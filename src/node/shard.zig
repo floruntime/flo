@@ -142,6 +142,10 @@ const ReplayRegistry = persistence_mod.ReplayRegistry;
 pub const run_id_mod = @import("run_id.zig");
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
+const memory_budget = @import("memory_budget.zig");
+const host_stats = @import("dashboard/host_stats.zig");
+const settings_machine = @import("../settings/machine.zig");
+const contract_view = @import("../contract/view.zig");
 
 /// The largest request a connection takes; `parse_buf` holds one whole.
 pub const MAX_REQUEST_SIZE = proto.MAX_REQUEST_BYTES;
@@ -284,6 +288,9 @@ comptime {
         if (info == .pointer and info.pointer.size == .one) @compileError("Replica." ++ name ++ " holds a pointer; the shard moves after init, so reach it through Io.Host");
     }
 }
+
+/// A settings entry shard 0's leader proposed and is waiting to see apply.
+pub const BudgetPropose = struct { term: u64, index: u64 };
 
 pub const Shard = struct {
     /// Shard index (0..shard_count-1).
@@ -721,6 +728,25 @@ pub const Shard = struct {
 
     /// Global metrics registry (optional, set by runtime when dashboard is enabled).
     metrics_registry: ?*MetricsRegistry,
+
+    /// The node's per-node memory budget, derived on shard 0 at each
+    /// settings-or-membership apply and read by `/status` and metrics. Only
+    /// shard 0 updates it; on other shards it stays at its default. Nothing
+    /// reads it to admit or refuse a write — it is for observability.
+    budget: memory_budget.Observation = .{},
+
+    /// This node's own figures for its settings row, computed once at init from
+    /// the host RAM and this node's shard count. Shard 0's leader proposes them;
+    /// 0 on a node that could not read its RAM, and on shards other than 0.
+    self_ram_bytes: u64 = 0,
+    self_reserve_bytes: u64 = 0,
+
+    /// The last settings entry shard 0's leader proposed but hasn't seen apply:
+    /// its term and index. While it is outstanding, the leader proposes no
+    /// more, so a stall (no quorum, a new term, a snapshot bar) can't stack
+    /// duplicates up to the outstanding cap and starve clients. Cleared when it
+    /// applies or its term is lost.
+    budget_propose_pending: ?BudgetPropose = null,
 
     /// The node's live count of held client connections, for the acceptor's
     /// connection cap. A shard releases a slot here when it closes a client
@@ -1160,8 +1186,20 @@ pub const Shard = struct {
             data_dir orelse "(ephemeral)",
         });
 
+        // Shard 0 carries the node's own memory figures and proposes them when
+        // it leads. This reads host RAM; a cgroup limit and a `ram` override
+        // come with the proper read later. The reserve is the node's floor plus
+        // rings over its shards, plus a margin.
+        const self_ram: u64 = if (shard_id == 0) host_stats.totalRamBytes() else 0;
+        const self_reserve: u64 = if (shard_id == 0)
+            memory_budget.reserve(shard_count, memory_budget.ringBytesPerShard(ual_capacity), memory_budget.DEFAULT_MARGIN_BYTES)
+        else
+            0;
+
         return .{
             .id = shard_id,
+            .self_ram_bytes = self_ram,
+            .self_reserve_bytes = self_reserve,
             .allocator = allocator,
             .reactor = reactor,
             .mailbox = mailbox,
@@ -5239,6 +5277,169 @@ pub const Shard = struct {
             if (leads and @import("test_faults.zig").of(entry) == .panic_leader_step) @panic("test fault: panic in the leader's step after apply");
         }
         self.workflow_handler.startApplied(self, entry, result);
+
+        // Shard 0 carries the memory budget: a settings row or a membership
+        // change can move it, so re-derive and refresh what `/status` and
+        // metrics show. Every replica applies the same entries, so each derives
+        // the same budget.
+        if (self.id == 0) switch (@as(entry_mod.EntryType, @fromBackingInt(@intCast(entry.header.entry_type)))) {
+            .settings_pool_share, .settings_node_mem, .settings_node_del, .raft_config => self.refreshBudget(),
+            else => {},
+        };
+    }
+
+    /// Re-derive the node's memory budget from shard 0's committed state: the
+    /// data-holding members joined with their settings rows and the pool-share
+    /// policy. Updates the shown budget and its metrics; logs a drop loudly. A
+    /// data-holder with no row yet freezes the budget (`Observation`). Nothing
+    /// enforces the budget — this only moves the display.
+    fn refreshBudget(self: *Shard) void {
+        const raft = self.raft_node;
+        // The membership as of the applied index, not `committed_config` (which
+        // commit moves ahead of apply): the budget joins against the applied
+        // store, so a lagging replica must derive over the same set. A lone
+        // node before its founding config applies is a group of itself.
+        const cfg = if (raft.applied_config.member_count > 0)
+            raft.applied_config
+        else
+            membership.Config.ofVoters(&.{self.cluster_node_id});
+
+        const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
+
+        // The pool-share policy, defaulting until a leader commits the genesis row.
+        var share: u16 = memory_budget.DEFAULT_SHARE_PERMILLE;
+        var pkb: [1 + settings_machine.POLICY_KEY.len]u8 = undefined;
+        const pkey = contract_view.key(&pkb, "", settings_machine.POLICY_KEY) catch return;
+        if (read.get(settings_machine.PolicyFam, pkey) catch null) |p| share = p.v.share_permille;
+
+        // One holder per data-holding member (a voter or a caught-up learner):
+        // its settings row, or null when it hasn't reported yet.
+        var holders: [membership.MAX_MEMBERS]memory_budget.Holder = undefined;
+        var n: usize = 0;
+        for (cfg.memberSlice()) |m| {
+            if (!(m.voter or m.caught_up)) continue;
+            var kb: [1 + 4]u8 = undefined;
+            const row = read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, m.id)) catch null;
+            holders[n] = .{
+                .node_id = m.id,
+                .mem = if (row) |r| .{ .ram_bytes = r.v.ram_bytes, .reserve = r.v.reserve } else null,
+            };
+            n += 1;
+        }
+
+        const was_provisional = self.budget.provisional_node;
+        const budget = memory_budget.derive(share, holders[0..n]);
+        if (self.budget.update(budget, nowMs())) |drop| {
+            log.warn("shard 0: memory budget fell {d} -> {d} bytes, now set by node {?d} — new creates are refused once use passes the line", .{ drop.before, drop.after, drop.governing });
+        }
+        // Log the freeze once, when it starts or moves to a different node, not
+        // on every later apply (the gauge carries the ongoing duration). This
+        // node's own id isn't logged: it proposes its own row, so a freeze on
+        // itself is the brief gap before that row applies, not an operator's
+        // problem.
+        if (self.budget.provisional_node) |pn| if (was_provisional != pn and pn != self.cluster_node_id) {
+            log.info("shard 0: memory budget provisional: node {d} has not reported its memory; the budget is frozen until it reports or is removed", .{pn});
+        };
+        if (self.metrics_registry) |mr| mr.memory_budget.set(
+            self.budget.budget_bytes,
+            self.budget.pool_use_bytes,
+            self.budget.governing_node orelse 0,
+            self.budget.provisional_since_ms orelse 0,
+            self.budget.provisional_node orelse 0,
+        );
+    }
+
+    /// Derive the budget once after boot, however boot established the applied
+    /// state. Replay applies the budget-relevant entries through the core
+    /// applier, which skips `afterApply`, so a warm boot never refreshes from
+    /// them; the runtime calls this on shard 0 after the deferred tail. It reads
+    /// the applied store and `applied_config` directly rather than keying off
+    /// replay, so when a snapshot boot lands (none exists today) it is covered
+    /// the same way — that restore path must leave `applied_config` and the
+    /// store set, as replay does, before the runtime reaches here.
+    pub fn refreshBudgetOnBoot(self: *Shard) void {
+        if (self.id == 0) self.refreshBudget();
+    }
+
+    /// Shard 0's leader keeps the settings rows current: the genesis pool-share
+    /// once, this node's own memory row when it is missing or its figures
+    /// changed, and a delete for any row whose node is no longer a member. Each
+    /// is a plain family write — it doesn't compete for the one-in-flight config
+    /// slot — gated on a read-back so a steady node proposes nothing, and on an
+    /// in-flight marker so a stall doesn't stack duplicates. At most one entry
+    /// per call; the next tick carries the next. Follower self-reporting comes
+    /// with the proper RAM read later; a data-holder without a row keeps the
+    /// budget provisional until then.
+    fn proposeBudgetRows(self: *Shard) void {
+        const raft = self.raft_node;
+        // One settings entry in flight at a time. While the last hasn't applied
+        // in its term, propose nothing; a lost term means it may be gone, so
+        // drop the marker and let the read-backs below decide afresh.
+        if (self.budget_propose_pending) |p| {
+            if (p.term == raft.current_term and p.index > raft.last_applied) return;
+            self.budget_propose_pending = null;
+        }
+
+        const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
+
+        // Genesis pool-share: propose the default once, if no policy row exists.
+        var pkb: [1 + settings_machine.POLICY_KEY.len]u8 = undefined;
+        const pkey = contract_view.key(&pkb, "", settings_machine.POLICY_KEY) catch return;
+        if ((read.get(settings_machine.PolicyFam, pkey) catch null) == null) {
+            var buf: [settings_machine.SetShare.max_size]u8 = undefined;
+            const bytes = settings_machine.SetShare.encodeInto(&buf, .{ .share_permille = memory_budget.DEFAULT_SHARE_PERMILLE }) catch return;
+            self.budget_propose_pending = proposeOrNull(raft, .settings_pool_share, bytes);
+            return;
+        }
+
+        // A delete for any row whose node the applied membership no longer
+        // names: a removed node's figures must stop governing the budget.
+        if (self.staleNodeRow(read)) |id| {
+            var buf: [settings_machine.DelNode.max_size]u8 = undefined;
+            const bytes = settings_machine.DelNode.encodeInto(&buf, .{ .node_id = id }) catch return;
+            self.budget_propose_pending = proposeOrNull(raft, .settings_node_del, bytes);
+            return;
+        }
+
+        // This node couldn't read its RAM: propose nothing (refuse-to-start is
+        // a later change), leaving the budget provisional rather than a 0 row.
+        if (self.self_ram_bytes == 0) return;
+        var kb: [1 + 4]u8 = undefined;
+        if (read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, self.cluster_node_id)) catch null) |row| {
+            if (row.v.ram_bytes == self.self_ram_bytes and row.v.reserve == self.self_reserve_bytes) return;
+        }
+        var buf: [settings_machine.SetNodeMem.max_size]u8 = undefined;
+        const bytes = settings_machine.SetNodeMem.encodeInto(&buf, .{
+            .node_id = self.cluster_node_id,
+            .ram_bytes = self.self_ram_bytes,
+            .reserve = self.self_reserve_bytes,
+        }) catch return;
+        self.budget_propose_pending = proposeOrNull(raft, .settings_node_mem, bytes);
+    }
+
+    /// Propose a settings entry; return its term and index to mark it in
+    /// flight, or null when the propose was refused (not the leader now, or the
+    /// outstanding cap is full) so the next tick tries again.
+    fn proposeOrNull(raft: *RaftNode, etype: entry_mod.EntryType, bytes: []const u8) ?BudgetPropose {
+        const r = raft.propose(etype, entry_mod.Flags.NONE, bytes) catch return null;
+        return .{ .term = r.term, .index = r.index };
+    }
+
+    /// A node-row whose id the applied membership no longer names, or null.
+    /// Only the applied config is read, so every replica would pick the same
+    /// row to delete; the leader is the one that proposes it.
+    fn staleNodeRow(self: *Shard, read: contract_view.ReadView) ?u32 {
+        const cfg = self.raft_node.applied_config;
+        if (cfg.member_count == 0) return null; // a lone node names only itself; nothing to prune
+        var kb: [1]u8 = undefined;
+        const prefix = contract_view.key(&kb, "", "") catch return null;
+        var it = read.range(settings_machine.NodeFam, prefix);
+        while (it.next() catch return null) |item| {
+            if (item.key.len < 1 + 4) continue;
+            const id = std.mem.readInt(u32, item.key[1..5], .little);
+            if (!cfg.names(id)) return id;
+        }
+        return null;
     }
 
     /// Triggers and per-namespace metrics for an entry that just applied:
@@ -5412,6 +5613,13 @@ pub const Shard = struct {
         // short of the halt), yet its duties are still its own: held.
         const holds = self.raft_node.role == .leader and self.offline == null and self.halted != null;
         if (leads or holds) self.runProducers() else self.duties.clear();
+
+        // Shard 0's leader keeps the memory-budget settings rows current. It
+        // runs here, not in the membership tick, because that tick is part of
+        // the Raft clock, which a lone (non-networked) node skips — yet the
+        // single node is the main mode, and its budget must appear. A halted
+        // shard appends nothing, so it proposes nothing even if it still leads.
+        if (self.id == 0 and leads and self.halted == null) self.proposeBudgetRows();
 
         // The producers above only proposed. What has committed (at once
         // on a single node) applies here, outside any module's work.
@@ -7589,6 +7797,13 @@ fn applyRaftConfig(ctx: *anyopaque, entry: *const entry_mod.Entry, _: *persisten
     const raft: *RaftNode = @ptrCast(@alignCast(ctx));
     const cfg = membership.decode(entry.payload) orelse return error.Halt;
     raft.commitMembership(&cfg, entry.header.index);
+    // The membership as of this apply: `committed_config` can already be ahead
+    // (commit runs before apply), so a read that must match applied state reads
+    // this instead. Set on every replica and on replay, in index order.
+    if (entry.header.index >= raft.applied_config_index) {
+        raft.applied_config = cfg;
+        raft.applied_config_index = entry.header.index;
+    }
     // At boot, replay applies the committed configs before the group comes
     // up: a node that lost its hard state checks the committed set even
     // when its latest config is not.
@@ -8249,6 +8464,169 @@ test "Shard: add and remove connections" {
 
     shard.removeConnection(conn_pipe[0]);
     try std.testing.expectEqual(@as(u32, 0), shard.connectionCount());
+}
+
+/// Build a fresh shard-0 replica (node `node_id`, alone), apply the genesis
+/// pool-share and this node's memory row, and return the budget it derived.
+fn deriveBudgetOnFreshShard(node_id: u32, ram_bytes: u64, reserve_bytes: u64) !memory_budget.Observation {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, node_id, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const r = shard.raft_node;
+    const base = r.last_applied;
+
+    var share_buf: [settings_machine.SetShare.max_size]u8 = undefined;
+    const share_bytes = try settings_machine.SetShare.encodeInto(&share_buf, .{ .share_permille = 700 });
+    const share_entry = entry_mod.buildEntry(.settings_pool_share, entry_mod.Flags.NONE, r.current_term, base + 1, 0, share_bytes);
+    var out = persistence_mod.Result.start(&share_entry);
+    try std.testing.expect(shard.applyEntry(&share_entry, &out));
+
+    var row_buf: [settings_machine.SetNodeMem.max_size]u8 = undefined;
+    const row_bytes = try settings_machine.SetNodeMem.encodeInto(&row_buf, .{ .node_id = node_id, .ram_bytes = ram_bytes, .reserve = reserve_bytes });
+    const row_entry = entry_mod.buildEntry(.settings_node_mem, entry_mod.Flags.NONE, r.current_term, base + 2, 0, row_bytes);
+    out = persistence_mod.Result.start(&row_entry);
+    try std.testing.expect(shard.applyEntry(&row_entry, &out));
+
+    return shard.budget;
+}
+
+test "memory budget: a settings row applies and every replica derives the same budget" {
+    const ram: u64 = 2 * 1024 * 1024 * 1024;
+    const reserve: u64 = 100 * 1024 * 1024;
+    const expected = (ram - reserve) * 700 / 1000;
+
+    const a = try deriveBudgetOnFreshShard(1, ram, reserve);
+    try std.testing.expectEqual(expected, a.budget_bytes);
+    try std.testing.expectEqual(@as(?u32, 1), a.governing_node);
+    try std.testing.expectEqual(@as(?u32, null), a.provisional_node);
+
+    // A second replica built independently applies the same entries and lands
+    // on the same budget: the derive reads only committed state, so every
+    // replica agrees.
+    const b = try deriveBudgetOnFreshShard(1, ram, reserve);
+    try std.testing.expectEqual(a.budget_bytes, b.budget_bytes);
+    try std.testing.expectEqual(a.governing_node, b.governing_node);
+}
+
+test "memory budget: a lagging replica derives over the applied config, not the committed one" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const r = shard.raft_node;
+
+    // Node 1 has reported its row.
+    const ram: u64 = 2 * 1024 * 1024 * 1024;
+    const reserve: u64 = 100 * 1024 * 1024;
+    var row_buf: [settings_machine.SetNodeMem.max_size]u8 = undefined;
+    const row_bytes = try settings_machine.SetNodeMem.encodeInto(&row_buf, .{ .node_id = 1, .ram_bytes = ram, .reserve = reserve });
+    const row_entry = entry_mod.buildEntry(.settings_node_mem, entry_mod.Flags.NONE, r.current_term, r.last_applied + 1, 0, row_bytes);
+    var out = persistence_mod.Result.start(&row_entry);
+    try std.testing.expect(shard.applyEntry(&row_entry, &out));
+
+    // A lagging replica: commit already names {1,2}, but only {1} has applied.
+    // Deriving over the committed set would call the budget provisional for the
+    // unreported node 2; deriving over the applied set (the fix) does not.
+    r.applied_config = membership.Config.ofVoters(&.{1});
+    r.committed_config = membership.Config.ofVoters(&.{ 1, 2 });
+    shard.refreshBudgetOnBoot();
+
+    try std.testing.expectEqual(@as(?u32, null), shard.budget.provisional_node);
+    try std.testing.expectEqual(@as(?u32, 1), shard.budget.governing_node);
+    try std.testing.expectEqual((ram - reserve) * 700 / 1000, shard.budget.budget_bytes);
+}
+
+test "memory budget: the leader proposes once and nothing while a proposal is in flight" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const r = shard.raft_node;
+    try std.testing.expect(r.role == .leader);
+
+    // No policy row yet: the first call appends the genesis share and marks it in flight.
+    const base = r.log.lastIndex();
+    shard.proposeBudgetRows();
+    try std.testing.expect(shard.budget_propose_pending != null);
+    try std.testing.expectEqual(base + 1, r.log.lastIndex());
+
+    // While it hasn't applied, a second call proposes nothing — no pile-up.
+    shard.proposeBudgetRows();
+    try std.testing.expectEqual(base + 1, r.log.lastIndex());
+
+    // Once it applies, the marker clears and the next call proposes this node's row.
+    _ = shard.applyCommitted();
+    shard.proposeBudgetRows();
+    try std.testing.expectEqual(base + 2, r.log.lastIndex());
+}
+
+test "memory budget: the leader deletes a row whose node left the membership" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const r = shard.raft_node;
+    try std.testing.expect(r.role == .leader);
+
+    // The policy, and a row for node 2 — proposed into the log and applied, so
+    // the log and store stay in step with the leader's own proposals.
+    var share_buf: [settings_machine.SetShare.max_size]u8 = undefined;
+    const share_bytes = try settings_machine.SetShare.encodeInto(&share_buf, .{ .share_permille = 700 });
+    _ = try r.propose(.settings_pool_share, entry_mod.Flags.NONE, share_bytes);
+    var row_buf: [settings_machine.SetNodeMem.max_size]u8 = undefined;
+    const row_bytes = try settings_machine.SetNodeMem.encodeInto(&row_buf, .{ .node_id = 2, .ram_bytes = 2 * 1024 * 1024 * 1024, .reserve = 100 * 1024 * 1024 });
+    _ = try r.propose(.settings_node_mem, entry_mod.Flags.NONE, row_bytes);
+    _ = shard.applyCommitted();
+
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    var kb: [1 + 4]u8 = undefined;
+    try std.testing.expect((read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, 2)) catch null) != null); // node 2's row is there
+
+    // The applied membership no longer names node 2: the leader proposes a
+    // delete for its row, and applying it removes the row.
+    r.applied_config = membership.Config.ofVoters(&.{1});
+    const before = r.log.lastIndex();
+    shard.proposeBudgetRows();
+    try std.testing.expectEqual(before + 1, r.log.lastIndex());
+    _ = shard.applyCommitted();
+
+    try std.testing.expect((read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, 2)) catch null) == null); // and gone
+}
+
+test "settings: a pool share over 1000 per-mille is refused at apply, writing no row" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const r = shard.raft_node;
+
+    var buf: [settings_machine.SetShare.max_size]u8 = undefined;
+    const bytes = try settings_machine.SetShare.encodeInto(&buf, .{ .share_permille = 2000 });
+    const e = entry_mod.buildEntry(.settings_pool_share, entry_mod.Flags.NONE, r.current_term, r.last_applied + 1, 0, bytes);
+    var out = persistence_mod.Result.start(&e);
+    _ = shard.applyEntry(&e, &out);
+    try std.testing.expect(out.refused() != null);
+
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    var pkb: [1 + settings_machine.POLICY_KEY.len]u8 = undefined;
+    const pkey = try contract_view.key(&pkb, "", settings_machine.POLICY_KEY);
+    try std.testing.expect((read.get(settings_machine.PolicyFam, pkey) catch null) == null);
 }
 
 test "Shard: dispatch ping via pipe-based connection" {

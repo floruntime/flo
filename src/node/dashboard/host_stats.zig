@@ -148,7 +148,10 @@ fn darwinSysctlU32(comptime name: [:0]const u8) ?u32 {
     return v;
 }
 
-fn totalRamBytes() u64 {
+/// The host's total RAM, or 0 if it can't be read. The memory budget reads
+/// this into a node's settings row; `MemTotal` is the host's RAM even inside a
+/// container, so a cgroup-limited node takes the min of this and its limit.
+pub fn totalRamBytes() u64 {
     if (is_linux) {
         return if (readProcField("/proc/meminfo", "MemTotal:")) |kb| kb * 1024 else 0;
     }

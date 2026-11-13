@@ -455,6 +455,63 @@ pub const ReplicationMetrics = struct {
     }
 };
 
+/// The node's memory budget, derived on shard 0 and shown as gauges.
+/// It enforces nothing here: `pool_use_bytes` is 0 until a later change charges
+/// the pool. A non-zero `provisional_since_ms` means a data-holder hasn't
+/// reported its memory, so the budget is frozen until it does or is removed;
+/// the exposed `provisional_ms` grows with wall time until then.
+pub const MemoryBudgetMetrics = struct {
+    /// The budget shown now, held at its last clean value while provisional.
+    budget_bytes: Atomic(u64) = Atomic(u64).init(0),
+    /// The pool's use. Nothing is charged yet, so always 0.
+    pool_use_bytes: Atomic(u64) = Atomic(u64).init(0),
+    /// The smallest data-holder, which sets the budget; 0 before any derive.
+    governing_node: Atomic(u64) = Atomic(u64).init(0),
+    /// The monotonic-ms stamp the current freeze began at, or 0 when not
+    /// provisional. The duration is computed at scrape, so it grows between
+    /// applies instead of standing still until the next one.
+    provisional_since_ms: Atomic(u64) = Atomic(u64).init(0),
+    /// The unreported data-holder freezing the budget; 0 when none.
+    provisional_node: Atomic(u64) = Atomic(u64).init(0),
+
+    pub fn set(self: *MemoryBudgetMetrics, budget_bytes: u64, pool_use_bytes: u64, governing_node: u32, provisional_since_ms: u64, provisional_node: u32) void {
+        self.budget_bytes.store(budget_bytes, .monotonic);
+        self.pool_use_bytes.store(pool_use_bytes, .monotonic);
+        self.governing_node.store(governing_node, .monotonic);
+        self.provisional_since_ms.store(provisional_since_ms, .monotonic);
+        self.provisional_node.store(provisional_node, .monotonic);
+    }
+
+    pub fn init() MemoryBudgetMetrics {
+        return .{};
+    }
+
+    pub const Snapshot = struct {
+        budget_bytes: u64,
+        pool_use_bytes: u64,
+        governing_node: u64,
+        provisional_since_ms: u64,
+        provisional_node: u64,
+
+        /// Milliseconds the budget has been provisional as of `now_ms`
+        /// (monotonic); 0 when not provisional.
+        pub fn provisionalMs(self: Snapshot, now_ms: u64) u64 {
+            if (self.provisional_since_ms == 0) return 0;
+            return if (now_ms > self.provisional_since_ms) now_ms - self.provisional_since_ms else 0;
+        }
+    };
+
+    pub fn snapshot(self: *const MemoryBudgetMetrics) Snapshot {
+        return .{
+            .budget_bytes = self.budget_bytes.load(.monotonic),
+            .pool_use_bytes = self.pool_use_bytes.load(.monotonic),
+            .governing_node = self.governing_node.load(.monotonic),
+            .provisional_since_ms = self.provisional_since_ms.load(.monotonic),
+            .provisional_node = self.provisional_node.load(.monotonic),
+        };
+    }
+};
+
 /// Server-level metrics (connections, subscriptions, commands, etc.)
 pub const ServerMetrics = struct {
     /// Current active connections
@@ -1011,6 +1068,9 @@ pub const MetricsRegistry = struct {
     /// Replication metrics (singleton - one per node)
     replication: ReplicationMetrics,
 
+    /// Memory-budget metrics (singleton - one per node), derived on shard 0.
+    memory_budget: MemoryBudgetMetrics,
+
     /// Per-shard metrics for the thread-per-shard architecture.
     /// Indexed by shard_id. Null until initShards() is called.
     shard_counters: ?[]ShardMetrics,
@@ -1054,6 +1114,7 @@ pub const MetricsRegistry = struct {
             .workflow = WorkflowMetrics.init(),
             .processing = ProcessingMetrics.init(),
             .replication = ReplicationMetrics.init(),
+            .memory_budget = MemoryBudgetMetrics.init(),
             .shard_counters = null,
             .num_shards = 0,
             .mutex = @import("stdx").Mutex{},
@@ -1400,6 +1461,11 @@ pub const MetricsRegistry = struct {
         // Export replication metrics
         try writeReplicationMetrics(writer, self.replication.snapshot());
 
+        // Export memory-budget metrics. The provisional duration is computed
+        // here, at scrape, so it grows with time rather than standing still
+        // between budget re-derivations.
+        try writeMemoryBudgetMetrics(writer, self.memory_budget.snapshot(), @import("stdx").time.monotonicMs());
+
         return aw.toOwnedSlice();
     }
 
@@ -1688,6 +1754,28 @@ fn writeReplicationMetrics(writer: anytype, snapshot: ReplicationMetrics.Snapsho
     try writer.print("\n# HELP flo_replication_peers_linked Peer links up right now\n", .{});
     try writer.print("# TYPE flo_replication_peers_linked gauge\n", .{});
     try writer.print("flo_replication_peers_linked {d}\n", .{snapshot.peers_linked});
+}
+
+fn writeMemoryBudgetMetrics(writer: anytype, snapshot: MemoryBudgetMetrics.Snapshot, now_ms: u64) !void {
+    try writer.print("\n# HELP flo_memory_budget_bytes The node's per-node memory budget, held at its last clean value while provisional\n", .{});
+    try writer.print("# TYPE flo_memory_budget_bytes gauge\n", .{});
+    try writer.print("flo_memory_budget_bytes {d}\n", .{snapshot.budget_bytes});
+
+    try writer.print("\n# HELP flo_memory_budget_pool_use_bytes The pool's use against the budget (0 until the pool is charged)\n", .{});
+    try writer.print("# TYPE flo_memory_budget_pool_use_bytes gauge\n", .{});
+    try writer.print("flo_memory_budget_pool_use_bytes {d}\n", .{snapshot.pool_use_bytes});
+
+    try writer.print("\n# HELP flo_memory_budget_governing_node The smallest data-holder, which sets the budget (0 before any derive)\n", .{});
+    try writer.print("# TYPE flo_memory_budget_governing_node gauge\n", .{});
+    try writer.print("flo_memory_budget_governing_node {d}\n", .{snapshot.governing_node});
+
+    try writer.print("\n# HELP flo_memory_budget_provisional_ms How long the budget has been frozen for an unreported data-holder\n", .{});
+    try writer.print("# TYPE flo_memory_budget_provisional_ms gauge\n", .{});
+    try writer.print("flo_memory_budget_provisional_ms {d}\n", .{snapshot.provisionalMs(now_ms)});
+
+    try writer.print("\n# HELP flo_memory_budget_provisional_node The unreported data-holder freezing the budget (0 when none)\n", .{});
+    try writer.print("# TYPE flo_memory_budget_provisional_node gauge\n", .{});
+    try writer.print("flo_memory_budget_provisional_node {d}\n", .{snapshot.provisional_node});
 }
 
 /// Write per-shard metrics in Prometheus format
@@ -2034,4 +2122,18 @@ test "MetricsRegistry: a shard writing through its metrics while another thread 
     for (0..writes) |_| queue.recordEnqueue(1, 1);
     thread.join();
     try std.testing.expectEqual(@as(u64, writes), (try registry.registerQueue("ns", "held")).snapshot().enqueue_ops_total);
+}
+
+test "MemoryBudgetMetrics: provisional_ms is computed at scrape, so it grows with time" {
+    var m = MemoryBudgetMetrics.init();
+    // Not provisional: 0 whatever the clock reads.
+    m.set(100, 0, 7, 0, 0);
+    try std.testing.expectEqual(@as(u64, 0), m.snapshot().provisionalMs(5000));
+    // Provisional since t=1000, node 9: the duration grows between applies.
+    m.set(100, 0, 7, 1000, 9);
+    try std.testing.expectEqual(@as(u64, 0), m.snapshot().provisionalMs(1000));
+    try std.testing.expectEqual(@as(u64, 4000), m.snapshot().provisionalMs(5000));
+    // A clock reading before the stamp (skew) never goes negative.
+    try std.testing.expectEqual(@as(u64, 0), m.snapshot().provisionalMs(500));
+    try std.testing.expectEqual(@as(u64, 9), m.snapshot().provisional_node);
 }
