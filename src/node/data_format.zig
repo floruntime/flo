@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 21;
+pub const CURRENT: u32 = 22;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -74,6 +74,9 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // shards a key's owner differs. SYSTEM no longer records partitions.
     // The layouts are unchanged.
     .{ .format = 21, .segment_version = 13, .entries = 0x6a7954352202e5d7 },
+    // The cluster-settings entries (the memory-budget pool share and per-node
+    // RAM) are logged, so their layouts join the pinned hash.
+    .{ .format = 22, .segment_version = 14, .entries = 0x3f3f20afb508db25 },
 };
 
 comptime {
