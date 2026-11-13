@@ -17,10 +17,7 @@ test "integration: router distributes keys across shards" {
         const key = std.fmt.bufPrint(&key_buf, "random-key-{d}", .{i}) catch unreachable;
         const target = router.routeKey(key);
         switch (target) {
-            .local => |t| {
-                const shard_id = router.slotToShard(t.slot);
-                per_shard[shard_id] += 1;
-            },
+            .local => per_shard[0] += 1,
             .shard => |t| {
                 per_shard[t.shard_id] += 1;
             },
@@ -46,12 +43,8 @@ test "integration: router distributes keys across shards" {
         const key = std.fmt.bufPrint(&key_buf, "verify-key-{d}", .{i}) catch unreachable;
         const target = router.routeKey(key);
         switch (target) {
-            .local => |t| {
-                try testing.expectEqual(@as(u16, 0), @as(u16, @intCast(t.slot % shard_count)));
-            },
-            .shard => |t| {
-                try testing.expectEqual(t.shard_id, @as(u16, @intCast(t.slot % shard_count)));
-            },
+            .local => try testing.expectEqual(@as(u32, 0), src.node.router.keySlot(key) % shard_count),
+            .shard => |t| try testing.expectEqual(@as(u32, t.shard_id), src.node.router.keySlot(key) % shard_count),
         }
     }
 }
@@ -62,28 +55,15 @@ test "integration: router same key always routes same" {
     const test_key = "consistent-routing-test-key";
 
     // Route the same key 100 times
-    const first_target = router.routeKey(test_key);
-    const first_slot = switch (first_target) {
-        .local => |t| t.slot,
-        .shard => |t| t.slot,
-    };
-    const first_shard = switch (first_target) {
+    const first_shard = switch (router.routeKey(test_key)) {
         .local => @as(u16, 0), // local means shard 0 (our local shard)
         .shard => |t| t.shard_id,
     };
-
     for (1..100) |_| {
-        const target = router.routeKey(test_key);
-        const slot = switch (target) {
-            .local => |t| t.slot,
-            .shard => |t| t.slot,
-        };
-        const shard = switch (target) {
+        const shard = switch (router.routeKey(test_key)) {
             .local => @as(u16, 0),
             .shard => |t| t.shard_id,
         };
-
-        try testing.expectEqual(first_slot, slot);
         try testing.expectEqual(first_shard, shard);
     }
 
@@ -91,19 +71,6 @@ test "integration: router same key always routes same" {
     var key_buf: [64]u8 = undefined;
     for (0..50) |i| {
         const key = std.fmt.bufPrint(&key_buf, "stability-key-{d}", .{i}) catch unreachable;
-
-        const t1 = router.routeKey(key);
-        const t2 = router.routeKey(key);
-
-        const p1 = switch (t1) {
-            .local => |t| t.slot,
-            .shard => |t| t.slot,
-        };
-        const p2 = switch (t2) {
-            .local => |t| t.slot,
-            .shard => |t| t.slot,
-        };
-
-        try testing.expectEqual(p1, p2);
+        try testing.expectEqual(router.routeKey(key), router.routeKey(key));
     }
 }

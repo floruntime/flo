@@ -34,7 +34,8 @@ test "e2e/config: partition_count and --partitions are refused at start, naming 
     const says = "partition_count is no longer a setting: every cluster has 4096 key partitions; remove it from the config";
     try expectRefused(.{ .shards = 1, .extra_config = "[server]\npartition_count = 0\n" }, says);
     try expectRefused(.{ .shards = 1, .extra_config = "[server]\npartition_count = 4096\n" }, says);
-    try expectRefused(.{ .shards = 1, .extra_args = &.{ "--partitions", "4096" } }, says);
+    try expectRefused(.{ .shards = 1, .extra_config = "[server]\npartition_count = \"auto\"\n" }, says);
+    try expectRefused(.{ .shards = 1, .extra_args = &.{ "--partitions", "4096" } }, "unknown flag --partitions: no longer a flag: every cluster has 4096 key partitions; leave it off");
 }
 
 test "e2e/config: a node restarted with another shard count is refused, naming both counts" {
@@ -46,7 +47,7 @@ test "e2e/config: a node restarted with another shard count is refused, naming b
     node.config.shards = 2;
     node.dump_log_on_failure = false;
     try testing.expectError(error.ServerNotReady, node.startWithTimeout(3000));
-    const says = "the data was written with 1 shards, and this start asks for 2";
+    const says = "the data was written for a shard count of 1, and this start asks for 2";
     if (!try node.logsContain(says)) {
         std.debug.print("expected the log to say: {s}\n", .{says});
         return error.TestUnexpectedResult;

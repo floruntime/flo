@@ -36,6 +36,9 @@ fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) c
     }.run;
 }
 
+/// What `server start --partitions` is told, after "unknown flag --partitions: ".
+pub const PARTITIONS_FLAG_GONE = "no longer a flag: every cluster has 4096 key partitions; leave it off";
+
 /// Create the server command tree
 pub fn createServerCommand(allocator: Allocator) !*commander.Command {
     const cmd = try commander.newBuilder(allocator)
@@ -294,7 +297,7 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .action(wrapHandler(runMetrics)),
         )
         .build();
-    cmd.retired_flags = &.{.{ .long = "partitions", .hint = server_config.PARTITIONS_GONE }};
+    cmd.retired_flags = &.{.{ .long = "partitions", .hint = PARTITIONS_FLAG_GONE }};
     return cmd;
 }
 

@@ -12,7 +12,7 @@ pub const table = [_]ops.Op{
         .name = "processing.remove",
         .code = 0x365,
         .class = .write,
-        .route = .run_id,
+        .route = .shard0,
         .request = Record(&.{}),
         .response = Record(&.{}),
         .cli = .{ .expose = .hand, .key = .{ .name = "job_id", .doc = "The job's id" }, .examples = &.{"flo processing remove job-123"} },

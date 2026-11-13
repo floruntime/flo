@@ -132,15 +132,15 @@ pub const TSHandler = struct {
     // ── Pre-Route ───────────────────────────────────────────────────────
 
     fn preRouteByMeasurement(req: Request) ?u64 {
-        if (req.key.len == 0) return 0;
+        if (req.key.len == 0) return null;
         return router.routeNsKey(req.ns_id, req.key);
     }
 
     /// A FloQL query carries its measurement in the query, not the key: it
-    /// runs on that measurement's shard. A query with none is refused
-    /// wherever it lands.
+    /// runs on that measurement's shard. A query with none runs on group 0,
+    /// where it is refused.
     fn preRouteByQueryMeasurement(req: Request) ?u64 {
-        const measurement = floql_parser.Parser.sourceMeasurement(req.value) orelse return 0;
+        const measurement = floql_parser.Parser.sourceMeasurement(req.value) orelse return null;
         return router.routeNsKey(req.ns_id, measurement);
     }
 
@@ -1208,7 +1208,7 @@ test "ts handler: pre-route by measurement" {
     try testing.expect(TSHandler.preRouteByMeasurement(req1) != TSHandler.preRouteByMeasurement(req3));
 
     const req_empty = makeRequest(.ts_write, "", "", "");
-    try testing.expectEqual(@as(?u64, 0), TSHandler.preRouteByMeasurement(req_empty));
+    try testing.expectEqual(@as(?u64, null), TSHandler.preRouteByMeasurement(req_empty));
 
     // Same measurement, different namespace → different hash (namespace isolation)
     var req_ns = makeRequest(.ts_write, "cpu", "", "");

@@ -109,7 +109,7 @@ pub const SystemManifest = struct {
     /// Validate that the running configuration matches manifested topology.
     pub fn validate(self: SystemManifest, requested_shards: u16) !void {
         if (self.shards != requested_shards) {
-            log.err("topology mismatch: the data was written with {d} shards, and this start asks for {d}", .{
+            log.err("topology mismatch: the data was written for a shard count of {d}, and this start asks for {d}", .{
                 self.shards,
                 requested_shards,
             });

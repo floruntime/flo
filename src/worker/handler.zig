@@ -192,7 +192,7 @@ pub const WorkerHandler = struct {
     }
 
     pub fn preRouteByWorker(req: Request) ?u64 {
-        if (req.key.len == 0) return 0;
+        if (req.key.len == 0) return null;
         return router.routeNsKey(req.ns_id, req.key);
     }
 

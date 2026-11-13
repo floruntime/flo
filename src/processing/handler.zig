@@ -495,18 +495,18 @@ pub const ProcessingHandler = struct {
     // ── Dispatcher Registration ─────────────────────────────────────────
 
     pub fn register(dispatcher: *Dispatcher) void {
-        dispatcher.registerWithRoute(.processing_submit, dispatchProcessing, preRouteByProcessing);
-        dispatcher.registerWithRoute(.processing_stop, dispatchProcessing, run_id_mod.preRouteByRunId);
-        dispatcher.registerWithRoute(.processing_cancel, dispatchProcessing, run_id_mod.preRouteByRunId);
-        dispatcher.registerWithRoute(.processing_status, dispatchProcessing, run_id_mod.preRouteByRunId);
+        // Every op naming a job runs on group 0, whatever its key: one
+        // group holds the job registry, so `max_jobs` bounds the server.
+        // Pinned to the group, not routed by a hash or a job id's bits.
+        inline for (.{ .processing_submit, .processing_stop, .processing_cancel, .processing_status }) |op|
+            dispatcher.register(op, dispatchProcessing);
+        dispatcher.register(.processing_remove, table_run.handler("processing.remove", ProcessingHandler, runRemove));
+        inline for (.{ .processing_submit, .processing_stop, .processing_cancel, .processing_status, .processing_remove }) |op|
+            dispatcher.setShardRoute(op, toGroup0);
         dispatcher.registerWalk(.processing_list, dispatchProcessing, localScanJobs);
-        dispatcher.registerWithRoute(.processing_remove, table_run.handler("processing.remove", ProcessingHandler, runRemove), run_id_mod.preRouteByRunId);
     }
 
-    /// Every submit goes to shard 0, whatever its key: one shard holds the
-    /// job registry, so `max_jobs` bounds the server, and each job id
-    /// carries that shard back for the ops that name it.
-    fn preRouteByProcessing(_: Request) ?u64 {
+    fn toGroup0(_: Request) ?u16 {
         return 0;
     }
 
@@ -660,12 +660,10 @@ pub const ProcessingHandler = struct {
             },
         };
 
-        // The job id carries a slot this shard owns (its own number, as
-        // slot n is on shard n), so every op routed by the id (status, stop,
-        // cancel) finds the job where it was stored. Not the job name's slot:
-        // that would be another shard's whenever submits all run here.
+        // A job id routes nothing (every processing op runs on group 0), so
+        // its slot bits are 0.
         var id_buf: [32]u8 = undefined;
-        const job_id = shard.run_id_gen.next(.job, shard.id, &id_buf);
+        const job_id = shard.run_id_gen.next(.job, 0, &id_buf);
 
         // Persist through Raft; the applier builds the job record and its
         // pipelines from the entry — the same applier a restart uses.
@@ -2821,12 +2819,19 @@ test "ProcessingHandler: removing a failed job un-counts it" {
     try std.testing.expect(!handler.jobs.contains("job-f"));
 }
 
-test "ProcessingHandler: every submit routes to shard 0, whatever its key" {
+test "ProcessingHandler: every op naming a job is pinned to group 0, whatever its key" {
+    const Dispatch = @import("../node/dispatcher.zig").Dispatcher;
+    var d = Dispatch.init();
+    ProcessingHandler.register(&d);
     var req: proto.Request = undefined;
     req.namespace = "acme";
-    for ([_][]const u8{ "", "k", "another-key" }) |key| {
-        req.key = key;
-        try std.testing.expectEqual(@as(?u64, 0), ProcessingHandler.preRouteByProcessing(req));
+    for ([_]proto.OpCode{ .processing_submit, .processing_stop, .processing_cancel, .processing_status, .processing_remove }) |op| {
+        // No hash route: a job id's bits, or a key's slot, could be any group's.
+        try std.testing.expect(d.pre_route[@backingInt(op)] == null);
+        for ([_][]const u8{ "", "k", "job-1a2b-3", "another-key" }) |key| {
+            req.key = key;
+            try std.testing.expectEqual(@as(?u16, 0), d.shard_route[@backingInt(op)].?(req));
+        }
     }
 }
 

@@ -319,7 +319,7 @@ pub const ActionsHandler = struct {
     }
 
     fn preRouteByAction(req: Request) ?u64 {
-        if (req.key.len == 0) return 0;
+        if (req.key.len == 0) return null;
         return router.routeNsKey(req.ns_id, req.key);
     }
 
@@ -521,6 +521,9 @@ pub const ActionsHandler = struct {
     ///                [status:u8][created_at:i64][has_started:u8][started_at?:i64]
     ///                [has_completed:u8][completed_at?:i64])*
     fn handleListRuns(shard: *Shard, req: Request) CommandResult {
+        // An action's runs are on its name's shard; with no name this would
+        // list only the shard it landed on.
+        if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "action name is required" } };
         const ns = req.ns_id;
         const limit: u32 = if (req.value.len >= 4) std.mem.readInt(u32, req.value[0..4], .little) else 100;
         var w: std.Io.Writer.Allocating = .init(shard.allocator);
@@ -2418,4 +2421,14 @@ test "an action entry naming no namespace is refused before it is proposed" {
     const shard: *Shard = undefined;
     try std.testing.expectError(error.NamespaceUnknown, propose(shard, .action_register, ae.Register.Value{ .ns = 0, .name = "a", .owner = "", .lease_ms = 1000, .max_attempts = 1 }));
     try std.testing.expectError(error.NamespaceUnknown, propose(shard, .action_delete, ae.Delete.Value{ .ns = 0, .name = "a" }));
+}
+
+test "listing action runs with no action name is refused, not answered from one shard" {
+    // An action's runs are on its name's shard: a keyless list would see
+    // only the shard it landed on. Refused before the shard is read.
+    const shard: *Shard = undefined;
+    const req: Request = .{ .header = proto.RequestHeader.init(.action_list_runs, 1), .namespace = "", .key = "", .value = "" };
+    const r = ActionsHandler.handleListRuns(shard, req);
+    try std.testing.expectEqual(@as(@TypeOf(r.err.code), .invalid_request), r.err.code);
+    try std.testing.expectEqualStrings("action name is required", r.err.message);
 }
