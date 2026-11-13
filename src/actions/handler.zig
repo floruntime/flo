@@ -437,7 +437,7 @@ pub const ActionsHandler = struct {
         if (parsed.labels) |l| if (l.len > ae.MAX_LABELS) return .{ .err = .{ .code = .invalid_request, .message = "invoke labels too large" } };
         var id_buf: [32]u8 = undefined;
         const run_id = shard.run_id_gen.next(.action, router.nsKeySlot(ns, name), &id_buf);
-        const proposed = propose(shard, .action_invoke, ae.Invoke.Value{ .ns = ns.int(), .action = name, .run = run_id, .input = parsed.input, .labels = parsed.labels, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null }) catch |err|
+        const proposed = propose(shard, .action_invoke, ae.Invoke.Value{ .ns = ns.int(), .action = name, .run = run_id, .input = parsed.input, .labels = parsed.labels, .source = .direct, .caller_run = null, .caller_workflow = null }) catch |err|
             return .{ .err = persistence.failureError(err, "action not persisted") };
         return .{ .parked = proposed };
     }
@@ -1436,7 +1436,7 @@ pub const ActionsHandler = struct {
         if (run.expiry_ns -| shard.raft_node.now() > half or self.extending.contains(run_key)) return .{ .answer = .{ .expires_at_ms = nsToMs(run.expiry_ns) } };
         try self.extending.ensureUnusedCapacity(self.allocator, 1);
         const owned = try self.allocator.dupe(u8, run_key);
-        const proposed = propose(shard, .action_extend, ae.Extend.Value{ .ns = req.ns_id.int(), .action = action, .run = req.key, .holder = worker, .token = token, .expiry_ns = run.expiry_ns, .held_since_ns = run.delivered_ns, .lease_ms = run.lease_ms }) catch |err| {
+        const proposed = propose(shard, .action_extend, ae.Extend.Value{ .ns = req.ns_id.int(), .action = action, .run = req.key, .holder = worker, .deliveries = deliveries, .token = token, .expiry_ns = run.expiry_ns, .held_since_ns = run.delivered_ns, .lease_ms = run.lease_ms }) catch |err| {
             self.allocator.free(owned);
             return .{ .refused = .{ .status = persistence.failureStatus(err), .refusal = persistence.failureRefusal(err, "touch not persisted") } };
         };
@@ -1509,7 +1509,7 @@ pub const ActionsHandler = struct {
                 if (leads and result.refused() == null) shard.wake_workers = true;
                 // The action was deleted after the invoke was proposed.
                 const no_action = if (result.refused()) |r| r.refusal.reason == .not_found else false;
-                if (leads and no_action) if (p.caller_shard) |from| self.failHeld(shard, from, p.run, .of(p.ns), p.action, "");
+                if (leads and no_action and p.caller_run != null) if (p.caller_workflow) |wf| self.failHeld(shard, callerShard(shard, .of(p.ns), wf), p.run, .of(p.ns), p.action, "");
             },
             .action_extend => {
                 const p = ae.Extend.decodeAll(e.payload, &diag) catch return;
@@ -1636,10 +1636,17 @@ pub const ActionsHandler = struct {
     fn tellWorkflow(self: *ActionsHandler, shard: *Shard, ns: NamespaceId, run_id: []const u8) void {
         const run = getRun(shard, ns, run_id) orelse return;
         if (!finishedStatus(run.status)) return;
-        const caller = run.caller_run orelse return;
-        const target = run.caller_shard orelse shard.router.slotToShard(run_id_mod.extractSlot(caller) orelse return);
+        _ = run.caller_run orelse return;
+        const target = callerShard(shard, ns, run.caller_workflow orelse return);
         if (target == shard.id) return;
         self.sendFinished(shard, target, run_id, statusOf(run), if (run.status == .completed) run.outcome else "", if (run.status == .completed) run.result else "");
+    }
+
+    /// The shard a calling workflow's run is on: its workflow name's, where
+    /// every run of it is placed. Not its run id's bits: a client may choose
+    /// the id, and a chosen one names no slot.
+    fn callerShard(shard: *Shard, ns: NamespaceId, workflow: []const u8) u16 {
+        return shard.router.hashToShard(router.routeNsKey(ns, workflow));
     }
 
     fn finishedStatus(s: machine.Status) bool {
@@ -1800,10 +1807,9 @@ pub const ActionsHandler = struct {
     };
 
     pub fn invokeByName(shard: *Shard, ns: NamespaceId, action_name: []const u8, input: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8, id_buf: *[32]u8) InvokeResult {
-        const caller_shard: ?u16 = if (caller_run_id != null) @intCast(shard.id) else null;
         if (!actionExists(shard, ns, action_name)) return .missing;
         const run_id = shard.run_id_gen.next(.action, router.nsKeySlot(ns, action_name), id_buf);
-        return switch (proposeInvoke(shard, ns, action_name, run_id, input orelse "", caller_run_id, caller_workflow_name, caller_shard)) {
+        return switch (proposeInvoke(shard, ns, action_name, run_id, input orelse "", caller_run_id, caller_workflow_name)) {
             .index => |index| .{ .invoked = .{ .id = run_id, .index = index } },
             .held => .held,
             .failed => .failed,
@@ -1814,8 +1820,8 @@ pub const ActionsHandler = struct {
     /// full, or refused for good.
     const Proposed = union(enum) { index: u64, held, failed };
 
-    fn proposeInvoke(shard: *Shard, ns: NamespaceId, action: []const u8, run_id: []const u8, input: []const u8, caller_run: ?[]const u8, caller_workflow: ?[]const u8, caller_shard: ?u16) Proposed {
-        const proposed = propose(shard, .action_invoke, ae.Invoke.Value{ .ns = ns.int(), .action = action, .run = run_id, .input = input, .labels = null, .source = if (caller_run != null) .workflow else .direct, .caller_run = caller_run, .caller_workflow = caller_workflow, .caller_shard = caller_shard }) catch |err| {
+    fn proposeInvoke(shard: *Shard, ns: NamespaceId, action: []const u8, run_id: []const u8, input: []const u8, caller_run: ?[]const u8, caller_workflow: ?[]const u8) Proposed {
+        const proposed = propose(shard, .action_invoke, ae.Invoke.Value{ .ns = ns.int(), .action = action, .run = run_id, .input = input, .labels = null, .source = if (caller_run != null) .workflow else .direct, .caller_run = caller_run, .caller_workflow = caller_workflow }) catch |err| {
             if (err == error.Overloaded) return .held;
             if (!shard.quietHalted(err)) log.err("shard {d}: action run {s} not started: {s}", .{ shard.id, run_id, @errorName(err) });
             return .failed;
@@ -1834,7 +1840,7 @@ pub const ActionsHandler = struct {
     pub fn startRunFromInbox(self: *ActionsHandler, shard: *Shard, from: u16, bytes: []const u8) void {
         const m = StartMessage.parse(bytes) orelse return;
         // Too long for an entry now means too long when the action registers.
-        if (!m.fits(from)) {
+        if (!m.fits()) {
             log.err("shard {d}: action run {s} asked for by a workflow is too long to log; that workflow's step fails", .{ shard.id, m.run });
             return self.sendFinished(shard, from, m.run, .cancelled, "", "");
         }
@@ -1843,7 +1849,7 @@ pub const ActionsHandler = struct {
             if (m.can_wait) return self.hold(shard, from, bytes, m.run, m.ns, m.action);
             return self.failHeld(shard, from, m.run, m.ns, m.action, "");
         }
-        switch (self.startRun(shard, from, m)) {
+        switch (self.startRun(shard, m)) {
             .index => {},
             // Tried again each tick, as a start held for its action is.
             .held => self.holdForRoom(shard, from, bytes, m),
@@ -1888,19 +1894,19 @@ pub const ActionsHandler = struct {
             return .{ .run = run, .ns = ns, .action = action, .caller = caller, .workflow = workflow, .can_wait = can_wait.len > 0, .input = bytes[r.off..] };
         }
 
-        fn invoke(m: StartMessage, from: u16) ae.Invoke.Value {
+        fn invoke(m: StartMessage) ae.Invoke.Value {
             const caller: ?[]const u8 = if (m.caller.len == 0) null else m.caller;
-            return .{ .ns = m.ns.int(), .action = m.action, .run = m.run, .input = m.input, .labels = null, .source = if (caller != null) .workflow else .direct, .caller_run = caller, .caller_workflow = if (m.workflow.len == 0) null else m.workflow, .caller_shard = if (caller != null) from else null };
+            return .{ .ns = m.ns.int(), .action = m.action, .run = m.run, .input = m.input, .labels = null, .source = if (caller != null) .workflow else .direct, .caller_run = caller, .caller_workflow = if (m.workflow.len == 0) null else m.workflow };
         }
 
-        fn fits(m: StartMessage, from: u16) bool {
-            _ = ae.Invoke.encodedSize(m.invoke(from)) catch return false;
+        fn fits(m: StartMessage) bool {
+            _ = ae.Invoke.encodedSize(m.invoke()) catch return false;
             return true;
         }
     };
 
-    fn startRun(self: *ActionsHandler, shard: *Shard, from: u16, m: StartMessage) Proposed {
-        const proposed = proposeInvoke(shard, m.ns, m.action, m.run, m.input, if (m.caller.len == 0) null else m.caller, if (m.workflow.len == 0) null else m.workflow, if (m.caller.len == 0) null else from);
+    fn startRun(self: *ActionsHandler, shard: *Shard, m: StartMessage) Proposed {
+        const proposed = proposeInvoke(shard, m.ns, m.action, m.run, m.input, if (m.caller.len == 0) null else m.caller, if (m.workflow.len == 0) null else m.workflow);
         if (proposed != .index) return proposed;
         const k = self.allocator.dupe(u8, m.run) catch return proposed;
         self.starting.put(self.allocator, k, @import("stdx").time.monotonicMs()) catch self.allocator.free(k);
@@ -1963,7 +1969,7 @@ pub const ActionsHandler = struct {
             const m = StartMessage.parse(e.value_ptr.bytes).?;
             if (actionExists(shard, m.ns, m.action)) {
                 // Not proposed: tried again next tick, until the wait ends.
-                if (self.startRun(shard, e.value_ptr.from, m) != .index) {
+                if (self.startRun(shard, m) != .index) {
                     if (now_ms < e.value_ptr.until_ms) continue;
                     self.sendFinished(shard, e.value_ptr.from, m.run, .cancelled, "", "");
                 }

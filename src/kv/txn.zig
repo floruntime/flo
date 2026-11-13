@@ -48,6 +48,7 @@
 
 const std = @import("std");
 const NamespaceId = @import("../namespace/table.zig").Id;
+const router = @import("../node/router.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
@@ -129,15 +130,22 @@ pub const AppendError = error{
 
 // ─── TxnTable ─────────────────────────────────────────────────────────────
 
-/// The shard a transaction id names: its top 16 bits, so a request inside
-/// a transaction routes to the shard holding it. The rest count the shard's
-/// transactions.
-pub fn idShard(id: u64) u16 {
+/// The slot a transaction id names: its top 16 bits hold the slot of the
+/// hash the transaction is pinned to, so a request inside it routes as a
+/// request on its keys does, to the group holding it. The rest count the
+/// group's transactions.
+///
+/// Ids stay unique per slot without naming a group: a group's counter
+/// starts at random (`randomCounter`). If a slot moves, its open
+/// transactions are dropped at the move's freeze, and the new owner's
+/// counter starts at random too, so an id from before matching a new
+/// transaction there is a chance of one in 2^48, not a reuse.
+pub fn idSlot(id: u64) u32 {
     return @intCast(id >> 48);
 }
 
-pub fn makeId(shard: u16, counter: u64) u64 {
-    return (@as(u64, shard) << 48) | (counter & ID_COUNTER_MASK);
+pub fn makeId(slot: u32, counter: u64) u64 {
+    return (@as(u64, slot) << 48) | (counter & ID_COUNTER_MASK);
 }
 
 pub const ID_COUNTER_MASK: u64 = (1 << 48) - 1;
@@ -176,8 +184,6 @@ pub const TxnTable = struct {
     /// leader starts it again, and a client still holding an id from
     /// before must not reach a new transaction with it.
     next_id: u64,
-    /// The shard this table belongs to: the high bits of its ids.
-    shard_id: u16 = 0,
 
     pub fn init(allocator: Allocator) TxnTable {
         return .{
@@ -200,8 +206,8 @@ pub const TxnTable = struct {
     pub fn begin(self: *TxnTable, pinned_hash: u64, ns_id: NamespaceId) !u64 {
         if (self.map.count() >= MAX_OPEN_TXNS) return error.TooManyOpenTxns;
 
-        const id = makeId(self.shard_id, self.next_id);
-        // Never 0, so no id is all zeros below its shard.
+        const id = makeId(router.slot(pinned_hash), self.next_id);
+        // Never 0, so no id is all zeros below its slot.
         self.next_id = @max(1, (self.next_id + 1) & ID_COUNTER_MASK);
         try self.map.put(id, .{
             .txn_id = id,
@@ -504,14 +510,15 @@ test "kv_batch: an op that breaks its kind's rule is refused, not logged" {
     try std.testing.expectError(error.InvalidBatch, encodeBatch(std.testing.allocator, .default, &ops));
 }
 
-test "txn: an id names its shard" {
+test "txn: an id names the slot of the hash it is pinned to, not a group" {
     const id = makeId(3, 42);
-    try std.testing.expectEqual(@as(u16, 3), idShard(id));
+    try std.testing.expectEqual(@as(u32, 3), idSlot(id));
     try std.testing.expectEqual(@as(u64, 42), id & ID_COUNTER_MASK);
-    try std.testing.expectEqual(@as(u16, 0xffff), idShard(makeId(0xffff, ID_COUNTER_MASK + 5)));
+    try std.testing.expectEqual(@as(u32, router.SLOTS - 1), idSlot(makeId(router.SLOTS - 1, ID_COUNTER_MASK + 5)));
 
     var t = TxnTable.init(std.testing.allocator);
     defer t.deinit();
-    t.shard_id = 7;
-    try std.testing.expectEqual(@as(u16, 7), idShard(try t.begin(0, .default)));
+    const pinned = router.routeNsKey(.default, "{user:1}:balance");
+    try std.testing.expectEqual(router.slot(pinned), idSlot(try t.begin(pinned, .default)));
+    try std.testing.expectEqual(router.nsKeySlot(.default, "{user:1}:name"), idSlot(try t.begin(pinned, .default)));
 }

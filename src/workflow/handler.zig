@@ -289,14 +289,16 @@ pub const WorkflowHandler = struct {
         /// Step name that triggered the pending action.
         pending_step_name_owned: ?[]const u8 = null,
 
-        /// Shard ID where the pending action run was created (for cross-shard lookup).
-        pending_action_shard_id: ?u16 = null,
+        /// The pending action's slot (its name's), resolved to a shard
+        /// through the router at each use, so it follows a moved slot.
+        pending_action_slot: ?u32 = null,
 
         /// Child workflow run ID when parked waiting for a `@workflow/<name>` step.
         pending_child_run_id_owned: ?[]const u8 = null,
 
-        /// Shard ID where the pending child workflow run lives (cross-shard lookup).
-        pending_child_shard_id: ?u16 = null,
+        /// The pending child workflow's slot (its name's), resolved to a
+        /// shard through the router at each use.
+        pending_child_slot: ?u32 = null,
 
         /// The index, in this shard's log, of the entry that creates the
         /// action or child run this run waits for; 0 when that run is
@@ -1250,7 +1252,7 @@ pub const WorkflowHandler = struct {
         const now_ms: i64 = @import("stdx").time.milliTimestamp();
         const reason = if (req.value.len > 0) req.value else "cancelled by user";
         const held_action = run.pending_action_run_id_owned;
-        const held_on = run.pending_action_shard_id orelse shard.id;
+        const held_on = slotShard(shard, run.pending_action_slot) orelse shard.id;
         const proposed = self.proposeComplete(shard, run_ns_key, run, .cancelled, reason, now_ms) catch |err| {
             const status: proto.StatusCode, const text: []const u8 = switch (err) {
                 error.OutOfMemory => .{ .internal_error, "out of memory" },
@@ -1967,7 +1969,7 @@ pub const WorkflowHandler = struct {
         parent.waiting_for_room = false;
         // The index is in the target shard's log: known only when that is
         // this shard.
-        self.parkForChild(parent, child_rid, step_label, child_name, target_shard_id, now_ms, if (is_local) child_index else 0);
+        self.parkForChild(parent, child_rid, step_label, child_name, router.nsKeySlot(ns, child_name), now_ms, if (is_local) child_index else 0);
         return null; // parked
     }
 
@@ -2026,6 +2028,12 @@ pub const WorkflowHandler = struct {
     /// Whether the run `run` waits for, which the caller did not find, was
     /// lost: this shard proposed it and has applied that entry's index
     /// without creating it.
+    /// The shard a pending action or child run is on, from its slot; null
+    /// when nothing is pending.
+    fn slotShard(shard: *const Shard, slot: ?u32) ?u16 {
+        return shard.router.slotToShard(slot orelse return null);
+    }
+
     fn pendingLost(shard: *Shard, run: *const RunRecord, on_shard: ?u16) bool {
         if ((on_shard orelse shard.id) != shard.id) return false;
         // No index: this shard held the start, and a step-down may have
@@ -2038,7 +2046,7 @@ pub const WorkflowHandler = struct {
     }
 
     /// Park a workflow run waiting for a child workflow to reach a terminal state.
-    fn parkForChild(self: *WorkflowHandler, run: *RunRecord, child_run_id: []const u8, step_label: []const u8, child_name: []const u8, target_shard_id: u16, now_ms: i64, index: u64) void {
+    fn parkForChild(self: *WorkflowHandler, run: *RunRecord, child_run_id: []const u8, step_label: []const u8, child_name: []const u8, slot: u32, now_ms: i64, index: u64) void {
         run.status = .waiting;
         self.watchParked(run);
         run.pending_index = index;
@@ -2049,7 +2057,7 @@ pub const WorkflowHandler = struct {
         if (run.pending_step_name_owned) |old| self.allocator.free(old);
         run.pending_step_name_owned = self.allocator.dupe(u8, step_label) catch null;
 
-        run.pending_child_shard_id = target_shard_id;
+        run.pending_child_slot = slot;
 
         const sig_type = std.fmt.allocPrint(self.allocator, "_child_done:{s}", .{child_run_id}) catch null;
         if (run.wait_signal_type_owned) |old| self.allocator.free(old);
@@ -2201,7 +2209,7 @@ pub const WorkflowHandler = struct {
 
         if (is_local and ActionsHandler.actionExists(shard, ns, action_name)) {
             // Local shard: use invokeByName directly (same thread, no threading concerns)
-            return self.invokeActionLocal(shard, run, ns, action_name, input, step_label, target_shard_id, now_ms);
+            return self.invokeActionLocal(shard, run, ns, action_name, input, step_label, now_ms);
         }
 
         // The action's shard creates the run on its own thread, through its
@@ -2217,7 +2225,7 @@ pub const WorkflowHandler = struct {
         if (is_local) {
             defer shard.allocator.free(message);
             shard.actions_handler.startRunFromInbox(shard, shard.id, message);
-            self.parkForAction(run, pre_run_id, step_label, action_name, target_shard_id, now_ms, 0);
+            self.parkForAction(run, pre_run_id, step_label, action_name, router.nsKeySlot(ns, action_name), now_ms, 0);
             return null;
         }
         const peer_mailboxes = shard.peer_mailboxes orelse {
@@ -2241,7 +2249,7 @@ pub const WorkflowHandler = struct {
 
         // Park the workflow run, awaiting action completion. The owning shard
         // proposes the run and wakes workers when it applies.
-        self.parkForAction(run, pre_run_id, step_label, action_name, target_shard_id, now_ms, 0);
+        self.parkForAction(run, pre_run_id, step_label, action_name, router.nsKeySlot(ns, action_name), now_ms, 0);
         return null; // signals: parked
     }
 
@@ -2255,7 +2263,6 @@ pub const WorkflowHandler = struct {
         action_name: []const u8,
         input: []const u8,
         step_label: []const u8,
-        target_shard_id: u16,
         now_ms: i64,
     ) ?[]const u8 {
         var action_id_buf: [32]u8 = undefined;
@@ -2270,7 +2277,7 @@ pub const WorkflowHandler = struct {
         run.waiting_for_room = false;
         // The run exists once the invoke applies; `checkPendingActions`
         // resumes this one when it finishes.
-        self.parkForAction(run, invoked.id, step_label, action_name, target_shard_id, now_ms, invoked.index);
+        self.parkForAction(run, invoked.id, step_label, action_name, router.nsKeySlot(ns, action_name), now_ms, invoked.index);
         return null;
     }
 
@@ -2330,7 +2337,7 @@ pub const WorkflowHandler = struct {
     }
 
     /// Park a workflow run waiting for an async action to complete.
-    fn parkForAction(self: *WorkflowHandler, run: *RunRecord, action_run_id: []const u8, step_label: []const u8, action_name: []const u8, target_shard_id: u16, now_ms: i64, index: u64) void {
+    fn parkForAction(self: *WorkflowHandler, run: *RunRecord, action_run_id: []const u8, step_label: []const u8, action_name: []const u8, slot: u32, now_ms: i64, index: u64) void {
         run.status = .waiting;
         self.watchParked(run);
         run.pending_index = index;
@@ -2342,8 +2349,8 @@ pub const WorkflowHandler = struct {
         if (run.pending_step_name_owned) |old| self.allocator.free(old);
         run.pending_step_name_owned = self.allocator.dupe(u8, step_label) catch null;
 
-        // Store which shard the action run lives on
-        run.pending_action_shard_id = target_shard_id;
+        // Store which slot the action run lives on
+        run.pending_action_slot = slot;
 
         // Set a synthetic signal type so handleSignal can also resume this run
         const sig_type = std.fmt.allocPrint(self.allocator, "_action_done:{s}", .{action_run_id}) catch null;
@@ -2453,10 +2460,10 @@ pub const WorkflowHandler = struct {
                     defer self.allocator.free(action);
                     self.addHistoryEvent(run, "action_not_registered", action, now_ms);
                 }
-                const done = if (getActionRunResult(shard, ns_key, run.pending_action_shard_id, action_rid)) |result|
+                const done = if (getActionRunResult(shard, ns_key, slotShard(shard, run.pending_action_slot), action_rid)) |result|
                     result.status == .completed or result.status == .failed or result.status == .timed_out or result.status == .cancelled
                 else
-                    pendingLost(shard, run, run.pending_action_shard_id);
+                    pendingLost(shard, run, slotShard(shard, run.pending_action_slot));
                 if (done and resume_count < resume_keys.len) {
                     resume_keys[resume_count] = ns_key;
                     resume_count += 1;
@@ -2545,7 +2552,7 @@ pub const WorkflowHandler = struct {
     /// Whether the child run referenced by a parent is in a terminal state.
     /// The child is in its parent's namespace.
     fn childRunTerminal(self: *WorkflowHandler, shard: *Shard, parent_ns_key: []const u8, child_run_id: []const u8, parent: *const RunRecord) bool {
-        const child_shard_id = parent.pending_child_shard_id;
+        const child_shard_id = slotShard(shard, parent.pending_child_slot);
         const child_ns_key = self.nsKey(keyNamespace(parent_ns_key), child_run_id) orelse return false;
         defer self.allocator.free(child_ns_key);
 
@@ -2575,7 +2582,7 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(child_ns_key);
 
         // Read the child's terminal status + a private copy of its output.
-        const tid = run.pending_child_shard_id orelse shard.id;
+        const tid = slotShard(shard, run.pending_child_slot) orelse shard.id;
         var child_status: RunStatus = undefined;
         var child_output: ?[]u8 = null;
         var lost = false;
@@ -2587,7 +2594,7 @@ pub const WorkflowHandler = struct {
             } else {
                 // Its start's index applied without creating it: the log
                 // dropped it, and the step fails.
-                if (!pendingLost(shard, run, run.pending_child_shard_id)) return;
+                if (!pendingLost(shard, run, slotShard(shard, run.pending_child_slot))) return;
                 log.warn("workflow run {f}: the child run {s} its step waits for was never created (its start was dropped); the step fails", .{ shown(run_ns_key), child_rid });
                 lost = true;
                 child_status = .failed;
@@ -2635,7 +2642,7 @@ pub const WorkflowHandler = struct {
         run.pending_child_run_id_owned = null;
         if (run.pending_step_name_owned) |s| self.allocator.free(s);
         run.pending_step_name_owned = null;
-        run.pending_child_shard_id = null;
+        run.pending_child_slot = null;
         run.pending_index = 0;
         if (run.wait_signal_type_owned) |s| self.allocator.free(s);
         run.wait_signal_type_owned = null;
@@ -2682,12 +2689,12 @@ pub const WorkflowHandler = struct {
         // What another shard told this one is taken here, before the run's
         // pending state (its id among it) is freed, and freed only once
         // the step's outcome, which may point into it, is spent.
-        const remote = (run.pending_action_shard_id orelse shard.id) != shard.id;
+        const remote = (slotShard(shard, run.pending_action_slot) orelse shard.id) != shard.id;
         const taken: ?ActionsHandler.Finished = shard.actions_handler.takeFinished(action_rid);
         defer if (taken) |f| shard.actions_handler.freeFinished(f);
-        const found: ?ActionsHandler.InternalRunResult = if (taken) |f| finishedResult(f) else if (remote) null else getActionRunResult(shard, run_ns_key, run.pending_action_shard_id, action_rid);
+        const found: ?ActionsHandler.InternalRunResult = if (taken) |f| finishedResult(f) else if (remote) null else getActionRunResult(shard, run_ns_key, slotShard(shard, run.pending_action_slot), action_rid);
         if (found == null) {
-            if (!pendingLost(shard, run, run.pending_action_shard_id)) return;
+            if (!pendingLost(shard, run, slotShard(shard, run.pending_action_slot))) return;
             log.warn("workflow run {f}: the action run {s} its step waits for was never created (its invoke was dropped); the step fails", .{ shown(run_ns_key), action_rid });
         }
 
@@ -2724,7 +2731,7 @@ pub const WorkflowHandler = struct {
         run.pending_action_run_id_owned = null;
         if (run.pending_step_name_owned) |s| self.allocator.free(s);
         run.pending_step_name_owned = null;
-        run.pending_action_shard_id = null;
+        run.pending_action_slot = null;
         run.pending_index = 0;
         if (run.wait_signal_type_owned) |s| self.allocator.free(s);
         run.wait_signal_type_owned = null;
@@ -6209,8 +6216,10 @@ test "step executor: a step whose action run another shard says was lost resumes
     _ = shard.applyCommitted();
     const run = handler.runs.getPtr(testKey(.default, "run-l")).?;
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
-    // As if its action ran on shard 1, which says it never started it.
-    run.pending_action_shard_id = 1;
+    // As if its action ran on shard 1 of two, which says it never started
+    // it: slot 1 is shard 1's.
+    shard.router = router.Router.init(2, 0);
+    run.pending_action_slot = 1;
     const rid = run.pending_action_run_id_owned.?;
     var msg: [128]u8 = undefined;
     std.mem.writeInt(u16, msg[0..2], @intCast(rid.len), .little);
@@ -6507,7 +6516,7 @@ test "step executor: checkPendingActions handles completed async action" {
     // A completed action run, of an action the transitions resolve.
     registerTestAction(&shard, "step-a");
     registerTestAction(&shard, "step-b");
-    applyTestActionEntry(&shard, .action_invoke, test_action_entries.Invoke.Value{ .ns = NamespaceId.default.int(), .action = "step-a", .run = "action-42", .input = "", .labels = null, .source = .workflow, .caller_run = "run-8", .caller_workflow = null, .caller_shard = null }, 1000);
+    applyTestActionEntry(&shard, .action_invoke, test_action_entries.Invoke.Value{ .ns = NamespaceId.default.int(), .action = "step-a", .run = "action-42", .input = "", .labels = null, .source = .workflow, .caller_run = "run-8", .caller_workflow = null }, 1000);
     completeTestAction(&shard, "action-42");
 
     // checkPendingActions should detect the completed action and resume step-a

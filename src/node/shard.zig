@@ -808,7 +808,6 @@ pub const Shard = struct {
         const kv_handler = try allocator.create(KVHandler);
         errdefer allocator.destroy(kv_handler);
         kv_handler.* = KVHandler.init(allocator, &partition.kv);
-        kv_handler.txn_table.shard_id = @intCast(shard_id);
         errdefer kv_handler.deinit();
 
         const stream_handler = try allocator.create(StreamHandler);
@@ -8204,7 +8203,7 @@ fn testRegister(name: []const u8) action_entries.Register.Value {
 }
 
 fn testInvoke(name: []const u8, run_id: []const u8) action_entries.Invoke.Value {
-    return .{ .ns = ns_table.DEFAULT.int(), .action = name, .run = run_id, .input = "{}", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null };
+    return .{ .ns = ns_table.DEFAULT.int(), .action = name, .run = run_id, .input = "{}", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null };
 }
 
 test "Shard: init and deinit" {
@@ -9118,12 +9117,12 @@ test "Shard: a request in a transaction goes to the shard its id names, and comm
     const makeId = txn_mod.makeId;
 
     var buf: [64]u8 = undefined;
-    // Another shard's id goes there; this shard's, or a shard that doesn't
-    // exist, runs here, where the second is refused as no transaction.
+    // An id goes where its slot is: slot n is shard n mod 2 here.
     for ([_]struct { id: u64, to: ?u16 }{
         .{ .id = makeId(1, 7), .to = 1 },
         .{ .id = makeId(0, 7), .to = null },
-        .{ .id = makeId(9, 7), .to = null },
+        .{ .id = makeId(2, 7), .to = null },
+        .{ .id = makeId(9, 7), .to = 1 },
     }) |case| {
         switch (a.resolveTarget(@backingInt(proto.OpCode.kv_get), txnGet(&buf, case.id))) {
             .local => try std.testing.expectEqual(@as(?u16, null), case.to),

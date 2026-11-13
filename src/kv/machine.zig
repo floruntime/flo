@@ -637,3 +637,36 @@ pub const TestKv = struct {
         std.debug.assert(r.refused() == null);
     }
 };
+
+test "kv machine: every record's slot follows from its stored key" {
+    const sc = @import("../contract/slot_check.zig");
+    const Store = @import("../contract/store.zig").Store;
+    const r = @import("../node/router.zig");
+    var t = TestKv.init(std.testing.allocator);
+    defer t.deinit();
+    // Two keys sharing a tag share a slot, the tag's.
+    const want = r.nsKeySlot(.default, "{user:1}");
+    for ([_][]const u8{ "{user:1}:name", "{user:1}:visits" }) |raw| {
+        var kb: [limits.MAX_KV_KEY]u8 = undefined;
+        const k = Key.init(&kb, .default, raw);
+        try t.put(k.stored, "v1", 10);
+        try t.put(k.stored, "v2", 20);
+    }
+    const D = struct {
+        fn value(_: void, _: *Store, key: []const u8, _: []const u8) ?u32 {
+            const k = Key.ofStored(key) orelse return null;
+            return r.nsKeySlot(k.ns, k.raw);
+        }
+        // `[ns][len:u16 BE][raw][version]`.
+        fn history(_: void, _: *Store, key: []const u8, _: []const u8) ?u32 {
+            if (key.len < 6) return null;
+            const len = std.mem.readInt(u16, key[4..6], .big);
+            if (key.len < 6 + len) return null;
+            return r.nsKeySlot(sc.nsOf(key), key[6..][0..len]);
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 2), try sc.expectFamily(&t.store, Values.ID, want, {}, D.value));
+    try std.testing.expect(try sc.expectFamily(&t.store, History.ID, want, {}, D.history) > 0);
+    // `kv.ns_counts` counts a namespace's keys on the shard: derived, so
+    // not placed.
+}
