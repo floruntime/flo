@@ -3197,3 +3197,127 @@ test "e2e/processing/cluster: a job removed through one node is gone on every no
         }
     }
 }
+
+// A queue sink whose queue is at its cap: the pipeline holds at the record
+// instead of losing it, and every record arrives once a consumer drains it.
+test "e2e/processing: a queue sink at its queue's cap holds its source, and loses no record" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .extra_config = "[queues]\nmax_messages = 2\n" } });
+    defer ctx.deinit();
+    const job =
+        \\kind: Processing
+        \\name: capped-qsink
+        \\sources.[0].name: src
+        \\sources.[0].stream.name: capped-in
+        \\sinks.[0].name: out
+        \\sinks.[0].queue.name: capped-q
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job, "capped-qsink.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    var submit = try ctx.cli.run(&.{ "processing", "submit", path });
+    defer submit.deinit();
+    try testing.expectEqual(@as(u8, 0), submit.exit_code);
+    for (CAPPED_RECORDS) |r| try ctx.exec(&.{ "stream", "append", "capped-in", r });
+
+    // Two at a time fit; drained, the pipeline goes on, and each record
+    // arrives exactly once.
+    const seen = try drainUntilAll(ctx, "capped-q");
+    for (seen) |n| try testing.expectEqual(@as(usize, 1), n);
+}
+
+const CAPPED_RECORDS = [_][]const u8{ "rec-a1", "rec-b2", "rec-c3", "rec-d4", "rec-e5", "rec-f6" };
+
+/// Dequeues `queue` with ack until every capped record has come; how many
+/// times each did.
+fn drainUntilAll(ctx: *stdx.testing.TestContext, queue: []const u8) ![CAPPED_RECORDS.len]usize {
+    var seen: [CAPPED_RECORDS.len]usize = @splat(0);
+    var tries: usize = 0;
+    while (std.mem.indexOfScalar(usize, &seen, 0) != null) : (tries += 1) {
+        if (tries == 120) {
+            std.debug.print("records seen: {any}\n", .{seen});
+            return error.RecordsLost;
+        }
+        var got = try ctx.cli.run(&.{ "queue", "dequeue", queue, "--count", "10", "--ack" });
+        defer got.deinit();
+        try testing.expectEqual(@as(u8, 0), got.exit_code);
+        for (CAPPED_RECORDS, 0..) |r, i| seen[i] += std.mem.count(u8, got.stdout, r);
+        stdx.time.sleep(250 * std.time.ns_per_ms);
+    }
+    return seen;
+}
+
+test "e2e/processing: on 4 shards, a queue sink on its job's shard holds at its cap and loses nothing; one on another shard loses what its cap refuses, counted there" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{
+        .shards = 4,
+        .metrics_enabled = true,
+        .extra_config = "[queues]\nmax_messages = 2\n",
+    } });
+    defer ctx.deinit();
+    // Every submit runs on shard 0, and its job there.
+    const router = src.node.router.Router.init(4, 0);
+    const shardOf = struct {
+        fn f(r: src.node.router.Router, key: []const u8) u16 {
+            return r.hashToShard(src.node.router.routeNsKey(.default, key));
+        }
+    }.f;
+    const home: u16 = 0;
+    var lbuf: [16]u8 = undefined;
+    var rbuf: [16]u8 = undefined;
+    var i: usize = 0;
+    const local = while (true) : (i += 1) {
+        const q = try std.fmt.bufPrint(&lbuf, "near{d}", .{i});
+        if (shardOf(router, q) == home) break q;
+    };
+    const remote = while (true) : (i += 1) {
+        const q = try std.fmt.bufPrint(&rbuf, "far{d}", .{i});
+        if (shardOf(router, q) != home) break q;
+    };
+    // The near sink first: held there, a record isn't sent to the far one.
+    var ybuf: [512]u8 = undefined;
+    const job = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: capped-two
+        \\sources.[0].name: src
+        \\sources.[0].stream.name: capped-in
+        \\sinks.[0].name: near
+        \\sinks.[0].queue.name: {s}
+        \\sinks.[1].name: far
+        \\sinks.[1].queue.name: {s}
+    , .{ local, remote });
+    const path = try writeDottedToTempYaml(testing.allocator, job, "capped-two.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    var submit = try ctx.cli.run(&.{ "processing", "submit", path });
+    defer submit.deinit();
+    try testing.expectEqual(@as(u8, 0), submit.exit_code);
+    for (CAPPED_RECORDS) |r| try ctx.exec(&.{ "stream", "append", "capped-in", r });
+
+    const seen = try drainUntilAll(ctx, local);
+    for (seen) |n| try testing.expectEqual(@as(usize, 1), n);
+    // The far queue kept the first two; the other four were refused at its
+    // shard's apply and counted dropped there.
+    var dropped: ?u64 = null;
+    for (0..40) |_| {
+        var http = try ctx.createMetricsHttp();
+        defer http.deinit();
+        var resp = try http.get("/metrics");
+        defer resp.deinit();
+        dropped = metricValue(resp.body, "flo_processing_records_dropped_total");
+        if (dropped == 4) break;
+        stdx.time.sleep(250 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(?u64, 4), dropped);
+    var far = try ctx.cli.run(&.{ "queue", "dequeue", remote, "--count", "10", "--ack" });
+    defer far.deinit();
+    try testing.expectEqual(@as(u8, 0), far.exit_code);
+    for (CAPPED_RECORDS, 0..) |r, k| try testing.expectEqual(@as(usize, if (k < 2) 1 else 0), std.mem.count(u8, far.stdout, r));
+}
+
+/// An unlabeled `name <value>` series from a Prometheus body.
+fn metricValue(body: []const u8, name: []const u8) ?u64 {
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, name)) continue;
+        if (line.len <= name.len or line[name.len] != ' ') continue;
+        return std.fmt.parseInt(u64, std.mem.trim(u8, line[name.len + 1 ..], " \r"), 10) catch continue;
+    }
+    return null;
+}
