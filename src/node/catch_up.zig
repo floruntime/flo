@@ -191,6 +191,8 @@ const Fixture = struct {
         try stdx.fs.makePath(self.path);
         self.writer = SegmentWriter.init(testing.allocator, 0);
         self.dl = try DurableLog.init(testing.allocator, &self.writer, self.path);
+        // Sealed segments, one per flush, as the bulk thread reads them.
+        self.dl.max_segment_bytes = 1;
         try self.writer.addEntry(&testEntry(1, 1, "one"));
         try self.writer.addEntry(&testEntry(2, 1, "two"));
         try self.writer.addEntry(&testEntry(3, 1, "three"));
@@ -301,4 +303,40 @@ test "catch up: with no bulk thread every read is made in place" {
 
 fn askAsync(cu: *CatchUp, start: u64, buf: []Entry, arena: []u8) CatchUpResult {
     return cu.source().read_range_async.?(cu, start, buf, arena);
+}
+
+test "catch up: a read across a sealed segment and the active one takes the sealed part from the bulk thread, the active part in place" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    // 1-3 sealed; 4-5 flushed into an active segment, 6 still buffered.
+    f.dl.max_segment_bytes = 1 << 20;
+    try f.dl.flush(5);
+    try f.writer.addEntry(&testEntry(6, 2, "six"));
+    var cu = CatchUp.init(testing.allocator, &f.dl, 8, 256);
+    defer cu.deinit();
+    var bulk = try bulk_io.BulkIo.init(testing.allocator);
+    defer bulk.deinit();
+    try bulk.start();
+    var done: Done = .{};
+    cu.bulk = &bulk;
+    cu.notify = .{ .ctx = &done, .done = Done.done };
+
+    var buf: [8]Entry = undefined;
+    var arena: [256]u8 = undefined;
+    // From 2: the sealed segment's part, from the bulk thread.
+    try testing.expect(askAsync(&cu, 2, &buf, &arena).pending);
+    try done.waitFor(1);
+    const sealed = askAsync(&cu, 2, &buf, &arena);
+    try testing.expectEqual(@as(usize, 2), sealed.count);
+    try testing.expectEqualStrings("three", buf[1].payload);
+    // From 4: the active segment, read here at once, never queued.
+    const active = askAsync(&cu, 4, &buf, &arena);
+    try testing.expectEqual(@as(usize, 2), active.count);
+    try testing.expectEqualStrings("four", buf[0].payload);
+    try testing.expectEqualStrings("five", buf[1].payload);
+    // Then the buffer.
+    const buffered = askAsync(&cu, 6, &buf, &arena);
+    try testing.expectEqual(@as(usize, 1), buffered.count);
+    try testing.expectEqualStrings("six", buf[0].payload);
 }

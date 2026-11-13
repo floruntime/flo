@@ -798,6 +798,10 @@ const TestIo = struct {
 
     pub fn send(r: *TestReplica, peer: u32, msg_type: transport.MsgType, _: u32, payload: []const u8) bool {
         const h = of(r);
+        if (msg_type == .append_entries_response) {
+            const resp = transport.deserializeAppendResponse(payload).?;
+            h.answers.append(testing.allocator, .{ .success = resp.success, .match = resp.match_index, .flushes_before = h.flushes }) catch @panic("OOM");
+        }
         if (msg_type == .append_entries) {
             const hdr = transport.deserializeAppendRequestHeader(payload).?;
             h.appends.append(testing.allocator, .{ .to = peer, .entries = hdr.entry_count, .verdict = hdr.halt_verdict, .prev_index = hdr.prev_log_index, .prev_term = hdr.prev_log_term }) catch @panic("OOM");
@@ -805,11 +809,14 @@ const TestIo = struct {
         return true;
     }
 
-    pub fn durableCommits(_: *TestReplica) bool {
-        return false;
+    pub fn durableCommits(r: *TestReplica) bool {
+        return of(r).durable;
     }
 
-    pub fn flushForAck(_: *TestReplica) bool {
+    pub fn flushForAck(r: *TestReplica) bool {
+        const h = of(r);
+        if (!h.flush_ok) return false;
+        h.flushes += 1;
         return true;
     }
 
@@ -851,11 +858,19 @@ const Harness = struct {
     raft: RaftNode,
     now: u64 = 1_000_000,
     appends: std.ArrayListUnmanaged(Append) = .empty,
+    /// Append answers this node sent, and how many flushes had succeeded
+    /// before each.
+    answers: std.ArrayListUnmanaged(Answer) = .empty,
+    /// Commits are durable: an append is answered only after its flush.
+    durable: bool = false,
+    flush_ok: bool = true,
+    flushes: u32 = 0,
     entries: [8]entry_mod.Entry = undefined,
     arena: [4096]u8 = undefined,
     out: [8192]u8 = undefined,
 
     const Append = struct { to: u32, entries: u32, verdict: raft_node_mod.HaltVerdict = .{}, prev_index: u64 = 0, prev_term: u64 = 0 };
+    const Answer = struct { success: bool, match: u64, flushes_before: u32 };
 
     fn init(self: *Harness) !void {
         self.* = .{ .replica = undefined, .raft = try RaftNode.init(testing.allocator, 1, 1, 1 << 16, .{ .durable_commits = false }) };
@@ -870,6 +885,7 @@ const Harness = struct {
 
     fn deinit(self: *Harness) void {
         self.appends.deinit(testing.allocator);
+        self.answers.deinit(testing.allocator);
         self.raft.deinit();
     }
 
@@ -991,6 +1007,32 @@ test "replica: a follower told its leader applied its halt on its own build is d
     h.appendFrom(2, term, .{ .index = 2, .term = 1, .build = 9 });
     try testing.expect(h.replica.diverged and h.replica.halted_alone);
     try testing.expect(std.mem.indexOf(u8, h.replica.divergedReason().?, "halted alone") != null);
+}
+
+test "replica: under durable commits a follower answers an append only once its flush has succeeded" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    h.durable = true;
+    const term = h.raft.current_term + 1;
+    const prev = h.raft.log.lastIndex();
+    const prev_term = h.raft.log.lastTerm();
+    var e = entry_mod.buildEntry(.raft_noop, 0, term, prev + 1, 5, "");
+    e.header.crc32c = e.computeCrc();
+    var buf: [transport.APPEND_REQ_PREFIX + entry_mod.HEADER_SIZE + 64]u8 = undefined;
+    const n = transport.serializeAppendRequest(.{ .term = term, .leader_id = 2, .prev_log_index = prev, .prev_log_term = prev_term, .leader_commit = 0, .entries = (&e)[0..1] }, &buf).?;
+    // Its flush fails: no answer, so the leader can't count an entry that
+    // isn't on disk here.
+    h.flush_ok = false;
+    h.replica.handleRaftFrame(.{ .source_node = 2, .group_id = 1, .msg_type = .append_entries, .payload = buf[0..n] });
+    try testing.expectEqual(@as(usize, 0), h.answers.items.len);
+    // Sent again with the disk back: answered, after the flush.
+    h.flush_ok = true;
+    h.replica.handleRaftFrame(.{ .source_node = 2, .group_id = 1, .msg_type = .append_entries, .payload = buf[0..n] });
+    try testing.expectEqual(@as(usize, 1), h.answers.items.len);
+    try testing.expect(h.answers.items[0].success);
+    try testing.expectEqual(prev + 1, h.answers.items[0].match);
+    try testing.expectEqual(@as(u32, 1), h.answers.items[0].flushes_before);
 }
 
 test "replica: a stale ack sends no second batch, and a lost latest ack is resent after the RPC timeout" {

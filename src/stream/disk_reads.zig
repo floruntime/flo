@@ -330,6 +330,8 @@ pub const DiskReads = struct {
                 self.want_block = .unwritten;
                 return .blocked;
             }
+            // The active segment is read here, as the buffer is.
+            if (self.dl.activeHolds(index) catch return self.blocked(now, .io)) return self.inPlace(.{ .stream = w.stream, .from = index, .limit = w.limit });
             if (wr.entry_count == 0 or index < wr.first_index) return .absent;
             return self.inPlace(.{ .stream = w.stream, .from = index, .limit = w.limit });
         };
@@ -638,6 +640,8 @@ const Fixture = struct {
         try stdx.fs.makePath(self.path);
         self.writer = SegmentWriter.init(testing.allocator, 0);
         self.dl = try DurableLog.init(testing.allocator, &self.writer, self.path);
+        // Sealed segments, one per flush, as the bulk thread reads them.
+        self.dl.max_segment_bytes = 1;
         self.raft_log = try RaftLog.init(testing.allocator, 4096);
         for (1..7) |i| {
             var buf: [64]u8 = undefined;
@@ -836,6 +840,7 @@ test "stream disk reads: an entry as large as the log takes lands, not taken as 
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
     var raft_log = try RaftLog.init(testing.allocator, 4 << 20);
     defer raft_log.deinit();
 
@@ -1014,4 +1019,43 @@ test "stream disk reads: a disk failure after a quiet spell starts its grace aga
     try testing.expectEqual(Want.pending, d.want(1, a));
     _ = d.drain();
     try testing.expect(reported.index == null);
+}
+
+test "stream disk reads: a window across a sealed segment and the active one reads the sealed part on the bulk thread, the active part in place" {
+    var f: Fixture = undefined;
+    try f.init(1, false);
+    defer f.deinit();
+    // 1-3 sealed, 4-6 in the active segment.
+    f.writer.truncateAfter(3);
+    try f.dl.flush(3);
+    f.dl.max_segment_bytes = 1 << 20;
+    for (4..7) |i| {
+        var buf: [64]u8 = undefined;
+        const e = appendEntry(&buf, i, 1, if (i % 2 == 1) "a" else "b", "value");
+        try f.writer.addEntry(&e);
+    }
+    try f.dl.flush(6);
+    try testing.expect(try f.dl.activeHolds(5));
+    var d = DiskReads.init(testing.allocator, &f.dl, &f.raft_log);
+    defer d.deinit();
+    var bulk = try bulk_io.BulkIo.init(testing.allocator);
+    defer bulk.deinit();
+    try bulk.start();
+    var done: Done = .{};
+    d.bulk = &bulk;
+    d.notify = .{ .ctx = &done, .done = Done.done };
+    d.setOwner();
+
+    const a: Window = .{ .stream = keyOf("a"), .from = 1, .limit = 10 };
+    try testing.expectEqual(Want.pending, d.want(1, a));
+    try done.waitFor(1);
+    try testing.expect(d.drain());
+    try testing.expect(d.get(1) != null and d.get(3) != null);
+    try testing.expectEqual(@as(u64, 1), d.reads_made);
+    // Past the sealed segment: the active one, read here at drain, not
+    // taken for absent and not handed to the bulk thread.
+    try testing.expectEqual(Want.pending, d.want(5, a));
+    try testing.expect(d.drain());
+    try testing.expect(d.get(5) != null);
+    try testing.expectEqual(@as(u64, 1), d.reads_made);
 }

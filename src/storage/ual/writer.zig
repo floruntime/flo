@@ -179,68 +179,54 @@ pub const SegmentWriter = struct {
         return self.data.items.len;
     }
 
-    /// Seal the segment and return the complete file contents.
-    /// Caller owns the returned slice.
-    pub fn seal(self: *SegmentWriter) ![]u8 {
-        // Compute sizes
-        const index_bytes = self.sparse_index.items.len * segment.SPARSE_ENTRY_SIZE;
-        const total_size = segment.HEADER_SIZE + self.data.items.len + index_bytes + segment.FOOTER_SIZE;
-
-        var result = try self.allocator.alloc(u8, total_size);
-        errdefer self.allocator.free(result);
-
-        var offset: usize = 0;
-
-        // 1. Write segment header
-        const hdr = segment.SegmentHeader{
-            .magic = segment.HEADER_MAGIC,
-            .version = segment.SEGMENT_VERSION,
-            .partition_id = self.partition_id,
-            .first_index = self.first_index,
-            .last_index = self.last_index,
-            .first_ts_ns = self.first_ts_ns,
-            .last_ts_ns = self.last_ts_ns,
-            .entry_count = self.entry_count,
+    /// The mark a sealed segment of the buffered entries carries.
+    pub fn sealedMark(self: *const SegmentWriter) segment.Mark {
+        return .{
+            .seq = 1,
+            .flags = segment.FLAG_SEALED | (if (self.holds_skip) segment.FLAG_HOLDS_SKIP else 0),
             .data_size = @intCast(self.data.items.len),
-            // Nothing compresses yet; the header keeps the byte for when
-            // something does.
-            .compression = @backingInt(segment.Compression.none),
-            .commit_index_at_seal = self.commit_index_at_seal,
-            .flags = if (self.holds_skip) segment.FLAG_HOLDS_SKIP else 0,
+            .entry_count = self.entry_count,
+            .last_index = self.last_index,
+            .last_ts_ns = self.last_ts_ns,
+            .commit_index = self.commit_index_at_seal,
+            .crc32c = 0,
         };
-        const hdr_bytes = hdr.asBytes();
-        @memcpy(result[offset .. offset + segment.HEADER_SIZE], hdr_bytes);
-        offset += segment.HEADER_SIZE;
+    }
 
-        // 2. Write entry data
-        @memcpy(result[offset .. offset + self.data.items.len], self.data.items);
-        offset += self.data.items.len;
-
-        // 3. Write sparse index
-        const sparse_index_offset: u32 = @intCast(offset);
-        for (self.sparse_index.items) |idx_entry| {
-            const entry_bytes: *const [segment.SPARSE_ENTRY_SIZE]u8 = @ptrCast(&idx_entry);
-            @memcpy(result[offset .. offset + segment.SPARSE_ENTRY_SIZE], entry_bytes);
-            offset += segment.SPARSE_ENTRY_SIZE;
-        }
-
-        // 4. Compute CRC over everything written so far
-        const crc = checksum_mod.checksum(result[0..offset]);
-
-        // 5. Write footer
+    /// The sparse index and footer that seal `data` (entry bytes from the
+    /// data section's start) under `fixed`, appended to `out`; `data_crc` is
+    /// the running CRC over `data`.
+    pub fn appendSealTail(allocator: std.mem.Allocator, out: *std.ArrayList(u8), sparse: []const segment.SparseIndexEntry, data_len: usize, data_crc: *checksum_mod.ChecksumStream, fixed: *const segment.Fixed, bitmap: u32) !void {
+        const sparse_index_offset: u32 = @intCast(segment.HEADER_SIZE + data_len);
+        const index_bytes = std.mem.sliceAsBytes(sparse);
+        try out.appendSlice(allocator, index_bytes);
+        var crc = data_crc.*;
+        crc.add(index_bytes);
+        crc.add(std.mem.asBytes(fixed));
         const footer = segment.Footer{
             .sparse_index_offset = sparse_index_offset,
-            .sparse_index_count = @intCast(self.sparse_index.items.len),
-            .entry_type_bitmap = self.entry_type_bitmap,
+            .sparse_index_count = @intCast(sparse.len),
+            .entry_type_bitmap = bitmap,
             .bloom_filter_offset = 0, // no bloom filter yet
-            .crc32c = crc,
+            .crc32c = crc.checksum(),
             ._padding = @splat(0),
             .magic = segment.FOOTER_MAGIC,
         };
-        const footer_bytes = footer.asBytes();
-        @memcpy(result[offset .. offset + segment.FOOTER_SIZE], footer_bytes);
+        try out.appendSlice(allocator, footer.asBytes());
+    }
 
-        return result;
+    /// Seal the segment and return the complete file contents.
+    /// Caller owns the returned slice.
+    pub fn seal(self: *SegmentWriter) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        const fixed = segment.fixedFor(self.partition_id, self.first_index, self.first_ts_ns);
+        try out.appendSlice(self.allocator, &segment.encodeHeader(fixed, self.sealedMark()));
+        try out.appendSlice(self.allocator, self.data.items);
+        var crc = checksum_mod.ChecksumStream.init();
+        crc.add(self.data.items);
+        try appendSealTail(self.allocator, &out, self.sparse_index.items, self.data.items.len, &crc, &fixed, self.entry_type_bitmap);
+        return out.toOwnedSlice(self.allocator);
     }
 
     /// Write the sealed segment to a file.
@@ -331,8 +317,8 @@ test "writer: add entries and seal" {
     defer std.testing.allocator.free(sealed);
 
     // Verify header
-    const hdr: *const segment.SegmentHeader = @ptrCast(@alignCast(sealed[0..segment.HEADER_SIZE]));
-    try std.testing.expectEqual(segment.SEGMENT_VERSION, hdr.version);
+    const hdr = try segment.SegmentHeader.parse(sealed[0..segment.HEADER_SIZE]);
+    try std.testing.expect(hdr.sealed());
     try std.testing.expectEqual(@as(u32, 3), hdr.entry_count);
     try std.testing.expectEqual(@as(u64, 1), hdr.first_index);
     try std.testing.expectEqual(@as(u64, 3), hdr.last_index);

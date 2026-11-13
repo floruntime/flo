@@ -28,36 +28,50 @@ pub const SegmentReader = struct {
     /// Byte offset where entry data ends (before sparse index).
     data_end: usize,
 
-    /// Open a segment from raw bytes (in-memory).
-    pub fn init(data: []const u8) error{ TooSmall, InvalidHeaderMagic, InvalidFooterMagic, InvalidVersion, InvalidCrc }!SegmentReader {
-        const min_size = segment.HEADER_SIZE + segment.FOOTER_SIZE;
-        if (data.len < min_size) return error.TooSmall;
+    pub const InitError = segment.SegmentHeader.Error || error{ InvalidFooterMagic, InvalidCrc, InvalidIndex, NoValidMark };
 
-        // Read header
-        const hdr: *const segment.SegmentHeader = @ptrCast(@alignCast(data[0..segment.HEADER_SIZE]));
-        if (!std.mem.eql(u8, &hdr.magic, &segment.HEADER_MAGIC)) return error.InvalidHeaderMagic;
-        if (hdr.version != segment.SEGMENT_VERSION) return error.InvalidVersion;
+    /// Open a segment from raw bytes (in-memory): a sealed one, its footer
+    /// CRC checked, or an active one, read to where its mark says its data
+    /// ends. An active segment has no sparse index and no type bitmap; its
+    /// entries carry their own CRCs.
+    pub fn init(data: []const u8) InitError!SegmentReader {
+        const hdr = try segment.SegmentHeader.parse(data);
+        if (hdr.slot == null) return error.NoValidMark;
+        if (!hdr.sealed()) {
+            const end = segment.HEADER_SIZE + @as(usize, hdr.data_size);
+            if (end > data.len) return error.TooSmall;
+            return .{
+                .data = data,
+                .header = hdr,
+                // Every type may be present.
+                .footer = .{ .sparse_index_offset = @intCast(end), .sparse_index_count = 0, .entry_type_bitmap = std.math.maxInt(u32), .bloom_filter_offset = 0, .crc32c = 0, ._padding = @splat(0), .magic = segment.FOOTER_MAGIC },
+                .sparse_index = &.{},
+                .data_start = segment.HEADER_SIZE,
+                .data_end = end,
+            };
+        }
+        if (data.len < segment.HEADER_SIZE + segment.FOOTER_SIZE) return error.TooSmall;
 
         // Read footer
         const footer_start = data.len - segment.FOOTER_SIZE;
         const ftr: *const segment.Footer = @ptrCast(@alignCast(data[footer_start..][0..segment.FOOTER_SIZE]));
         if (!std.mem.eql(u8, &ftr.magic, &segment.FOOTER_MAGIC)) return error.InvalidFooterMagic;
 
-        // Verify CRC (covers everything except the footer itself)
-        const expected_crc = checksum_mod.checksum(data[0..footer_start]);
-        if (ftr.crc32c != expected_crc) return error.InvalidCrc;
+        // Verify CRC: the data and sparse index, then the fixed header part.
+        if (ftr.crc32c != segment.footerCrc(data[segment.HEADER_SIZE..footer_start], &hdr.fixed_bytes)) return error.InvalidCrc;
 
         // Decode sparse index
         const idx_offset: usize = ftr.sparse_index_offset;
         const idx_count: usize = ftr.sparse_index_count;
         const idx_end = idx_offset + idx_count * segment.SPARSE_ENTRY_SIZE;
+        if (idx_offset != segment.HEADER_SIZE + @as(usize, hdr.data_size) or idx_end != footer_start) return error.InvalidIndex;
 
         const sparse_ptr: [*]const segment.SparseIndexEntry = @ptrCast(@alignCast(data[idx_offset..idx_end]));
         const sparse_index = sparse_ptr[0..idx_count];
 
         return .{
             .data = data,
-            .header = hdr.*,
+            .header = hdr,
             .footer = ftr.*,
             .sparse_index = sparse_index,
             .data_start = segment.HEADER_SIZE,
@@ -213,7 +227,7 @@ pub const PositionedSegment = struct {
         const file = try stdx.fs.openFile(path, .{});
         errdefer stdx.fs.closeFile(file);
         const size = try file.length(stdx.io.instance());
-        if (size < segment.HEADER_SIZE + segment.FOOTER_SIZE) return error.TooSmall;
+        if (size < segment.HEADER_SIZE) return error.TooSmall;
         if (size <= WHOLE_MAX) {
             const whole = try allocator.alloc(u8, @intCast(size));
             errdefer allocator.free(whole);
@@ -235,10 +249,23 @@ pub const PositionedSegment = struct {
 
         var hdr_bytes: [segment.HEADER_SIZE]u8 = undefined;
         if (try stdx.fs.readAt(file, &hdr_bytes, 0) != hdr_bytes.len) return error.ShortRead;
-        const hdr: *const segment.SegmentHeader = @ptrCast(&hdr_bytes);
-        if (!std.mem.eql(u8, &hdr.magic, &segment.HEADER_MAGIC)) return error.InvalidHeaderMagic;
-        if (hdr.version != segment.SEGMENT_VERSION) return error.InvalidVersion;
+        const hdr = try segment.SegmentHeader.parse(&hdr_bytes);
+        if (hdr.slot == null) return error.NoValidMark;
         if (hdr.compression != @backingInt(segment.Compression.none)) return error.Compressed;
+        // Active: no index or footer yet; read from the start, to where its
+        // mark says the data ends.
+        if (!hdr.sealed()) {
+            const end = segment.HEADER_SIZE + @as(u64, hdr.data_size);
+            if (end > size) return error.TooSmall;
+            return .{
+                .file = file,
+                .first_index = hdr.first_index,
+                .last_index = hdr.last_index,
+                .data_start = segment.HEADER_SIZE,
+                .data_end = end,
+                .sparse = try allocator.alloc(segment.SparseIndexEntry, 0),
+            };
+        }
 
         var ftr_bytes: [segment.FOOTER_SIZE]u8 = undefined;
         const footer_start = size - segment.FOOTER_SIZE;
