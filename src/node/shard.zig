@@ -19418,7 +19418,8 @@ test "a flipped byte in a sealed segment takes its shard offline, and replay sto
     const path = try t.segment(2, &buf);
     const bytes = try DamageTest.readFile(path);
     defer std.testing.allocator.free(bytes);
-    bytes[bytes.len / 2] ^= 0xff;
+    // In its entries, past the header blocks.
+    bytes[@import("../storage/ual/segment.zig").HEADER_SIZE + 20] ^= 0xff;
     try DamageTest.writeFile(path, bytes);
     // The first segment holds the bootstrap no-op and one enqueue; the
     // second, the next.
@@ -19507,7 +19508,8 @@ test "a member whose segment is damaged at boot is diverged, and /status says wh
     const path = try t.segment(2, &buf);
     const bytes = try DamageTest.readFile(path);
     defer std.testing.allocator.free(bytes);
-    bytes[bytes.len / 2] ^= 0xff;
+    // In its entries, past the header blocks.
+    bytes[@import("../storage/ual/segment.zig").HEADER_SIZE + 20] ^= 0xff;
     try DamageTest.writeFile(path, bytes);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
@@ -23344,7 +23346,8 @@ test "Shard: alone with sync durability, a suspended leader still flushes and co
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try t.put(1, "a", &buf)).header.status);
     const s = t.shard.snapshot_window.?.s;
     try ParkTest.send(&t.shard, t.conn, .kv_put, 2, "b", "v");
-    // Flushed and committed, though not applied.
+    // The tick's apply pass: flushed and committed, though not applied.
+    _ = t.shard.applyCommitted();
     try std.testing.expect(r.durable_index >= s + 1);
     try std.testing.expect(r.commit_index >= s + 1);
     try std.testing.expectEqual(s, r.last_applied);
