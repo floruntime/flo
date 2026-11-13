@@ -277,42 +277,43 @@ pub const TSHandler = struct {
         // the series identity (see ts_mod.canonicalTagHash).
         const tags_str: []const u8 = if (req.findOption(.ts_tags)) |opt| opt.asString() else "";
 
-        // Persist through Raft for durability and replication.
-        //
+        if (self.shard_ptr) |sptr| return proposeWrite(shardFromPtr(sptr), req.namespace, measurement, field_name, value, client_ts, tags_str, entry_mod.Flags.NONE);
+        // No shard (unit tests): insert directly (the projection
+        // canonicalizes the tag set and owns hashing + dictionary
+        // registration).
+        const timestamp_ns = client_ts orelse serverTimestampNs();
+        const ual_index = self.nextUalIndex();
+        self.ts.insert(req.ns_id, measurement, field_name, value, timestamp_ns, ual_index, tags_str) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "ts write failed" } };
+        };
+        return writeOk(measurement, timestamp_ns, ual_index);
+    }
+
+    /// A point, proposed as a client's write is: a sink's write on the
+    /// shard that owns its measurement comes here too, with `Flags.SINK`.
+    /// A null `timestamp_ns` takes the entry's stamp.
+    pub fn proposeWrite(shard: *Shard, namespace: []const u8, measurement: []const u8, field_name: []const u8, value: f64, timestamp_ns: ?u64, tags: []const u8, flags: u16) CommandResult {
         // The value carries the reading AND the field name, client timestamp and
         // tag set (ts_mod.TsWriteValue). Persisting only the 8 value bytes — as
         // this did — meant replay reconstructed every point as `<measurement>/
         // value` at the entry's own timestamp with no tags, silently losing
         // three of the four dimensions on restart.
-        if (self.shard_ptr) |sptr| {
-            const shard = shardFromPtr(sptr);
-            var val_buf: [ts_mod.MAX_TAG_STRING + 512]u8 = undefined;
-            const encoded = ts_mod.TsWriteValue.encode(&val_buf, .{
-                .value = value,
-                // 0: the point takes the entry's stamp.
-                .timestamp_ns = client_ts orelse 0,
-                .field_name = field_name,
-                .tags = tags_str,
-            }) orelse {
-                return .{ .err = .{ .code = .invalid_request, .message = "ts write: field/tags too large" } };
-            };
-            // A point without its own timestamp takes the entry's stamp,
-            // which the responder answers with.
-            const proposed = persistence_mod.proposeEntry(shard, .ts_write, entry_mod.Flags.NONE, req.namespace, measurement, encoded) catch |err| {
-                return .{ .err = persistence_mod.failureError(err, "ts write not persisted") };
-            };
-            return .{ .parked = proposed };
-        } else {
-            // No shard (unit tests): insert directly (the projection
-            // canonicalizes the tag set and owns hashing + dictionary
-            // registration).
-            const timestamp_ns = client_ts orelse serverTimestampNs();
-            const ual_index = self.nextUalIndex();
-            self.ts.insert(req.ns_id, measurement, field_name, value, timestamp_ns, ual_index, tags_str) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "ts write failed" } };
-            };
-            return writeOk(measurement, timestamp_ns, ual_index);
-        }
+        var val_buf: [ts_mod.MAX_TAG_STRING + 512]u8 = undefined;
+        const encoded = ts_mod.TsWriteValue.encode(&val_buf, .{
+            .value = value,
+            // 0: the point takes the entry's stamp.
+            .timestamp_ns = timestamp_ns orelse 0,
+            .field_name = field_name,
+            .tags = tags,
+        }) orelse {
+            return .{ .err = .{ .code = .invalid_request, .message = "ts write: field/tags too large" } };
+        };
+        // A point without its own timestamp takes the entry's stamp,
+        // which the responder answers with.
+        const proposed = persistence_mod.proposeEntry(shard, .ts_write, flags, namespace, measurement, encoded) catch |err| {
+            return .{ .err = persistence_mod.failureError(err, "ts write not persisted") };
+        };
+        return .{ .parked = proposed };
     }
 
     fn writeOk(measurement: []const u8, timestamp_ns: u64, sequence: u64) CommandResult {

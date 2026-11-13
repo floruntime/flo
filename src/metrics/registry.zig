@@ -677,8 +677,9 @@ pub const ShardMetrics = struct {
     snapshot_skipped_leader_not_ready: Atomic(u64) = Atomic(u64).init(0),
     /// Processing KV sink writes from other shards waiting here for room
     /// (gauge), and those dropped because that list was full (cumulative).
-    kv_sink_retry_pending: Atomic(u64) = Atomic(u64).init(0),
-    kv_sink_retry_overflow: Atomic(u64) = Atomic(u64).init(0),
+    sink_retry_pending: Atomic(u64) = Atomic(u64).init(0),
+    sink_retry_bytes: Atomic(u64) = Atomic(u64).init(0),
+    sink_retry_overflow: Atomic(u64) = Atomic(u64).init(0),
     /// The last snapshot bar's index, and the logical bytes applied since.
     bar_last: Atomic(u64) = Atomic(u64).init(0),
     bar_bytes: Atomic(u64) = Atomic(u64).init(0),
@@ -878,8 +879,9 @@ pub const ShardMetrics = struct {
         persist_failures: u64,
         flushes_failing_for_ms: u64,
         snapshot_skipped_leader_not_ready: u64,
-        kv_sink_retry_pending: u64,
-        kv_sink_retry_overflow: u64,
+        sink_retry_pending: u64,
+        sink_retry_bytes: u64,
+        sink_retry_overflow: u64,
         bar_last: u64,
         bar_bytes: u64,
         hardstate_failures: u64,
@@ -931,8 +933,9 @@ pub const ShardMetrics = struct {
             .persist_failures = self.persist_failures.load(.monotonic),
             .flushes_failing_for_ms = self.flushes_failing_for_ms.load(.monotonic),
             .snapshot_skipped_leader_not_ready = self.snapshot_skipped_leader_not_ready.load(.monotonic),
-            .kv_sink_retry_pending = self.kv_sink_retry_pending.load(.monotonic),
-            .kv_sink_retry_overflow = self.kv_sink_retry_overflow.load(.monotonic),
+            .sink_retry_pending = self.sink_retry_pending.load(.monotonic),
+            .sink_retry_bytes = self.sink_retry_bytes.load(.monotonic),
+            .sink_retry_overflow = self.sink_retry_overflow.load(.monotonic),
             .bar_last = self.bar_last.load(.monotonic),
             .bar_bytes = self.bar_bytes.load(.monotonic),
             .hardstate_failures = self.hardstate_failures.load(.monotonic),
@@ -1735,8 +1738,9 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_persist_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.persist_failures });
     try writer.print("flo_shard_flushes_failing_for_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.flushes_failing_for_ms / 1000, snap.flushes_failing_for_ms % 1000 });
     try writer.print("flo_shard_snapshot_skipped_total{{shard_id=\"{d}\",reason=\"leader_not_ready\"}} {d}\n", .{ snap.shard_id, snap.snapshot_skipped_leader_not_ready });
-    try writer.print("flo_shard_kv_sink_retry_pending{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.kv_sink_retry_pending });
-    try writer.print("flo_shard_kv_sink_retry_overflow_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.kv_sink_retry_overflow });
+    try writer.print("flo_shard_sink_retry_pending{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.sink_retry_pending });
+    try writer.print("flo_shard_sink_retry_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.sink_retry_bytes });
+    try writer.print("flo_shard_sink_retry_overflow_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.sink_retry_overflow });
     try writer.print("flo_shard_snapshot_bar_last{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bar_last });
     try writer.print("flo_shard_snapshot_bar_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bar_bytes });
     try writer.print("flo_shard_hardstate_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.hardstate_failures });

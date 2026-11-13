@@ -39,8 +39,6 @@ const offline = @import("offline.zig");
 const raft_hard_state = @import("../raft/hard_state.zig");
 const StreamHandler = @import("../stream/handler.zig").StreamHandler;
 const KVHandler = @import("../kv/handler.zig").KVHandler;
-const TSHandler = @import("../ts/handler.zig").TSHandler;
-const QueueHandler = @import("../queue/handler.zig").QueueHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const manifest = @import("manifest.zig");
 const data_format = @import("data_format.zig");
@@ -377,9 +375,6 @@ pub const Runtime = struct {
     peer_kv_handlers_slice: ?[]const *KVHandler,
 
     /// Cross-shard TS / queue handler arrays — allocated during wirePeer*, freed on deinit.
-    peer_ts_handlers_slice: ?[]const *TSHandler,
-    peer_queue_handlers_slice: ?[]const *QueueHandler,
-
     /// Cross-shard shard pointer array — allocated during wirePeerShards, freed on deinit.
     peer_shards_slice: ?[]*Shard,
 
@@ -451,8 +446,6 @@ pub const Runtime = struct {
             .data_dir_lock = null,
             .peer_stream_handlers_slice = null,
             .peer_kv_handlers_slice = null,
-            .peer_ts_handlers_slice = null,
-            .peer_queue_handlers_slice = null,
             .peer_mailboxes_slice = null,
             .peer_shards_slice = null,
         };
@@ -521,16 +514,6 @@ pub const Runtime = struct {
         if (self.peer_kv_handlers_slice) |s| {
             self.allocator.free(s);
             self.peer_kv_handlers_slice = null;
-        }
-
-        // Clean up peer TS / queue handler arrays
-        if (self.peer_ts_handlers_slice) |s| {
-            self.allocator.free(s);
-            self.peer_ts_handlers_slice = null;
-        }
-        if (self.peer_queue_handlers_slice) |s| {
-            self.allocator.free(s);
-            self.peer_queue_handlers_slice = null;
         }
 
         if (self.peer_mailboxes_slice) |s| {
@@ -830,8 +813,6 @@ pub const Runtime = struct {
         try self.wirePeerKvHandlers(shards);
 
         // 2.556 Wire cross-shard TS / queue handler references for processing sinks.
-        try self.wirePeerTsHandlers(shards);
-        try self.wirePeerQueueHandlers(shards);
 
         // 2.56 Give every shard every shard's mailbox.
         try self.wirePeerMailboxes(shards);
@@ -1167,36 +1148,6 @@ pub const Runtime = struct {
 
         for (0..n) |i| {
             shards[i].processing_handler.setPeerKvHandlers(handlers);
-        }
-    }
-
-    /// Wire cross-shard TS handler references so TS sinks write to the shard
-    /// that owns the target measurement.
-    fn wirePeerTsHandlers(self: *Runtime, shards: []Shard) !void {
-        const n = self.shard_count;
-        const handlers = try self.allocator.alloc(*TSHandler, n);
-        for (0..n) |i| {
-            handlers[i] = shards[i].ts_handler;
-        }
-        self.peer_ts_handlers_slice = handlers;
-
-        for (0..n) |i| {
-            shards[i].processing_handler.setPeerTsHandlers(handlers);
-        }
-    }
-
-    /// Wire cross-shard queue handler references so queue sinks enqueue to the
-    /// shard that owns the target queue.
-    fn wirePeerQueueHandlers(self: *Runtime, shards: []Shard) !void {
-        const n = self.shard_count;
-        const handlers = try self.allocator.alloc(*QueueHandler, n);
-        for (0..n) |i| {
-            handlers[i] = shards[i].queue_handler;
-        }
-        self.peer_queue_handlers_slice = handlers;
-
-        for (0..n) |i| {
-            shards[i].processing_handler.setPeerQueueHandlers(handlers);
         }
     }
 

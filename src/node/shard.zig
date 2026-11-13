@@ -71,6 +71,7 @@ const acceptor_mod = @import("acceptor.zig");
 const kv_state = @import("../kv/state.zig");
 const KVMetrics = @import("../metrics/registry.zig").KVMetrics;
 const KVHandler = @import("../kv/handler.zig").KVHandler;
+const SinkWrite = @import("../processing/sink_write.zig").SinkWrite;
 const kv_handler_mod = @import("../kv/handler.zig");
 const projection_router = @import("../projection/router.zig");
 const silent_loss = @import("silent_loss.zig");
@@ -614,16 +615,19 @@ pub const Shard = struct {
     /// (cumulative): followers at the same bar take theirs, and this leader's
     /// next is at the next bar.
     snapshot_skips_leader_not_ready: u64 = 0,
-    /// Processing KV sink writes other shards sent here that the log was
-    /// too full to take, in arrival order, retried each tick: encoded
-    /// `SinkPut`s, owned. While any wait, newer ones queue behind them, so a
-    /// key's writes still land in the order they were sent.
-    kv_sink_retries: std.ArrayListUnmanaged([]u8) = .empty,
-    /// The bytes `kv_sink_retries` holds.
-    kv_sink_retry_bytes: usize = 0,
+    /// Sink writes other shards' pipelines sent here that couldn't be
+    /// proposed yet (the log full, or their target not ready: a queue at
+    /// its caps, a namespace not yet in its table), retried each tick. While one
+    /// waits, newer writes to its target queue behind it, so a target's
+    /// writes land in the order they were sent.
+    sink_retries: std.ArrayListUnmanaged(SinkRetry) = .empty,
+    /// The bytes `sink_retries` holds.
+    sink_retry_bytes: usize = 0,
+    /// Targets a retry pass found still not ready: their later writes wait.
+    sink_retry_blocked: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// Such writes dropped because the list was full (cumulative): what is
-    /// still lost until channels give sinks durable delivery.
-    kv_sink_retry_overflow: u64 = 0,
+    /// still lost until sinks hear back from the owner.
+    sink_retry_overflow: u64 = 0,
     /// A committed entry could not be read to apply it — a resource or IO
     /// failure reading below the ring, not a hole. The shard holds it unapplied
     /// and retries, but not on every call: `read_retry_at_ms` paces the retry,
@@ -1436,8 +1440,9 @@ pub const Shard = struct {
 
     pub fn deinit(self: *Shard) void {
         self.marker.close();
-        for (self.kv_sink_retries.items) |b| self.allocator.free(b);
-        self.kv_sink_retries.deinit(self.allocator);
+        for (self.sink_retries.items) |r| self.allocator.free(r.bytes);
+        self.sink_retries.deinit(self.allocator);
+        self.sink_retry_blocked.deinit(self.allocator);
         self.skips.deinit(self.allocator);
         self.closing_fds.deinit(self.allocator);
         self.resume_fds.deinit(self.allocator);
@@ -2739,7 +2744,7 @@ pub const Shard = struct {
             .shutdown => self.shutdown(),
             .action_start => self.startActionRun(msg),
             .action_finished, .action_result_ask, .action_abandon, .worker_report, .action_held, .action_unhold => self.actionMessage(msg),
-            .kv_sink_put => self.runKvSinkPut(msg),
+            .sink_write => self.runSinkWrite(msg),
             .reply => self.deliverReply(msg),
             .forward_request => self.runForwardedRequest(msg),
             .cancel_reads => {
@@ -2773,65 +2778,129 @@ pub const Shard = struct {
         }
     }
 
-    /// A processing KV sink on another shard wrote a key this shard owns.
-    fn runKvSinkPut(self: *Shard, msg: InboxMessage) void {
+    /// A pipeline on another shard wrote a target this shard owns.
+    pub fn runSinkWrite(self: *Shard, msg: InboxMessage) void {
         const bytes = inboxPayload(msg);
-        // Behind writes already waiting, so a key's writes keep their order.
-        if (self.kv_sink_retries.items.len > 0) return self.holdKvSinkPut(bytes);
-        if (!self.proposeKvSinkPut(bytes)) return self.holdKvSinkPut(bytes);
-        if (bytes.len > 0) self.allocator.free(bytes);
-    }
-
-    /// Proposes one encoded sink write; false when the log is too full to
-    /// take it now. A write refused for good, or that doesn't decode, is
-    /// counted as dropped.
-    fn proposeKvSinkPut(self: *Shard, bytes: []const u8) bool {
-        const put = KVHandler.SinkPut.decode(bytes) orelse {
-            self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", "?", "the sink's message didn't decode");
-            return true;
-        };
-        switch (KVHandler.sinkPropose(self, put.namespace, put.key, put.value, put.ttl_ms)) {
-            .proposed => {},
-            .held => return false,
-            .dropped => |why| self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", put.key, why),
+        const target = sinkTarget(bytes);
+        // Behind a write to the same target already waiting, so a target's
+        // writes keep their order.
+        for (self.sink_retries.items) |r| if (r.target == target) return self.holdSinkWrite(bytes, target);
+        switch (self.proposeSinkWrite(bytes)) {
+            .done => if (bytes.len > 0) self.allocator.free(bytes),
+            .room, .wait => self.holdSinkWrite(bytes, target),
         }
-        return true;
     }
 
-    /// Most sink writes waiting for room on one shard, and most bytes: a
-    /// write can be 64 KiB, so the count alone would let 256 MiB wait.
-    pub const KV_SINK_RETRY_MAX = 4096;
-    pub const KV_SINK_RETRY_MAX_BYTES = 16 * 1024 * 1024;
+    pub const SinkRetry = struct {
+        /// An encoded `SinkWrite`, owned.
+        bytes: []u8,
+        /// Its target's identity (`sinkTarget`).
+        target: u64,
+    };
 
-    fn holdKvSinkPut(self: *Shard, bytes: []u8) void {
-        if (self.kv_sink_retries.items.len >= KV_SINK_RETRY_MAX or self.kv_sink_retry_bytes + bytes.len > KV_SINK_RETRY_MAX_BYTES) {
-            self.kv_sink_retry_overflow += 1;
-            self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", "?", "too many sink writes wait for room on the owning shard");
+    fn sinkTarget(bytes: []const u8) u64 {
+        const w = SinkWrite.decode(bytes) orelse return 0;
+        return w.targetKey();
+    }
+
+    const SinkOutcome = enum { done, room, wait };
+
+    /// Proposes one encoded sink write. One refused for good, or that
+    /// doesn't decode, is counted dropped and done.
+    fn proposeSinkWrite(self: *Shard, bytes: []const u8) SinkOutcome {
+        const w = SinkWrite.decode(bytes) orelse {
+            self.processing_handler.noteSinkDrop(self.metrics_registry, "?", "?", "the sink's message didn't decode");
+            return .done;
+        };
+        return switch (self.processing_handler.proposeSinkWrite(self, w)) {
+            .proposed, .dropped => .done,
+            .room => .room,
+            .wait => .wait,
+        };
+    }
+
+    /// Stopping: sink writes other shards' pipelines sent here and this
+    /// shard never proposed are lost. Their senders' cursors are past them,
+    /// so a restart doesn't send them again; said and counted.
+    fn dropSinkWritesAtStop(self: *Shard, unread: usize) void {
+        const held = self.sink_retries.items.len;
+        if (held + unread == 0) return;
+        for (self.sink_retries.items) |r| if (r.bytes.len > 0) self.allocator.free(r.bytes);
+        self.sink_retries.clearRetainingCapacity();
+        self.sink_retry_bytes = 0;
+        self.processing_handler.sink_drops += held + unread;
+        if (self.metrics_registry) |m| for (0..held + unread) |_| m.processing.recordDropped();
+        log.warn("shard {d}: stopping with {d} sink writes from other shards' pipelines not yet written ({d} waiting, {d} unread); they are lost", .{ self.id, held + unread, held, unread });
+    }
+
+    /// Most sink writes waiting on one shard, and most bytes: a write can
+    /// be 64 KiB, so the count alone would let 256 MiB wait.
+    pub const SINK_RETRY_MAX = 4096;
+    pub const SINK_RETRY_MAX_BYTES = 16 * 1024 * 1024;
+
+    /// Most of the list one target may hold: a target that never takes
+    /// its writes (a queue no one drains) leaves room for the rest.
+    pub const SINK_RETRY_TARGET_MAX = SINK_RETRY_MAX / 4;
+    pub const SINK_RETRY_TARGET_MAX_BYTES = SINK_RETRY_MAX_BYTES / 4;
+
+    fn holdSinkWrite(self: *Shard, bytes: []u8, target: u64) void {
+        var target_writes: usize = 0;
+        var target_bytes: usize = 0;
+        for (self.sink_retries.items) |r| if (r.target == target) {
+            target_writes += 1;
+            target_bytes += r.bytes.len;
+        };
+        const why: ?[]const u8 = if (self.sink_retries.items.len >= SINK_RETRY_MAX or self.sink_retry_bytes + bytes.len > SINK_RETRY_MAX_BYTES)
+            "too many sink writes wait on the owning shard"
+        else if (target_writes >= SINK_RETRY_TARGET_MAX or target_bytes + bytes.len > SINK_RETRY_TARGET_MAX_BYTES)
+            "this target's writes already fill its share of those waiting on the owning shard"
+        else
+            null;
+        if (why) |w| {
+            self.sink_retry_overflow += 1;
+            self.processing_handler.noteSinkDrop(self.metrics_registry, "sink", "?", w);
             if (bytes.len > 0) self.allocator.free(bytes);
             return;
         }
-        self.kv_sink_retries.append(self.allocator, bytes) catch {
-            self.kv_sink_retry_overflow += 1;
-            self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", "?", "out of memory holding a sink write for room");
+        self.sink_retries.append(self.allocator, .{ .bytes = bytes, .target = target }) catch {
+            self.sink_retry_overflow += 1;
+            self.processing_handler.noteSinkDrop(self.metrics_registry, "sink", "?", "out of memory holding a sink write");
             if (bytes.len > 0) self.allocator.free(bytes);
             return;
         };
-        self.kv_sink_retry_bytes += bytes.len;
+        self.sink_retry_bytes += bytes.len;
     }
 
-    /// Proposes the sink writes waiting for room, oldest first, until the
-    /// log is full again.
-    fn retryKvSinkPuts(self: *Shard) void {
-        const items = self.kv_sink_retries.items;
-        var done: usize = 0;
-        while (done < items.len) : (done += 1) {
-            if (!self.proposeKvSinkPut(items[done])) break;
-            self.kv_sink_retry_bytes -= items[done].len;
-            if (items[done].len > 0) self.allocator.free(items[done]);
+    /// Proposes the sink writes waiting, oldest first, until the log is
+    /// full again. A target that still can't take its write keeps the ones
+    /// behind it waiting; other targets go on.
+    fn retrySinkWrites(self: *Shard) void {
+        const blocked = &self.sink_retry_blocked;
+        blocked.clearRetainingCapacity();
+        var stop = false;
+        const items = self.sink_retries.items;
+        var keep: usize = 0;
+        for (items) |r| {
+            if (!stop and !blocked.contains(r.target)) {
+                switch (self.proposeSinkWrite(r.bytes)) {
+                    .done => {
+                        self.sink_retry_bytes -= r.bytes.len;
+                        if (r.bytes.len > 0) self.allocator.free(r.bytes);
+                        continue;
+                    },
+                    // Nothing more fits this tick.
+                    .room => stop = true,
+                    // Short of memory to note it, nothing more is tried
+                    // this tick, so no later write passes this one.
+                    .wait => blocked.put(self.allocator, r.target, {}) catch {
+                        stop = true;
+                    },
+                }
+            }
+            items[keep] = r;
+            keep += 1;
         }
-        if (done == 0) return;
-        std.mem.copyForwards([]u8, items[0 .. items.len - done], items[done..]);
-        self.kv_sink_retries.shrinkRetainingCapacity(items.len - done);
+        self.sink_retries.shrinkRetainingCapacity(keep);
     }
 
     /// How a run a workflow here waits on ended, or a workflow's shard
@@ -4599,8 +4668,9 @@ pub const Shard = struct {
             sm.setReadBlocked(self.read_blocked);
             sm.persist_failures.store(self.persist_failures, .monotonic);
             sm.snapshot_skipped_leader_not_ready.store(self.snapshot_skips_leader_not_ready, .monotonic);
-            sm.kv_sink_retry_pending.store(self.kv_sink_retries.items.len, .monotonic);
-            sm.kv_sink_retry_overflow.store(self.kv_sink_retry_overflow, .monotonic);
+            sm.sink_retry_pending.store(self.sink_retries.items.len, .monotonic);
+            sm.sink_retry_bytes.store(self.sink_retry_bytes, .monotonic);
+            sm.sink_retry_overflow.store(self.sink_retry_overflow, .monotonic);
             sm.bar_last.store(self.defaultPartition().last_bar, .monotonic);
             sm.bar_bytes.store(self.defaultPartition().bar_bytes, .monotonic);
             // A duration, not the monotonic start: a raw clock reading means
@@ -5247,7 +5317,7 @@ pub const Shard = struct {
         group_handler.afterApply(self, entry, result);
         // A pipeline's sink write refused at apply is read again or counted.
         switch (@as(entry_mod.EntryType, @fromBackingInt(@intCast(entry.header.entry_type)))) {
-            .queue_enqueue, .kv_put, .stream_append => self.processing_handler.afterApply(self, entry, result),
+            .queue_enqueue, .kv_put, .stream_append, .ts_write => self.processing_handler.afterApply(self, entry, result),
             else => {},
         }
         if (comptime build_options.test_faults) {
@@ -5433,7 +5503,7 @@ pub const Shard = struct {
         // on a single node) applies here, outside any module's work.
         _ = self.applyCommitted();
         self.stepSnapshotWindow();
-        if (self.kv_sink_retries.items.len > 0) self.retryKvSinkPuts();
+        if (self.sink_retries.items.len > 0) self.retrySinkWrites();
         _ = self.coldCaughtUp();
 
         // Shard 0: namespaces created this tick go to disk, then into the
@@ -5663,10 +5733,16 @@ pub const Shard = struct {
     /// and its asker answers it from the slot it holds.
     fn refuseUnrunRequests(self: *Shard) void {
         var buf: [64]InboxMessage = undefined;
+        var sink_writes: usize = 0;
         while (true) {
             const count = self.mailbox.inbox.drain(&buf);
-            if (count == 0) return;
+            if (count == 0) return self.dropSinkWritesAtStop(sink_writes);
             for (buf[0..count]) |msg| switch (msg.tag) {
+                .sink_write => {
+                    const bytes = inboxPayload(msg);
+                    if (bytes.len > 0) self.allocator.free(bytes);
+                    sink_writes += 1;
+                },
                 .forward_request => {
                     const bytes = inboxPayload(msg);
                     defer if (bytes.len > 0) self.allocator.free(bytes);
@@ -5677,7 +5753,7 @@ pub const Shard = struct {
                     self.deliverDeferredRefusal(reply_to, request_id, .unavailable, proto.notRun(SHUTTING_DOWN_NOT_RUN));
                 },
                 .reply => self.deliverReply(msg),
-                .action_start, .kv_sink_put, .action_finished, .action_result_ask, .action_abandon, .worker_report, .action_held, .action_unhold => {
+                .action_start, .action_finished, .action_result_ask, .action_abandon, .worker_report, .action_held, .action_unhold => {
                     const bytes = inboxPayload(msg);
                     if (bytes.len > 0) self.allocator.free(bytes);
                 },
@@ -10055,7 +10131,7 @@ test "Shard: a namespace still unknown when the held write runs again is refused
     try std.testing.expectEqual(@as(usize, 0), b.gathers.inUse());
 }
 
-test "Shard: a processing sink in a namespace not yet published writes nothing until it is, then is held when the id puts its stream on another shard" {
+test "Shard: a processing sink in a namespace not yet published writes nothing until it is, then writes on the shard its id puts the stream on" {
     var two: TwoShards = undefined;
     try two.init();
     defer two.deinit();
@@ -10107,17 +10183,17 @@ test "Shard: a processing sink in a namespace not yet published writes nothing u
     _ = a.processing_handler.tickPipelines(a);
     two.settle();
     try std.testing.expectEqual(id, two.namespaces.lookup("pns").?);
-    // Published: the stream is on shard 1, so the job is held, unrun.
+    // Published: the stream is on shard 1, which resolves the namespace and
+    // appends the record itself; nothing lands here.
     var it = a.processing_handler.pipelines.valueIterator();
     while (it.next()) |pipe| pipe.last_poll_ms = 0;
     _ = a.processing_handler.tickPipelines(a);
     two.settle();
     try std.testing.expectEqual(@as(usize, 0), entriesOf(a, .stream_append, from_a));
-    try std.testing.expectEqual(@as(usize, 0), entriesOf(b, .stream_append, from_b));
+    try std.testing.expectEqual(@as(usize, 1), entriesOf(b, .stream_append, from_b));
     var jobs = a.processing_handler.jobs.valueIterator();
-    const job = jobs.next().?;
-    try std.testing.expect(job.held);
-    try std.testing.expect(std.mem.indexOf(u8, job.held_owned, "is on another") != null);
+    try std.testing.expect(!jobs.next().?.held);
+    try std.testing.expectEqual(@as(u64, 0), a.processing_handler.sink_drops + b.processing_handler.sink_drops);
 }
 
 test "Shard: a queue sink's write refused for room at apply reads its record again, counted, and no checkpoint passes it" {
@@ -10186,7 +10262,7 @@ test "Shard: a queue sink's write refused for room at apply reads its record aga
     try std.testing.expectEqual(@as(usize, 0), a.processing_handler.pending_sinks);
 
     // A refusal for another reason is counted dropped, not read again.
-    try pipe.pending.append(a.allocator, .{ .term = a.raft_node.current_term, .index = 1 << 40, .again = .{ .stream = start }, .kind = .queue, .target = queue, .held = 0 });
+    try pipe.pending.append(a.allocator, .{ .term = a.raft_node.current_term, .index = 1 << 40, .again = .{ .stream = start }, .kind = .queue, .target = queue });
     a.processing_handler.pending_sinks += 1;
     const e = entry_mod.buildEntry(.queue_enqueue, entry_mod.Flags.NONE, a.raft_node.current_term, 1 << 40, 1, "");
     var out = persistence_mod.Result.start(&e);
@@ -10246,11 +10322,11 @@ test "Shard: a pipeline's pending sink writes from an earlier term are read agai
 
     // Term 3 proposed 14, which a new leader's entries replaced; this node
     // leads again in term 5 and proposes 12, then 13.
-    ph.notePending(a, pipe, .{ .term = 3, .index = 14, .timestamp_ns = 0 }, .queue, queue, 0);
-    ph.notePending(a, pipe, .{ .term = 5, .index = 12, .timestamp_ns = 0 }, .queue, queue, 0);
+    ph.notePending(a, pipe, .{ .term = 3, .index = 14, .timestamp_ns = 0 }, .queue, queue);
+    ph.notePending(a, pipe, .{ .term = 5, .index = 12, .timestamp_ns = 0 }, .queue, queue);
     try std.testing.expectEqual(@as(usize, 1), pipe.pending.items.len);
     try std.testing.expectEqual(rewinds + 1, ph.sink_rewinds);
-    ph.notePending(a, pipe, .{ .term = 5, .index = 13, .timestamp_ns = 0 }, .queue, queue, 0);
+    ph.notePending(a, pipe, .{ .term = 5, .index = 13, .timestamp_ns = 0 }, .queue, queue);
 
     // 12 applies: settled as applied, nothing dropped or read again.
     const e12 = entry_mod.buildEntry(.queue_enqueue, entry_mod.Flags.SINK, 5, 12, 1, "");
@@ -10261,7 +10337,7 @@ test "Shard: a pipeline's pending sink writes from an earlier term are read agai
     try std.testing.expectEqual(@as(u64, 0), ph.sink_drops);
 
     // 13 is settled though a later one sits ahead of it.
-    try pipe.pending.insert(a.allocator, 0, .{ .term = 5, .index = 20, .again = pipe.resume_here, .kind = .queue, .target = queue, .held = 0 });
+    try pipe.pending.insert(a.allocator, 0, .{ .term = 5, .index = 20, .again = pipe.resume_here, .kind = .queue, .target = queue });
     ph.pending_sinks += 1;
     const e13 = entry_mod.buildEntry(.queue_enqueue, entry_mod.Flags.SINK, 5, 13, 1, "");
     var ok13 = persistence_mod.Result.start(&e13);
@@ -10357,17 +10433,13 @@ test "Shard: a queue sink's write refused for room at apply is read again after 
     try std.testing.expectEqual(@as(u64, 6), queue_handler_mod.countQueue(&shard, .default, queue));
 }
 
-test "Shard: a queue sink's write to another shard's queue, refused at apply there, is counted dropped by that shard" {
+test "Shard: a queue sink's writes to another shard's full queue go through its inbox, wait there in order, and land once it has room" {
     var two: TwoShards = undefined;
     try two.init();
     defer two.deinit();
     const a = &two.shards[0];
     const b = &two.shards[1];
-    const queues = [_]*queue_handler_mod.QueueHandler{ a.queue_handler, b.queue_handler };
-    for (&two.shards) |*s| {
-        s.wireHandlerShardPtrs();
-        s.processing_handler.setPeerQueueHandlers(&queues);
-    }
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
     b.queue_handler.caps.max_messages = 3;
     var sbuf: [16]u8 = undefined;
     const source = try keyOn(a, .default, 0, &sbuf);
@@ -10399,21 +10471,124 @@ test "Shard: a queue sink's write to another shard's queue, refused at apply the
     two.settle();
     var pit = a.processing_handler.pipelines.valueIterator();
     const pipe = pit.next().?;
+    const a_log = a.raft_node.log.lastIndex();
     pipe.last_poll_ms = 0;
     _ = a.processing_handler.tickPipelines(a);
+    // Nothing proposed on shard 0's log for shard 1's queue.
+    try std.testing.expectEqual(@as(usize, 0), entriesOf(a, .queue_enqueue, a_log + 1));
     two.settle();
 
-    // Shard 1 refused all three at apply and counted them; shard 0 saw
-    // none of it.
+    // Shard 1 holds them, unproposed: nothing lost, nothing dropped.
     try std.testing.expectEqual(@as(u64, 3), queue_handler_mod.countQueue(b, .default, queue));
-    try std.testing.expectEqual(@as(u64, 3), b.processing_handler.sink_drops);
-    try std.testing.expectEqual(@as(u64, 0), a.processing_handler.sink_drops);
+    try std.testing.expectEqual(@as(usize, 3), b.sink_retries.items.len);
+    try std.testing.expectEqual(@as(u64, 0), b.processing_handler.sink_drops);
     try std.testing.expectEqual(@as(usize, 0), a.processing_handler.pending_sinks);
-    // A client's enqueue refused at apply isn't a sink's: not counted.
+
+    // Room: they land, in the order sent.
+    b.queue_handler.caps.max_messages = 6;
+    b.retrySinkWrites();
+    two.settle();
+    try std.testing.expectEqual(@as(usize, 0), b.sink_retries.items.len);
+    try std.testing.expectEqual(@as(u64, 6), queue_handler_mod.countQueue(b, .default, queue));
+    try std.testing.expectEqual(@as(u64, 0), b.processing_handler.sink_drops);
+
+    // A sink's write refused at apply anyway (here proposed past the check)
+    // is counted by the shard that applied it; a client's isn't.
+    b.queue_handler.freeResult(b.queue_handler.sinkEnqueue(.{ .header = proto.RequestHeader.init(.queue_enqueue, 0), .namespace = "default", .ns_id = .default, .key = queue, .value = "late" }));
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 1), b.processing_handler.sink_drops);
     _ = try queue_handler_mod.proposeEnqueue(b, queue, "client");
     two.settle();
-    try std.testing.expectEqual(@as(u64, 3), queue_handler_mod.countQueue(b, .default, queue));
-    try std.testing.expectEqual(@as(u64, 3), b.processing_handler.sink_drops);
+    try std.testing.expectEqual(@as(u64, 6), queue_handler_mod.countQueue(b, .default, queue));
+    try std.testing.expectEqual(@as(u64, 1), b.processing_handler.sink_drops);
+}
+
+/// Points `measurement`/`field` holds in `ns` on `shard`, any tags.
+fn tsPoints(shard: *Shard, ns: ns_table.Id, measurement: []const u8, field: []const u8) !usize {
+    var buf: [16]@import("../projection/ts.zig").StoredPoint = undefined;
+    return (try shard.ts_handler.ts.queryRange(ns, measurement, field, null, 0, std.math.maxInt(u64), &buf)).points_in_buffer;
+}
+
+test "Shard: a TS sink write for a namespace this shard hasn't seen published waits, never lands under no namespace, and is logged once it is" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    // Shard 0 creates the namespace; it isn't published yet.
+    try std.testing.expect(a.namespace_handler.prepareWrite(a, "tns") == .go);
+    _ = a.applyCommitted();
+    try std.testing.expect(two.namespaces.lookup("tns") == null);
+
+    var vbuf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &vbuf, @bitCast(@as(f64, 2.5)), .little);
+    const bytes = (SinkWrite{ .kind = .ts, .namespace = "tns", .target = "cpu", .value = &vbuf, .field = "value", .tags = "host=a" }).encode(b.allocator).?;
+    const from_b = b.raft_node.log.lastIndex() + 1;
+    b.runSinkWrite(.{ .tag = .sink_write, .src_shard = 0, .payload_len = @intCast(bytes.len), .payload_ptr = bytes.ptr });
+    try std.testing.expectEqual(@as(usize, 1), b.sink_retries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), entriesOf(b, .ts_write, from_b));
+    try std.testing.expectEqual(@as(usize, 0), try tsPoints(b, .invalid, "cpu", "value"));
+
+    // Published: retried, logged on shard 1 as a client's write is, and read
+    // back under the namespace's id.
+    two.settle();
+    const id = two.namespaces.lookup("tns").?;
+    b.retrySinkWrites();
+    two.settle();
+    try std.testing.expectEqual(@as(usize, 0), b.sink_retries.items.len);
+    const at = entryAt(b, .ts_write, from_b).?;
+    var ebuf: [4096]u8 = undefined;
+    try std.testing.expect(b.raft_node.log.getEntryCopy(at, &ebuf).?.header.flags & entry_mod.Flags.SINK != 0);
+    try std.testing.expectEqual(@as(usize, 1), try tsPoints(b, id, "cpu", "value"));
+    try std.testing.expectEqual(@as(usize, 0), try tsPoints(b, .invalid, "cpu", "value"));
+    try std.testing.expectEqual(@as(u64, 0), b.processing_handler.sink_drops);
+}
+
+test "Shard: a TS sink whose measurement is on another shard writes through that shard's log, not into its store" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var mbuf: [16]u8 = undefined;
+    var mi: usize = 0;
+    const measurement = while (true) : (mi += 1) {
+        const m = try std.fmt.bufPrint(&mbuf, "m{d}", .{mi});
+        if (a.router.hashToShard(node_router.routeNsKey(.default, m)) == 1) break m;
+    };
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    for ([_][]const u8{ "1.5", "2.5" }) |r| _ = try a.stream_handler.appendPayloadToStream(source, "default", r);
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [256]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: tsfar
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\sinks:
+        \\  - name: out
+        \\    ts: {{ measurement: {s} }}
+    , .{ source, measurement });
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    const from_b = b.raft_node.log.lastIndex() + 1;
+    const from_a = a.raft_node.log.lastIndex() + 1;
+    var pit = a.processing_handler.pipelines.valueIterator();
+    pit.next().?.last_poll_ms = 0;
+    _ = a.processing_handler.tickPipelines(a);
+    // Sent, not yet applied anywhere: shard 1's store is untouched.
+    try std.testing.expectEqual(@as(usize, 0), try tsPoints(b, .default, measurement, "value"));
+    two.settle();
+    try std.testing.expectEqual(@as(usize, 0), entriesOf(a, .ts_write, from_a));
+    try std.testing.expectEqual(@as(usize, 2), entriesOf(b, .ts_write, from_b));
+    try std.testing.expectEqual(@as(usize, 2), try tsPoints(b, .default, measurement, "value"));
+    try std.testing.expectEqual(@as(usize, 0), try tsPoints(a, .default, measurement, "value"));
 }
 
 test "Shard: a pipeline's KV sinks send another shard no more than its inbox has room for, so a tick isn't held at the same record every time" {
@@ -10435,7 +10610,7 @@ test "Shard: a pipeline's KV sinks send another shard no more than its inbox has
     while (found < 2) : (i += 1) {
         const p = try std.fmt.bufPrint(&pbuf[found], "hot{d}", .{i});
         var full: [32]u8 = undefined;
-        if (a.processing_handler.kvOwner(a, "default", try std.fmt.bufPrint(&full, "{s}:", .{p})) == 1) {
+        if (a.processing_handler.sinkOwner(a, "default", try std.fmt.bufPrint(&full, "{s}:", .{p})) == 1) {
             prefixes[found] = p;
             found += 1;
         }
@@ -10469,8 +10644,8 @@ test "Shard: a pipeline's KV sinks send another shard no more than its inbox has
     // Shard 1's inbox already part full, from senders it hasn't drained.
     const filler = 600;
     for (0..filler) |_| {
-        const m = (KVHandler.SinkPut{ .namespace = "default", .key = "cold", .value = "x", .ttl_ms = 0 }).encode(a.allocator).?;
-        try std.testing.expect(b.mailbox.inbox.send(.{ .tag = .kv_sink_put, .src_shard = 0, .payload_len = @intCast(m.len), .payload_ptr = m.ptr }));
+        const m = (SinkWrite{ .kind = .kv, .namespace = "default", .target = "cold", .value = "x", .ttl_ms = 0 }).encode(a.allocator).?;
+        try std.testing.expect(b.mailbox.inbox.send(.{ .tag = .sink_write, .src_shard = 0, .payload_len = @intCast(m.len), .payload_ptr = m.ptr }));
     }
     const from_b = b.raft_node.log.lastIndex() + 1;
     var it = a.processing_handler.pipelines.valueIterator();
@@ -10512,7 +10687,7 @@ test "Shard: a pipeline tick held partway through a batch resumes at the record 
     const sku = while (true) : (i += 1) {
         const k = try std.fmt.bufPrint(&kbuf, "s{d}", .{i});
         var full: [32]u8 = undefined;
-        if (a.processing_handler.kvOwner(a, "default", try std.fmt.bufPrint(&full, "hot:{s}", .{k})) == 1) break k;
+        if (a.processing_handler.sinkOwner(a, "default", try std.fmt.bufPrint(&full, "hot:{s}", .{k})) == 1) break k;
     };
     var sbuf: [16]u8 = undefined;
     const source = try keyOn(a, .default, 0, &sbuf);
@@ -24160,8 +24335,8 @@ test "Shard: a stream trigger whose shard is capped while apply is suspended kee
 
 /// A KV sink write as another shard sends it to the key's owner.
 fn kvSinkMessage(sh: *Shard, key: []const u8, value: []const u8) InboxMessage {
-    const bytes = (KVHandler.SinkPut{ .namespace = "default", .key = key, .value = value, .ttl_ms = null }).encode(sh.allocator).?;
-    return .{ .tag = .kv_sink_put, .src_shard = 1, .payload_len = @intCast(bytes.len), .payload_ptr = bytes.ptr };
+    const bytes = (SinkWrite{ .kind = .kv, .namespace = "default", .target = key, .value = value, .ttl_ms = null }).encode(sh.allocator).?;
+    return .{ .tag = .sink_write, .src_shard = 1, .payload_len = @intCast(bytes.len), .payload_ptr = bytes.ptr };
 }
 
 test "Shard: KV sink writes another shard sends while this one is full wait in order, are proposed once there's room, and past the list's bound are counted dropped" {
@@ -24179,28 +24354,30 @@ test "Shard: KV sink writes another shard sends while this one is full wait in o
     const last = r.log.lastIndex();
 
     // Two writes to one key, then another: held, nothing proposed.
-    sh.runKvSinkPut(kvSinkMessage(sh, "sink-key", "first"));
-    sh.runKvSinkPut(kvSinkMessage(sh, "sink-key", "second"));
-    sh.runKvSinkPut(kvSinkMessage(sh, "other", "x"));
-    try std.testing.expectEqual(@as(usize, 3), sh.kv_sink_retries.items.len);
+    sh.runSinkWrite(kvSinkMessage(sh, "sink-key", "first"));
+    sh.runSinkWrite(kvSinkMessage(sh, "sink-key", "second"));
+    sh.runSinkWrite(kvSinkMessage(sh, "other", "x"));
+    try std.testing.expectEqual(@as(usize, 3), sh.sink_retries.items.len);
     try std.testing.expectEqual(last, r.log.lastIndex());
     try std.testing.expectEqual(@as(u64, 0), sh.processing_handler.sink_drops);
 
     // Full list: the next is dropped and counted.
-    while (sh.kv_sink_retries.items.len < Shard.KV_SINK_RETRY_MAX) sh.runKvSinkPut(kvSinkMessage(sh, "more", "y"));
-    sh.runKvSinkPut(kvSinkMessage(sh, "past", "z"));
-    try std.testing.expectEqual(@as(u64, 1), sh.kv_sink_retry_overflow);
+    var kbuf: [16]u8 = undefined;
+    var more: usize = 0;
+    while (sh.sink_retries.items.len < Shard.SINK_RETRY_MAX) : (more += 1) sh.runSinkWrite(kvSinkMessage(sh, try std.fmt.bufPrint(&kbuf, "more{d}", .{more}), "y"));
+    sh.runSinkWrite(kvSinkMessage(sh, "past", "z"));
+    try std.testing.expectEqual(@as(u64, 1), sh.sink_retry_overflow);
     try std.testing.expectEqual(@as(u64, 1), sh.processing_handler.sink_drops);
 
     // Room again: proposed oldest first, a key's last write winning.
     try stepWindowClosed(sh);
     var rounds: u32 = 0;
-    while (sh.kv_sink_retries.items.len > 0 and rounds < 100) : (rounds += 1) {
+    while (sh.sink_retries.items.len > 0 and rounds < 100) : (rounds += 1) {
         _ = try sh.tick(0);
         var passes: u32 = 0;
         while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
     }
-    try std.testing.expectEqual(@as(usize, 0), sh.kv_sink_retries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), sh.sink_retries.items.len);
     var buf: [4096]u8 = undefined;
     var rbuf: [1 << 20]u8 = undefined;
     // Drain the parked fillers' answers, then read the key back.
@@ -24221,21 +24398,21 @@ test "Shard: a KV sink write arriving while earlier ones wait goes behind them, 
     const sh = &t.shard;
     const r = sh.raft_node;
     try fillCapSuspended(&t);
-    sh.runKvSinkPut(kvSinkMessage(sh, "k", "first"));
-    try std.testing.expectEqual(@as(usize, 1), sh.kv_sink_retries.items.len);
+    sh.runSinkWrite(kvSinkMessage(sh, "k", "first"));
+    try std.testing.expectEqual(@as(usize, 1), sh.sink_retries.items.len);
 
     // Room again, before the list is retried: the next write still waits.
     try resumeAndApply(sh);
     try std.testing.expect(r.log.lastIndex() - r.last_applied < raft_node_mod.MAX_OUTSTANDING);
     const last = r.log.lastIndex();
-    sh.runKvSinkPut(kvSinkMessage(sh, "k", "second"));
-    try std.testing.expectEqual(@as(usize, 2), sh.kv_sink_retries.items.len);
+    sh.runSinkWrite(kvSinkMessage(sh, "k", "second"));
+    try std.testing.expectEqual(@as(usize, 2), sh.sink_retries.items.len);
     try std.testing.expectEqual(last, r.log.lastIndex());
 
     // Retried in order: the key ends with the later write.
     _ = try sh.tick(0);
-    try std.testing.expectEqual(@as(usize, 0), sh.kv_sink_retries.items.len);
-    try std.testing.expectEqual(@as(usize, 0), sh.kv_sink_retry_bytes);
+    try std.testing.expectEqual(@as(usize, 0), sh.sink_retries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), sh.sink_retry_bytes);
     var passes: u32 = 0;
     while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
     var buf: [4096]u8 = undefined;
@@ -24256,14 +24433,62 @@ test "Shard: KV sink writes waiting for room are bounded by bytes as well as by 
     const sh = &t.shard;
     try fillCapSuspended(&t);
     const big: [60 * 1024]u8 = @splat('v');
-    while (sh.kv_sink_retry_bytes + big.len + 64 <= Shard.KV_SINK_RETRY_MAX_BYTES) sh.runKvSinkPut(kvSinkMessage(sh, "big", &big));
-    const held = sh.kv_sink_retries.items.len;
-    try std.testing.expect(held < Shard.KV_SINK_RETRY_MAX);
-    try std.testing.expectEqual(@as(u64, 0), sh.kv_sink_retry_overflow);
-    sh.runKvSinkPut(kvSinkMessage(sh, "big", &big));
-    try std.testing.expectEqual(held, sh.kv_sink_retries.items.len);
-    try std.testing.expectEqual(@as(u64, 1), sh.kv_sink_retry_overflow);
-    try std.testing.expect(sh.kv_sink_retry_bytes <= Shard.KV_SINK_RETRY_MAX_BYTES);
+    var kbuf: [16]u8 = undefined;
+    var n: usize = 0;
+    while (sh.sink_retry_bytes + big.len + 64 <= Shard.SINK_RETRY_MAX_BYTES) : (n += 1) sh.runSinkWrite(kvSinkMessage(sh, try std.fmt.bufPrint(&kbuf, "big{d}", .{n}), &big));
+    const held = sh.sink_retries.items.len;
+    try std.testing.expect(held < Shard.SINK_RETRY_MAX);
+    try std.testing.expectEqual(@as(u64, 0), sh.sink_retry_overflow);
+    sh.runSinkWrite(kvSinkMessage(sh, "big-last", &big));
+    try std.testing.expectEqual(held, sh.sink_retries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), sh.sink_retry_overflow);
+    try std.testing.expect(sh.sink_retry_bytes <= Shard.SINK_RETRY_MAX_BYTES);
+}
+
+test "Shard: one target's sink writes waiting on a full shard take at most their share of the list, by count and by bytes; others still wait" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    try fillCapSuspended(&t);
+    while (sh.sink_retries.items.len < Shard.SINK_RETRY_TARGET_MAX) sh.runSinkWrite(kvSinkMessage(sh, "hot", "v"));
+    try std.testing.expectEqual(@as(u64, 0), sh.sink_retry_overflow);
+    sh.runSinkWrite(kvSinkMessage(sh, "hot", "v"));
+    try std.testing.expectEqual(@as(u64, 1), sh.sink_retry_overflow);
+    try std.testing.expectEqual(Shard.SINK_RETRY_TARGET_MAX, sh.sink_retries.items.len);
+    // Another target still waits.
+    sh.runSinkWrite(kvSinkMessage(sh, "cold", "v"));
+    try std.testing.expectEqual(Shard.SINK_RETRY_TARGET_MAX + 1, sh.sink_retries.items.len);
+
+    // By bytes: a target's quarter of them.
+    const big: [60 * 1024]u8 = @splat('v');
+    while (true) {
+        const before = sh.sink_retry_overflow;
+        sh.runSinkWrite(kvSinkMessage(sh, "wide", &big));
+        if (sh.sink_retry_overflow != before) break;
+    }
+    var wide: usize = 0;
+    for (sh.sink_retries.items) |r| if (r.target == (SinkWrite{ .kind = .kv, .namespace = "default", .target = "wide", .value = "" }).targetKey()) {
+        wide += r.bytes.len;
+    };
+    try std.testing.expect(wide <= Shard.SINK_RETRY_TARGET_MAX_BYTES);
+    try std.testing.expect(wide + big.len > Shard.SINK_RETRY_TARGET_MAX_BYTES);
+}
+
+test "Shard: sink writes still waiting when a shard stops are counted dropped" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    try fillCapSuspended(&t);
+    for ([_][]const u8{ "a", "b", "c" }) |k| sh.runSinkWrite(kvSinkMessage(sh, k, "v"));
+    const m = kvSinkMessage(sh, "unread", "v");
+    try std.testing.expect(sh.mailbox.inbox.send(m));
+    const drops = sh.processing_handler.sink_drops;
+    sh.refuseUnrunRequests();
+    try std.testing.expectEqual(@as(usize, 0), sh.sink_retries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), sh.sink_retry_bytes);
+    try std.testing.expectEqual(drops + 4, sh.processing_handler.sink_drops);
 }
 
 test "Shard: a workflow step whose action invoke the log is too full to take waits, says so once, and invokes once there's room" {
