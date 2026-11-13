@@ -11,6 +11,7 @@
 //! fails at once rather than hand out a buffer someone is still using.
 
 const std = @import("std");
+const large_buffer = @import("../util/large_buffer.zig");
 
 pub const Scratch = struct {
     buf: []u8,
@@ -18,12 +19,15 @@ pub const Scratch = struct {
     held: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, size: usize) !Scratch {
-        return .{ .buf = try allocator.alloc(u8, size) };
+        _ = allocator;
+        // Mapped, not filled: only what a borrow writes is resident.
+        return .{ .buf = try large_buffer.mapped(u8, size) };
     }
 
     pub fn deinit(self: *Scratch, allocator: std.mem.Allocator) void {
         std.debug.assert(!self.held);
-        allocator.free(self.buf);
+        _ = allocator;
+        large_buffer.unmap(u8, self.buf);
         self.* = undefined;
     }
 

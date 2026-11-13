@@ -937,12 +937,13 @@ pub const Shard = struct {
 
         const apply_buf = try large_buffer.alloc(allocator, u8, limits.MAX_LOG_ENTRY_PAYLOAD);
         errdefer large_buffer.free(allocator, u8, apply_buf);
-        const read_buf = try allocator.alloc(u8, READ_CHUNK);
-        errdefer allocator.free(read_buf);
-        const parse_buf = try allocator.alloc(u8, MAX_REQUEST_SIZE);
-        errdefer allocator.free(parse_buf);
-        const entry_buf = try allocator.alloc(u8, persistence_mod.MAX_PERSIST_PAYLOAD);
-        errdefer allocator.free(entry_buf);
+        // Mapped, not filled: a shard with no client never writes them.
+        const read_buf = try large_buffer.mapped(u8, READ_CHUNK);
+        errdefer large_buffer.unmap(u8, read_buf);
+        const parse_buf = try large_buffer.mapped(u8, MAX_REQUEST_SIZE);
+        errdefer large_buffer.unmap(u8, parse_buf);
+        const entry_buf = try large_buffer.mapped(u8, persistence_mod.MAX_PERSIST_PAYLOAD);
+        errdefer large_buffer.unmap(u8, entry_buf);
         var scratch = try Scratch.init(allocator, SCRATCH_SIZE);
         errdefer scratch.deinit(allocator);
 
@@ -1511,9 +1512,9 @@ pub const Shard = struct {
         large_buffer.free(self.allocator, u8, self.replica.rpc_arena);
         large_buffer.free(self.allocator, u8, self.replica.rpc_out);
         large_buffer.free(self.allocator, u8, self.apply_buf);
-        self.allocator.free(self.read_buf);
-        self.allocator.free(self.parse_buf);
-        self.allocator.free(self.entry_buf);
+        large_buffer.unmap(u8, self.read_buf);
+        large_buffer.unmap(u8, self.parse_buf);
+        large_buffer.unmap(u8, self.entry_buf);
         self.scratch.deinit(self.allocator);
 
         // Clean up partitions (each owns UAL + all projections)

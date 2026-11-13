@@ -29,6 +29,7 @@
 //! The receiver shard frees the payload after processing.
 
 const std = @import("std");
+const large_buffer = @import("../util/large_buffer.zig");
 const assert = std.debug.assert;
 const Atomic = std.atomic.Value;
 const Wake = @import("mailbox.zig").Wake;
@@ -133,8 +134,8 @@ pub const Inbox = struct {
             break :blk c;
         };
 
-        const slots = try allocator.alloc(Message, cap);
-        @memset(slots, std.mem.zeroes(Message));
+        // Mapped, so already zero: a message slot is touched once it's used.
+        const slots = try large_buffer.mapped(Message, cap);
 
         return .{
             .slots = slots,
@@ -149,7 +150,7 @@ pub const Inbox = struct {
 
     /// Release the slot buffer.
     pub fn deinit(self: *Inbox) void {
-        self.allocator.free(self.slots);
+        large_buffer.unmap(Message, self.slots);
     }
 
     /// Non-blocking send. Returns true on success, false if ring is full (backpressure).

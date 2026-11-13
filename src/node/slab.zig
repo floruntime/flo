@@ -31,6 +31,7 @@
 //! ```
 
 const std = @import("std");
+const large_buffer = @import("../util/large_buffer.zig");
 
 /// Reference to a slab-allocated buffer. Carries metadata for deallocation.
 pub const SlabRef = struct {
@@ -84,7 +85,8 @@ const Pool = struct {
         try pool.all_chunks.ensureTotalCapacity(allocator, initial_count);
 
         for (0..initial_count) |_| {
-            const buf = try allocator.alloc(u8, slab_size);
+            // Mapped, not filled: a chunk's pages are touched as it's used.
+            const buf = try large_buffer.mapped(u8, slab_size);
             const ptr: [*]u8 = buf.ptr;
             pool.free_list.appendAssumeCapacity(ptr);
             pool.all_chunks.appendAssumeCapacity(ptr);
@@ -96,7 +98,7 @@ const Pool = struct {
     fn deinit(self: *Pool, allocator: std.mem.Allocator) void {
         // Free all chunks (both in-use and free)
         for (self.all_chunks.items) |chunk| {
-            allocator.free(chunk[0..self.slab_size]);
+            large_buffer.unmap(u8, chunk[0..self.slab_size]);
         }
         self.all_chunks.deinit(allocator);
         self.free_list.deinit(allocator);
@@ -116,7 +118,7 @@ const Pool = struct {
 
     /// Grow pool by allocating a new slab
     fn grow(self: *Pool, allocator: std.mem.Allocator) ![*]u8 {
-        const buf = try allocator.alloc(u8, self.slab_size);
+        const buf = try large_buffer.mapped(u8, self.slab_size);
         const ptr: [*]u8 = buf.ptr;
         try self.all_chunks.append(allocator, ptr);
         return ptr;
