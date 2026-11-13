@@ -1208,3 +1208,56 @@ test "queue machine: a ready message's encoded state is its payload and a fixed 
 fn emptyMsgForTest() Msg.Value {
     return .{ .queue = "01234567", .priority = 0, .status = .ready, .payload = "", .enqueued_ns = 0, .due_ns = 0, .deliveries = 0, .failures = 0, .holder = "", .request_key = null, .token = .{ .term = 0, .index = 0 }, .lease_ms = 0, .delivered_ns = 0, .expiry_ns = 0, .ended = .none, .started_ns = 0, .@"error" = "", .dead_ns = 0 };
 }
+
+test "queue machine: every record's slot follows from what it stores, joined to its queue's meta" {
+    const sc = @import("../contract/slot_check.zig");
+    const Store = @import("../contract/store.zig").Store;
+    var t = TestQueues.init(testing.allocator);
+    defer t.deinit();
+    // A tagged name: its slot is the tag's, which its hash, the key every
+    // record but the meta holds, can't say.
+    const queue = "{acct:7}:jobs";
+    const want = router.nsKeySlot(NS, queue);
+    for (0..4) |i| {
+        const r = try t.apply(.queue_enqueue, enqueueValue(NS, queue, 0, "m"), (10 + i) * ms);
+        try testing.expect(r.refused() == null);
+    }
+    // Two leased (deadlines), then one of them dead-lettered.
+    const d = try t.apply(.queue_deliver, qe.Deliver.Value{ .ns = NS.int(), .queue = queue, .count = 2, .max_bytes = 1 << 20, .holder = "c1", .lease_ms = LEASE_MS }, 20 * ms);
+    try testing.expect(d.refused() == null);
+    const m = t.msg(NS, queue, 1).?;
+    var b: [qe.Items.max_size]u8 = undefined;
+    const items = try qe.Item.encodeInto(&b, .{ .seq = 1, .deliveries = m.deliveries });
+    const rel = try t.apply(.queue_release, qe.Release.Value{ .ns = NS.int(), .queue = queue, .holder = "c1", .token = m.token, .expiry_ns = m.expiry_ns, .items = .{ .bytes = items, .count = 1 }, .delay_ms = 0, .dead = true, .@"error" = "boom" }, 21 * ms);
+    try testing.expect(rel.refused() == null);
+
+    const D = struct {
+        fn meta(_: void, _: *Store, key: []const u8, value: []const u8) ?u32 {
+            const v = Metas.Value.decode(value) catch return null;
+            return router.nsKeySlot(sc.nsOf(key), v.v.name);
+        }
+        // `[ns][hash]`, the queue's meta key: the name is there.
+        fn byMeta(store: *Store, meta_key: []const u8) ?u32 {
+            return meta({}, store, meta_key, store.get(Metas.ID, meta_key) orelse return null);
+        }
+        fn underQueue(_: void, store: *Store, key: []const u8, _: []const u8) ?u32 {
+            return byMeta(store, key[0..12]);
+        }
+        fn deadline(_: void, store: *Store, key: []const u8, _: []const u8) ?u32 {
+            const k = parseDeadlineKey(key[1..]) orelse return null;
+            var mk: [12]u8 = undefined;
+            mk[0..4].* = k.ns.bytes();
+            mk[4..12].* = k.id[0..8].*;
+            return byMeta(store, &mk);
+        }
+    };
+    try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Metas.ID, want, {}, D.meta));
+    try testing.expectEqual(@as(usize, 4), try sc.expectFamily(&t.store, Msgs.ID, want, {}, D.underQueue));
+    try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Dead.ID, want, {}, D.underQueue));
+    try testing.expectEqual(@as(usize, 2), try sc.expectFamily(&t.store, Ready.ID, want, {}, D.underQueue));
+    try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Deadlines.ID, want, {}, D.deadline));
+    // A queue delivery takes no request key (`M.deliver(.., null, ..)`), so
+    // `queue.request` holds nothing to place.
+    try testing.expectEqual(@as(usize, 0), t.count(M.Requests));
+    // `queue.held` counts the whole shard: derived, so not placed.
+}

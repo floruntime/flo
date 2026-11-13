@@ -141,9 +141,8 @@ pub const KVHandler = struct {
             .{ "kv.txn.commit", OpCode.kv_commit_txn, txnCommit },
             .{ "kv.txn.rollback", OpCode.kv_rollback_txn, txnRollback },
         }) |o| {
-            dispatcher.registerWithRoute(o[1], table_run.handler(o[0], KVHandler, o[2]), table_run.routeByKey);
-            // A request in a transaction runs on the shard its id names.
-            if (table_run.op(o[0]).txn != null) dispatcher.setShardRoute(o[1], txnShardOfBody);
+            // A request in a transaction runs where its id's slot is.
+            dispatcher.registerWithRoute(o[1], table_run.handler(o[0], KVHandler, o[2]), if (table_run.op(o[0]).txn != null) routeTxnOrKey else table_run.routeByKey);
         }
         // Many keys: run where the client is, gathering the rest.
         dispatcher.register(.kv_mget, table_run.handler("kv.mget", KVHandler, mget));
@@ -363,9 +362,11 @@ pub const KVHandler = struct {
         };
     }
 
-    /// The shard a table op's transaction lives on, when it names one.
-    fn txnShardOfBody(req: Request) ?u16 {
-        return txn_mod.idShard(table_run.txnId(req) orelse return null);
+    /// A request in a transaction routes by its id's slot, where the
+    /// transaction is held (a slot is its own hash); any other by its key.
+    fn routeTxnOrKey(req: Request) ?u64 {
+        if (table_run.txnId(req)) |id| return txn_mod.idSlot(id);
+        return table_run.routeByKey(req);
     }
 
     pub const DeleteResponse = table_run.op("kv.delete").response;
@@ -1037,7 +1038,10 @@ test "kv handler: every KV op in the table has a handler, and the key-routed one
         // scan walks every shard; mget runs where it lands.
         const routed = o.route == .key and o.fanout == .none;
         try testing.expectEqual(routed, dispatcher.pre_route[o.code] != null);
-        try testing.expectEqual(o.txn != null, dispatcher.shard_route[o.code] != null);
+        // None is pinned to a shard: a transaction's id names its slot, and
+        // its ops route by it before their key.
+        try testing.expect(dispatcher.shard_route[o.code] == null);
+        if (o.txn != null) try testing.expect(dispatcher.pre_route[o.code].? == &KVHandler.routeTxnOrKey);
     }
     try testing.expect(dispatcher.isWalkOp(@backingInt(OpCode.kv_scan)));
     try testing.expectEqual(@as(u16, kv_ops.table.len), dispatcher.handler_count);

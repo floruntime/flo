@@ -79,7 +79,6 @@ pub const Run = Record(&.{
     .{ .name = "source", .T = schema.Enum(ae.Source) },
     .{ .name = "caller_run", .T = Optional(Bytes(limits.MAX_QUALIFIED_KEY)) },
     .{ .name = "caller_workflow", .T = Optional(Bytes(limits.MAX_QUALIFIED_KEY)) },
-    .{ .name = "caller_shard", .T = Optional(Int(u16)) },
     .{ .name = "created_ns", .T = Int(u64) },
     // Its ready key's due time, while ready.
     .{ .name = "due_ns", .T = Int(u64) },
@@ -263,7 +262,6 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 .source = p.source,
                 .caller_run = p.caller_run,
                 .caller_workflow = p.caller_workflow,
-                .caller_shard = p.caller_shard,
                 .created_ns = stamp,
                 .due_ns = stamp,
                 .deliveries = 0,
@@ -349,7 +347,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             const p = ae.Extend.decodeAll(e.payload, &diag) catch return error.Halt;
             const rk = try idKey(view, .of(p.ns), p.run);
             var run = (try inScope(view, rk, p.action)) orelse return out.refuse(.not_found, .not_found, NO_RUN);
-            if (!holds(run.v, p.holder, run.v.deliveries, p.token)) return stale(out, run.v, p.holder, run.v.deliveries, p.token);
+            if (!holds(run.v, p.holder, p.deliveries, p.token)) return stale(out, run.v, p.holder, p.deliveries, p.token);
             if (p.lease_ms != run.v.lease_ms or p.held_since_ns != run.v.delivered_ns) return out.refuse(.bad_request, .unclassified, NOT_ITS_LEASE);
             // More than half the lease left, or held to the ceiling: the
             // lease stands, and nothing is written.
@@ -529,7 +527,7 @@ fn register(t: *TestActions, max_attempts: u32) !void {
 }
 
 fn invokeIn(t: *TestActions, ns: NamespaceId, run_id: []const u8, stamp: u64) !void {
-    const r = try t.apply(.action_invoke, ae.Invoke.Value{ .ns = ns.int(), .action = "send", .run = run_id, .input = "in", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null }, stamp);
+    const r = try t.apply(.action_invoke, ae.Invoke.Value{ .ns = ns.int(), .action = "send", .run = run_id, .input = "in", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null }, stamp);
     try testing.expect(r.refused() == null);
 }
 
@@ -558,7 +556,7 @@ fn releaseOf(t: *TestActions, run_id: []const u8, abandoned: bool) ae.Release.Va
 
 fn extendOf(t: *TestActions, run_id: []const u8) ae.Extend.Value {
     const r = t.run(.default, run_id).?;
-    return .{ .ns = DEFAULT, .action = "send", .run = run_id, .holder = "w1", .token = r.token, .expiry_ns = r.expiry_ns, .held_since_ns = r.delivered_ns, .lease_ms = r.lease_ms };
+    return .{ .ns = DEFAULT, .action = "send", .run = run_id, .holder = "w1", .deliveries = r.deliveries, .token = r.token, .expiry_ns = r.expiry_ns, .held_since_ns = r.delivered_ns, .lease_ms = r.lease_ms };
 }
 
 /// An expire of `item` alone.
@@ -623,6 +621,11 @@ test "actions machine: a refused entry changes nothing: a stale token, an early 
     var ext = extendOf(&t, "r1");
     ext.token.index += 1;
     try testing.expect((try t.apply(.action_extend, ext, 30 * ms)).refused() != null);
+    // An extend names its delivery's count, as a settle does: another
+    // count is another delivery's, refused at apply on every replica.
+    ext = extendOf(&t, "r1");
+    ext.deliveries += 1;
+    try testing.expectEqual(Reason.stale_report, (try t.apply(.action_extend, ext, 30 * ms)).refused().?.refusal.reason);
     try testing.expectEqual(before, t.sums());
 
     // Another action's name with the live token: answered as no such run,
@@ -870,7 +873,7 @@ test "actions machine: one action and run id in two namespaces are two of each, 
     try testing.expectEqual(Status.ready, t.run(other, "r1").?.status);
     // Deleted in one, the action is still the other's to invoke.
     try testing.expect((try t.apply(.action_delete, ae.Delete.Value{ .ns = DEFAULT, .name = "send" }, 30 * ms)).refused() == null);
-    try testing.expectEqualStrings(NO_ACTION, (try t.apply(.action_invoke, ae.Invoke.Value{ .ns = DEFAULT, .action = "send", .run = "r2", .input = "", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null }, 40 * ms)).refused().?.refusal.message);
+    try testing.expectEqualStrings(NO_ACTION, (try t.apply(.action_invoke, ae.Invoke.Value{ .ns = DEFAULT, .action = "send", .run = "r2", .input = "", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null }, 40 * ms)).refused().?.refusal.message);
     try invokeIn(&t, other, "r2", 40 * ms);
     try testing.expect(t.run(.default, "r2") == null);
 }
@@ -977,3 +980,56 @@ test "actions machine: a run completed after a failed attempt keeps no error" {
     _ = try t.apply(.action_settle, settleOf(&t, "r1"), 23 * ms);
     try testing.expectEqualStrings("", t.run(.default, "r1").?.@"error");
 }
+
+test "actions machine: every record's slot follows from what it stores, the action's name's" {
+    const sc = @import("../contract/slot_check.zig");
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    // A tagged name: its slot is the tag's, which no name hash says.
+    const action = "{acct:7}:send";
+    const want = @import("../node/router.zig").nsKeySlot(.default, action);
+    _ = try t.apply(.action_register, ae.Register.Value{ .ns = DEFAULT, .name = action, .owner = "", .lease_ms = LEASE_MS, .max_attempts = 3 }, 1);
+    // One run left ready, one leased under a request key (a deadline and a
+    // request record), and one chosen by a client.
+    for ([_][]const u8{ "act-1a00-0", "act-2b00-0", "order-17" }, [_]u64{ 10, 11, 12 }) |run, at| {
+        const r = try t.apply(.action_invoke, ae.Invoke.Value{ .ns = DEFAULT, .action = action, .run = run, .input = "in", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null }, at * ms);
+        try testing.expect(r.refused() == null);
+    }
+    for ([_][]const u8{ "act-2b00-0", "order-17" }, [_]u64{ 11, 12 }) |run, due| {
+        const r = try t.apply(.action_deliver, ae.Deliver.Value{ .ns = DEFAULT, .action = action, .run = run, .due_ns = due * ms, .holder = "w1", .request_key = run, .lease_ms = LEASE_MS }, 20 * ms);
+        try testing.expect(r.refused() == null);
+    }
+
+    const D = struct {
+        fn def(_: void, _: *store_mod_t, key: []const u8, _: []const u8) ?u32 {
+            return @import("../node/router.zig").nsKeySlot(sc.nsOf(key), key[4..]);
+        }
+        fn run(_: void, _: *store_mod_t, key: []const u8, value: []const u8) ?u32 {
+            const r = Runs.Value.decode(value) catch return null;
+            return @import("../node/router.zig").nsKeySlot(sc.nsOf(key), r.v.action);
+        }
+        fn ready(_: void, _: *store_mod_t, key: []const u8, _: []const u8) ?u32 {
+            return @import("../node/router.zig").nsKeySlot(sc.nsOf(key), sc.nameAfterNs(key));
+        }
+        fn deadline(_: void, _: *store_mod_t, key: []const u8, value: []const u8) ?u32 {
+            // Past the family's empty namespace, as the duty reads it.
+            const k = M.parseDeadlineKey(key[1..]) orelse return null;
+            const d = Deadlines.Value.decode(value) catch return null;
+            return @import("../node/router.zig").nsKeySlot(k.ns, d.v.scope);
+        }
+        // Keyed by holder: placed by its run's action, a join.
+        fn request(_: void, store: *store_mod_t, key: []const u8, value: []const u8) ?u32 {
+            const q = Requests.Value.decode(value) catch return null;
+            var b: [4 + ae.MAX_RUN_ID]u8 = undefined;
+            const rk = view_mod.idKey(&b, sc.nsOf(key), q.v.run) catch return null;
+            return run({}, store, rk, store.get(Runs.ID, rk) orelse return null);
+        }
+    };
+    try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Defs.ID, want, {}, D.def));
+    try testing.expectEqual(@as(usize, 3), try sc.expectFamily(&t.store, Runs.ID, want, {}, D.run));
+    try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Ready.ID, want, {}, D.ready));
+    try testing.expectEqual(@as(usize, 2), try sc.expectFamily(&t.store, Deadlines.ID, want, {}, D.deadline));
+    try testing.expectEqual(@as(usize, 2), try sc.expectFamily(&t.store, Requests.ID, want, {}, D.request));
+}
+
+const store_mod_t = @import("../contract/store.zig").Store;

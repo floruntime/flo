@@ -1021,6 +1021,37 @@ test "e2e/workflow: on many shards, a step whose action another shard owns resum
     for (runs) |run_id| try expectRunCompletes(ctx, run_id, 1500);
 }
 
+test "e2e/workflow: on 4 shards, a run whose chosen id reads as another shard's slot is told when its action on a third shard ends" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    const router = @import("src").node.router;
+    const run_id_mod = @import("src").node.run_id;
+    const r = router.Router.init(4, 0);
+    const wf = "cid-wf";
+    var act_buf: [32]u8 = undefined;
+    const action = try actionPlaced(&act_buf, "cid-act", wf, false);
+    // A chosen id whose text decodes as a run id's bits, naming a slot on
+    // neither the workflow's shard nor the action's: the action's end must
+    // go by the workflow's name, not by those bits.
+    var rid_buf: [16]u8 = undefined;
+    const run_id = for (1..4096) |i| {
+        const id = try std.fmt.bufPrint(&rid_buf, "cid-{x}00", .{i});
+        const bits_shard = r.slotToShard(run_id_mod.extractSlot(id) orelse continue);
+        if (bits_shard != shardOfKey(wf) and bits_shard != shardOfKey(action)) break id;
+    } else return error.NoRunId;
+
+    try ctx.exec(&.{ "action", "register", action });
+    try createStepWorkflow(ctx, wf, action);
+    try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", run_id });
+    var taken = try ctx.cli.run(&.{ "worker", "await", action, "--worker-id", "cid-w", "--block", "5000" });
+    defer taken.deinit();
+    try testing.expectEqual(@as(u8, 0), taken.exit_code);
+    const id = extractTaskId(std.mem.trim(u8, taken.stdout, &std.ascii.whitespace)) orelse return error.AssertionFailed;
+    try ctx.exec(&.{ "worker", "complete", id, "--worker-id", "cid-w", "--result", "{}" });
+    // Told at once, not found by a 5 s ask.
+    try expectRunCompletes(ctx, run_id, 1500);
+}
+
 /// Extract task ID from worker await output.
 /// Output format: "Task: <task_id>\nPayload: ..."
 fn extractTaskId(output: []const u8) ?[]const u8 {

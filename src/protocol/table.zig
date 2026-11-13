@@ -94,3 +94,71 @@ test "table: the hash changes with the hand layout epoch" {
     try std.testing.expect(comptime hash(&op_table, &entry_table, HAND_LAYOUT_EPOCH) != hash(&op_table, &entry_table, HAND_LAYOUT_EPOCH + 1));
     try std.testing.expectEqual(HASH, comptime hash(&op_table, &entry_table, HAND_LAYOUT_EPOCH));
 }
+
+test "no stored layout names a shard or group: a record's place comes from its key's slot" {
+    // A slot can move between groups, and a group can split, so a stored
+    // field naming one goes stale. Scans the files that declare what is
+    // logged or kept (entry layouts, the machines' records) for a field
+    // named for a shard, group or node. Replica machinery (src/raft) names
+    // nodes by design and isn't scanned.
+    const stdx = @import("stdx");
+    const a = std.testing.allocator;
+    // Quantities, not places: a cap on what the group holds.
+    const exempt = [_][]const u8{"shard_held_bytes"};
+    const words = [_][]const u8{ "shard", "group_id", "group_index", "node_id" };
+    var stack: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (stack.items) |p| a.free(p);
+        stack.deinit(a);
+    }
+    try stack.append(a, try a.dupe(u8, "src"));
+    var i: usize = 0;
+    var files: usize = 0;
+    var found: usize = 0;
+    while (i < stack.items.len) : (i += 1) {
+        const dir_path = stack.items[i];
+        var dir = try stdx.fs.openDir(dir_path, .{ .iterate = true });
+        defer stdx.fs.closeDir(dir);
+        var it = dir.iterate();
+        while (try it.next(stdx.io.instance())) |entry| {
+            const path = try std.fs.path.join(a, &.{ dir_path, entry.name });
+            if (entry.kind == .directory) {
+                if (std.mem.eql(u8, path, "src/raft")) {
+                    a.free(path);
+                    continue;
+                }
+                try stack.append(a, path);
+                continue;
+            }
+            defer a.free(path);
+            const durable = std.mem.endsWith(u8, entry.name, "_entries.zig") or
+                std.mem.eql(u8, entry.name, "machine.zig") or
+                std.mem.eql(u8, entry.name, "group_machine.zig") or
+                std.mem.eql(u8, entry.name, "delivery.zig");
+            if (!durable) continue;
+            const source = try stdx.fs.readFileAlloc(a, path, 1 << 20);
+            defer a.free(source);
+            files += 1;
+            var lines = std.mem.splitScalar(u8, source, '\n');
+            var line_no: usize = 0;
+            while (lines.next()) |line| {
+                line_no += 1;
+                const at = std.mem.indexOf(u8, line, ".name = \"") orelse continue;
+                const rest = line[at + ".name = \"".len ..];
+                const name = rest[0 .. std.mem.indexOfScalar(u8, rest, '"') orelse continue];
+                const named = for (words) |w| {
+                    if (std.mem.indexOf(u8, name, w) != null) break true;
+                } else false;
+                const allowed = for (exempt) |e| {
+                    if (std.mem.eql(u8, name, e)) break true;
+                } else false;
+                if (named and !allowed) {
+                    std.debug.print("{s}:{d}: stored field \"{s}\" names a place; derive it from the record's key\n", .{ path, line_no, name });
+                    found += 1;
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), found);
+    try std.testing.expect(files >= 10);
+}

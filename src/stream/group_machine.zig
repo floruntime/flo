@@ -1466,3 +1466,55 @@ test "group machine: a group takes new records only within its caps, and a settl
     try testing.expectEqual(heldBy(0), t.meta("s", "g").?.held_bytes);
     try testing.expectEqual(@as(u32, 1), answerInt(u32, try t.apply(.group_deliver, v, 13 * ms)));
 }
+
+test "group machine: every record's slot follows from what it stores, joined to its group's meta" {
+    const sc = @import("../contract/slot_check.zig");
+    const Store = @import("../contract/store.zig").Store;
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    // Groups route by their stream's name.
+    const want = router.nsKeySlot(NS, "s");
+    _ = try t.append("s", 100, 4);
+    // Three delivered: one dead-lettered, one released to be delivered
+    // again (a ready record), one still leased (a deadline).
+    const d = try deliver(&t, 3, 1 << 20, "c1", 10 * ms);
+    try testing.expectEqual(@as(usize, 3), d.n);
+    try testing.expectEqual(@as(u32, 1), (try release(&t, d, d.records[0..1], true, 11 * ms)).applied);
+    try testing.expectEqual(@as(u32, 1), (try release(&t, d, d.records[1..2], false, 11 * ms)).applied);
+
+    const D = struct {
+        fn meta(_: void, _: *Store, key: []const u8, value: []const u8) ?u32 {
+            const v = Metas.Value.decode(value) catch return null;
+            return router.nsKeySlot(sc.nsOf(key), v.v.stream);
+        }
+        // `[ns][scope]`, the group's meta key: the stream's name is there.
+        fn byMeta(store: *Store, meta_key: []const u8) ?u32 {
+            return meta({}, store, meta_key, store.get(Metas.ID, meta_key) orelse return null);
+        }
+        fn underGroup(_: void, store: *Store, key: []const u8, _: []const u8) ?u32 {
+            return byMeta(store, key[0 .. 4 + SCOPE_LEN]);
+        }
+        fn deadline(_: void, store: *Store, key: []const u8, _: []const u8) ?u32 {
+            const k = parseDeadlineKey(key[1..]) orelse return null;
+            var mk: [4 + SCOPE_LEN]u8 = undefined;
+            mk[0..4].* = k.ns.bytes();
+            mk[4..].* = k.id[0..SCOPE_LEN].*;
+            return byMeta(store, &mk);
+        }
+        // `[0][ns][stream hash]`, no name: any of its groups' metas has it.
+        fn stream(_: void, store: *Store, key: []const u8, _: []const u8) ?u32 {
+            var it = store.range(Metas.ID, key[1..13]);
+            const rec = it.next() orelse return null;
+            return meta({}, store, rec.key(), rec.value);
+        }
+    };
+    try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Metas.ID, want, {}, D.meta));
+    try testing.expectEqual(@as(usize, 3), try sc.expectFamily(&t.store, Items.ID, want, {}, D.underGroup));
+    try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Dead.ID, want, {}, D.underGroup));
+    try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Deadlines.ID, want, {}, D.deadline));
+    try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Ready.ID, want, {}, D.underGroup));
+    try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Streams_.ID, want, {}, D.stream));
+    // A group delivery takes no request key (`M.deliver(.., null, ..)`), so
+    // `group.request` holds nothing to place.
+    try testing.expectEqual(@as(usize, 0), t.count(M.Requests));
+}

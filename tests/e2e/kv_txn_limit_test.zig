@@ -160,8 +160,9 @@ test "e2e/kv/txn-limit: every shard of a node takes both settings" {
     defer testing.allocator.free(value);
     @memset(value, 'x');
 
-    // Tags until a transaction has been refused on each shard, which a
-    // transaction's id names in its top 16 bits.
+    // Tags until a transaction has been refused on each shard. A
+    // transaction's id holds its slot in its top 16 bits, and slot n is on
+    // shard n mod 4.
     var seen: [4]bool = @splat(false);
     var attempt: usize = 0;
     while (std.mem.indexOfScalar(bool, &seen, false) != null) : (attempt += 1) {
@@ -170,7 +171,7 @@ test "e2e/kv/txn-limit: every shard of a node takes both settings" {
         const tag = try std.fmt.bufPrint(&tag_buf, "r{d}", .{attempt});
         var buf: [32]u8 = undefined;
         const txn = (try begin(cli, tag, &buf)) orelse return error.BeginRefused;
-        const shard: usize = @intCast((try std.fmt.parseInt(u64, txn, 10)) >> 48);
+        const shard: usize = @intCast(((try std.fmt.parseInt(u64, txn, 10)) >> 48) % 4);
         if (seen[shard]) continue;
         seen[shard] = true;
         // Ops: three small ones, and the fourth refused.
