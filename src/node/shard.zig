@@ -4160,7 +4160,8 @@ pub const Shard = struct {
             self.marker.resumed();
             // The entry is passed over when the apply reaches it again. One
             // whose apply ran before it halted already left what a pass-over
-            // leaves, and the partition takes nothing twice.
+            // leaves: the ring refuses a second take of all but a KV entry,
+            // and the bar count takes no index twice.
             if (self.marker.crashed) |*c| if (c.index == h.index) self.marker.skipped();
             return true;
         }
@@ -4568,6 +4569,8 @@ pub const Shard = struct {
             sm.snapshot_skipped_leader_not_ready.store(self.snapshot_skips_leader_not_ready, .monotonic);
             sm.kv_sink_retry_pending.store(self.kv_sink_retries.items.len, .monotonic);
             sm.kv_sink_retry_overflow.store(self.kv_sink_retry_overflow, .monotonic);
+            sm.bar_last.store(self.defaultPartition().last_bar, .monotonic);
+            sm.bar_bytes.store(self.defaultPartition().bar_bytes, .monotonic);
             // A duration, not the monotonic start: a raw clock reading means
             // nothing to a reader and Prometheus can't subtract it.
             sm.flushes_failing_for_ms.store(if (self.flushes_failing_since_ms == 0) 0 else nowMs() -| self.flushes_failing_since_ms, .monotonic);
@@ -4625,6 +4628,10 @@ pub const Shard = struct {
         slot.read_blocked_serves.store(self.read_blocked and self.raft_network == null, .release);
         slot.persist_failures.store(self.persist_failures, .monotonic);
         slot.snapshot_skipped_leader_not_ready.store(self.snapshot_skips_leader_not_ready, .monotonic);
+        const part = self.defaultPartition();
+        slot.bar_last.store(part.last_bar, .monotonic);
+        slot.bar_bytes.store(part.bar_bytes, .monotonic);
+        slot.bar_threshold.store(part.barThreshold(), .monotonic);
         const window = self.snapshot_window;
         slot.snapshot_bar.store(if (window) |w| w.s else 0, .monotonic);
         slot.snapshot_suspended_for_ms.store(if (window) |w| nowMs() -| w.opened_ms else 0, .monotonic);
@@ -4900,8 +4907,11 @@ pub const Shard = struct {
 
     /// Whether the entry just applied is a bar, and if so how long a test
     /// window holds (0 for none). Bars proper come with snapshots.
-    fn barAt(self: *const Shard, e: *const entry_mod.Entry) ?u64 {
+    fn barAt(self: *Shard, e: *const entry_mod.Entry) ?u64 {
         if (self.test_bar != 0 and e.header.index == self.test_bar) return 0;
+        if (comptime BARS_OPEN_WINDOWS) {
+            if (self.defaultPartition().last_bar == e.header.index) return 0;
+        }
         if (comptime build_options.test_faults) {
             if (@import("test_faults.zig").of(e) == .snapshot_window) return TEST_FAULT_WINDOW_MS;
         }
@@ -7316,6 +7326,11 @@ pub const SnapshotWindow = struct {
     /// an e2e test can write through it.
     hold_until_ms: u64 = 0,
 };
+
+/// Whether a bar suspends apply. Not until snapshots are written: bars are
+/// found and reported, but a window with nothing to serialize would only
+/// pause apply. Not a setting; the change that writes snapshots removes it.
+const BARS_OPEN_WINDOWS = false;
 
 /// Stub slices a test bar's window queues before it closes.
 pub const TEST_BAR_SLICES: u32 = 3;
@@ -23876,4 +23891,122 @@ test "Shard: action starts held for room have a bound of their own, which leaves
     ah.startRunFromInbox(sh, 1, m);
     try std.testing.expect(ah.startPending("missing-1"));
     try std.testing.expectEqual(ActionsHandler.MAX_HELD + 1, ah.held.count());
+}
+
+test "Shard: two replicas applying the same log find the same bars, the state a snapshot would encode moving between them" {
+    Partition.test_bar_min_bytes = 600;
+    defer Partition.test_bar_min_bytes = null;
+    const allocator = std.testing.allocator;
+    // Stream appends carry the bytes; KV puts (each also kept in the key's
+    // history) and action registers move the state between bars.
+    const n = 300;
+    var bufs: [n][400]u8 = undefined;
+    var entries: [n]entry_mod.Entry = undefined;
+    for (&entries, 0..) |*e, i| {
+        const index = i + 1;
+        const len = (i * 13) % 90;
+        var value: [90]u8 = undefined;
+        @memset(value[0..len], 'v');
+        if (i % 6 == 1) {
+            var key = TEST_KV_K.* ++ [_]u8{'0' + @as(u8, @intCast(i % 9))};
+            e.* = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, index, index, try kv_entries.Put.encodeInto(&bufs[i], .{ .key = &key, .value = value[0..len], .ttl_ms = null, .condition = .always, .cas_version = null }));
+        } else if (i % 25 == 3) {
+            var name_buf: [8]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "a{d}", .{i});
+            var reg = testRegister(name);
+            reg.owner = value[0 .. len % 40];
+            e.* = try ActionsHandler.for_tests.entry(.action_register, reg, 1, index, index, &bufs[i]);
+        } else {
+            @memset(bufs[i][0..400], 's');
+            e.* = entry_mod.buildEntry(.stream_append, entry_mod.Flags.NONE, 1, index, index, bufs[i][0..400]);
+        }
+    }
+    var bars: [2][n]u64 = undefined;
+    var states: [2][n]u64 = undefined;
+    var found: [2]usize = .{ 0, 0 };
+    var final: [2]u64 = undefined;
+    for (0..2) |r| {
+        var part = try Partition.init(allocator, 0, 8192, 0);
+        defer part.deinit();
+        part.wireProjections();
+        var registry: ReplayRegistry = .{};
+        var last: u64 = 0;
+        var since: u64 = 0;
+        for (&entries) |*e| {
+            var out: persistence_mod.Result = .{};
+            out.reset(e);
+            const before = part.store.encodedBytes();
+            // A stream append has no applier in a bare registry; the
+            // partition takes and counts it all the same.
+            const res = applyEntryCore(&part, &registry, e, &out);
+            try std.testing.expect(res == .applied or (res == .no_applier and e.header.entry_type == @backingInt(entry_mod.EntryType.stream_append)));
+            // A bar is the first index whose bytes since the last reach the
+            // larger of the minimum and the state before it.
+            since += entry_mod.HEADER_SIZE + e.payload.len;
+            const threshold = @max(600, before);
+            try std.testing.expectEqual(since >= threshold, part.last_bar != last);
+            if (part.last_bar != last) {
+                since = 0;
+                last = part.last_bar;
+                bars[r][found[r]] = last;
+                // The threshold the bar met: the state before its entry.
+                states[r][found[r]] = before;
+                found[r] += 1;
+            }
+        }
+        final[r] = part.store.encodedBytes();
+    }
+    try std.testing.expect(found[0] >= 3);
+    try std.testing.expectEqualSlices(u64, bars[0][0..found[0]], bars[1][0..found[1]]);
+    try std.testing.expectEqualSlices(u64, states[0][0..found[0]], states[1][0..found[1]]);
+    try std.testing.expectEqual(final[0], final[1]);
+    // The state grew past the minimum, so later bars fell by it.
+    try std.testing.expect(final[0] > 600);
+    try std.testing.expect(states[0][found[0] - 1] > 600);
+    try std.testing.expect(states[0][found[0] - 1] > states[0][0]);
+}
+
+test "Shard: boot replay finds the same bars as live apply did, and the same bytes since the last" {
+    Partition.test_bar_min_bytes = 500;
+    defer Partition.test_bar_min_bytes = null;
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var live_last: u64 = 0;
+    var live_bytes: u64 = 0;
+    var live_applied: u64 = 0;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        // Stream appends add log bytes but no family state, so the bars come
+        // from the minimum; a few KV puts move the state between them.
+        const payload = @as([200]u8, @splat('s'));
+        for (0..40) |i| {
+            try shard.stream_handler.appendPayloadToStream("s", "default", &payload);
+            if (i % 8 == 0) {
+                var kbuf: [16]u8 = undefined;
+                _ = try @import("../kv/handler.zig").KVHandler.testProposePut(&shard, try std.fmt.bufPrint(&kbuf, "k{d}", .{i}), "v");
+            }
+            _ = shard.applyCommitted();
+        }
+        const part = shard.defaultPartition();
+        live_last = part.last_bar;
+        live_bytes = part.bar_bytes;
+        live_applied = shard.raft_node.last_applied;
+        try std.testing.expect(live_last > 0);
+        try shard.flushSegmentToDisk();
+    }
+    var shard = try t.open();
+    defer shard.deinit();
+    shard.applyDeferredTail();
+    try std.testing.expectEqual(live_last, shard.defaultPartition().last_bar);
+    // The reopened node applies entries of its own past what live did (its
+    // term's no-op): the count is live's plus theirs.
+    var extra: u64 = 0;
+    var i = live_applied + 1;
+    while (i <= shard.raft_node.last_applied) : (i += 1) {
+        const e = shard.raft_node.log.getEntry(i).?;
+        extra += entry_mod.HEADER_SIZE + e.payload.len;
+    }
+    try std.testing.expectEqual(live_bytes + extra, shard.defaultPartition().bar_bytes);
 }

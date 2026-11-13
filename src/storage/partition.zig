@@ -47,6 +47,13 @@ pub const Partition = struct {
     /// The state of every family a contract machine keeps, and the scratch
     /// one entry's staged writes live in.
     store: contract_store.Store,
+    /// Logical bytes taken since the last snapshot bar: each entry's header
+    /// and payload, for every index, refused and passed-over ones too.
+    bar_bytes: u64 = 0,
+    /// The last bar's index; 0 before the first.
+    last_bar: u64 = 0,
+    /// The highest index counted toward a bar.
+    bar_counted_through: u64 = 0,
     apply_scratch: std.heap.ArenaAllocator,
 
     /// Raft state placeholders (real Raft added in Phase 3).
@@ -201,6 +208,7 @@ pub const Partition = struct {
         if (e.header.index > self.committed_index) {
             self.committed_index = e.header.index;
         }
+        self.countForBar(e);
 
         log.debug("Partition: applied entry, partition_id={d}, index={d}, type={d}", .{ self.id, e.header.index, e.header.entry_type });
 
@@ -233,6 +241,45 @@ pub const Partition = struct {
         }
 
         return .{ .index = index, .route = route, .failed = failed };
+    }
+
+    /// Bars fall at least this many logical bytes apart.
+    pub const BAR_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// The bytes since the last bar after which the next one falls: at least
+    /// `BAR_MIN_BYTES`, and at least the state a snapshot would encode, so a
+    /// snapshot costs no more than the log written since the last.
+    pub fn barThreshold(self: *const Partition) u64 {
+        return @max(barMinBytes(), self.store.encodedBytes());
+    }
+
+    /// Tests only: a smaller minimum, so a bar comes within a few entries.
+    /// Global, so a shard that replays its log at boot sees it too.
+    pub var test_bar_min_bytes: ?u64 = null;
+
+    fn barMinBytes() u64 {
+        if (@import("builtin").is_test) {
+            if (test_bar_min_bytes) |b| return b;
+        }
+        return BAR_MIN_BYTES;
+    }
+
+    /// Counts an entry just taken towards the next bar, and makes it the bar
+    /// if it reaches it. Every replica takes the same entries over the same
+    /// state, so every replica finds the same bars.
+    /// Each index counts once, however often it is taken: a KV index skips
+    /// the ring that refuses a second take, so one applied and then halted
+    /// on is taken again when a repair passes over it, where a replay that
+    /// knows of the repair takes it only once.
+    /// The threshold reads the state before the entry applies: the shard
+    /// runs the entry's machine after the take.
+    fn countForBar(self: *Partition, e: *const Entry) void {
+        if (e.header.index <= self.bar_counted_through) return;
+        self.bar_counted_through = e.header.index;
+        self.bar_bytes += entry_mod.HEADER_SIZE + e.payload.len;
+        if (self.bar_bytes < self.barThreshold()) return;
+        self.last_bar = e.header.index;
+        self.bar_bytes = 0;
     }
 
     fn lowerIndexFirst(_: void, a: u64, b: u64) std.math.Order {
@@ -593,4 +640,165 @@ test "partition: kv entries reach the projection but neither the ring nor the wa
     _ = try part.apply(&e2);
     try testing.expectEqual(@as(u64, "stream-payload".len), part.warm_bytes_used);
     try testing.expect(part.readPayloadWarm(2) != null);
+}
+
+/// Applies `entries` in order and returns the bars found, in order.
+/// Applies `entries`, noting each bar and the state's size where it fell.
+fn barsOf(part: *Partition, entries: []const Entry, out: []u64, states: []u64) ![]u64 {
+    var n: usize = 0;
+    var last: u64 = part.last_bar;
+    for (entries) |*e| {
+        _ = try part.apply(e);
+        if (part.last_bar != last) {
+            last = part.last_bar;
+            out[n] = last;
+            states[n] = part.store.encodedBytes();
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+test "partition: two replicas applying the same log find the same bars, every index counted once" {
+    const allocator = testing.allocator;
+    Partition.test_bar_min_bytes = 600;
+    defer Partition.test_bar_min_bytes = null;
+    // Stream appends of varying sizes, empty entries and KV puts. Taken
+    // alone, with no machine run, the state stays empty: the shard's test
+    // of two replicas moves it.
+    const n = 80;
+    var payloads: [n][64]u8 = undefined;
+    var kv_bufs: [n][160]u8 = undefined;
+    var entries: [n]Entry = undefined;
+    const ns = @import("../namespace/table.zig").DEFAULT.bytes();
+    for (&entries, 0..) |*e, i| {
+        const len = (i * 7) % 60;
+        @memset(payloads[i][0..len], 'p');
+        if (i % 5 == 0) {
+            e.* = makeEntry(.raft_noop, i + 1, 1, "");
+        } else if (i % 3 == 0) {
+            var key: [ns.len + 2]u8 = undefined;
+            @memcpy(key[0..ns.len], &ns);
+            key[ns.len] = 'k';
+            key[ns.len + 1] = '0' + @as(u8, @intCast(i % 7));
+            e.* = kvTestEntry(&kv_bufs[i], .kv_put, .{ .key = &key, .value = payloads[i][0..len], .ttl_ms = null, .condition = .always, .cas_version = null }, i + 1, 1000 + i);
+            continue;
+        } else {
+            e.* = makeEntry(.stream_append, i + 1, 1, payloads[i][0..len]);
+        }
+        e.header.crc32c = e.computeCrc();
+    }
+    var bars: [2][n]u64 = undefined;
+    var states: [2][n]u64 = undefined;
+    var found: [2][]u64 = undefined;
+    for (0..2) |r| {
+        var part = try Partition.init(allocator, 0, 8192, 0);
+        defer part.deinit();
+        part.wireProjections();
+        found[r] = try barsOf(&part, &entries, &bars[r], &states[r]);
+    }
+    try testing.expect(found[0].len >= 3);
+    try testing.expectEqualSlices(u64, found[0], found[1]);
+    try testing.expectEqualSlices(u64, states[0][0..found[0].len], states[1][0..found[1].len]);
+
+    // The count is the entries' headers and payloads: a bar is the first
+    // index at which it reaches the larger of 600 and the state before it.
+    var part = try Partition.init(allocator, 0, 8192, 0);
+    defer part.deinit();
+    part.wireProjections();
+    var since: u64 = 0;
+    var next_bar: usize = 0;
+    for (&entries) |*e| {
+        const threshold = @max(600, part.store.encodedBytes());
+        _ = try part.apply(e);
+        since += entry_mod.HEADER_SIZE + e.payload.len;
+        if (next_bar < found[0].len and found[0][next_bar] == e.header.index) {
+            try testing.expect(since >= threshold);
+            since = 0;
+            next_bar += 1;
+        } else try testing.expect(since < threshold);
+    }
+
+    // An index taken again (refused by the ring) isn't counted twice.
+    var again = try Partition.init(allocator, 0, 8192, 0);
+    defer again.deinit();
+    again.wireProjections();
+    _ = try again.apply(&entries[1]);
+    const after_one = again.bar_bytes;
+    try testing.expectError(error.IndexNotIncreasing, again.apply(&entries[1]));
+    try testing.expectEqual(after_one, again.bar_bytes);
+}
+
+test "partition: a bar falls no sooner than the state a snapshot would encode" {
+    const allocator = testing.allocator;
+    Partition.test_bar_min_bytes = 100;
+    defer Partition.test_bar_min_bytes = null;
+    var part = try Partition.init(allocator, 0, 8192, 0);
+    defer part.deinit();
+    part.wireProjections();
+    // State bigger than the minimum: the threshold is the state's size.
+    const rec = try part.store.allocRecord("key");
+    const big = @as([400]u8, @splat('v'));
+    part.store.link(1, rec, try allocator.dupe(u8, &big));
+    try testing.expect(part.store.encodedBytes() > 400);
+    try testing.expectEqual(part.store.encodedBytes(), part.barThreshold());
+    const payload = @as([80]u8, @splat('x'));
+    var e = makeEntry(.stream_append, 1, 1, &payload);
+    e.header.crc32c = e.computeCrc();
+    _ = try part.apply(&e);
+    // 120 bytes taken: past the minimum, short of the state.
+    try testing.expectEqual(@as(u64, 0), part.last_bar);
+    // Enough more to reach the state's size makes a bar.
+    var i: u64 = 2;
+    while (part.last_bar == 0) : (i += 1) {
+        var more = makeEntry(.stream_append, i, 1, &payload);
+        more.header.crc32c = more.computeCrc();
+        _ = try part.apply(&more);
+    }
+    try testing.expect((i - 1) * 120 >= part.store.encodedBytes());
+}
+
+test "partition: an entry a repair skips, passed over, counts toward the bar as an applied one does" {
+    const allocator = testing.allocator;
+    var part = try Partition.init(allocator, 0, 8192, 0);
+    defer part.deinit();
+    part.wireProjections();
+    var e = makeEntry(.stream_append, 1, 1, "passed over");
+    e.header.crc32c = e.computeCrc();
+    try part.passOverSkipped(&e);
+    try testing.expectEqual(@as(u64, entry_mod.HEADER_SIZE + "passed over".len), part.bar_bytes);
+}
+
+test "partition: a KV index the router has applied already, taken again, isn't counted again" {
+    const allocator = testing.allocator;
+    var part = try Partition.init(allocator, 0, 8192, 0);
+    defer part.deinit();
+    part.wireProjections();
+    var payload_buf: [128]u8 = undefined;
+    const e = kvTestEntry(&payload_buf, .kv_put, .{ .key = @import("../namespace/table.zig").DEFAULT.bytes() ++ "key1", .value = "val1", .ttl_ms = null, .condition = .always, .cas_version = null }, 1, 1000);
+    _ = try part.apply(&e);
+    const once = part.bar_bytes;
+    try testing.expectEqual(@as(u64, entry_mod.HEADER_SIZE + e.payload.len), once);
+    // KV skips the ring, so nothing refuses it before the router does.
+    _ = try part.apply(&e);
+    try testing.expectEqual(once, part.bar_bytes);
+}
+
+test "partition: a KV index taken and then passed over by a repair counts once, as a replay that passes over it alone does" {
+    const allocator = testing.allocator;
+    var payload_buf: [128]u8 = undefined;
+    const e = kvTestEntry(&payload_buf, .kv_put, .{ .key = @import("../namespace/table.zig").DEFAULT.bytes() ++ "key1", .value = "val1", .ttl_ms = null, .condition = .always, .cas_version = null }, 1, 1000);
+    // Live: applied (and halted on), then passed over by the repair.
+    var live = try Partition.init(allocator, 0, 8192, 0);
+    defer live.deinit();
+    live.wireProjections();
+    _ = try live.apply(&e);
+    try live.passOverSkipped(&e);
+    // A replay that knows of the repair only passes over it.
+    var replayed = try Partition.init(allocator, 0, 8192, 0);
+    defer replayed.deinit();
+    replayed.wireProjections();
+    try replayed.passOverSkipped(&e);
+    try testing.expectEqual(replayed.bar_bytes, live.bar_bytes);
+    try testing.expectEqual(@as(u64, entry_mod.HEADER_SIZE + e.payload.len), live.bar_bytes);
 }
