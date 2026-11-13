@@ -1475,9 +1475,12 @@ test "group machine: every record's slot follows from what it stores, joined to 
     // Groups route by their stream's name.
     const want = router.nsKeySlot(NS, "s");
     _ = try t.append("s", 100, 4);
-    const d = try deliver(&t, 2, 1 << 20, "c1", 10 * ms);
-    try testing.expectEqual(@as(usize, 2), d.n);
-    _ = try release(&t, d, d.records[0..1], true, 11 * ms);
+    // Three delivered: one dead-lettered, one released to be delivered
+    // again (a ready record), one still leased (a deadline).
+    const d = try deliver(&t, 3, 1 << 20, "c1", 10 * ms);
+    try testing.expectEqual(@as(usize, 3), d.n);
+    try testing.expectEqual(@as(u32, 1), (try release(&t, d, d.records[0..1], true, 11 * ms)).applied);
+    try testing.expectEqual(@as(u32, 1), (try release(&t, d, d.records[1..2], false, 11 * ms)).applied);
 
     const D = struct {
         fn meta(_: void, _: *Store, key: []const u8, value: []const u8) ?u32 {
@@ -1498,13 +1501,6 @@ test "group machine: every record's slot follows from what it stores, joined to 
             mk[4..].* = k.id[0..SCOPE_LEN].*;
             return byMeta(store, &mk);
         }
-        fn request(_: void, store: *Store, key: []const u8, value: []const u8) ?u32 {
-            const q = M.Requests.Value.decode(value) catch return null;
-            var mk: [4 + SCOPE_LEN]u8 = undefined;
-            mk[0..4].* = key[0..4].*;
-            mk[4..].* = q.v.run[0..SCOPE_LEN].*;
-            return byMeta(store, &mk);
-        }
         // `[0][ns][stream hash]`, no name: any of its groups' metas has it.
         fn stream(_: void, store: *Store, key: []const u8, _: []const u8) ?u32 {
             var it = store.range(Metas.ID, key[1..13]);
@@ -1512,11 +1508,13 @@ test "group machine: every record's slot follows from what it stores, joined to 
             return meta({}, store, rec.key(), rec.value);
         }
     };
-    try testing.expect(try sc.expectFamily(&t.store, Metas.ID, want, {}, D.meta) > 0);
-    try testing.expect(try sc.expectFamily(&t.store, Items.ID, want, {}, D.underGroup) > 0);
-    try testing.expect(try sc.expectFamily(&t.store, Dead.ID, want, {}, D.underGroup) > 0);
-    try testing.expect(try sc.expectFamily(&t.store, Deadlines.ID, want, {}, D.deadline) > 0);
-    _ = try sc.expectFamily(&t.store, Ready.ID, want, {}, D.underGroup);
-    _ = try sc.expectFamily(&t.store, M.Requests.ID, want, {}, D.request);
-    try testing.expect(try sc.expectFamily(&t.store, Streams_.ID, want, {}, D.stream) > 0);
+    try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Metas.ID, want, {}, D.meta));
+    try testing.expectEqual(@as(usize, 3), try sc.expectFamily(&t.store, Items.ID, want, {}, D.underGroup));
+    try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Dead.ID, want, {}, D.underGroup));
+    try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Deadlines.ID, want, {}, D.deadline));
+    try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Ready.ID, want, {}, D.underGroup));
+    try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Streams_.ID, want, {}, D.stream));
+    // A group delivery takes no request key (`M.deliver(.., null, ..)`), so
+    // `group.request` holds nothing to place.
+    try testing.expectEqual(@as(usize, 0), t.count(M.Requests));
 }

@@ -1250,19 +1250,14 @@ test "queue machine: every record's slot follows from what it stores, joined to 
             mk[4..12].* = k.id[0..8].*;
             return byMeta(store, &mk);
         }
-        fn request(_: void, store: *Store, key: []const u8, value: []const u8) ?u32 {
-            const q = M.Requests.Value.decode(value) catch return null;
-            var mk: [12]u8 = undefined;
-            mk[0..4].* = key[0..4].*;
-            mk[4..12].* = q.v.run[0..8].*;
-            return byMeta(store, &mk);
-        }
     };
     try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Metas.ID, want, {}, D.meta));
     try testing.expectEqual(@as(usize, 4), try sc.expectFamily(&t.store, Msgs.ID, want, {}, D.underQueue));
     try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Dead.ID, want, {}, D.underQueue));
     try testing.expectEqual(@as(usize, 2), try sc.expectFamily(&t.store, Ready.ID, want, {}, D.underQueue));
     try testing.expectEqual(@as(usize, 1), try sc.expectFamily(&t.store, Deadlines.ID, want, {}, D.deadline));
-    _ = try sc.expectFamily(&t.store, M.Requests.ID, want, {}, D.request);
+    // A queue delivery takes no request key (`M.deliver(.., null, ..)`), so
+    // `queue.request` holds nothing to place.
+    try testing.expectEqual(@as(usize, 0), t.count(M.Requests));
     // `queue.held` counts the whole shard: derived, so not placed.
 }

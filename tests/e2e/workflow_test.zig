@@ -1045,7 +1045,7 @@ test "e2e/workflow: on 4 shards, a run whose chosen id reads as another shard's 
     try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", run_id });
     var taken = try ctx.cli.run(&.{ "worker", "await", action, "--worker-id", "cid-w", "--block", "5000" });
     defer taken.deinit();
-    try stdx.testing.assertSucceeded(taken);
+    try testing.expectEqual(@as(u8, 0), taken.exit_code);
     const id = extractTaskId(std.mem.trim(u8, taken.stdout, &std.ascii.whitespace)) orelse return error.AssertionFailed;
     try ctx.exec(&.{ "worker", "complete", id, "--worker-id", "cid-w", "--result", "{}" });
     // Told at once, not found by a 5 s ask.

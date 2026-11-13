@@ -2025,15 +2025,15 @@ pub const WorkflowHandler = struct {
         return null;
     }
 
-    /// Whether the run `run` waits for, which the caller did not find, was
-    /// lost: this shard proposed it and has applied that entry's index
-    /// without creating it.
     /// The shard a pending action or child run is on, from its slot; null
     /// when nothing is pending.
     fn slotShard(shard: *const Shard, slot: ?u32) ?u16 {
         return shard.router.slotToShard(slot orelse return null);
     }
 
+    /// Whether the run `run` waits for, which the caller did not find, was
+    /// lost: this shard proposed it and has applied that entry's index
+    /// without creating it.
     fn pendingLost(shard: *Shard, run: *const RunRecord, on_shard: ?u16) bool {
         if ((on_shard orelse shard.id) != shard.id) return false;
         // No index: this shard held the start, and a step-down may have
