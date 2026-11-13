@@ -372,8 +372,8 @@ pub const Connection = struct {
         in_flight,
         /// `MAX_BLOCKING_IN_FLIGHT` of its reads are blocked on other shards.
         blocking_reads,
-        /// The target's share of this shard's ask slots is taken.
-        slots,
+        /// The target's share of this shard's reply capacity is taken.
+        reply_capacity,
         /// This shard's share of the target's inbox is unread.
         inbox,
     };

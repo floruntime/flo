@@ -52,7 +52,7 @@ pub fn main() !void {
     for (&shards, 0..) |*s, i| {
         const dir = try std.fmt.bufPrint(&dirs[i], "{s}/n{d}", .{ root, i });
         try stdx.fs.makePath(dir);
-        s.* = try Shard.init(allocator, 0, 1, 4096, pipe_fds[0], dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+        s.* = try Shard.init(allocator, 0, 1, pipe_fds[0], dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     }
     const after = residentKiB();
     for (&shards) |*s| s.deinit();

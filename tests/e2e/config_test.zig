@@ -30,39 +30,29 @@ test "e2e/config: a config file named on the command line that is missing is ref
     try expectRefused(.{ .shards = 1, .config_file_missing = true }, "not found");
 }
 
-test "e2e/config: a node restarted with a partition count other than the one its data was written with is refused, automatic included" {
-    const node = try ServerProcess.initWithConfig(testing.allocator, .{ .shards = 1 });
-    defer node.deinit();
-    // Automatic: 4096 for one shard, recorded as that.
-    try node.start();
-    node.stop();
-
-    node.config.extra_config = "[server]\npartition_count = 8192\n";
-    node.dump_log_on_failure = false;
-    try testing.expectError(error.ServerNotReady, node.startWithTimeout(3000));
-    const says = "the data was written with 4096 partitions, and this start asks for 8192";
-    if (!try node.logsContain(says)) {
-        std.debug.print("expected the log to say: {s}\n", .{says});
-        return error.TestUnexpectedResult;
-    }
-
-    // The same count, explicit, is the same topology.
-    node.config.extra_config = "[server]\npartition_count = 4096\n";
-    try node.start();
+test "e2e/config: partition_count and --partitions are refused at start, naming the fix" {
+    const says = "partition_count is no longer a setting: every cluster has 4096 key partitions; remove it from the config";
+    try expectRefused(.{ .shards = 1, .extra_config = "[server]\npartition_count = 0\n" }, says);
+    try expectRefused(.{ .shards = 1, .extra_config = "[server]\npartition_count = 4096\n" }, says);
+    try expectRefused(.{ .shards = 1, .extra_args = &.{ "--partitions", "4096" } }, says);
 }
 
-test "e2e/config: a node written with an explicit partition count is refused when restarted automatic, if the counts differ" {
-    const node = try ServerProcess.initWithConfig(testing.allocator, .{ .shards = 1, .extra_config = "[server]\npartition_count = 8192\n" });
+test "e2e/config: a node restarted with another shard count is refused, naming both counts" {
+    const node = try ServerProcess.initWithConfig(testing.allocator, .{ .shards = 1 });
     defer node.deinit();
     try node.start();
     node.stop();
 
-    node.config.extra_config = null;
+    node.config.shards = 2;
     node.dump_log_on_failure = false;
     try testing.expectError(error.ServerNotReady, node.startWithTimeout(3000));
-    const says = "the data was written with 8192 partitions, and this start asks for 4096 (automatic)";
+    const says = "the data was written with 1 shards, and this start asks for 2";
     if (!try node.logsContain(says)) {
         std.debug.print("expected the log to say: {s}\n", .{says});
         return error.TestUnexpectedResult;
     }
+
+    // The count it was written with still starts.
+    node.config.shards = 1;
+    try node.start();
 }
