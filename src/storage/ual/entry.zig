@@ -175,6 +175,12 @@ pub const Flags = struct {
     pub const TOMBSTONE: u16 = 1 << 3;
     /// A stream delete given `--force`: it drops the stream whatever it holds.
     pub const FORCE: u16 = 1 << 4;
+    /// Written by a processing pipeline's sink. Refused at apply, it is a
+    /// record lost to that sink: the leader applying it counts it dropped
+    /// unless the pipeline that proposed it, on this shard, reads it again.
+    /// Best effort around leader changes: one applied after the term has
+    /// moved on is not counted.
+    pub const SINK: u16 = 1 << 5;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════

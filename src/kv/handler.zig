@@ -880,6 +880,15 @@ pub const KVHandler = struct {
         comptime entry_type: entry_mod.EntryType,
         payload: kv_entries.Payload(@backingInt(entry_type)).Value,
     ) !@import("../raft/node.zig").ProposeResult {
+        return proposeKVFlagged(shard, entry_type, entry_mod.Flags.NONE, payload);
+    }
+
+    fn proposeKVFlagged(
+        shard: *Shard,
+        comptime entry_type: entry_mod.EntryType,
+        flags: u16,
+        payload: kv_entries.Payload(@backingInt(entry_type)).Value,
+    ) !@import("../raft/node.zig").ProposeResult {
         const P = kv_entries.Payload(@backingInt(entry_type));
         comptime std.debug.assert(P.max_size <= MAX_KEY_ENTRY_PAYLOAD);
         // A write runs once its namespace is known here (`prepareWrite`); a
@@ -889,7 +898,7 @@ pub const KVHandler = struct {
         const buf = shard.scratch.borrow(size);
         defer shard.scratch.release(buf);
         const bytes = P.encodeInto(buf, payload) catch |err| return encodeError(err);
-        return try shard.raft_node.propose(entry_type, entry_mod.Flags.NONE, bytes);
+        return try shard.raft_node.propose(entry_type, flags, bytes);
     }
 
     /// For tests: propose a put of `value` at `key` in the default
@@ -962,7 +971,8 @@ pub const KVHandler = struct {
 
     /// What became of a processing KV sink's write.
     pub const SinkResult = union(enum) {
-        proposed,
+        /// In the log, not yet applied.
+        proposed: @import("../raft/node.zig").ProposeResult,
         /// The shard can take no more writes for now: the sink holds its
         /// source, or its message, and tries again.
         held,
@@ -983,7 +993,7 @@ pub const KVHandler = struct {
             return .{ .dropped = "the namespace isn't created on this shard yet" };
         }
         var kbuf: [MAX_KV_KEY]u8 = undefined;
-        _ = proposeKV(shard, .kv_put, .{ .key = Key.init(&kbuf, ns_id, raw_key).stored, .value = value, .ttl_ms = ttl_ms, .condition = .always, .cas_version = null }) catch |err| return switch (err) {
+        const proposed = proposeKVFlagged(shard, .kv_put, entry_mod.Flags.SINK, .{ .key = Key.init(&kbuf, ns_id, raw_key).stored, .value = value, .ttl_ms = ttl_ms, .condition = .always, .cas_version = null }) catch |err| return switch (err) {
             error.Overloaded => .held,
             error.NotLeader => .{ .dropped = "this node doesn't lead its group" },
             error.WritesStopped => .{ .dropped = "the shard stopped taking writes" },
@@ -991,7 +1001,7 @@ pub const KVHandler = struct {
             else => .{ .dropped = @errorName(err) },
         };
         shard.namespace_handler.markNamespaceHasData(namespace, shard);
-        return .proposed;
+        return .{ .proposed = proposed };
     }
 
     // ── Blocking GET Waiter Management ──────────────────────────────────
