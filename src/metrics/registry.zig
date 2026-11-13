@@ -294,6 +294,10 @@ pub const ProcessingMetrics = struct {
     errors_total: Atomic(u64) = Atomic(u64).init(0),
     /// Pipeline ticks stopped because a sink's shard was full.
     ticks_held_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Sink writes proposed and not yet applied, on every shard.
+    sink_pending: Atomic(u64) = Atomic(u64).init(0),
+    /// Sink writes refused for room at apply, their records read again.
+    sink_rewinds_total: Atomic(u64) = Atomic(u64).init(0),
 
     pub fn init() ProcessingMetrics {
         return .{};
@@ -342,6 +346,15 @@ pub const ProcessingMetrics = struct {
         _ = self.ticks_held_total.fetchAdd(1, .monotonic);
     }
 
+    /// A shard's pending sink writes moved from `was` to `now`.
+    pub fn moveSinkPending(self: *ProcessingMetrics, was: usize, now: usize) void {
+        if (now > was) _ = self.sink_pending.fetchAdd(now - was, .monotonic) else _ = self.sink_pending.fetchSub(was - now, .monotonic);
+    }
+
+    pub fn recordSinkRewind(self: *ProcessingMetrics) void {
+        _ = self.sink_rewinds_total.fetchAdd(1, .monotonic);
+    }
+
     pub const Snapshot = struct {
         active_jobs: u64,
         jobs_submitted_total: u64,
@@ -353,6 +366,8 @@ pub const ProcessingMetrics = struct {
         checkpoints_completed_total: u64,
         errors_total: u64,
         ticks_held_total: u64,
+        sink_pending: u64,
+        sink_rewinds_total: u64,
     };
 
     pub fn snapshot(self: *const ProcessingMetrics) Snapshot {
@@ -367,6 +382,8 @@ pub const ProcessingMetrics = struct {
             .checkpoints_completed_total = self.checkpoints_completed_total.load(.monotonic),
             .errors_total = self.errors_total.load(.monotonic),
             .ticks_held_total = self.ticks_held_total.load(.monotonic),
+            .sink_pending = self.sink_pending.load(.monotonic),
+            .sink_rewinds_total = self.sink_rewinds_total.load(.monotonic),
         };
     }
 };
@@ -1648,6 +1665,12 @@ fn writeProcessingMetrics(writer: anytype, snapshot: ProcessingMetrics.Snapshot)
     try writer.print("# HELP flo_processing_ticks_held_total Pipeline ticks stopped because a sink's shard was full\n", .{});
     try writer.print("# TYPE flo_processing_ticks_held_total counter\n", .{});
     try writer.print("flo_processing_ticks_held_total {d}\n", .{snapshot.ticks_held_total});
+    try writer.print("# HELP flo_processing_sink_pending Sink writes proposed and not yet applied\n", .{});
+    try writer.print("# TYPE flo_processing_sink_pending gauge\n", .{});
+    try writer.print("flo_processing_sink_pending {d}\n", .{snapshot.sink_pending});
+    try writer.print("# HELP flo_processing_sink_rewinds_total Sink writes refused for room at apply, their records read again\n", .{});
+    try writer.print("# TYPE flo_processing_sink_rewinds_total counter\n", .{});
+    try writer.print("flo_processing_sink_rewinds_total {d}\n", .{snapshot.sink_rewinds_total});
 }
 
 /// Write replication metrics in Prometheus format

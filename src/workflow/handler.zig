@@ -4830,6 +4830,10 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     const namespaces = try std.testing.allocator.create(NamespaceHandler);
     namespaces.* = try NamespaceHandler.init(std.testing.allocator);
     shard.namespace_handler = namespaces;
+    // Its sink bookkeeping sees every KV and stream entry that applies.
+    const processing = try std.testing.allocator.create(@import("../processing/handler.zig").ProcessingHandler);
+    processing.* = @import("../processing/handler.zig").ProcessingHandler.init(std.testing.allocator);
+    shard.processing_handler = processing;
     return shard;
 }
 
@@ -4846,6 +4850,8 @@ fn destroyTestShard(shard: *Shard) void {
     std.testing.allocator.free(shard.pending);
     shard.namespace_handler.deinit();
     std.testing.allocator.destroy(shard.namespace_handler);
+    shard.processing_handler.deinit();
+    std.testing.allocator.destroy(shard.processing_handler);
 }
 
 fn createTestRun(handler: *WorkflowHandler, ns_key: []const u8, run_id: []const u8, wf_name: []const u8) void {

@@ -5238,6 +5238,11 @@ pub const Shard = struct {
         // A dequeue its deliver answers, dequeues woken for messages ready.
         self.queue_handler.afterApply(self, entry, result);
         group_handler.afterApply(self, entry, result);
+        // A pipeline's sink write refused at apply is read again or counted.
+        switch (@as(entry_mod.EntryType, @fromBackingInt(@intCast(entry.header.entry_type)))) {
+            .queue_enqueue, .kv_put, .stream_append => self.processing_handler.afterApply(self, entry, result),
+            else => {},
+        }
         if (comptime build_options.test_faults) {
             const leads = self.raft_node.role == .leader and entry.header.term == self.raft_node.current_term;
             if (leads and @import("test_faults.zig").of(entry) == .panic_leader_step) @panic("test fault: panic in the leader's step after apply");
@@ -10067,7 +10072,7 @@ test "Shard: a processing sink in a namespace not yet published writes nothing u
     };
     var sbuf: [16]u8 = undefined;
     const source = try keyOn(a, .default, 0, &sbuf);
-    try a.stream_handler.appendPayloadToStream(source, "default", "rec-1");
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "rec-1");
     two.settle();
 
     const c = try TestClient.open(a);
@@ -10108,6 +10113,302 @@ test "Shard: a processing sink in a namespace not yet published writes nothing u
     try std.testing.expect(std.mem.indexOf(u8, job.held_owned, "is on another") != null);
 }
 
+test "Shard: a queue sink's write refused for room at apply reads its record again, counted, and no checkpoint passes it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    a.queue_handler.caps.max_messages = 3;
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    var qbuf: [16]u8 = undefined;
+    var qi: usize = 0;
+    const queue = while (true) : (qi += 1) {
+        const q = try std.fmt.bufPrint(&qbuf, "q{d}", .{qi});
+        if (a.router.hashToShard(node_router.routeNsKey(.default, q)) == 0) break q;
+    };
+    for ([_][]const u8{ "r0", "r1", "r2" }) |r| _ = try a.stream_handler.appendPayloadToStream(source, "default", r);
+    two.settle();
+
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [256]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: tight
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\sinks:
+        \\  - name: out
+        \\    queue: {{ name: {s} }}
+    , .{ source, queue });
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    const pipe = pit.next().?;
+    const start: StreamID = .{ .timestamp_ms = pipe.stream_cursor_ts, .sequence = pipe.stream_cursor_seq };
+
+    // The tick fits all three (the queue is empty), proposes them and its
+    // checkpoint; another producer fills the queue before they apply.
+    pipe.last_poll_ms = 0;
+    _ = a.processing_handler.tickPipelines(a);
+    try std.testing.expectEqual(@as(usize, 3), pipe.pending.items.len);
+    for (0..3) |_| try queue_handler_mod.enqueueHere(a, queue, "other");
+    two.settle();
+
+    // All three refused at apply: read again from the start, counted as
+    // held, none dropped, none pending.
+    try std.testing.expectEqual(@as(usize, 0), pipe.pending.items.len);
+    try std.testing.expectEqual(@as(u64, 3), a.processing_handler.sink_rewinds);
+    try std.testing.expectEqual(@as(u64, 0), a.processing_handler.sink_drops);
+    try std.testing.expect((StreamID{ .timestamp_ms = pipe.stream_cursor_ts, .sequence = pipe.stream_cursor_seq }).eql(start));
+    try std.testing.expect(pipe.held_since_ms != 0);
+    // The checkpoint, proposed while they were pending, stops before them:
+    // a restart reads them again too.
+    try std.testing.expect(!(StreamID{ .timestamp_ms = pipe.persisted_cursor_ts, .sequence = pipe.persisted_cursor_seq }).greaterThan(start));
+
+    // Room again: they are written, once each, and the pipeline isn't held.
+    a.queue_handler.caps.max_messages = 6;
+    pipe.last_poll_ms = 0;
+    _ = a.processing_handler.tickPipelines(a);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 6), queue_handler_mod.countQueue(a, .default, queue));
+    try std.testing.expectEqual(@as(i64, 0), pipe.held_since_ms);
+    try std.testing.expectEqual(@as(usize, 0), a.processing_handler.pending_sinks);
+
+    // A refusal for another reason is counted dropped, not read again.
+    try pipe.pending.append(a.allocator, .{ .term = a.raft_node.current_term, .index = 1 << 40, .again = .{ .stream = start }, .kind = .queue, .target = queue, .held = 0 });
+    a.processing_handler.pending_sinks += 1;
+    const e = entry_mod.buildEntry(.queue_enqueue, entry_mod.Flags.NONE, a.raft_node.current_term, 1 << 40, 1, "");
+    var out = persistence_mod.Result.start(&e);
+    out.refuse(.conflict, .unclassified, "conflict: another queue's name hashes as this one's");
+    a.processing_handler.afterApply(a, &e, &out);
+    try std.testing.expectEqual(@as(u64, 1), a.processing_handler.sink_drops);
+    try std.testing.expectEqual(@as(u64, 3), a.processing_handler.sink_rewinds);
+}
+
+/// A job on shard 0 reading `records` from a stream there into queue
+/// `queue` there, reading `batch` a tick; its one pipeline.
+fn localQueueSinkJob(two: *TwoShards, c: TestClient, queue: []const u8, records: usize, batch: u32) !*ProcessingHandler.PipelineState {
+    const a = &two.shards[0];
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    for (0..records) |_| _ = try a.stream_handler.appendPayloadToStream(source, "default", "r");
+    two.settle();
+    var ybuf: [256]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: local
+        \\batch_size: {d}
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\sinks:
+        \\  - name: out
+        \\    queue: {{ name: {s} }}
+    , .{ batch, source, queue });
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    return pit.next().?;
+}
+
+fn localQueue(a: *Shard, buf: []u8) ![]const u8 {
+    var qi: usize = 0;
+    while (true) : (qi += 1) {
+        const q = try std.fmt.bufPrint(buf, "q{d}", .{qi});
+        if (a.router.hashToShard(node_router.routeNsKey(.default, q)) == 0) return q;
+    }
+}
+
+test "Shard: a pipeline's pending sink writes from an earlier term are read again when it first writes in a new one, and later ones settle wherever they sit" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var qbuf: [16]u8 = undefined;
+    const queue = try localQueue(a, &qbuf);
+    const pipe = try localQueueSinkJob(&two, c, queue, 1, 100);
+    const ph = a.processing_handler;
+    const rewinds = ph.sink_rewinds;
+
+    // Term 3 proposed 14, which a new leader's entries replaced; this node
+    // leads again in term 5 and proposes 12, then 13.
+    ph.notePending(a, pipe, .{ .term = 3, .index = 14, .timestamp_ns = 0 }, .queue, queue, 0);
+    ph.notePending(a, pipe, .{ .term = 5, .index = 12, .timestamp_ns = 0 }, .queue, queue, 0);
+    try std.testing.expectEqual(@as(usize, 1), pipe.pending.items.len);
+    try std.testing.expectEqual(rewinds + 1, ph.sink_rewinds);
+    ph.notePending(a, pipe, .{ .term = 5, .index = 13, .timestamp_ns = 0 }, .queue, queue, 0);
+
+    // 12 applies: settled as applied, nothing dropped or read again.
+    const e12 = entry_mod.buildEntry(.queue_enqueue, entry_mod.Flags.SINK, 5, 12, 1, "");
+    var ok12 = persistence_mod.Result.start(&e12);
+    ph.afterApply(a, &e12, &ok12);
+    try std.testing.expectEqual(@as(usize, 1), pipe.pending.items.len);
+    try std.testing.expectEqual(rewinds + 1, ph.sink_rewinds);
+    try std.testing.expectEqual(@as(u64, 0), ph.sink_drops);
+
+    // 13 is settled though a later one sits ahead of it.
+    try pipe.pending.insert(a.allocator, 0, .{ .term = 5, .index = 20, .again = pipe.resume_here, .kind = .queue, .target = queue, .held = 0 });
+    ph.pending_sinks += 1;
+    const e13 = entry_mod.buildEntry(.queue_enqueue, entry_mod.Flags.SINK, 5, 13, 1, "");
+    var ok13 = persistence_mod.Result.start(&e13);
+    ph.afterApply(a, &e13, &ok13);
+    try std.testing.expectEqual(@as(usize, 1), pipe.pending.items.len);
+    try std.testing.expectEqual(@as(u64, 20), pipe.pending.items[0].index);
+    try std.testing.expectEqual(@as(usize, 1), ph.pending_sinks);
+    try std.testing.expectEqual(@as(u64, 0), ph.sink_drops);
+    try std.testing.expectEqual(rewinds + 1, ph.sink_rewinds);
+}
+
+test "Shard: a pipeline with a batch of sink writes still to apply proposes no more" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var qbuf: [16]u8 = undefined;
+    const queue = try localQueue(a, &qbuf);
+    const pipe = try localQueueSinkJob(&two, c, queue, 5, 2);
+    pipe.last_poll_ms = 0;
+    _ = a.processing_handler.tickPipelines(a);
+    try std.testing.expectEqual(@as(usize, 2), pipe.pending.items.len);
+    const cursor: StreamID = .{ .timestamp_ms = pipe.stream_cursor_ts, .sequence = pipe.stream_cursor_seq };
+    const from = a.raft_node.log.lastIndex() + 1;
+    // Not yet applied: the next tick reads and proposes nothing.
+    pipe.last_poll_ms = 0;
+    _ = a.processing_handler.tickPipelines(a);
+    try std.testing.expectEqual(@as(usize, 2), pipe.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), entriesOf(a, .queue_enqueue, from));
+    try std.testing.expect((StreamID{ .timestamp_ms = pipe.stream_cursor_ts, .sequence = pipe.stream_cursor_seq }).eql(cursor));
+    // Applied: it goes on.
+    two.settle();
+    pipe.last_poll_ms = 0;
+    _ = a.processing_handler.tickPipelines(a);
+    try std.testing.expectEqual(@as(usize, 2), entriesOf(a, .queue_enqueue, from));
+}
+
+test "Shard: a queue sink's write refused for room at apply is read again after a restart before the next tick" {
+    var t: DamageTest = undefined;
+    try t.initActive();
+    defer t.deinit();
+    const queue = "out";
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        shard.queue_handler.caps.max_messages = 3;
+        for ([_][]const u8{ "r0", "r1", "r2" }) |r| _ = try shard.stream_handler.appendPayloadToStream("src", "default", r);
+        try std.testing.expect(shard.applyCommitted());
+        const c = try TestClient.open(&shard);
+        defer _ = std.c.close(c.pair[1]);
+        const yaml =
+            \\kind: Processing
+            \\name: tight
+            \\sources:
+            \\  - name: src
+            \\    stream: { name: src }
+            \\sinks:
+            \\  - name: out
+            \\    queue: { name: out }
+        ;
+        shard.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+        try std.testing.expect(shard.applyCommitted());
+        var pit = shard.processing_handler.pipelines.valueIterator();
+        const pipe = pit.next().?;
+        // Another producer's enqueues, ahead in the log, fill the queue;
+        // the tick, seeing it empty, proposes all three and its checkpoint.
+        for (0..3) |_| _ = try queue_handler_mod.proposeEnqueue(&shard, queue, "other");
+        pipe.last_poll_ms = 0;
+        _ = shard.processing_handler.tickPipelines(&shard);
+        try std.testing.expectEqual(@as(usize, 3), pipe.pending.items.len);
+        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expectEqual(@as(u64, 3), shard.processing_handler.sink_rewinds);
+        try std.testing.expectEqual(@as(u64, 3), queue_handler_mod.countQueue(&shard, .default, queue));
+        try shard.flushSegmentToDisk();
+    }
+    // Restarted before another tick: the job resumes from its checkpoint,
+    // which stopped before the refused records, and writes them once room
+    // returns.
+    var shard = try t.open();
+    defer shard.deinit();
+    shard.queue_handler.caps.max_messages = 6;
+    try std.testing.expectEqual(@as(u64, 3), queue_handler_mod.countQueue(&shard, .default, queue));
+    var rounds: u32 = 0;
+    while (queue_handler_mod.countQueue(&shard, .default, queue) < 6 and rounds < 5) : (rounds += 1) {
+        var pit = shard.processing_handler.pipelines.valueIterator();
+        while (pit.next()) |pipe| pipe.last_poll_ms = 0;
+        _ = shard.processing_handler.tickPipelines(&shard);
+        _ = shard.applyCommitted();
+    }
+    try std.testing.expectEqual(@as(u64, 6), queue_handler_mod.countQueue(&shard, .default, queue));
+}
+
+test "Shard: a queue sink's write to another shard's queue, refused at apply there, is counted dropped by that shard" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const queues = [_]*queue_handler_mod.QueueHandler{ a.queue_handler, b.queue_handler };
+    for (&two.shards) |*s| {
+        s.wireHandlerShardPtrs();
+        s.processing_handler.setPeerQueueHandlers(&queues);
+    }
+    b.queue_handler.caps.max_messages = 3;
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    var qbuf: [16]u8 = undefined;
+    var qi: usize = 0;
+    const queue = while (true) : (qi += 1) {
+        const q = try std.fmt.bufPrint(&qbuf, "q{d}", .{qi});
+        if (a.router.hashToShard(node_router.routeNsKey(.default, q)) == 1) break q;
+    };
+    for ([_][]const u8{ "r0", "r1", "r2" }) |r| _ = try a.stream_handler.appendPayloadToStream(source, "default", r);
+    // Shard 1's queue is full.
+    for (0..3) |_| try queue_handler_mod.enqueueHere(b, queue, "other");
+    two.settle();
+
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [256]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: far
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\sinks:
+        \\  - name: out
+        \\    queue: {{ name: {s} }}
+    , .{ source, queue });
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    const pipe = pit.next().?;
+    pipe.last_poll_ms = 0;
+    _ = a.processing_handler.tickPipelines(a);
+    two.settle();
+
+    // Shard 1 refused all three at apply and counted them; shard 0 saw
+    // none of it.
+    try std.testing.expectEqual(@as(u64, 3), queue_handler_mod.countQueue(b, .default, queue));
+    try std.testing.expectEqual(@as(u64, 3), b.processing_handler.sink_drops);
+    try std.testing.expectEqual(@as(u64, 0), a.processing_handler.sink_drops);
+    try std.testing.expectEqual(@as(usize, 0), a.processing_handler.pending_sinks);
+    // A client's enqueue refused at apply isn't a sink's: not counted.
+    _ = try queue_handler_mod.proposeEnqueue(b, queue, "client");
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 3), queue_handler_mod.countQueue(b, .default, queue));
+    try std.testing.expectEqual(@as(u64, 3), b.processing_handler.sink_drops);
+}
+
 test "Shard: a pipeline's KV sinks send another shard no more than its inbox has room for, so a tick isn't held at the same record every time" {
     var two: TwoShards = undefined;
     try two.init();
@@ -10135,7 +10436,7 @@ test "Shard: a pipeline's KV sinks send another shard no more than its inbox has
     var sbuf: [16]u8 = undefined;
     const source = try keyOn(a, .default, 0, &sbuf);
     const records = 600;
-    for (0..records) |_| try a.stream_handler.appendPayloadToStream(source, "default", "v");
+    for (0..records) |_| _ = try a.stream_handler.appendPayloadToStream(source, "default", "v");
     two.settle();
 
     const c = try TestClient.open(a);
@@ -10217,7 +10518,7 @@ test "Shard: a pipeline tick held partway through a batch resumes at the record 
     try w.writeAll("{\"order\":{\"items\":[");
     for (0..fanout) |j| try w.print("{s}{{\"sku\":\"{s}\"}}", .{ if (j == 0) "" else ",", sku });
     try w.writeAll("]}}");
-    for (0..records) |_| try a.stream_handler.appendPayloadToStream(source, "default", w.buffered());
+    for (0..records) |_| _ = try a.stream_handler.appendPayloadToStream(source, "default", w.buffered());
     two.settle();
 
     const c = try TestClient.open(a);
@@ -12202,7 +12503,7 @@ test "Shard: a pipeline's stream read finds a namespace by the node's table only
     // Shard 0 creates it and appends behind the create; both apply, and
     // nothing is published yet.
     try std.testing.expect(a.namespace_handler.proposeCreateOn(a.raft_node, "fresh") == .proposed);
-    try a.stream_handler.appendPayloadToStream("s", "fresh", "x");
+    _ = try a.stream_handler.appendPayloadToStream("s", "fresh", "x");
     _ = a.applyCommitted();
     try std.testing.expect(two.namespaces.lookup("fresh") == null);
     const sh = a.stream_handler;
@@ -23628,7 +23929,7 @@ test "Shard: a processing sink whose shard is capped while apply is suspended ho
     const records = 1500;
     for (0..records) |k| {
         var pbuf: [16]u8 = undefined;
-        try sh.stream_handler.appendPayloadToStream("in", "default", try std.fmt.bufPrint(&pbuf, "rec-{d}", .{k}));
+        _ = try sh.stream_handler.appendPayloadToStream("in", "default", try std.fmt.bufPrint(&pbuf, "rec-{d}", .{k}));
         if (k % 256 == 0) _ = sh.applyCommitted();
     }
     _ = sh.applyCommitted();
@@ -23821,7 +24122,7 @@ test "Shard: a stream trigger whose shard is capped while apply is suspended kee
     const events = 1500;
     for (0..events) |k| {
         var pbuf: [16]u8 = undefined;
-        try sh.stream_handler.appendPayloadToStream("events", "default", try std.fmt.bufPrint(&pbuf, "ev-{d}", .{k}));
+        _ = try sh.stream_handler.appendPayloadToStream("events", "default", try std.fmt.bufPrint(&pbuf, "ev-{d}", .{k}));
         if (k % 256 == 0) _ = sh.applyCommitted();
     }
     var passes: u32 = 0;
@@ -24285,7 +24586,7 @@ test "Shard: boot replay finds the same bars as live apply did, and the same byt
         // from the minimum; a few KV puts move the state between them.
         const payload = @as([200]u8, @splat('s'));
         for (0..40) |i| {
-            try shard.stream_handler.appendPayloadToStream("s", "default", &payload);
+            _ = try shard.stream_handler.appendPayloadToStream("s", "default", &payload);
             if (i % 8 == 0) {
                 var kbuf: [16]u8 = undefined;
                 _ = try @import("../kv/handler.zig").KVHandler.testProposePut(&shard, try std.fmt.bufPrint(&kbuf, "k{d}", .{i}), "v");
