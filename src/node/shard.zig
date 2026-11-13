@@ -8214,8 +8214,13 @@ test "Shard: init and deinit" {
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
 
+    // Its mapped buffers bypass the testing allocator's leak check: they
+    // are counted, and every one comes back at deinit.
+    const mapped = large_buffer.mapped_bytes.load(.monotonic);
     var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer std.testing.expectEqual(mapped, large_buffer.mapped_bytes.load(.monotonic)) catch @panic("a shard's mapped buffer was not freed");
     defer shard.deinit();
+    try std.testing.expect(large_buffer.mapped_bytes.load(.monotonic) > mapped);
 
     try std.testing.expectEqual(@as(u16, 0), shard.id);
     try std.testing.expectEqual(@as(u32, 0), shard.connectionCount());

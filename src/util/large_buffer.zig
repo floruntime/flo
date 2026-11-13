@@ -15,17 +15,29 @@
 //!
 //! Smaller buffers go to the caller's allocator as before, and each is freed
 //! the way it was allocated, which its size decides.
+//!
+//! A mapped buffer bypasses the caller's allocator, so a test's leak check
+//! doesn't see one that is never freed. Debug builds count the bytes mapped
+//! (`mapped_bytes`), and the shard's init-and-deinit test checks they all
+//! come back.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// From this size up, a buffer is mapped.
 pub const MIN_BYTES: usize = 1024 * 1024;
 
+const counted = builtin.mode == .debug;
+
+/// Bytes mapped and not yet freed, in a debug build; 0 otherwise.
+pub var mapped_bytes: std.atomic.Value(usize) = .init(0);
+
 pub fn alloc(allocator: std.mem.Allocator, comptime T: type, n: usize) error{OutOfMemory}![]T {
-    const bytes = n * @sizeOf(T);
+    const bytes = std.math.mul(usize, n, @sizeOf(T)) catch return error.OutOfMemory;
     if (bytes < MIN_BYTES) return allocator.alloc(T, n);
     // `rawAlloc`, not `alloc`: the interface's `alloc` is what fills.
     const ptr = std.heap.page_allocator.rawAlloc(bytes, .of(T), @returnAddress()) orelse return error.OutOfMemory;
+    if (counted) _ = mapped_bytes.fetchAdd(bytes, .monotonic);
     const typed: [*]T = @ptrCast(@alignCast(ptr));
     return typed[0..n];
 }
@@ -34,9 +46,14 @@ pub fn free(allocator: std.mem.Allocator, comptime T: type, buf: []T) void {
     const bytes = buf.len * @sizeOf(T);
     if (bytes < MIN_BYTES) return allocator.free(buf);
     std.heap.page_allocator.rawFree(std.mem.sliceAsBytes(buf), .of(T), @returnAddress());
+    if (counted) _ = mapped_bytes.fetchSub(bytes, .monotonic);
 }
 
 test "large buffer: a mapped buffer reads zeros, not the safe-mode fill, and a small one is the allocator's" {
+    const before = mapped_bytes.load(.monotonic);
+    defer std.testing.expectEqual(before, mapped_bytes.load(.monotonic)) catch @panic("a mapped buffer was not freed");
+    // A size that overflows is refused, not wrapped.
+    try std.testing.expectError(error.OutOfMemory, alloc(std.testing.allocator, u64, std.math.maxInt(usize) / 4));
     const big = try alloc(std.testing.allocator, u8, MIN_BYTES);
     defer free(std.testing.allocator, u8, big);
     try std.testing.expectEqual(@as(u8, 0), big[0]);
