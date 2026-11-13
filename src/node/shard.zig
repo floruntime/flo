@@ -5025,6 +5025,12 @@ pub const Shard = struct {
         // over it (after an async-flush rewind, say) would make it neither
         // its own history nor the group's, so it stays as it was.
         if (self.applying or self.offline != null or self.replica.diverged) return true;
+        // With sync durability a leader's writes commit only once on disk:
+        // flushing first lets what that commits apply now. Before any return
+        // below: a halted leader's own repair skip, or a write while a read
+        // is blocked, still has to reach disk to commit, and this is the
+        // tick's one flush.
+        self.syncFlushIfNeeded();
         // Blocked on a read and still inside the back-off: don't probe the disk
         // again this call. apply runs after every request, so re-attempting
         // here would mean one disk read per request and one log line per retry.
@@ -5039,9 +5045,6 @@ pub const Shard = struct {
             self.answerHaltedPending();
             return false;
         }
-        // With sync durability a leader's writes commit only once on disk:
-        // flushing first lets what that commits apply now.
-        self.syncFlushIfNeeded();
         // Suspended at a bar: after the flush, so a sync leader still makes
         // its writes durable and commits them; they apply on resume. Replies
         // held for entries at or below the bar go now.
@@ -18902,9 +18905,16 @@ const AdminTest = struct {
     conn: *Connection,
 
     fn init(self: *AdminTest, node_id: u32, role: ClusterRole) !void {
+        return self.initWith(node_id, role, null, .async_flush);
+    }
+
+    /// `init`, keeping its log in `data_dir` under `durability`.
+    fn initWith(self: *AdminTest, node_id: u32, role: ClusterRole, data_dir: ?[]const u8, durability: Durability) !void {
         self.pipe_fds = try @import("stdx").io.pipe();
         self.rn = try RaftNetwork.init(std.testing.allocator, node_id, 0, 9000, .{ 127, 0, 0, 1 }, "s");
-        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, node_id, role, .{}, .{});
+        // As the server sets it: under sync a leader counts its own copy only
+        // once it is on disk.
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, durability, node_id, role, .{ .self_counts_when_durable = durability == .sync }, .{});
         self.shard.raft_network = &self.rn;
         self.shard.wireHandlerShardPtrs();
         try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &self.pair));
@@ -21920,6 +21930,41 @@ test "Shard: a repair skip runs only from the admin socket, on a leader halted a
     // Asked again, it is skipped already, not a build split.
     t.conn.response_deferred = false;
     try expectAnswer((try t.repairSkip(.admin, h, false, &buf)).?, .bad_request, "skipped already");
+}
+
+test "Shard: a halted sync leader flushes its own repair skip, which commits only once its copy is on disk" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    var t: AdminTest = undefined;
+    try t.initWith(1, .bootstrap, data_dir, .sync);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    try std.testing.expect(t.shard.applyCommitted());
+    try ParkTest.joinPeer(&t.shard);
+    var buf: [1024]u8 = undefined;
+    // An entry every replica fails, committed by the peer and this
+    // leader's own flushed copy: it halts there.
+    const h = (try raft.propose(.cg_create, entry_mod.Flags.NONE, "")).index;
+    _ = t.shard.applyCommitted();
+    raft.peers[0].sent_up_to = h;
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = h, .from = 2 });
+    try std.testing.expect(!t.shard.applyCommitted());
+    const halt = raft.halt_at.?;
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = h, .from = 2, .halt = halt });
+    // Its skip, acked by the peer: one of two voters until this leader's
+    // copy is on disk, which only its apply pass flushes, halted or not.
+    try std.testing.expect((try t.repairSkip(.peer, h, true, &buf)) == null);
+    const s = raft.log.lastIndex();
+    raft.peers[0].sent_up_to = s;
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = s, .from = 2, .halt = halt });
+    try std.testing.expect(raft.commit_index < s);
+    _ = t.shard.applyCommitted();
+    try std.testing.expect(raft.durable_index >= s);
+    try std.testing.expect(raft.commit_index >= s);
+    _ = t.shard.applyCommitted();
+    try std.testing.expect(t.shard.halted == null);
 }
 
 test "Shard: a leader that applied the entry its followers halted at says to upgrade them, not to skip it" {
