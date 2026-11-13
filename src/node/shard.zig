@@ -1753,7 +1753,8 @@ pub const Shard = struct {
 
     /// A client's request: walked across shards, sent to the shard that
     /// owns it, or run here. Walk opcodes (list/scan) aggregate across
-    /// shards unless the pre-route narrows to a single partition.
+    /// shards unless the pre-route names a key, which narrows them to its
+    /// slot's shard.
     fn route(self: *Shard, conn: *Connection, req: proto.Request, auth: run_mod.Authorized) void {
         conn.recordRequest();
         self.requests_dispatched += 1;
