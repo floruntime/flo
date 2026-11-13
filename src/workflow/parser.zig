@@ -41,7 +41,6 @@ pub const SearchAttrType = definition.SearchAttrType;
 pub const InlinePlan = definition.InlinePlan;
 pub const ScheduleDef = definition.ScheduleDef;
 pub const StreamTriggerDef = definition.StreamTriggerDef;
-pub const TriggerMode = definition.TriggerMode;
 pub const RetryPolicy = plan_types.RetryPolicy;
 pub const BackoffType = plan_types.BackoffType;
 pub const ExecutorConfig = plan_types.ExecutorConfig;
@@ -636,8 +635,6 @@ pub const MAX_TRIGGER_STREAM = @import("../protocol/limits.zig").MAX_QUALIFIED_K
 /// trigger:
 ///   stream: "orders"               # source stream (required)
 ///   namespace: "prod"              # source namespace (optional)
-///   consumer_group: "wf-orders"    # consumer group name (optional)
-///   mode: shared                   # shared | exclusive | key_shared
 ///   batch_size: 1                  # events per workflow run
 ///   batch_timeout_ms: 5000
 /// ```
@@ -645,30 +642,28 @@ fn parseTrigger(allocator: Allocator, root: JsonValue, d: D) ParseError!?StreamT
     const trig_obj = try optObject(d, root, "trigger") orelse return null;
     const mark = d.push("trigger");
     defer d.pop(mark);
-    try checkKeys(d, trig_obj, &.{ "stream", "namespace", "consumer_group", "mode", "batch_size", "batch_timeout_ms" });
+    // Once accepted and never read: a trigger reads its stream with its own
+    // cursor, so neither has anything to set.
+    inline for (.{ "consumer_group", "mode" }) |gone| if (trig_obj.object.get(gone) != null)
+        return d.fail(ParseError.UnknownKey, "\"{s}\" is not a trigger option: a trigger reads its stream with its own cursor, each event once, in order", .{gone});
+    try checkKeys(d, trig_obj, &.{ "stream", "namespace", "batch_size", "batch_timeout_ms" });
 
     const stream = try reqString(d, trig_obj, "stream");
     if (stream.len == 0) return d.fail(ParseError.InvalidFieldType, "\"stream\" must not be empty", .{});
     // No stream has a longer name; the runs it starts carry it in their key.
     if (stream.len > MAX_TRIGGER_STREAM) return d.fail(ParseError.InvalidFieldType, "a stream name is at most {d} bytes, not {d}", .{ MAX_TRIGGER_STREAM, stream.len });
     const namespace = try optString(d, trig_obj, "namespace");
-    const consumer_group = try optString(d, trig_obj, "consumer_group");
-    const mode = try oneOf(TriggerMode, d, "mode", try optString(d, trig_obj, "mode") orelse "shared", &.{
-        .{ "shared", .shared }, .{ "exclusive", .exclusive }, .{ "key_shared", .key_shared },
-    }, ParseError.InvalidFieldType);
     const batch_size = try optIntAs(u32, d, trig_obj, "batch_size") orelse 1;
     if (batch_size == 0) return d.fail(ParseError.InvalidFieldType, "\"batch_size\" must be at least 1", .{});
     const batch_timeout_ms = try optIntAs(u32, d, trig_obj, "batch_timeout_ms") orelse 5000;
 
     var trig = StreamTriggerDef{
         .stream = try dupe(allocator, stream),
-        .mode = mode,
         .batch_size = batch_size,
         .batch_timeout_ms = batch_timeout_ms,
     };
     errdefer trig.deinit(allocator);
     if (namespace) |ns| trig.namespace = try dupe(allocator, ns);
-    if (consumer_group) |cg| trig.consumer_group = try dupe(allocator, cg);
     return trig;
 }
 
@@ -1238,6 +1233,12 @@ test "parseWorkflow: a retry on a plan step is refused" {
     , ParseError.UnknownKey, "a plan step takes no \"retry\"; each executor retries by its own policy at start");
 }
 
+test "parseWorkflow: a trigger's consumer_group or mode is refused, naming why" {
+    const why = " is not a trigger option: a trigger reads its stream with its own cursor, each event once, in order at trigger";
+    try expectRefused(wrap("", "\"trigger\": { \"stream\": \"s\", \"consumer_group\": \"g\" },"), ParseError.UnknownKey, "\"consumer_group\"" ++ why);
+    try expectRefused(wrap("", "\"trigger\": { \"stream\": \"s\", \"mode\": \"exclusive\" },"), ParseError.UnknownKey, "\"mode\"" ++ why);
+}
+
 test "parseWorkflow: a trigger naming a stream longer than any stream is refused" {
     const name = comptime stdx.repeat("s", (MAX_TRIGGER_STREAM + 1));
     try expectRefused(wrap("", "\"trigger\": { \"stream\": \"" ++ name ++ "\" },"), ParseError.InvalidFieldType, std.fmt.comptimePrint("a stream name is at most {d} bytes, not {d} at trigger", .{ MAX_TRIGGER_STREAM, MAX_TRIGGER_STREAM + 1 }));
@@ -1267,7 +1268,6 @@ test "parseWorkflow: a value of the wrong kind is refused, not defaulted" {
 test "parseWorkflow: an unknown enum value is refused, not defaulted" {
     try expectRefused(wrap("\"retry\": { \"backoff\": \"exp-jitter-200ms\" },", ""), ParseError.InvalidBackoffType, "\"backoff\" must be one of constant|linear|exponential|exponential_jitter, not \"exp-jitter-200ms\" at start.retry");
     try expectRefused(wrap("", "\"terminals\": { \"T\": { \"status\": \"done\" } },"), ParseError.InvalidFieldType, "\"status\" must be one of completed|failed|cancelled|timed_out, not \"done\" at terminals.T");
-    try expectRefused(wrap("", "\"trigger\": { \"stream\": \"s\", \"mode\": \"key-shared\" },"), ParseError.InvalidFieldType, "\"mode\" must be one of shared|exclusive|key_shared, not \"key-shared\" at trigger");
     try expectRefused(wrap("",
         \\"plans": { "p": { "selection": "round_robin", "executors": [ { "name": "e", "run": "@actions/e" } ] } },
     ), ParseError.InvalidSelectionStrategy, "\"selection\" must be one of static-order|round-robin|random|health-weighted, not \"round_robin\" at plans.p");
@@ -1321,7 +1321,6 @@ test "parseWorkflow: snake_case keys parse" {
         \\    from: $.input.customer
         \\trigger:
         \\  stream: orders
-        \\  consumer_group: g
         \\  batch_size: 2
         \\  batch_timeout_ms: 100
         \\plans:
@@ -1371,7 +1370,6 @@ test "parseWorkflow: snake_case keys parse" {
     try std.testing.expectEqualStrings("{\"a\": \"$.input.a\"}", def.start.run.input_mapping.?);
     try std.testing.expectEqual(@as(u32, 2), def.start.run.poll.?.max_attempts);
     try std.testing.expectEqual(@as(?i64, 1000), def.steps[0].step.wait_for_signal.timeout_ms);
-    try std.testing.expectEqualStrings("g", def.trigger.?.consumer_group.?);
     try std.testing.expectEqual(@as(?u32, 5), def.plans[0].executors[0].rate_limit.?.max_per_second);
     try std.testing.expectEqual(@as(u32, 10), def.plans[0].health_config.?.min_samples);
     try std.testing.expectEqual(@as(i64, 60000), def.plans[0].health_config.?.window_ms);

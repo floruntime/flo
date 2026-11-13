@@ -95,6 +95,8 @@ pub const ProcessingHandler = struct {
     /// more writes for now: the pipeline stops and keeps its cursor, and the
     /// next tick reads the batch again (at-least-once), so nothing is dropped.
     sink_overloaded: bool = false,
+    /// When a held pipeline was last said to be waiting (`noteHeld`).
+    held_warn_ms: i64 = 0,
 
     /// Per-job pipeline execution state (keyed by same job_id as jobs map).
     pipelines: std.StringHashMap(PipelineState),
@@ -197,6 +199,9 @@ pub const ProcessingHandler = struct {
         last_read_count: u32 = 0,
         /// Highest event-time watermark observed (0 = none / processing-time source).
         watermark_ms: i64 = 0,
+        /// When its ticks began stopping for room in a sink's shard; 0 while
+        /// they complete.
+        held_since_ms: i64 = 0,
         /// Per-tick processing time (ns) over productive ticks: last/max/sum/count.
         tick_ns_last: u64 = 0,
         tick_ns_max: u64 = 0,
@@ -1686,11 +1691,13 @@ pub const ProcessingHandler = struct {
                 self.writeSinkRecord(pipe, shard, json, pt.field_value, pt.timestamp_ns, shard.ts_handler.ts.tagsForHash(src_ns, pt.tag_hash), 0);
             }
 
-            // A sink found the shard full: this tick's points are read again
-            // next tick, from where it began.
+            // A sink found its shard full: the next tick reads again from
+            // this point's time. Points before it at that time are written
+            // again; those before it are not.
             if (self.sink_overloaded) {
                 self.sink_overloaded = false;
-                pipe.ts_cursor_ns = cursor_before;
+                pipe.ts_cursor_ns = @max(cursor_before, pt.timestamp_ns);
+                self.noteHeld(shard, pipe);
                 return;
             }
 
@@ -1705,6 +1712,7 @@ pub const ProcessingHandler = struct {
             job.records_processed += 1;
             pipe.records_in += 1;
         }
+        pipe.held_since_ms = 0;
         // As a stream source does: a restart resumes here, not from the
         // measurement's first point.
         maybePersistCheckpoint(pipeline_key, pipe, shard, job.ns_id);
@@ -1740,7 +1748,7 @@ pub const ProcessingHandler = struct {
         // outputs are written.
         var arena = std.heap.ArenaAllocator.init(shard.allocator);
         defer arena.deinit();
-        for (result.payloads) |payload| {
+        for (result.payloads, 0..) |payload, i| {
             defer _ = arena.reset(.retain_capacity);
             log.debug("tickStreamSource: payload len={d} first100='{s}'", .{ payload.len, if (payload.len > 100) payload[0..100] else payload });
             const output_records = applyOperatorChain(pipe.operators, payload, @import("stdx").time.milliTimestamp(), arena.allocator()) catch |err| blk: {
@@ -1759,10 +1767,15 @@ pub const ProcessingHandler = struct {
                 self.writeSinkRecordFromStream(pipe, shard, "", payload, 0);
             }
 
-            // A sink found the shard full: the batch is read again next tick,
-            // from the same cursor.
+            // A sink found its shard full: the next tick reads again from
+            // this record, every sink of those before it written.
             if (self.sink_overloaded) {
                 self.sink_overloaded = false;
+                if (i > 0) {
+                    pipe.stream_cursor_ts = result.ids[i - 1].timestamp_ms;
+                    pipe.stream_cursor_seq = result.ids[i - 1].sequence;
+                }
+                self.noteHeld(shard, pipe);
                 return;
             }
 
@@ -1773,6 +1786,7 @@ pub const ProcessingHandler = struct {
         // Advance cursor to last StreamID read
         pipe.stream_cursor_ts = result.last_id.timestamp_ms;
         pipe.stream_cursor_seq = result.last_id.sequence;
+        pipe.held_since_ms = 0;
 
         // Persist the advanced cursor durably (throttled) so the pipeline
         // resumes from here after restart instead of re-reading from the start.
@@ -1849,6 +1863,20 @@ pub const ProcessingHandler = struct {
         self.sink_overloaded = true;
     }
 
+    /// A tick stopped for room. A pipeline held this long by the same full
+    /// shard is said so, once per interval, as a stuck one would be.
+    fn noteHeld(self: *ProcessingHandler, shard: *Shard, pipe: *PipelineState) void {
+        if (shard.metrics_registry) |m| m.processing.recordHeldTick();
+        const now = @import("stdx").time.milliTimestamp();
+        if (pipe.held_since_ms == 0) pipe.held_since_ms = now;
+        const held_for = now - pipe.held_since_ms;
+        if (held_for < HELD_WARN_MS or now - self.held_warn_ms < 30_000) return;
+        self.held_warn_ms = now;
+        log.warn("job '{s}': a pipeline has waited {d} s for room in a sink's shard", .{ self.ticking_job, @divTrunc(held_for, 1000) });
+    }
+
+    const HELD_WARN_MS: i64 = 30_000;
+
     /// How many source records a tick may take now: the writes this shard
     /// can still propose before its cap, shared among the pipeline's sinks
     /// that propose here. An operator that emits several records per input
@@ -1859,10 +1887,24 @@ pub const ProcessingHandler = struct {
         // One spare, for a sink namespace's implicit create.
         const room = raft_node_mod.MAX_OUTSTANDING -| used -| 1;
         var proposing: usize = 0;
+        var kv_sinks: usize = 0;
         for (pipe.sinks) |snk| {
             if (snk.kind != .ts) proposing += 1;
+            if (snk.kind == .kv) kv_sinks += 1;
         }
-        return @intCast(room / @max(proposing, 1));
+        const log_room = room / @max(proposing, 1);
+        // A KV sink's write for a key on another shard goes through that
+        // shard's inbox, which no larger batch fits: a send it refuses holds
+        // the tick, and a batch that never fits would be refused at the same
+        // record every tick.
+        const mailboxes = shard.peer_mailboxes orelse return log_room;
+        if (kv_sinks == 0 or mailboxes.len <= 1) return log_room;
+        var inbox_room: usize = std.math.maxInt(usize);
+        for (mailboxes, 0..) |mb, i| {
+            if (i == shard.id) continue;
+            inbox_room = @min(inbox_room, mb.inbox.capacity -| mb.inbox.pending());
+        }
+        return @min(log_room, inbox_room / kv_sinks);
     }
 
     pub fn noteSinkDrop(self: *ProcessingHandler, metrics: ?*MetricsRegistry, kind: []const u8, target: []const u8, why: []const u8) void {
@@ -2044,8 +2086,8 @@ pub const ProcessingHandler = struct {
     /// KV sink: write the record under `key_prefix + separator + record_key`
     /// on the shard that owns that key, so a later `kv get` finds it: here,
     /// or, when another shard owns it, by a message that shard proposes
-    /// from. A message to a full inbox is not retried: the record is lost,
-    /// and counted, until channels give sinks durable delivery.
+    /// from. A full inbox holds the source as a full log does, so the batch
+    /// is read and sent again.
     fn writeKvSink(self: *ProcessingHandler, snk: SinkConfig, shard: *Shard, record_key: []const u8, payload: []const u8) void {
         var key_buf: [MAX_SINK_KEY]u8 = undefined;
         const full_key = self.kvSinkKeyOrDrop(&key_buf, snk, shard.metrics_registry, record_key) orelse return;
@@ -2053,9 +2095,10 @@ pub const ProcessingHandler = struct {
         if (std.mem.indexOfScalar(u8, full_key, 0) != null) return self.noteSinkDrop(shard.metrics_registry, "kv", full_key, "key must not contain NUL");
         const owner = self.kvOwner(shard, snk.namespace, full_key);
         if (owner == shard.id) {
-            if (kv_handler_mod.KVHandler.sinkPropose(shard, snk.namespace, full_key, payload, snk.kv_ttl_ms)) |why| {
-                if (why.ptr == kv_handler_mod.KVHandler.SINK_OVERLOADED.ptr) return self.holdForRoom();
-                self.noteSinkDrop(shard.metrics_registry, "kv", full_key, why);
+            switch (kv_handler_mod.KVHandler.sinkPropose(shard, snk.namespace, full_key, payload, snk.kv_ttl_ms)) {
+                .proposed => {},
+                .held => self.holdForRoom(),
+                .dropped => |why| self.noteSinkDrop(shard.metrics_registry, "kv", full_key, why),
             }
             return;
         }
@@ -2064,13 +2107,13 @@ pub const ProcessingHandler = struct {
         if (!shard.peer_mailboxes.?[owner].inbox.send(.{ .tag = .kv_sink_put, .src_shard = @intCast(shard.id), .payload_len = @intCast(message.len), .payload_ptr = message.ptr })) {
             shard.allocator.free(message);
             if (shard.shard_metrics) |sm| sm.recordCrossShardOverloaded(.engine);
-            self.noteSinkDrop(shard.metrics_registry, "kv", full_key, "the owning shard's inbox is full; the record is lost");
+            self.holdForRoom();
         }
     }
 
     /// The shard that owns KV `key` in `namespace`: this one when there are
     /// no others to send to.
-    fn kvOwner(self: *const ProcessingHandler, shard: *const Shard, namespace: []const u8, key: []const u8) u16 {
+    pub fn kvOwner(self: *const ProcessingHandler, shard: *const Shard, namespace: []const u8, key: []const u8) u16 {
         const mailboxes = shard.peer_mailboxes orelse return @intCast(shard.id);
         if (mailboxes.len <= 1 or self.peer_partition_count == 0 or self.peer_shard_count == 0) return @intCast(shard.id);
         const owner = self.peerShardId(namespace, key);
