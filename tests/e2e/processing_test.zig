@@ -3005,7 +3005,7 @@ test "e2e/processing: kv_lookup is refused on a server of more than one shard" {
     try testing.expect(!listed.contains("e2e-kvlookup-shards"));
 }
 
-test "e2e/processing: on 4 shards, stream sinks outside default on another shard are refused at submit, and in default they run" {
+test "e2e/processing: on 4 shards, stream sinks run on every shard, in a namespace and in default" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
     defer ctx.deinit();
     try ctx.exec(&.{ "ns", "create", "rv4" });
@@ -3020,30 +3020,20 @@ test "e2e/processing: on 4 shards, stream sinks outside default on another shard
         \\sinks.[6].stream.name: rv-out6
         \\sinks.[7].stream.name: rv-out7
     ;
-    const in_rv4 = try writeDottedToTempYaml(testing.allocator, "kind: Processing\nname: rv-pass\nnamespace: rv4\n" ++ sinks, "e2e-rv4.yaml");
-    defer cleanupTempFile(testing.allocator, in_rv4);
-    var refused = try ctx.cli.run(&.{ "processing", "submit", in_rv4, "-n", "rv4" });
-    defer refused.deinit();
-    try testing.expectEqual(@as(u8, 3), refused.exit_code);
-    try testing.expect(refused.contains("sink outside the default namespace must be on the job's shard"));
-    var listed = try ctx.cli.run(&.{ "processing", "list", "-n", "rv4" });
-    defer listed.deinit();
-    try testing.expectEqual(@as(u8, 0), listed.exit_code);
-    try testing.expect(!listed.contains("rv-pass"));
-    // Every shard still takes writes in rv4.
     var buf: [16]u8 = undefined;
-    for (0..8) |i| try ctx.exec(&.{ "stream", "append", try std.fmt.bufPrint(&buf, "rv-out{d}", .{i}), "direct", "-n", "rv4" });
-
-    // In default, the same sinks run, on every shard.
-    const in_default = try writeDottedToTempYaml(testing.allocator, "kind: Processing\nname: rv-pass\n" ++ sinks, "e2e-rv-default.yaml");
-    defer cleanupTempFile(testing.allocator, in_default);
-    const out = try ctx.execCapture(&.{ "processing", "submit", in_default });
-    _ = extractJobId(out) orelse return error.NoJobId;
-    try ctx.exec(&.{ "stream", "append", "rv-in", "hello-pipeline" });
-    for (0..8) |i| {
-        if (!try readStreamBlocking(ctx, try std.fmt.bufPrint(&buf, "rv-out{d}", .{i}), "default", "hello-pipeline", "8000")) {
-            ctx.dumpServerLogs();
-            return error.SinkRecordMissing;
+    for ([_][]const u8{ "rv4", "default" }) |ns| {
+        var ybuf: [512]u8 = undefined;
+        const yaml = try std.fmt.bufPrint(&ybuf, "kind: Processing\nname: rv-pass\nnamespace: {s}\n" ++ sinks, .{ns});
+        const path = try writeDottedToTempYaml(testing.allocator, yaml, "e2e-rv.yaml");
+        defer cleanupTempFile(testing.allocator, path);
+        const out = try ctx.execCapture(&.{ "processing", "submit", path, "-n", ns });
+        _ = extractJobId(out) orelse return error.NoJobId;
+        try ctx.exec(&.{ "stream", "append", "rv-in", "hello-pipeline", "-n", ns });
+        for (0..8) |i| {
+            if (!try readStreamBlocking(ctx, try std.fmt.bufPrint(&buf, "rv-out{d}", .{i}), ns, "hello-pipeline", "8000")) {
+                ctx.dumpServerLogs();
+                return error.SinkRecordMissing;
+            }
         }
     }
 }
@@ -3245,7 +3235,7 @@ fn drainUntilAll(ctx: *stdx.testing.TestContext, queue: []const u8) ![CAPPED_REC
     return seen;
 }
 
-test "e2e/processing: on 4 shards, a queue sink on its job's shard holds at its cap and loses nothing; one on another shard loses what its cap refuses, counted there" {
+test "e2e/processing: on 4 shards, queue sinks at their cap lose nothing: on the job's shard the source waits, on another the writes wait there" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{
         .shards = 4,
         .metrics_enabled = true,
@@ -3292,23 +3282,15 @@ test "e2e/processing: on 4 shards, a queue sink on its job's shard holds at its 
 
     const seen = try drainUntilAll(ctx, local);
     for (seen) |n| try testing.expectEqual(@as(usize, 1), n);
-    // The far queue kept the first two; the other four were refused at its
-    // shard's apply and counted dropped there.
-    var dropped: ?u64 = null;
-    for (0..40) |_| {
-        var http = try ctx.createMetricsHttp();
-        defer http.deinit();
-        var resp = try http.get("/metrics");
-        defer resp.deinit();
-        dropped = metricValue(resp.body, "flo_processing_records_dropped_total");
-        if (dropped == 4) break;
-        stdx.time.sleep(250 * std.time.ns_per_ms);
-    }
-    try testing.expectEqual(@as(?u64, 4), dropped);
-    var far = try ctx.cli.run(&.{ "queue", "dequeue", remote, "--count", "10", "--ack" });
-    defer far.deinit();
-    try testing.expectEqual(@as(u8, 0), far.exit_code);
-    for (CAPPED_RECORDS, 0..) |r, k| try testing.expectEqual(@as(usize, if (k < 2) 1 else 0), std.mem.count(u8, far.stdout, r));
+    // The far queue holds the first two; the other four wait on its shard,
+    // nothing dropped, and come as it drains, once each.
+    var http = try ctx.createMetricsHttp();
+    defer http.deinit();
+    var resp = try http.get("/metrics");
+    defer resp.deinit();
+    try testing.expectEqual(@as(?u64, 0), metricValue(resp.body, "flo_processing_records_dropped_total"));
+    const far = try drainUntilAll(ctx, remote);
+    for (far) |n| try testing.expectEqual(@as(usize, 1), n);
 }
 
 /// An unlabeled `name <value>` series from a Prometheus body.
@@ -3320,4 +3302,143 @@ fn metricValue(body: []const u8, name: []const u8) ?u64 {
         return std.fmt.parseInt(u64, std.mem.trim(u8, line[name.len + 1 ..], " \r"), 10) catch continue;
     }
     return null;
+}
+
+// ── Sinks on other shards, under load ─────────────────────────────────────
+
+const STRESS_JOBS = 2;
+const STRESS_RECORDS = 12;
+const STRESS_CLIENT = 4;
+
+/// A name of the form `prefix{n}` that the default namespace puts on `shard` of 4.
+fn nameOn(buf: []u8, prefix: []const u8, shard: u16) ![]const u8 {
+    const router = src.node.router.Router.init(4, 0);
+    var n: usize = 0;
+    while (true) : (n += 1) {
+        const name = try std.fmt.bufPrint(buf, "{s}{d}", .{ prefix, n });
+        if (router.hashToShard(src.node.router.routeNsKey(.default, name)) == shard) return name;
+    }
+}
+
+/// Whether every marker is in `text` at least once.
+fn allSeen(text: []const u8, markers: []const []const u8) bool {
+    for (markers) |m| if (std.mem.indexOf(u8, text, m) == null) return false;
+    return true;
+}
+
+/// Each marker is in `text` exactly once.
+fn expectEachOnce(text: []const u8, markers: []const []const u8, where: []const u8) !void {
+    for (markers) |m| {
+        const n = std.mem.count(u8, text, m);
+        if (n != 1) {
+            std.debug.print("{s}: {s} seen {d} times\n", .{ where, m, n });
+            return error.WrongCount;
+        }
+    }
+}
+
+test "e2e/processing: on 4 shards, jobs write queues, streams and a measurement on every shard while clients write them too; each record lands once, and a restart keeps them" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    const a = testing.allocator;
+    var names: [4][2][16]u8 = undefined;
+    var queues: [4][]const u8 = undefined;
+    var streams: [4][]const u8 = undefined;
+    for (0..4) |s| {
+        queues[s] = try nameOn(&names[s][0], "sq", @intCast(s));
+        streams[s] = try nameOn(&names[s][1], "ss", @intCast(s));
+    }
+    var mbuf: [16]u8 = undefined;
+    const measurement = try nameOn(&mbuf, "sm", 3);
+
+    // Every job writes every target; jobs run on shard 0, so most are another shard's.
+    for (0..STRESS_JOBS) |j| {
+        var ybuf: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&ybuf);
+        try w.print("kind: Processing\nname: stress{d}\nsources.[0].name: src\nsources.[0].stream.name: stress-in{d}\n", .{ j, j });
+        for (0..4) |s| try w.print("sinks.[{d}].name: q{d}\nsinks.[{d}].queue.name: {s}\nsinks.[{d}].name: s{d}\nsinks.[{d}].stream.name: {s}\n", .{ 2 * s, s, 2 * s, queues[s], 2 * s + 1, s, 2 * s + 1, streams[s] });
+        try w.print("sinks.[8].name: m\nsinks.[8].ts.measurement: {s}\nsinks.[8].ts.value_field: v\n", .{measurement});
+        var pbuf: [32]u8 = undefined;
+        const path = try writeDottedToTempYaml(a, w.buffered(), try std.fmt.bufPrint(&pbuf, "stress{d}.yaml", .{j}));
+        defer cleanupTempFile(a, path);
+        var submit = try ctx.cli.run(&.{ "processing", "submit", path });
+        defer submit.deinit();
+        try testing.expectEqual(@as(u8, 0), submit.exit_code);
+    }
+    // Sources and clients interleaved: the jobs write while clients do.
+    // Each record carries a marker with no quotes, so it reads the same
+    // however the CLI prints it.
+    var markers: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (markers.items) |m| a.free(m);
+        markers.deinit(a);
+    }
+    var ibuf: [16]u8 = undefined;
+    var jbuf: [64]u8 = undefined;
+    for (0..STRESS_RECORDS) |k| {
+        for (0..STRESS_JOBS) |j| {
+            const m = try std.fmt.allocPrint(a, "j{d}r{d}x", .{ j, k });
+            try markers.append(a, m);
+            try ctx.exec(&.{ "stream", "append", try std.fmt.bufPrint(&ibuf, "stress-in{d}", .{j}), try std.fmt.bufPrint(&jbuf, "{{\"v\":{d},\"id\":\"{s}\"}}", .{ k, m }) });
+        }
+        if (k < STRESS_CLIENT) {
+            const m = try std.fmt.allocPrint(a, "client{d}x", .{k});
+            try markers.append(a, m);
+            for (0..4) |s| {
+                try ctx.exec(&.{ "queue", "enqueue", queues[s], m });
+                try ctx.exec(&.{ "stream", "append", streams[s], m });
+            }
+        }
+    }
+
+    // Every stream has each record once; so after a restart.
+    var want_buf: [32]u8 = undefined;
+    const want_points = try std.fmt.bufPrint(&want_buf, "{d}.000000", .{STRESS_JOBS * STRESS_RECORDS});
+    for (0..2) |round| {
+        for (streams) |s| {
+            var tries: usize = 0;
+            while (true) : (tries += 1) {
+                var read = try ctx.cli.run(&.{ "stream", "read", s, "--limit", "1000" });
+                defer read.deinit();
+                try testing.expectEqual(@as(u8, 0), read.exit_code);
+                if (allSeen(read.stdout, markers.items) or tries == 120) {
+                    var wbuf: [48]u8 = undefined;
+                    try expectEachOnce(read.stdout, markers.items, try std.fmt.bufPrint(&wbuf, "{s} ({s})", .{ s, if (round == 0) "before the restart" else "after it" }));
+                    break;
+                }
+                stdx.time.sleep(250 * std.time.ns_per_ms);
+            }
+        }
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            const points = try ctx.execCapture(&.{ "ts", "query", measurement, "--from", "1", "--to", "99999999999999", "--window", "1000000h", "--agg", "count", "-o", "raw" });
+            if (std.mem.endsWith(u8, std.mem.trim(u8, points, " \n"), want_points)) break;
+            if (tries == 120) {
+                std.debug.print("ts count: {s}, wanted {s}\n", .{ points, want_points });
+                return error.WrongCount;
+            }
+            stdx.time.sleep(250 * std.time.ns_per_ms);
+        }
+        // Idle past the checkpoint interval, every pipeline's cursor is on
+        // disk, so the restart reads nothing again.
+        if (round == 0) {
+            stdx.time.sleep(3000 * std.time.ns_per_ms);
+            try ctx.restartServer();
+        }
+    }
+
+    // Each queue: every record once.
+    for (queues) |q| {
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(a);
+        var tries: usize = 0;
+        while (!allSeen(got.items, markers.items) and tries < 120) : (tries += 1) {
+            var d = try ctx.cli.run(&.{ "queue", "dequeue", q, "--count", "100", "--ack" });
+            defer d.deinit();
+            try testing.expectEqual(@as(u8, 0), d.exit_code);
+            try got.appendSlice(a, d.stdout);
+            stdx.time.sleep(100 * std.time.ns_per_ms);
+        }
+        try expectEachOnce(got.items, markers.items, q);
+    }
 }
