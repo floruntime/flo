@@ -105,7 +105,6 @@ pub const ProcessingHandler = struct {
     /// Enables pipelines to read/write streams on the shard that owns them.
     peer_stream_handlers: ?[]const *stream_handler_mod.StreamHandler = null,
     peer_shard_count: u16 = 1,
-    peer_partition_count: u32 = 0,
     /// The node's namespace table, wired by the shard: a sink routes by its
     /// namespace's id, as the dispatcher does.
     ns_table: ?*const @import("../namespace/table.zig").Table = null,
@@ -314,13 +313,12 @@ pub const ProcessingHandler = struct {
         return peers[self.peerShardId(namespace, stream_name)];
     }
 
-    /// Shard that owns `key` in `namespace`, using the same composite hash the
-    /// dispatchers use to route stream/kv/queue/ts commands. Sinks resolve through
-    /// this so a write lands on the shard a subsequent read will query.
+    /// Shard that owns `key` in `namespace`, by the router the dispatchers use
+    /// for stream/kv/queue/ts commands. Sinks resolve through this so a write
+    /// lands on the shard a subsequent read will query.
     fn peerShardId(self: *const ProcessingHandler, namespace: []const u8, key: []const u8) u16 {
-        const hash = router.routeNsKey(self.namespaceIdOf(namespace), key);
-        const partition_id: u32 = @intCast(hash % self.peer_partition_count);
-        return @intCast(partition_id % self.peer_shard_count);
+        const r = router.Router.init(self.peer_shard_count, self.own_shard);
+        return r.hashToShard(router.routeNsKey(self.namespaceIdOf(namespace), key));
     }
 
     /// The id of namespace `namespace` (empty is "default") as the node's
@@ -343,7 +341,7 @@ pub const ProcessingHandler = struct {
     fn crossShardSink(self: *const ProcessingHandler, kind: definition.SinkKind, namespace: []const u8, target: []const u8) bool {
         if (kind != .stream and kind != .queue) return false;
         if (std.mem.eql(u8, namespace, "default")) return false;
-        if (self.peer_shard_count <= 1 or self.peer_partition_count == 0) return false;
+        if (self.peer_shard_count <= 1) return false;
         if (self.namespaceIdOf(namespace) == .invalid) return false;
         return self.peerShardId(namespace, target) != self.own_shard;
     }
@@ -389,7 +387,7 @@ pub const ProcessingHandler = struct {
     /// Resolve the TS handler that owns `measurement` in `namespace` (for TS sinks).
     fn resolveTsHandler(self: *ProcessingHandler, local: *ts_handler_mod.TSHandler, namespace: []const u8, measurement: []const u8) *ts_handler_mod.TSHandler {
         const peers = self.peer_ts_handlers orelse return local;
-        if (peers.len <= 1 or self.peer_partition_count == 0 or self.peer_shard_count == 0) return local;
+        if (peers.len <= 1 or self.peer_shard_count == 0) return local;
         const shard_id = self.peerShardId(namespace, measurement);
         return if (shard_id < peers.len) peers[shard_id] else local;
     }
@@ -397,7 +395,7 @@ pub const ProcessingHandler = struct {
     /// Resolve the queue handler that owns `queue_name` in `namespace` (for queue sinks).
     fn resolveQueueHandler(self: *ProcessingHandler, local: *queue_handler_mod.QueueHandler, namespace: []const u8, queue_name: []const u8) *queue_handler_mod.QueueHandler {
         const peers = self.peer_queue_handlers orelse return local;
-        if (peers.len <= 1 or self.peer_partition_count == 0 or self.peer_shard_count == 0) return local;
+        if (peers.len <= 1 or self.peer_shard_count == 0) return local;
         const shard_id = self.peerShardId(namespace, queue_name);
         return if (shard_id < peers.len) peers[shard_id] else local;
     }
@@ -662,28 +660,12 @@ pub const ProcessingHandler = struct {
             },
         };
 
-        // Generate a unique job ID with embedded partition bits.
-        //
-        // The partition MUST route back to the shard that stores this job's
-        // registry entry — i.e. THIS shard. Submit is routed here by
-        // preRouteByProcessing (every submit → partition 0 → shard 0), so the
-        // entry lives in this shard's `self.jobs`. The job_id's partition bits
-        // are how every ID-routed op (status/stop/cancel) finds it again:
-        // partitionToShard = partition % shard_count.
-        //
-        // Deriving the partition from the job *name* (keyToPartitionNs) was
-        // wrong: it resolves to an arbitrary partition whose shard differs from
-        // the storing shard whenever keyToPartitionNs(ns,name) % shard_count
-        // != shard.id, yielding spurious "Job not found" on any multi-shard
-        // deployment. It only worked by luck when the name happened to hash to
-        // a partition congruent to the storing shard (e.g. 1152 % 3 == 0).
-        //
-        // Embedding shard.id is correct and future-proof: shard.id < shard_count
-        // <= partition_count, and shard.id % shard_count == shard.id, so the ID
-        // always routes back to the shard that created and stores the job.
-        const partition_id: u32 = shard.id;
+        // The job id carries a slot this shard owns (its own number, as
+        // slot n is on shard n), so every op routed by the id (status, stop,
+        // cancel) finds the job where it was stored. Not the job name's slot:
+        // that would be another shard's whenever submits all run here.
         var id_buf: [32]u8 = undefined;
-        const job_id = shard.run_id_gen.next(.job, partition_id, &id_buf);
+        const job_id = shard.run_id_gen.next(.job, shard.id, &id_buf);
 
         // Persist through Raft; the applier builds the job record and its
         // pipelines from the entry — the same applier a restart uses.
@@ -1554,10 +1536,10 @@ pub const ProcessingHandler = struct {
     /// keys spread across shards.
     fn sinkShard(self: *const ProcessingHandler, snk: SinkConfig) ?u16 {
         return switch (snk.kind) {
-            .kv => if (self.peer_shard_count <= 1 or self.peer_partition_count == 0) self.own_shard else null,
-            .stream, .queue => if (self.peer_shard_count <= 1 or self.peer_partition_count == 0) self.own_shard else self.peerShardId(snk.namespace, snk.target),
+            .kv => if (self.peer_shard_count <= 1) self.own_shard else null,
+            .stream, .queue => if (self.peer_shard_count <= 1) self.own_shard else self.peerShardId(snk.namespace, snk.target),
             // TS sinks write the owner's measurement, as stream sinks do.
-            .ts => if (self.peer_shard_count <= 1 or self.peer_partition_count == 0) self.own_shard else self.peerShardId(snk.namespace, snk.measurement),
+            .ts => if (self.peer_shard_count <= 1) self.own_shard else self.peerShardId(snk.namespace, snk.measurement),
         };
     }
 
@@ -2115,7 +2097,7 @@ pub const ProcessingHandler = struct {
     /// no others to send to.
     pub fn kvOwner(self: *const ProcessingHandler, shard: *const Shard, namespace: []const u8, key: []const u8) u16 {
         const mailboxes = shard.peer_mailboxes orelse return @intCast(shard.id);
-        if (mailboxes.len <= 1 or self.peer_partition_count == 0 or self.peer_shard_count == 0) return @intCast(shard.id);
+        if (mailboxes.len <= 1 or self.peer_shard_count == 0) return @intCast(shard.id);
         const owner = self.peerShardId(namespace, key);
         return if (owner < mailboxes.len) owner else @intCast(shard.id);
     }
@@ -2299,7 +2281,6 @@ test "processing: a sink's shard is its target's, any for a KV sink, and its own
     h.own_shard = 1;
     try std.testing.expectEqual(@as(?u16, 1), h.sinkShard(.{ .kind = .kv }));
     h.peer_shard_count = 4;
-    h.peer_partition_count = 16;
     try std.testing.expectEqual(@as(?u16, null), h.sinkShard(.{ .kind = .kv }));
     try std.testing.expectEqual(@as(?u16, h.peerShardId("default", "cpu")), h.sinkShard(.{ .kind = .ts, .namespace = "default", .measurement = "cpu" }));
     const snk: ProcessingHandler.SinkConfig = .{ .kind = .stream, .target = "out", .namespace = "default" };
@@ -2864,7 +2845,6 @@ test "ProcessingHandler: kv_lookup reads its own shard's KV, whatever the key ha
 
     var handler = ProcessingHandler.init(allocator);
     defer handler.deinit();
-    handler.peer_partition_count = 8;
     handler.peer_shard_count = 2;
     handler.setPeerKvHandlers(&peers);
 
@@ -3037,7 +3017,6 @@ test "ProcessingHandler: a stream or queue sink outside default on another shard
     var handler = ProcessingHandler.init(allocator);
     defer handler.deinit();
     handler.peer_shard_count = 4;
-    handler.peer_partition_count = 256;
     handler.own_shard = 0;
     // Routed by the id the node's table publishes for it.
     const table = try @import("../namespace/table.zig").Table.create(allocator);

@@ -1,34 +1,38 @@
 //! Self-routing Run IDs
 //!
-//! Format: `{prefix}{hex(u64)}-{hex(shard)}`, e.g. `act-1a2b3c4d5e6f00-3`
+//! Format: `{prefix}{hex(u64)}-{hex(tag)}`, e.g. `act-1a2b3c4d5e6f00-3`
 //!
 //! The packed u64 encodes:
 //!   ```
-//!   [timestamp_ms: 42 bits][partition_id: 14 bits][sequence: 8 bits]
+//!   [timestamp_ms: 42 bits][slot: 14 bits][sequence: 8 bits]
 //!   ```
 //!
-//! This makes every run ID self-routing: the server extracts the partition
-//! directly from the ID bits, with no entity-name lookup required. The suffix
-//! names the shard that minted it: a shard mints ids for partitions it does
-//! not own (a workflow starting an action on another shard), so two shards'
-//! generators share a partition's id space and only the suffix keeps them
-//! apart.
+//! This makes every run ID self-routing: the server reads the slot of the
+//! run's definition (its name's slot) straight from the ID bits, with no
+//! lookup. The slot is fixed for the name, so the id stays right wherever the
+//! slot later lives.
+//!
+//! The suffix is a uniqueness tag, not a location: the number of the shard
+//! whose generator minted the id. A shard mints ids for slots it doesn't own
+//! (a workflow starting an action on another shard), so two generators share
+//! a slot's id space and only the tag keeps their ids apart. Once a slot
+//! moves, or a group splits, the tag no longer names where the run lives, so
+//! nothing may parse it or route by it.
 //!
 //! ## Constraints
 //!
-//! - Max partition ID: 16,383 (14 bits). Configure `partition_count ≤ 16384`.
+//! - The slot field is 14 bits wide; slots are below `router.SLOTS` (4096).
 //! - Sequence: 256 per millisecond per shard; past that the id's millisecond
 //!   runs ahead of the clock rather than repeat an id.
 //! - Timestamp range: ~139 years from custom epoch (2024-01-01 → ~2163).
-//! - Max encoded length: prefix (4) + hex (16) + '-' + shard hex (2) = 23 bytes.
+//! - Max encoded length: prefix (4) + hex (16) + '-' + tag hex (2) = 23 bytes.
 
 const std = @import("std");
 
 /// Custom epoch: 2024-01-01T00:00:00Z in milliseconds.
 const EPOCH_MS: u64 = 1_704_067_200_000;
 
-/// Maximum partition ID encodable in 14 bits.
-pub const MAX_PARTITION: u32 = 0x3FFF; // 16383
+const SLOTS = @import("router.zig").SLOTS;
 
 /// Maximum total length of a generated run ID.
 pub const MAX_ID_LEN: usize = 23;
@@ -57,7 +61,8 @@ pub const Prefix = enum {
 
 /// Per-shard run ID generator. Single-threaded — no atomics needed.
 pub const Generator = struct {
-    /// The shard this generator mints for, written into every id.
+    /// The number of the shard this generator runs on, written into every id
+    /// as its uniqueness tag (see the file comment): never read back.
     shard: u16 = 0,
     last_ms: u64 = 0,
     sequence: u8 = 0,
@@ -68,10 +73,10 @@ pub const Generator = struct {
     /// the wall clock does, and moves on by one when a millisecond's 256 ids
     /// are spent.
     ///
-    /// `partition_id` is the partition this entity belongs to (from router).
-    /// The caller must ensure `partition_id <= MAX_PARTITION`.
-    pub fn next(self: *Generator, prefix: Prefix, partition_id: u32, buf: []u8) []const u8 {
+    /// `slot` is the slot of the run's definition (`router.nsKeySlot`).
+    pub fn next(self: *Generator, prefix: Prefix, slot: u32, buf: []u8) []const u8 {
         std.debug.assert(buf.len >= MAX_ID_LEN);
+        std.debug.assert(slot < SLOTS);
         const now_ms = @max(currentMs(), self.last_ms);
 
         if (now_ms == self.last_ms) {
@@ -85,10 +90,10 @@ pub const Generator = struct {
         }
 
         const ts_bits: u64 = self.last_ms & 0x3FF_FFFF_FFFF; // 42 bits
-        const part_bits: u64 = @as(u64, partition_id & 0x3FFF); // 14 bits
+        const slot_bits: u64 = @as(u64, slot); // 14 bits
         const seq_bits: u64 = @as(u64, self.sequence); // 8 bits
 
-        const id_bits: u64 = (ts_bits << 22) | (part_bits << 8) | seq_bits;
+        const id_bits: u64 = (ts_bits << 22) | (slot_bits << 8) | seq_bits;
 
         const pfx = prefix.string();
         @memcpy(buf[0..pfx.len], pfx);
@@ -104,9 +109,9 @@ pub const Generator = struct {
 // Extraction
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Extract the partition ID from a run ID string.
+/// Extract the slot from a run ID string.
 /// Returns null if the ID cannot be parsed.
-pub fn extractPartition(run_id: []const u8) ?u32 {
+pub fn extractSlot(run_id: []const u8) ?u32 {
     const id_bits = decodePayload(run_id) orelse return null;
     return @intCast((id_bits >> 8) & 0x3FFF);
 }
@@ -129,7 +134,7 @@ pub fn looksGenerated(prefix: Prefix, run_id: []const u8) bool {
 }
 
 /// Decode the hex payload from a prefixed run ID: what follows the first
-/// dash, up to the shard suffix if there is one.
+/// dash, up to the tag if there is one.
 fn decodePayload(run_id: []const u8) ?u64 {
     const dash_pos = std.mem.indexOfScalar(u8, run_id, '-') orelse return null;
     if (dash_pos + 1 >= run_id.len) return null;
@@ -144,14 +149,13 @@ fn decodePayload(run_id: []const u8) ?u64 {
 
 /// Pre-route function for run-ID-based opcodes.
 ///
-/// Extracts the partition directly from the packed ID bits in the key.
+/// Extracts the slot directly from the packed ID bits in the key.
 /// Returns null (broadcast/walk) if the ID cannot be decoded.
 pub fn preRouteByRunId(req: @import("../protocol/proto.zig").Request) ?u64 {
     if (req.key.len == 0) return 0;
-    const partition_id = extractPartition(req.key) orelse return null;
-    // Return partition_id directly — Router.hashToPartition(partition_id)
-    // yields partition_id when partition_id < partition_count.
-    return @as(u64, partition_id);
+    // Returned as the hash: the router's `slot(hash)` gives back a slot
+    // unchanged.
+    return @as(u64, extractSlot(req.key) orelse return null);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -223,14 +227,13 @@ test "hex roundtrip" {
     }
 }
 
-test "run ID encode/decode partition roundtrip" {
+test "run ID encode/decode slot roundtrip" {
     var gen = Generator{};
-    const partitions = [_]u32{ 0, 1, 42, 1000, 4095, 16383 };
-    for (partitions) |pid| {
+    const slots = [_]u32{ 0, 1, 42, 1000, SLOTS - 1 };
+    for (slots) |s| {
         var buf: [32]u8 = undefined;
-        const id = gen.next(.workflow, pid, &buf);
-        const extracted = extractPartition(id).?;
-        try std.testing.expectEqual(pid, extracted);
+        const id = gen.next(.workflow, s, &buf);
+        try std.testing.expectEqual(s, extractSlot(id).?);
     }
 }
 
@@ -264,12 +267,12 @@ test "prefix strings" {
     try std.testing.expect(std.mem.startsWith(u8, job, "job-"));
 }
 
-test "extractPartition returns null for invalid IDs" {
-    try std.testing.expectEqual(@as(?u32, null), extractPartition(""));
-    try std.testing.expectEqual(@as(?u32, null), extractPartition("no-dash-here!"));
+test "extractSlot returns null for invalid IDs" {
+    try std.testing.expectEqual(@as(?u32, null), extractSlot(""));
+    try std.testing.expectEqual(@as(?u32, null), extractSlot("no-dash-here!"));
 }
 
-test "preRouteByRunId extracts partition" {
+test "preRouteByRunId extracts the slot" {
     const proto = @import("../protocol/proto.zig");
     var gen = Generator{};
     var buf: [32]u8 = undefined;
@@ -301,18 +304,18 @@ test "looksGenerated: the generator's own form, and nothing else" {
     try std.testing.expect(!looksGenerated(.action, minted));
 }
 
-test "two shards minting for one partition in one millisecond never mint the same id" {
+test "two shards minting for one slot in one millisecond never mint the same id" {
     var a = Generator{ .shard = 0 };
     var b = Generator{ .shard = 1 };
     var buf_a: [MAX_ID_LEN]u8 = undefined;
     var buf_b: [MAX_ID_LEN]u8 = undefined;
-    // Same clock, same partition, same sequence: only the suffix differs.
+    // Same clock, same slot, same sequence: only the tag differs.
     a.last_ms = currentMs() + 1000;
     b.last_ms = a.last_ms;
     const ia = a.next(.action, 7, &buf_a);
     const ib = b.next(.action, 7, &buf_b);
     try std.testing.expect(!std.mem.eql(u8, ia, ib));
-    try std.testing.expectEqual(extractPartition(ia), extractPartition(ib));
+    try std.testing.expectEqual(extractSlot(ia), extractSlot(ib));
 }
 
 test "a generator never repeats an id: not past 256 in a millisecond, not when the clock goes back" {

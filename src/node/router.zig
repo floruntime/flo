@@ -1,17 +1,18 @@
-//! Partition Router — `hash(key) → partition_id → shard_id`
+//! Router — `hash(key) → slot → shard`
 //!
-//! Two-level consistent routing used by all subsystems:
+//! Two-level routing used by all subsystems:
 //!
-//!   1. Wyhash(routing_key) mod partition_count → partition_id
-//!   2. partition_id mod shard_count → shard_id
+//!   1. Wyhash(routing_key) mod SLOTS → slot
+//!   2. slot mod shard_count → shard
 //!
-//! This guarantees the ownership invariant:
-//!   partition_id % shard_count == shard_id
+//! The slot count is fixed for every node and cluster, so a key's slot never
+//! changes; what a slot maps to can. Durable state names a slot, never a
+//! shard.
 //!
 //! ## Hash Tags
 //!
 //! Redis-style `{tag}` support: `"user:{alice}:profile"` and
-//! `"user:{alice}:orders"` hash to the same partition.
+//! `"user:{alice}:orders"` hash to the same slot.
 //!
 //! ## Domain Routing
 //!
@@ -26,11 +27,10 @@ pub const NamespaceId = @import("../namespace/table.zig").Id;
 // Constants
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Default multiplier: partitions = shard_count * MULTIPLIER
-const DEFAULT_PARTITION_MULTIPLIER: u32 = 32;
-
-/// Minimum partition count regardless of shard count
-const MIN_PARTITION_COUNT: u32 = 4096;
+/// The number of routing slots. Fixed: a key's slot is part of what durable
+/// state records (a run id carries its definition's slot), so changing it
+/// would re-home every key.
+pub const SLOTS: u32 = 4096;
 
 /// Wyhash seed — must never change (wire compat)
 const HASH_SEED: u64 = 0;
@@ -41,17 +41,17 @@ const HASH_SEED: u64 = 0;
 
 /// Result of a routing decision.
 pub const RouteTarget = union(enum) {
-    /// Partition lives on this shard — handle locally.
+    /// Slot lives on this shard — handle locally.
     local: LocalTarget,
-    /// Partition lives on a different shard on the same node — forward via inbox.
+    /// Slot lives on a different shard on the same node — forward via inbox.
     shard: ShardTarget,
 
     pub const LocalTarget = struct {
-        partition_id: u32,
+        slot: u32,
     };
 
     pub const ShardTarget = struct {
-        partition_id: u32,
+        slot: u32,
         shard_id: u16,
     };
 };
@@ -61,15 +61,13 @@ pub const RouteTarget = union(enum) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub const Router = struct {
-    partition_count: u32,
     shard_count: u16,
     local_shard_id: u16,
 
     /// Create a router for the given shard.
-    pub fn init(partition_count: u32, shard_count: u16, local_shard_id: u16) Router {
-        const effective = effectivePartitionCount(partition_count, shard_count);
+    pub fn init(shard_count: u16, local_shard_id: u16) Router {
+        std.debug.assert(shard_count >= 1 and shard_count <= SLOTS);
         return .{
-            .partition_count = effective,
             .shard_count = shard_count,
             .local_shard_id = local_shard_id,
         };
@@ -77,24 +75,24 @@ pub const Router = struct {
 
     // ─── Core routing ────────────────────────────────────────────────────
 
-    /// Map a 64-bit hash to a partition ID.
-    pub fn hashToPartition(self: Router, hash: u64) u32 {
-        return @intCast(hash % self.partition_count);
+    /// Map a slot to the shard that owns it.
+    pub fn slotToShard(self: Router, s: u32) u16 {
+        return @intCast(s % self.shard_count);
     }
 
-    /// Map a partition ID to a shard ID.
-    pub fn partitionToShard(self: Router, partition_id: u32) u16 {
-        return @intCast(partition_id % self.shard_count);
-    }
-
-    /// Full route: hash → partition → local-or-forward decision (single-node).
+    /// Full route: hash → slot → local-or-forward decision (single-node).
     pub fn route(self: Router, hash: u64) RouteTarget {
-        const partition_id = self.hashToPartition(hash);
-        const shard_id = self.partitionToShard(partition_id);
+        const s = slot(hash);
+        const shard_id = self.slotToShard(s);
         if (shard_id == self.local_shard_id) {
-            return .{ .local = .{ .partition_id = partition_id } };
+            return .{ .local = .{ .slot = s } };
         }
-        return .{ .shard = .{ .partition_id = partition_id, .shard_id = shard_id } };
+        return .{ .shard = .{ .slot = s, .shard_id = shard_id } };
+    }
+
+    /// The shard owning a hash's slot.
+    pub fn hashToShard(self: Router, hash: u64) u16 {
+        return self.slotToShard(slot(hash));
     }
 
     // ─── Convenience: key-based routing ──────────────────────────────────
@@ -103,17 +101,22 @@ pub const Router = struct {
     pub fn routeKey(self: Router, key: []const u8) RouteTarget {
         return self.route(hashKey(key));
     }
-
-    /// Key → partition (convenience).
-    pub fn keyToPartition(self: Router, key: []const u8) u32 {
-        return self.hashToPartition(hashKey(key));
-    }
-
-    /// Namespaced key → partition.
-    pub fn keyToPartitionNs(self: Router, ns: NamespaceId, key: []const u8) u32 {
-        return self.hashToPartition(routeNsKey(ns, key));
-    }
 };
+
+/// Map a 64-bit hash to its slot.
+pub fn slot(hash: u64) u32 {
+    return @intCast(hash % SLOTS);
+}
+
+/// Key → slot (with hash tag extraction).
+pub fn keySlot(key: []const u8) u32 {
+    return slot(hashKey(key));
+}
+
+/// Namespaced key → slot.
+pub fn nsKeySlot(ns: NamespaceId, key: []const u8) u32 {
+    return slot(routeNsKey(ns, key));
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Hash functions (public — used by domain handlers)
@@ -173,18 +176,6 @@ pub fn extractRoutingKey(key: []const u8) []const u8 {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Partition count auto-configuration
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Compute effective partition count.
-/// If `configured == 0`, auto-derive from shard_count.
-pub fn effectivePartitionCount(configured: u32, shard_count: u16) u32 {
-    if (configured > 0) return configured;
-    const derived = @as(u32, shard_count) * DEFAULT_PARTITION_MULTIPLIER;
-    return @max(MIN_PARTITION_COUNT, derived);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -205,55 +196,54 @@ test "Router: hash tag extraction" {
     try std.testing.expectEqualStrings("mykey", extractRoutingKey("mykey"));
 }
 
-test "Router: deterministic partition assignment" {
-    const router = Router.init(0, 4, 0); // auto partition count, 4 shards, shard 0
-
-    // Same key always maps to same partition
-    const p1 = router.keyToPartition("test-key");
-    const p2 = router.keyToPartition("test-key");
-    try std.testing.expectEqual(p1, p2);
-
-    // Different keys may map to different partitions (statistical, but should differ for these)
-    const pa = router.keyToPartition("key-aaa");
-    const pb = router.keyToPartition("key-bbb");
-    // They CAN be equal, but with 4096 partitions it's unlikely
-    _ = pa;
-    _ = pb;
+test "Router: a key's slot is deterministic and in range" {
+    try std.testing.expectEqual(keySlot("test-key"), keySlot("test-key"));
+    for (0..1000) |i| {
+        var buf: [16]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "key-{d}", .{i}) catch unreachable;
+        try std.testing.expect(keySlot(key) < SLOTS);
+    }
 }
 
 test "Router: hash tag co-location" {
-    const router = Router.init(4096, 8, 0);
-
-    // Keys with same hash tag must land on same partition
-    const p1 = router.keyToPartition("user:{alice}:profile");
-    const p2 = router.keyToPartition("user:{alice}:orders");
-    const p3 = router.keyToPartition("user:{alice}:sessions");
-    try std.testing.expectEqual(p1, p2);
-    try std.testing.expectEqual(p2, p3);
-
-    // Different tags should (likely) differ
-    const p4 = router.keyToPartition("user:{bob}:profile");
-    // With 4096 partitions, hash collision is very unlikely
-    try std.testing.expect(p1 != p4);
+    // Keys with same hash tag must land on same slot
+    const p1 = keySlot("user:{alice}:profile");
+    try std.testing.expectEqual(p1, keySlot("user:{alice}:orders"));
+    try std.testing.expectEqual(p1, keySlot("user:{alice}:sessions"));
+    try std.testing.expect(p1 != keySlot("user:{bob}:profile"));
 }
 
 test "Router: ownership invariant" {
-    // partition_id % shard_count == shard_id
+    // slot % shard_count == shard_id
     const shard_count: u16 = 8;
-    const router = Router.init(4096, shard_count, 0);
+    const router = Router.init(shard_count, 0);
 
     const keys = [_][]const u8{ "key1", "key2", "key3", "test", "hello", "world" };
     for (keys) |key| {
-        const partition = router.keyToPartition(key);
-        const shard = router.partitionToShard(partition);
-        try std.testing.expectEqual(shard, @as(u16, @intCast(partition % shard_count)));
+        const s = keySlot(key);
+        try std.testing.expectEqual(router.slotToShard(s), @as(u16, @intCast(s % shard_count)));
+        try std.testing.expectEqual(router.slotToShard(s), router.hashToShard(hashKey(key)));
+    }
+}
+
+test "Router: up to 128 shards, a key's owner is what it was before slots were fixed" {
+    // Before, a router took max(4096, shards * 32) partitions, which is 4096
+    // up to 128 shards; above that the owner of a key moves.
+    var prng = std.Random.DefaultPrng.init(0x5107);
+    const rand = prng.random();
+    for ([_]u16{ 1, 2, 3, 4, 7, 16, 64, 128 }) |n| {
+        const router = Router.init(n, 0);
+        const before = @max(@as(u64, 4096), @as(u64, n) * 32);
+        for (0..2000) |_| {
+            const h = rand.int(u64);
+            try std.testing.expectEqual(@as(u16, @intCast((h % before) % n)), router.hashToShard(h));
+        }
     }
 }
 
 test "Router: route local vs shard" {
-    const router = Router.init(4096, 4, 2); // local shard = 2
+    const router = Router.init(4, 2); // local shard = 2
 
-    // Try many keys and verify routing correctness
     var local_count: usize = 0;
     var remote_count: usize = 0;
     for (0..100) |i| {
@@ -262,12 +252,12 @@ test "Router: route local vs shard" {
         const target = router.routeKey(key);
         switch (target) {
             .local => |t| {
-                try std.testing.expectEqual(@as(u16, 2), @as(u16, @intCast(t.partition_id % 4)));
+                try std.testing.expectEqual(@as(u16, 2), @as(u16, @intCast(t.slot % 4)));
                 local_count += 1;
             },
             .shard => |t| {
                 try std.testing.expect(t.shard_id != 2);
-                try std.testing.expectEqual(t.shard_id, @as(u16, @intCast(t.partition_id % 4)));
+                try std.testing.expectEqual(t.shard_id, @as(u16, @intCast(t.slot % 4)));
                 remote_count += 1;
             },
         }
@@ -278,30 +268,14 @@ test "Router: route local vs shard" {
 }
 
 test "Router: namespaced routing" {
-    const router = Router.init(4096, 4, 0);
-
-    // Same key, different namespace → different partition
-    const p1 = router.keyToPartitionNs(.of(16), "mykey");
-    const p2 = router.keyToPartitionNs(.of(17), "mykey");
-    try std.testing.expect(p1 != p2);
-
-    // Same namespace + same key → same partition
-    const p3 = router.keyToPartitionNs(.of(16), "mykey");
-    try std.testing.expectEqual(p1, p3);
+    // Same key, different namespace → different slot
+    const p1 = nsKeySlot(.of(16), "mykey");
+    try std.testing.expect(p1 != nsKeySlot(.of(17), "mykey"));
+    try std.testing.expectEqual(p1, nsKeySlot(.of(16), "mykey"));
 
     // A hash tag routes within its namespace, not across them.
     try std.testing.expectEqual(routeNsKey(.of(16), "user:{alice}:a"), routeNsKey(.of(16), "user:{alice}:b"));
     try std.testing.expect(routeNsKey(.of(16), "{alice}") != routeNsKey(.of(17), "{alice}"));
-}
-
-test "Router: effective partition count" {
-    // Explicit config preserved
-    try std.testing.expectEqual(@as(u32, 8192), effectivePartitionCount(8192, 4));
-
-    // Auto-derive from shard count
-    try std.testing.expectEqual(@as(u32, 4096), effectivePartitionCount(0, 4)); // 4*32=128 < 4096
-    try std.testing.expectEqual(@as(u32, 4096), effectivePartitionCount(0, 128)); // 128*32=4096
-    try std.testing.expectEqual(@as(u32, 8192), effectivePartitionCount(0, 256)); // 256*32=8192 > 4096
 }
 
 test "Router: nameHash is the namespace's own" {

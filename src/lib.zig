@@ -85,6 +85,7 @@ pub const util = struct {
     pub const json_path = @import("util/json_path.zig");
     pub const validation = @import("util/validation.zig");
     pub const constants = @import("util/constants.zig");
+    pub const large_buffer = @import("util/large_buffer.zig");
 };
 
 // =============================================================================

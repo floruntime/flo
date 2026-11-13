@@ -34,6 +34,7 @@
 //! The ring is non-overlapping: eviction must happen before write.
 
 const std = @import("std");
+const large_buffer = @import("../../util/large_buffer.zig");
 const plant = @import("../../plant.zig");
 const stdx = @import("stdx");
 const entry_mod = @import("entry.zig");
@@ -92,7 +93,12 @@ pub const UAL = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize, max_hot_entries: u64) !UAL {
-        const buf = try allocator.alloc(u8, capacity);
+        // Mapped, not filled: its pages are resident only once written, and
+        // read as zeros until then, not 0xAA. Every read goes through an
+        // appended entry's position at or past `read_pos` (`read`,
+        // `readCopy`, `readHeader`), so none sees a byte not written; were
+        // one to, a zero header fails the magic check as 0xAA did.
+        const buf = try large_buffer.alloc(allocator, u8, capacity);
         return .{
             .buffer = buf,
             .capacity = capacity,
@@ -114,7 +120,7 @@ pub const UAL = struct {
 
     pub fn deinit(self: *UAL) void {
         self.positions.deinit(self.allocator);
-        self.allocator.free(self.buffer);
+        large_buffer.free(self.allocator, u8, self.buffer);
     }
 
     /// Bytes currently used in the ring.

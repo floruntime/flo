@@ -38,7 +38,7 @@ fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) c
 
 /// Create the server command tree
 pub fn createServerCommand(allocator: Allocator) !*commander.Command {
-    return try commander.newBuilder(allocator)
+    const cmd = try commander.newBuilder(allocator)
         .name("server")
         .about("Server management commands")
         .group("Server Commands")
@@ -91,7 +91,6 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("data-dir", 'd', "", "Data directory for storage")
                 .stringFlag("durability", 0, "", "Storage durability: sync or async_flush")
                 .uintFlag("shards", 's', 0, "Number of data shards (0=auto)")
-                .uintFlag("partitions", 0, 0, "Number of virtual partitions, at most 16384 (0=auto: max(4096, shards×32))")
                 .uintFlag("max-txn-ops", 0, 0, "Most ops one KV transaction may hold, 1 to 256 (default: 64); more costs latency")
                 .uintFlag("max-txn-bytes", 0, 0, "Most key and value bytes one KV transaction may hold, up to 1048576 (default: 262144); more costs latency")
                 .stringFlag("log-level", 'l', "", "Log level: debug, info, warn, error")
@@ -295,6 +294,8 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .action(wrapHandler(runMetrics)),
         )
         .build();
+    cmd.retired_flags = &.{.{ .long = "partitions", .hint = server_config.PARTITIONS_GONE }};
+    return cmd;
 }
 
 // Signal handling
@@ -474,7 +475,6 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     // Read wide so an out-of-range count is refused by the config check,
     // not truncated on the way in.
     const shards = ctx.getChangedUint("shards");
-    const partitions = ctx.getChangedUint("partitions");
     const max_txn_ops = ctx.getChangedUint("max-txn-ops");
     const max_txn_bytes = ctx.getChangedUint("max-txn-bytes");
     const log_level = ctx.getString("log-level");
@@ -504,7 +504,6 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
         port,
         stdx.nullIfEmpty(u8, data_dir),
         shards,
-        partitions,
         stdx.nullIfEmpty(u8, log_level),
         stdx.nullIfEmpty(u8, log_format),
         stdx.nullIfEmpty(u8, durability),
@@ -514,7 +513,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
                 ctx.printErr("Invalid --durability value. Use: sync or async_flush\n", .{});
             },
             // Already logged, naming the file or the flag.
-            error.InvalidShardCount, error.InvalidPartitionCount, error.UnknownSetting, error.InvalidSetting, error.FileNotFound => {},
+            error.InvalidShardCount, error.UnknownSetting, error.InvalidSetting, error.FileNotFound => {},
             else => ctx.printErr("Error loading configuration: {}\n", .{err}),
         }
         return error.Usage;
@@ -612,11 +611,6 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
         ctx.print("  Shards:     auto ({d} CPUs)\n", .{cpu_count});
     } else {
         ctx.print("  Shards:     {d}\n", .{config.shards});
-    }
-    if (config.partition_count == 0) {
-        ctx.print("  Partitions: auto (max(4096, shards × 32))\n", .{});
-    } else {
-        ctx.print("  Partitions: {d}\n", .{config.partition_count});
     }
     ctx.print("  Log level:  {s}\n", .{@tagName(config.log_level)});
     ctx.print("  Durability: {s}\n", .{@tagName(config.durability)});
@@ -746,7 +740,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
 fn offlineConfig(ctx: *commander.Context) commander.Error!server_config.ServerConfig {
     const config_path = ctx.getString("config");
     const data_dir = ctx.getString("data-dir");
-    return server_config.loadWithOverrides(ctx.allocator, stdx.nullIfEmpty(u8, config_path), null, stdx.nullIfEmpty(u8, data_dir), null, null, null, null, null) catch |err| {
+    return server_config.loadWithOverrides(ctx.allocator, stdx.nullIfEmpty(u8, config_path), null, stdx.nullIfEmpty(u8, data_dir), null, null, null, null) catch |err| {
         switch (err) {
             error.UnknownSetting, error.InvalidSetting, error.FileNotFound => {},
             else => ctx.printErr("Error loading configuration: {}\n", .{err}),
@@ -1366,7 +1360,6 @@ fn printDataDir(ctx: *commander.Context, data_dir: []const u8) void {
     };
     if (manifest) |m| {
         ctx.print("  Shards:     {d}\n", .{m.shards});
-        if (m.partitions > 0) ctx.print("  Partitions: {d}\n", .{m.partitions});
     } else {
         ctx.print("  Shards:     none yet (no {s})\n", .{data_format.SYSTEM_FILENAME});
     }

@@ -1,8 +1,9 @@
 //! System topology manifest — prevents silent data corruption from shard count changes.
 //!
-//! On first boot, writes `{data_dir}/SYSTEM` with the shard count and partition count.
-//! On subsequent boots, validates that the counts match. If not, errors with a
-//! human-readable message explaining how to recover.
+//! On first boot, writes `{data_dir}/SYSTEM` with the shard count. On
+//! subsequent boots, a start asking for another count is refused, naming both.
+//! The key partition count isn't recorded: it is fixed for every node
+//! (`router.SLOTS`).
 //!
 //! File format: JSON for easy debugging and human inspection.
 //!
@@ -11,7 +12,6 @@
 //! ```json
 //! {
 //!   "shards": 8,
-//!   "partitions": 256,
 //!   "created_at": 1772033477,
 //!   "version": "2.0.0"
 //! }
@@ -20,13 +20,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
-const effectivePartitionCount = @import("router.zig").effectivePartitionCount;
 
 pub const SystemManifest = struct {
     /// Number of shards this data was written with
     shards: u16,
-    /// Number of partitions (affects key→shard routing)
-    partitions: u32,
     /// Unix timestamp when data directory was first created
     created_at: i64,
     /// Flo version that created this manifest
@@ -68,11 +65,6 @@ pub const SystemManifest = struct {
         else
             return error.InvalidManifest;
 
-        const partitions: u32 = if (root.get("partitions")) |p|
-            if (p == .integer) std.math.cast(u32, p.integer) orelse return error.InvalidManifest else 0
-        else
-            0;
-
         const created_at: i64 = if (root.get("created_at")) |c|
             if (c == .integer) c.integer else 0
         else
@@ -80,14 +72,13 @@ pub const SystemManifest = struct {
 
         return SystemManifest{
             .shards = shards,
-            .partitions = partitions,
             .created_at = created_at,
             .version = CURRENT_VERSION,
         };
     }
 
     /// Create and write a new SYSTEM manifest to data_path.
-    pub fn create(allocator: Allocator, data_path: []const u8, shards: u16, partitions: u32) !void {
+    pub fn create(allocator: Allocator, data_path: []const u8, shards: u16) !void {
         const path = try std.fs.path.join(allocator, &.{ data_path, FILENAME });
         defer allocator.free(path);
 
@@ -98,7 +89,6 @@ pub const SystemManifest = struct {
         const w = &aw.writer;
         try w.writeAll("{\n");
         try w.print("  \"shards\": {d},\n", .{shards});
-        try w.print("  \"partitions\": {d},\n", .{partitions});
         try w.print("  \"created_at\": {d},\n", .{@import("stdx").time.milliTimestamp()});
         try w.print("  \"version\": \"{s}\"\n", .{CURRENT_VERSION});
         try w.writeAll("}\n");
@@ -117,32 +107,14 @@ pub const SystemManifest = struct {
     }
 
     /// Validate that the running configuration matches manifested topology.
-    /// Returns ShardCountChanged or PartitionCountChanged, the shard count
-    /// checked first.
-    pub fn validate(self: SystemManifest, requested_shards: u16, requested_partitions: u32) !void {
+    pub fn validate(self: SystemManifest, requested_shards: u16) !void {
         if (self.shards != requested_shards) {
-            log.err("topology mismatch: shard count changed existing={d} requested={d}", .{
+            log.err("topology mismatch: the data was written with {d} shards, and this start asks for {d}", .{
                 self.shards,
                 requested_shards,
             });
             printMismatchError("shard", self.shards, requested_shards);
             return error.ShardCountChanged;
-        }
-
-        // Compared as the router counts them: 0 is automatic, which the
-        // shard count (equal by now) decides, so an automatic count and an
-        // explicit one that differs from it are a change too.
-        const existing = effectivePartitionCount(self.partitions, self.shards);
-        const requested = effectivePartitionCount(requested_partitions, requested_shards);
-        if (existing != requested) {
-            log.err("topology mismatch: the data was written with {d} partitions{s}, and this start asks for {d}{s}", .{
-                existing,
-                if (self.partitions == 0) " (automatic)" else "",
-                requested,
-                if (requested_partitions == 0) " (automatic)" else "",
-            });
-            printMismatchError("partition", existing, requested);
-            return error.PartitionCountChanged;
         }
     }
 
@@ -173,13 +145,12 @@ pub const SystemManifest = struct {
 
 /// Ensure topology consistency. Call before spawning shard threads.
 ///
-/// - If SYSTEM file exists: validate shard/partition counts match
+/// - If SYSTEM file exists: validate the shard count matches
 /// - If no SYSTEM file: create data dir + SYSTEM manifest
 pub fn ensureTopology(
     allocator: Allocator,
     data_path: []const u8,
     requested_shards: u16,
-    requested_partitions: u32,
 ) !void {
     // Ensure data directory exists
     @import("stdx").fs.makePathDurable(data_path) catch |err| {
@@ -190,22 +161,11 @@ pub fn ensureTopology(
     };
 
     if (try SystemManifest.load(allocator, data_path)) |manifest| {
-        try manifest.validate(requested_shards, requested_partitions);
-        log.info("topology verified: shards={d} partitions={d} path={s}", .{
-            manifest.shards,
-            manifest.partitions,
-            data_path,
-        });
+        try manifest.validate(requested_shards);
+        log.info("topology verified: shards={d} path={s}", .{ manifest.shards, data_path });
     } else {
-        // The count the router uses, never 0: what was written stays
-        // readable as what it was.
-        const partitions = effectivePartitionCount(requested_partitions, requested_shards);
-        try SystemManifest.create(allocator, data_path, requested_shards, partitions);
-        log.info("topology manifest created: shards={d} partitions={d} path={s}", .{
-            requested_shards,
-            partitions,
-            data_path,
-        });
+        try SystemManifest.create(allocator, data_path, requested_shards);
+        log.info("topology manifest created: shards={d} path={s}", .{ requested_shards, data_path });
     }
 }
 
@@ -223,13 +183,12 @@ test "create and load manifest" {
     defer allocator.free(path);
 
     const before = @import("stdx").fs.dir_syncs.load(.monotonic);
-    try SystemManifest.create(allocator, path, 8, 256);
+    try SystemManifest.create(allocator, path, 8);
     try std.testing.expectEqual(before + 1, @import("stdx").fs.dir_syncs.load(.monotonic));
 
     const loaded = try SystemManifest.load(allocator, path);
     try std.testing.expect(loaded != null);
     try std.testing.expectEqual(@as(u16, 8), loaded.?.shards);
-    try std.testing.expectEqual(@as(u32, 256), loaded.?.partitions);
 }
 
 test "a manifest with a count out of range, or not an object, is refused" {
@@ -240,7 +199,7 @@ test "a manifest with a count out of range, or not an object, is refused" {
     defer allocator.free(path);
     const file_path = try std.fs.path.join(allocator, &.{ path, SystemManifest.FILENAME });
     defer allocator.free(file_path);
-    for ([_][]const u8{ "{\"shards\": 70000}", "{\"shards\": -1}", "{\"shards\": 4, \"partitions\": -1}", "[4]" }) |body| {
+    for ([_][]const u8{ "{\"shards\": 70000}", "{\"shards\": -1}", "[4]" }) |body| {
         const f = try @import("stdx").fs.createFileAbsolute(file_path, .{ .truncate = true });
         try @import("stdx").fs.writeAll(f, body);
         @import("stdx").fs.closeFile(f);
@@ -248,69 +207,10 @@ test "a manifest with a count out of range, or not an object, is refused" {
     }
 }
 
-test "validate matching topology" {
-    const manifest = SystemManifest{
-        .shards = 8,
-        .partitions = 256,
-        .created_at = 0,
-        .version = "2.0.0",
-    };
-
-    // Should pass
-    try manifest.validate(8, 256);
-}
-
-test "validate shard mismatch" {
-    const manifest = SystemManifest{
-        .shards = 8,
-        .partitions = 256,
-        .created_at = 0,
-        .version = "2.0.0",
-    };
-
-    const result = manifest.validate(4, 256);
-    try std.testing.expectError(error.ShardCountChanged, result);
-}
-
-test "validate partition mismatch" {
-    const manifest = SystemManifest{
-        .shards = 8,
-        .partitions = 256,
-        .created_at = 0,
-        .version = "2.0.0",
-    };
-
-    const result = manifest.validate(8, 512);
-    try std.testing.expectError(error.PartitionCountChanged, result);
-}
-
-test "an automatic partition count is compared as the count the router uses" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmp.dir.realPathFileAlloc(@import("stdx").io.instance(), ".", allocator);
-    defer allocator.free(path);
-
-    // Written automatic for 4 shards: 4096, recorded as such.
-    try ensureTopology(allocator, path, 4, 0);
-    const written = (try SystemManifest.load(allocator, path)).?;
-    try std.testing.expectEqual(@as(u32, 4096), written.partitions);
-    try ensureTopology(allocator, path, 4, 0);
-    try ensureTopology(allocator, path, 4, 4096);
-    try std.testing.expectError(error.PartitionCountChanged, ensureTopology(allocator, path, 4, 8192));
-
-    // A manifest that recorded automatic as 0 resolves the same way.
-    const auto: SystemManifest = .{ .shards = 200, .partitions = 0, .created_at = 0, .version = "1.0.0" };
-    try auto.validate(200, 0);
-    try auto.validate(200, 6400);
-    try std.testing.expectError(error.PartitionCountChanged, auto.validate(200, 4096));
-    // A shard count that changed is refused as that, whatever the
-    // partitions: with automatic ones both would differ.
-    try std.testing.expectError(error.ShardCountChanged, auto.validate(256, 0));
-    // And an explicit count against an automatic start.
-    const explicit: SystemManifest = .{ .shards = 4, .partitions = 8192, .created_at = 0, .version = "1.0.0" };
-    try std.testing.expectError(error.PartitionCountChanged, explicit.validate(4, 0));
-    try explicit.validate(4, 8192);
+test "a start with another shard count is refused, naming both" {
+    const manifest = SystemManifest{ .shards = 8, .created_at = 0, .version = "2.0.0" };
+    try manifest.validate(8);
+    try std.testing.expectError(error.ShardCountChanged, manifest.validate(4));
 }
 
 test "ensureTopology creates new manifest" {
@@ -322,19 +222,18 @@ test "ensureTopology creates new manifest" {
     const path = try tmp.dir.realPathFileAlloc(@import("stdx").io.instance(), ".", allocator);
     defer allocator.free(path);
 
-    try ensureTopology(allocator, path, 4, 128);
+    try ensureTopology(allocator, path, 4);
 
     // Should have created SYSTEM file
     const loaded = try SystemManifest.load(allocator, path);
     try std.testing.expect(loaded != null);
     try std.testing.expectEqual(@as(u16, 4), loaded.?.shards);
-    try std.testing.expectEqual(@as(u32, 128), loaded.?.partitions);
 
     // Second call should succeed (same topology)
-    try ensureTopology(allocator, path, 4, 128);
+    try ensureTopology(allocator, path, 4);
 
     // Different topology should fail
-    const result = ensureTopology(allocator, path, 8, 128);
+    const result = ensureTopology(allocator, path, 8);
     try std.testing.expectError(error.ShardCountChanged, result);
 }
 
@@ -349,8 +248,8 @@ test "ensureTopology syncs a data directory it creates and its SYSTEM file, and 
 
     const syncs = &@import("stdx").fs.dir_syncs;
     const before = syncs.load(.monotonic);
-    try ensureTopology(allocator, data, 4, 64);
+    try ensureTopology(allocator, data, 4);
     try std.testing.expectEqual(before + 2, syncs.load(.monotonic));
-    try ensureTopology(allocator, data, 4, 64);
+    try ensureTopology(allocator, data, 4);
     try std.testing.expectEqual(before + 2, syncs.load(.monotonic));
 }

@@ -437,7 +437,7 @@ pub const ActionsHandler = struct {
         if (parsed.input.len > ae.MAX_INPUT) return .{ .err = .{ .code = .invalid_request, .message = "action input too large" } };
         if (parsed.labels) |l| if (l.len > ae.MAX_LABELS) return .{ .err = .{ .code = .invalid_request, .message = "invoke labels too large" } };
         var id_buf: [32]u8 = undefined;
-        const run_id = shard.run_id_gen.next(.action, shard.router.keyToPartitionNs(ns, name), &id_buf);
+        const run_id = shard.run_id_gen.next(.action, router.nsKeySlot(ns, name), &id_buf);
         const proposed = propose(shard, .action_invoke, ae.Invoke.Value{ .ns = ns.int(), .action = name, .run = run_id, .input = parsed.input, .labels = parsed.labels, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null }) catch |err|
             return .{ .err = persistence.failureError(err, "action not persisted") };
         return .{ .parked = proposed };
@@ -1638,7 +1638,7 @@ pub const ActionsHandler = struct {
         const run = getRun(shard, ns, run_id) orelse return;
         if (!finishedStatus(run.status)) return;
         const caller = run.caller_run orelse return;
-        const target = run.caller_shard orelse shard.router.partitionToShard(run_id_mod.extractPartition(caller) orelse return);
+        const target = run.caller_shard orelse shard.router.slotToShard(run_id_mod.extractSlot(caller) orelse return);
         if (target == shard.id) return;
         self.sendFinished(shard, target, run_id, statusOf(run), if (run.status == .completed) run.outcome else "", if (run.status == .completed) run.result else "");
     }
@@ -1803,7 +1803,7 @@ pub const ActionsHandler = struct {
     pub fn invokeByName(shard: *Shard, ns: NamespaceId, action_name: []const u8, input: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8, id_buf: *[32]u8) InvokeResult {
         const caller_shard: ?u16 = if (caller_run_id != null) @intCast(shard.id) else null;
         if (!actionExists(shard, ns, action_name)) return .missing;
-        const run_id = shard.run_id_gen.next(.action, shard.router.keyToPartitionNs(ns, action_name), id_buf);
+        const run_id = shard.run_id_gen.next(.action, router.nsKeySlot(ns, action_name), id_buf);
         return switch (proposeInvoke(shard, ns, action_name, run_id, input orelse "", caller_run_id, caller_workflow_name, caller_shard)) {
             .index => |index| .{ .invoked = .{ .id = run_id, .index = index } },
             .held => .held,

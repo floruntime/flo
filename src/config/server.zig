@@ -41,9 +41,8 @@ pub const TieredLogConfig = tiered_log_config.TieredLogConfig;
 /// Maximum shards per node: a cross-shard message names its sender in one byte.
 pub const MAX_SHARDS: u16 = 256;
 
-/// Maximum partitions: a run id carries its partition in 14 bits, and one
-/// past that would route its status and signals to another partition.
-pub const MAX_PARTITIONS: u32 = @import("../node/run_id.zig").MAX_PARTITION + 1;
+/// What a config or command line that still sets the partition count is told.
+pub const PARTITIONS_GONE = "partition_count is no longer a setting: every cluster has 4096 key partitions; remove it from the config";
 
 /// How long a worker may go without a heartbeat.
 pub const WorkersConfig = struct {
@@ -89,7 +88,6 @@ pub const ServerConfig = struct {
     /// default: what a command that deletes the directory insists on.
     data_dir_set: bool = false,
     shards: u16 = 0, // 0 = auto-detect CPU count; defines data topology (permanent!)
-    partition_count: u32 = 0, // 0 = auto (max(4096, shards × 32)); virtual partitions for rebalancing
     max_connections: u32 = 0, // 0 = auto from the open-file limit; client connections held at once
 
     // [storage] section — unified tier configuration
@@ -171,7 +169,6 @@ pub const ServerConfig = struct {
     pub fn toRuntimeConfig(self: *const ServerConfig) RuntimeConfig {
         return RuntimeConfig{
             .num_shards = self.shards,
-            .partition_count = self.partition_count,
             .max_connections = self.max_connections,
             .data_dir = self.data_dir,
             .listen_port = self.port,
@@ -234,6 +231,7 @@ const sections = [_]Section{
             .{ .name = "data_dir", .kind = .string },
             // Range-checked by load, which names the automatic value.
             .{ .name = "shards", .kind = .integer, .min = std.math.minInt(i64) },
+            // Refused by load, naming the fix.
             .{ .name = "partition_count", .kind = .integer, .min = std.math.minInt(i64) },
             .{ .name = "max_connections", .kind = .integer, .min = 0, .max = std.math.maxInt(u32) },
         },
@@ -443,12 +441,9 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
             }
             config.shards = @intCast(s);
         }
-        if (server.getInt("partition_count")) |pc| {
-            if (pc < 0 or pc > MAX_PARTITIONS) {
-                log.err("[server] partition_count = {d}: must be 0 (automatic) to {d}", .{ pc, MAX_PARTITIONS });
-                return error.InvalidPartitionCount;
-            }
-            config.partition_count = @intCast(pc);
+        if (server.getInt("partition_count") != null) {
+            log.err("[server] {s}", .{PARTITIONS_GONE});
+            return error.InvalidSetting;
         }
         if (server.getInt("max_connections")) |mc| {
             if (mc < 0 or mc > std.math.maxInt(u32)) {
@@ -581,7 +576,6 @@ pub fn loadWithOverrides(
     port_override: ?u16,
     data_dir_override: ?[]const u8,
     shards_override: ?u32,
-    partition_count_override: ?u32,
     log_level_override: ?[]const u8,
     log_format_override: ?[]const u8,
     durability_override: ?[]const u8,
@@ -619,13 +613,6 @@ pub fn loadWithOverrides(
             return error.InvalidShardCount;
         }
         config.shards = @intCast(s);
-    }
-    if (partition_count_override) |pc| {
-        if (pc > MAX_PARTITIONS) {
-            log.err("--partitions {d}: must be 0 (automatic) to {d}", .{ pc, MAX_PARTITIONS });
-            return error.InvalidPartitionCount;
-        }
-        config.partition_count = pc;
     }
     if (log_level_override) |level| {
         config.log_level = ServerConfig.LogLevel.fromString(level) orelse {
@@ -681,12 +668,6 @@ pub fn generateDefaultConfig() []const u8 {
     \\# WARNING: Cannot be changed after data exists without rebalancing!
     \\# Keys are hashed to shards - mismatch = data loss.
     \\shards = 0
-    \\
-    \\# Number of virtual partitions for two-level routing (0=auto: max(4096, shards × 32))
-    \\# Partitions are the unit of data ownership and rebalancing.
-    \\# Must be >= shards. A higher count enables finer-grained rebalancing.
-    \\# WARNING: Cannot be changed after data exists without rebalancing!
-    \\# partition_count = 0
     \\
     \\# Client connections held at once (0 = auto from the open-file limit).
     \\# Over this, a new connection is accepted and closed at once.
@@ -837,7 +818,7 @@ test "Durability.parseDurability accepts known values" {
 
 test "loadWithOverrides applies durability flag" {
     const allocator = std.testing.allocator;
-    var config = try loadWithOverrides(allocator, null, null, null, null, null, null, null, "sync");
+    var config = try loadWithOverrides(allocator, null, null, null, null, null, null, "sync");
     defer config.deinit();
     try std.testing.expectEqual(Durability.sync, config.durability);
 }
@@ -855,7 +836,7 @@ test "toRuntimeConfig conversion" {
     try std.testing.expectEqual(@as(u16, 4), runtime_config.num_shards);
 }
 
-test "a shard or partition count out of range is refused, not cast, from the file or the command line" {
+test "a shard count out of range is refused, not cast, from the file or the command line" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -871,21 +852,28 @@ test "a shard or partition count out of range is refused, not cast, from the fil
     }
     const path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{dir});
     defer allocator.free(path);
-    const f = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
-    try @import("stdx").fs.writeAll(f, "[server]\npartition_count = 16385\n");
-    @import("stdx").fs.closeFile(f);
-    try std.testing.expectError(error.InvalidPartitionCount, load(allocator, path));
-
     const g = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
     @import("stdx").fs.closeFile(g);
-    try std.testing.expectError(error.InvalidShardCount, loadWithOverrides(allocator, path, null, null, 70000, null, null, null, null));
-    try std.testing.expectError(error.InvalidPartitionCount, loadWithOverrides(allocator, path, null, null, null, MAX_PARTITIONS + 1, null, null, null));
-    var config = try loadWithOverrides(allocator, path, null, null, MAX_SHARDS, null, null, null, null);
+    try std.testing.expectError(error.InvalidShardCount, loadWithOverrides(allocator, path, null, null, 70000, null, null, null));
+    var config = try loadWithOverrides(allocator, path, null, null, MAX_SHARDS, null, null, null);
     defer config.deinit();
     try std.testing.expectEqual(MAX_SHARDS, config.shards);
-    var most = try loadWithOverrides(allocator, path, null, null, null, MAX_PARTITIONS, null, null, null);
-    defer most.deinit();
-    try std.testing.expectEqual(MAX_PARTITIONS, most.partition_count);
+}
+
+test "partition_count is refused at any value, the automatic one too" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try @import("stdx").fs.dirRealpathAlloc(tmp.dir, allocator, ".");
+    defer allocator.free(dir);
+    for ([_][]const u8{ "[server]\npartition_count = 0\n", "[server]\npartition_count = 4096\n", "[server]\npartition_count = 16385\n" }) |body| {
+        const path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{dir});
+        defer allocator.free(path);
+        const f = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
+        try @import("stdx").fs.writeAll(f, body);
+        @import("stdx").fs.closeFile(f);
+        try std.testing.expectError(error.InvalidSetting, load(allocator, path));
+    }
 }
 
 test "dashboard origins and hosts that could never match are refused at load" {
@@ -963,8 +951,8 @@ test "config: what flo.toml can't hold is refused, not ignored" {
     const ok = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
     try @import("stdx").fs.writeAll(ok, "[server]\nport = 9000\n");
     @import("stdx").fs.closeFile(ok);
-    try std.testing.expectError(error.InvalidSetting, loadWithOverrides(allocator, path, null, null, null, null, "loud", null, null));
-    try std.testing.expectError(error.InvalidSetting, loadWithOverrides(allocator, path, null, null, null, null, null, "xml", null));
+    try std.testing.expectError(error.InvalidSetting, loadWithOverrides(allocator, path, null, null, null, "loud", null, null));
+    try std.testing.expectError(error.InvalidSetting, loadWithOverrides(allocator, path, null, null, null, null, "xml", null));
 }
 
 test "config: the file config init writes loads, and a named file that is missing is refused" {
@@ -975,7 +963,7 @@ test "config: the file config init writes loads, and a named file that is missin
     defer allocator.free(dir);
     const path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{dir});
     defer allocator.free(path);
-    try std.testing.expectError(error.FileNotFound, loadWithOverrides(allocator, path, null, null, null, null, null, null, null));
+    try std.testing.expectError(error.FileNotFound, loadWithOverrides(allocator, path, null, null, null, null, null, null));
     const f = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
     try @import("stdx").fs.writeAll(f, generateDefaultConfig());
     @import("stdx").fs.closeFile(f);

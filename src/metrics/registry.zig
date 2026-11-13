@@ -581,8 +581,6 @@ pub const ShardMetrics = struct {
     bytes_sent: Atomic(u64) = Atomic(u64).init(0),
     /// Current subscriptions on this shard
     subscriptions: Atomic(u64) = Atomic(u64).init(0),
-    /// Total partitions owned by this shard
-    partitions: Atomic(u64) = Atomic(u64).init(0),
     /// Reactor event loop iterations (measures utilization)
     reactor_loops: Atomic(u64) = Atomic(u64).init(0),
     /// Total inbox messages processed
@@ -695,7 +693,7 @@ pub const ShardMetrics = struct {
 
     /// Labels for `connections_paused`: the shard's wait reasons, in order,
     /// then paused for unsent answers.
-    pub const PAUSE_REASONS = [_][]const u8{ "in_flight", "blocking_reads", "slots", "inbox", "unsent_answers" };
+    pub const PAUSE_REASONS = [_][]const u8{ "in_flight", "blocking_reads", "reply_capacity", "inbox", "unsent_answers" };
 
     pub const CrossShardClass = enum(u2) { client_forward, engine, gather };
 
@@ -736,10 +734,6 @@ pub const ShardMetrics = struct {
 
     pub fn subscriptionRemoved(self: *ShardMetrics) void {
         _ = self.subscriptions.fetchSub(1, .monotonic);
-    }
-
-    pub fn setPartitions(self: *ShardMetrics, count: u64) void {
-        self.partitions.store(count, .monotonic);
     }
 
     pub fn recordReactorLoop(self: *ShardMetrics) void {
@@ -839,7 +833,6 @@ pub const ShardMetrics = struct {
         bytes_received: u64,
         bytes_sent: u64,
         subscriptions: u64,
-        partitions: u64,
         reactor_loops: u64,
         inbox_processed: u64,
         inbox_pending: u64,
@@ -890,7 +883,6 @@ pub const ShardMetrics = struct {
             .bytes_received = self.bytes_received.load(.monotonic),
             .bytes_sent = self.bytes_sent.load(.monotonic),
             .subscriptions = self.subscriptions.load(.monotonic),
-            .partitions = self.partitions.load(.monotonic),
             .reactor_loops = self.reactor_loops.load(.monotonic),
             .inbox_processed = self.inbox_processed.load(.monotonic),
             .inbox_pending = if (self.live_pending) |lp| lp.read(lp.ctx) else self.inbox_pending.load(.monotonic),
@@ -1692,7 +1684,6 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_bytes_received_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bytes_received });
     try writer.print("flo_shard_bytes_sent_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bytes_sent });
     try writer.print("flo_shard_subscriptions{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.subscriptions });
-    try writer.print("flo_shard_partitions{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.partitions });
     try writer.print("flo_shard_reactor_loops_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.reactor_loops });
     try writer.print("flo_shard_inbox_processed_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.inbox_processed });
     try writer.print("flo_shard_inbox_pending{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.inbox_pending });
@@ -1945,13 +1936,11 @@ test "registry: shard metrics reactor and inbox" {
     shard.recordReactorLoop();
     shard.recordInboxProcessed(10);
     shard.setInboxPending(5);
-    shard.setPartitions(8);
 
     const snap = shard.snapshot();
     try testing.expectEqual(@as(u64, 2), snap.reactor_loops);
     try testing.expectEqual(@as(u64, 10), snap.inbox_processed);
     try testing.expectEqual(@as(u64, 5), snap.inbox_pending);
-    try testing.expectEqual(@as(u64, 8), snap.partitions);
 }
 
 test "registry: queue and stream series are exactly the ones something records" {

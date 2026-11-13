@@ -31,6 +31,7 @@
 //! ```
 
 const std = @import("std");
+const large_buffer = @import("../util/large_buffer.zig");
 
 /// Reference to a slab-allocated buffer. Carries metadata for deallocation.
 pub const SlabRef = struct {
@@ -71,6 +72,14 @@ const Pool = struct {
     all_chunks: std.ArrayListUnmanaged([*]u8),
     /// Size of each slab in this pool
     slab_size: usize,
+    /// How many of `all_chunks`, from the first, are mapped rather than the
+    /// allocator's: the initial chunks of a class of `MAP_MIN` or more.
+    mapped: usize = 0,
+
+    /// From this chunk size up, the initial chunks are mapped. Smaller ones
+    /// would each take a page for a few bytes, and a chunk grown under load
+    /// stays the allocator's, so growth is never a syscall.
+    const MAP_MIN: usize = 64 * 1024;
 
     fn init(allocator: std.mem.Allocator, slab_size: usize, initial_count: usize) !Pool {
         var pool = Pool{
@@ -83,11 +92,15 @@ const Pool = struct {
         try pool.free_list.ensureTotalCapacity(allocator, initial_count);
         try pool.all_chunks.ensureTotalCapacity(allocator, initial_count);
 
+        const map = slab_size >= MAP_MIN;
+        errdefer pool.deinit(allocator);
         for (0..initial_count) |_| {
-            const buf = try allocator.alloc(u8, slab_size);
+            // Mapped, not filled: a chunk's pages are touched as it's used.
+            const buf = if (map) try large_buffer.mapped(u8, slab_size) else try allocator.alloc(u8, slab_size);
             const ptr: [*]u8 = buf.ptr;
             pool.free_list.appendAssumeCapacity(ptr);
             pool.all_chunks.appendAssumeCapacity(ptr);
+            if (map) pool.mapped += 1;
         }
 
         return pool;
@@ -95,8 +108,8 @@ const Pool = struct {
 
     fn deinit(self: *Pool, allocator: std.mem.Allocator) void {
         // Free all chunks (both in-use and free)
-        for (self.all_chunks.items) |chunk| {
-            allocator.free(chunk[0..self.slab_size]);
+        for (self.all_chunks.items, 0..) |chunk, i| {
+            if (i < self.mapped) large_buffer.unmap(u8, chunk[0..self.slab_size]) else allocator.free(chunk[0..self.slab_size]);
         }
         self.all_chunks.deinit(allocator);
         self.free_list.deinit(allocator);
@@ -116,6 +129,7 @@ const Pool = struct {
 
     /// Grow pool by allocating a new slab
     fn grow(self: *Pool, allocator: std.mem.Allocator) ![*]u8 {
+        // The allocator's, not mapped: growth happens under load.
         const buf = try allocator.alloc(u8, self.slab_size);
         const ptr: [*]u8 = buf.ptr;
         try self.all_chunks.append(allocator, ptr);
@@ -353,4 +367,19 @@ test "Slab: opaque pointer for inbox" {
     // Round-trip through *anyopaque
     const recovered: [*]u8 = @ptrCast(@alignCast(opq));
     try std.testing.expectEqual(ref.ptr, recovered);
+}
+
+test "Slab: only the largest class's initial chunks are mapped; a chunk grown under load is the allocator's" {
+    const mapped_before = large_buffer.mapped_bytes.load(.monotonic);
+    var slab = try SlabAllocator.init(std.testing.allocator);
+    // Eight 64 KiB chunks mapped; the small classes' many chunks are not.
+    try std.testing.expectEqual(mapped_before + INITIAL_SLABS[POOL_COUNT - 1] * CLASS_SIZES[POOL_COUNT - 1], large_buffer.mapped_bytes.load(.monotonic));
+    // One more than the initial chunks: the ninth grows, from the allocator,
+    // which the testing allocator then tracks.
+    var refs: [INITIAL_SLABS[POOL_COUNT - 1] + 1]SlabRef = undefined;
+    for (&refs) |*r| r.* = try slab.alloc(CLASS_SIZES[POOL_COUNT - 1]);
+    try std.testing.expectEqual(mapped_before + INITIAL_SLABS[POOL_COUNT - 1] * CLASS_SIZES[POOL_COUNT - 1], large_buffer.mapped_bytes.load(.monotonic));
+    for (refs) |r| slab.free(r);
+    slab.deinit();
+    try std.testing.expectEqual(mapped_before, large_buffer.mapped_bytes.load(.monotonic));
 }

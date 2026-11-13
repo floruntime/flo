@@ -938,8 +938,8 @@ pub const WorkflowHandler = struct {
         const run_id_str = if (explicit_run_id) |rid|
             rid
         else blk: {
-            const partition_id = shard.router.keyToPartitionNs(req.ns_id, workflow_name);
-            break :blk shard.run_id_gen.next(.workflow, partition_id, &run_id_buf);
+            const slot = router.nsKeySlot(req.ns_id, workflow_name);
+            break :blk shard.run_id_gen.next(.workflow, slot, &run_id_buf);
         };
 
         // Build namespace-qualified key for the runs map
@@ -2002,8 +2002,8 @@ pub const WorkflowHandler = struct {
         id_buf: *[32]u8,
         index: *u64,
     ) union(enum) { started: []const u8, held, failed } {
-        const partition_id = shard.router.keyToPartitionNs(ns, wf_name);
-        const run_id_str = shard.run_id_gen.next(.workflow, partition_id, id_buf);
+        const slot = router.nsKeySlot(ns, wf_name);
+        const run_id_str = shard.run_id_gen.next(.workflow, slot, id_buf);
         const proposed = self.proposeStart(shard, ns, run_id_str, wf_name, "latest", input, null, evt_type) catch |err| {
             if (err == error.Overloaded) return .held;
             if (!shard.quietHalted(err)) log.err("workflow {s}: run {s} not started: {s}", .{ wf_name, run_id_str, @errorName(err) });
@@ -2215,8 +2215,8 @@ pub const WorkflowHandler = struct {
         // message while the action isn't registered, so a step waits for
         // its action wherever the two are placed.
         var run_id_buf: [32]u8 = undefined;
-        const partition_id = shard.router.keyToPartitionNs(ns, action_name);
-        const pre_run_id = shard.run_id_gen.next(.action, partition_id, &run_id_buf);
+        const slot = router.nsKeySlot(ns, action_name);
+        const pre_run_id = shard.run_id_gen.next(.action, slot, &run_id_buf);
         const message = ActionsHandler.encodeStartRunMessage(shard.allocator, ns, pre_run_id, action_name, input, run.run_id_owned, run.workflow_name_owned, can_wait) orelse {
             return definition.StepOutcome.execution_failure;
         };
@@ -3457,10 +3457,10 @@ pub const WorkflowHandler = struct {
         var key_buf: [512]u8 = undefined;
         const idem = std.fmt.bufPrint(&key_buf, "schedule:{d}:{s}:{d}", .{ schedule.ns.int(), schedule.workflow_name_owned, slot_ms }) catch return false;
 
-        // Generate run ID with embedded partition bits
+        // Generate run ID with the definition's slot in its bits
         var run_id_buf: [32]u8 = undefined;
-        const partition_id = shard.router.keyToPartitionNs(schedule.ns, schedule.workflow_name_owned);
-        const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf);
+        const slot = router.nsKeySlot(schedule.ns, schedule.workflow_name_owned);
+        const run_id_str = shard.run_id_gen.next(.workflow, slot, &run_id_buf);
 
         return self.proposeRun(shard, schedule.ns, run_id_str, schedule.workflow_name_owned, "latest", input, idem, "schedule_started") != null;
     }
@@ -3615,10 +3615,10 @@ pub const WorkflowHandler = struct {
         input: []const u8,
         event_id: StreamID,
     ) bool {
-        // Generate run ID with embedded partition bits
+        // Generate run ID with the definition's slot in its bits
         var run_id_buf: [32]u8 = undefined;
-        const partition_id = shard.router.keyToPartitionNs(trigger.ns, trigger.workflow_name_owned);
-        const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf);
+        const slot = router.nsKeySlot(trigger.ns, trigger.workflow_name_owned);
+        const run_id_str = shard.run_id_gen.next(.workflow, slot, &run_id_buf);
 
         // Room for the longest stream name a trigger may have, and both
         // numbers at their widest.
@@ -4803,7 +4803,7 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     try raft_node.bootstrap();
     shard.raft_node = raft_node;
     shard.raft_network = null;
-    shard.router = router.Router.init(1, 1, 0);
+    shard.router = router.Router.init(1, 0);
     shard.run_id_gen = .{};
     shard.waiter_pool = try waiter_pool_mod.WaiterPool.init(std.testing.allocator);
     // The one applier needs a partition to append to (whose store holds
