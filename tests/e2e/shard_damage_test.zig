@@ -15,7 +15,7 @@ fn twoShards() !*stdx.testing.TestContext {
     return stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 2, .durability = .sync } });
 }
 
-/// Flip a byte in the middle of every sealed segment shard `shard` holds.
+/// Flip a byte in the middle of the entries of every segment shard `shard` holds.
 fn corruptSegments(data_dir: []const u8, shard: u16) !usize {
     var path_buf: [512]u8 = undefined;
     const segs = try std.fmt.bufPrint(&path_buf, "{s}/{d:0>5}/segs", .{ data_dir, shard });
@@ -33,7 +33,9 @@ fn corruptSegments(data_dir: []const u8, shard: u16) !usize {
             break :blk try stdx.fs.readToEndAlloc(f, testing.allocator, 1 << 24);
         };
         defer testing.allocator.free(bytes);
-        bytes[bytes.len / 2] ^= 0xff;
+        // In its entries, past the header's blocks.
+        const header = @import("src").storage.ual.segment.HEADER_SIZE;
+        bytes[header + (bytes.len - header) / 2] ^= 0xff;
         const f = try stdx.fs.createFile(path, .{});
         defer stdx.fs.closeFile(f);
         try stdx.fs.writeAll(f, bytes);

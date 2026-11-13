@@ -55,7 +55,7 @@ test "e2e/health: a healthy node is live and ready on both ports, and /status na
     }
 }
 
-/// Flip a byte in the middle of every sealed segment shard `shard` holds.
+/// Flip a byte in the middle of the entries of every segment shard `shard` holds.
 fn corruptSegments(data_dir: []const u8, shard: u16) !usize {
     var path_buf: [512]u8 = undefined;
     const segs = try std.fmt.bufPrint(&path_buf, "{s}/{d:0>5}/segs", .{ data_dir, shard });
@@ -73,7 +73,9 @@ fn corruptSegments(data_dir: []const u8, shard: u16) !usize {
             break :blk try stdx.fs.readToEndAlloc(f, testing.allocator, 1 << 24);
         };
         defer testing.allocator.free(bytes);
-        bytes[bytes.len / 2] ^= 0xff;
+        // In its entries, past the header's blocks.
+        const header = @import("src").storage.ual.segment.HEADER_SIZE;
+        bytes[header + (bytes.len - header) / 2] ^= 0xff;
         const f = try stdx.fs.createFile(path, .{});
         defer stdx.fs.closeFile(f);
         try stdx.fs.writeAll(f, bytes);
@@ -114,7 +116,12 @@ test "e2e/health: a lone node with a damaged shard stays ready, and /status says
     const damaged = shards[1].object;
     try testing.expectEqualStrings("offline", damaged.get("state").?.string);
     try testing.expect(std.mem.startsWith(u8, damaged.get("reason").?.string, "segment"));
-    try testing.expect(damaged.get("losses").?.object.get("segment_unreadable").?.integer > 0);
+    // A sealed segment fails its file checksum; the active one, which has
+    // none, an entry's own.
+    const losses = damaged.get("losses").?.object;
+    const unreadable = if (losses.get("segment_unreadable")) |v| v.integer else 0;
+    const bad_entry = if (losses.get("segment_bad_entry")) |v| v.integer else 0;
+    try testing.expect(unreadable + bad_entry > 0);
 }
 
 /// Write `count` keys over one connection, `batch` requests in flight at

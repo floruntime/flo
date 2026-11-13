@@ -5210,7 +5210,11 @@ pub const Shard = struct {
             const prev = apply_marker.begin(&self.marker, entry);
             defer apply_marker.end(prev);
             if (comptime build_options.test_faults) {
-                if (@import("test_faults.zig").of(entry) == .panic_after_apply) @panic("test fault: panic after apply");
+                const fault = @import("test_faults.zig").of(entry);
+                if (fault == .panic_after_apply) @panic("test fault: panic after apply");
+                if (fault == .seal_each_flush) if (self.durable_log) |dl| {
+                    dl.max_segment_bytes = 1;
+                };
             }
             self.recordApplied(entry, result);
         }
