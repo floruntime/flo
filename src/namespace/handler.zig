@@ -343,14 +343,14 @@ pub const NamespaceHandler = struct {
         return n;
     }
 
-    /// The name shard 0's log created as `id`, published or not; null on
-    /// another shard, which reads names from `table` alone. A walk of the
-    /// live namespaces, for a read that misses the table in the moment
-    /// between a create applying and its publish.
+    /// The name shard 0's log created as `id` and hasn't published yet;
+    /// null on another shard, which reads names from `table` alone. For a
+    /// read that misses the table in the moment between a create applying
+    /// and its publish, so it walks only those creates: it runs on every
+    /// miss, a dequeue's included.
     pub fn createdName(self: *const NamespaceHandler, id: ns_table.Id) ?[]const u8 {
         if (!self.owner) return null;
-        var it = self.namespaces.iterator();
-        while (it.next()) |e| if (e.value_ptr.id == id) return e.key_ptr.*;
+        for (self.unpublished.items) |u| if (u.id == id) return u.name;
         return null;
     }
 
