@@ -97,11 +97,12 @@ pub const NamespaceHandler = struct {
     /// never publishes is out of reach. Set at boot with `id_floor`.
     unknown_above: u32 = 0,
     unknown_top: u32 = 0,
-    /// How many of them the table lacked when last reported: the table only
-    /// grows, so a change in the count is a change in the ids.
+    /// How many of them the table lacked when last reported.
     unknown_reported: u32 = 0,
-    /// How many times they were logged: once per change.
+    /// How many times they were logged as an error (each time they rose),
+    /// and at info as all known again.
     unknown_logged: u32 = 0,
+    unknown_cleared: u32 = 0,
     /// Shard 0: creates applied and not yet on disk, published at the next
     /// flush.
     unpublished: std.ArrayListUnmanaged(Unpublished) = .empty,
@@ -340,6 +341,17 @@ pub const NamespaceHandler = struct {
             n += 1;
         }
         return n;
+    }
+
+    /// The name shard 0's log created as `id`, published or not; null on
+    /// another shard, which reads names from `table` alone. A walk of the
+    /// live namespaces, for a read that misses the table in the moment
+    /// between a create applying and its publish.
+    pub fn createdName(self: *const NamespaceHandler, id: ns_table.Id) ?[]const u8 {
+        if (!self.owner) return null;
+        var it = self.namespaces.iterator();
+        while (it.next()) |e| if (e.value_ptr.id == id) return e.key_ptr.*;
+        return null;
     }
 
     /// Shard 0: the id of a namespace by name, as its own log and this
