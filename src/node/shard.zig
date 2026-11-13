@@ -109,6 +109,7 @@ const ual_mod = @import("../storage/ual/ual.zig");
 const UAL = ual_mod.UAL;
 const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
 const durable_log_mod = @import("../storage/durable_log.zig");
+const large_buffer = @import("../util/large_buffer.zig");
 const DurableLog = durable_log_mod.DurableLog;
 const CatchUp = @import("catch_up.zig").CatchUp;
 const DiskReads = @import("../stream/disk_reads.zig").DiskReads;
@@ -874,10 +875,11 @@ pub const Shard = struct {
         partition.kv.read_clock = .{ .ctx = raft_node, .now_ns = RaftNode.nowOpaque };
         const rpc_entries = try allocator.alloc(entry_mod.Entry, RPC_MAX_ENTRIES);
         errdefer allocator.free(rpc_entries);
-        const rpc_arena = try allocator.alloc(u8, RPC_BATCH_BYTES);
-        errdefer allocator.free(rpc_arena);
-        const rpc_out = try allocator.alloc(u8, transport.APPEND_REQ_PREFIX + RPC_MAX_ENTRIES * entry_mod.HEADER_SIZE + RPC_BATCH_BYTES);
-        errdefer allocator.free(rpc_out);
+        // Mapped, not filled: a group with no peers never touches them.
+        const rpc_arena = try large_buffer.alloc(allocator, u8, RPC_BATCH_BYTES);
+        errdefer large_buffer.free(allocator, u8, rpc_arena);
+        const rpc_out = try large_buffer.alloc(allocator, u8, transport.APPEND_REQ_PREFIX + RPC_MAX_ENTRIES * entry_mod.HEADER_SIZE + RPC_BATCH_BYTES);
+        errdefer large_buffer.free(allocator, u8, rpc_out);
         const pending = try allocator.alloc(Pending, PENDING_SLOTS);
         errdefer allocator.free(pending);
         @memset(pending, .{});
@@ -933,8 +935,8 @@ pub const Shard = struct {
         stream_handler.registerReplay(&replay_registry);
         try checkAppliers(shard_id, &replay_registry);
 
-        const apply_buf = try allocator.alloc(u8, limits.MAX_LOG_ENTRY_PAYLOAD);
-        errdefer allocator.free(apply_buf);
+        const apply_buf = try large_buffer.alloc(allocator, u8, limits.MAX_LOG_ENTRY_PAYLOAD);
+        errdefer large_buffer.free(allocator, u8, apply_buf);
         const read_buf = try allocator.alloc(u8, READ_CHUNK);
         errdefer allocator.free(read_buf);
         const parse_buf = try allocator.alloc(u8, MAX_REQUEST_SIZE);
@@ -1506,9 +1508,9 @@ pub const Shard = struct {
         self.respond_proxy.deinit();
         self.allocator.destroy(self.respond_proxy);
         self.allocator.free(self.replica.rpc_entries);
-        self.allocator.free(self.replica.rpc_arena);
-        self.allocator.free(self.replica.rpc_out);
-        self.allocator.free(self.apply_buf);
+        large_buffer.free(self.allocator, u8, self.replica.rpc_arena);
+        large_buffer.free(self.allocator, u8, self.replica.rpc_out);
+        large_buffer.free(self.allocator, u8, self.apply_buf);
         self.allocator.free(self.read_buf);
         self.allocator.free(self.parse_buf);
         self.allocator.free(self.entry_buf);

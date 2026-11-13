@@ -61,6 +61,7 @@
 //! ```
 
 const std = @import("std");
+const large_buffer = @import("../util/large_buffer.zig");
 const proto = @import("../protocol/proto.zig");
 const ReplyTo = @import("reply_to.zig").ReplyTo;
 const log = @import("stdx").log;
@@ -196,7 +197,8 @@ pub const WaiterPool = struct {
     pub fn init(allocator: std.mem.Allocator) !WaiterPool {
         return .{
             .allocator = allocator,
-            .waiters = try allocator.alloc(Waiter, MAX_WAITERS),
+            // Mapped, not filled: only the waiters in use are ever touched.
+            .waiters = try large_buffer.alloc(allocator, Waiter, MAX_WAITERS),
             .count = 0,
         };
     }
@@ -210,7 +212,7 @@ pub const WaiterPool = struct {
 
     pub fn deinit(self: *WaiterPool, allocator: std.mem.Allocator) void {
         for (self.waiters[0..self.count]) |w| if (w.key_heap) |k| allocator.free(k);
-        allocator.free(self.waiters);
+        large_buffer.free(allocator, Waiter, self.waiters);
     }
 
     // ── Registration ────────────────────────────────────────────────────
