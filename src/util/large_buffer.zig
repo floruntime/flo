@@ -35,6 +35,19 @@ pub var mapped_bytes: std.atomic.Value(usize) = .init(0);
 pub fn alloc(allocator: std.mem.Allocator, comptime T: type, n: usize) error{OutOfMemory}![]T {
     const bytes = std.math.mul(usize, n, @sizeOf(T)) catch return error.OutOfMemory;
     if (bytes < MIN_BYTES) return allocator.alloc(T, n);
+    return mapped(T, n);
+}
+
+pub fn free(allocator: std.mem.Allocator, comptime T: type, buf: []T) void {
+    if (buf.len * @sizeOf(T) < MIN_BYTES) return allocator.free(buf);
+    unmap(T, buf);
+}
+
+/// Mapped whatever its size, for a buffer a shard holds from init but may
+/// never write (a request's parse buffer, the slab's chunks): its pages,
+/// rounded up to whole ones, cost nothing until used. Freed by `unmap`.
+pub fn mapped(comptime T: type, n: usize) error{OutOfMemory}![]T {
+    const bytes = std.math.mul(usize, n, @sizeOf(T)) catch return error.OutOfMemory;
     // `rawAlloc`, not `alloc`: the interface's `alloc` is what fills.
     const ptr = std.heap.page_allocator.rawAlloc(bytes, .of(T), @returnAddress()) orelse return error.OutOfMemory;
     if (counted) _ = mapped_bytes.fetchAdd(bytes, .monotonic);
@@ -42,11 +55,9 @@ pub fn alloc(allocator: std.mem.Allocator, comptime T: type, n: usize) error{Out
     return typed[0..n];
 }
 
-pub fn free(allocator: std.mem.Allocator, comptime T: type, buf: []T) void {
-    const bytes = buf.len * @sizeOf(T);
-    if (bytes < MIN_BYTES) return allocator.free(buf);
+pub fn unmap(comptime T: type, buf: []T) void {
     std.heap.page_allocator.rawFree(std.mem.sliceAsBytes(buf), .of(T), @returnAddress());
-    if (counted) _ = mapped_bytes.fetchSub(bytes, .monotonic);
+    if (counted) _ = mapped_bytes.fetchSub(buf.len * @sizeOf(T), .monotonic);
 }
 
 test "large buffer: a mapped buffer reads zeros, not the safe-mode fill, and a small one is the allocator's" {
