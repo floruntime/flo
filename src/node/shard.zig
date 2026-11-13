@@ -603,6 +603,9 @@ pub const Shard = struct {
     /// serialized. Raft runs on, and commit advances; writes committed
     /// meanwhile wait in the pending table and are answered on resume.
     snapshot_window: ?SnapshotWindow = null,
+    /// Set while a request's own apply runs: under sync durability its flush
+    /// waits for the tick's apply pass, shared by every request read.
+    hold_sync_flush: bool = false,
     /// Tests only: the next bar. Bars proper come with snapshots; until then
     /// a window opens only here, or at a test fault's entry.
     test_bar: u64 = 0,
@@ -1010,11 +1013,22 @@ pub const Shard = struct {
             // by `applyDeferredTail` (see `SegmentHeader.commit_index_at_seal`).
             // A cold boot replays the log and applies none of it.
             //
-            // A `.flseg.tmp` is a flush a crash cut short: the normal torn
-            // tail, never part of the log. A `.flseg` that will not read is
-            // damage, and replay stops there, unless the read failed for
+            // A `.flseg.tmp` is a rewrite a crash cut short, never part of
+            // the log; the active segment's torn tail is a flush cut short,
+            // cut back to its last whole entry. A `.flseg` that will not read
+            // is damage, and replay stops there, unless the read failed for
             // want of resources: then boot refuses, and a restart may read it.
             _ = durable_log.?.removeTornTail() catch |err| log.warn("shard {d}: could not remove a torn segment flush: {s}", .{ shard_id, @errorName(err) });
+            // Before anything lists the log: a mark behind its entries would
+            // hide written ones from replay.
+            _ = durable_log.?.recoverActive() catch |err| {
+                // A header that won't read is the listing's to report, below,
+                // as the damage it is.
+                if (durable_log.?.badHeaderSegment().len == 0) {
+                    log.err("shard {d}: could not recover the newest segment's tail: {s}; not starting, since what it holds is unknown until it is", .{ shard_id, @errorName(err) });
+                    return err;
+                }
+            };
             var watermark: u64 = 0;
             var replayed_stamp: u64 = 0;
             if (boot_damage == null) {
@@ -1359,7 +1373,7 @@ pub const Shard = struct {
     /// With sync durability, flush what the log holds and tell the Raft
     /// node it's on disk: a leader's own copy counts toward commit only then.
     pub fn syncFlushIfNeeded(self: *Shard) void {
-        if (self.durability != .sync) return;
+        if (self.durability != .sync or self.hold_sync_flush) return;
         const raft = self.raft_node;
         const through = raft.log.lastIndex();
         self.flushSegmentToDisk() catch |err| {
@@ -1798,7 +1812,11 @@ pub const Shard = struct {
         // Apply what committed during the request: on a single node, what
         // its handler proposed on its own account (a dequeue's ack, an
         // implicit namespace create) and anything past the entry `park`
-        // answered at. In a cluster these wait for a peer's ack.
+        // answered at. In a cluster these wait for a peer's ack. Under sync
+        // durability nothing commits unflushed, and the flush waits for the
+        // tick's apply pass: every request read this tick shares it.
+        self.hold_sync_flush = true;
+        defer self.hold_sync_flush = false;
         _ = self.applyCommitted();
     }
 
@@ -3166,9 +3184,9 @@ pub const Shard = struct {
         slot.* = .{ .active = true, .index = proposed.index, .term = proposed.term, .reply_to = conn.replyTo(), .request_id = req.header.request_id, .answer = answer, .release = release, .ctx = ctx };
         self.pending_count += 1;
         conn.response_deferred = true;
-        // A leader counts itself toward the quorum; when commits are
-        // durable its own copy is on disk before it does.
-        if (self.durability == .sync) self.syncFlushIfNeeded();
+        // Under sync durability its own copy is flushed with the rest of
+        // this tick's writes, by the apply pass that follows (one fdatasync
+        // for all of them), before anything is answered.
         self.replica.pump(nowMs());
     }
 
@@ -4137,7 +4155,8 @@ pub const Shard = struct {
             self.marker.resumed();
             // The entry is passed over when the apply reaches it again. One
             // whose apply ran before it halted already left what a pass-over
-            // leaves, and the partition takes nothing twice.
+            // leaves: the ring refuses a second take of all but a KV entry,
+            // and the bar count takes no index twice.
             if (self.marker.crashed) |*c| if (c.index == h.index) self.marker.skipped();
             return true;
         }
@@ -4575,6 +4594,8 @@ pub const Shard = struct {
             sm.snapshot_skipped_leader_not_ready.store(self.snapshot_skips_leader_not_ready, .monotonic);
             sm.kv_sink_retry_pending.store(self.kv_sink_retries.items.len, .monotonic);
             sm.kv_sink_retry_overflow.store(self.kv_sink_retry_overflow, .monotonic);
+            sm.bar_last.store(self.defaultPartition().last_bar, .monotonic);
+            sm.bar_bytes.store(self.defaultPartition().bar_bytes, .monotonic);
             // A duration, not the monotonic start: a raw clock reading means
             // nothing to a reader and Prometheus can't subtract it.
             sm.flushes_failing_for_ms.store(if (self.flushes_failing_since_ms == 0) 0 else nowMs() -| self.flushes_failing_since_ms, .monotonic);
@@ -4632,6 +4653,10 @@ pub const Shard = struct {
         slot.read_blocked_serves.store(self.read_blocked and self.raft_network == null, .release);
         slot.persist_failures.store(self.persist_failures, .monotonic);
         slot.snapshot_skipped_leader_not_ready.store(self.snapshot_skips_leader_not_ready, .monotonic);
+        const part = self.defaultPartition();
+        slot.bar_last.store(part.last_bar, .monotonic);
+        slot.bar_bytes.store(part.bar_bytes, .monotonic);
+        slot.bar_threshold.store(part.barThreshold(), .monotonic);
         const window = self.snapshot_window;
         slot.snapshot_bar.store(if (window) |w| w.s else 0, .monotonic);
         slot.snapshot_suspended_for_ms.store(if (window) |w| nowMs() -| w.opened_ms else 0, .monotonic);
@@ -4907,8 +4932,11 @@ pub const Shard = struct {
 
     /// Whether the entry just applied is a bar, and if so how long a test
     /// window holds (0 for none). Bars proper come with snapshots.
-    fn barAt(self: *const Shard, e: *const entry_mod.Entry) ?u64 {
+    fn barAt(self: *Shard, e: *const entry_mod.Entry) ?u64 {
         if (self.test_bar != 0 and e.header.index == self.test_bar) return 0;
+        if (comptime BARS_OPEN_WINDOWS) {
+            if (self.defaultPartition().last_bar == e.header.index) return 0;
+        }
         if (comptime build_options.test_faults) {
             if (@import("test_faults.zig").of(e) == .snapshot_window) return TEST_FAULT_WINDOW_MS;
         }
@@ -5004,6 +5032,12 @@ pub const Shard = struct {
         // over it (after an async-flush rewind, say) would make it neither
         // its own history nor the group's, so it stays as it was.
         if (self.applying or self.offline != null or self.replica.diverged) return true;
+        // With sync durability a leader's writes commit only once on disk:
+        // flushing first lets what that commits apply now. Before any return
+        // below: a halted leader's own repair skip, or a write while a read
+        // is blocked, still has to reach disk to commit, and this is the
+        // tick's one flush.
+        self.syncFlushIfNeeded();
         // Blocked on a read and still inside the back-off: don't probe the disk
         // again this call. apply runs after every request, so re-attempting
         // here would mean one disk read per request and one log line per retry.
@@ -5018,9 +5052,6 @@ pub const Shard = struct {
             self.answerHaltedPending();
             return false;
         }
-        // With sync durability a leader's writes commit only once on disk:
-        // flushing first lets what that commits apply now.
-        self.syncFlushIfNeeded();
         // Suspended at a bar: after the flush, so a sync leader still makes
         // its writes durable and commits them; they apply on resume. Replies
         // held for entries at or below the bar go now.
@@ -5191,7 +5222,11 @@ pub const Shard = struct {
             const prev = apply_marker.begin(&self.marker, entry);
             defer apply_marker.end(prev);
             if (comptime build_options.test_faults) {
-                if (@import("test_faults.zig").of(entry) == .panic_after_apply) @panic("test fault: panic after apply");
+                const fault = @import("test_faults.zig").of(entry);
+                if (fault == .panic_after_apply) @panic("test fault: panic after apply");
+                if (fault == .seal_each_flush) if (self.durable_log) |dl| {
+                    dl.max_segment_bytes = 1;
+                };
             }
             self.recordApplied(entry, result);
         }
@@ -7326,6 +7361,11 @@ pub const SnapshotWindow = struct {
     hold_until_ms: u64 = 0,
 };
 
+/// Whether a bar suspends apply. Not until snapshots are written: bars are
+/// found and reported, but a window with nothing to serialize would only
+/// pause apply. Not a setting; the change that writes snapshots removes it.
+const BARS_OPEN_WINDOWS = false;
+
 /// Stub slices a test bar's window queues before it closes.
 pub const TEST_BAR_SLICES: u32 = 3;
 /// How long a window a test fault opens holds apply.
@@ -8051,6 +8091,13 @@ fn replaySegmentFile(
         // that way: a writer or format bug.
         const seg_entry = opened.reader.readEntryAt(offset) orelse {
             out.damage = silent_loss.Damage.init(.segment_bad_entry, "segment {s} holds an entry at byte {d} that will not parse", .{ name, offset });
+            return;
+        };
+        // An active segment has no whole-file checksum: each entry its own.
+        // Recovery cut a torn tail past its mark, so one failing here was
+        // recorded whole.
+        if (!opened.reader.header.sealed()) seg_entry.validate() catch |err| {
+            out.damage = silent_loss.Damage.init(.segment_bad_entry, "segment {s} holds an entry at byte {d} that fails its check ({s})", .{ name, offset, @errorName(err) });
             return;
         };
         // Apply switches on the type byte as an exhaustive enum: a type this
@@ -14429,6 +14476,8 @@ const ColdStream = struct {
         self.data_dir = try testDataDir(&self.tmp);
         self.pipe_fds = try @import("stdx").io.pipe();
         self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], self.data_dir, 64 * 1024, 0, 0, durability, 1, .single, .{}, .{});
+        // Each flush its own sealed segment, as the bulk thread reads them.
+        self.shard.durable_log.?.max_segment_bytes = 1;
         self.shard.wireHandlerShardPtrs();
         try std.testing.expect(self.shard.applyCommitted());
         self.shard.defaultPartition().setWarmBudget(4096);
@@ -16495,7 +16544,14 @@ test "Shard: alone with sync durability, a write whose flush fails is not acked,
     try s.init(&tmp);
     defer s.deinit();
 
-    // The segments directory refuses new files: the flush fails.
+    // The segments directory refuses new files, and the active segment,
+    // closed, won't open for writing: the flush fails.
+    const dl = s.shard.durable_log.?;
+    dl.closeActive();
+    const files = try dl.segments();
+    var seg_z: [520:0]u8 = undefined;
+    _ = try std.fmt.bufPrintSentinel(&seg_z, "{s}", .{files[files.len - 1].path}, 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(&seg_z, 0o400));
     try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(s.segs_z, 0o500));
     var buf: [1024]u8 = undefined;
     const refused = try s.put(1, "k1", &buf);
@@ -16504,11 +16560,39 @@ test "Shard: alone with sync durability, a write whose flush fails is not acked,
     try std.testing.expect(s.shard.kv_handler.kv.getIn(.default, "k1") == null);
 
     try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(s.segs_z, 0o700));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(&seg_z, 0o600));
     const acked = try s.put(2, "k2", &buf);
     try std.testing.expectEqual(proto.StatusCode.ok, acked.getStatus());
     // The refused write was in the log; it reached disk with this one.
     try std.testing.expect(s.shard.kv_handler.kv.getIn(.default, "k1") != null);
     try std.testing.expect(s.shard.kv_handler.kv.getIn(.default, "k2") != null);
+}
+
+test "Shard: alone with sync durability, the writes a tick parks share one flush, and none is answered before it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: SyncAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+    const dl = s.shard.durable_log.?;
+    const before = dl.appends;
+    // Three writes parked in one tick, before its apply pass: none flushed,
+    // none answered.
+    for (0..3) |i| {
+        var kbuf: [8]u8 = undefined;
+        try ParkTest.send(&s.shard, s.conn, .kv_put, 10 + i, try std.fmt.bufPrint(&kbuf, "g{d}", .{i}), "v");
+    }
+    try std.testing.expectEqual(before, dl.appends);
+    try std.testing.expect(s.shard.raft_node.durable_index < s.shard.raft_node.log.lastIndex());
+    var rbuf: [64]u8 = undefined;
+    try std.testing.expect(std.c.recv(s.pair[1], &rbuf, rbuf.len, std.c.MSG.DONTWAIT) <= 0);
+    // The apply pass: one flush for the three, then their answers.
+    _ = s.shard.applyCommitted();
+    try std.testing.expectEqual(before + 1, dl.appends);
+    var buf: [2048]u8 = undefined;
+    var r: [3]proto.Response = undefined;
+    try ParkTest.responses(&s.shard, s.conn, s.pair[1], &buf, &r);
+    for (r) |one| try std.testing.expectEqual(proto.StatusCode.ok, one.getStatus());
 }
 
 test "Shard: an entry the writer could not buffer is buffered again from the log before the flush" {
@@ -18930,9 +19014,16 @@ const AdminTest = struct {
     conn: *Connection,
 
     fn init(self: *AdminTest, node_id: u32, role: ClusterRole) !void {
+        return self.initWith(node_id, role, null, .async_flush);
+    }
+
+    /// `init`, keeping its log in `data_dir` under `durability`.
+    fn initWith(self: *AdminTest, node_id: u32, role: ClusterRole, data_dir: ?[]const u8, durability: Durability) !void {
         self.pipe_fds = try @import("stdx").io.pipe();
         self.rn = try RaftNetwork.init(std.testing.allocator, node_id, 0, 9000, .{ 127, 0, 0, 1 }, "s");
-        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, node_id, role, .{}, .{});
+        // As the server sets it: under sync a leader counts its own copy only
+        // once it is on disk.
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, durability, node_id, role, .{ .self_counts_when_durable = durability == .sync }, .{});
         self.shard.raft_network = &self.rn;
         self.shard.wireHandlerShardPtrs();
         try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &self.pair));
@@ -19253,6 +19344,7 @@ const DamageTest = struct {
     data_dir: []const u8,
     segs: []const u8,
     pipe_fds: [2]i32,
+    seal_every_flush: bool,
 
     const ENQUEUES = 4;
 
@@ -19261,6 +19353,21 @@ const DamageTest = struct {
         self.data_dir = try testDataDir(&self.tmp);
         self.segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{self.data_dir});
         self.pipe_fds = try @import("stdx").io.pipe();
+        self.seal_every_flush = true;
+        try self.write();
+    }
+
+    /// `init`, keeping its writes in one active segment, as a run does.
+    fn initActive(self: *DamageTest) !void {
+        try self.init();
+        // Again from empty, appended rather than sealed per flush.
+        try @import("stdx").fs.deleteTree(self.segs);
+        try @import("stdx").fs.makePath(self.segs);
+        self.seal_every_flush = false;
+        try self.write();
+    }
+
+    fn write(self: *DamageTest) !void {
         var shard = try self.open();
         defer shard.deinit();
         for (0..ENQUEUES) |i| {
@@ -19285,6 +19392,9 @@ const DamageTest = struct {
     fn openWith(self: *DamageTest, durability: Durability) !Shard {
         var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, self.pipe_fds[0], self.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, durability, 1, .single, .{}, .{});
         shard.wireHandlerShardPtrs();
+        // These tests damage one sealed segment among several: each flush
+        // seals its own, unless a test keeps the active segment.
+        if (self.seal_every_flush) shard.durable_log.?.max_segment_bytes = 1;
         return shard;
     }
 
@@ -19349,6 +19459,65 @@ const DamageTest = struct {
     }
 };
 
+/// Flip a byte in the active segment's newest mark.
+fn tearNewestMark(path: []const u8) !void {
+    const seg = @import("../storage/ual/segment.zig");
+    const bytes = try DamageTest.readFile(path);
+    defer std.testing.allocator.free(bytes);
+    const hdr = try seg.SegmentHeader.parse(bytes[0..seg.HEADER_SIZE]);
+    bytes[seg.MARK_OFFSETS[hdr.slot.?] + 20] ^= 0xff;
+    try DamageTest.writeFile(path, bytes);
+}
+
+test "a restart that lost the active segment's newest mark finds every write past the older one" {
+    var t: DamageTest = undefined;
+    try t.initActive();
+    defer t.deinit();
+    var buf: [512]u8 = undefined;
+    const path = try t.segment(0, &buf);
+    try tearNewestMark(path);
+    var shard = try t.open();
+    defer shard.deinit();
+    try std.testing.expect(shard.offline == null);
+    _ = shard.applyCommitted();
+    try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES), DamageTest.queued(&shard));
+}
+
+test "a flush a crash cut short in the active segment is cut at boot, and the shard serves" {
+    var t: DamageTest = undefined;
+    try t.initActive();
+    defer t.deinit();
+    var buf: [512]u8 = undefined;
+    const path = try t.segment(0, &buf);
+    const bytes = try DamageTest.readFile(path);
+    defer std.testing.allocator.free(bytes);
+    // Half an entry past what the mark records.
+    var torn = try std.testing.allocator.alloc(u8, bytes.len + 30);
+    defer std.testing.allocator.free(torn);
+    @memcpy(torn[0..bytes.len], bytes);
+    @memcpy(torn[bytes.len..], bytes[@import("../storage/ual/segment.zig").HEADER_SIZE..][0..30]);
+    try DamageTest.writeFile(path, torn);
+    var shard = try t.open();
+    defer shard.deinit();
+    try std.testing.expect(shard.offline == null);
+    _ = shard.applyCommitted();
+    try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES), DamageTest.queued(&shard));
+}
+
+test "an entry failing its check within what the active segment's mark records takes its shard offline" {
+    var t: DamageTest = undefined;
+    try t.initActive();
+    defer t.deinit();
+    var buf: [512]u8 = undefined;
+    const path = try t.segment(0, &buf);
+    const bytes = try DamageTest.readFile(path);
+    defer std.testing.allocator.free(bytes);
+    // The last entry's last payload byte: within the mark, so damage.
+    bytes[bytes.len - 1] ^= 0xff;
+    try DamageTest.writeFile(path, bytes);
+    try t.expectOffline(.segment_bad_entry, DamageTest.ENQUEUES - 1);
+}
+
 test "a segment flush a crash cut short is removed at boot, and the shard serves" {
     var t: DamageTest = undefined;
     try t.init();
@@ -19372,7 +19541,8 @@ test "a flipped byte in a sealed segment takes its shard offline, and replay sto
     const path = try t.segment(2, &buf);
     const bytes = try DamageTest.readFile(path);
     defer std.testing.allocator.free(bytes);
-    bytes[bytes.len / 2] ^= 0xff;
+    // In its entries, past the header blocks.
+    bytes[@import("../storage/ual/segment.zig").HEADER_SIZE + 20] ^= 0xff;
     try DamageTest.writeFile(path, bytes);
     // The first segment holds the bootstrap no-op and one enqueue; the
     // second, the next.
@@ -19461,7 +19631,8 @@ test "a member whose segment is damaged at boot is diverged, and /status says wh
     const path = try t.segment(2, &buf);
     const bytes = try DamageTest.readFile(path);
     defer std.testing.allocator.free(bytes);
-    bytes[bytes.len / 2] ^= 0xff;
+    // In its entries, past the header blocks.
+    bytes[@import("../storage/ual/segment.zig").HEADER_SIZE + 20] ^= 0xff;
     try DamageTest.writeFile(path, bytes);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
@@ -19511,7 +19682,7 @@ test "an entry that will not parse in a segment whose checksum holds takes its s
     const seg = @import("../storage/ual/segment.zig");
     std.mem.writeInt(u32, bytes[seg.HEADER_SIZE + 32 ..][0..4], 0xffff_fff0, .little);
     const footer_start = bytes.len - seg.FOOTER_SIZE;
-    std.mem.writeInt(u32, bytes[footer_start + 16 ..][0..4], @import("../util/checksum.zig").checksum(bytes[0..footer_start]), .little);
+    std.mem.writeInt(u32, bytes[footer_start + 16 ..][0..4], seg.footerCrc(bytes[seg.HEADER_SIZE..footer_start], bytes[0..seg.FIXED_SIZE]), .little);
     try DamageTest.writeFile(path, bytes);
     try t.expectOffline(.segment_bad_entry, 1);
 }
@@ -19529,7 +19700,7 @@ test "an entry of a type this build doesn't know takes its shard offline, not th
     const seg = @import("../storage/ual/segment.zig");
     bytes[seg.HEADER_SIZE + 5] = 0x83;
     const footer_start = bytes.len - seg.FOOTER_SIZE;
-    std.mem.writeInt(u32, bytes[footer_start + 16 ..][0..4], @import("../util/checksum.zig").checksum(bytes[0..footer_start]), .little);
+    std.mem.writeInt(u32, bytes[footer_start + 16 ..][0..4], seg.footerCrc(bytes[seg.HEADER_SIZE..footer_start], bytes[0..seg.FIXED_SIZE]), .little);
     try DamageTest.writeFile(path, bytes);
     try t.expectOffline(.segment_bad_entry, 1);
 }
@@ -21870,6 +22041,41 @@ test "Shard: a repair skip runs only from the admin socket, on a leader halted a
     try expectAnswer((try t.repairSkip(.admin, h, false, &buf)).?, .bad_request, "skipped already");
 }
 
+test "Shard: a halted sync leader flushes its own repair skip, which commits only once its copy is on disk" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    var t: AdminTest = undefined;
+    try t.initWith(1, .bootstrap, data_dir, .sync);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    try std.testing.expect(t.shard.applyCommitted());
+    try ParkTest.joinPeer(&t.shard);
+    var buf: [1024]u8 = undefined;
+    // An entry every replica fails, committed by the peer and this
+    // leader's own flushed copy: it halts there.
+    const h = (try raft.propose(.cg_create, entry_mod.Flags.NONE, "")).index;
+    _ = t.shard.applyCommitted();
+    raft.peers[0].sent_up_to = h;
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = h, .from = 2 });
+    try std.testing.expect(!t.shard.applyCommitted());
+    const halt = raft.halt_at.?;
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = h, .from = 2, .halt = halt });
+    // Its skip, acked by the peer: one of two voters until this leader's
+    // copy is on disk, which only its apply pass flushes, halted or not.
+    try std.testing.expect((try t.repairSkip(.peer, h, true, &buf)) == null);
+    const s = raft.log.lastIndex();
+    raft.peers[0].sent_up_to = s;
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = s, .from = 2, .halt = halt });
+    try std.testing.expect(raft.commit_index < s);
+    _ = t.shard.applyCommitted();
+    try std.testing.expect(raft.durable_index >= s);
+    try std.testing.expect(raft.commit_index >= s);
+    _ = t.shard.applyCommitted();
+    try std.testing.expect(t.shard.halted == null);
+}
+
 test "Shard: a leader that applied the entry its followers halted at says to upgrade them, not to skip it" {
     var t: AdminTest = undefined;
     try t.init(1, .bootstrap);
@@ -23298,7 +23504,8 @@ test "Shard: alone with sync durability, a suspended leader still flushes and co
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try t.put(1, "a", &buf)).header.status);
     const s = t.shard.snapshot_window.?.s;
     try ParkTest.send(&t.shard, t.conn, .kv_put, 2, "b", "v");
-    // Flushed and committed, though not applied.
+    // The tick's apply pass: flushed and committed, though not applied.
+    _ = t.shard.applyCommitted();
     try std.testing.expect(r.durable_index >= s + 1);
     try std.testing.expect(r.commit_index >= s + 1);
     try std.testing.expectEqual(s, r.last_applied);
@@ -23985,4 +24192,122 @@ test "Shard: action starts held for room have a bound of their own, which leaves
     ah.startRunFromInbox(sh, 1, m);
     try std.testing.expect(ah.startPending("missing-1"));
     try std.testing.expectEqual(ActionsHandler.MAX_HELD + 1, ah.held.count());
+}
+
+test "Shard: two replicas applying the same log find the same bars, the state a snapshot would encode moving between them" {
+    Partition.test_bar_min_bytes = 600;
+    defer Partition.test_bar_min_bytes = null;
+    const allocator = std.testing.allocator;
+    // Stream appends carry the bytes; KV puts (each also kept in the key's
+    // history) and action registers move the state between bars.
+    const n = 300;
+    var bufs: [n][400]u8 = undefined;
+    var entries: [n]entry_mod.Entry = undefined;
+    for (&entries, 0..) |*e, i| {
+        const index = i + 1;
+        const len = (i * 13) % 90;
+        var value: [90]u8 = undefined;
+        @memset(value[0..len], 'v');
+        if (i % 6 == 1) {
+            var key = TEST_KV_K.* ++ [_]u8{'0' + @as(u8, @intCast(i % 9))};
+            e.* = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, index, index, try kv_entries.Put.encodeInto(&bufs[i], .{ .key = &key, .value = value[0..len], .ttl_ms = null, .condition = .always, .cas_version = null }));
+        } else if (i % 25 == 3) {
+            var name_buf: [8]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "a{d}", .{i});
+            var reg = testRegister(name);
+            reg.owner = value[0 .. len % 40];
+            e.* = try ActionsHandler.for_tests.entry(.action_register, reg, 1, index, index, &bufs[i]);
+        } else {
+            @memset(bufs[i][0..400], 's');
+            e.* = entry_mod.buildEntry(.stream_append, entry_mod.Flags.NONE, 1, index, index, bufs[i][0..400]);
+        }
+    }
+    var bars: [2][n]u64 = undefined;
+    var states: [2][n]u64 = undefined;
+    var found: [2]usize = .{ 0, 0 };
+    var final: [2]u64 = undefined;
+    for (0..2) |r| {
+        var part = try Partition.init(allocator, 0, 8192, 0);
+        defer part.deinit();
+        part.wireProjections();
+        var registry: ReplayRegistry = .{};
+        var last: u64 = 0;
+        var since: u64 = 0;
+        for (&entries) |*e| {
+            var out: persistence_mod.Result = .{};
+            out.reset(e);
+            const before = part.store.encodedBytes();
+            // A stream append has no applier in a bare registry; the
+            // partition takes and counts it all the same.
+            const res = applyEntryCore(&part, &registry, e, &out);
+            try std.testing.expect(res == .applied or (res == .no_applier and e.header.entry_type == @backingInt(entry_mod.EntryType.stream_append)));
+            // A bar is the first index whose bytes since the last reach the
+            // larger of the minimum and the state before it.
+            since += entry_mod.HEADER_SIZE + e.payload.len;
+            const threshold = @max(600, before);
+            try std.testing.expectEqual(since >= threshold, part.last_bar != last);
+            if (part.last_bar != last) {
+                since = 0;
+                last = part.last_bar;
+                bars[r][found[r]] = last;
+                // The threshold the bar met: the state before its entry.
+                states[r][found[r]] = before;
+                found[r] += 1;
+            }
+        }
+        final[r] = part.store.encodedBytes();
+    }
+    try std.testing.expect(found[0] >= 3);
+    try std.testing.expectEqualSlices(u64, bars[0][0..found[0]], bars[1][0..found[1]]);
+    try std.testing.expectEqualSlices(u64, states[0][0..found[0]], states[1][0..found[1]]);
+    try std.testing.expectEqual(final[0], final[1]);
+    // The state grew past the minimum, so later bars fell by it.
+    try std.testing.expect(final[0] > 600);
+    try std.testing.expect(states[0][found[0] - 1] > 600);
+    try std.testing.expect(states[0][found[0] - 1] > states[0][0]);
+}
+
+test "Shard: boot replay finds the same bars as live apply did, and the same bytes since the last" {
+    Partition.test_bar_min_bytes = 500;
+    defer Partition.test_bar_min_bytes = null;
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var live_last: u64 = 0;
+    var live_bytes: u64 = 0;
+    var live_applied: u64 = 0;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        // Stream appends add log bytes but no family state, so the bars come
+        // from the minimum; a few KV puts move the state between them.
+        const payload = @as([200]u8, @splat('s'));
+        for (0..40) |i| {
+            try shard.stream_handler.appendPayloadToStream("s", "default", &payload);
+            if (i % 8 == 0) {
+                var kbuf: [16]u8 = undefined;
+                _ = try @import("../kv/handler.zig").KVHandler.testProposePut(&shard, try std.fmt.bufPrint(&kbuf, "k{d}", .{i}), "v");
+            }
+            _ = shard.applyCommitted();
+        }
+        const part = shard.defaultPartition();
+        live_last = part.last_bar;
+        live_bytes = part.bar_bytes;
+        live_applied = shard.raft_node.last_applied;
+        try std.testing.expect(live_last > 0);
+        try shard.flushSegmentToDisk();
+    }
+    var shard = try t.open();
+    defer shard.deinit();
+    shard.applyDeferredTail();
+    try std.testing.expectEqual(live_last, shard.defaultPartition().last_bar);
+    // The reopened node applies entries of its own past what live did (its
+    // term's no-op): the count is live's plus theirs.
+    var extra: u64 = 0;
+    var i = live_applied + 1;
+    while (i <= shard.raft_node.last_applied) : (i += 1) {
+        const e = shard.raft_node.log.getEntry(i).?;
+        extra += entry_mod.HEADER_SIZE + e.payload.len;
+    }
+    try std.testing.expectEqual(live_bytes + extra, shard.defaultPartition().bar_bytes);
 }

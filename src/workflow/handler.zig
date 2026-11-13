@@ -4790,6 +4790,7 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.diverged_damage = null;
     shard.offline_published = .init(false);
     shard.snapshot_window = null;
+    shard.hold_sync_flush = false;
     shard.test_bar = 0;
     shard.snapshot_skips_leader_not_ready = 0;
     shard.kv_sink_retries = .empty;

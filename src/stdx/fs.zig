@@ -246,6 +246,16 @@ pub fn readAll(file: File, buffer: []u8) !usize {
     return read_total;
 }
 
+/// Write all of `bytes` at `offset`, leaving the file position alone.
+pub fn writeAt(file: File, bytes: []const u8, offset: u64) !void {
+    return file.writePositionalAll(io(), bytes, offset);
+}
+
+/// Cut or extend a file to `len` bytes.
+pub fn setLength(file: File, len: u64) !void {
+    return file.setLength(io(), len);
+}
+
 /// Write all bytes to an opened file.
 pub fn writeAll(file: File, bytes: []const u8) !void {
     return file.writeStreamingAll(io(), bytes);

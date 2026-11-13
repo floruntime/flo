@@ -14,6 +14,7 @@ const entry_mod = @import("ual/entry.zig");
 const SegmentWriter = @import("ual/writer.zig").SegmentWriter;
 const SegmentReader = @import("ual/reader.zig").SegmentReader;
 const PositionedSegment = @import("ual/reader.zig").PositionedSegment;
+const checksum_mod = @import("../util/checksum.zig");
 const log = stdx.log;
 
 const Entry = entry_mod.Entry;
@@ -28,16 +29,106 @@ pub const SegmentFile = struct {
     commit_index_at_seal: u64,
     /// The header says it holds a repair skip.
     holds_skip: bool = false,
+    /// Sealed: never appended to again. The newest segment is the one that
+    /// may not be.
+    sealed: bool = true,
     /// The header would not read; listed only by a recovery listing, with
     /// first_index from the filename and the rest unknown.
     unreadable: bool = false,
     path: []const u8,
 };
 
+/// The newest segment, open for appends: each flush adds its entries, syncs
+/// them and records them in a mark. At `max_segment_bytes` it is sealed.
+pub const Active = struct {
+    file: std.Io.File,
+    fixed: segment.Fixed,
+    first_index: u64,
+    last_index: u64,
+    last_ts_ns: u64,
+    data_size: u64,
+    entry_count: u32,
+    flags: u8,
+    commit_index: u64,
+    /// The newest mark's sequence number and slot; the next goes in the
+    /// other slot.
+    seq: u32,
+    slot: u1,
+    /// Every 256th entry, as a sealed segment's index has them, kept as the
+    /// entries are appended: a read seeks by it, and the seal writes it.
+    sparse: std.ArrayListUnmanaged(segment.SparseIndexEntry) = .empty,
+    /// The indexes of the repair skips it holds, so a cut knows whether any
+    /// remain.
+    skips: std.ArrayListUnmanaged(u64) = .empty,
+    bitmap: u32,
+    /// The data's CRC so far, which the seal's footer needs.
+    crc: checksum_mod.ChecksumStream,
+    /// False after a cut, which can't take bytes back out of a running CRC:
+    /// the seal then reads the data back to sum it.
+    crc_whole: bool = true,
+
+    fn view(self: *Active) PositionedSegment {
+        return .{
+            .file = self.file,
+            .first_index = self.first_index,
+            .last_index = self.last_index,
+            .data_start = segment.HEADER_SIZE,
+            .data_end = segment.HEADER_SIZE + self.data_size,
+            .sparse = self.sparse.items,
+        };
+    }
+
+    fn close(self: *Active, allocator: std.mem.Allocator) void {
+        stdx.fs.closeFile(self.file);
+        self.sparse.deinit(allocator);
+        self.skips.deinit(allocator);
+    }
+
+    /// Count an entry just appended at data offset `offset`. Capacity is
+    /// reserved first (`reserve`), so this never fails.
+    fn note(self: *Active, e: *const Entry, offset: u64) void {
+        if (self.entry_count % segment.SPARSE_INDEX_INTERVAL == 0) self.sparse.appendAssumeCapacity(.{ .index = e.header.index, .offset = @intCast(offset) });
+        if (e.header.entry_type == @backingInt(entry_mod.EntryType.repair_skip)) {
+            self.skips.appendAssumeCapacity(e.header.index);
+            self.flags |= segment.FLAG_HOLDS_SKIP;
+        }
+        self.entry_count += 1;
+        self.last_index = e.header.index;
+        self.last_ts_ns = e.header.timestamp_ns;
+        self.bitmap = segment.bitmapSet(self.bitmap, e.header.entry_type);
+    }
+
+    fn reserve(self: *Active, allocator: std.mem.Allocator, entries: u32) !void {
+        try self.sparse.ensureUnusedCapacity(allocator, entries / segment.SPARSE_INDEX_INTERVAL + 1);
+        try self.skips.ensureUnusedCapacity(allocator, entries);
+    }
+
+    fn mark(self: *const Active, seq: u32) segment.Mark {
+        return .{
+            .seq = seq,
+            .flags = self.flags,
+            .data_size = @intCast(self.data_size),
+            .entry_count = self.entry_count,
+            .last_index = self.last_index,
+            .last_ts_ns = self.last_ts_ns,
+            .commit_index = self.commit_index,
+            .crc32c = 0,
+        };
+    }
+};
+
 pub const DurableLog = struct {
     allocator: std.mem.Allocator,
     writer: *SegmentWriter,
     segs_path: []const u8,
+    /// The newest segment, open for appends, once a flush or a read below
+    /// the ring has opened it.
+    active: ?Active = null,
+    /// An active segment is sealed once its data reaches this; tests lower it.
+    max_segment_bytes: u64 = segment.DEFAULT_MAX_SEGMENT_SIZE,
+    /// Flushes appended, and segments created, for tests and benches.
+    appends: u64 = 0,
+    creates: u64 = 0,
     /// Truncations that did not reach every file; each one is a replay
     /// that may apply a suffix the leader discarded.
     truncate_failures: u64 = 0,
@@ -69,6 +160,14 @@ pub const DurableLog = struct {
     /// be opened, standing in for a resource or IO failure from the OS without
     /// provoking a real one. Null in production.
     test_open_error: ?anyerror = null,
+    /// Tests only: an error a seal returns once its index and footer are
+    /// written, before the mark that seals it. Null in production.
+    test_seal_error: ?anyerror = null,
+    /// Tests only: an error the next mark write after an append returns.
+    test_mark_error: ?anyerror = null,
+    /// The active segment's newest mark failed to write: its entries are
+    /// on disk past what its mark on disk says.
+    mark_owed: bool = false,
     /// The segment last read below the ring, kept open: a deferred tail
     /// reads one entry per call, and re-opening it each time would read its
     /// sparse index again.
@@ -86,7 +185,8 @@ pub const DurableLog = struct {
         if (w.entry_count > 0 and start >= w.first_index and start <= w.last_index) return null;
         if (self.pending_cut) |cut| if (start > cut) return null;
         const f = covering(try self.segments(), start) orelse return null;
-        if (f.unreadable) return null;
+        // The active segment is read here, where its appends are made.
+        if (f.unreadable or !f.sealed) return null;
         if (f.path.len > path_buf.len) return error.PathTooLong;
         @memcpy(path_buf[0..f.path.len], f.path);
         const end = if (self.pending_cut) |cut| @min(cut, f.last_index) else f.last_index;
@@ -134,13 +234,17 @@ pub const DurableLog = struct {
     }
 
     pub fn deinit(self: *DurableLog) void {
+        self.closeActive();
         self.invalidate();
         self.allocator.free(self.scratch);
         self.allocator.free(self.segs_path);
     }
 
-    /// Seal the buffered entries into a new segment stamped with the commit
-    /// index they were flushed under. Nothing to flush is not an error.
+    /// Append the buffered entries to the active segment and sync them, then
+    /// record them in its mark under the commit index they were flushed
+    /// under: one fdatasync, no new file, unless this flush starts a
+    /// segment. A segment that reaches `max_segment_bytes` is sealed.
+    /// Nothing to flush is not an error.
     pub fn flush(self: *DurableLog, commit_index: u64) !void {
         // A pending cut owes a write even when no new entries do, and its write
         // can fail: try it before the empty-buffer return, so a caller tracking
@@ -149,40 +253,251 @@ pub const DurableLog = struct {
         if (self.pending_cut != null) {
             self.recoverTruncation() catch return error.TruncationIncomplete;
         }
+        // A mark still owed first: an append past a mark that says less
+        // would leave entries a reopen from that mark would write over.
+        if (self.mark_owed) if (self.active) |*a| {
+            self.writeMark(a) catch return error.MarkUnwritten;
+            self.mark_owed = false;
+        };
         if (self.writer.entry_count == 0) return;
         self.writer.commit_index_at_seal = commit_index;
-        // A failed write may still leave the file in place (only the
-        // directory sync failed), so drop the cached listing.
-        errdefer self.invalidate();
-        try self.writer.writeToFile(self.segs_path);
-        const sealed: SegmentFile = .{
-            .first_index = self.writer.first_index,
-            .last_index = self.writer.last_index,
-            .commit_index_at_seal = commit_index,
-            .holds_skip = self.writer.holds_skip,
-            .path = "",
-        };
+        const a = try self.activeFor(self.writer.first_index, self.writer.first_ts_ns);
+        try self.append(a, commit_index);
         self.writer.reset();
-        self.listSealed(sealed);
+        self.listActive();
+        // The entries are on disk, but not yet said to be: the flush fails,
+        // as one that didn't reach disk does, and the next one writes the
+        // mark before anything else.
+        self.writeMark(a) catch |err| {
+            self.mark_owed = true;
+            log.err("durable log: could not record a flush in the segment starting at index {d}: {s}; no more is appended until it is", .{ a.first_index, @errorName(err) });
+            return error.MarkUnwritten;
+        };
+        if (a.data_size >= self.max_segment_bytes) self.sealActive() catch |err| {
+            // The entries are on disk: the flush stands. The seal is tried
+            // again at the next flush, over whatever it left past the data.
+            log.warn("durable log: could not seal the segment starting at index {d}: {s}; it is sealed at a later flush", .{ a.first_index, @errorName(err) });
+        };
     }
 
-    /// The segment just sealed, added to the cached listing rather than the
-    /// listing dropped: a read below the ring would otherwise list the
-    /// whole directory, opening every header, after every flush. Dropped
-    /// instead when it wouldn't sort last, which a flush above the log's end
-    /// never is.
-    fn listSealed(self: *DurableLog, sealed: SegmentFile) void {
-        const old = self.listing orelse return;
-        if (old.len > 0 and sealed.first_index <= old[old.len - 1].last_index) return self.invalidate();
+    /// The active segment the buffer starting at `first` goes on: the one
+    /// open, the newest on disk if it ends just below `first`, or a new one.
+    fn activeFor(self: *DurableLog, first: u64, first_ts_ns: u64) !*Active {
+        if (self.active) |*a| {
+            if (a.last_index + 1 == first) return a;
+            if (first <= a.last_index) {
+                log.err("durable log: a flush starting at index {d} overlaps the active segment, which ends at {d}", .{ first, a.last_index });
+                return error.FlushOverlaps;
+            }
+            // A gap the writer left: this segment is done; the next starts
+            // past it, as a new file would have before.
+            try self.sealActive();
+        }
+        const files = try self.segments();
+        if (files.len > 0) {
+            const newest = files[files.len - 1];
+            if (!newest.sealed and newest.last_index + 1 == first) {
+                try self.openActive(newest.path);
+                return &self.active.?;
+            }
+            if (!newest.sealed) try self.sealFile(newest.path);
+        }
+        try self.createActive(first, first_ts_ns);
+        return &self.active.?;
+    }
+
+    /// A new segment for entries from `first`: its header with an empty mark,
+    /// synced with its directory entry, so the appends after need neither.
+    fn createActive(self: *DurableLog, first: u64, first_ts_ns: u64) !void {
         var name_buf: [32]u8 = undefined;
-        const name = segment.segmentFilename(&name_buf, sealed.first_index) orelse return self.invalidate();
+        const name = segment.segmentFilename(&name_buf, first) orelse return error.FilenameTooLong;
+        var path_buf: [512]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ self.segs_path, name }) catch return error.PathTooLong;
+        const fixed = segment.fixedFor(self.writer.partition_id, first, first_ts_ns);
+        const empty: segment.Mark = .{ .seq = 1, .flags = 0, .data_size = 0, .entry_count = 0, .last_index = first - 1, .last_ts_ns = 0, .commit_index = 0, .crc32c = 0 };
+        const file = try stdx.fs.createFile(path, .{ .read = true, .truncate = true });
+        errdefer stdx.fs.closeFile(file);
+        try stdx.fs.writeAll(file, &segment.encodeHeader(fixed, empty));
+        try stdx.fs.sync(file);
+        try stdx.fs.syncDir(self.segs_path);
+        self.active = .{
+            .file = file,
+            .fixed = fixed,
+            .first_index = first,
+            .last_index = first - 1,
+            .last_ts_ns = 0,
+            .data_size = 0,
+            .entry_count = 0,
+            .flags = 0,
+            .commit_index = 0,
+            .seq = 1,
+            .slot = 0,
+            .bitmap = 0,
+            .crc = checksum_mod.ChecksumStream.init(),
+        };
+        self.creates += 1;
+    }
+
+    /// The unsealed segment at `path`, opened for appends: its entries read
+    /// once to rebuild the index, skips and CRC a seal needs.
+    fn openActive(self: *DurableLog, path: []const u8) !void {
+        const file = try stdx.fs.openFile(path, .{ .mode = .read_write });
+        errdefer stdx.fs.closeFile(file);
+        var hdr_bytes: [segment.HEADER_SIZE]u8 = undefined;
+        if (try stdx.fs.readAt(file, &hdr_bytes, 0) != hdr_bytes.len) return error.ShortRead;
+        const hdr = try segment.SegmentHeader.parse(&hdr_bytes);
+        if (hdr.slot == null or hdr.sealed()) return error.NotActive;
+        const data = try self.allocator.alloc(u8, hdr.data_size);
+        defer self.allocator.free(data);
+        if (try stdx.fs.readAt(file, data, segment.HEADER_SIZE) != data.len) return error.ShortRead;
+        var a: Active = .{
+            .file = file,
+            .fixed = std.mem.bytesToValue(segment.Fixed, &hdr.fixed_bytes),
+            .first_index = hdr.first_index,
+            .last_index = hdr.first_index - 1,
+            .last_ts_ns = 0,
+            .data_size = 0,
+            .entry_count = 0,
+            .flags = 0,
+            .commit_index = hdr.commit_index_at_seal,
+            .seq = hdr.seq,
+            .slot = hdr.slot.?,
+            .bitmap = 0,
+            .crc = checksum_mod.ChecksumStream.init(),
+        };
+        errdefer {
+            a.sparse.deinit(self.allocator);
+            a.skips.deinit(self.allocator);
+        }
+        var off: usize = 0;
+        while (off < data.len) {
+            const e = Entry.deserialize(data[off..]) orelse return error.TornActiveSegment;
+            try a.reserve(self.allocator, 1);
+            a.note(&e, off);
+            off += e.totalSize();
+        }
+        if (a.last_index != hdr.last_index) return error.TornActiveSegment;
+        a.data_size = data.len;
+        a.crc.add(data);
+        self.active = a;
+    }
+
+    /// The writer's buffer appended to `a` and synced, then its mark.
+    fn append(self: *DurableLog, a: *Active, commit_index: u64) !void {
+        const w = self.writer;
+        const data = w.data.items;
+        // Room first: once the bytes are on disk, counting them can't fail.
+        try a.reserve(self.allocator, w.entry_count);
+        try stdx.fs.writeAt(a.file, data, segment.HEADER_SIZE + a.data_size);
+        try stdx.fs.sync(a.file);
+        self.appends += 1;
+        var off: usize = 0;
+        while (off < data.len) {
+            const e = Entry.deserialize(data[off..]).?;
+            a.note(&e, a.data_size + off);
+            off += e.totalSize();
+        }
+        a.crc.add(data);
+        a.data_size += data.len;
+        a.commit_index = @max(a.commit_index, commit_index);
+        // Not synced on its own: the next flush's sync takes it. So the mark
+        // on disk may lag the entries by one flush, never lead them, and a
+        // crash loses at most that one. Recovery finds the entries past it
+        // by their CRCs; the commit index it records lags with it, which
+        // only makes a boot more careful: entries above the watermark are
+        // applied once commit is re-established, not from replay.
+    }
+
+    /// The next mark, in the slot not holding the newest.
+    fn writeMark(self: *DurableLog, a: *Active) !void {
+        if (self.test_mark_error) |e| {
+            self.test_mark_error = null;
+            return e;
+        }
+        const slot: u1 = a.slot ^ 1;
+        const m = a.mark(a.seq + 1).withCrc();
+        try stdx.fs.writeAt(a.file, std.mem.asBytes(&m), segment.MARK_OFFSETS[slot]);
+        a.seq += 1;
+        a.slot = slot;
+    }
+
+    /// Append the sparse index and footer, sync, then mark it sealed and
+    /// sync again: until that mark is on disk the file is still active, and
+    /// recovery cuts the index and footer off as a torn tail.
+    fn sealActive(self: *DurableLog) !void {
+        const a = &(self.active orelse return);
+        if (!a.crc_whole) {
+            a.crc = try sumData(self.allocator, a.file, a.data_size);
+            a.crc_whole = true;
+        }
+        var tail: std.ArrayList(u8) = .empty;
+        defer tail.deinit(self.allocator);
+        try SegmentWriter.appendSealTail(self.allocator, &tail, a.sparse.items, @intCast(a.data_size), &a.crc, &a.fixed, a.bitmap);
+        try stdx.fs.writeAt(a.file, tail.items, segment.HEADER_SIZE + a.data_size);
+        try stdx.fs.sync(a.file);
+        if (self.test_seal_error) |e| return e;
+        // The sealed mark from a copy: until it is on disk the segment is
+        // still active here too, so a failed seal is retried over the same
+        // data, never taken for sealed.
+        var sealed = a.mark(a.seq + 1);
+        sealed.flags |= segment.FLAG_SEALED;
+        const slot: u1 = a.slot ^ 1;
+        try stdx.fs.writeAt(a.file, std.mem.asBytes(&sealed.withCrc()), segment.MARK_OFFSETS[slot]);
+        try stdx.fs.sync(a.file);
+        a.seq = sealed.seq;
+        a.slot = slot;
+        a.flags = sealed.flags;
+        self.mark_owed = false;
+        if (self.listing) |l| {
+            if (l.len > 0 and l[l.len - 1].first_index == a.first_index) l[l.len - 1].sealed = true;
+        }
+        self.closeActive();
+    }
+
+    /// Seal an unsealed segment that isn't open: opened, then sealed.
+    fn sealFile(self: *DurableLog, path: []const u8) !void {
+        try self.openActive(path);
+        try self.sealActive();
+    }
+
+    /// Close the active segment; the next flush or read below the ring
+    /// opens it again.
+    pub fn closeActive(self: *DurableLog) void {
+        if (self.active) |*a| a.close(self.allocator);
+        self.active = null;
+    }
+
+    /// The active segment as the cached listing has it, updated in place
+    /// after a flush rather than the listing dropped: a read below the ring
+    /// would otherwise list the whole directory, opening every header,
+    /// after every flush.
+    fn listActive(self: *DurableLog) void {
+        const old = self.listing orelse return;
+        const a = &self.active.?;
+        if (old.len > 0 and old[old.len - 1].first_index == a.first_index) {
+            const f = &old[old.len - 1];
+            f.last_index = a.last_index;
+            f.commit_index_at_seal = a.commit_index;
+            f.holds_skip = a.flags & segment.FLAG_HOLDS_SKIP != 0;
+            f.sealed = false;
+            return;
+        }
+        if (old.len > 0 and a.first_index <= old[old.len - 1].last_index) return self.invalidate();
+        var name_buf: [32]u8 = undefined;
+        const name = segment.segmentFilename(&name_buf, a.first_index) orelse return self.invalidate();
         const path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.segs_path, name }) catch return self.invalidate();
         const grown = self.allocator.realloc(old, old.len + 1) catch {
             self.allocator.free(path);
             return self.invalidate();
         };
-        grown[old.len] = sealed;
-        grown[old.len].path = path;
+        grown[old.len] = .{
+            .first_index = a.first_index,
+            .last_index = a.last_index,
+            .commit_index_at_seal = a.commit_index,
+            .holds_skip = a.flags & segment.FLAG_HOLDS_SKIP != 0,
+            .sealed = false,
+            .path = path,
+        };
         self.listing = grown;
     }
 
@@ -243,9 +558,33 @@ pub const DurableLog = struct {
     }
 
     fn readSealed(self: *DurableLog, start: u64, buf: []Entry, arena: []u8) !?PositionedSegment.Read {
-        const opened = try self.openCovering(start) orelse return null;
         if (self.scratch.len == 0) self.scratch = try self.allocator.alloc(u8, SCRATCH_SIZE);
+        if (try self.activeHolding(start)) |a| return try a.view().read(start, buf, arena, self.scratch);
+        const opened = try self.openCovering(start) orelse return null;
         return try opened.read(start, buf, arena, self.scratch);
+    }
+
+    /// The active segment, if it holds `index`: the one open, or the newest
+    /// on disk, unsealed, opened now so reads seek by its index rather than
+    /// scan it from the start.
+    fn activeHolding(self: *DurableLog, index: u64) !?*Active {
+        if (self.active) |*a| return if (index >= a.first_index and index <= a.last_index) a else null;
+        const files = try self.segments();
+        if (files.len == 0) return null;
+        const newest = files[files.len - 1];
+        if (newest.sealed or newest.unreadable or index < newest.first_index or index > newest.last_index) return null;
+        if (self.test_open_error) |e| return e;
+        try self.openActive(newest.path);
+        return &self.active.?;
+    }
+
+    /// Whether `index` is in the active segment, which only this thread
+    /// reads (`sealedSource` doesn't hand it to another).
+    pub fn activeHolds(self: *DurableLog, index: u64) !bool {
+        const files = try self.segments();
+        if (files.len == 0) return false;
+        const newest = files[files.len - 1];
+        return !newest.sealed and index >= newest.first_index and index <= newest.last_index;
     }
 
     pub const ReadBlockClass = enum {
@@ -313,6 +652,12 @@ pub const DurableLog = struct {
             self.pending_cut = @min(self.pending_cut orelse after_index, after_index);
         }
         if (self.pending_cut != null) try self.recoverTruncation();
+        if (self.active) |*a| {
+            // Nothing lies above the active segment, so a cut inside it is
+            // that file's alone: cut to the last kept entry and marked,
+            // with no intent or rewrite. One below it deletes it whole.
+            if (after_index >= a.first_index and after_index < a.last_index) try self.cutActive(after_index) else if (after_index < a.first_index) self.closeActive();
+        }
         const files = try self.listSegments(true);
         defer self.freeSegments(files);
         if (files.len == 0 or files[files.len - 1].last_index <= after_index) return;
@@ -373,6 +718,67 @@ pub const DurableLog = struct {
         self.pending_cut = null;
     }
 
+    /// Cut the active segment after `after_index`, an index it holds below
+    /// its last: its file is cut where the first entry above begins, found
+    /// from the index entry at or below it, then marked and synced.
+    fn cutActive(self: *DurableLog, after_index: u64) !void {
+        const a = &self.active.?;
+        // Start at the last indexed entry at or below the cut; its ordinal
+        // is its index-entry position times the interval.
+        var k: usize = 0;
+        for (a.sparse.items, 0..) |e, i| {
+            if (e.index > after_index) break;
+            k = i;
+        }
+        var offset: u64 = if (a.sparse.items.len > 0) a.sparse.items[k].offset else 0;
+        var ordinal: u32 = @intCast(k * segment.SPARSE_INDEX_INTERVAL);
+        var last_ts: u64 = 0;
+        var hdr_buf: [entry_mod.HEADER_SIZE]u8 = undefined;
+        while (offset < a.data_size) {
+            if (try stdx.fs.readAt(a.file, &hdr_buf, segment.HEADER_SIZE + offset) != hdr_buf.len) return error.ShortRead;
+            const hdr: *align(1) const entry_mod.Header = @ptrCast(&hdr_buf);
+            if (hdr.index > after_index) break;
+            last_ts = hdr.timestamp_ns;
+            ordinal += 1;
+            offset += entry_mod.HEADER_SIZE + @as(u64, hdr.payload_len);
+        }
+        // The shorter mark first, synced, and only then the file cut: the
+        // file is never shorter than its mark says, which recovery would
+        // take for damage. A crash between the two leaves entries past the
+        // mark, which recovery keeps as written (they were) and Raft
+        // replaces: a suffix a cut discards is an older term's, uncommitted.
+        var skips = a.skips.items.len;
+        while (skips > 0 and a.skips.items[skips - 1] > after_index) skips -= 1;
+        var next = a.mark(a.seq + 1);
+        next.data_size = @intCast(offset);
+        next.entry_count = ordinal;
+        next.last_index = after_index;
+        next.last_ts_ns = last_ts;
+        next.commit_index = @min(a.commit_index, after_index);
+        if (skips == 0) next.flags &= ~segment.FLAG_HOLDS_SKIP;
+        const slot: u1 = a.slot ^ 1;
+        try stdx.fs.writeAt(a.file, std.mem.asBytes(&next.withCrc()), segment.MARK_OFFSETS[slot]);
+        try stdx.fs.sync(a.file);
+        a.seq = next.seq;
+        a.slot = slot;
+        a.flags = next.flags;
+        self.mark_owed = false;
+        a.data_size = offset;
+        a.entry_count = ordinal;
+        a.last_index = after_index;
+        a.last_ts_ns = last_ts;
+        a.commit_index = next.commit_index;
+        while (a.sparse.items.len > 0 and a.sparse.items[a.sparse.items.len - 1].offset >= offset) _ = a.sparse.pop();
+        a.skips.shrinkRetainingCapacity(skips);
+        // The types bitmap stays a superset: it only lets a reader skip a
+        // segment, never miss an entry.
+        a.crc_whole = false;
+        // Past the mark now; the next append writes over whatever a failed
+        // or unfinished cut leaves here.
+        try stdx.fs.setLength(a.file, segment.HEADER_SIZE + offset);
+        try stdx.fs.sync(a.file);
+    }
+
     pub const Dropped = struct { files: usize = 0, bytes: u64 = 0 };
 
     /// Delete the sealed segments wholly at or below `through`, oldest
@@ -404,6 +810,15 @@ pub const DurableLog = struct {
     }
 
     fn applyCut(self: *DurableLog, files: []SegmentFile, after_index: u64) !void {
+        // A rewrite or delete replaces the file under the open handle; the
+        // rewrite reads the file to its mark, so an owed one is written first.
+        if (self.active) |*a| if (a.last_index > after_index) {
+            if (self.mark_owed) {
+                try self.writeMark(a);
+                self.mark_owed = false;
+            }
+            self.closeActive();
+        };
         // The rewrite needs room for a second copy; it goes first so a full
         // disk fails before anything is deleted.
         var rewritten: usize = 0;
@@ -520,11 +935,23 @@ pub const DurableLog = struct {
                 });
                 continue;
             };
+            if (hdr.slot == null) {
+                // Neither mark reads: what it holds is unknown until
+                // recovery scans it (`recoverActive`).
+                log.err("durable log: neither mark in the header of {s} reads", .{path});
+                const kept = @min(de.name.len, self.bad_header.len);
+                @memcpy(self.bad_header[0..kept], de.name[0..kept]);
+                self.bad_header_len = kept;
+                if (strict) return error.NoValidMark;
+                try files.append(self.allocator, .{ .first_index = hdr.first_index, .last_index = std.math.maxInt(u64), .commit_index_at_seal = 0, .unreadable = true, .path = path });
+                continue;
+            }
             try files.append(self.allocator, .{
                 .first_index = hdr.first_index,
                 .last_index = hdr.last_index,
                 .commit_index_at_seal = hdr.commit_index_at_seal,
-                .holds_skip = hdr.flags & segment.FLAG_HOLDS_SKIP != 0,
+                .holds_skip = hdr.holdsSkip(),
+                .sealed = hdr.sealed(),
                 .path = path,
             });
         }
@@ -547,11 +974,12 @@ pub const DurableLog = struct {
         return self.bad_header[0..self.bad_header_len];
     }
 
-    /// Delete the `.tmp` files flushes left behind. A segment is written to
-    /// `<name>.flseg.tmp` and renamed into place only once it is on disk,
-    /// so one still named `.tmp` is a flush a crash cut short: never part
-    /// of the log, and the normal tail of an unclean shutdown. Returns how
-    /// many went.
+    /// Delete the `.tmp` files rewrites left behind. A whole segment (a
+    /// cut's rewrite, an offline tool's) is written to `<name>.flseg.tmp`
+    /// and renamed into place only once it is on disk, so one still named
+    /// `.tmp` is a write a crash cut short: never part of the log. The
+    /// active segment's torn tail is `recoverActive`'s. Returns how many
+    /// went.
     pub fn removeTornTail(self: *DurableLog) !usize {
         const io = stdx.io.instance();
         var removed: usize = 0;
@@ -576,6 +1004,132 @@ pub const DurableLog = struct {
             try stdx.fs.deleteFile(path);
             log.info("durable log: removed {s}, a segment flush an unclean shutdown cut short (never part of the log)", .{name});
             removed += 1;
+        }
+    }
+
+    pub const Recovered = struct {
+        /// Unsealed segments whose mark was behind or ahead of their entries,
+        /// and bytes cut from them as the tail of a flush a crash interrupted.
+        marked: usize = 0,
+        cut_bytes: u64 = 0,
+        /// Unsealed segments holding no whole entry, deleted.
+        removed: usize = 0,
+        /// Unsealed segments older than the newest, sealed.
+        sealed: usize = 0,
+    };
+
+    /// At boot, before anything lists or reads the log: make each unsealed
+    /// segment's mark say what its file holds. Its entries are scanned from
+    /// the start; past what its mark records, the first that doesn't read
+    /// whole, carry its own CRC or follow the one before it ends the
+    /// segment, and the rest is cut as a flush a crash interrupted (or a
+    /// seal's index and footer, written before the mark that seals it).
+    /// Entries past a stale mark are kept: they were synced before their
+    /// mark was written. One failing within what the mark records was
+    /// written whole, so it is damage, not a torn tail: nothing is cut, and
+    /// replay stops there. A segment left with
+    /// no entry is deleted; an unsealed one that isn't the newest, which a
+    /// run never leaves (a seal is synced before the next segment starts),
+    /// is sealed. A header that won't read is left for the listing to
+    /// report.
+    pub fn recoverActive(self: *DurableLog) !Recovered {
+        self.closeActive();
+        self.invalidate();
+        var out: Recovered = .{};
+        const files = try self.listSegments(false);
+        defer self.freeSegments(files);
+        // Newest first: one left with nothing is deleted, and the one
+        // before it is then the newest, still to be appended to.
+        var newest = true;
+        var i = files.len;
+        while (i > 0) {
+            i -= 1;
+            const f = files[i];
+            if (f.sealed and !f.unreadable) {
+                newest = false;
+                continue;
+            }
+            const removed = out.removed;
+            try self.repairUnsealed(f.path, newest, &out);
+            if (out.removed == removed) newest = false;
+        }
+        self.invalidate();
+        return out;
+    }
+
+    fn repairUnsealed(self: *DurableLog, path: []const u8, newest: bool, out: *Recovered) !void {
+        const file = try stdx.fs.openFile(path, .{ .mode = .read_write });
+        var closed = false;
+        defer if (!closed) stdx.fs.closeFile(file);
+        var hdr_bytes: [segment.HEADER_SIZE]u8 = undefined;
+        if (try stdx.fs.readAt(file, &hdr_bytes, 0) != hdr_bytes.len) return;
+        const hdr = segment.SegmentHeader.parse(&hdr_bytes) catch return;
+        if (hdr.sealed()) return;
+        // Neither mark reads (a write tears one block at most, so this is
+        // damage to both): rebuilt from the fixed part and its entries,
+        // trusting none of them as recorded.
+        const size = try stdx.fs.fileLength(file);
+        const data = try self.allocator.alloc(u8, @intCast(size - segment.HEADER_SIZE));
+        defer self.allocator.free(data);
+        if (try stdx.fs.readAt(file, data, segment.HEADER_SIZE) != data.len) return error.ShortRead;
+        var off: usize = 0;
+        var count: u32 = 0;
+        var last_ts: u64 = 0;
+        var holds_skip = false;
+        while (off < data.len) {
+            const e = Entry.deserialize(data[off..]) orelse break;
+            if (e.header.index != hdr.first_index + count) break;
+            e.validate() catch break;
+            last_ts = e.header.timestamp_ns;
+            if (e.header.entry_type == @backingInt(entry_mod.EntryType.repair_skip)) holds_skip = true;
+            count += 1;
+            off += e.totalSize();
+        }
+        const marked: u64 = if (hdr.slot != null) hdr.data_size else 0;
+        if (off < marked) {
+            log.err("durable log: {s} holds an entry at byte {d} that fails its check, within what its mark records as written; left for replay to report", .{ path, off });
+            return;
+        }
+        if (count == 0) {
+            stdx.fs.closeFile(file);
+            closed = true;
+            try stdx.fs.deleteFile(path);
+            try stdx.fs.syncDir(self.segs_path);
+            log.info("durable log: removed {s}, a segment no whole entry reached", .{path});
+            out.removed += 1;
+            return;
+        }
+        const last = hdr.first_index + count - 1;
+        if (hdr.slot == null) log.warn("durable log: neither mark of {s} reads, so whether it was sealed is unknown; its {d} whole entries are kept, anything past them is cut (and sealed again if it isn't the newest), and they apply once commit is re-established", .{ path, count });
+        const in_step = hdr.slot != null and hdr.data_size == off and hdr.last_index == last;
+        if (off < data.len) {
+            try stdx.fs.setLength(file, segment.HEADER_SIZE + off);
+            log.info("durable log: cut {d} bytes past the last whole entry of {s}, the tail of a flush or seal a crash cut short", .{ data.len - off, path });
+            out.cut_bytes += data.len - off;
+        }
+        if (!in_step) {
+            const slot: u1 = if (hdr.slot) |sl| sl ^ 1 else 0;
+            const m = (segment.Mark{
+                .seq = hdr.seq + 1,
+                .flags = if (holds_skip) segment.FLAG_HOLDS_SKIP else 0,
+                .data_size = @intCast(off),
+                .entry_count = count,
+                .last_index = last,
+                .last_ts_ns = last_ts,
+                // What it was flushed under, no higher than what it holds;
+                // with no mark, none, and replay waits for commit.
+                .commit_index = if (hdr.slot != null) @min(hdr.commit_index_at_seal, last) else 0,
+                .crc32c = 0,
+            }).withCrc();
+            try stdx.fs.writeAt(file, std.mem.asBytes(&m), segment.MARK_OFFSETS[slot]);
+            out.marked += 1;
+        }
+        if (off < data.len or !in_step) try stdx.fs.sync(file);
+        stdx.fs.closeFile(file);
+        closed = true;
+        if (!newest) {
+            try self.sealFile(path);
+            out.sealed += 1;
         }
     }
 
@@ -657,18 +1211,30 @@ pub const DurableLog = struct {
     }
 };
 
-/// Read only the 64-byte header: listing a directory of large segments must
-/// not read them.
+/// Read only the header: listing a directory of large segments must not
+/// read them.
 fn readHeader(path: []const u8) !segment.SegmentHeader {
     const file = try stdx.fs.openFile(path, .{});
     defer stdx.fs.closeFile(file);
     var buf: [segment.HEADER_SIZE]u8 = undefined;
     const n = try stdx.fs.readAll(file, &buf);
     if (n != buf.len) return error.TooSmall;
-    const hdr: *const segment.SegmentHeader = @ptrCast(@alignCast(&buf));
-    if (!std.mem.eql(u8, &hdr.magic, &segment.HEADER_MAGIC)) return error.InvalidHeaderMagic;
-    if (hdr.version != segment.SEGMENT_VERSION) return error.InvalidVersion;
-    return hdr.*;
+    return segment.SegmentHeader.parse(&buf);
+}
+
+/// The CRC of a segment's first `len` data bytes, read back in chunks.
+fn sumData(allocator: std.mem.Allocator, file: std.Io.File, len: u64) !checksum_mod.ChecksumStream {
+    var crc = checksum_mod.ChecksumStream.init();
+    const chunk = try allocator.alloc(u8, 1 << 20);
+    defer allocator.free(chunk);
+    var at: u64 = 0;
+    while (at < len) {
+        const want: usize = @intCast(@min(chunk.len, len - at));
+        if (try stdx.fs.readAt(file, chunk[0..want], segment.HEADER_SIZE + at) != want) return error.ShortRead;
+        crc.add(chunk[0..want]);
+        at += want;
+    }
+    return crc;
 }
 
 /// Copy entries at or above `start` out of a self-delimiting byte run.
@@ -728,6 +1294,7 @@ test "durable log: flush tries a pending cut before the empty-buffer return, so 
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
     // Two sealed segments on disk, 1..3 and 4..6; the buffer is empty.
     try writer.addEntry(&testEntry(1, 1, "a"));
     try writer.addEntry(&testEntry(2, 1, "b"));
@@ -781,6 +1348,7 @@ test "durable log: watermark is the highest commit index any segment was sealed 
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
 
     try testing.expectEqual(@as(u64, 0), try dl.watermark());
     try writer.addEntry(&testEntry(1, 1, "a"));
@@ -799,6 +1367,7 @@ test "durable log: a segment holding a repair skip says so in its header, and a 
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
 
     try writer.addEntry(&testEntry(1, 1, "a"));
     try dl.flush(1);
@@ -835,6 +1404,7 @@ test "durable log: readRange serves the writer buffer, then each sealed segment"
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
 
     try writer.addEntry(&testEntry(1, 1, "one"));
     try writer.addEntry(&testEntry(2, 1, "two"));
@@ -871,6 +1441,7 @@ test "durable log: every index is found in its own segment among many, and none 
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
 
     // 40 segments of uneven size: segment k holds k % 3 + 1 entries, from index 5.
     var index: u64 = 5;
@@ -1006,6 +1577,7 @@ test "durable log: a positioned read refuses an entry whose bytes don't match it
     defer dl_writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &dl_writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
     for ([_]u64{ 2, 1002 }) |i| {
         const r = dl.readRange(i, &buf, &arena);
         try testing.expectEqual(@as(usize, 0), r.count);
@@ -1067,11 +1639,12 @@ test "durable log: a positioned read checks an entry bigger than its scratch, an
             const idx = std.mem.readInt(u32, bytes[footer..][0..4], .little);
             std.mem.writeInt(u32, bytes[idx + 8 ..][0..4], 0xFFFF_FFFF, .little);
         }
-        /// The header's data size, one short.
+        /// The mark's data size, one short (its CRC rewritten to match).
         fn data_size(bytes: []u8) void {
-            const at = @offsetOf(segment.SegmentHeader, "data_size");
-            const v = std.mem.readInt(u32, bytes[at..][0..4], .little);
-            std.mem.writeInt(u32, bytes[at..][0..4], v - 1, .little);
+            const at = segment.MARK_OFFSETS[0];
+            var m = std.mem.bytesToValue(segment.Mark, bytes[at..][0..segment.MARK_SIZE]);
+            m.data_size -= 1;
+            @memcpy(bytes[at..][0..segment.MARK_SIZE], std.mem.asBytes(&m.withCrc()));
         }
     };
     var first: u64 = 1;
@@ -1120,6 +1693,7 @@ test "durable log: truncateAfter rewrites the sealed tail under its own name and
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
 
     // Three sealed files (1-3, 4-6, 7-8) and a buffered 9-10, as sync
     // durability leaves them, then a leader change truncates after 5.
@@ -1205,6 +1779,7 @@ test "durable log: dropThrough deletes whole segments oldest first, keeps one st
         defer writer.deinit();
         var dl = try DurableLog.init(testing.allocator, &writer, td.path);
         defer dl.deinit();
+        dl.max_segment_bytes = 1;
         // Sealed 1-3, 4-6 and 7-8, under commits 3, 6 and 8.
         for (1..9) |i| {
             try writer.addEntry(&testEntry(i, 1, "x"));
@@ -1235,6 +1810,7 @@ test "durable log: dropThrough deletes whole segments oldest first, keeps one st
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
     const files = try dl.listSegments(true);
     defer dl.freeSegments(files);
     try testing.expectEqual(@as(usize, 2), files.len);
@@ -1257,6 +1833,7 @@ test "durable log: a truncation the previous run did not finish is completed bef
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
 
     // Files 1-3 and 4-5 exist; a cut after 2 was recorded and then the
     // process died before touching either file.
@@ -1288,6 +1865,7 @@ test "durable log: a segment from another stored format refuses to be listed" {
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
     try writer.addEntry(&testEntry(1, 1, "a"));
     try dl.flush(1);
     const files = try dl.listSegments(true);
@@ -1296,7 +1874,7 @@ test "durable log: a segment from another stored format refuses to be listed" {
     // The segment as a build with the previous format wrote it.
     const bytes = try stdx.fs.readFileAlloc(testing.allocator, files[0].path, 1 << 20);
     defer testing.allocator.free(bytes);
-    std.mem.writeInt(u16, bytes[@offsetOf(segment.SegmentHeader, "version")..][0..2], segment.SEGMENT_VERSION - 1, .little);
+    std.mem.writeInt(u16, bytes[@offsetOf(segment.Fixed, "version")..][0..2], segment.SEGMENT_VERSION - 1, .little);
     const file = try stdx.fs.createFile(files[0].path, .{});
     defer stdx.fs.closeFile(file);
     try stdx.fs.writeAll(file, bytes);
@@ -1310,6 +1888,7 @@ test "durable log: two segments holding the same index refuse to be listed" {
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
 
     try writer.addEntry(&testEntry(1, 1, "a"));
     try writer.addEntry(&testEntry(2, 1, "b"));
@@ -1323,6 +1902,8 @@ test "durable log: two segments holding the same index refuse to be listed" {
     try stray.writeToFile(td.path);
 
     try testing.expectError(error.OverlappingSegments, dl.listSegments(true));
+    // The flush left a listing cached; the stray file came after it.
+    dl.invalidate();
     try testing.expectError(error.OverlappingSegments, dl.watermark());
     // Recovery lists without the check, since it exists to repair this.
     const files = try dl.listSegments(false);
@@ -1336,6 +1917,7 @@ test "durable log: the cached listing and open segment are dropped by a flush an
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
 
     try writer.addEntry(&testEntry(1, 1, "a"));
     try writer.addEntry(&testEntry(2, 1, "b"));
@@ -1364,6 +1946,7 @@ test "durable log: a truncation that cannot reach the files wedges flushing unti
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
 
     try writer.addEntry(&testEntry(1, 1, "a"));
     try writer.addEntry(&testEntry(2, 1, "b"));
@@ -1410,6 +1993,7 @@ test "durable log: a cut that fails after its intent is recorded is finished by 
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
 
     try writer.addEntry(&testEntry(1, 1, "a"));
     try writer.addEntry(&testEntry(2, 1, "b"));
@@ -1465,6 +2049,7 @@ test "durable log: a cut that cannot even list the files is remembered" {
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
     try writer.addEntry(&testEntry(1, 1, "a"));
     try writer.addEntry(&testEntry(2, 1, "b"));
     try writer.addEntry(&testEntry(3, 1, "c"));
@@ -1490,6 +2075,7 @@ test "durable log: a cut retried after its deletes already happened still syncs 
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
 
     // A cut after 3 whose only work was deleting 4-5: that delete happened,
     // the directory sync after it failed, and the intent is still on disk.
@@ -1521,6 +2107,7 @@ test "durable log: a salvage deletes a file above the cut whose header won't rea
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
     for ([_]u64{ 1, 2, 3, 4, 5, 6 }) |i| {
         try writer.addEntry(&testEntry(i, 1, "x"));
         if (i % 2 == 0) try dl.flush(i);
@@ -1558,6 +2145,7 @@ test "durable log: a salvage below a pending cut records its own, one above keep
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
     for ([_]u64{ 1, 2, 3, 4, 5, 6 }) |i| {
         try writer.addEntry(&testEntry(i, 1, "x"));
         if (i % 2 == 0) try dl.flush(i);
@@ -1592,6 +2180,7 @@ test "durable log: a recovery listing refuses a damaged file whose name is not a
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/backup.flseg", .{td.path});
     const file = try stdx.fs.createFile(path, .{});
@@ -1606,6 +2195,7 @@ test "durable log: a resource or IO read failure is held as blocked, corruption 
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
     try writer.addEntry(&testEntry(1, 1, "one"));
     try writer.addEntry(&testEntry(2, 1, "two"));
     try writer.addEntry(&testEntry(3, 1, "three"));
@@ -1705,6 +2295,7 @@ test "durable log: a flush adds its segment to the cached listing, so a read aft
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, path);
     defer dl.deinit();
+    dl.max_segment_bytes = 1;
 
     const SEGMENTS = 2_000;
     for (1..SEGMENTS + 1) |i| {
@@ -1752,4 +2343,496 @@ test "durable log: readBlockClass sorts a read error into resource, disk, or fau
     try testing.expectEqual(R.disk, DurableLog.readBlockClass(error.PermissionDenied));
     try testing.expectEqual(R.fault, DurableLog.readBlockClass(error.FileNotFound));
     try testing.expectEqual(R.fault, DurableLog.readBlockClass(error.EndOfStream));
+}
+
+// ─── The active segment ───────────────────────────────────────────────────────
+
+/// Flush entries `from` through `to` as one flush under commit `to`.
+fn flushRun(dl: *DurableLog, writer: *SegmentWriter, from: u64, to: u64, payload: []const u8) !void {
+    var i = from;
+    while (i <= to) : (i += 1) try writer.addEntry(&testEntry(i, 1, payload));
+    try dl.flush(to);
+}
+
+fn countSegments(dir: []const u8) !usize {
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (names.items) |n| testing.allocator.free(n);
+        names.deinit(testing.allocator);
+    }
+    try fileNames(dir, &names);
+    var n: usize = 0;
+    for (names.items) |name| {
+        if (std.mem.endsWith(u8, name, ".flseg")) n += 1;
+    }
+    return n;
+}
+
+test "durable log: flushes append to one active segment, one sync each, and it is sealed once it reaches its size" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    dl.max_segment_bytes = 4096;
+
+    const syncs = stdx.fs.dir_syncs.load(.monotonic);
+    for (0..10) |k| try flushRun(&dl, &writer, k * 3 + 1, k * 3 + 3, "payload-bytes");
+    // Ten flushes, one file: its directory entry synced once, when made.
+    try testing.expectEqual(@as(usize, 1), try countSegments(td.path));
+    try testing.expectEqual(@as(u64, 10), dl.appends);
+    try testing.expectEqual(@as(u64, 1), dl.creates);
+    try testing.expectEqual(syncs + 1, stdx.fs.dir_syncs.load(.monotonic));
+    var files = try dl.listSegments(true);
+    try testing.expectEqual(@as(u64, 30), files[0].last_index);
+    try testing.expectEqual(@as(u64, 30), files[0].commit_index_at_seal);
+    try testing.expect(!files[0].sealed);
+    dl.freeSegments(files);
+
+    // Past its size it is sealed, and the next flush starts another.
+    const big = @as([4096]u8, @splat('B'));
+    try flushRun(&dl, &writer, 31, 31, &big);
+    try flushRun(&dl, &writer, 32, 33, "after");
+    files = try dl.listSegments(true);
+    defer dl.freeSegments(files);
+    try testing.expectEqual(@as(usize, 2), files.len);
+    try testing.expect(files[0].sealed and !files[1].sealed);
+    try testing.expectEqual(@as(u64, 31), files[0].last_index);
+    try testing.expectEqual(@as(u64, 32), files[1].first_index);
+    // The sealed one reads whole, its footer checked; every index reads.
+    const opened = try SegmentReader.initFromFile(testing.allocator, files[0].path);
+    testing.allocator.free(opened.buf);
+    var buf: [1]Entry = undefined;
+    var arena: [8192]u8 = undefined;
+    for (1..34) |i| try testing.expectEqual(@as(usize, 1), dl.readRange(i, &buf, &arena).count);
+    // Only the sealed one is handed to another thread.
+    var path_buf: [512]u8 = undefined;
+    try testing.expect((try dl.sealedSource(5, &path_buf)) != null);
+    try testing.expect((try dl.sealedSource(33, &path_buf)) == null);
+    try testing.expect(try dl.activeHolds(33));
+    try testing.expect(!(try dl.activeHolds(5)));
+}
+
+test "durable log: after a restart the newest unsealed segment is appended to, not replaced" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    {
+        var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+        defer dl.deinit();
+        for (0..300) |k| try flushRun(&dl, &writer, k + 1, k + 1, "x");
+    }
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    const r = try dl.recoverActive();
+    try testing.expectEqual(@as(usize, 0), r.marked + r.removed + r.sealed);
+    try flushRun(&dl, &writer, 301, 302, "y");
+    try testing.expectEqual(@as(usize, 1), try countSegments(td.path));
+    try testing.expectEqual(@as(u64, 0), dl.creates);
+    var buf: [400]Entry = undefined;
+    var arena: [4096]u8 = undefined;
+    try testing.expectEqual(@as(usize, 302), dl.readRange(1, &buf, &arena).count);
+    // Reopened, its index was rebuilt: a read seeks, not scans.
+    try testing.expect(dl.active.?.sparse.items.len == 2);
+}
+
+/// The file's header as it was, written back over it: a crash that kept
+/// the entries of the flushes since but lost their marks.
+fn restoreHeader(path: []const u8, header: *const [segment.HEADER_SIZE]u8) !void {
+    const file = try stdx.fs.openFile(path, .{ .mode = .read_write });
+    defer stdx.fs.closeFile(file);
+    try stdx.fs.writeAt(file, header, 0);
+}
+
+fn readHeaderBytes(path: []const u8) ![segment.HEADER_SIZE]u8 {
+    const file = try stdx.fs.openFile(path, .{});
+    defer stdx.fs.closeFile(file);
+    var out: [segment.HEADER_SIZE]u8 = undefined;
+    _ = try stdx.fs.readAt(file, &out, 0);
+    return out;
+}
+
+fn appendBytes(path: []const u8, bytes: []const u8) !void {
+    const file = try stdx.fs.openFile(path, .{ .mode = .read_write });
+    defer stdx.fs.closeFile(file);
+    try stdx.fs.writeAt(file, bytes, try stdx.fs.fileLength(file));
+}
+
+test "durable log: recovery keeps entries past a mark a crash lost, and cuts a torn flush after them" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var path: []u8 = undefined;
+    {
+        var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+        defer dl.deinit();
+        try flushRun(&dl, &writer, 1, 3, "first");
+        const files = try dl.segments();
+        path = try testing.allocator.dupe(u8, files[0].path);
+        const early = try readHeaderBytes(path);
+        try flushRun(&dl, &writer, 4, 6, "second");
+        try flushRun(&dl, &writer, 7, 9, "third");
+        // The marks of the last two flushes lost; the entries synced.
+        try restoreHeader(path, &early);
+        // And half an entry of a fourth flush the crash cut short.
+        var torn = testEntry(10, 1, "fourth flush");
+        var torn_bytes: [64]u8 = undefined;
+        @memcpy(torn_bytes[0..entry_mod.HEADER_SIZE], torn.header.asBytes());
+        try appendBytes(path, torn_bytes[0 .. entry_mod.HEADER_SIZE + 3]);
+    }
+    defer testing.allocator.free(path);
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    const r = try dl.recoverActive();
+    try testing.expectEqual(@as(usize, 1), r.marked);
+    try testing.expectEqual(@as(u64, entry_mod.HEADER_SIZE + 3), r.cut_bytes);
+    const files = try dl.listSegments(true);
+    defer dl.freeSegments(files);
+    try testing.expectEqual(@as(u64, 9), files[0].last_index);
+    // The commit recorded is the old mark's: the flushes since wait for
+    // commit to be re-established.
+    try testing.expectEqual(@as(u64, 3), files[0].commit_index_at_seal);
+    var buf: [16]Entry = undefined;
+    var arena: [1024]u8 = undefined;
+    try testing.expectEqual(@as(usize, 9), dl.readRange(1, &buf, &arena).count);
+    // Recovered once, it has nothing more to do.
+    const again = try dl.recoverActive();
+    try testing.expectEqual(@as(usize, 0), again.marked);
+    try testing.expectEqual(@as(u64, 0), again.cut_bytes);
+}
+
+test "durable log: an entry failing its check within what the mark records is left for replay, not cut" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var path: []u8 = undefined;
+    var size: u64 = 0;
+    {
+        var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+        defer dl.deinit();
+        try flushRun(&dl, &writer, 1, 3, "first");
+        try flushRun(&dl, &writer, 4, 6, "second");
+        path = try testing.allocator.dupe(u8, (try dl.segments())[0].path);
+    }
+    defer testing.allocator.free(path);
+    {
+        const file = try stdx.fs.openFile(path, .{ .mode = .read_write });
+        defer stdx.fs.closeFile(file);
+        size = try stdx.fs.fileLength(file);
+        // A flipped payload byte in the second entry.
+        const at = segment.HEADER_SIZE + entry_mod.HEADER_SIZE + "first".len + entry_mod.HEADER_SIZE + 1;
+        try stdx.fs.writeAt(file, "Z", at);
+    }
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    const r = try dl.recoverActive();
+    try testing.expectEqual(@as(usize, 0), r.marked + r.removed);
+    try testing.expectEqual(@as(u64, 0), r.cut_bytes);
+    try testing.expectEqual(size, (try stdx.fs.statFile(path, .{})).size);
+    try testing.expectEqual(@as(u64, 6), (try dl.segments())[0].last_index);
+}
+
+test "durable log: a seal cut short before its mark leaves an active segment, its index and footer cut at recovery" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var tail_len: usize = 0;
+    {
+        var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+        defer dl.deinit();
+        try flushRun(&dl, &writer, 1, 4, "entries");
+        const a = &dl.active.?;
+        // The index and footer written, the mark sealing it not.
+        var tail: std.ArrayList(u8) = .empty;
+        defer tail.deinit(testing.allocator);
+        try SegmentWriter.appendSealTail(testing.allocator, &tail, a.sparse.items, @intCast(a.data_size), &a.crc, &a.fixed, a.bitmap);
+        try stdx.fs.writeAt(a.file, tail.items, segment.HEADER_SIZE + a.data_size);
+        tail_len = tail.items.len;
+    }
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    const r = try dl.recoverActive();
+    try testing.expectEqual(@as(u64, tail_len), r.cut_bytes);
+    try flushRun(&dl, &writer, 5, 6, "more");
+    var buf: [8]Entry = undefined;
+    var arena: [512]u8 = undefined;
+    try testing.expectEqual(@as(usize, 6), dl.readRange(1, &buf, &arena).count);
+}
+
+test "durable log: recovery deletes an active segment no entry reached, and seals one that isn't the newest" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    {
+        var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+        defer dl.deinit();
+        try flushRun(&dl, &writer, 1, 3, "one");
+        // An unsealed segment followed by another: never left by a run,
+        // made here by hand.
+        dl.closeActive();
+        try dl.createActive(4, 0);
+        try flushRun(&dl, &writer, 4, 5, "two");
+        // And a newest made with nothing in it.
+        dl.closeActive();
+        try dl.createActive(6, 0);
+    }
+    try testing.expectEqual(@as(usize, 3), try countSegments(td.path));
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    const r = try dl.recoverActive();
+    try testing.expectEqual(@as(usize, 1), r.removed);
+    try testing.expectEqual(@as(usize, 1), r.sealed);
+    const files = try dl.listSegments(true);
+    defer dl.freeSegments(files);
+    // The empty newest gone, the one before it is the newest, left active.
+    try testing.expectEqual(@as(usize, 2), files.len);
+    try testing.expect(files[0].sealed and !files[1].sealed);
+}
+
+test "durable log: a cut inside the active segment shortens it and the next flush continues it; one below it deletes it" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    for (0..4) |k| try flushRun(&dl, &writer, k * 200 + 1, k * 200 + 200, "v");
+    const cut_syncs = stdx.fs.dir_syncs.load(.monotonic);
+    try dl.truncateAfter(450);
+    // No intent and no rewrite: no directory sync, the same file.
+    try testing.expectEqual(cut_syncs, stdx.fs.dir_syncs.load(.monotonic));
+    try testing.expectEqual(@as(usize, 1), try countSegments(td.path));
+    try testing.expectEqual(@as(u64, 450), dl.active.?.last_index);
+    try testing.expectEqual(@as(u64, 450), dl.active.?.commit_index);
+    // Its entries above the cut are gone; new ones follow it.
+    var buf: [1]Entry = undefined;
+    var arena: [64]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), dl.readRange(451, &buf, &arena).count);
+    try flushRun(&dl, &writer, 451, 460, "w");
+    try testing.expectEqual(@as(usize, 1), dl.readRange(455, &buf, &arena).count);
+    try testing.expectEqualStrings("w", buf[0].payload);
+    // Sealed, its CRC summed again over what the cut kept.
+    try dl.sealActive();
+    const opened = try SegmentReader.initFromFile(testing.allocator, (try dl.segments())[0].path);
+    testing.allocator.free(opened.buf);
+
+    // A cut below a newer active segment deletes it whole.
+    try flushRun(&dl, &writer, 461, 470, "z");
+    try testing.expectEqual(@as(usize, 2), try countSegments(td.path));
+    try dl.truncateAfter(455);
+    try testing.expect(dl.active == null);
+    const files = try dl.listSegments(true);
+    defer dl.freeSegments(files);
+    try testing.expectEqual(@as(usize, 1), files.len);
+    try testing.expectEqual(@as(u64, 455), files[0].last_index);
+}
+
+test "durable log: a repair skip in the active segment is in its mark, and a cut that drops it takes it out" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    try flushRun(&dl, &writer, 1, 2, "a");
+    var skip = entry_mod.buildEntry(.repair_skip, 0, 1, 3, 3000, "skip");
+    skip.header.crc32c = skip.computeCrc();
+    try writer.addEntry(&skip);
+    try dl.flush(3);
+    {
+        const with = try dl.listSegments(true);
+        defer dl.freeSegments(with);
+        try testing.expect(with[0].holds_skip);
+    }
+    try dl.truncateAfter(2);
+    const files = try dl.listSegments(true);
+    defer dl.freeSegments(files);
+    try testing.expect(!files[0].holds_skip);
+}
+
+/// Flip a byte in the mark slot that holds the newest mark, or in both.
+fn tearMarks(path: []const u8, both: bool) !void {
+    const hdr = try readHeaderBytes(path);
+    const parsed = try segment.SegmentHeader.parse(&hdr);
+    const file = try stdx.fs.openFile(path, .{ .mode = .read_write });
+    defer stdx.fs.closeFile(file);
+    for (segment.MARK_OFFSETS, 0..) |at, i| {
+        if (!both and i != parsed.slot.?) continue;
+        var b: [1]u8 = .{hdr[at + 20] ^ 0xff};
+        try stdx.fs.writeAt(file, &b, at + 20);
+    }
+}
+
+test "durable log: a torn newest mark falls back to the older one, and the entries past it are kept" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var path: []u8 = undefined;
+    {
+        var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+        defer dl.deinit();
+        try flushRun(&dl, &writer, 1, 3, "first");
+        try flushRun(&dl, &writer, 4, 6, "second");
+        path = try testing.allocator.dupe(u8, (try dl.segments())[0].path);
+    }
+    defer testing.allocator.free(path);
+    try tearMarks(path, false);
+    // The older mark: the first flush's.
+    try testing.expectEqual(@as(u64, 3), (try segment.SegmentHeader.parse(&(try readHeaderBytes(path)))).last_index);
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    const r = try dl.recoverActive();
+    try testing.expectEqual(@as(usize, 1), r.marked);
+    try testing.expectEqual(@as(u64, 0), r.cut_bytes);
+    const files = try dl.listSegments(true);
+    defer dl.freeSegments(files);
+    try testing.expectEqual(@as(u64, 6), files[0].last_index);
+    // The older mark's commit: the lag a lost mark leaves.
+    try testing.expectEqual(@as(u64, 3), files[0].commit_index_at_seal);
+}
+
+test "durable log: both marks unreadable, the segment is rebuilt from its entries, with no commit trusted" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var path: []u8 = undefined;
+    {
+        var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+        defer dl.deinit();
+        try flushRun(&dl, &writer, 1, 3, "first");
+        try flushRun(&dl, &writer, 4, 6, "second");
+        path = try testing.allocator.dupe(u8, (try dl.segments())[0].path);
+    }
+    defer testing.allocator.free(path);
+    try tearMarks(path, true);
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    // Strictly listed, it is refused until recovered.
+    try testing.expectError(error.NoValidMark, dl.listSegments(true));
+    const r = try dl.recoverActive();
+    try testing.expectEqual(@as(usize, 1), r.marked);
+    const files = try dl.listSegments(true);
+    defer dl.freeSegments(files);
+    try testing.expectEqual(@as(u64, 6), files[0].last_index);
+    try testing.expectEqual(@as(u64, 0), files[0].commit_index_at_seal);
+    var buf: [8]Entry = undefined;
+    var arena: [512]u8 = undefined;
+    try testing.expectEqual(@as(usize, 6), dl.readRange(1, &buf, &arena).count);
+}
+
+test "durable log: a crash at any step of a cut inside the active segment leaves every entry readable" {
+    // What a crash can leave on disk, the mark synced before the cut: none
+    // of the cut, its mark alone, or all of it. Never the file cut below
+    // its mark.
+    const Landed = enum { nothing, mark, all };
+    for ([_]Landed{ .nothing, .mark, .all }) |landed| {
+        var td = try TestDir.init();
+        defer td.deinit();
+        var writer = SegmentWriter.init(testing.allocator, 0);
+        defer writer.deinit();
+        var path: []u8 = undefined;
+        var before: []u8 = undefined;
+        {
+            var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+            defer dl.deinit();
+            for (0..3) |k| try flushRun(&dl, &writer, k * 7 + 1, k * 7 + 7, "entry");
+            path = try testing.allocator.dupe(u8, (try dl.segments())[0].path);
+            before = try stdx.fs.readFileAlloc(testing.allocator, path, 1 << 20);
+            try dl.truncateAfter(15);
+        }
+        defer testing.allocator.free(path);
+        defer testing.allocator.free(before);
+        switch (landed) {
+            .all => {},
+            // The whole file as it was.
+            .nothing => {
+                const f = try stdx.fs.createFile(path, .{});
+                defer stdx.fs.closeFile(f);
+                try stdx.fs.writeAll(f, before);
+            },
+            // The new mark, over the old length and entries.
+            .mark => {
+                const f = try stdx.fs.openFile(path, .{ .mode = .read_write });
+                defer stdx.fs.closeFile(f);
+                try stdx.fs.writeAt(f, before[segment.HEADER_SIZE..], segment.HEADER_SIZE);
+            },
+        }
+        var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+        defer dl.deinit();
+        _ = try dl.recoverActive();
+        // Every entry the cut kept reads; what it dropped, where it
+        // survived, reads too, for Raft to replace.
+        var buf: [32]Entry = undefined;
+        var arena: [2048]u8 = undefined;
+        const want: usize = if (landed == .all) 15 else 21;
+        try testing.expectEqual(want, dl.readRange(1, &buf, &arena).count);
+        try testing.expectEqual(@as(u64, want), (try dl.segments())[0].last_index);
+        // And it takes appends from there.
+        try dl.truncateAfter(15);
+        try flushRun(&dl, &writer, 16, 17, "new");
+        try testing.expectEqual(@as(usize, 17), dl.readRange(1, &buf, &arena).count);
+    }
+}
+
+test "durable log: a seal that fails before its mark leaves the segment active, and the next flush seals it" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    dl.max_segment_bytes = 256;
+    dl.test_seal_error = error.InputOutput;
+    const big = @as([300]u8, @splat('B'));
+    // Its entries are on disk: the flush stands, the seal waits.
+    try flushRun(&dl, &writer, 1, 2, &big);
+    try testing.expect(dl.active.?.flags & segment.FLAG_SEALED == 0);
+    var listed = try dl.listSegments(true);
+    try testing.expect(!listed[0].sealed);
+    dl.freeSegments(listed);
+    // Retried at the next flush, over what the failed one left.
+    dl.test_seal_error = null;
+    try flushRun(&dl, &writer, 3, 3, "c");
+    try testing.expect(dl.active == null);
+    listed = try dl.listSegments(true);
+    defer dl.freeSegments(listed);
+    try testing.expect(listed[0].sealed);
+    const opened = try SegmentReader.initFromFile(testing.allocator, listed[0].path);
+    testing.allocator.free(opened.buf);
+    try testing.expectEqual(@as(u64, 3), opened.reader.header.last_index);
+}
+
+test "durable log: a mark that fails to write fails its flush, and the next flush writes it before appending" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    {
+        var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+        defer dl.deinit();
+        try flushRun(&dl, &writer, 1, 3, "first");
+        dl.test_mark_error = error.InputOutput;
+        try testing.expectError(error.MarkUnwritten, flushRun(&dl, &writer, 4, 6, "second"));
+        try testing.expect(dl.mark_owed);
+        // Its entries are on disk, past the mark on disk.
+        try testing.expectEqual(@as(u64, 3), (try segment.SegmentHeader.parse(&(try readHeaderBytes((try dl.segments())[0].path)))).last_index);
+        try flushRun(&dl, &writer, 7, 9, "third");
+        try testing.expect(!dl.mark_owed);
+        try testing.expectEqual(@as(u64, 9), (try segment.SegmentHeader.parse(&(try readHeaderBytes((try dl.segments())[0].path)))).last_index);
+    }
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    const r = try dl.recoverActive();
+    try testing.expectEqual(@as(usize, 0), r.marked);
+    var buf: [16]Entry = undefined;
+    var arena: [512]u8 = undefined;
+    try testing.expectEqual(@as(usize, 9), dl.readRange(1, &buf, &arena).count);
 }

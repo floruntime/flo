@@ -31,6 +31,15 @@ fn salvage(ctx: *stdx.testing.TestContext, after: []const u8, yes: bool) !stdx.t
 }
 
 /// The sorted segment files of shard 0.
+/// From here on each sync write seals its own segment, so a test can
+/// damage one among several: the newest segment is otherwise appended to
+/// until it reaches 64 MiB. A test fault, so only a `-Dtest-faults` build.
+fn sealEachFlush(ctx: *stdx.testing.TestContext) !void {
+    const test_faults = @import("src").node.test_faults;
+    if (!test_faults.enabled) return error.SkipZigTest;
+    try ctx.exec(&.{ "kv", "set", test_faults.Fault.seal_each_flush.key(), "x" });
+}
+
 fn segments(ctx: *stdx.testing.TestContext, out: *std.ArrayListUnmanaged([]const u8)) ![]const u8 {
     const segs = try std.fmt.allocPrint(testing.allocator, "{s}/00000/segs", .{ctx.server.getDataDir()});
     var dir = try stdx.fs.openDir(segs, .{ .iterate = true });
@@ -52,10 +61,11 @@ test "e2e/salvage: a shard offline on a segment that won't read comes up with th
         .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true },
     });
     defer ctx.deinit();
+    try sealEachFlush(ctx);
     for ([_][]const u8{ "kept1", "kept2", "lost1", "lost2" }) |k| try ctx.exec(&.{ "kv", "set", k, "v" });
     ctx.server.stop();
 
-    // Every sync write seals its own segment: the last two hold lost1 and
+    // Each sync write sealed its own segment: the last two hold lost1 and
     // lost2. Spoil the first one's header.
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
@@ -218,6 +228,7 @@ test "e2e/salvage: a cluster founder's data directory is refused, whatever its d
         .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true, .cluster_enabled = true },
     });
     defer ctx.deinit();
+    try sealEachFlush(ctx);
     for ([_][]const u8{ "a", "b", "c" }) |k| try ctx.exec(&.{ "kv", "set", k, "v" });
     ctx.server.stop();
     const first_lost = try spoilSecondLast(ctx);
@@ -234,6 +245,7 @@ test "e2e/salvage: a cut recorded before a crash is finished by the next start, 
         .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true },
     });
     defer ctx.deinit();
+    try sealEachFlush(ctx);
     for ([_][]const u8{ "kept1", "kept2", "lost1", "lost2" }) |k| try ctx.exec(&.{ "kv", "set", k, "v" });
     ctx.server.stop();
     const first_lost = try spoilSecondLast(ctx);

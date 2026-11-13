@@ -73,6 +73,9 @@ pub fn summarizeDir(allocator: std.mem.Allocator, dir: []const u8) !Summary {
     defer writer.deinit();
     var dl = try durable_log_mod.DurableLog.init(allocator, &writer, segs);
     defer dl.deinit();
+    // What a boot would make of the active segment, first: its mark may
+    // be behind entries a crash left synced.
+    _ = try dl.recoverActive();
     const files = dl.segments() catch |err| switch (err) {
         error.FileNotFound => return sum,
         else => return err,
@@ -131,6 +134,9 @@ pub fn forceMembers(allocator: std.mem.Allocator, data_dir: []const u8, sum: *co
     defer writer.deinit();
     var dl = try durable_log_mod.DurableLog.init(allocator, &writer, segs);
     defer dl.deinit();
+    // What a boot would make of the active segment, first: its mark may
+    // be behind entries a crash left synced.
+    _ = try dl.recoverActive();
     // A cut the server recorded but did not finish leaves the summary's
     // last index unsure; the server's next boot finishes it.
     if (sum.truncation_pending) return error.TruncationIncomplete;
@@ -176,6 +182,9 @@ pub fn entryAt(allocator: std.mem.Allocator, dir: []const u8, index: u64, arena:
     defer writer.deinit();
     var dl = try durable_log_mod.DurableLog.init(allocator, &writer, segs);
     defer dl.deinit();
+    // What a boot would make of the active segment, first: its mark may
+    // be behind entries a crash left synced.
+    _ = try dl.recoverActive();
     var one: [1]Entry = undefined;
     const r = dl.readRange(index, &one, arena);
     if (r.blocked) return if (r.disk_failing) error.LogDiskFailing else error.LogReadBlocked;
@@ -220,6 +229,9 @@ pub fn repairSkip(allocator: std.mem.Allocator, dir: []const u8, shard: u16, sum
     defer writer.deinit();
     var dl = try durable_log_mod.DurableLog.init(allocator, &writer, segs);
     defer dl.deinit();
+    // What a boot would make of the active segment, first: its mark may
+    // be behind entries a crash left synced.
+    _ = try dl.recoverActive();
 
     const term = if (sum.hard_state) |hs| @max(hs.term, sum.last_term) else sum.last_term;
     const index = sum.last_index + 1;
@@ -342,6 +354,9 @@ pub fn readable(allocator: std.mem.Allocator, dir: []const u8) !Readable {
     defer writer.deinit();
     var dl = try durable_log_mod.DurableLog.init(allocator, &writer, segs);
     defer dl.deinit();
+    // What a boot would make of the active segment, first: its mark may
+    // be behind entries a crash left synced.
+    _ = try dl.recoverActive();
     const files = try dl.listSegments(false);
     defer dl.freeSegments(files);
     if (files.len == 0) return r;
@@ -463,6 +478,9 @@ pub fn salvage(allocator: std.mem.Allocator, dir: []const u8, shard: u16, r: *co
     defer writer.deinit();
     var dl = try durable_log_mod.DurableLog.init(allocator, &writer, segs);
     defer dl.deinit();
+    // What a boot would make of the active segment, first: its mark may
+    // be behind entries a crash left synced.
+    _ = try dl.recoverActive();
     try dl.salvageAfter(after);
     // Read back strictly: nothing past the cut, and no commit past it.
     for (try dl.segments()) |f| if (f.last_index > after) return error.SalvageIncomplete;
@@ -932,4 +950,46 @@ test "offline: salvage sees a config past the damage, and refuses a cut that kee
     try testing.expect(r.saw_config);
     try testing.expect(r.config_unknown); // the damaged header itself
     try testing.expectError(error.KeepsNothing, checkSalvage(&r, 0));
+}
+
+test "offline: inspect after a crash that lost the active segment's mark reports every entry, as a boot would" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(root);
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try groupDir(&dir_buf, root);
+    var segs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const segs = try std.fmt.bufPrint(&segs_buf, "{s}/segs", .{dir});
+    try stdx.fs.makePath(segs);
+    const segment = @import("../storage/ual/segment.zig");
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path: []const u8 = undefined;
+    var early: [segment.HEADER_SIZE]u8 = undefined;
+    {
+        var dl = try durable_log_mod.DurableLog.init(testing.allocator, &writer, segs);
+        defer dl.deinit();
+        for (1..7) |i| {
+            var e = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, i, i * 10, "");
+            e.header.crc32c = e.computeCrc();
+            try writer.addEntry(&e);
+            if (i == 3 or i == 6) try dl.flush(i);
+            if (i == 3) {
+                path = try std.fmt.bufPrint(&path_buf, "{s}", .{(try dl.segments())[0].path});
+                const f = try stdx.fs.openFile(path, .{});
+                defer stdx.fs.closeFile(f);
+                _ = try stdx.fs.readAt(f, &early, 0);
+            }
+        }
+    }
+    // The second flush's mark lost: the header as after the first.
+    {
+        const f = try stdx.fs.openFile(path, .{ .mode = .read_write });
+        defer stdx.fs.closeFile(f);
+        try stdx.fs.writeAt(f, &early, 0);
+    }
+    const sum = try summarizeDir(testing.allocator, dir);
+    try testing.expectEqual(@as(u64, 6), sum.last_index);
 }

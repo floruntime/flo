@@ -98,6 +98,15 @@ pub const Store = struct {
         return Record.of(node).value;
     }
 
+    /// Every family's encoded size, summed: what a snapshot of the store
+    /// encodes. A sum of each record's key, value and overhead, so the same
+    /// contents give the same total whatever order they were written in.
+    pub fn encodedBytes(self: *const Store) u64 {
+        var total: u64 = 0;
+        for (&self.families) |*f| total += f.encoded_bytes;
+        return total;
+    }
+
     pub fn family(self: *const Store, fam: u16) *const FamilyState {
         return &self.families[fam];
     }
@@ -236,4 +245,50 @@ pub fn checksum(store: *Store, fam: u16) u64 {
     var h = std.hash.Wyhash.init(0x666c_6f2d_6661_6d73); // "flo-fams"
     walk(store, fam, Sink{ .h = &h }) catch |err| switch (err) {};
     return h.final();
+}
+
+test "store: the same contents reached by different writes in different orders encode the same size and bytes" {
+    const testing = std.testing;
+    const Write = struct {
+        fn put(store: *Store, fam: u16, key: []const u8, value: []const u8) !void {
+            const v = try testing.allocator.dupe(u8, value);
+            if (store.find(fam, key)) |n| return store.replace(fam, n, v);
+            const rec = try store.allocRecord(key);
+            store.link(fam, rec, v);
+        }
+        fn del(store: *Store, fam: u16, key: []const u8) void {
+            store.unlink(fam, store.find(fam, key).?);
+        }
+    };
+    var a = Store.init(testing.allocator);
+    defer a.deinit();
+    var b = Store.init(testing.allocator);
+    defer b.deinit();
+
+    // a: straight to the end state.
+    try Write.put(&a, 1, "k1", "one");
+    try Write.put(&a, 1, "k2", "two-two");
+    try Write.put(&a, 2, "q", "x");
+    // b: the other way round, through values and keys that don't last.
+    try Write.put(&b, 2, "gone", "a long value that is deleted again");
+    try Write.put(&b, 2, "q", "first value of q, replaced");
+    try Write.put(&b, 1, "k2", "short");
+    try Write.put(&b, 1, "tmp", "t");
+    try Write.put(&b, 1, "k1", "one");
+    Write.del(&b, 1, "tmp");
+    try Write.put(&b, 2, "q", "x");
+    Write.del(&b, 2, "gone");
+    try Write.put(&b, 1, "k2", "two-two");
+
+    try testing.expectEqual(a.encodedBytes(), b.encodedBytes());
+    for ([_]u16{ 1, 2 }) |fam| {
+        try testing.expectEqual(a.family(fam).encoded_bytes, b.family(fam).encoded_bytes);
+        var wa: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer wa.deinit();
+        var wb: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer wb.deinit();
+        try encode(&a, fam, &wa.writer);
+        try encode(&b, fam, &wb.writer);
+        try testing.expectEqualSlices(u8, wa.written(), wb.written());
+    }
 }

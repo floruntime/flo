@@ -30,6 +30,9 @@ pub fn main() !void {
     defer writer.deinit();
     var dl = try DurableLog.init(allocator, &writer, dir);
     defer dl.deinit();
+    // Each flush sealed, as a sync log did before the active segment: the
+    // walk this measures is one across many sealed segments.
+    dl.max_segment_bytes = 1;
 
     const payload = @as([100]u8, @splat('p'));
     for (1..SEGMENTS + 1) |i| {
