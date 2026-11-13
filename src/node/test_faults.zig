@@ -31,6 +31,10 @@ pub const Fault = enum {
     /// Opens a snapshot window at the set's entry, suspending apply for a
     /// while on every replica, as a snapshot bar does.
     snapshot_window,
+    /// From the set on, each flush seals its own segment on every replica
+    /// that applies it, so a test can damage one segment among several, as
+    /// it could before segments were appended to.
+    seal_each_flush,
 
     pub fn key(f: Fault) []const u8 {
         return switch (f) {
@@ -41,6 +45,7 @@ pub const Fault = enum {
             .panic_leader_step => "flo-test-fault-panic-leader-step",
             .panic_answering_waiter => "flo-test-fault-panic-answering-waiter",
             .snapshot_window => "flo-test-fault-snapshot-window",
+            .seal_each_flush => "flo-test-fault-seal-each-flush",
         };
     }
 };
@@ -76,6 +81,6 @@ pub fn crash(f: Fault) void {
             const p: *allowzero volatile u8 = @ptrFromInt(0);
             p.* = 1;
         },
-        .halt, .panic_after_apply, .panic_leader_step, .panic_answering_waiter, .snapshot_window => {},
+        .halt, .panic_after_apply, .panic_leader_step, .panic_answering_waiter, .snapshot_window, .seal_each_flush => {},
     }
 }
