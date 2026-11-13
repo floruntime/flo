@@ -362,7 +362,7 @@ fn expectMetric(ctx: *stdx.testing.TestContext, line: []const u8) !void {
 
 /// Which shard the server routes `key` to in "default" on `shards` shards.
 fn shardOf(shards: u16, key: []const u8) u16 {
-    const r = src.node.router.Router.init(0, shards, 0);
+    const r = src.node.router.Router.init(shards, 0);
     return switch (r.route(src.node.router.routeNsKey(.default, key))) {
         .local => 0,
         .shard => |t| t.shard_id,

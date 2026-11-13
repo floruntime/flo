@@ -364,8 +364,7 @@ pub const Acceptor = struct {
 
         if (key.len > 0) {
             const hash = routing.hashKey(key);
-            const partition = self.router.hashToPartition(hash);
-            const shard_id = self.router.partitionToShard(partition);
+            const shard_id = self.router.hashToShard(hash);
             self.routed_by_key += 1;
             return shard_id;
         }
@@ -481,7 +480,7 @@ test "Acceptor: at the connection cap, a new connection is accepted and closed, 
     @import("stdx").net.sysFcntlSetNonblocking(listener) catch {};
 
     var pipes: [1]i32 = .{-1};
-    var acceptor = Acceptor.init(&pipes, Router.init(4096, 1, 0));
+    var acceptor = Acceptor.init(&pipes, Router.init(1, 0));
     acceptor.listen_fd = listener;
     var active = std.atomic.Value(u32).init(2); // already at the cap
     var sm = ServerMetrics.init();
@@ -506,7 +505,7 @@ test "Acceptor: at the connection cap, a new connection is accepted and closed, 
 
 test "Acceptor: round-robin routing" {
     var pipes: [2]i32 = .{ -1, -1 }; // dummy pipe fds
-    const router = Router.init(4096, 2, 0);
+    const router = Router.init(2, 0);
     var acceptor = Acceptor.init(&pipes, router);
 
     // Round-robin should cycle through shards
@@ -521,7 +520,7 @@ test "Acceptor: round-robin routing" {
 
 test "Acceptor: a header at an odd offset in the peek buffer is read, not trapped on" {
     var pipes: [2]i32 = .{ -1, -1 };
-    var acceptor = Acceptor.init(&pipes, Router.init(4096, 2, 0));
+    var acceptor = Acceptor.init(&pipes, Router.init(2, 0));
     const header = proto.RequestHeader.init(@fromBackingInt(@intCast(0x01)), 0);
     // One byte past an 8-byte boundary: a cast would trap in a safe build.
     var buf: [128]u8 align(8) = undefined;
@@ -564,7 +563,7 @@ test "Acceptor: listen and accept via TCP" {
     defer _ = std.c.close(pipe1[1]);
 
     var shard_pipes = [_]i32{ pipe0[1], pipe1[1] };
-    const router = Router.init(4096, 2, 0);
+    const router = Router.init(2, 0);
     var acceptor = Acceptor.init(&shard_pipes, router);
 
     // Listen on ephemeral port
@@ -610,7 +609,7 @@ test "Acceptor: listen and accept via TCP" {
 
 test "acceptor: listens on the configured bind address" {
     var shard_pipes = [_]i32{ -1, -1 };
-    const router = Router.init(4096, 2, 0);
+    const router = Router.init(2, 0);
     var acceptor = Acceptor.init(&shard_pipes, router);
     defer if (acceptor.listen_fd >= 0) @import("stdx").net.sysClose(acceptor.listen_fd);
     try acceptor.listen(.{ 127, 0, 0, 1 }, 0);
@@ -621,7 +620,7 @@ test "acceptor: listens on the configured bind address" {
 test "acceptor: a bound socket refuses connects until it listens" {
     const stdx_net = @import("stdx").net;
     var shard_pipes = [_]i32{ -1, -1 };
-    var acceptor = Acceptor.init(&shard_pipes, Router.init(4096, 2, 0));
+    var acceptor = Acceptor.init(&shard_pipes, Router.init(2, 0));
     const fd = try Acceptor.bindSocket(.{ 127, 0, 0, 1 }, 0);
     var owned = true;
     defer if (owned) stdx_net.sysClose(fd);

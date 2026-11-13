@@ -3475,10 +3475,9 @@ test "e2e/workflow: on 4 shards, a run started with an id the client chose is fo
 // A step whose action isn't registered
 // =============================================================================
 
-/// Which shard the server routes `key` to on 4 shards: by namespace and key,
-/// over as many partitions as it picks when none are configured.
+/// Which shard the server routes `key` to on 4 shards: by namespace and key.
 fn shardOfKey(key: []const u8) u16 {
-    const r = @import("src").node.router.Router.init(0, 4, 0);
+    const r = @import("src").node.router.Router.init(4, 0);
     return switch (r.route(@import("src").node.router.routeNsKey(.default, key))) {
         .local => 0,
         .shard => |s| s.shard_id,

@@ -280,9 +280,8 @@ test "e2e/action/claims: on 4 shards, a worker whose shard isn't its action's is
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
     defer ctx.deinit();
     // A worker and an action on different shards, as the server routes
-    // them: by namespace and key, over as many partitions as it picks for
-    // 4 shards when none are configured.
-    const router = src.node.router.Router.init(0, 4, 0);
+    // them: by namespace and key, on 4 shards.
+    const router = src.node.router.Router.init(4, 0);
     const shardOf = struct {
         fn f(r: src.node.router.Router, key: []const u8) u16 {
             return switch (r.route(src.node.router.routeNsKey(.default, key))) {

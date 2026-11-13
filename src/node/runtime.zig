@@ -75,7 +75,6 @@ pub const RuntimeConfig = struct {
     pub const PORT_OFFSET_RAFT: u16 = 500; // listen_port + 500
 
     num_shards: u16 = 0,
-    partition_count: u32 = 0,
     data_dir: []const u8 = "~/.flo/data",
 
     /// TCP port for client connections (default: 9000)
@@ -657,7 +656,6 @@ pub const Runtime = struct {
             self.allocator,
             data_dir,
             self.shard_count,
-            self.config.partition_count,
         );
 
         // The client socket is bound before anything uses this node's
@@ -1375,7 +1373,6 @@ const ShardBoot = struct {
                 rt.allocator,
                 @intCast(i),
                 rt.shard_count,
-                rt.config.partition_count,
                 self.pipes[i][0],
                 self.data_dir,
                 rt.config.tiered_log.hot_buffer_capacity,
@@ -1624,7 +1621,7 @@ fn writeShardLog(data_dir: []const u8, id: u16, shard_count: u16, entries: usize
     const pipe_fds = try stdx.io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, id, shard_count, 0, pipe_fds[0], data_dir, @import("../storage/partition.zig").Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    var shard = try Shard.init(std.testing.allocator, id, shard_count, pipe_fds[0], data_dir, @import("../storage/partition.zig").Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     for (0..entries) |i| {

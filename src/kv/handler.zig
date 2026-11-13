@@ -585,7 +585,7 @@ pub const KVHandler = struct {
         fn of(self: MgetOwner, raw_key: []const u8) u16 {
             checkKey(raw_key) catch return self.shard.id;
             const r = &self.shard.router;
-            return r.partitionToShard(r.hashToPartition(router.routeNsKey(self.ns_id, raw_key)));
+            return r.hashToShard(router.routeNsKey(self.ns_id, raw_key));
         }
     };
 
