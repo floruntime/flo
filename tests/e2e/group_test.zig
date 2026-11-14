@@ -407,11 +407,35 @@ test "e2e/group: a removed group op is refused, naming what replaces it" {
         .{ .op = .stream_group_claim, .says = "groups have no claim: a read takes expired and nacked records" },
         .{ .op = .stream_group_configure_sweeper, .says = "set when it is created" },
     };
-    for (cases) |c| {
-        var r = try conn.sendRequest(c.op, "default", "s", "\x01\x00g");
+    // In a namespace that exists, and in one never created: either way the
+    // answer names what replaces the op.
+    for ([_][]const u8{ "default", "never-made" }) |ns| for (cases) |c| {
+        var r = try conn.sendRequest(c.op, ns, "s", "\x01\x00g");
         defer r.deinit();
         try testing.expect(r.isError());
-        if (std.mem.indexOf(u8, r.errorMessage(), c.says) == null) std.debug.print("{s}: {s}\n", .{ @tagName(c.op), r.errorMessage() });
+        if (std.mem.indexOf(u8, r.errorMessage(), c.says) == null) std.debug.print("{s} in {s}: {s}\n", .{ @tagName(c.op), ns, r.errorMessage() });
         try testing.expect(std.mem.indexOf(u8, r.errorMessage(), c.says) != null);
-    }
+    };
+}
+
+test "e2e/group: an ack or nack to a group that isn't there is refused not found, and a nack's error up to 1024 bytes is kept" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "stream", "append", "s", "a" });
+    var r = try read(ctx, "s", "w", "1");
+    defer r.deinit();
+    var db: [256]u8 = undefined;
+    const ds = try deliveries(&db, r.stdout);
+    var none = try ctx.cli.run(&.{ "stream", "group", "ack", "s", "--group", "nope", "--consumer", "w", "--ids", ds });
+    defer none.deinit();
+    try testing.expect(none.exit_code != 0);
+    try testing.expect(none.stderrContains("consumer group not found"));
+    // An error past an option's 255 bytes rides in the body whole.
+    const long: [1000]u8 = @splat('e');
+    var nack = try ctx.cli.run(&.{ "stream", "group", "nack", "s", "--group", "g", "--consumer", "w", "--ids", ds, "--error", &long });
+    defer nack.deinit();
+    try testing.expect(nack.stdoutContains("Failed 1 record(s)"));
+    var pending = try ctx.cli.run(&.{ "stream", "group", "read", "s", "--group", "g", "--consumer", "w", "-o", "json" });
+    defer pending.deinit();
+    try testing.expect(pending.stdoutContains("\"deliveries\":2"));
 }

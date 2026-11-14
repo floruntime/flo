@@ -175,7 +175,7 @@ pub const StreamHandler = struct {
         dispatcher.registerWithRoute(.stream_group_touch, group_handler.dispatchTouch, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_info, group_handler.dispatchInfo, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_pending, group_handler.dispatchPending, preRouteByStream);
-        inline for (.{ OpCode.stream_group_join, OpCode.stream_group_leave, OpCode.stream_group_claim, OpCode.stream_group_configure_sweeper }) |op|
+        inline for (group_handler.REMOVED) |op|
             dispatcher.registerWithRoute(op, group_handler.dispatchRemoved, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_list, table_run.handler("stream.group.list", StreamHandler, runGroupList), preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_members, table_run.handler("stream.group.members", StreamHandler, runGroupMembers), preRouteByStream);
