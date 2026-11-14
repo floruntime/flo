@@ -927,48 +927,6 @@ pub const KVHandler = struct {
         return t;
     }
 
-    // ── Sink put ─────────────────────────────────────────────────────────
-
-    /// A sink's write for the shard that owns its key, as an inbox message
-    /// carries it: `[ns len u8][ns][ttl? u8][ttl u64][key len u16][key][value]`.
-    /// The key is as the sink named it; the owner finds the namespace's id.
-    pub const SinkPut = struct {
-        namespace: []const u8,
-        key: []const u8,
-        value: []const u8,
-        ttl_ms: ?u64,
-
-        /// The message's bytes, owned by the caller (the receiver frees
-        /// them), or null out of memory.
-        pub fn encode(self: SinkPut, allocator: Allocator) ?[]u8 {
-            const buf = allocator.alloc(u8, 1 + self.namespace.len + 9 + 2 + self.key.len + self.value.len) catch return null;
-            var off: usize = 0;
-            buf[0] = @intCast(self.namespace.len);
-            @memcpy(buf[1..][0..self.namespace.len], self.namespace);
-            off = 1 + self.namespace.len;
-            buf[off] = @intFromBool(self.ttl_ms != null);
-            std.mem.writeInt(u64, buf[off + 1 ..][0..8], self.ttl_ms orelse 0, .little);
-            off += 9;
-            std.mem.writeInt(u16, buf[off..][0..2], @intCast(self.key.len), .little);
-            off += 2;
-            @memcpy(buf[off..][0..self.key.len], self.key);
-            off += self.key.len;
-            @memcpy(buf[off..][0..self.value.len], self.value);
-            return buf;
-        }
-
-        pub fn decode(bytes: []const u8) ?SinkPut {
-            if (bytes.len < 1) return null;
-            const ns_end = 1 + @as(usize, bytes[0]);
-            if (bytes.len < ns_end + 11) return null;
-            const ttl: ?u64 = if (bytes[ns_end] != 0) std.mem.readInt(u64, bytes[ns_end + 1 ..][0..8], .little) else null;
-            const key_len = std.mem.readInt(u16, bytes[ns_end + 9 ..][0..2], .little);
-            const key_at = ns_end + 11;
-            if (bytes.len < key_at + key_len) return null;
-            return .{ .namespace = bytes[1..ns_end], .key = bytes[key_at..][0..key_len], .value = bytes[key_at + key_len ..], .ttl_ms = ttl };
-        }
-    };
-
     /// What became of a processing KV sink's write.
     pub const SinkResult = union(enum) {
         /// In the log, not yet applied.

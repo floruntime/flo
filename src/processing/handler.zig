@@ -59,6 +59,7 @@ const Flags = entry_mod.Flags;
 
 const native_registry = @import("operators/native_registry.zig");
 const kv_lookup_mod = @import("operators/kv_lookup.zig");
+const SinkWrite = @import("sink_write.zig").SinkWrite;
 const operator_mod = @import("operator.zig");
 const Operator = operator_mod.Operator;
 const collector_mod = @import("collector.zig");
@@ -124,11 +125,10 @@ pub const ProcessingHandler = struct {
     /// The shard this handler runs on; kv_lookup reads only its KV.
     own_shard: u16 = 0,
 
-    /// Cross-shard TS / queue handlers — one per shard, wired by Runtime.
-    /// Enables TS and queue sinks to write to the shard that owns the target
-    /// measurement / queue (matching how `ts read` / `queue dequeue` route).
-    peer_ts_handlers: ?[]const *ts_handler_mod.TSHandler = null,
-    peer_queue_handlers: ?[]const *queue_handler_mod.QueueHandler = null,
+    /// Sink enqueues proposed on this shard and not yet applied, from its
+    /// own pipelines and other shards': what a queue's caps must still
+    /// leave room for (`queueFits`).
+    sink_enqueues: std.ArrayListUnmanaged(SinkEnqueue) = .empty,
 
     /// Most jobs a server holds. Every held job counts, stopped or not: each
     /// keeps its definition, up to 256 KiB, until `processing.remove` drops
@@ -177,9 +177,9 @@ pub const ProcessingHandler = struct {
         kind: SinkKind,
         /// The sink's target, as its `SinkConfig` holds it.
         target: []const u8,
-        /// What it holds against a queue's caps (0 for other sinks).
-        held: u64,
     };
+
+    const SinkEnqueue = struct { index: u64, ns: NamespaceId, name: u64, held: u64 };
 
     pub const PipelineState = struct {
         // Source configuration
@@ -314,6 +314,7 @@ pub const ProcessingHandler = struct {
             self.freeJobRecord(entry.value_ptr);
         }
         self.jobs.deinit();
+        self.sink_enqueues.deinit(self.allocator);
     }
 
     /// Wire cross-shard stream handler references.
@@ -326,16 +327,6 @@ pub const ProcessingHandler = struct {
     /// Called by Runtime after all shards are initialized.
     pub fn setPeerKvHandlers(self: *ProcessingHandler, handlers: []const *kv_handler_mod.KVHandler) void {
         self.peer_kv_handlers = handlers;
-    }
-
-    /// Wire cross-shard TS handler references (for TS sinks).
-    pub fn setPeerTsHandlers(self: *ProcessingHandler, handlers: []const *ts_handler_mod.TSHandler) void {
-        self.peer_ts_handlers = handlers;
-    }
-
-    /// Wire cross-shard queue handler references (for queue sinks).
-    pub fn setPeerQueueHandlers(self: *ProcessingHandler, handlers: []const *queue_handler_mod.QueueHandler) void {
-        self.peer_queue_handlers = handlers;
     }
 
     /// Resolve the correct StreamHandler for a given stream name + namespace.
@@ -364,31 +355,12 @@ pub const ProcessingHandler = struct {
         return t.lookup(name) orelse .invalid;
     }
 
-    /// A stream or queue sink proposes its write on the shard that owns its
-    /// target, from this shard's thread, without that shard's request gate.
-    /// Outside "default" that shard may never have bound the namespace, and
-    /// its log would then hold a write it cannot apply. Such a sink is
-    /// refused until sinks write through the shard that owns their target.
-    /// A namespace not yet published has no id to route by, so whether
-    /// its target is here isn't known yet: `sinksReady` asks again once it
-    /// is, before the pipeline writes anything.
-    fn crossShardSink(self: *const ProcessingHandler, kind: definition.SinkKind, namespace: []const u8, target: []const u8) bool {
-        if (kind != .stream and kind != .queue) return false;
-        if (std.mem.eql(u8, namespace, "default")) return false;
-        if (self.peer_shard_count <= 1) return false;
-        if (self.namespaceIdOf(namespace) == .invalid) return false;
-        return self.peerShardId(namespace, target) != self.own_shard;
-    }
-
-    const SinksReady = union(enum) { ready, wait, refused: []const u8 };
-
     /// Whether `pipe` may write now. Every sink routes by its namespace's
     /// published id: before shard 0 publishes it, a sink can't tell which
     /// shard owns its target, so the pipeline reads nothing and waits,
-    /// its cursor where it was. Once every id is known, a stream or queue
-    /// sink whose target is on another shard is refused, as at submit.
-    fn sinksReady(self: *const ProcessingHandler, shard: *Shard, pipe: *const PipelineState, buf: []u8) SinksReady {
-        var wait = false;
+    /// its cursor where it was.
+    fn sinksReady(self: *const ProcessingHandler, shard: *Shard, pipe: *const PipelineState) bool {
+        var ready = true;
         for (pipe.sinks) |snk| {
             if (self.namespaceIdOf(snk.namespace) != .invalid) continue;
             // A namespace this shard refuses for good takes no write; its
@@ -396,42 +368,9 @@ pub const ProcessingHandler = struct {
             // 0 can publish is waited for.
             if (shard.namespace_handler.admission(snk.namespace)) |r| if (r.status != .unavailable) continue;
             shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
-            wait = true;
+            ready = false;
         }
-        if (wait) return .wait;
-        for (pipe.sinks) |snk| {
-            if (!self.crossShardSink(snk.kind, snk.namespace, snk.target)) continue;
-            return .{ .refused = std.fmt.bufPrint(buf, "a {s} sink outside the default namespace must be on the job's shard, and '{s}' is on another; use the default namespace, or one shard (--shards 1)", .{ @tagName(snk.kind), snk.target }) catch
-                "a stream or queue sink outside the default namespace must be on the job's shard; use the default namespace, or one shard (--shards 1)" };
-        }
-        return .ready;
-    }
-
-    /// Why a job's sinks can't run here: one that `crossShardSink` refuses.
-    fn sinkShardRefusal(self: *const ProcessingHandler, def: *const definition.JobDefinition, buf: []u8) ?[]const u8 {
-        for (def.sinks.items) |snk| {
-            const namespace = if (snk.namespace.len > 0) snk.namespace else "default";
-            if (!self.crossShardSink(snk.kind, namespace, snk.target)) continue;
-            return std.fmt.bufPrint(buf, "sink '{s}': a {s} sink outside the default namespace must be on the job's shard, and '{s}' is on another; use the default namespace, or one shard (--shards 1)", .{ snk.name, @tagName(snk.kind), snk.target }) catch
-                "a stream or queue sink outside the default namespace must be on the job's shard; use the default namespace, or one shard (--shards 1)";
-        }
-        return null;
-    }
-
-    /// Resolve the TS handler that owns `measurement` in `namespace` (for TS sinks).
-    fn resolveTsHandler(self: *ProcessingHandler, local: *ts_handler_mod.TSHandler, namespace: []const u8, measurement: []const u8) *ts_handler_mod.TSHandler {
-        const peers = self.peer_ts_handlers orelse return local;
-        if (peers.len <= 1 or self.peer_shard_count == 0) return local;
-        const shard_id = self.peerShardId(namespace, measurement);
-        return if (shard_id < peers.len) peers[shard_id] else local;
-    }
-
-    /// Resolve the queue handler that owns `queue_name` in `namespace` (for queue sinks).
-    fn resolveQueueHandler(self: *ProcessingHandler, local: *queue_handler_mod.QueueHandler, namespace: []const u8, queue_name: []const u8) *queue_handler_mod.QueueHandler {
-        const peers = self.peer_queue_handlers orelse return local;
-        if (peers.len <= 1 or self.peer_shard_count == 0) return local;
-        const shard_id = self.peerShardId(namespace, queue_name);
-        return if (shard_id < peers.len) peers[shard_id] else local;
+        return ready;
     }
 
     fn freeJobRecord(self: *ProcessingHandler, job: *JobRecord) void {
@@ -678,10 +617,6 @@ pub const ProcessingHandler = struct {
             return;
         }
         if (def.shardRefusal(self.peer_shard_count)) |why| {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
-            return;
-        }
-        if (self.sinkShardRefusal(&def, &why_buf)) |why| {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
             return;
         }
@@ -1299,7 +1234,6 @@ pub const ProcessingHandler = struct {
         if (def.sinks.items.len == 0) return null;
         // The shard count is this node's: another replica may run it.
         if (def.shardRefusal(self.peer_shard_count)) |why| return .{ .held = why };
-        if (self.sinkShardRefusal(def, why_buf)) |why| return .{ .held = why };
 
         // The job's tags, from its sinks and classify operators: read while
         // operators are built (classify keeps only tag bits), so no pipeline
@@ -1618,15 +1552,7 @@ pub const ProcessingHandler = struct {
             // Enforce poll interval
             const poll_ms: i64 = @intCast(pipe.src_poll_ms);
             if (now_ms - pipe.last_poll_ms < poll_ms) continue;
-            var why_buf: [256]u8 = undefined;
-            switch (self.sinksReady(shard, pipe, &why_buf)) {
-                .ready => {},
-                .wait => continue,
-                .refused => |why| {
-                    self.holdJob(job, why);
-                    continue;
-                },
-            }
+            if (!self.sinksReady(shard, pipe)) continue;
             if (self.sinksHeld(shard, pipe)) {
                 held = true;
                 continue;
@@ -1680,7 +1606,7 @@ pub const ProcessingHandler = struct {
         // does while a batch of its writes is still to apply.
         if (room == 0 or pipe.pending.items.len >= pipe.batch_size) return;
         const points = point_buf[0..@min(result.points_in_buffer, room)];
-        if (points.len == 0) return;
+        if (points.len == 0) return maybePersistCheckpoint(pipeline_key, pipe, shard, job.ns_id);
         const cursor_before = pipe.ts_cursor_ns;
         self.sink_overloaded = false;
 
@@ -1764,6 +1690,9 @@ pub const ProcessingHandler = struct {
             // (the stream handler logged them), so the source doesn't stall.
             pipe.stream_cursor_ts = result.last_id.timestamp_ms;
             pipe.stream_cursor_seq = result.last_id.sequence;
+            // Idle, the last batch's cursor still reaches disk: a restart
+            // doesn't read it again.
+            maybePersistCheckpoint(pipeline_key, pipe, shard, job.ns_id);
             return;
         }
 
@@ -1911,33 +1840,28 @@ pub const ProcessingHandler = struct {
     const HELD_WARN_MS: i64 = 30_000;
 
     /// How many source records a tick may take now: the writes this shard
-    /// can still propose before its cap, shared among the pipeline's sinks
-    /// that propose here. An operator that emits several records per input
-    /// can still exceed it; that write is held (`holdForRoom`), not dropped.
+    /// can still propose before its cap, shared among the pipeline's sinks.
+    /// An operator that emits several records per input can still exceed
+    /// it; that write is held (`holdForRoom`), not dropped.
     fn sinkRoom(shard: *const Shard, pipe: *const PipelineState) usize {
         const raft = shard.raft_node;
         const used = raft.log.lastIndex() -| raft.last_applied;
         // One spare, for a sink namespace's implicit create.
         const room = raft_node_mod.MAX_OUTSTANDING -| used -| 1;
-        var proposing: usize = 0;
-        var kv_sinks: usize = 0;
-        for (pipe.sinks) |snk| {
-            if (snk.kind != .ts) proposing += 1;
-            if (snk.kind == .kv) kv_sinks += 1;
-        }
-        const log_room = room / @max(proposing, 1);
-        // A KV sink's write for a key on another shard goes through that
+        const sinks = @max(pipe.sinks.len, 1);
+        const log_room = room / sinks;
+        // A write whose target is on another shard goes through that
         // shard's inbox, which no larger batch fits: a send it refuses holds
         // the tick, and a batch that never fits would be refused at the same
         // record every tick.
         const mailboxes = shard.peer_mailboxes orelse return log_room;
-        if (kv_sinks == 0 or mailboxes.len <= 1) return log_room;
+        if (mailboxes.len <= 1) return log_room;
         var inbox_room: usize = std.math.maxInt(usize);
         for (mailboxes, 0..) |mb, i| {
             if (i == shard.id) continue;
             inbox_room = @min(inbox_room, mb.inbox.capacity -| mb.inbox.pending());
         }
-        return @min(log_room, inbox_room / kv_sinks);
+        return @min(log_room, inbox_room / sinks);
     }
 
     pub fn noteSinkDrop(self: *ProcessingHandler, metrics: ?*MetricsRegistry, kind: []const u8, target: []const u8, why: []const u8) void {
@@ -1978,43 +1902,10 @@ pub const ProcessingHandler = struct {
                 continue;
             }
             switch (snk.kind) {
-                .stream => {
-                    const sink_handler = self.resolveStreamHandler(shard.stream_handler, snk.target, snk.namespace);
-                    // The applier names the stream by resolving its
-                    // namespace. Only this shard's handler may be touched
-                    // from this thread; a sink on another shard writes
-                    // only to "default" (`crossShardSink`, `sinksReady`).
-                    if (sink_handler != shard.stream_handler and !std.mem.eql(u8, snk.namespace, "default")) {
-                        self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, "the stream is on another shard");
-                        continue;
-                    }
-                    if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
-                    const proposed = sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
-                        if (err == error.Overloaded) return self.holdForRoom();
-                        self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, @errorName(err));
-                        continue;
-                    };
-                    // Another shard's log: refused there, its leader counts it.
-                    if (sink_handler == shard.stream_handler) self.notePending(shard, pipe, proposed, .stream, snk.target, 0);
-                },
-                .ts => {
-                    const ts_h = self.resolveTsHandler(shard.ts_handler, snk.namespace, snk.measurement);
-                    const ual_idx = ts_h.nextUalIndex();
-                    ts_h.ts.insert(
-                        shard.namespaceId(snk.namespace),
-                        snk.measurement,
-                        snk.value_field,
-                        field_value,
-                        timestamp_ns,
-                        ual_idx,
-                        src_tags,
-                    ) catch |err| {
-                        self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, @errorName(err));
-                        continue;
-                    };
-                },
+                .stream => self.sendSinkWrite(pipe, shard, snk, .{ .kind = .stream, .namespace = snk.namespace, .target = snk.target, .value = payload }),
+                .ts => self.sendTsPoint(pipe, shard, snk, snk.value_field, field_value, timestamp_ns, src_tags),
                 .kv => self.writeKvSink(pipe, snk, shard, "", payload),
-                .queue => self.writeQueueSink(pipe, snk, shard, payload),
+                .queue => self.sendSinkWrite(pipe, shard, snk, .{ .kind = .queue, .namespace = snk.namespace, .target = snk.target, .value = payload, .priority = snk.queue_priority }),
             }
         }
     }
@@ -2037,28 +1928,10 @@ pub const ProcessingHandler = struct {
                 continue;
             }
             switch (snk.kind) {
-                .stream => {
-                    const sink_handler = self.resolveStreamHandler(shard.stream_handler, snk.target, snk.namespace);
-                    // The applier names the stream by resolving its
-                    // namespace. Only this shard's handler may be touched
-                    // from this thread; a sink on another shard writes
-                    // only to "default" (`crossShardSink`, `sinksReady`).
-                    if (sink_handler != shard.stream_handler and !std.mem.eql(u8, snk.namespace, "default")) {
-                        self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, "the stream is on another shard");
-                        continue;
-                    }
-                    if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
-                    const proposed = sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
-                        if (err == error.Overloaded) return self.holdForRoom();
-                        self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, @errorName(err));
-                        continue;
-                    };
-                    // Another shard's log: refused there, its leader counts it.
-                    if (sink_handler == shard.stream_handler) self.notePending(shard, pipe, proposed, .stream, snk.target, 0);
-                },
-                .ts => self.writeTsSinkFromJson(snk, shard, payload),
+                .stream => self.sendSinkWrite(pipe, shard, snk, .{ .kind = .stream, .namespace = snk.namespace, .target = snk.target, .value = payload }),
+                .ts => self.writeTsSinkFromJson(pipe, snk, shard, payload),
                 .kv => self.writeKvSink(pipe, snk, shard, record_key, payload),
-                .queue => self.writeQueueSink(pipe, snk, shard, payload),
+                .queue => self.sendSinkWrite(pipe, shard, snk, .{ .kind = .queue, .namespace = snk.namespace, .target = snk.target, .value = payload, .priority = snk.queue_priority }),
             }
         }
     }
@@ -2066,16 +1939,15 @@ pub const ProcessingHandler = struct {
     /// TS sink (JSON source variant): honors the `fields:` map (one point per
     /// `field_name ← json_key` pair) and the `tags:` map (real tag hash). Falls back
     /// to the `value_field` shorthand (single "value" field) when no fields map is set.
-    /// Routes to the shard that owns the measurement so `ts read` finds the points.
-    fn writeTsSinkFromJson(self: *ProcessingHandler, snk: SinkConfig, shard: *Shard, payload: []const u8) void {
-        const ts_h = self.resolveTsHandler(shard.ts_handler, snk.namespace, snk.measurement);
-        const now_ns: u64 = @intCast(@as(u64, @bitCast(@import("stdx").time.milliTimestamp())) * 1_000_000);
+    /// Each point takes the stamp of the entry its owner proposes.
+    fn writeTsSinkFromJson(self: *ProcessingHandler, pipe: *PipelineState, snk: SinkConfig, shard: *Shard, payload: []const u8) void {
         var sink_tag_buf: [ts_mod.MAX_TAG_STRING]u8 = undefined;
         const sink_tags = computeTsSinkTags(snk.ts_tag_keys, payload, &sink_tag_buf);
 
         if (snk.ts_field_keys.len > 0) {
             var it = FlatPairIterator.init(snk.ts_field_keys);
             while (it.next()) |pair| {
+                if (self.sink_overloaded) return;
                 // pair.key = TS field name, pair.value = JSON field to extract from.
                 const value = extractJsonFloat(payload, pair.value) orelse {
                     self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the record has no numeric field for it");
@@ -2085,11 +1957,7 @@ pub const ProcessingHandler = struct {
                     self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the value is not a finite number");
                     continue;
                 }
-                const ual_idx = ts_h.nextUalIndex();
-                ts_h.ts.insert(shard.namespaceId(snk.namespace), snk.measurement, pair.key, value, now_ns, ual_idx, sink_tags) catch |err| {
-                    self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, @errorName(err));
-                    continue;
-                };
+                self.sendTsPoint(pipe, shard, snk, pair.key, value, 0, sink_tags);
             }
             return;
         }
@@ -2098,8 +1966,14 @@ pub const ProcessingHandler = struct {
         const value = extractJsonFloat(payload, snk.value_field) orelse
             (std.fmt.parseFloat(f64, payload) catch return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the record is not a number"));
         if (!std.math.isFinite(value)) return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the value is not a finite number");
-        const ual_idx = ts_h.nextUalIndex();
-        ts_h.ts.insert(shard.namespaceId(snk.namespace), snk.measurement, "value", value, now_ns, ual_idx, sink_tags) catch |err| self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, @errorName(err));
+        self.sendTsPoint(pipe, shard, snk, "value", value, 0, sink_tags);
+    }
+
+    /// One TS point, at `timestamp_ns` (0: its entry's stamp).
+    fn sendTsPoint(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, snk: SinkConfig, field: []const u8, value: f64, timestamp_ns: u64, tags: []const u8) void {
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, @bitCast(value), .little);
+        self.sendSinkWrite(pipe, shard, snk, .{ .kind = .ts, .namespace = snk.namespace, .target = snk.measurement, .value = &bytes, .timestamp_ns = timestamp_ns, .field = field, .tags = tags });
     }
 
     const MAX_SINK_KEY = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
@@ -2126,99 +2000,164 @@ pub const ProcessingHandler = struct {
         };
     }
 
-    /// KV sink: write the record under `key_prefix + separator + record_key`
-    /// on the shard that owns that key, so a later `kv get` finds it: here,
-    /// or, when another shard owns it, by a message that shard proposes
-    /// from. A full inbox holds the source as a full log does, so the batch
-    /// is read and sent again.
+    /// KV sink: write the record under `key_prefix + separator + record_key`,
+    /// on the shard that owns that key, so a later `kv get` finds it.
     fn writeKvSink(self: *ProcessingHandler, pipe: *PipelineState, snk: SinkConfig, shard: *Shard, record_key: []const u8, payload: []const u8) void {
         var key_buf: [MAX_SINK_KEY]u8 = undefined;
         const full_key = self.kvSinkKeyOrDrop(&key_buf, snk, shard.metrics_registry, record_key) orelse return;
         // As a client's key: the CLI and SDKs have never written one with NUL.
         if (std.mem.indexOfScalar(u8, full_key, 0) != null) return self.noteSinkDrop(shard.metrics_registry, "kv", full_key, "key must not contain NUL");
-        const owner = self.kvOwner(shard, snk.namespace, full_key);
+        self.sendSinkWrite(pipe, shard, snk, .{ .kind = .kv, .namespace = snk.namespace, .target = full_key, .value = payload, .ttl_ms = snk.kv_ttl_ms });
+    }
+
+    /// The shard that owns `target` in `namespace`: this one when there are
+    /// no others to send to.
+    pub fn sinkOwner(self: *const ProcessingHandler, shard: *const Shard, namespace: []const u8, target: []const u8) u16 {
+        const mailboxes = shard.peer_mailboxes orelse return @intCast(shard.id);
+        if (mailboxes.len <= 1 or self.peer_shard_count == 0) return @intCast(shard.id);
+        const owner = self.peerShardId(namespace, target);
+        return if (owner < mailboxes.len) owner else @intCast(shard.id);
+    }
+
+    /// A sink write goes where its target is: proposed here when this
+    /// shard owns it, and watched until it applies; otherwise sent to the
+    /// owner's inbox, which proposes it from its own thread. A full log
+    /// here, a full inbox, or a target not ready holds the tick, so the
+    /// record is read and sent again.
+    fn sendSinkWrite(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, snk: SinkConfig, w: SinkWrite) void {
+        // What a pending write names: the sink's own, as its key may not outlive the tick.
+        const label = if (snk.kind == .ts) snk.measurement else snk.target;
+        const owner = self.sinkOwner(shard, w.namespace, w.target);
         if (owner == shard.id) {
-            switch (kv_handler_mod.KVHandler.sinkPropose(shard, snk.namespace, full_key, payload, snk.kv_ttl_ms)) {
-                .proposed => |p| self.notePending(shard, pipe, p, .kv, snk.target, 0),
-                .held => self.holdForRoom(),
-                .dropped => |why| self.noteSinkDrop(shard.metrics_registry, "kv", full_key, why),
+            switch (self.proposeSinkWrite(shard, w)) {
+                .proposed => |p| self.notePending(shard, pipe, p, snk.kind, label),
+                .room, .wait => self.holdForRoom(),
+                .dropped => {},
             }
             return;
         }
-        const message = (kv_handler_mod.KVHandler.SinkPut{ .namespace = snk.namespace, .key = full_key, .value = payload, .ttl_ms = snk.kv_ttl_ms }).encode(shard.allocator) orelse
-            return self.noteSinkDrop(shard.metrics_registry, "kv", full_key, "out of memory");
-        if (!shard.peer_mailboxes.?[owner].inbox.send(.{ .tag = .kv_sink_put, .src_shard = @intCast(shard.id), .payload_len = @intCast(message.len), .payload_ptr = message.ptr })) {
+        const message = w.encode(shard.allocator) orelse
+            return self.noteSinkDrop(shard.metrics_registry, @tagName(w.kind), label, "out of memory, or a name too long to send");
+        if (!shard.peer_mailboxes.?[owner].inbox.send(.{ .tag = .sink_write, .src_shard = @intCast(shard.id), .payload_len = @intCast(message.len), .payload_ptr = message.ptr })) {
             shard.allocator.free(message);
             if (shard.shard_metrics) |sm| sm.recordCrossShardOverloaded(.engine);
             self.holdForRoom();
         }
     }
 
-    /// The shard that owns KV `key` in `namespace`: this one when there are
-    /// no others to send to.
-    pub fn kvOwner(self: *const ProcessingHandler, shard: *const Shard, namespace: []const u8, key: []const u8) u16 {
-        const mailboxes = shard.peer_mailboxes orelse return @intCast(shard.id);
-        if (mailboxes.len <= 1 or self.peer_shard_count == 0) return @intCast(shard.id);
-        const owner = self.peerShardId(namespace, key);
-        return if (owner < mailboxes.len) owner else @intCast(shard.id);
+    /// What became of a sink write on the shard that owns its target.
+    pub const Proposed = union(enum) {
+        /// In the log, not yet applied.
+        proposed: persistence_mod.ProposeResult,
+        /// The log is full: try again once it drains.
+        room,
+        /// Its target can't take it yet (a queue at its caps, a namespace
+        /// not yet in this shard's table): try again later.
+        wait,
+        /// Refused for good, and counted dropped.
+        dropped,
+    };
+
+    /// A sink write proposed on this shard, which owns its target, as a
+    /// client's write is: through the namespace's write gate and the
+    /// target's handler, marked as a sink's (`Flags.SINK`). Only ever
+    /// called on this shard's own thread.
+    pub fn proposeSinkWrite(self: *ProcessingHandler, shard: *Shard, w: SinkWrite) Proposed {
+        const label: []const u8 = @tagName(w.kind);
+        switch (shard.namespace_handler.prepareWrite(shard, w.namespace)) {
+            .go => {},
+            .ensure => return .wait,
+            .refused => |r| return if (r.status == .overloaded) .room else self.dropped(shard, label, w.target, r.message),
+        }
+        const ns = shard.namespaceId(w.namespace);
+        if (ns == .invalid) return .wait;
+        switch (w.kind) {
+            .kv => return switch (kv_handler_mod.KVHandler.sinkPropose(shard, w.namespace, w.target, w.value, w.ttl_ms)) {
+                .proposed => |p| .{ .proposed = p },
+                .held => .room,
+                .dropped => |why| self.dropped(shard, label, w.target, why),
+            },
+            .queue => {
+                // Past the queue's caps, counting the sink enqueues proposed
+                // here and not yet applied, it would be refused at apply.
+                if (!self.queueFits(shard, ns, w.target, w.value.len)) return .wait;
+                var opt_buf: [64]u8 = undefined;
+                var ob = proto.OptionsBuilder.init(&opt_buf);
+                if (w.priority > 0) ob.addU8(.priority, w.priority) catch {};
+                const result = shard.queue_handler.sinkEnqueue(.{
+                    .header = makeSinkHeader(.queue_enqueue),
+                    .namespace = w.namespace,
+                    .ns_id = ns,
+                    .key = w.target,
+                    .value = w.value,
+                    .options = opt_buf[0..ob.offset],
+                });
+                defer shard.queue_handler.freeResult(result);
+                switch (result) {
+                    .parked => |p| {
+                        // Short of memory the queue is counted short of
+                        // these, and its caps refuse the excess at apply.
+                        self.sink_enqueues.append(self.allocator, .{ .index = p.index, .ns = ns, .name = queueNameHash(w.target), .held = queue_machine.heldBy(w.value.len, 0) }) catch {};
+                        return .{ .proposed = p };
+                    },
+                    .err => |e| return if (e.code == .overloaded) .room else self.dropped(shard, label, w.target, e.message),
+                    else => return self.dropped(shard, label, w.target, "the enqueue gave no answer"),
+                }
+            },
+            .stream => {
+                const p = shard.stream_handler.appendPayloadToStream(w.target, w.namespace, w.value) catch |err| return switch (err) {
+                    error.Overloaded => .room,
+                    else => self.dropped(shard, label, w.target, @errorName(err)),
+                };
+                return .{ .proposed = p };
+            },
+            .ts => {
+                if (w.value.len != 8) return self.dropped(shard, label, w.target, "the value is not a number");
+                const value: f64 = @bitCast(std.mem.readInt(u64, w.value[0..8], .little));
+                const result = ts_handler_mod.TSHandler.proposeWrite(shard, w.namespace, w.target, w.field, value, if (w.timestamp_ns == 0) null else w.timestamp_ns, w.tags, Flags.SINK);
+                return switch (result) {
+                    .parked => |p| .{ .proposed = p },
+                    .err => |e| if (e.code == .overloaded) .room else self.dropped(shard, label, w.target, e.message),
+                    else => self.dropped(shard, label, w.target, "the write gave no answer"),
+                };
+            },
+        }
     }
 
-    /// Queue sink: enqueue the record payload into the configured queue (durable,
-    /// via the queue handler's Raft-backed enqueue path), routed to the shard that
-    /// owns the queue so a later `queue dequeue` finds it.
-    fn writeQueueSink(self: *ProcessingHandler, pipe: *PipelineState, snk: SinkConfig, shard: *Shard, payload: []const u8) void {
-        var opt_buf: [64]u8 = undefined;
-        var ob = proto.OptionsBuilder.init(&opt_buf);
-        if (snk.queue_priority > 0) ob.addU8(.priority, snk.queue_priority) catch {};
+    fn dropped(self: *ProcessingHandler, shard: *Shard, kind: []const u8, target: []const u8, why: []const u8) Proposed {
+        self.noteSinkDrop(shard.metrics_registry, kind, target, why);
+        return .dropped;
+    }
 
-        const req = proto.Request{
-            .header = makeSinkHeader(.queue_enqueue),
-            .namespace = snk.namespace,
-            // The enqueue registers the queue under this id, as the applier
-            // files its messages: published before any sink writes
-            // (`sinksReady`).
-            .ns_id = self.namespaceIdOf(snk.namespace),
-            .key = snk.target, // queue name
-            .value = payload,
-            .options = opt_buf[0..ob.offset],
+    fn queueNameHash(name: []const u8) u64 {
+        return std.hash.Wyhash.hash(0, name);
+    }
+
+    /// Whether queue `name` takes a message of `len` bytes, counting the
+    /// sink enqueues proposed here and not yet applied.
+    fn queueFits(self: *ProcessingHandler, shard: *Shard, ns: NamespaceId, name: []const u8, len: usize) bool {
+        // Those applied are in the queue's own counts now; one a leader
+        // change dropped goes once the log applies past its index.
+        const applied = shard.raft_node.last_applied;
+        var keep: usize = 0;
+        for (self.sink_enqueues.items) |e| if (e.index > applied) {
+            self.sink_enqueues.items[keep] = e;
+            keep += 1;
         };
-        const q = self.resolveQueueHandler(shard.queue_handler, snk.namespace, snk.target);
-        // The applier labels the queue by resolving its namespace; only
-        // this shard's handler may be touched from this thread, and a sink
-        // on another shard writes only to "default" (`crossShardSink`,
-        // `sinksReady`).
-        if (q != shard.queue_handler and !std.mem.eql(u8, snk.namespace, "default"))
-            return self.noteSinkDrop(shard.metrics_registry, "queue", snk.target, "the queue is on another shard");
-        if (q == shard.queue_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
-        // Past the queue's caps, counting what this pipeline has proposed
-        // to it and not yet applied, the enqueue would be refused at apply:
-        // the source waits here instead.
-        const held = queue_machine.heldBy(payload.len, 0);
-        if (q == shard.queue_handler) {
-            var msgs: u64 = 0;
-            var bytes: u64 = 0;
-            for (pipe.pending.items) |p| if (p.kind == .queue and std.mem.eql(u8, p.target, snk.target)) {
-                msgs += 1;
-                bytes += p.held;
-            };
-            if (!queue_handler_mod.sinkWouldFit(q.caps, shard, req.ns_id, snk.target, payload.len, msgs, bytes)) return self.holdForRoom();
-        }
-        const result = q.sinkEnqueue(req);
-        defer q.freeResult(result);
-        switch (result) {
-            .err => |e| {
-                if (e.code == .overloaded) return self.holdForRoom();
-                self.noteSinkDrop(shard.metrics_registry, "queue", snk.target, e.message);
-            },
-            // Another shard's log: refused there, its leader counts it.
-            .parked => |p| if (q == shard.queue_handler) self.notePending(shard, pipe, p, .queue, snk.target, held),
-            else => {},
-        }
+        self.sink_enqueues.shrinkRetainingCapacity(keep);
+        const hash = queueNameHash(name);
+        var msgs: u64 = 0;
+        var bytes: u64 = 0;
+        for (self.sink_enqueues.items) |e| if (e.ns == ns and e.name == hash) {
+            msgs += 1;
+            bytes += e.held;
+        };
+        return queue_handler_mod.sinkWouldFit(shard.queue_handler.caps, shard, ns, name, len, msgs, bytes);
     }
 
     /// A sink write this shard's log took: kept until it applies. One the
     /// list can't take is read again at once rather than go unwatched.
-    pub fn notePending(self: *ProcessingHandler, shard: *Shard, pipe: *PipelineState, proposed: persistence_mod.ProposeResult, kind: SinkKind, target: []const u8, held: u64) void {
+    pub fn notePending(self: *ProcessingHandler, shard: *Shard, pipe: *PipelineState, proposed: persistence_mod.ProposeResult, kind: SinkKind, target: []const u8) void {
         // The first write of a new term: those of earlier terms were lost
         // with the leadership, or apply under their own term unwatched.
         // Either way their records are read again, and none is left to
@@ -2227,7 +2166,7 @@ pub const ProcessingHandler = struct {
             self.rewindEveryPending(shard);
             self.pending_term = proposed.term;
         }
-        pipe.pending.append(self.allocator, .{ .term = proposed.term, .index = proposed.index, .again = pipe.resume_here, .kind = kind, .target = target, .held = held }) catch {
+        pipe.pending.append(self.allocator, .{ .term = proposed.term, .index = proposed.index, .again = pipe.resume_here, .kind = kind, .target = target }) catch {
             rewind(pipe, pipe.resume_here);
             self.holdForRoom();
             return;
@@ -2301,6 +2240,7 @@ pub const ProcessingHandler = struct {
         const kind: []const u8 = switch (@as(EntryType, @fromBackingInt(@intCast(entry.header.entry_type)))) {
             .queue_enqueue => "queue",
             .stream_append => "stream",
+            .ts_write => "ts",
             else => "kv",
         };
         self.noteSinkDrop(shard.metrics_registry, kind, "(not watched here: another shard's pipeline, or one since removed)", r.refusal.message);
@@ -3224,57 +3164,6 @@ test "ProcessingHandler: a job reading two streams frees its tag registry once" 
 
     _ = handler.startPipelines("job-two", &def, &test_why_buf);
     try std.testing.expectEqual(@as(u32, 2), handler.pipelines.count());
-}
-
-test "ProcessingHandler: a stream or queue sink outside default on another shard is refused, on its own shard or in default it runs" {
-    const allocator = std.testing.allocator;
-    var handler = ProcessingHandler.init(allocator);
-    defer handler.deinit();
-    handler.peer_shard_count = 4;
-    handler.own_shard = 0;
-    // Routed by the id the node's table publishes for it.
-    const table = try @import("../namespace/table.zig").Table.create(allocator);
-    defer table.destroy();
-    try table.publish(@import("../namespace/table.zig").FIRST_ALLOCATED, "acme", 1);
-    handler.ns_table = table;
-    // A target on this shard and one on another, in "acme".
-    var here_buf: [16]u8 = undefined;
-    var there_buf: [16]u8 = undefined;
-    var here: ?[]const u8 = null;
-    var there: ?[]const u8 = null;
-    var i: usize = 0;
-    while (here == null or there == null) : (i += 1) {
-        const on_this = handler.peerShardId("acme", try std.fmt.bufPrint(&here_buf, "out{d}", .{i})) == 0;
-        if (on_this and here == null) here = try std.fmt.bufPrint(&here_buf, "out{d}", .{i});
-        if (!on_this and there == null) there = try std.fmt.bufPrint(&there_buf, "out{d}", .{i});
-    }
-    var yaml_buf: [512]u8 = undefined;
-    var why: [256]u8 = undefined;
-    const Case = struct { kind: []const u8, namespace: []const u8, target: []const u8, refused: bool };
-    for ([_]Case{
-        .{ .kind = "stream", .namespace = "acme", .target = there.?, .refused = true },
-        .{ .kind = "queue", .namespace = "acme", .target = there.?, .refused = true },
-        .{ .kind = "stream", .namespace = "acme", .target = here.?, .refused = false },
-        .{ .kind = "stream", .namespace = "default", .target = there.?, .refused = false },
-        .{ .kind = "kv", .namespace = "acme", .target = "", .refused = false },
-    }) |c| {
-        const yaml = try std.fmt.bufPrint(&yaml_buf,
-            \\kind: Processing
-            \\name: j
-            \\namespace: {s}
-            \\sources:
-            \\  - name: a
-            \\    stream: {{ name: in }}
-            \\sinks:
-            \\  - name: out
-            \\    {s}: {{ {s}{s} }}
-        , .{ c.namespace, c.kind, if (c.target.len > 0) "name: " else "key_prefix: p", c.target });
-        var def = try parser.parseJobDefinition(allocator, yaml, null);
-        defer def.deinit(allocator);
-        try std.testing.expectEqual(c.refused, handler.sinkShardRefusal(&def, &why) != null);
-        // The same on replay: the job's pipelines are held, not run.
-        if (c.refused) try std.testing.expect(handler.startPipelines("job-x", &def, &why).? == .held);
-    }
 }
 
 test "ProcessingHandler: a two-source job short of memory at any point leaves nothing behind" {
