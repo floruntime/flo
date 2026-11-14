@@ -204,7 +204,7 @@ export type QueueDetailInfo = QueueInfo
 export interface QueueMessage {
   seq: number
   priority: number
-  attempts: number
+  deliveries: number
   enqueued_at: number
   size: number
   payload: string

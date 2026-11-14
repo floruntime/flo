@@ -94,6 +94,15 @@ pub const Reason = enum(u16) {
     /// The node holds as many workflow runs as it keeps: let some finish or
     /// delete them first. Defined ahead of the check that returns it.
     too_many_workflow_runs = 35,
+    /// The queue holds as many messages or bytes as its caps allow, or the
+    /// shard's queues and groups together do. It drains as messages are
+    /// acked: back off and send again.
+    queue_full = 36,
+    /// A consumer group read took nothing new: the group holds as many
+    /// records as its caps allow, or the shard's queues and groups together
+    /// do. Its consumers hold too many records they haven't acked (or it
+    /// holds dead ones): reading again won't help until they ack or nack.
+    group_held_full = 37,
 };
 
 /// Whether a refused request took effect.
