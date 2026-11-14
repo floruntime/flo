@@ -43,7 +43,7 @@ pub const FOOTER_MAGIC: [8]u8 = .{ 'F', 'L', 'O', '_', 'E', 'N', 'D', 0 };
 /// the segment's own, so a data directory written before it is refused at
 /// open, not misread. node/data_format.zig pins the entry layouts this
 /// version stores, and the data directory format that goes with it.
-pub const SEGMENT_VERSION: u16 = 14;
+pub const SEGMENT_VERSION: u16 = 15;
 /// A device writes whole blocks: the fixed part and each mark get one.
 pub const BLOCK_SIZE: usize = 4096;
 /// The fixed part's block and the two marks' blocks; entry data starts after.

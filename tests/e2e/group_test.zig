@@ -439,3 +439,33 @@ test "e2e/group: an ack or nack to a group that isn't there is refused not found
     defer pending.deinit();
     try testing.expect(pending.stdoutContains("\"deliveries\":2"));
 }
+
+test "e2e/group: an abandoned record goes again at once and spends no attempt; abandon with a failure's options is refused" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    // One attempt: a single nack would kill it.
+    try ctx.exec(&.{ "stream", "group", "create", "s", "--group", "g", "--max-deliver", "1" });
+    try ctx.exec(&.{ "stream", "append", "s", "job" });
+    var db: [256]u8 = undefined;
+    for (1..4) |n| {
+        var r = try read(ctx, "s", "w", "1");
+        defer r.deinit();
+        try testing.expect(r.stdoutContains("\"data\":\"job\""));
+        var want: [32]u8 = undefined;
+        try testing.expect(r.stdoutContains(try std.fmt.bufPrint(&want, "\"deliveries\":{d}", .{n})));
+        const ds = try deliveries(&db, r.stdout);
+        if (n == 1) {
+            // Abandon is the hand-back alone.
+            for ([_][]const u8{ "--dlq", "--error=boom" }) |extra| {
+                var bad = try ctx.cli.run(&.{ "stream", "group", "nack", "s", "--group", "g", "--consumer", "w", "--ids", ds, "--abandon", extra });
+                defer bad.deinit();
+                try testing.expect(bad.exit_code != 0);
+                try testing.expect(bad.stderrContains("abandon hands records back unstarted, so it takes no dead, delay_ms or error"));
+            }
+        }
+        var back = try ctx.cli.run(&.{ "stream", "group", "nack", "s", "--group", "g", "--consumer", "w", "--ids", ds, "--abandon" });
+        defer back.deinit();
+        try testing.expect(back.stdoutContains("Handed back 1 record(s)"));
+    }
+    try testing.expect(try infoHas(ctx, "s", "\"ready\":1,\"leased\":0,\"dead\":0"));
+}

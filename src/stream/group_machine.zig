@@ -499,7 +499,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         },
         .group_release => {
             const p = ge.Release.decodeAll(e.payload, &diag) catch return error.Halt;
-            try report(view, out, p, .{ .release = .{ .delay_ms = p.delay_ms, .dead = p.dead, .@"error" = p.@"error", .free = p.free } }, stamp);
+            try report(view, out, p, .{ .release = .{ .delay_ms = p.delay_ms, .dead = p.dead, .@"error" = p.@"error", .ended = p.ended } }, stamp);
         },
         .group_extend => {
             const p = ge.Extend.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -713,7 +713,7 @@ fn deliverApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
 
 const Report = union(enum) {
     settle,
-    release: struct { delay_ms: u64, dead: bool, @"error": []const u8, free: bool },
+    release: struct { delay_ms: u64, dead: bool, @"error": []const u8, ended: ge.HandBack },
     extend: struct { lease_ms: u64, held_since_ns: u64 },
 };
 
@@ -749,7 +749,7 @@ fn report(view: *View, out: *Result, p: anytype, kind: Report, stamp: u64) Apply
             const same = delivery.sameDelivery(item.v, p.holder, named.deliveries, p.token);
             const repeat = same and switch (kind) {
                 .settle, .extend => false,
-                .release => item.v.ended == .released,
+                .release => item.v.ended == .released or item.v.ended == .abandoned,
             };
             if (repeat) {
                 applied += 1;
@@ -770,11 +770,12 @@ fn report(view: *View, out: *Result, p: anytype, kind: Report, stamp: u64) Apply
             },
             .release => |r| {
                 try M.endLease(view, ns, &id, item.v, p.holder, null, p.expiry_ns);
-                if (r.free) {
-                    // Handed back by the leader, never seen: no failure,
-                    // and not a delivery.
+                if (r.ended != .failed) {
+                    // Handed back unstarted: ready again at once, no
+                    // failure. The leader's own (`unread`) was never seen,
+                    // so isn't a delivery either.
                     item.v.ended = .abandoned;
-                    try lessU32(&item.v.deliveries);
+                    if (r.ended == .unread) try lessU32(&item.v.deliveries);
                     m.leased -= 1;
                     try M.readyAgain(view, ns, &id, &item.v, stamp);
                     m.ready += 1;
@@ -1190,7 +1191,7 @@ fn release(t: *TestGroups, d: Delivered, records: []const StreamID, dead: bool, 
     var buf: [512]u8 = undefined;
     const items = try itemsOf(&buf, t, records);
     const exp = t.item("s", "g", records[0]).?.expiry_ns;
-    const r = try t.apply(.group_release, ge.Release.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = d.token, .expiry_ns = exp, .items = items, .delay_ms = 0, .dead = dead, .@"error" = "boom", .free = false }, stamp);
+    const r = try t.apply(.group_release, ge.Release.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = d.token, .expiry_ns = exp, .items = items, .delay_ms = 0, .dead = dead, .@"error" = "boom", .ended = .failed }, stamp);
     return Answer.of(r, false);
 }
 
@@ -1228,7 +1229,7 @@ test "group machine: a deliver takes no more than its leader chose: the ready re
     var ib: [512]u8 = undefined;
     const items = try itemsOf(&ib, &t, d.records[0..2]);
     const exp = t.item("s", "g", first).?.expiry_ns;
-    const back = try t.apply(.group_release, ge.Release.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = d.token, .expiry_ns = exp, .items = items, .delay_ms = 0, .dead = false, .@"error" = "", .free = true }, 11 * ms);
+    const back = try t.apply(.group_release, ge.Release.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = d.token, .expiry_ns = exp, .items = items, .delay_ms = 0, .dead = false, .@"error" = "", .ended = .unread }, 11 * ms);
     try testing.expectEqual(@as(u32, 2), Answer.of(back, false).applied);
     try testing.expectEqual(@as(u32, 0), t.item("s", "g", first).?.failures);
     try testing.expectEqual(@as(u32, 0), t.item("s", "g", first).?.deliveries);
@@ -1257,6 +1258,50 @@ test "group machine: a report to a group that isn't there is refused not_found, 
         const r = try t.apply(.group_settle, ge.Settle.Value{ .ns = NS.int(), .stream = "s", .group = group, .holder = "c1", .token = d.token, .expiry_ns = 0, .items = items }, 21 * ms);
         try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, r.refused().?.status);
     }
+}
+
+fn abandon(t: *TestGroups, d: Delivered, records: []const StreamID, stamp: u64) !Answer {
+    var buf: [512]u8 = undefined;
+    const items = try itemsOf(&buf, t, records);
+    const exp = if (t.item("s", "g", records[0])) |i| i.expiry_ns else 0;
+    const r = try t.apply(.group_release, ge.Release.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = d.token, .expiry_ns = exp, .items = items, .delay_ms = 0, .dead = false, .@"error" = "", .ended = .abandoned }, stamp);
+    return Answer.of(r, false);
+}
+
+test "group machine: an abandoned record is ready at once, its delivery kept and no failure counted; a resend applies, a stale one doesn't" {
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 2);
+    const d = try deliver(&t, 2, 1 << 20, "c1", 10 * ms);
+    const rec = sid(100, 0);
+
+    const a = try abandon(&t, d, &.{rec}, 11 * ms);
+    try testing.expectEqual(@as(u32, 1), a.applied);
+    const it = t.item("s", "g", rec).?;
+    try testing.expectEqual(Status.ready, it.status);
+    try testing.expectEqual(@as(u64, 11 * ms), it.due_ns);
+    try testing.expectEqual(@as(u32, 1), it.deliveries);
+    try testing.expectEqual(@as(u32, 0), it.failures);
+    try testing.expectEqual(@as(u64, 1), t.meta("s", "g").?.ready);
+    try testing.expectEqual(@as(u64, 1), t.meta("s", "g").?.leased);
+
+    // The same abandon again counts as applied, and changes nothing.
+    const sums = t.sums();
+    const again = try abandon(&t, d, &.{rec}, 12 * ms);
+    try testing.expectEqual(@as(u32, 1), again.applied);
+    try testing.expectEqual(@as(usize, 0), again.n);
+    try testing.expectEqual(sums, t.sums());
+
+    // Delivered again: the first delivery's abandon is stale, and applies
+    // nothing to the second.
+    const d2 = try deliver(&t, 1, 1 << 20, "c2", 13 * ms);
+    try testing.expect(d2.records[0].eql(rec));
+    const stale = try abandon(&t, d, &.{rec}, 14 * ms);
+    try testing.expectEqual(@as(u32, 0), stale.applied);
+    try testing.expectEqual(Why.delivered_again, stale.refused[0].why);
+    try testing.expectEqual(Status.leased, t.item("s", "g", rec).?.status);
+    try testing.expectEqualStrings("c2", t.item("s", "g", rec).?.holder);
+    try testing.expectEqual(@as(u32, 2), t.item("s", "g", rec).?.deliveries);
 }
 
 test "group machine: acking one record of an append acks only that record" {

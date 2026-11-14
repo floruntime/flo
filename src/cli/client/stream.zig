@@ -306,7 +306,7 @@ pub const GroupItem = struct { id: StreamID, deliveries: u32 };
 pub const GroupReport = enum { ack, nack, touch };
 
 /// Options a nack takes.
-pub const NackOptions = struct { delay_ms: u64 = 0, dead: bool = false, error_text: []const u8 = "" };
+pub const NackOptions = struct { delay_ms: u64 = 0, dead: bool = false, error_text: []const u8 = "", abandon: bool = false };
 
 /// Report on one delivery's records: `[group][consumer][term:u64][index:u64]`
 /// `[count:u32]([ms:u64][seq:u64][deliveries:u32])*`. The answer is
@@ -341,6 +341,7 @@ pub fn groupReport(
         try writer.writeLengthPrefixed(u16, nack.error_text);
         if (nack.delay_ms > 0) try builder.addU64(.delay_ms, nack.delay_ms);
         if (nack.dead) try builder.addFlag(.dead);
+        if (nack.abandon) try builder.addFlag(.abandon);
     }
     const op: proto.OpCode = switch (kind) {
         .ack => .stream_group_ack,
