@@ -148,14 +148,18 @@ pub const ChannelViolation = struct {
 /// the message again. It holds every channel to exactly once, in order: a
 /// receiver applies seq n + 1 after n, never one twice, never one its
 /// sender doesn't hold, and in the end every message its sender holds.
+///
+/// Every group here keeps a disk, so a sender losing a send its receiver
+/// applied is always a violation. A run of groups with no data directory
+/// would have to allow it: such a group promises nothing across a crash.
 pub const ChannelOracle = struct {
     allocator: Allocator,
     channels: [MAX_GROUPS][MAX_GROUPS]Channel = @splat(@splat(.{})),
     violations: std.ArrayListUnmanaged(ChannelViolation) = .empty,
     applies: u64 = 0,
-    /// A sender may lose what its receiver applied: with no data directory,
-    /// or ephemeral, a crash keeps nothing and promises nothing.
-    sender_loss_legal: bool = false,
+    /// Reports of what a group already reported, as its restart replays its
+    /// log: each matched what was recorded.
+    replays: u64 = 0,
 
     const Logged = struct { hash: u64, index: u64 };
 
@@ -187,46 +191,78 @@ pub const ChannelOracle = struct {
     }
 
     /// The sender applied a send at `index`: seqs go up by one per channel.
+    /// One already recorded is the sender's restart replaying its log, and
+    /// must be the same send at the same index.
     pub fn sent(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, hash: u64, index: u64) !void {
         const c = &self.channels[from][to];
+        if (seq >= 1 and seq <= c.sent.items.len) {
+            const was = c.sent.items[seq - 1];
+            if (was.index == index and was.hash == hash) {
+                self.replays += 1;
+                return;
+            }
+            return self.fail(from, to, seq, "a sender's seqs skipped or repeated");
+        }
         if (seq != c.sent.items.len + 1) return self.fail(from, to, seq, "a sender's seqs skipped or repeated");
         try c.sent.append(self.allocator, .{ .hash = hash, .index = index });
     }
 
-    /// The receiver applied a message at `index`.
+    /// The receiver applied a message at `index`. One already recorded at
+    /// that index is its restart replaying its log; at any other index it
+    /// is the message applied again.
     pub fn applied(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, hash: u64, index: u64) !void {
         const c = &self.channels[from][to];
-        self.applies += 1;
         const through = c.appliedThrough();
-        if (seq <= through) return self.fail(from, to, seq, "applied a message twice");
+        if (seq >= 1 and seq <= through) {
+            const was = c.applied.items[seq - 1];
+            if (was.index == index and was.hash == hash) {
+                self.replays += 1;
+                return;
+            }
+            return self.fail(from, to, seq, "applied a message twice");
+        }
+        self.applies += 1;
         if (seq != through + 1) return self.fail(from, to, seq, "applied a message past a gap");
         if (seq > c.sent.items.len) return self.fail(from, to, seq, "applied a message its sender doesn't hold");
         if (c.sent.items[seq - 1].hash != hash) return self.fail(from, to, seq, "applied another message than the one sent at its seq");
         try c.applied.append(self.allocator, .{ .hash = hash, .index = index });
     }
 
-    /// `group` came back from a crash with its log through `kept`: its sends
-    /// and applies above that are gone. A receiver that applied a send now
-    /// gone applied a message whose cause is gone.
+    /// `group` came back from a crash with its log through `kept`.
     pub fn recovered(self: *ChannelOracle, group: GroupId, kept: u64) void {
-        for (0..MAX_GROUPS) |peer_| {
-            const peer: GroupId = @intCast(peer_);
-            const out = &self.channels[group][peer];
-            var n = out.sent.items.len;
-            while (n > 0 and out.sent.items[n - 1].index > kept) n -= 1;
-            if (n < out.sent.items.len) {
-                if (out.appliedThrough() > n) {
-                    if (!self.sender_loss_legal) self.fail(group, peer, out.appliedThrough(), "applied a message its sender lost");
-                    // Legal here, so the seqs start over on both sides.
-                    out.applied.shrinkRetainingCapacity(n);
-                }
-                out.sent.shrinkRetainingCapacity(n);
-            }
-            const in = &self.channels[peer][group];
+        var all: [MAX_GROUPS]?u64 = @splat(null);
+        all[group] = kept;
+        self.recoveredAll(&all);
+    }
+
+    /// The groups that came back from one crash, each with its log through
+    /// `kept[g]`: their sends and applies above that are gone. Every
+    /// group's applies are cut first, then every sender is checked, so a
+    /// send and its apply that the crash took together are no violation,
+    /// whichever group is numbered first. A receiver still holding the
+    /// apply of a send now gone applied a message whose cause is gone.
+    pub fn recoveredAll(self: *ChannelOracle, kept: []const ?u64) void {
+        for (kept, 0..) |k, g| if (k) |keep| for (0..MAX_GROUPS) |peer| {
+            const in = &self.channels[peer][g];
             var m = in.applied.items.len;
-            while (m > 0 and in.applied.items[m - 1].index > kept) m -= 1;
+            while (m > 0 and in.applied.items[m - 1].index > keep) m -= 1;
             in.applied.shrinkRetainingCapacity(m);
-        }
+        };
+        for (kept, 0..) |k, g_| if (k) |keep| for (0..MAX_GROUPS) |peer_| {
+            const g: GroupId = @intCast(g_);
+            const peer: GroupId = @intCast(peer_);
+            const out = &self.channels[g][peer];
+            var n = out.sent.items.len;
+            while (n > 0 and out.sent.items[n - 1].index > keep) n -= 1;
+            if (n == out.sent.items.len) continue;
+            if (out.appliedThrough() > n) {
+                self.fail(g, peer, out.appliedThrough(), "applied a message its sender lost");
+                // Reported; the channel starts over from what both hold, so
+                // the run goes on past it.
+                out.applied.shrinkRetainingCapacity(n);
+            }
+            out.sent.shrinkRetainingCapacity(n);
+        };
     }
 
     /// Every message each sender holds was applied: once the channels have
@@ -315,10 +351,9 @@ pub const Groups = struct {
         return self.sims[0].now;
     }
 
-    /// Every group converged, and the channels drained: nothing in flight,
-    /// every message its sender holds applied.
-    fn converged(self: *Groups) bool {
-        for (self.sims) |*s| if (!s.isConverged()) return false;
+    /// The channels drained: nothing in flight, every message its sender
+    /// holds applied.
+    fn drained(self: *const Groups) bool {
         return self.mailbox.queue.items.len == 0 and self.oracle.drained();
     }
 
@@ -333,7 +368,11 @@ pub const Groups = struct {
         const up = self.sims[0].nodeUp(NODE);
         for (self.sims[1..]) |*s| try s.followFate(NODE, up);
         if (was_up and !up) self.mailbox.crash();
-        if (!was_up and up) for (self.sims, 0..) |*s, g| self.oracle.recovered(@intCast(g), s.keptIndex(NODE));
+        if (!was_up and up) {
+            var kept: [MAX_GROUPS]?u64 = @splat(null);
+            for (self.sims, 0..) |*s, g| kept[g] = s.keptIndex(NODE);
+            self.oracle.recoveredAll(kept[0..self.sims.len]);
+        }
     }
 
     /// One tick of every group, the node's fate carried to all of them,
@@ -355,20 +394,30 @@ pub const Groups = struct {
 
     pub fn run(self: *Groups) !Summary {
         while (!self.sims[0].safetyDone() and !self.failed()) try self.step();
-        var converging = false;
+        // Each group converges by its own deadline, or fails as it would
+        // alone; the run goes on to the latest of them at most.
+        var deadlines: [MAX_GROUPS]u64 = @splat(0);
+        var converged_by: [MAX_GROUPS]bool = @splat(false);
         if (!self.failed()) {
-            converging = true;
             const was_up = self.sims[0].nodeUp(NODE);
-            var deadline: u64 = 0;
-            for (self.sims) |*s| deadline = @max(deadline, try s.beginConvergence());
+            var last: u64 = 0;
+            for (self.sims, 0..) |*s, g| {
+                deadlines[g] = try s.beginConvergence();
+                last = @max(last, deadlines[g]);
+            }
             try self.followFate(was_up);
             // The network heals for convergence, and so does the mailbox:
             // latency stays, losses stop.
             self.mailbox.faults.drop_percent = 0;
             self.mailbox.faults.duplicate_percent = 0;
-            while (self.now() < deadline and !self.failed()) {
+            while (self.now() < last and !self.failed()) {
                 try self.step();
-                if (self.converged()) break;
+                var all = true;
+                for (self.sims, 0..) |*s, g| {
+                    if (!converged_by[g] and self.now() <= deadlines[g] and s.isConverged()) converged_by[g] = true;
+                    all = all and converged_by[g];
+                }
+                if (all and self.drained()) break;
             }
             // Every message a sender holds was applied by now, or the run
             // fails: no channel may stall.
@@ -376,8 +425,8 @@ pub const Groups = struct {
         }
         const summaries = try self.allocator.alloc(simulator.Summary, self.sims.len);
         var ok = self.oracle.violations.items.len == 0;
-        for (self.sims, summaries) |*s, *out| {
-            out.* = s.finish(converging and s.isConverged());
+        for (self.sims, summaries, 0..) |*s, *out, g| {
+            out.* = s.finish(converged_by[g]);
             ok = ok and out.ok;
         }
         return .{
@@ -566,17 +615,62 @@ test "vopr groups: the channel oracle holds a channel to exactly once, in order"
             try testing.expectEqualStrings(c.detail, o.violations.items[0].detail);
         }
     }
-    // With nothing promised across a crash, a sender losing what was
-    // applied is no violation, and both sides start over.
+}
+
+test "vopr groups: a crash that takes a send and its apply together is no violation, whichever group is numbered first" {
+    for ([_][2]GroupId{ .{ 0, 1 }, .{ 1, 0 } }) |pair| {
+        const sender = pair[0];
+        const receiver = pair[1];
+        var o = ChannelOracle.init(testing.allocator);
+        defer o.deinit();
+        // The sender sends seq 1 at its index 7, the receiver applies it at
+        // its 3; the crash keeps the sender through 6, the receiver through 2.
+        try o.sent(sender, receiver, 1, 11, 7);
+        try o.applied(sender, receiver, 1, 11, 3);
+        var kept: [MAX_GROUPS]?u64 = @splat(null);
+        kept[sender] = 6;
+        kept[receiver] = 2;
+        o.recoveredAll(&kept);
+        try testing.expectEqual(@as(usize, 0), o.violations.items.len);
+        // Both start over: the send again, at the sender's next index.
+        try o.sent(sender, receiver, 1, 12, 7);
+        try o.applied(sender, receiver, 1, 12, 3);
+        o.finish();
+        try testing.expectEqual(@as(usize, 0), o.violations.items.len);
+    }
+}
+
+test "vopr groups: a clean restart's replay reports what was recorded, and nothing else passes for one" {
     var o = ChannelOracle.init(testing.allocator);
     defer o.deinit();
-    o.sender_loss_legal = true;
-    try o.sent(0, 1, 1, 11, 7);
+    try o.sent(0, 1, 1, 11, 4);
+    try o.sent(0, 1, 2, 12, 5);
     try o.applied(0, 1, 1, 11, 2);
-    o.recovered(0, 6);
-    try o.sent(0, 1, 1, 21, 7);
-    try o.applied(0, 1, 1, 21, 3);
+    try o.applied(0, 1, 2, 12, 3);
+    // A crash that kept everything, then replay from index 1: every report
+    // again, at the same index.
+    var kept: [MAX_GROUPS]?u64 = @splat(null);
+    kept[0] = 5;
+    kept[1] = 3;
+    o.recoveredAll(&kept);
+    try o.applied(0, 1, 1, 11, 2);
+    try o.applied(0, 1, 2, 12, 3);
+    try o.sent(0, 1, 1, 11, 4);
+    try o.sent(0, 1, 2, 12, 5);
+    try testing.expectEqual(@as(u64, 4), o.replays);
     try testing.expectEqual(@as(usize, 0), o.violations.items.len);
+    // Traffic after the restart goes on as before.
+    try o.sent(0, 1, 3, 13, 6);
+    try o.applied(0, 1, 3, 13, 4);
+    o.finish();
+    try testing.expectEqual(@as(usize, 0), o.violations.items.len);
+    // A replay that isn't what was recorded is caught: another send at a
+    // recorded seq, or a recorded message applied at another index.
+    try o.sent(0, 1, 2, 99, 5);
+    try o.applied(0, 1, 1, 11, 9);
+    try testing.expectEqual(@as(usize, 2), o.violations.items.len);
+    try testing.expectEqualStrings("a sender's seqs skipped or repeated", o.violations.items[0].detail);
+    try testing.expectEqualStrings("applied a message twice", o.violations.items[1].detail);
 }
 
 test "vopr groups: frames reach the handler only while the node is up" {
