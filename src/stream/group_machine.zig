@@ -311,7 +311,7 @@ fn reholdError(view: *View, meta: *Meta.Value, old_len: usize, new_len: usize) A
     return unhold(view, meta, old_len - new_len);
 }
 
-pub const FULL = "overloaded: group '{s}' on stream '{s}' is full: it holds {d} records (at most {d}) and {d} held bytes (at most {d}), leased, ready and dead; ack or nack them";
+pub const FULL = "overloaded: group '{s}' on stream '{s}' is full: it holds {d} records (at most {d}) and {d} held bytes (at most {d}), leased, ready and dead; ack or nack the leased ones, and delete the group or trim the stream to clear dead ones";
 pub const SHARD_FULL = "overloaded: this shard's queues and groups hold {d} held bytes, at most {d}; ack, consume or purge some";
 
 pub const BEING_REMOVED = "unavailable: this group's records from before it was deleted, or its stream was, are still being removed; retry";

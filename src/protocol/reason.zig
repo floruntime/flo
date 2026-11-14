@@ -83,10 +83,12 @@ pub const Reason = enum(u16) {
     admin_only = 30,
     /// The processing job is running: stop or cancel it first.
     job_running = 31,
-    /// The node's memory budget is spent: delete something, give the node
-    /// more memory, or raise its budget. The message names the node.
+    /// The node's memory budget is spent: delete something, or give the
+    /// node more memory. The message names the node. Defined ahead of the
+    /// check that returns it.
     memory_budget = 32,
-    /// The node holds as many actions as it registers: delete one first.
+    /// The shard holds as many actions as one shard registers, a built-in
+    /// limit: delete one first.
     too_many_actions = 33,
     /// The node holds as many workflow definitions as it keeps: delete one
     /// first. Defined ahead of the check that returns it, so clients know it.
@@ -100,8 +102,11 @@ pub const Reason = enum(u16) {
     queue_full = 36,
     /// A consumer group read took nothing new: the group holds as many
     /// records as its caps allow, or the shard's queues and groups together
-    /// do. Its consumers hold too many records they haven't acked (or it
-    /// holds dead ones): reading again won't help until they ack or nack.
+    /// do. Reading again won't help until room is made. A group's cap counts
+    /// leased, ready and dead records: leased ones leave as consumers ack or
+    /// nack, dead ones only when the group is deleted or a stream trim
+    /// passes them. The shard's cap clears as its other groups and queues
+    /// drain. The message says which cap was hit.
     group_held_full = 37,
 };
 

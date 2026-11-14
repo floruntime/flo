@@ -82,7 +82,7 @@ pub const Response = struct {
             .unavailable => "Unavailable",
             .outcome_pending => "Committed, not applied: its shard halted — do not resend it unchanged",
             .no_namespace => "Namespace not found",
-            .limit => "At a limit the node's operator sets",
+            .limit => "At a limit on what the node holds",
             _ => "Unknown error",
         };
     }
