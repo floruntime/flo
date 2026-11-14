@@ -175,7 +175,7 @@ pub const StreamHandler = struct {
         dispatcher.registerWithRoute(.stream_group_touch, group_handler.dispatchTouch, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_info, group_handler.dispatchInfo, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_pending, group_handler.dispatchPending, preRouteByStream);
-        inline for (.{ OpCode.stream_group_join, OpCode.stream_group_leave, OpCode.stream_group_claim, OpCode.stream_group_configure_sweeper }) |op|
+        inline for (group_handler.REMOVED) |op|
             dispatcher.registerWithRoute(op, group_handler.dispatchRemoved, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_list, table_run.handler("stream.group.list", StreamHandler, runGroupList), preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_members, table_run.handler("stream.group.members", StreamHandler, runGroupMembers), preRouteByStream);
@@ -1335,7 +1335,7 @@ pub const StreamHandler = struct {
 
     /// Append payload to a named stream (used by processing pipelines).
     /// Wraps the payload in batch format for consistency with all other appends.
-    pub fn appendPayloadToStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, payload: []const u8) !void {
+    pub fn appendPayloadToStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, payload: []const u8) !persistence_mod.ProposeResult {
         // Wrap raw payload in batch format: [count:u32][payload_len:u32][payload][header_count:u16]
         const batch_size = 4 + 4 + payload.len + 2;
         const batch_buf = try self.allocator.alloc(u8, batch_size);
@@ -1356,7 +1356,7 @@ pub const StreamHandler = struct {
         defer self.allocator.free(stored_value);
         // The applier registers the stream's name; the caller proposed the
         // namespace's implicit create first where it could.
-        _ = try persistence_mod.proposeEntry(shard, .stream_append, entry_mod.Flags.NONE, namespace, stream_name, stored_value);
+        return persistence_mod.proposeEntry(shard, .stream_append, entry_mod.Flags.SINK, namespace, stream_name, stored_value);
     }
 
     /// Read payloads from a named stream (used by processing pipelines).

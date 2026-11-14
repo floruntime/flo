@@ -20,9 +20,12 @@
 //!   `[term:u64][index:u64][expires_at_ms:i64][count:u32]` then each record
 //!   as a stream read gives it, followed by `[deliveries:u32]`.
 //! - ack, touch `[group][consumer][term:u64][index:u64][count:u32]`
-//!   `([ms:u64][seq:u64][deliveries:u32])*`; nack the same, with options
-//!   delay_ms, dead, error. Answer `[applied:u32][refused:u32]`
-//!   `([ms:u64][seq:u64][why:u8])*`, a touch's after `[expires_at_ms:i64]`.
+//!   `([ms:u64][seq:u64][deliveries:u32])*`; nack the same, then
+//!   `[error_len:u16][error]` (at most 1024 bytes, 0 for none), with options
+//!   delay_ms, dead, or abandon alone: handed back unstarted, ready at once,
+//!   the delivery counted but no failure. Answer `[applied:u32][refused:u32]`
+//!   `([ms:u64][seq:u64][why:u8])*`; a touch's leads with
+//!   `[expires_at_ms:i64]`. A group that isn't there is refused not_found.
 //! - info `[group]`. Answer `[pending:u64][holders:u32][created_at_ns:u64]`
 //!   `[ready:u64][leased:u64][dead:u64][trimmed_pending:u64]`: the records
 //!   out and waiting, then by state; those at or below a trim, cleanup not
@@ -261,6 +264,10 @@ fn check(shard: *Shard, conn: *Connection, req: Request) bool {
 }
 
 // ── Removed ops ─────────────────────────────────────────────────────────
+
+/// Ops groups no longer have. Each is refused naming what replaces it,
+/// whatever namespace it names: no namespace need exist to say so.
+pub const REMOVED = [_]proto.OpCode{ .stream_group_join, .stream_group_leave, .stream_group_claim, .stream_group_configure_sweeper };
 
 /// An op groups no longer have: refused, naming what replaces it.
 pub fn dispatchRemoved(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -534,7 +541,8 @@ fn freeUnread(shard: *Shard, p: *const ge.Deliver.Value, e: *const Entry, expiry
         };
         if (count == 0) continue;
         const free = kind == .fetching;
-        _ = propose(shard, .group_release, ge.Release.Value{ .ns = p.ns, .stream = p.stream, .group = p.group, .holder = p.holder, .token = .{ .term = e.header.term, .index = e.header.index }, .expiry_ns = expiry, .items = .{ .bytes = buf[0..w], .count = count }, .delay_ms = 0, .dead = false, .@"error" = if (free) "" else LOST, .free = free }) catch {};
+        const ended: ge.HandBack = if (free) .unread else .failed;
+        _ = propose(shard, .group_release, ge.Release.Value{ .ns = p.ns, .stream = p.stream, .group = p.group, .holder = p.holder, .token = .{ .term = e.header.term, .index = e.header.index }, .expiry_ns = expiry, .items = .{ .bytes = buf[0..w], .count = count }, .delay_ms = 0, .dead = false, .@"error" = if (free) "" else LOST, .ended = ended }) catch {};
     }
 }
 
@@ -626,9 +634,15 @@ fn report(shard: *Shard, conn: *Connection, req: Request, kind: Report) void {
         .nack => blk: {
             const delay: u64 = if (req.findOption(.delay_ms)) |o| o.asU64() orelse return refuse(shard, conn, req.header.request_id, .bad_request, "bad request: delay_ms is a u64") else 0;
             if (delay > ge.MAX_DELAY_MS) return refuse(shard, conn, req.header.request_id, .bad_request, "bad request: delay_ms is at most 86400000 (a day)");
-            const text = if (req.findOption(.error_text)) |o| o.asString() else "";
+            // Its error in the body: an option's length is one byte.
+            const text = n.rest.readLengthPrefixed(u16) orelse return refuse(shard, conn, req.header.request_id, .bad_request, "bad request: a nack ends with its error, [error_len:u16][error], 0 for none");
             if (text.len > ge.MAX_ERROR) return refuse(shard, conn, req.header.request_id, .bad_request, "bad request: an error is at most 1024 bytes");
-            break :blk propose(shard, .group_release, ge.Release.Value{ .ns = req.ns_id.int(), .stream = req.key, .group = n.group, .holder = consumer, .token = token, .expiry_ns = expiry, .items = parsed.items, .delay_ms = delay, .dead = req.findOption(.dead) != null, .@"error" = text, .free = false });
+            const dead = req.findOption(.dead) != null;
+            // Handed back unstarted: no failure, so nothing a failure takes.
+            const abandon = req.findOption(.abandon) != null;
+            if (abandon and (dead or delay > 0 or text.len > 0))
+                return refuse(shard, conn, req.header.request_id, .bad_request, "bad request: abandon hands records back unstarted, so it takes no dead, delay_ms or error");
+            break :blk propose(shard, .group_release, ge.Release.Value{ .ns = req.ns_id.int(), .stream = req.key, .group = n.group, .holder = consumer, .token = token, .expiry_ns = expiry, .items = parsed.items, .delay_ms = delay, .dead = dead, .@"error" = text, .ended = if (abandon) .abandoned else .failed });
         },
         .touch => blk: {
             const l = parsed.lease orelse Item{ .scope = "", .status = .ready, .due_ns = 0, .deliveries = 0, .failures = 0, .holder = "", .request_key = null, .token = token, .lease_ms = ae.MIN_LEASE_MS, .delivered_ns = 0, .expiry_ns = 0, .ended = .none, .started_ns = 0, .@"error" = "", .dead_ns = 0 };

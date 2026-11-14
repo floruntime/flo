@@ -123,8 +123,8 @@ pub const EntryType = enum(u8) {
 
     // ── Namespace ──
     namespace_create = 0x60,
-    // 0x61 and 0x62 were a namespace delete and settings, never written; retired.
-    namespace_bind = 0x63,
+    // 0x61 and 0x62 were a namespace delete and settings, never written;
+    // 0x63 was another shard's bind of a name to its id. Retired.
 
     // ── Actions ──
     action_register = 0x70,
@@ -149,7 +149,7 @@ pub const EntryType = enum(u8) {
     pub fn hasKeyValue(self: EntryType) bool {
         return switch (self) {
             .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch => false,
-            .namespace_create, .namespace_bind => false,
+            .namespace_create => false,
             .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => false,
             .stream_append, .stream_trim, .stream_delete, .stream_config => true,
             .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge => false,
@@ -175,6 +175,17 @@ pub const Flags = struct {
     pub const TOMBSTONE: u16 = 1 << 3;
     /// A stream delete given `--force`: it drops the stream whatever it holds.
     pub const FORCE: u16 = 1 << 4;
+    /// Written by a processing pipeline's sink. Refused at apply, it is a
+    /// record lost to that sink: the leader applying it counts it dropped
+    /// unless the pipeline that proposed it, on this shard, reads it again.
+    /// Best effort around leader changes: one applied after the term has
+    /// moved on is not counted.
+    pub const SINK: u16 = 1 << 5;
+    /// A workflow create whose trigger names its workflow's own namespace,
+    /// as the leader that proposed it read the request: every replica reads
+    /// the trigger's stream as the workflow's own, whether or not its
+    /// namespace table has the name yet.
+    pub const OWN_NAMESPACE: u16 = 1 << 6;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════

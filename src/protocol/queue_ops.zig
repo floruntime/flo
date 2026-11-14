@@ -19,7 +19,7 @@ pub const MAX_PEEK_PAYLOAD: u32 = 4096;
 pub const Peeked = Record(&.{
     .{ .name = "seq", .T = Int(u64) },
     .{ .name = "priority", .T = Int(u32) },
-    .{ .name = "attempts", .T = Int(u32) },
+    .{ .name = "deliveries", .T = Int(u32) },
     .{ .name = "enqueued_at_ms", .T = Int(i64) },
     .{ .name = "size", .T = Int(u32) },
     .{ .name = "payload", .T = Bytes(MAX_PEEK_PAYLOAD) },

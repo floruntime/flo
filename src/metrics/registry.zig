@@ -294,6 +294,10 @@ pub const ProcessingMetrics = struct {
     errors_total: Atomic(u64) = Atomic(u64).init(0),
     /// Pipeline ticks stopped because a sink's shard was full.
     ticks_held_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Sink writes proposed and not yet applied, on every shard.
+    sink_pending: Atomic(u64) = Atomic(u64).init(0),
+    /// Sink writes refused for room at apply, their records read again.
+    sink_rewinds_total: Atomic(u64) = Atomic(u64).init(0),
 
     pub fn init() ProcessingMetrics {
         return .{};
@@ -342,6 +346,15 @@ pub const ProcessingMetrics = struct {
         _ = self.ticks_held_total.fetchAdd(1, .monotonic);
     }
 
+    /// A shard's pending sink writes moved from `was` to `now`.
+    pub fn moveSinkPending(self: *ProcessingMetrics, was: usize, now: usize) void {
+        if (now > was) _ = self.sink_pending.fetchAdd(now - was, .monotonic) else _ = self.sink_pending.fetchSub(was - now, .monotonic);
+    }
+
+    pub fn recordSinkRewind(self: *ProcessingMetrics) void {
+        _ = self.sink_rewinds_total.fetchAdd(1, .monotonic);
+    }
+
     pub const Snapshot = struct {
         active_jobs: u64,
         jobs_submitted_total: u64,
@@ -353,6 +366,8 @@ pub const ProcessingMetrics = struct {
         checkpoints_completed_total: u64,
         errors_total: u64,
         ticks_held_total: u64,
+        sink_pending: u64,
+        sink_rewinds_total: u64,
     };
 
     pub fn snapshot(self: *const ProcessingMetrics) Snapshot {
@@ -367,6 +382,8 @@ pub const ProcessingMetrics = struct {
             .checkpoints_completed_total = self.checkpoints_completed_total.load(.monotonic),
             .errors_total = self.errors_total.load(.monotonic),
             .ticks_held_total = self.ticks_held_total.load(.monotonic),
+            .sink_pending = self.sink_pending.load(.monotonic),
+            .sink_rewinds_total = self.sink_rewinds_total.load(.monotonic),
         };
     }
 };
@@ -461,6 +478,10 @@ pub const ServerMetrics = struct {
     /// settings: the leader that proposed them has different ones, and
     /// governs. Nonzero means the nodes' settings differ.
     queue_cap_mismatch_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Namespace ids other shards hold data under that shard 0's log has no
+    /// create for (a lost log tail): that data is out of reach. /status
+    /// lists them.
+    namespace_ids_unknown: Atomic(u64) = Atomic(u64).init(0),
     /// Server start timestamp (ms)
     start_time_ms: i64,
 
@@ -524,6 +545,7 @@ pub const ServerMetrics = struct {
         client_version_refused: u64,
         connections_rejected_total: u64,
         queue_cap_mismatch_total: u64,
+        namespace_ids_unknown: u64,
         uptime_seconds: u64,
     };
 
@@ -537,6 +559,7 @@ pub const ServerMetrics = struct {
             .client_version_refused = self.client_version_refused.load(.monotonic),
             .connections_rejected_total = self.connections_rejected_total.load(.monotonic),
             .queue_cap_mismatch_total = self.queue_cap_mismatch_total.load(.monotonic),
+            .namespace_ids_unknown = self.namespace_ids_unknown.load(.monotonic),
             .uptime_seconds = self.uptimeSeconds(),
         };
     }
@@ -1445,6 +1468,10 @@ fn writeServerMetrics(writer: anytype, snapshot: ServerMetrics.Snapshot) !void {
     try writer.print("# TYPE flo_queue_cap_mismatch_total counter\n", .{});
     try writer.print("flo_queue_cap_mismatch_total {d}\n", .{snapshot.queue_cap_mismatch_total});
 
+    try writer.print("# HELP flo_namespace_ids_unknown Namespace ids other shards hold data under that shard 0's log has no create for; /status lists them\n", .{});
+    try writer.print("# TYPE flo_namespace_ids_unknown gauge\n", .{});
+    try writer.print("flo_namespace_ids_unknown {d}\n", .{snapshot.namespace_ids_unknown});
+
     // Uptime
     try writer.print("# HELP flo_uptime_seconds Server uptime in seconds\n", .{});
     try writer.print("# TYPE flo_uptime_seconds gauge\n", .{});
@@ -1638,6 +1665,12 @@ fn writeProcessingMetrics(writer: anytype, snapshot: ProcessingMetrics.Snapshot)
     try writer.print("# HELP flo_processing_ticks_held_total Pipeline ticks stopped because a sink's shard was full\n", .{});
     try writer.print("# TYPE flo_processing_ticks_held_total counter\n", .{});
     try writer.print("flo_processing_ticks_held_total {d}\n", .{snapshot.ticks_held_total});
+    try writer.print("# HELP flo_processing_sink_pending Sink writes proposed and not yet applied\n", .{});
+    try writer.print("# TYPE flo_processing_sink_pending gauge\n", .{});
+    try writer.print("flo_processing_sink_pending {d}\n", .{snapshot.sink_pending});
+    try writer.print("# HELP flo_processing_sink_rewinds_total Sink writes refused for room at apply, their records read again\n", .{});
+    try writer.print("# TYPE flo_processing_sink_rewinds_total counter\n", .{});
+    try writer.print("flo_processing_sink_rewinds_total {d}\n", .{snapshot.sink_rewinds_total});
 }
 
 /// Write replication metrics in Prometheus format

@@ -99,10 +99,11 @@ fn readOf(shard: *Shard) ReadView {
 }
 
 /// The name of namespace `ns`, as the node's table has it or, on shard 0
-/// before it publishes a create, as this shard does: for what a client
+/// before it publishes a create, as its own log does: for what a client
 /// reads, never for a key.
 fn namespaceName(shard: *Shard, ns: NamespaceId) ?[]const u8 {
-    return shard.namespace_handler.table.nameOf(ns) orelse shard.namespace_handler.nameOf(ns);
+    const nh = shard.namespace_handler;
+    return nh.table.nameOf(ns) orelse nh.createdName(ns);
 }
 
 fn nsToMs(ns: u64) i64 {

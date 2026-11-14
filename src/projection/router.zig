@@ -227,7 +227,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         // Registry-owned: applied by the owning handler's callback, never by
         // this router (Shard.assertOneApplier enforces it).
         .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step_started => .none,
-        .namespace_create, .namespace_bind => .none,
+        .namespace_create => .none,
         // Actions: their contract machine (actions/machine.zig).
         .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => .none,
         .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint, .processing_remove => .none,

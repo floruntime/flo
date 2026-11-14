@@ -193,8 +193,8 @@ pub const WorkflowHandler = struct {
     /// Cleared by the shard while it applies entries replicated from a peer:
     /// those producers run on the node that owns the definition.
     install_producers: bool = true,
-    /// This shard's namespaces, as its applied entries bind them: what an
-    /// applier reads a namespace's name from, the same on every replica.
+    /// This shard's namespace handler, whose table an applier reads a
+    /// namespace's name from.
     namespaces: ?*const NamespaceHandler = null,
 
     /// Active interval/cron schedules, by their definitions' keys.
@@ -784,7 +784,13 @@ pub const WorkflowHandler = struct {
         // The applier stores the definition and (re)registers its trigger
         // and schedule from the entry; the same applier runs at boot, so a
         // restart keeps them too.
-        const proposed = self.proposeCreate(shard, req.ns_id, name, yaml) catch |err| {
+        // Whether the trigger names the workflow's own namespace is decided
+        // here, where the name is the request's, and logged with the entry:
+        // a replica applying it may not have the name in its table yet (a
+        // replay at boot, before shard 0 publishes), and must read the same
+        // stream as the leader.
+        const own_ns = if (def.trigger) |t| if (t.namespace) |n| std.mem.eql(u8, n, if (req.namespace.len == 0) "default" else req.namespace) else false else false;
+        const proposed = self.proposeCreate(shard, req.ns_id, name, yaml, if (own_ns) entry_mod.Flags.OWN_NAMESPACE else entry_mod.Flags.NONE) catch |err| {
             shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "workflow not persisted"));
             return null;
         };
@@ -3292,11 +3298,15 @@ pub const WorkflowHandler = struct {
 
     /// The namespace a trigger names for its stream, or null when that is
     /// the workflow's own: named, empty or left out, all three read the same
-    /// stream, so a redefinition moving between them keeps its cursor.
+    /// stream, so a redefinition moving between them keeps its cursor. The
+    /// own name is read from the node's table by id; a create entry whose
+    /// leader found its trigger naming its own namespace says so itself
+    /// (`Flags.OWN_NAMESPACE`), so a replica whose table lacks the name
+    /// yet resolves it alike.
     fn otherStreamNamespace(self: *const WorkflowHandler, ns: NamespaceId, named: ?[]const u8) ?[]const u8 {
         const name = named orelse return null;
         if (name.len == 0) return null;
-        const own = if (self.namespaces) |h| h.nameOf(ns) orelse h.table.nameOf(ns) else null;
+        const own = if (self.namespaces) |h| h.table.nameOf(ns) else null;
         if (own) |o| if (std.mem.eql(u8, o, name)) return null;
         return name;
     }
@@ -3813,11 +3823,11 @@ pub const WorkflowHandler = struct {
 
     /// Persist a workflow_create entry to the UAL so the definition survives
     /// restart, keyed as the definitions map keys it.
-    fn proposeCreate(self: *WorkflowHandler, shard: *Shard, ns: NamespaceId, name: []const u8, yaml: []const u8) !persistence_mod.ProposeResult {
+    fn proposeCreate(self: *WorkflowHandler, shard: *Shard, ns: NamespaceId, name: []const u8, yaml: []const u8, flags: u16) !persistence_mod.ProposeResult {
         _ = self;
         var key_buf: [MAX_START_KEY]u8 = undefined;
         if (KEY_PREFIX + name.len > key_buf.len) return error.KeyTooLarge;
-        return persistence_mod.proposeEntryIn(shard, .workflow_create, entry_mod.Flags.NONE, ns, writeKey(&key_buf, ns, name), yaml);
+        return persistence_mod.proposeEntryIn(shard, .workflow_create, flags, ns, writeKey(&key_buf, ns, name), yaml);
     }
 
     /// Start a run for a producer (a schedule, a trigger, a parent run):
@@ -4105,7 +4115,7 @@ pub const WorkflowHandler = struct {
         if (cmd.key.len < KEY_PREFIX or keyNamespace(cmd.key) != cmd.namespace_id) return error.Halt;
 
         return switch (etype) {
-            .workflow_create => self.replayCreate(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / 1_000_000), out),
+            .workflow_create => self.replayCreate(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / 1_000_000), entry.header.flags, out),
             .workflow_start => self.replayStart(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
             .workflow_enabled => self.replayEnabled(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
             .workflow_step_started => self.replayStepStarted(cmd.key, cmd.value, out),
@@ -4115,7 +4125,7 @@ pub const WorkflowHandler = struct {
     }
 
     /// Apply a workflow_create entry, keyed by the definition's key.
-    fn replayCreate(self: *WorkflowHandler, ns_key_raw: []const u8, yaml: []const u8, created_at_ms: i64, out: *Result) persistence_mod.ApplyError!void {
+    fn replayCreate(self: *WorkflowHandler, ns_key_raw: []const u8, yaml: []const u8, created_at_ms: i64, flags: u16, out: *Result) persistence_mod.ApplyError!void {
         const ns = keyNamespace(ns_key_raw);
         const raw_name = keyName(ns_key_raw);
         out.putBytes(raw_name);
@@ -4168,7 +4178,9 @@ pub const WorkflowHandler = struct {
         // them here so a restart keeps them and a redefinition without one
         // drops it.
         if (!self.install_producers) return;
-        if (def.trigger) |trigger| {
+        if (def.trigger) |named| {
+            var trigger = named;
+            if (flags & entry_mod.Flags.OWN_NAMESPACE != 0) trigger.namespace = null;
             self.registerStreamTrigger(ns, raw_name, trigger);
         } else {
             self.unregisterStreamTrigger(ns, raw_name);
@@ -4634,6 +4646,33 @@ test "workflow handler: a re-created trigger naming its own namespace, or none, 
     try testing.expectEqualStrings("team-b", handler.stream_triggers.getPtr(key).?.stream_namespace_owned.?);
 }
 
+test "workflow handler: a create entry saying its trigger names its own namespace reads the own stream where the table lacks the name" {
+    const allocator = testing.allocator;
+    // Another shard's handler, before shard 0 publishes anything: as at
+    // replay during boot.
+    var namespaces = try NamespaceHandler.initFor(allocator, 1, null);
+    defer namespaces.deinit();
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    handler.namespaces = &namespaces;
+    const head = "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1\",\"trigger\":{\"stream\":\"events\",\"batch_size\":4";
+    const tail = "},\"start\":{\"run\":\"@actions/a\",\"transitions\":{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}";
+    var out: Result = .{};
+    const key = handler.nsKey(TEST_NS_A, "wf").?;
+    defer allocator.free(key);
+
+    try handler.replayCreate(testKey(TEST_NS_A, "wf"), head ++ tail, 1, 0, &out);
+    handler.stream_triggers.getPtr(key).?.stream_cursor_ts = 1700;
+    // Named, as the workflow's own: the entry says so, and the cursor stays.
+    try handler.replayCreate(testKey(TEST_NS_A, "wf"), head ++ ",\"namespace\":\"team-a\"" ++ tail, 2, entry_mod.Flags.OWN_NAMESPACE, &out);
+    try testing.expect(handler.stream_triggers.getPtr(key).?.stream_namespace_owned == null);
+    try testing.expectEqual(@as(u64, 1700), handler.stream_triggers.getPtr(key).?.stream_cursor_ts);
+    // Named, and not its own: another stream, read from its start.
+    try handler.replayCreate(testKey(TEST_NS_A, "wf"), head ++ ",\"namespace\":\"team-b\"" ++ tail, 3, 0, &out);
+    try testing.expectEqualStrings("team-b", handler.stream_triggers.getPtr(key).?.stream_namespace_owned.?);
+    try testing.expectEqual(@as(u64, 0), handler.stream_triggers.getPtr(key).?.stream_cursor_ts);
+}
+
 // ── Step Executor Tests ─────────────────────────────────────────────────
 
 /// Minimal 2-step workflow: start → step_b → flo.Completed
@@ -4791,6 +4830,10 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     const namespaces = try std.testing.allocator.create(NamespaceHandler);
     namespaces.* = try NamespaceHandler.init(std.testing.allocator);
     shard.namespace_handler = namespaces;
+    // Its sink bookkeeping sees every KV and stream entry that applies.
+    const processing = try std.testing.allocator.create(@import("../processing/handler.zig").ProcessingHandler);
+    processing.* = @import("../processing/handler.zig").ProcessingHandler.init(std.testing.allocator);
+    shard.processing_handler = processing;
     return shard;
 }
 
@@ -4807,6 +4850,8 @@ fn destroyTestShard(shard: *Shard) void {
     std.testing.allocator.free(shard.pending);
     shard.namespace_handler.deinit();
     std.testing.allocator.destroy(shard.namespace_handler);
+    shard.processing_handler.deinit();
+    std.testing.allocator.destroy(shard.processing_handler);
 }
 
 fn createTestRun(handler: *WorkflowHandler, ns_key: []const u8, run_id: []const u8, wf_name: []const u8) void {
@@ -5820,7 +5865,7 @@ test "workflow schedule: enabled again, slots count from the enable, and those m
         \\    type: never
         \\  transitions:
         \\    success: flo.Completed
-    , 1000, &out);
+    , 1000, 0, &out);
     const s = handler.schedules.getPtr(testKey(TEST_NS_A, "wf")).?;
     try testing.expectEqual(@as(?i64, 4000), WorkflowHandler.dueSlot(s, 4999));
 
@@ -5850,7 +5895,7 @@ test "workflow start: a disable committed ahead refuses a client or schedule sta
         \\    type: never
         \\  transitions:
         \\    success: flo.Completed
-    , 1000, &out);
+    , 1000, 0, &out);
     const sched = handler.schedules.getPtr(testKey(TEST_NS_A, "wf")).?;
     const fired_before = sched.fired_ms;
 
@@ -5898,7 +5943,7 @@ test "workflow start: a redefinition that requires a key, committed ahead, refus
         \\    type: never
         \\  transitions:
         \\    success: flo.Completed
-    , 1000, &out);
+    , 1000, 0, &out);
     var buf: [256]u8 = undefined;
     out = .{};
     try handler.replayStart(testKey(TEST_NS_A, "r1"), startValue(&buf, "wf", "workflow_started", ""), 2000, &out);
@@ -6629,8 +6674,8 @@ test "workflow replay: a redefinition that won't parse halts and keeps the defin
         \\    failure: flo.Failed
     ;
     var out: Result = .{};
-    try handler.replayCreate(testKey(.default, "wf"), yaml, 1, &out);
-    try testing.expectError(error.Halt, handler.replayCreate(testKey(.default, "wf"), "kind: [", 2, &out));
+    try handler.replayCreate(testKey(.default, "wf"), yaml, 1, 0, &out);
+    try testing.expectError(error.Halt, handler.replayCreate(testKey(.default, "wf"), "kind: [", 2, 0, &out));
     const def = handler.definitions.get(testKey(.default, "wf")) orelse return error.DefinitionDropped;
     try testing.expectEqualStrings("1", def.version_owned);
     try testing.expectEqual(@as(usize, 1), handler.definitions.count());

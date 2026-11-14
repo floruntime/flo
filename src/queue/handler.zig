@@ -96,12 +96,16 @@ fn nsToMs(ns: u64) i64 {
 
 /// Propose a queue entry, encoded in the shard's entry buffer when it fits.
 fn propose(shard: *Shard, comptime etype: EntryType, body: anytype) !persistence_mod.ProposeResult {
+    return proposeFlagged(shard, etype, entry_mod.Flags.NONE, body);
+}
+
+fn proposeFlagged(shard: *Shard, comptime etype: EntryType, flags: u16, body: anytype) !persistence_mod.ProposeResult {
     const P = qe.Payload(@backingInt(etype));
     const size = try P.encodedSize(body);
-    if (size <= shard.entry_buf.len) return shard.raft_node.propose(etype, entry_mod.Flags.NONE, try P.encodeInto(shard.entry_buf[0..size], body));
+    if (size <= shard.entry_buf.len) return shard.raft_node.propose(etype, flags, try P.encodeInto(shard.entry_buf[0..size], body));
     const buf = try shard.allocator.alloc(u8, size);
     defer shard.allocator.free(buf);
-    return shard.raft_node.propose(etype, entry_mod.Flags.NONE, try P.encodeInto(buf, body));
+    return shard.raft_node.propose(etype, flags, try P.encodeInto(buf, body));
 }
 
 /// A queue's meta, if it is `name`'s (another name may hash the same).
@@ -117,6 +121,20 @@ pub fn msgOf(shard: *Shard, ns: NamespaceId, hash: [8]u8, seq: u64) ?Msg {
     const id = machine.idOf(hash, seq);
     const got = (readOf(shard).get(machine.Msgs, machine.storeKey(&b, ns, &id)) catch return null) orelse return null;
     return got.v;
+}
+
+/// Whether a sink's enqueue of `payload_len` bytes to `name` fits the caps
+/// its entry would carry, counting `msgs` messages and `bytes` held bytes
+/// the sink proposed there and not yet applied. Past them it would be
+/// refused at apply, after the sink had moved past its record.
+pub fn sinkWouldFit(caps: Caps, shard: *Shard, ns: NamespaceId, name: []const u8, payload_len: usize, msgs: u64, bytes: u64) bool {
+    const size = machine.heldBy(payload_len, 0);
+    if (metaOf(shard, ns, name)) |m| {
+        if (m.ready + m.leased + m.dead + msgs + 1 > caps.max_messages) return false;
+        if (m.held_bytes + bytes + size > caps.max_bytes) return false;
+    } else if (msgs + 1 > caps.max_messages or bytes + size > caps.max_bytes) return false;
+    const shard_held = if (readOf(shard).get(machine.Helds, machine.HELD_KEY) catch null) |h| h.v.bytes else 0;
+    return shard_held + bytes + size <= caps.shard_held_bytes;
 }
 
 /// The messages a queue holds, ready, leased and dead.
@@ -401,7 +419,7 @@ pub const QueueHandler = struct {
         if (req.key.len == 0 and op != .queue_list) return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
         const shard: *Shard = @ptrCast(@alignCast(self.shard_ptr orelse return .{ .err = .{ .code = .internal_error, .message = "queue handler has no shard" } }));
         return switch (op) {
-            .queue_enqueue => self.handleEnqueue(shard, req),
+            .queue_enqueue => self.handleEnqueue(shard, req, entry_mod.Flags.NONE),
             .queue_stats => self.handleStats(shard, req),
             .queue_dlq_list => self.handleDlqList(shard, req),
             .queue_dlq_requeue => .{ .err = .{ .code = .invalid_request, .message = "dlq requeue not yet implemented" } },
@@ -416,10 +434,10 @@ pub const QueueHandler = struct {
     /// enqueue does.
     pub fn sinkEnqueue(self: *QueueHandler, req: Request) CommandResult {
         const shard: *Shard = @ptrCast(@alignCast(self.shard_ptr orelse return .{ .err = .{ .code = .internal_error, .message = "queue handler has no shard" } }));
-        return self.handleEnqueue(shard, req);
+        return self.handleEnqueue(shard, req, entry_mod.Flags.SINK);
     }
 
-    fn handleEnqueue(self: *QueueHandler, shard: *Shard, req: Request) CommandResult {
+    fn handleEnqueue(self: *QueueHandler, shard: *Shard, req: Request, flags: u16) CommandResult {
         if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
         if (req.value.len > qe.MAX_MESSAGE) return .{ .err = .{ .code = .invalid_request, .message = "message too large: a queue message holds at most 64 KiB" } };
         if (req.key.len > qe.QueueName.max_size) return .{ .err = .{ .code = .invalid_request, .message = "queue name too long" } };
@@ -431,7 +449,7 @@ pub const QueueHandler = struct {
         // published, or on shard 0 proposed ahead of this write.
         const ns = shard.namespaceId(req.namespace);
         if (ns == .invalid) return .{ .err = persistence_mod.failureError(error.NamespaceUnknown, "enqueue not persisted") };
-        const proposed = propose(shard, .queue_enqueue, enqueueValue(self.caps, ns, req.key, priority, delay_ms, req.value)) catch |err| {
+        const proposed = proposeFlagged(shard, .queue_enqueue, flags, enqueueValue(self.caps, ns, req.key, priority, delay_ms, req.value)) catch |err| {
             return .{ .err = persistence_mod.failureError(err, "enqueue not persisted") };
         };
         return .{ .parked = proposed };
@@ -450,7 +468,7 @@ pub const QueueHandler = struct {
 
     /// A page of a queue's dead letters, oldest first:
     ///   [count:u32] ([seq:u64][size:u32][len:u32][payload][enqueued_at_ms:i64]
-    ///                [attempts:u32][priority:u8][moved_at_ms:i64])*
+    ///                [deliveries:u32][priority:u8][moved_at_ms:i64])*
     ///   [total:u64][has_more:u8][last_seq:u64]
     /// `[limit:u32][after:u64]?` picks the page: up to 100, after the dead
     /// letter whose seq ends the page before, or from the oldest if that one
@@ -598,7 +616,7 @@ pub const QueueHandler = struct {
                 const added = out.add(.{
                     .seq = seq,
                     .priority = m.priority,
-                    .attempts = m.deliveries,
+                    .deliveries = m.deliveries,
                     .enqueued_at_ms = nsToMs(m.enqueued_ns),
                     .size = @intCast(m.payload.len),
                     .payload = shown,
@@ -787,9 +805,13 @@ pub const QueueHandler = struct {
         shard.deliverDeferred(a.reply_to, if (result.refused() != null) a.leased else a.answer);
     }
 
+    /// Metered under the namespace's name as the node's table has it, or
+    /// on shard 0 its own log; one another shard's table doesn't have yet
+    /// is not metered rather than mislabelled.
     fn recordDequeue(self: *QueueHandler, shard: *Shard, ns: NamespaceId, name: []const u8, n: usize, bytes: usize) void {
         const mr = self.metrics_registry orelse return;
-        const namespace = shard.namespace_handler.nameOf(ns) orelse return;
+        const nh = shard.namespace_handler;
+        const namespace = nh.table.nameOf(ns) orelse nh.createdName(ns) orelse return;
         const qm = mr.registerQueue(namespace, name) catch return;
         if (n == 0) qm.recordEmptyDequeue() else qm.recordDequeue(n, bytes);
     }
