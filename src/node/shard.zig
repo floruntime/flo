@@ -82,6 +82,9 @@ const ge_mod = @import("../protocol/group_entries.zig");
 const group_handler = @import("../stream/group_handler.zig");
 const contract_machine = @import("../contract/machine.zig");
 const contract_machines = @import("../contract/machines.zig");
+const channel_driver = @import("../contract/channel_driver.zig");
+const channels_mod = @import("../contract/channels.zig");
+const kv_machine = @import("../kv/machine.zig");
 const repair = @import("repair.zig");
 const Scratch = @import("scratch.zig").Scratch;
 const health_mod = @import("health.zig");
@@ -550,6 +553,11 @@ pub const Shard = struct {
     /// publish the elapsed duration computed from it, not this raw reading, so a
     /// reader and Prometheus see a plain "failing for N ms".
     flushes_failing_since_ms: u64 = 0,
+    /// Under `async_flush`, the last index a flush put on disk: what channels
+    /// deliver against there (`channelDurable`).
+    flushed_index: u64 = 0,
+    /// This shard's side of its channels, while it leads.
+    channel: channel_driver.Driver,
 
     /// Where the Raft node persists its term and vote (null if ephemeral).
     hard_state_store: ?*HardStateStore,
@@ -833,6 +841,9 @@ pub const Shard = struct {
         errdefer partition.deinit();
         partition.wireProjections();
         partitions[0] = partition;
+        // A send's receiver is the shard owning its slot, fixed for the data
+        // directory: every replica derives the same one.
+        partition.store.place = .{ .group = shard_id, .count = shard_count };
 
         // Create handlers pointing at the default partition's projections
         const kv_handler = try allocator.create(KVHandler);
@@ -1212,6 +1223,9 @@ pub const Shard = struct {
             .dispatcher = dispatcher,
             .connections = .{},
             .router = Router.init(shard_count, shard_id),
+            .channel = channel_driver.Driver.init(allocator, shard_id, shard_count),
+            // Everything replay put in the log came from disk.
+            .flushed_index = raft_node.log.lastIndex(),
             .slab = slab,
             .acceptor_pipe_rd = acceptor_pipe_rd,
             .stop_requested = .init(false),
@@ -1337,9 +1351,74 @@ pub const Shard = struct {
     pub fn flushSegmentToDisk(self: *Shard) !void {
         const dl = self.durable_log orelse return;
         try self.rebufferGap(dl.writer);
+        const tip = dl.writer.last_index;
         try dl.flush(self.raft_node.commit_index);
         // Flushes are reaching disk again: end the failing run.
         self.flushes_failing_since_ms = 0;
+        self.flushed_index = @max(self.flushed_index, tip);
+    }
+
+    /// The highest index this shard's crash can't lose: what a channel
+    /// delivers through. One replica's own: under `sync` what it fsynced,
+    /// under `async_flush` what its last flush wrote, and with no data
+    /// directory what it applied, since such a shard keeps nothing anyway.
+    pub fn channelDurable(self: *const Shard) u64 {
+        if (self.durable_log == null) return self.raft_node.last_applied;
+        return switch (self.durability) {
+            .sync => self.raft_node.durable_index,
+            .async_flush => self.flushed_index,
+        };
+    }
+
+    /// How the channel driver reaches this shard's peers and log.
+    const ChannelIo = struct {
+        shard: *Shard,
+
+        pub fn sendFrame(io: ChannelIo, to: u16, bytes: []const u8) bool {
+            const s = io.shard;
+            const mb = if (to == s.id) s.mailbox else blk: {
+                const all = s.peer_mailboxes orelse return false;
+                if (to >= all.len) return false;
+                break :blk all[to];
+            };
+            const owned = s.allocator.dupe(u8, bytes) catch return false;
+            // A full ring drops the frame: the protocol resends.
+            if (mb.inbox.send(.{ .tag = .channel, .src_shard = @intCast(s.id), .payload_len = @intCast(owned.len), .payload_ptr = owned.ptr })) return true;
+            s.allocator.free(owned);
+            return false;
+        }
+
+        pub fn propose(io: ChannelIo, etype: entry_mod.EntryType, payload: []const u8) bool {
+            if (io.shard.halted != null) return false;
+            _ = io.shard.raft_node.propose(etype, entry_mod.Flags.NONE, payload) catch return false;
+            return true;
+        }
+    };
+
+    /// The channel driver's memory is a term's: a new one starts over.
+    fn channelTerm(self: *Shard) void {
+        if (self.channel.term != self.raft_node.current_term) self.channel.reset(self.raft_node.current_term);
+    }
+
+    /// Delivery, resends, trims and acks, on a leader. Inert with no channel
+    /// traffic: two counts and nothing else.
+    fn tickChannels(self: *Shard) void {
+        const st = &self.defaultPartition().store;
+        if (st.families[channels_mod.OutFam.ID].count == 0 and st.families[channels_mod.InFam.ID].count == 0) return;
+        self.channelTerm();
+        self.channel.tick(nowMs(), .{ .store = st }, self.channelDurable(), ChannelIo{ .shard = self });
+    }
+
+    /// A channel frame from another shard, or this one. Its sender is the
+    /// inbox's, never the frame's word. Only a leader past its earlier terms
+    /// takes one; the sender resends to whoever leads.
+    fn channelFrame(self: *Shard, msg: InboxMessage) void {
+        const bytes = inboxPayload(msg);
+        defer if (bytes.len > 0) self.allocator.free(bytes);
+        const leads = self.raft_node.role == .leader and self.offline == null and (self.raft_node.leaderReady() or self.halted != null);
+        if (!leads) return;
+        self.channelTerm();
+        self.channel.onFrame(msg.src_shard, bytes, nowMs(), .{ .store = &self.defaultPartition().store }, self.channelDurable(), self.halted != null, ChannelIo{ .shard = self });
     }
 
     /// A flush to disk failed: count it (cumulative) and, if this is the first
@@ -1478,6 +1557,7 @@ pub const Shard = struct {
 
     pub fn deinit(self: *Shard) void {
         self.marker.close();
+        self.channel.deinit();
         for (self.sink_retries.items) |r| self.allocator.free(r.bytes);
         self.sink_retries.deinit(self.allocator);
         self.sink_retry_blocked.deinit(self.allocator);
@@ -2797,6 +2877,7 @@ pub const Shard = struct {
                 defer if (bytes.len > 0) self.allocator.free(bytes);
                 self.processing_handler.takeSourcePage(self, bytes);
             },
+            .channel => self.channelFrame(msg),
             .reply => self.deliverReply(msg),
             .forward_request => self.runForwardedRequest(msg),
             .cancel_reads => {
@@ -5724,6 +5805,8 @@ pub const Shard = struct {
         // The producers above only proposed. What has committed (at once
         // on a single node) applies here, outside any module's work.
         _ = self.applyCommitted();
+        // A halted leader still delivers what it sent before the halt.
+        if (leads or holds) self.tickChannels();
         self.stepSnapshotWindow();
         if (self.sink_retries.items.len > 0) self.retrySinkWrites();
         _ = self.coldCaughtUp();
@@ -5975,7 +6058,7 @@ pub const Shard = struct {
                     self.deliverDeferredRefusal(reply_to, request_id, .unavailable, proto.notRun(SHUTTING_DOWN_NOT_RUN));
                 },
                 .reply => self.deliverReply(msg),
-                .action_start, .source_read, .source_page, .action_finished, .action_result_ask, .action_abandon, .worker_report, .action_held, .action_unhold => {
+                .action_start, .source_read, .source_page, .action_finished, .action_result_ask, .action_abandon, .worker_report, .action_held, .action_unhold, .channel => {
                     const bytes = inboxPayload(msg);
                     if (bytes.len > 0) self.allocator.free(bytes);
                 },
@@ -25459,4 +25542,118 @@ test "Shard: boot replay finds the same bars as live apply did, and the same byt
         extra += entry_mod.HEADER_SIZE + e.payload.len;
     }
     try std.testing.expectEqual(live_bytes + extra, shard.defaultPartition().bar_bytes);
+}
+
+/// Writes a message to `a`'s outbox as a sender's apply does: staged on a
+/// view, written in its commit.
+fn sendFromApply(a: *Shard, slot: u16, etype: entry_mod.EntryType, payload: []const u8) !void {
+    const p = a.defaultPartition();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var keys = contract_view.KeySet.init(arena.allocator());
+    var view = contract_view.View.init(&p.store, arena.allocator(), &keys);
+    try view.send(slot, @backingInt(etype), payload);
+    try channels_mod.writeSends(&view, a.raft_node.last_applied);
+    try view.commit();
+}
+
+test "Shard: a message to another shard's slot is applied there once, through its target's machine, and its outbox is trimmed" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    // A key shard 1 owns.
+    var kbuf: [16]u8 = undefined;
+    var ki: usize = 0;
+    const key = while (true) : (ki += 1) {
+        const k = try std.fmt.bufPrint(&kbuf, "k{d}", .{ki});
+        if (a.router.hashToShard(node_router.routeNsKey(.default, k)) == 1) break k;
+    };
+    const slot: u16 = @intCast(node_router.slot(node_router.routeNsKey(.default, key)));
+    var full: [32]u8 = undefined;
+    const ns_key = try std.fmt.bufPrint(&full, "{s}{s}", .{ ns_table.DEFAULT.bytes(), key });
+    var pbuf: [128]u8 = undefined;
+    const put = try kv_entries.Put.encodeInto(&pbuf, .{ .key = ns_key, .value = "from-a", .ttl_ms = null, .condition = .always, .cas_version = null });
+    try sendFromApply(a, slot, .kv_put, put);
+
+    const values_before = b.defaultPartition().store.families[kv_machine.Values.ID].count;
+    for (0..8) |_| {
+        a.tickChannels();
+        b.tickChannels();
+        two.settle();
+    }
+    // Applied on shard 1, once, by the KV machine.
+    try std.testing.expectEqualStrings("from-a", b.kv_handler.kv.getIn(.default, key).?.value);
+    try std.testing.expectEqual(values_before + 1, b.defaultPartition().store.families[kv_machine.Values.ID].count);
+    try std.testing.expectEqual(@as(u64, 1), channels_mod.inOf(.{ .store = &b.defaultPartition().store }, 0).?.applied);
+    // Shard 0's outbox is empty, its message durably acked.
+    try std.testing.expectEqual(@as(u64, 0), a.defaultPartition().store.families[channels_mod.OutFam.ID].count);
+    try std.testing.expectEqual(@as(u64, 1), channels_mod.metaOf(.{ .store = &a.defaultPartition().store }, 1).acked);
+    // Shard 1 took it in one inbound entry: more ticks take nothing again.
+    const b_log = b.raft_node.log.lastIndex();
+    for (0..4) |_| {
+        a.tickChannels();
+        b.tickChannels();
+        two.settle();
+    }
+    try std.testing.expectEqual(b_log, b.raft_node.log.lastIndex());
+}
+
+test "Shard: with no channel traffic a tick sends no frame and proposes nothing" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const logs = [2]u64{ two.shards[0].raft_node.log.lastIndex(), two.shards[1].raft_node.log.lastIndex() };
+    for (0..100) |_| {
+        for (&two.shards) |*s| s.tickChannels();
+        for (&two.shards) |*s| try std.testing.expectEqual(@as(usize, 0), s.mailbox.inbox.pending());
+    }
+    for (&two.shards, logs) |*s, l| try std.testing.expectEqual(l, s.raft_node.log.lastIndex());
+    // Nothing was allocated for batches.
+    for (&two.shards) |*s| try std.testing.expectEqual(@as(usize, 0), s.channel.buf.len);
+}
+
+test "Shard: a channel's durable index is what fsynced under sync, what the last flush wrote under async, and what applied with no data directory" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    // No data directory: whatever applied, since nothing is kept anyway.
+    {
+        var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+        _ = try queue_handler_mod.proposeEnqueue(&shard, "q", &[_]u8{'A'});
+        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expectEqual(shard.raft_node.last_applied, shard.channelDurable());
+    }
+    for ([_]Durability{ .sync, .async_flush }) |durability| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const data_dir = try testDataDir(&tmp);
+        defer std.testing.allocator.free(data_dir);
+        var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, durability, 1, .single, .{ .self_counts_when_durable = durability == .sync }, .{});
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+        try std.testing.expect(shard.applyCommitted());
+        const booted = shard.channelDurable();
+        _ = try queue_handler_mod.proposeEnqueue(&shard, "q", &[_]u8{'A'});
+        try std.testing.expect(shard.applyCommitted());
+        const last = shard.raft_node.log.lastIndex();
+        switch (durability) {
+            // Applied means fsynced first.
+            .sync => try std.testing.expectEqual(last, shard.channelDurable()),
+            // Applied, but on disk only once a flush writes it.
+            .async_flush => {
+                try std.testing.expectEqual(booted, shard.channelDurable());
+                try std.testing.expect(booted < last);
+                try shard.flushSegmentToDisk();
+                try std.testing.expectEqual(last, shard.channelDurable());
+            },
+        }
+    }
 }

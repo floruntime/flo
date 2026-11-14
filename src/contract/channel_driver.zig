@@ -130,21 +130,34 @@ pub const Driver = struct {
     term: u64 = 0,
     peers: [MAX_GROUPS]Peer = @splat(.{}),
     counts: Counts = .{},
+    allocator: std.mem.Allocator,
     /// A frame or an inbound entry is built here, one at a time, over a
-    /// message list built in `msgs`.
-    buf: []u8,
-    msgs: []u8,
+    /// message list built in `msgs`. Allocated at the first batch either
+    /// way, so a group that never sends or takes a message pays nothing.
+    buf: []u8 = &.{},
+    msgs: []u8 = &.{},
 
-    pub fn init(allocator: std.mem.Allocator, group: u16, count: u16) !Driver {
+    pub fn init(allocator: std.mem.Allocator, group: u16, count: u16) Driver {
         std.debug.assert(count <= MAX_GROUPS and group < count);
-        const buf = try allocator.alloc(u8, 1 + ce.Inbound.max_size);
-        errdefer allocator.free(buf);
-        return .{ .group = group, .count = count, .buf = buf, .msgs = try allocator.alloc(u8, ce.Messages.max_size) };
+        return .{ .allocator = allocator, .group = group, .count = count };
     }
 
-    pub fn deinit(self: *Driver, allocator: std.mem.Allocator) void {
-        allocator.free(self.buf);
-        allocator.free(self.msgs);
+    pub fn deinit(self: *Driver) void {
+        self.allocator.free(self.buf);
+        self.allocator.free(self.msgs);
+    }
+
+    /// The batch buffers, allocated once; false when there's no memory for
+    /// them, and the batch waits.
+    fn buffers(self: *Driver) bool {
+        if (self.buf.len > 0) return true;
+        self.buf = self.allocator.alloc(u8, 1 + ce.Inbound.max_size) catch return false;
+        self.msgs = self.allocator.alloc(u8, ce.Messages.max_size) catch {
+            self.allocator.free(self.buf);
+            self.buf = &.{};
+            return false;
+        };
+        return true;
     }
 
     /// A new term, or a new leader: everything in memory starts over, from
@@ -220,6 +233,7 @@ pub const Driver = struct {
     /// as far as messages are durable. Returns the last seq sent, or null.
     fn sendBatch(self: *Driver, b: u16, from: u64, last: u64, floor: u64, ready: u64, read: ReadView, io: anytype) ?u64 {
         const p = &self.peers[b];
+        if (!self.buffers()) return null;
         var list: schema.Writer = .{ .buf = self.msgs };
         var n: u32 = 0;
         var bytes: usize = 0;
@@ -310,6 +324,7 @@ pub const Driver = struct {
             return self.answer(from, p, applied, dur, accepted + 1, .ok, io);
         }
         // Propose from the first seq not yet accepted.
+        if (!self.buffers()) return self.answer(from, p, applied, dur, 0, .busy, io);
         var w: schema.Writer = .{ .buf = self.msgs };
         var it = b.messages.iterator();
         var seq = b.first_seq;

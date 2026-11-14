@@ -53,7 +53,7 @@ const Sim = struct {
                 .id = @intCast(i),
                 .store = store_mod.Store.init(allocator),
                 .scratch = std.heap.ArenaAllocator.init(allocator),
-                .driver = try driver_mod.Driver.init(allocator, @intCast(i), count),
+                .driver = driver_mod.Driver.init(allocator, @intCast(i), count),
             };
             g.store.place = .{ .group = @intCast(i), .count = count };
             g.store.strict_keys = true;
@@ -66,7 +66,7 @@ const Sim = struct {
         for (self.groups) |*g| {
             g.store.deinit();
             g.scratch.deinit();
-            g.driver.deinit(self.allocator);
+            g.driver.deinit();
             for (g.pending.items) |p| self.allocator.free(p.bytes);
             g.pending.deinit(self.allocator);
             g.applied_at.deinit(self.allocator);
