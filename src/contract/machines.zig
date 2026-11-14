@@ -4,13 +4,16 @@
 
 const machine = @import("machine.zig");
 
-pub const list = [_]machine.Machine{
+/// The machines a message from another group may be for.
+const targets = [_]machine.Machine{
     @import("../kv/machine.zig").machine,
     @import("../actions/machine.zig").machine,
     @import("../queue/machine.zig").machine,
     @import("../stream/group_machine.zig").machine,
     @import("../settings/machine.zig").machine,
 };
+
+pub const list = targets ++ [_]machine.Machine{@import("channels.zig").Channels(&targets).machine};
 
 comptime {
     machine.check(&list);

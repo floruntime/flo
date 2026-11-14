@@ -8107,8 +8107,9 @@ fn localDamage(err: persistence_mod.ApplyError, d: silent_loss.Damage) silent_lo
 /// whose effect is the shard's (`Shard.checkSkip`).
 const APPLIES_NOTHING = [_]entry_mod.EntryType{ .raft_noop, .repair_skip };
 /// Entry types nothing writes today. One that arrives anyway is counted as
-/// having no applier.
-const NEVER_WRITTEN = [_]entry_mod.EntryType{ .cg_create, .raft_snapshot };
+/// having no applier. A channel probe is the channel's test machine's,
+/// which no server runs.
+const NEVER_WRITTEN = [_]entry_mod.EntryType{ .cg_create, .raft_snapshot, .channel_probe };
 
 fn listed(list: []const entry_mod.EntryType, etype: entry_mod.EntryType) bool {
     return std.mem.indexOfScalar(entry_mod.EntryType, list, etype) != null;

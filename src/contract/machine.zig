@@ -10,6 +10,7 @@ const persistence = @import("../storage/persistence.zig");
 const store_mod = @import("store.zig");
 const view_mod = @import("view.zig");
 const Streams = @import("streams.zig").Streams;
+const channels = @import("channels.zig");
 
 const EntryType = entry_mod.EntryType;
 const Entry = entry_mod.Entry;
@@ -132,6 +133,12 @@ pub fn applyEntryWith(m: *const Machine, store: *store_mod.Store, scratch: *std.
     view.streams_read = streams;
     try m.apply(&view, e, out);
     if (out.refused() != null) return;
+    // What it sends leaves with its writes: the outbox is written in the
+    // same commit, under this entry's index.
+    if (view.sends.items.len > 0) {
+        if (channels.tooMuchSent(view.sends.items)) |why| return out.refuse(.bad_request, .malformed, why);
+        try channels.writeSends(&view, e.header.index);
+    }
     try view.commit();
 }
 

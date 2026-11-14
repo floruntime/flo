@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 25;
+pub const CURRENT: u32 = 26;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -86,6 +86,9 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // shard (the calling workflow's name says it), and an action extend
     // names its delivery's count, checked at apply.
     .{ .format = 25, .segment_version = 17, .entries = 0xf5b0a7ef40e425d2 },
+    // Channels: messages a group takes in from another, outbox trims, and
+    // the test machine's probe.
+    .{ .format = 26, .segment_version = 18, .entries = 0xf9606d0319816e24 },
 };
 
 comptime {

@@ -233,6 +233,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint, .processing_remove => .none,
         // Cluster settings: their contract machine (settings/machine.zig).
         .settings_pool_share, .settings_node_mem, .settings_node_del => .none,
+        .channel_inbound, .channel_trim, .channel_probe => .none,
     };
 }
 
