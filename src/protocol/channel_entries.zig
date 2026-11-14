@@ -13,8 +13,14 @@ const Int = schema.Int;
 const Bytes = schema.Bytes;
 const Record = schema.Record;
 
-/// Most messages one `inbound` entry takes.
+/// Most messages one `inbound` entry takes. A message's place in its entry
+/// is a u8 (`View.Message.ordinal`), which time-series points pack beside
+/// their index, so this stays at most 256.
 pub const MAX_BATCH = 64;
+
+comptime {
+    std.debug.assert(MAX_BATCH <= 256);
+}
 
 /// What the header fields of `Inbound` and of one `Message` take, so a
 /// single message of the largest payload still fits one entry.

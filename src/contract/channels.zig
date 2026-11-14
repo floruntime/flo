@@ -254,7 +254,7 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
             const before: ?In.Value = if (try view.get(InFam, in_key)) |v| v.v else null;
             var applied = if (before) |b| b.applied else 0;
             var seq = p.first_seq;
-            var ordinal: u32 = 0;
+            var ordinal: u8 = 0;
             var it = p.messages.iterator();
             while (it.next() catch return error.Halt) |m| : ({
                 seq += 1;
