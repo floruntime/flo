@@ -41,7 +41,7 @@ pub const Tag = enum(u8) {
     shutdown, // Graceful shutdown signal
     action_start, // Start an action run on the owning shard: payload from ActionsHandler.encodeStartRunMessage
     cancel_reads, // a client of the sender closed: drop its blocking reads parked here, answering each empty; sequence as forward_request
-    kv_sink_put, // a processing KV sink's write of a key this shard owns: payload from KVHandler.SinkPut.encode
+    sink_write, // a processing sink's write of a target this shard owns: payload from processing/sink_write.zig SinkWrite.encode
     action_finished, // how a run a workflow on the receiver waits on ended: payload from ActionsHandler.sendFinished
     action_result_ask, // a workflow's shard asking a run's shard how it ended: payload [ns_len:u16][ns][run]
     action_abandon, // a task whose await went away before it was answered, handed back to the run's shard
