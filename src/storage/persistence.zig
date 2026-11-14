@@ -251,11 +251,11 @@ pub fn proposeEntry(
     // into the request's id. Both reads agree because the table and the
     // shard's maps only grow, and nothing deletes a namespace. (A leader's
     // pending creates are dropped only when it stops leading, and then it
-    // proposes nothing.) The one way a name gets a second id is a shard 0
-    // that lost a create's tail and created the name again; a shard that
-    // still binds the old id refuses the namespace before any write
-    // (`Shard.boundElsewhere`). A namespace delete would have to stamp from
-    // the request's id instead.
+    // proposes nothing.) A shard 0 that lost a create's tail and created
+    // the name again gives it a new id, which both reads then agree on; the
+    // data under the old id is out of reach, and reported
+    // (`Shard.reportUnknownNamespaces`). A namespace delete would have to
+    // stamp from the request's id instead.
     const ns_id = shard.namespaceId(namespace);
     return proposeEntryIn(shard, entry_type, flags, ns_id, key, value);
 }

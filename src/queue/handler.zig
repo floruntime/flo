@@ -805,9 +805,13 @@ pub const QueueHandler = struct {
         shard.deliverDeferred(a.reply_to, if (result.refused() != null) a.leased else a.answer);
     }
 
+    /// Metered under the namespace's name as the node's table has it, or
+    /// on shard 0 its own log; one another shard's table doesn't have yet
+    /// is not metered rather than mislabelled.
     fn recordDequeue(self: *QueueHandler, shard: *Shard, ns: NamespaceId, name: []const u8, n: usize, bytes: usize) void {
         const mr = self.metrics_registry orelse return;
-        const namespace = shard.namespace_handler.nameOf(ns) orelse return;
+        const nh = shard.namespace_handler;
+        const namespace = nh.table.nameOf(ns) orelse nh.createdName(ns) orelse return;
         const qm = mr.registerQueue(namespace, name) catch return;
         if (n == 0) qm.recordEmptyDequeue() else qm.recordDequeue(n, bytes);
     }

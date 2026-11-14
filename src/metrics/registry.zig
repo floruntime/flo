@@ -478,6 +478,10 @@ pub const ServerMetrics = struct {
     /// settings: the leader that proposed them has different ones, and
     /// governs. Nonzero means the nodes' settings differ.
     queue_cap_mismatch_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Namespace ids other shards hold data under that shard 0's log has no
+    /// create for (a lost log tail): that data is out of reach. /status
+    /// lists them.
+    namespace_ids_unknown: Atomic(u64) = Atomic(u64).init(0),
     /// Server start timestamp (ms)
     start_time_ms: i64,
 
@@ -541,6 +545,7 @@ pub const ServerMetrics = struct {
         client_version_refused: u64,
         connections_rejected_total: u64,
         queue_cap_mismatch_total: u64,
+        namespace_ids_unknown: u64,
         uptime_seconds: u64,
     };
 
@@ -554,6 +559,7 @@ pub const ServerMetrics = struct {
             .client_version_refused = self.client_version_refused.load(.monotonic),
             .connections_rejected_total = self.connections_rejected_total.load(.monotonic),
             .queue_cap_mismatch_total = self.queue_cap_mismatch_total.load(.monotonic),
+            .namespace_ids_unknown = self.namespace_ids_unknown.load(.monotonic),
             .uptime_seconds = self.uptimeSeconds(),
         };
     }
@@ -1461,6 +1467,10 @@ fn writeServerMetrics(writer: anytype, snapshot: ServerMetrics.Snapshot) !void {
     try writer.print("# HELP flo_queue_cap_mismatch_total Enqueues applied under a leader's queue caps that differ from this node's own\n", .{});
     try writer.print("# TYPE flo_queue_cap_mismatch_total counter\n", .{});
     try writer.print("flo_queue_cap_mismatch_total {d}\n", .{snapshot.queue_cap_mismatch_total});
+
+    try writer.print("# HELP flo_namespace_ids_unknown Namespace ids other shards hold data under that shard 0's log has no create for; /status lists them\n", .{});
+    try writer.print("# TYPE flo_namespace_ids_unknown gauge\n", .{});
+    try writer.print("flo_namespace_ids_unknown {d}\n", .{snapshot.namespace_ids_unknown});
 
     // Uptime
     try writer.print("# HELP flo_uptime_seconds Server uptime in seconds\n", .{});
