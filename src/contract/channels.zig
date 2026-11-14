@@ -86,22 +86,36 @@ pub const families = [_]machine_mod.FamilyInfo{ machine_mod.info(OutFam), machin
 
 // ─── Keys ──────────────────────────────────────────────────────────────────
 
-pub const GROUP_KEY = 1 + 2;
-pub const OUT_KEY = 1 + 2 + 8;
+/// A peer group as a key names it: the group, then its incarnation, which
+/// is 0 until a split gives a group a new one.
+pub const PEER_LEN = 4;
+pub const GROUP_KEY = 1 + PEER_LEN;
+pub const OUT_KEY = 1 + PEER_LEN + 8;
+
+pub fn peerBytes(peer: u16) [PEER_LEN]u8 {
+    var b: [PEER_LEN]u8 = undefined;
+    std.mem.writeInt(u16, b[0..2], peer, .big);
+    std.mem.writeInt(u16, b[2..4], 0, .big);
+    return b;
+}
+
+/// An outbox record's key after its namespace: the receiver, then the seq,
+/// big-endian so a range is in seq order.
+pub fn outBytes(to: u16, seq: u64) [PEER_LEN + 8]u8 {
+    var b: [PEER_LEN + 8]u8 = undefined;
+    b[0..PEER_LEN].* = peerBytes(to);
+    std.mem.writeInt(u64, b[PEER_LEN..][0..8], seq, .big);
+    return b;
+}
 
 /// A channel's peer group, under no namespace.
 pub fn groupKey(buf: *[GROUP_KEY]u8, peer: u16) []const u8 {
-    var b: [2]u8 = undefined;
-    std.mem.writeInt(u16, &b, peer, .big);
+    const b = peerBytes(peer);
     return view_mod.key(buf, "", &b) catch unreachable;
 }
 
-/// An outbox record: the receiver, then the seq, big-endian so a range is
-/// in seq order.
 pub fn outKey(buf: *[OUT_KEY]u8, to: u16, seq: u64) []const u8 {
-    var b: [10]u8 = undefined;
-    std.mem.writeInt(u16, b[0..2], to, .big);
-    std.mem.writeInt(u64, b[2..10], seq, .big);
+    const b = outBytes(to, seq);
     return view_mod.key(buf, "", &b) catch unreachable;
 }
 
@@ -196,8 +210,7 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
             switch (typeOf(e) orelse return) {
                 .channel_inbound => {
                     const p = ce.Inbound.decodeAll(e.payload, &diag) catch return;
-                    var b: [2]u8 = undefined;
-                    std.mem.writeInt(u16, &b, p.from, .big);
+                    const b = peerBytes(p.from);
                     try out.add(InFam.ID, "", &b);
                     var it = p.messages.iterator();
                     while (it.next() catch return) |m| {
@@ -209,15 +222,12 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 },
                 .channel_trim => {
                     const p = ce.Trim.decodeAll(e.payload, &diag) catch return;
-                    var b: [2]u8 = undefined;
-                    std.mem.writeInt(u16, &b, p.to, .big);
+                    const b = peerBytes(p.to);
                     try out.add(MetaFam.ID, "", &b);
                     if (p.through < p.first or p.through - p.first >= ce.MAX_TRIM_SPAN) return;
                     var seq = p.first;
                     while (seq <= p.through) : (seq += 1) {
-                        var k: [10]u8 = undefined;
-                        std.mem.writeInt(u16, k[0..2], p.to, .big);
-                        std.mem.writeInt(u64, k[2..10], seq, .big);
+                        const k = outBytes(p.to, seq);
                         try out.add(OutFam.ID, "", &k);
                     }
                 },

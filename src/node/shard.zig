@@ -8106,9 +8106,9 @@ fn localDamage(err: persistence_mod.ApplyError, d: silent_loss.Damage) silent_lo
 /// Entry types with nothing to apply: the term's no-op, and a repair skip,
 /// whose effect is the shard's (`Shard.checkSkip`).
 const APPLIES_NOTHING = [_]entry_mod.EntryType{ .raft_noop, .repair_skip };
-/// Entry types nothing writes today. One that arrives anyway is counted as
-/// having no applier. A channel probe is the channel's test machine's,
-/// which no server runs.
+/// Entry types nothing writes today. One that arrives anyway has no applier,
+/// and halts its shard there. A channel probe is the channel's test
+/// machine's, which no server runs.
 const NEVER_WRITTEN = [_]entry_mod.EntryType{ .cg_create, .raft_snapshot, .channel_probe };
 
 fn listed(list: []const entry_mod.EntryType, etype: entry_mod.EntryType) bool {
@@ -20764,6 +20764,8 @@ test "an entry no projection or applier can take halts its shard at it, applying
         .{ .entry_type = .kv_put, .payload = "not a command payload", .why = "its applier refused it" },
         // Nothing writes this type, and nothing applies it.
         .{ .entry_type = .cg_create, .payload = "", .why = "no applier on this build" },
+        // The channel's test machine's probe: no server applies one.
+        .{ .entry_type = .channel_probe, .payload = "", .why = "no applier on this build" },
         // Larger than the partition ring.
         .{ .entry_type = .stream_append, .payload = &big, .why = "the partition refused it" },
     }) |c| {
