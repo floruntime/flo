@@ -3442,3 +3442,62 @@ test "e2e/processing: on 4 shards, jobs write queues, streams and a measurement 
         try expectEachOnce(got.items, markers.items, q);
     }
 }
+
+test "e2e/processing: on 4 shards, a job reads a stream and a measurement other shards own, each record once" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    const a = testing.allocator;
+    // Jobs run on shard 0; their sources are on 2 and 3.
+    var sbuf: [16]u8 = undefined;
+    const stream = try nameOn(&sbuf, "far-in", 2);
+    var mbuf: [16]u8 = undefined;
+    const measurement = try nameOn(&mbuf, "far-m", 3);
+    const n = 20;
+    var markers: [n][24]u8 = undefined;
+    var stamps: [n][24]u8 = undefined;
+    for (0..n) |i| {
+        try ctx.exec(&.{ "stream", "append", stream, try std.fmt.bufPrint(&markers[i], "far{d}x", .{i}) });
+        const ts = try std.fmt.bufPrint(&stamps[i], "17000000001{d:0>2}", .{i});
+        var vbuf: [8]u8 = undefined;
+        try ctx.exec(&.{ "ts", "write", measurement, "--value", try std.fmt.bufPrint(&vbuf, "{d}", .{i}), "--timestamp", ts });
+    }
+    var ybuf: [512]u8 = undefined;
+    for ([_]struct { name: []const u8, src: []const u8 }{
+        .{ .name = "far-stream", .src = try std.fmt.allocPrint(a, "sources.[0].stream.name: {s}", .{stream}) },
+        .{ .name = "far-ts", .src = try std.fmt.allocPrint(a, "sources.[0].ts.measurement: {s}\nsources.[0].ts.field: value", .{measurement}) },
+    }) |j| {
+        defer a.free(j.src);
+        const yaml = try std.fmt.bufPrint(&ybuf, "kind: Processing\nname: {s}\nsources.[0].name: src\n{s}\nsinks.[0].name: out\nsinks.[0].stream.name: {s}-out\n", .{ j.name, j.src, j.name });
+        const path = try writeDottedToTempYaml(a, yaml, "far-src.yaml");
+        defer cleanupTempFile(a, path);
+        var submit = try ctx.cli.run(&.{ "processing", "submit", path });
+        defer submit.deinit();
+        try testing.expectEqual(@as(u8, 0), submit.exit_code);
+    }
+    for ([_]struct { out: []const u8, ts: bool }{ .{ .out = "far-stream-out", .ts = false }, .{ .out = "far-ts-out", .ts = true } }) |o| {
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            var read = try ctx.cli.run(&.{ "stream", "read", o.out, "--limit", "1000" });
+            defer read.deinit();
+            var all = true;
+            var once = true;
+            for (0..n) |i| {
+                var wbuf: [24]u8 = undefined;
+                const want = if (o.ts) std.fmt.bufPrint(&wbuf, "17000000001{d:0>2}", .{i}) catch unreachable else std.fmt.bufPrint(&wbuf, "far{d}x", .{i}) catch unreachable;
+                const c = std.mem.count(u8, read.stdout, want);
+                if (c == 0) all = false;
+                if (c > 1) once = false;
+            }
+            if (!once) {
+                std.debug.print("{s}: a record came twice\n{s}\n", .{ o.out, read.stdout });
+                return error.WrongCount;
+            }
+            if (all) break;
+            if (tries == 120) {
+                std.debug.print("{s}: records missing\n{s}\n", .{ o.out, read.stdout });
+                return error.RecordsLost;
+            }
+            stdx.time.sleep(250 * std.time.ns_per_ms);
+        }
+    }
+}

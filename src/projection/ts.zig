@@ -722,6 +722,83 @@ pub const TSProjection = struct {
         return result;
     }
 
+    /// A point's place in a series' read order: its time, then the log
+    /// index it was applied from, which no two of a measurement's points
+    /// share.
+    pub const ReadAt = struct {
+        ns: u64,
+        ual: u64,
+
+        pub fn before(a: ReadAt, b: ReadAt) bool {
+            return a.ns < b.ns or (a.ns == b.ns and a.ual < b.ual);
+        }
+
+        fn of(p: StoredPoint) ReadAt {
+            return .{ .ns = p.timestamp_ns, .ual = p.ual_index };
+        }
+    };
+
+    /// The earliest points after `after`, in (time, log index) order, of
+    /// one series or (`tag_hash` null) every tag-series of a measurement's
+    /// field: up to `out.len`, however the series hold them. A reader that
+    /// goes on from its last point neither skips nor repeats one, even
+    /// among points sharing a time.
+    pub fn readAfter(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, tag_hash: ?u64, after: ReadAt, out: []StoredPoint) !usize {
+        if (out.len == 0) return 0;
+        var n: usize = 0;
+        if (tag_hash) |th| {
+            const series_str = try seriesKeyToString(self.allocator, .{ .ns_id = ns_id, .measurement = measurement, .field_name = field_name, .tag_hash = th });
+            defer self.allocator.free(series_str);
+            if (self.buffers.get(series_str)) |buf| for (buf.points.items) |p| keepEarliest(out, &n, after, p);
+        } else {
+            const prefix = try seriesKeyPrefix(self.allocator, ns_id, measurement, field_name);
+            defer self.allocator.free(prefix);
+            var it = self.buffers.iterator();
+            while (it.next()) |kv| {
+                if (!std.mem.startsWith(u8, kv.key_ptr.*, prefix)) continue;
+                for (kv.value_ptr.points.items) |p| keepEarliest(out, &n, after, p);
+            }
+        }
+        std.mem.sort(StoredPoint, out[0..n], {}, struct {
+            fn lt(_: void, a: StoredPoint, b: StoredPoint) bool {
+                return ReadAt.of(a).before(ReadAt.of(b));
+            }
+        }.lt);
+        self.stats.queries += 1;
+        return n;
+    }
+
+    /// Keeps `out[0..n]` the earliest points after `after` seen so far, as
+    /// a heap with the latest at the root.
+    fn keepEarliest(out: []StoredPoint, n: *usize, after: ReadAt, p: StoredPoint) void {
+        const at = ReadAt.of(p);
+        if (!after.before(at)) return;
+        if (n.* < out.len) {
+            var i = n.*;
+            out[i] = p;
+            n.* += 1;
+            while (i > 0) {
+                const parent = (i - 1) / 2;
+                if (!ReadAt.of(out[parent]).before(ReadAt.of(out[i]))) break;
+                std.mem.swap(StoredPoint, &out[parent], &out[i]);
+                i = parent;
+            }
+            return;
+        }
+        if (!at.before(ReadAt.of(out[0]))) return;
+        out[0] = p;
+        var i: usize = 0;
+        while (true) {
+            const l = 2 * i + 1;
+            if (l >= out.len) break;
+            var big = l;
+            if (l + 1 < out.len and ReadAt.of(out[l]).before(ReadAt.of(out[l + 1]))) big = l + 1;
+            if (!ReadAt.of(out[i]).before(ReadAt.of(out[big]))) break;
+            std.mem.swap(StoredPoint, &out[i], &out[big]);
+            i = big;
+        }
+    }
+
     /// Query every tag-series whose tags satisfy `preds`, merged and
     /// time-ordered.
     ///
