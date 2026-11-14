@@ -307,6 +307,18 @@ pub const Scenario = struct {
         return s;
     }
 
+    /// The node every shard of a multi-shard server lives on: one replica
+    /// per group, so nothing to partition, no membership to change, and no
+    /// disk another replica could restore.
+    pub fn makeOneNode(s: *Scenario) void {
+        s.node_count = 1;
+        s.partition_permille = 0;
+        s.config_change_permille = 0;
+        s.wipe_permille = 0;
+        s.max_lost_nodes = 1;
+        s.outsider_permille = 0;
+    }
+
     /// Draw each node a limit, with one node at the built-in most, and another
     /// at or below the default, so a batch that one leader may propose is
     /// always above another node's own limit. Payloads and the ring grow to

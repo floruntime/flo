@@ -1029,7 +1029,7 @@ pub const Simulator = struct {
     const RAFT_GROUP: u32 = 1;
 
     pub fn init(allocator: Allocator, scenario: Scenario, options: Options) !Simulator {
-        std.debug.assert(scenario.node_count >= 3 and scenario.node_count <= MAX_NODES);
+        std.debug.assert(scenario.node_count >= 1 and scenario.node_count <= MAX_NODES);
         std.debug.assert(scenario.outsider_permille == 0 or scenario.node_count < MAX_NODES);
         var self = Simulator{
             .allocator = allocator,
@@ -2536,54 +2536,94 @@ pub const Simulator = struct {
     }
 
     pub fn run(self: *Simulator) !Summary {
-        while (self.now < self.scenario.ticks_safety and self.checker.violations.items.len == 0) {
-            try self.tick();
-            self.progress();
-        }
+        while (!self.safetyDone()) try self.advance();
         var converged_ok = false;
         if (self.checker.violations.items.len == 0) {
-            try self.transitionToConvergence();
-            // Budget scales with repair cost: next_index backs off one
-            // step per round trip, so a from-zero follower needs round
-            // trips linear in the log length, at message latency.
-            var max_log: u64 = 0;
-            for (self.nodes) |*node| max_log = @max(max_log, node.raft.log.lastIndex());
-            const budget = @max(
-                self.scenario.ticks_convergence,
-                max_log * (self.scenario.msg_delay_max_ms + 2) * 2,
-            );
-            const deadline = self.now + budget;
+            const deadline = try self.beginConvergence();
             while (self.now < deadline and self.checker.violations.items.len == 0) {
-                try self.tick();
-                self.progress();
-                if (self.options.verbose and self.now % 5000 == 0) {
-                    std.debug.print("[dbg] tick={d}\n", .{self.now});
-                    for (self.nodes) |*nd| std.debug.print(
-                        "  n{d} up={} core={} role={s} term={d} dl={d} commit={d} applied={d} log={d}\n",
-                        .{ nd.id, nd.up, self.core[nd.id - 1], @tagName(nd.raft.role), nd.raft.current_term, nd.raft.election_deadline_ms, nd.raft.commit_index, nd.raft.last_applied, nd.raft.log.lastIndex() },
-                    );
-                }
+                try self.advance();
+                self.convergenceProgress();
                 if (self.converged()) {
                     converged_ok = true;
                     break;
                 }
             }
-            // Only async mode lets a crash erase applied history; sync
-            // fails on any divergence (`onDiverged`).
-            const excused = self.divergences_beyond_tolerance > 0 and self.scenario.durability == .async_flush;
-            if (!converged_ok and self.checker.violations.items.len == 0 and !excused) {
-                self.checker.fail(.{
-                    .invariant = .convergence,
-                    .node = 0,
-                    .index = 0,
-                    .tick = self.now,
-                    .detail = "core did not apply all acked ops within the budget",
-                });
-            }
+        }
+        return self.finish(converged_ok);
+    }
+
+    /// One tick, and its progress line. Several groups on one node step
+    /// their simulators together through this.
+    pub fn advance(self: *Simulator) !void {
+        try self.tick();
+        self.progress();
+    }
+
+    /// The safety phase is over: its ticks ran, or something failed.
+    pub fn safetyDone(self: *const Simulator) bool {
+        return self.now >= self.scenario.ticks_safety or self.checker.violations.items.len > 0;
+    }
+
+    /// Starts the convergence phase; returns the tick it must converge by.
+    pub fn beginConvergence(self: *Simulator) !u64 {
+        try self.transitionToConvergence();
+        // Budget scales with repair cost: next_index backs off one
+        // step per round trip, so a from-zero follower needs round
+        // trips linear in the log length, at message latency.
+        var max_log: u64 = 0;
+        for (self.nodes) |*node| max_log = @max(max_log, node.raft.log.lastIndex());
+        const budget = @max(
+            self.scenario.ticks_convergence,
+            max_log * (self.scenario.msg_delay_max_ms + 2) * 2,
+        );
+        return self.now + budget;
+    }
+
+    fn convergenceProgress(self: *Simulator) void {
+        if (self.options.verbose and self.now % 5000 == 0) {
+            std.debug.print("[dbg] tick={d}\n", .{self.now});
+            for (self.nodes) |*nd| std.debug.print(
+                "  n{d} up={} core={} role={s} term={d} dl={d} commit={d} applied={d} log={d}\n",
+                .{ nd.id, nd.up, self.core[nd.id - 1], @tagName(nd.raft.role), nd.raft.current_term, nd.raft.election_deadline_ms, nd.raft.commit_index, nd.raft.last_applied, nd.raft.log.lastIndex() },
+            );
+        }
+    }
+
+    /// Every acked op applied by the core.
+    pub fn isConverged(self: *Simulator) bool {
+        return self.converged();
+    }
+
+    /// The run's end: a convergence failure if it didn't converge, then the
+    /// final checks, then the summary.
+    pub fn finish(self: *Simulator, converged_ok: bool) Summary {
+        // Only async mode lets a crash erase applied history; sync
+        // fails on any divergence (`onDiverged`).
+        const excused = self.divergences_beyond_tolerance > 0 and self.scenario.durability == .async_flush;
+        if (!converged_ok and self.phase == .convergence and self.checker.violations.items.len == 0 and !excused) {
+            self.checker.fail(.{
+                .invariant = .convergence,
+                .node = 0,
+                .index = 0,
+                .tick = self.now,
+                .detail = "core did not apply all acked ops within the budget",
+            });
         }
         self.finalDurabilityCheck();
         self.finalSumsCheck();
         return self.summary();
+    }
+
+    /// Node `id` crashes or comes back as it did in another group on the
+    /// same node: a process crash takes every group on it.
+    pub fn followFate(self: *Simulator, id: NodeId, up: bool) !void {
+        const node = &self.nodes[id - 1];
+        if (node.up == up) return;
+        if (up) try self.restartNode(node) else self.crashNode(node);
+    }
+
+    pub fn nodeUp(self: *const Simulator, id: NodeId) bool {
+        return self.nodes[id - 1].up;
     }
 
     /// The machines' families at the last index each node applied, which

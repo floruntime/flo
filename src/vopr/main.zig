@@ -66,6 +66,9 @@ const Args = struct {
     family_mutant: vopr.families.Mutant = .none,
     catching_up: bool = false,
     txn_limits: bool = false,
+    /// Run this many groups on one node, through the mailbox, instead of
+    /// one replicated group (0: one group, as always).
+    groups: u8 = 0,
     max_delivered: u64 = 0,
     skip: [8]u64 = undefined,
     skip_len: usize = 0,
@@ -83,7 +86,7 @@ const Args = struct {
 fn usage() void {
     std.debug.print(
         "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] [--jobs=N] [--out-dir=DIR] " ++
-            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--pending-reads] [--wipes] [--membership] [--byzantine] [--halts] [--actions] [--queues] [--catching-up] [--txn-limits] [--max-delivered=N] " ++
+            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--pending-reads] [--wipes] [--membership] [--byzantine] [--halts] [--actions] [--queues] [--catching-up] [--txn-limits] [--groups=N] [--max-delivered=N] " ++
             "[--family-mutant=NAME] [--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
         .{},
     );
@@ -124,6 +127,9 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.catching_up = true;
         } else if (std.mem.startsWith(u8, arg, "--max-delivered=")) {
             args.max_delivered = try std.fmt.parseInt(u64, arg["--max-delivered=".len..], 10);
+        } else if (std.mem.startsWith(u8, arg, "--groups=")) {
+            args.groups = try std.fmt.parseInt(u8, arg["--groups=".len..], 10);
+            if (args.groups == 0 or args.groups > vopr.groups.MAX_GROUPS) return error.Usage;
         } else if (std.mem.eql(u8, arg, "--txn-limits")) {
             args.txn_limits = true;
         } else if (std.mem.startsWith(u8, arg, "--skip=")) {
@@ -199,6 +205,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     else
         Scenario.fromSeed(seed);
     if (args.volatile_mode) scenario.hard_state = .volatile_state;
+    if (args.groups > 0 and args.scenario_in == null) scenario.makeOneNode();
     // A planted bug the run never reaches would pass, and say nothing.
     if (args.family_mutant.needsTxnLimits() and !scenario.hasTxnLimits()) {
         std.debug.print("--family-mutant={t} is in a node's transaction limit: run it with --txn-limits, or a scenario that has them\n", .{args.family_mutant});
@@ -225,6 +232,8 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         try writeScenario(&scenario, path);
         std.debug.print("[vopr] scenario written to {s}\n", .{path});
     }
+
+    if (args.groups > 0) return runGroups(allocator, args, scenario);
 
     var sim = try Simulator.init(allocator, scenario, .{
         .max_delivered = args.max_delivered,
@@ -315,6 +324,41 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
                 if (args.volatile_mode) " --mode=volatile" else "",
             });
         }
+    }
+    return s.ok;
+}
+
+/// `scenario` as group 0 of `args.groups` groups on one node.
+fn runGroups(allocator: std.mem.Allocator, args: Args, scenario: Scenario) !bool {
+    if (scenario.node_count != 1) {
+        std.debug.print("--groups runs groups of one replica: the scenario has {d} nodes\n", .{scenario.node_count});
+        std.process.exit(2);
+    }
+    var groups = try vopr.Groups.init(allocator, scenario, args.groups, .{
+        .max_delivered = args.max_delivered,
+        .volatile_hard_state = args.volatile_mode or scenario.hard_state == .volatile_state,
+        .family_mutant = args.family_mutant,
+        .verbose = args.verbose,
+        .progress_every = if (args.log_path != null) 10_000 else 0,
+    });
+    defer groups.deinit();
+    const s = try groups.run();
+    defer allocator.free(s.groups);
+    std.debug.print(
+        "[vopr] seed={d} {s}: groups={d} crashes={d} frames_sent={d} frames_delivered={d} frames_lost_in_crash={d} channel_applies={d} channel_violations={d}\n",
+        .{ scenario.seed, if (s.ok) "OK" else "FAILED", s.groups.len, s.crashes, s.frames_sent, s.frames_delivered, s.frames_lost_in_crash, s.channel_applies, s.channel_violations },
+    );
+    for (s.groups, 0..) |g, i| std.debug.print("[vopr]   group {d} {s}: ticks={d} acked={d} lost={d} committed={d} state_checks={d}\n", .{ i, if (g.ok) "OK" else "FAILED", g.ticks, g.ops_acked, g.ops_lost, g.max_committed, g.state_checks });
+    if (!s.ok) {
+        var vbuf: [16384]u8 = undefined;
+        var vw: std.Io.Writer = .fixed(&vbuf);
+        for (groups.sims, 0..) |*sim, i| if (sim.checker.violations.items.len > 0) {
+            vw.print("group {d}:\n", .{i}) catch {};
+            sim.printViolations(&vw) catch {};
+        };
+        for (groups.oracle.violations.items) |v| vw.print("channel {d}->{d} seq {d}: {s}\n", .{ v.from, v.to, v.seq, v.detail }) catch {};
+        std.debug.print("{s}", .{vw.buffered()});
+        std.debug.print("[vopr] reproduce with: vopr --seed={d} --groups={d}{s}\n", .{ scenario.seed, args.groups, if (args.volatile_mode) " --mode=volatile" else "" });
     }
     return s.ok;
 }
@@ -474,6 +518,8 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
     if (args.family_mutant != .none) try argv.append(allocator, try std.fmt.bufPrint(&mutant_arg, "--family-mutant={t}", .{args.family_mutant}));
     if (args.catching_up) try argv.append(allocator, "--catching-up");
     if (args.txn_limits) try argv.append(allocator, "--txn-limits");
+    var groups_arg: [16]u8 = undefined;
+    if (args.groups > 0) try argv.append(allocator, try std.fmt.bufPrint(&groups_arg, "--groups={d}", .{args.groups}));
     if (args.verbose) try argv.append(allocator, "--verbose");
 
     var child = stdx.process.Child.init(argv.items, allocator);
