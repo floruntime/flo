@@ -36,6 +36,9 @@ fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) c
     }.run;
 }
 
+/// What `server start --partitions` is told, after "unknown flag --partitions: ".
+pub const PARTITIONS_FLAG_GONE = "no longer a flag: every cluster has 4096 key partitions; leave it off";
+
 /// Create the server command tree
 pub fn createServerCommand(allocator: Allocator) !*commander.Command {
     const cmd = try commander.newBuilder(allocator)
@@ -294,7 +297,7 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .action(wrapHandler(runMetrics)),
         )
         .build();
-    cmd.retired_flags = &.{.{ .long = "partitions", .hint = server_config.PARTITIONS_GONE }};
+    cmd.retired_flags = &.{.{ .long = "partitions", .hint = PARTITIONS_FLAG_GONE }};
     return cmd;
 }
 
@@ -929,7 +932,7 @@ fn skipRefusal(ctx: *commander.Context, err: anyerror, shard: u16, index: u64, h
     return switch (err) {
         error.IsSkip => outcome.localRefusal(ctx, "entry {d} is itself a repair; a skip is never skipped", .{index}),
         error.NotSkippable => outcome.localRefusal(ctx, "entry {d} is a config or a term's no-op, which a shard applies even while halted; it is never skipped", .{index}),
-        error.NamespaceEntry => outcome.localRefusal(ctx, "entry {d} creates or binds a namespace, and the writes behind it carry its id: skipped, they would land under an id another namespace may take. It is never skipped; cut the log before it instead (flo server salvage --shard {d} --truncate-after {d}), which drops those writes with it", .{ index, shard, index -| 1 }),
+        error.NamespaceEntry => outcome.localRefusal(ctx, "entry {d} creates a namespace, and the writes behind it carry its id: skipped, they would land under an id another namespace may take. It is never skipped; cut the log before it instead (flo server salvage --shard {d} --truncate-after {d}), which drops those writes with it", .{ index, shard, index -| 1 }),
         else => outcome.localRefusal(ctx, "shard {d} is not halted at entry {d} (term {d}): only the entry a shard halted at is skipped. Start the server to see where it halts", .{ shard, index, halted.header.term }),
     };
 }

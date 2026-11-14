@@ -182,7 +182,7 @@ pub fn getQueueMessages(allocator: Allocator, queue_name: []const u8, query_stri
                 try mobj.begin();
                 try mobj.intField("seq", m.seq);
                 try mobj.intField("priority", m.priority);
-                try mobj.intField("attempts", m.attempts);
+                try mobj.intField("deliveries", m.deliveries);
                 try mobj.intField("enqueued_at", m.enqueued_at_ms);
                 try mobj.intField("size", m.size);
                 try mobj.stringField("payload", m.payload);
@@ -236,7 +236,7 @@ pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?
             var e = json.ObjectBuilder(@TypeOf(writer)).init(writer);
             try e.begin();
             try e.intField("seq", d.seq);
-            try e.intField("attempts", d.attempts);
+            try e.intField("deliveries", d.deliveries);
             try e.intField("priority", d.priority);
             try e.intField("enqueued_at", d.enqueued_at_ms);
             try e.intField("moved_at", d.moved_at_ms);
@@ -315,17 +315,20 @@ pub fn purgeQueue(allocator: Allocator, queue_name: []const u8, query_string: ?[
 }
 
 /// POST /queues/:name — enqueue a message (loopback write). Body is the payload;
-/// `?priority=` optional.
+/// `?priority=` and `?delay_ms=` (at most a day) optional.
 pub fn enqueueMessage(allocator: Allocator, queue_name: []const u8, body: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     const priority: u8 = @intCast(@min(h.parseQueryParam(u64, query_string, "priority") orelse 0, 255));
-    // Queues have no delayed delivery; a delay asked for is refused, not dropped.
-    if (h.parseQueryParam([]const u8, query_string, "delay_ms") != null)
-        return try h.jsonError(allocator, "delay_ms is not supported: queues have no delayed delivery");
+    // A delay that isn't a number is refused, not dropped; the server
+    // refuses one past a day.
+    const delay_ms: u64 = if (h.parseQueryParam([]const u8, query_string, "delay_ms") != null)
+        h.parseQueryParam(u64, query_string, "delay_ms") orelse return try h.jsonError(allocator, "delay_ms must be a whole number of milliseconds")
+    else
+        0;
 
     var client = loopback.connect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
-    var resp = client_mod.queue.enqueue(&client, ns_q, queue_name, body, priority, 0) catch
+    var resp = client_mod.queue.enqueue(&client, ns_q, queue_name, body, priority, delay_ms) catch
         return try h.jsonError(allocator, "Enqueue failed");
     defer resp.deinit();
     if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());

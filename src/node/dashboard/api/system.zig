@@ -137,6 +137,20 @@ pub fn getMetricsJson(allocator: Allocator, ctx: *DashboardContext) ![]const u8 
     try repl_obj.intField("slow_peer_drops_total", repl.slow_peer_drops_total);
     try repl_obj.end();
 
+    // The node's memory budget: the figure shown is held at its last clean
+    // value while a data-holder hasn't reported (provisional_ms > 0). The
+    // provisional duration is computed here, at scrape, so it grows with time.
+    // Nothing is charged against it yet, so pool_use_bytes is 0.
+    const mb = ctx.metrics.memory_budget.snapshot();
+    var mb_obj = try obj.objectField("memory_budget");
+    try mb_obj.begin();
+    try mb_obj.intField("budget_bytes", mb.budget_bytes);
+    try mb_obj.intField("pool_use_bytes", mb.pool_use_bytes);
+    try mb_obj.intField("governing_node", mb.governing_node);
+    try mb_obj.intField("provisional_ms", mb.provisionalMs(@import("stdx").time.monotonicMs()));
+    try mb_obj.intField("provisional_node", mb.provisional_node);
+    try mb_obj.end();
+
     try obj.end();
     return try json_aw.toOwnedSlice();
 }

@@ -22,11 +22,12 @@
 //! Each opcode may have a `PreRouteFn` that computes a routing hash
 //! before dispatch. Three modes:
 //!
-//! | `pre_route` | Return    | Behavior                        |
-//! |-------------|-----------|---------------------------------|
-//! | null        | —         | System command, no routing      |
-//! | set         | `?u64`    | Single-partition route           |
-//! | set         | `null`    | Multi-shard → ShardWalker       |
+//! | `pre_route` | Return    | Behavior                                  |
+//! |-------------|-----------|-------------------------------------------|
+//! | null        | —         | System command, runs where it arrives     |
+//! | set         | hash      | The shard owning the hash's slot          |
+//! | set         | `null`    | Names no key: a walk op walks every shard,|
+//! |             |           | any other op runs on group 0 (shard 0)    |
 //!
 //! ## Registration
 //!

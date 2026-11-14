@@ -234,6 +234,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .examples(&.{
                             "flo stream group nack events --group mygroup --consumer worker1 --ids 3.42.1703350800000-0.1 --delay 10000 --error \"upstream timed out\"",
                             "flo stream group nack events --group mygroup --consumer worker1 --ids 3.42.1703350800000-0.1 --dlq",
+                            "flo stream group nack events --group mygroup --consumer worker1 --ids 3.42.1703350800000-0.1 --abandon",
                         })
                         .arg("stream", "Stream name")
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
@@ -242,6 +243,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .uintFlag("delay", 0, 0, "How long before they're ready again (ms, at most a day)")
                         .boolFlag("dlq", 0, "Dead-letter them now, whatever attempts are left")
                         .stringFlag("error", 0, "", "Why they failed")
+                        .boolFlag("abandon", 0, "Hand them back unstarted: ready again at once, no attempt spent (alone: not with --delay, --dlq or --error)")
                         .action(wrapHandler(runGroupNack)),
                 )
                 .subcommand(
@@ -1070,6 +1072,7 @@ fn runGroupReport(ctx: *commander.Context, kind: client_mod.stream.GroupReport) 
         if (nack.delay_ms > 86_400_000) return outcome.usage(ctx, "--delay is at most 86400000 (a day), not {d}", .{nack.delay_ms});
         nack.dead = ctx.getBool("dlq");
         nack.error_text = ctx.getString("error") orelse "";
+        nack.abandon = ctx.getBool("abandon");
     }
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
@@ -1129,7 +1132,7 @@ fn runGroupReport(ctx: *commander.Context, kind: client_mod.stream.GroupReport) 
     }
     const verb = switch (kind) {
         .ack => "Acknowledged",
-        .nack => "Failed",
+        .nack => if (nack.abandon) "Handed back" else "Failed",
         .touch => "Kept",
     };
     if (json_output) {

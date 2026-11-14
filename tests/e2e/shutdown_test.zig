@@ -8,14 +8,25 @@ const proto = @import("src").protocol.proto;
 const kv_ops = @import("src").protocol.kv_ops;
 
 const CLIENTS = 4;
+/// Per client: ms to connect, ms to the first ok answer (or -1), the first
+/// non-ok answer's status and text, and how its loop ended.
+const Trace = struct { connect_ms: i64 = -1, first_ack_ms: i64 = -1, answered: u64 = 0, bad: u64 = 0, first_bad: [160]u8 = @splat(0), first_bad_len: usize = 0, end: []const u8 = "?", end_ms: i64 = -1 };
+var traces: [CLIENTS]Trace = @splat(.{});
 
 /// Put keys `c<client>-<i>` as request id i + 1 over one connection, `batch`
 /// in flight, until the server stops answering; each id answered ok goes in
 /// `acked`. The key's shard may not be this connection's, so answers come
 /// back in any order: only an id says which write was acknowledged.
 fn putUntilClosed(port: u16, client: usize, acked: *std.ArrayList(u64)) void {
+    const tr = &traces[client];
+    const t0 = stdx.time.monotonicMs();
+    defer tr.end_ms = @intCast(stdx.time.monotonicMs() - t0);
     const batch = 256;
-    const fd = stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, port, 1000) catch return;
+    const fd = stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, port, 1000) catch |e| {
+        tr.end = @errorName(e);
+        return;
+    };
+    tr.connect_ms = @intCast(stdx.time.monotonicMs() - t0);
     defer _ = std.c.close(fd);
     var out: [batch * 128]u8 = undefined;
     var in: [batch * 64 + 4096]u8 = undefined;
@@ -33,7 +44,10 @@ fn putUntilClosed(port: u16, client: usize, acked: *std.ArrayList(u64)) void {
         var sent: usize = 0;
         while (sent < used) {
             const rc = std.c.write(fd, out[sent..].ptr, used - sent);
-            if (rc <= 0) return;
+            if (rc <= 0) {
+                tr.end = "write failed";
+                return;
+            }
             sent += @intCast(rc);
         }
         var got: usize = 0;
@@ -41,7 +55,17 @@ fn putUntilClosed(port: u16, client: usize, acked: *std.ArrayList(u64)) void {
         var answered: usize = 0;
         while (answered < batch) {
             if (proto.Response.parse(in[off..got])) |r| {
-                if (r.header.status == @backingInt(proto.StatusCode.ok)) acked.append(std.heap.page_allocator, r.header.request_id) catch return;
+                tr.answered += 1;
+                if (r.header.status == @backingInt(proto.StatusCode.ok)) {
+                    if (tr.first_ack_ms < 0) tr.first_ack_ms = @intCast(stdx.time.monotonicMs() - t0);
+                    acked.append(std.heap.page_allocator, r.header.request_id) catch return;
+                } else {
+                    if (tr.bad == 0) {
+                        const msg = std.fmt.bufPrint(&tr.first_bad, "status {d}: {s}", .{ r.header.status, r.data[0..@min(r.data.len, 120)] }) catch "";
+                        tr.first_bad_len = msg.len;
+                    }
+                    tr.bad += 1;
+                }
                 off += @sizeOf(proto.ResponseHeader) + r.header.data_len;
                 answered += 1;
                 continue;
@@ -52,9 +76,15 @@ fn putUntilClosed(port: u16, client: usize, acked: *std.ArrayList(u64)) void {
                 off = 0;
             }
             const rc = std.c.read(fd, in[got..].ptr, in.len - got);
-            if (rc == 0) return;
+            if (rc == 0) {
+                tr.end = "closed";
+                return;
+            }
             if (rc < 0) {
-                if (std.c._errno().* != @backingInt(std.c.E.AGAIN)) return;
+                if (std.c._errno().* != @backingInt(std.c.E.AGAIN)) {
+                    tr.end = "read failed";
+                    return;
+                }
                 stdx.time.sleep(std.time.ns_per_ms / 4);
                 continue;
             }
@@ -98,6 +128,15 @@ test "e2e/shutdown: SIGTERM under load stops the server promptly, and every ackn
         return error.TestUnexpectedResult;
     }
 
+    // A client with no acks at all fails below before any write is read
+    // back. It happens rarely, so far only on Linux; say what each client
+    // saw, so a run that hits it shows whether it never connected, was
+    // refused, or was never answered.
+    for (&acked, 0..) |*a, c| if (a.items.len == 0) {
+        for (traces, 0..) |t, i| std.debug.print("TRACE client {d}: connect {d} ms, first ack {d} ms, answered {d}, not ok {d} ({s}), ended '{s}' at {d} ms, acked {d}\n", .{ i, t.connect_ms, t.first_ack_ms, t.answered, t.bad, t.first_bad[0..t.first_bad_len], t.end, t.end_ms, acked[i].items.len });
+        std.debug.print("TRACE client {d} acked nothing\n", .{c});
+        break;
+    };
     try ctx.restartServer();
     // Each client's last acknowledged keys, the ones a lost flush would
     // take first, read back.

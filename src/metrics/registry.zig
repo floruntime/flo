@@ -294,6 +294,10 @@ pub const ProcessingMetrics = struct {
     errors_total: Atomic(u64) = Atomic(u64).init(0),
     /// Pipeline ticks stopped because a sink's shard was full.
     ticks_held_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Sink writes proposed and not yet applied, on every shard.
+    sink_pending: Atomic(u64) = Atomic(u64).init(0),
+    /// Sink writes refused for room at apply, their records read again.
+    sink_rewinds_total: Atomic(u64) = Atomic(u64).init(0),
 
     pub fn init() ProcessingMetrics {
         return .{};
@@ -342,6 +346,15 @@ pub const ProcessingMetrics = struct {
         _ = self.ticks_held_total.fetchAdd(1, .monotonic);
     }
 
+    /// A shard's pending sink writes moved from `was` to `now`.
+    pub fn moveSinkPending(self: *ProcessingMetrics, was: usize, now: usize) void {
+        if (now > was) _ = self.sink_pending.fetchAdd(now - was, .monotonic) else _ = self.sink_pending.fetchSub(was - now, .monotonic);
+    }
+
+    pub fn recordSinkRewind(self: *ProcessingMetrics) void {
+        _ = self.sink_rewinds_total.fetchAdd(1, .monotonic);
+    }
+
     pub const Snapshot = struct {
         active_jobs: u64,
         jobs_submitted_total: u64,
@@ -353,6 +366,8 @@ pub const ProcessingMetrics = struct {
         checkpoints_completed_total: u64,
         errors_total: u64,
         ticks_held_total: u64,
+        sink_pending: u64,
+        sink_rewinds_total: u64,
     };
 
     pub fn snapshot(self: *const ProcessingMetrics) Snapshot {
@@ -367,6 +382,8 @@ pub const ProcessingMetrics = struct {
             .checkpoints_completed_total = self.checkpoints_completed_total.load(.monotonic),
             .errors_total = self.errors_total.load(.monotonic),
             .ticks_held_total = self.ticks_held_total.load(.monotonic),
+            .sink_pending = self.sink_pending.load(.monotonic),
+            .sink_rewinds_total = self.sink_rewinds_total.load(.monotonic),
         };
     }
 };
@@ -438,6 +455,63 @@ pub const ReplicationMetrics = struct {
     }
 };
 
+/// The node's memory budget, derived on shard 0 and shown as gauges.
+/// It enforces nothing here: `pool_use_bytes` is 0 until a later change charges
+/// the pool. A non-zero `provisional_since_ms` means a data-holder hasn't
+/// reported its memory, so the budget is frozen until it does or is removed;
+/// the exposed `provisional_ms` grows with wall time until then.
+pub const MemoryBudgetMetrics = struct {
+    /// The budget shown now, held at its last clean value while provisional.
+    budget_bytes: Atomic(u64) = Atomic(u64).init(0),
+    /// The pool's use. Nothing is charged yet, so always 0.
+    pool_use_bytes: Atomic(u64) = Atomic(u64).init(0),
+    /// The smallest data-holder, which sets the budget; 0 before any derive.
+    governing_node: Atomic(u64) = Atomic(u64).init(0),
+    /// The monotonic-ms stamp the current freeze began at, or 0 when not
+    /// provisional. The duration is computed at scrape, so it grows between
+    /// applies instead of standing still until the next one.
+    provisional_since_ms: Atomic(u64) = Atomic(u64).init(0),
+    /// The unreported data-holder freezing the budget; 0 when none.
+    provisional_node: Atomic(u64) = Atomic(u64).init(0),
+
+    pub fn set(self: *MemoryBudgetMetrics, budget_bytes: u64, pool_use_bytes: u64, governing_node: u32, provisional_since_ms: u64, provisional_node: u32) void {
+        self.budget_bytes.store(budget_bytes, .monotonic);
+        self.pool_use_bytes.store(pool_use_bytes, .monotonic);
+        self.governing_node.store(governing_node, .monotonic);
+        self.provisional_since_ms.store(provisional_since_ms, .monotonic);
+        self.provisional_node.store(provisional_node, .monotonic);
+    }
+
+    pub fn init() MemoryBudgetMetrics {
+        return .{};
+    }
+
+    pub const Snapshot = struct {
+        budget_bytes: u64,
+        pool_use_bytes: u64,
+        governing_node: u64,
+        provisional_since_ms: u64,
+        provisional_node: u64,
+
+        /// Milliseconds the budget has been provisional as of `now_ms`
+        /// (monotonic); 0 when not provisional.
+        pub fn provisionalMs(self: Snapshot, now_ms: u64) u64 {
+            if (self.provisional_since_ms == 0) return 0;
+            return if (now_ms > self.provisional_since_ms) now_ms - self.provisional_since_ms else 0;
+        }
+    };
+
+    pub fn snapshot(self: *const MemoryBudgetMetrics) Snapshot {
+        return .{
+            .budget_bytes = self.budget_bytes.load(.monotonic),
+            .pool_use_bytes = self.pool_use_bytes.load(.monotonic),
+            .governing_node = self.governing_node.load(.monotonic),
+            .provisional_since_ms = self.provisional_since_ms.load(.monotonic),
+            .provisional_node = self.provisional_node.load(.monotonic),
+        };
+    }
+};
+
 /// Server-level metrics (connections, subscriptions, commands, etc.)
 pub const ServerMetrics = struct {
     /// Current active connections
@@ -461,6 +535,10 @@ pub const ServerMetrics = struct {
     /// settings: the leader that proposed them has different ones, and
     /// governs. Nonzero means the nodes' settings differ.
     queue_cap_mismatch_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Namespace ids other shards hold data under that shard 0's log has no
+    /// create for (a lost log tail): that data is out of reach. /status
+    /// lists them.
+    namespace_ids_unknown: Atomic(u64) = Atomic(u64).init(0),
     /// Server start timestamp (ms)
     start_time_ms: i64,
 
@@ -524,6 +602,7 @@ pub const ServerMetrics = struct {
         client_version_refused: u64,
         connections_rejected_total: u64,
         queue_cap_mismatch_total: u64,
+        namespace_ids_unknown: u64,
         uptime_seconds: u64,
     };
 
@@ -537,6 +616,7 @@ pub const ServerMetrics = struct {
             .client_version_refused = self.client_version_refused.load(.monotonic),
             .connections_rejected_total = self.connections_rejected_total.load(.monotonic),
             .queue_cap_mismatch_total = self.queue_cap_mismatch_total.load(.monotonic),
+            .namespace_ids_unknown = self.namespace_ids_unknown.load(.monotonic),
             .uptime_seconds = self.uptimeSeconds(),
         };
     }
@@ -654,8 +734,9 @@ pub const ShardMetrics = struct {
     snapshot_skipped_leader_not_ready: Atomic(u64) = Atomic(u64).init(0),
     /// Processing KV sink writes from other shards waiting here for room
     /// (gauge), and those dropped because that list was full (cumulative).
-    kv_sink_retry_pending: Atomic(u64) = Atomic(u64).init(0),
-    kv_sink_retry_overflow: Atomic(u64) = Atomic(u64).init(0),
+    sink_retry_pending: Atomic(u64) = Atomic(u64).init(0),
+    sink_retry_bytes: Atomic(u64) = Atomic(u64).init(0),
+    sink_retry_overflow: Atomic(u64) = Atomic(u64).init(0),
     /// The last snapshot bar's index, and the logical bytes applied since.
     bar_last: Atomic(u64) = Atomic(u64).init(0),
     bar_bytes: Atomic(u64) = Atomic(u64).init(0),
@@ -855,8 +936,9 @@ pub const ShardMetrics = struct {
         persist_failures: u64,
         flushes_failing_for_ms: u64,
         snapshot_skipped_leader_not_ready: u64,
-        kv_sink_retry_pending: u64,
-        kv_sink_retry_overflow: u64,
+        sink_retry_pending: u64,
+        sink_retry_bytes: u64,
+        sink_retry_overflow: u64,
         bar_last: u64,
         bar_bytes: u64,
         hardstate_failures: u64,
@@ -908,8 +990,9 @@ pub const ShardMetrics = struct {
             .persist_failures = self.persist_failures.load(.monotonic),
             .flushes_failing_for_ms = self.flushes_failing_for_ms.load(.monotonic),
             .snapshot_skipped_leader_not_ready = self.snapshot_skipped_leader_not_ready.load(.monotonic),
-            .kv_sink_retry_pending = self.kv_sink_retry_pending.load(.monotonic),
-            .kv_sink_retry_overflow = self.kv_sink_retry_overflow.load(.monotonic),
+            .sink_retry_pending = self.sink_retry_pending.load(.monotonic),
+            .sink_retry_bytes = self.sink_retry_bytes.load(.monotonic),
+            .sink_retry_overflow = self.sink_retry_overflow.load(.monotonic),
             .bar_last = self.bar_last.load(.monotonic),
             .bar_bytes = self.bar_bytes.load(.monotonic),
             .hardstate_failures = self.hardstate_failures.load(.monotonic),
@@ -994,6 +1077,9 @@ pub const MetricsRegistry = struct {
     /// Replication metrics (singleton - one per node)
     replication: ReplicationMetrics,
 
+    /// Memory-budget metrics (singleton - one per node), derived on shard 0.
+    memory_budget: MemoryBudgetMetrics,
+
     /// Per-shard metrics for the thread-per-shard architecture.
     /// Indexed by shard_id. Null until initShards() is called.
     shard_counters: ?[]ShardMetrics,
@@ -1037,6 +1123,7 @@ pub const MetricsRegistry = struct {
             .workflow = WorkflowMetrics.init(),
             .processing = ProcessingMetrics.init(),
             .replication = ReplicationMetrics.init(),
+            .memory_budget = MemoryBudgetMetrics.init(),
             .shard_counters = null,
             .num_shards = 0,
             .mutex = @import("stdx").Mutex{},
@@ -1383,6 +1470,11 @@ pub const MetricsRegistry = struct {
         // Export replication metrics
         try writeReplicationMetrics(writer, self.replication.snapshot());
 
+        // Export memory-budget metrics. The provisional duration is computed
+        // here, at scrape, so it grows with time rather than standing still
+        // between budget re-derivations.
+        try writeMemoryBudgetMetrics(writer, self.memory_budget.snapshot(), @import("stdx").time.monotonicMs());
+
         return aw.toOwnedSlice();
     }
 
@@ -1444,6 +1536,10 @@ fn writeServerMetrics(writer: anytype, snapshot: ServerMetrics.Snapshot) !void {
     try writer.print("# HELP flo_queue_cap_mismatch_total Enqueues applied under a leader's queue caps that differ from this node's own\n", .{});
     try writer.print("# TYPE flo_queue_cap_mismatch_total counter\n", .{});
     try writer.print("flo_queue_cap_mismatch_total {d}\n", .{snapshot.queue_cap_mismatch_total});
+
+    try writer.print("# HELP flo_namespace_ids_unknown Namespace ids other shards hold data under that shard 0's log has no create for; /status lists them\n", .{});
+    try writer.print("# TYPE flo_namespace_ids_unknown gauge\n", .{});
+    try writer.print("flo_namespace_ids_unknown {d}\n", .{snapshot.namespace_ids_unknown});
 
     // Uptime
     try writer.print("# HELP flo_uptime_seconds Server uptime in seconds\n", .{});
@@ -1638,6 +1734,12 @@ fn writeProcessingMetrics(writer: anytype, snapshot: ProcessingMetrics.Snapshot)
     try writer.print("# HELP flo_processing_ticks_held_total Pipeline ticks stopped because a sink's shard was full\n", .{});
     try writer.print("# TYPE flo_processing_ticks_held_total counter\n", .{});
     try writer.print("flo_processing_ticks_held_total {d}\n", .{snapshot.ticks_held_total});
+    try writer.print("# HELP flo_processing_sink_pending Sink writes proposed and not yet applied\n", .{});
+    try writer.print("# TYPE flo_processing_sink_pending gauge\n", .{});
+    try writer.print("flo_processing_sink_pending {d}\n", .{snapshot.sink_pending});
+    try writer.print("# HELP flo_processing_sink_rewinds_total Sink writes refused for room at apply, their records read again\n", .{});
+    try writer.print("# TYPE flo_processing_sink_rewinds_total counter\n", .{});
+    try writer.print("flo_processing_sink_rewinds_total {d}\n", .{snapshot.sink_rewinds_total});
 }
 
 /// Write replication metrics in Prometheus format
@@ -1665,6 +1767,28 @@ fn writeReplicationMetrics(writer: anytype, snapshot: ReplicationMetrics.Snapsho
     try writer.print("\n# HELP flo_replication_peers_linked Peer links up right now\n", .{});
     try writer.print("# TYPE flo_replication_peers_linked gauge\n", .{});
     try writer.print("flo_replication_peers_linked {d}\n", .{snapshot.peers_linked});
+}
+
+fn writeMemoryBudgetMetrics(writer: anytype, snapshot: MemoryBudgetMetrics.Snapshot, now_ms: u64) !void {
+    try writer.print("\n# HELP flo_memory_budget_bytes The node's per-node memory budget, held at its last clean value while provisional\n", .{});
+    try writer.print("# TYPE flo_memory_budget_bytes gauge\n", .{});
+    try writer.print("flo_memory_budget_bytes {d}\n", .{snapshot.budget_bytes});
+
+    try writer.print("\n# HELP flo_memory_budget_pool_use_bytes The pool's use against the budget (0 until the pool is charged)\n", .{});
+    try writer.print("# TYPE flo_memory_budget_pool_use_bytes gauge\n", .{});
+    try writer.print("flo_memory_budget_pool_use_bytes {d}\n", .{snapshot.pool_use_bytes});
+
+    try writer.print("\n# HELP flo_memory_budget_governing_node The smallest data-holder, which sets the budget (0 before any derive)\n", .{});
+    try writer.print("# TYPE flo_memory_budget_governing_node gauge\n", .{});
+    try writer.print("flo_memory_budget_governing_node {d}\n", .{snapshot.governing_node});
+
+    try writer.print("\n# HELP flo_memory_budget_provisional_ms How long the budget has been frozen for an unreported data-holder\n", .{});
+    try writer.print("# TYPE flo_memory_budget_provisional_ms gauge\n", .{});
+    try writer.print("flo_memory_budget_provisional_ms {d}\n", .{snapshot.provisionalMs(now_ms)});
+
+    try writer.print("\n# HELP flo_memory_budget_provisional_node The unreported data-holder freezing the budget (0 when none)\n", .{});
+    try writer.print("# TYPE flo_memory_budget_provisional_node gauge\n", .{});
+    try writer.print("flo_memory_budget_provisional_node {d}\n", .{snapshot.provisional_node});
 }
 
 /// Write per-shard metrics in Prometheus format
@@ -1702,8 +1826,9 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_persist_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.persist_failures });
     try writer.print("flo_shard_flushes_failing_for_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.flushes_failing_for_ms / 1000, snap.flushes_failing_for_ms % 1000 });
     try writer.print("flo_shard_snapshot_skipped_total{{shard_id=\"{d}\",reason=\"leader_not_ready\"}} {d}\n", .{ snap.shard_id, snap.snapshot_skipped_leader_not_ready });
-    try writer.print("flo_shard_kv_sink_retry_pending{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.kv_sink_retry_pending });
-    try writer.print("flo_shard_kv_sink_retry_overflow_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.kv_sink_retry_overflow });
+    try writer.print("flo_shard_sink_retry_pending{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.sink_retry_pending });
+    try writer.print("flo_shard_sink_retry_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.sink_retry_bytes });
+    try writer.print("flo_shard_sink_retry_overflow_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.sink_retry_overflow });
     try writer.print("flo_shard_snapshot_bar_last{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bar_last });
     try writer.print("flo_shard_snapshot_bar_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bar_bytes });
     try writer.print("flo_shard_hardstate_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.hardstate_failures });
@@ -2011,4 +2136,18 @@ test "MetricsRegistry: a shard writing through its metrics while another thread 
     for (0..writes) |_| queue.recordEnqueue(1, 1);
     thread.join();
     try std.testing.expectEqual(@as(u64, writes), (try registry.registerQueue("ns", "held")).snapshot().enqueue_ops_total);
+}
+
+test "MemoryBudgetMetrics: provisional_ms is computed at scrape, so it grows with time" {
+    var m = MemoryBudgetMetrics.init();
+    // Not provisional: 0 whatever the clock reads.
+    m.set(100, 0, 7, 0, 0);
+    try std.testing.expectEqual(@as(u64, 0), m.snapshot().provisionalMs(5000));
+    // Provisional since t=1000, node 9: the duration grows between applies.
+    m.set(100, 0, 7, 1000, 9);
+    try std.testing.expectEqual(@as(u64, 0), m.snapshot().provisionalMs(1000));
+    try std.testing.expectEqual(@as(u64, 4000), m.snapshot().provisionalMs(5000));
+    // A clock reading before the stamp (skew) never goes negative.
+    try std.testing.expectEqual(@as(u64, 0), m.snapshot().provisionalMs(500));
+    try std.testing.expectEqual(@as(u64, 9), m.snapshot().provisional_node);
 }

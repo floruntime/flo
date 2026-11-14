@@ -881,6 +881,15 @@ pub const KVHandler = struct {
         comptime entry_type: entry_mod.EntryType,
         payload: kv_entries.Payload(@backingInt(entry_type)).Value,
     ) !@import("../raft/node.zig").ProposeResult {
+        return proposeKVFlagged(shard, entry_type, entry_mod.Flags.NONE, payload);
+    }
+
+    fn proposeKVFlagged(
+        shard: *Shard,
+        comptime entry_type: entry_mod.EntryType,
+        flags: u16,
+        payload: kv_entries.Payload(@backingInt(entry_type)).Value,
+    ) !@import("../raft/node.zig").ProposeResult {
         const P = kv_entries.Payload(@backingInt(entry_type));
         comptime std.debug.assert(P.max_size <= MAX_KEY_ENTRY_PAYLOAD);
         // A write runs once its namespace is known here (`prepareWrite`); a
@@ -890,7 +899,7 @@ pub const KVHandler = struct {
         const buf = shard.scratch.borrow(size);
         defer shard.scratch.release(buf);
         const bytes = P.encodeInto(buf, payload) catch |err| return encodeError(err);
-        return try shard.raft_node.propose(entry_type, entry_mod.Flags.NONE, bytes);
+        return try shard.raft_node.propose(entry_type, flags, bytes);
     }
 
     /// For tests: propose a put of `value` at `key` in the default
@@ -919,51 +928,10 @@ pub const KVHandler = struct {
         return t;
     }
 
-    // ── Sink put ─────────────────────────────────────────────────────────
-
-    /// A sink's write for the shard that owns its key, as an inbox message
-    /// carries it: `[ns len u8][ns][ttl? u8][ttl u64][key len u16][key][value]`.
-    /// The key is as the sink named it; the owner finds the namespace's id.
-    pub const SinkPut = struct {
-        namespace: []const u8,
-        key: []const u8,
-        value: []const u8,
-        ttl_ms: ?u64,
-
-        /// The message's bytes, owned by the caller (the receiver frees
-        /// them), or null out of memory.
-        pub fn encode(self: SinkPut, allocator: Allocator) ?[]u8 {
-            const buf = allocator.alloc(u8, 1 + self.namespace.len + 9 + 2 + self.key.len + self.value.len) catch return null;
-            var off: usize = 0;
-            buf[0] = @intCast(self.namespace.len);
-            @memcpy(buf[1..][0..self.namespace.len], self.namespace);
-            off = 1 + self.namespace.len;
-            buf[off] = @intFromBool(self.ttl_ms != null);
-            std.mem.writeInt(u64, buf[off + 1 ..][0..8], self.ttl_ms orelse 0, .little);
-            off += 9;
-            std.mem.writeInt(u16, buf[off..][0..2], @intCast(self.key.len), .little);
-            off += 2;
-            @memcpy(buf[off..][0..self.key.len], self.key);
-            off += self.key.len;
-            @memcpy(buf[off..][0..self.value.len], self.value);
-            return buf;
-        }
-
-        pub fn decode(bytes: []const u8) ?SinkPut {
-            if (bytes.len < 1) return null;
-            const ns_end = 1 + @as(usize, bytes[0]);
-            if (bytes.len < ns_end + 11) return null;
-            const ttl: ?u64 = if (bytes[ns_end] != 0) std.mem.readInt(u64, bytes[ns_end + 1 ..][0..8], .little) else null;
-            const key_len = std.mem.readInt(u16, bytes[ns_end + 9 ..][0..2], .little);
-            const key_at = ns_end + 11;
-            if (bytes.len < key_at + key_len) return null;
-            return .{ .namespace = bytes[1..ns_end], .key = bytes[key_at..][0..key_len], .value = bytes[key_at + key_len ..], .ttl_ms = ttl };
-        }
-    };
-
     /// What became of a processing KV sink's write.
     pub const SinkResult = union(enum) {
-        proposed,
+        /// In the log, not yet applied.
+        proposed: @import("../raft/node.zig").ProposeResult,
         /// The shard can take no more writes for now: the sink holds its
         /// source, or its message, and tries again.
         held,
@@ -984,7 +952,7 @@ pub const KVHandler = struct {
             return .{ .dropped = "the namespace isn't created on this shard yet" };
         }
         var kbuf: [MAX_KV_KEY]u8 = undefined;
-        _ = proposeKV(shard, .kv_put, .{ .key = Key.init(&kbuf, ns_id, raw_key).stored, .value = value, .ttl_ms = ttl_ms, .condition = .always, .cas_version = null }) catch |err| return switch (err) {
+        const proposed = proposeKVFlagged(shard, .kv_put, entry_mod.Flags.SINK, .{ .key = Key.init(&kbuf, ns_id, raw_key).stored, .value = value, .ttl_ms = ttl_ms, .condition = .always, .cas_version = null }) catch |err| return switch (err) {
             error.Overloaded => .held,
             error.NotLeader => .{ .dropped = "this node doesn't lead its group" },
             error.WritesStopped => .{ .dropped = "the shard stopped taking writes" },
@@ -992,7 +960,7 @@ pub const KVHandler = struct {
             else => .{ .dropped = @errorName(err) },
         };
         shard.namespace_handler.markNamespaceHasData(namespace, shard);
-        return .proposed;
+        return .{ .proposed = proposed };
     }
 
     // ── Blocking GET Waiter Management ──────────────────────────────────

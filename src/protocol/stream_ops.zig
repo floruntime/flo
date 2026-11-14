@@ -54,8 +54,8 @@ pub const table = [_]ops.Op{
         .name = "stream.group.list",
         .code = 0x15D,
         .class = .read,
-        // On the stream's shard, answered by its leader, which alone holds
-        // members and pending entries.
+        // On the stream's shard, answered by its leader, which has applied
+        // every lease it granted.
         .at_leader = true,
         .route = .key,
         .request = Record(&.{}),
@@ -65,7 +65,7 @@ pub const table = [_]ops.Op{
         }),
         // Generated, under the hand-written `stream group`.
         .cli = .{ .expose = .hand, .key = .{ .name = "stream", .doc = "The stream's name" }, .render = .record, .examples = &.{"flo stream group list orders"} },
-        .doc = "A stream's consumer groups: members, pending entries, settings and the last record delivered. Members and pending are the leader's, and a leader change starts them again.",
+        .doc = "A stream's consumer groups: each one's members (the consumers holding its records now), its records out, its settings and the last record its cursor took. All of it is logged, so a leader change keeps it.",
     },
     .{
         .name = "stream.group.members",
@@ -81,7 +81,7 @@ pub const table = [_]ops.Op{
             .{ .name = "more", .T = schema.Bool, .doc = "The group has more members than the answer holds" },
         }),
         .cli = .{ .expose = .hand, .key = .{ .name = "stream", .doc = "The stream's name" }, .args = &.{"group"}, .render = .record, .examples = &.{"flo stream group members orders billing"} },
-        .doc = "A consumer group's members: each one's state, its pending entries, when it joined and when it was last delivered to. All of it is the leader's, and a leader change starts it again.",
+        .doc = "A consumer group's members: the consumers holding its records now, each with how many it holds, when it first took one it still holds, and when it last took one. All of it is logged, so a leader change keeps it.",
     },
 };
 

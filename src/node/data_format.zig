@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 22;
+pub const CURRENT: u32 = 25;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -74,10 +74,18 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // shards a key's owner differs. SYSTEM no longer records partitions.
     // The layouts are unchanged.
     .{ .format = 21, .segment_version = 13, .entries = 0x6a7954352202e5d7 },
+    // Namespace binds are gone: shards read names from the namespace table.
+    .{ .format = 22, .segment_version = 14, .entries = 0x7356ae3192283144 },
+    // A group release says how its records were handed back (failed,
+    // abandoned or unread), not whether the leader freed them.
+    .{ .format = 23, .segment_version = 15, .entries = 0xc9eb5825e509ecdd },
+    // The cluster-settings entries (the memory-budget pool share and per-node
+    // RAM) are logged, so their layouts join the pinned hash.
+    .{ .format = 24, .segment_version = 16, .entries = 0x55eb3403850faf9 },
     // No entry names a shard: an action invoke and run drop the caller's
     // shard (the calling workflow's name says it), and an action extend
     // names its delivery's count, checked at apply.
-    .{ .format = 22, .segment_version = 14, .entries = 0xc5c15961ead005db },
+    .{ .format = 25, .segment_version = 17, .entries = 0xf5b0a7ef40e425d2 },
 };
 
 comptime {

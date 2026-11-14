@@ -19,6 +19,7 @@ const namespace_entries = @import("namespace_entries.zig");
 const action_entries = @import("action_entries.zig");
 const queue_entries = @import("queue_entries.zig");
 const group_entries = @import("group_entries.zig");
+const settings_entries = @import("settings_entries.zig");
 const golden = @import("golden.zig");
 const proto = @import("proto.zig");
 const EntryType = @import("../storage/ual/entry.zig").EntryType;
@@ -26,7 +27,7 @@ const EntryType = @import("../storage/ual/entry.zig").EntryType;
 pub const op_table = system_ops.table ++ namespace_ops.table ++ kv_ops.table ++ stream_ops.table ++ queue_ops.table ++ ts_ops.table ++ action_ops.table ++ worker_ops.table ++ processing_ops.table;
 /// The groups the table's ops form under their families.
 pub const op_groups = kv_ops.groups;
-pub const entry_table = kv_entries.table ++ namespace_entries.table ++ action_entries.table ++ queue_entries.table ++ group_entries.table;
+pub const entry_table = kv_entries.table ++ namespace_entries.table ++ action_entries.table ++ queue_entries.table ++ group_entries.table ++ settings_entries.table;
 
 comptime {
     ops.check(&op_table);
@@ -71,7 +72,7 @@ pub fn creates(code: u16) bool {
 /// are hashed by name and value, and the golden vectors by their bytes, so
 /// adding one of those or changing a vectored layout needs no bump. It goes
 /// once that list is empty.
-pub const HAND_LAYOUT_EPOCH: u32 = 10;
+pub const HAND_LAYOUT_EPOCH: u32 = 11;
 
 pub const HASH: u64 = hash(&op_table, &entry_table, HAND_LAYOUT_EPOCH);
 

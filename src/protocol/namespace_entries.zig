@@ -1,8 +1,7 @@
-//! The namespace family's log entries. A create is logged on shard 0, the
-//! namespace's one owner, and names the id it gives the namespace. A bind
-//! is logged on any other shard before its first write in that namespace,
-//! so the shard's own log says which id a name is: replaying it never
-//! needs shard 0.
+//! The namespace family's log entry: a create, logged on shard 0, the
+//! namespaces' one owner, naming the id it gives the namespace. Other
+//! shards' entries carry only the id; they read the name from the node's
+//! namespace table, which shard 0 publishes.
 
 const std = @import("std");
 const schema = @import("schema.zig");
@@ -18,14 +17,8 @@ pub const Create = Record(&.{
     .{ .name = "id", .T = Id },
 });
 
-pub const Bind = Record(&.{
-    .{ .name = "id", .T = Id },
-    .{ .name = "name", .T = namespace_ops.Name },
-});
-
 pub const table = [_]entries.Entry{
     .{ .name = "namespace.create", .type_code = 0x60, .payload = Create, .max_payload = Create.max_size, .doc = "A namespace created, with its id." },
-    .{ .name = "namespace.bind", .type_code = 0x63, .payload = Bind, .max_payload = Bind.max_size, .doc = "A shard's record that a name is that id, before the shard's first write in it." },
 };
 
 /// The payload schema of entry type `code`.

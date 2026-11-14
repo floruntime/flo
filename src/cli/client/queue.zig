@@ -136,7 +136,7 @@ pub fn list(client: *Client, namespace: []const u8, limit: ?u32, cursor: ?[]cons
 
 /// A `queue_dlq_list` page:
 ///   [count:u32] ([seq:u64][size:u32][len:u32][payload][enqueued_at_ms:i64]
-///                [attempts:u32][priority:u8][moved_at_ms:i64])*
+///                [deliveries:u32][priority:u8][moved_at_ms:i64])*
 ///   [total:u64][has_more:u8][last_seq:u64]
 pub const DlqPage = struct {
     count: u32,
@@ -151,7 +151,7 @@ pub const DlqPage = struct {
         size: u32,
         payload: []const u8,
         enqueued_at_ms: i64,
-        attempts: u32,
+        deliveries: u32,
         priority: u8,
         moved_at_ms: i64,
     };
@@ -178,7 +178,7 @@ pub const DlqPage = struct {
             .size = size,
             .payload = r.readLengthPrefixed(u32) orelse return null,
             .enqueued_at_ms = r.readI64() orelse return null,
-            .attempts = r.readU32() orelse return null,
+            .deliveries = r.readU32() orelse return null,
             .priority = r.readU8() orelse return null,
             .moved_at_ms = r.readI64() orelse return null,
         };
@@ -210,7 +210,7 @@ test "a dead-letter page decodes entry by entry, and a cut one is refused" {
     const e = it.next().?;
     try std.testing.expectEqualStrings("hi", e.payload);
     try std.testing.expectEqual(@as(u32, 5000), e.size);
-    try std.testing.expectEqual(@as(u32, 3), e.attempts);
+    try std.testing.expectEqual(@as(u32, 3), e.deliveries);
     try std.testing.expect(it.next() == null);
     for (0..page.len) |n| try std.testing.expect(DlqPage.decode(page[0..n]) == null);
 }

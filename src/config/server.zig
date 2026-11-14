@@ -41,7 +41,8 @@ pub const TieredLogConfig = tiered_log_config.TieredLogConfig;
 /// Maximum shards per node: a cross-shard message names its sender in one byte.
 pub const MAX_SHARDS: u16 = 256;
 
-/// What a config or command line that still sets the partition count is told.
+/// What a config that still sets the partition count is told, whatever its
+/// value or type.
 pub const PARTITIONS_GONE = "partition_count is no longer a setting: every cluster has 4096 key partitions; remove it from the config";
 
 /// How long a worker may go without a heartbeat.
@@ -231,8 +232,6 @@ const sections = [_]Section{
             .{ .name = "data_dir", .kind = .string },
             // Range-checked by load, which names the automatic value.
             .{ .name = "shards", .kind = .integer, .min = std.math.minInt(i64) },
-            // Refused by load, naming the fix.
-            .{ .name = "partition_count", .kind = .integer, .min = std.math.minInt(i64) },
             .{ .name = "max_connections", .kind = .integer, .min = 0, .max = std.math.maxInt(u32) },
         },
     },
@@ -296,6 +295,7 @@ const removed = [_]struct { name: []const u8, why: []const u8 }{
     .{ .name = "background_tasks", .why = "[background_tasks] was removed: namespace delete is refused, so there is no deletion task to tune. Remove the section." },
     .{ .name = "kv.expose_internal_keys", .why = "[kv] expose_internal_keys was never read: internal keys stay hidden. Remove the line." },
     .{ .name = "storage.max_local_segments", .why = "[storage] max_local_segments isn't wired up: nothing reads it. Remove the line." },
+    .{ .name = "server.partition_count", .why = "[server] " ++ PARTITIONS_GONE },
     .{ .name = "storage.enable_wal_truncation", .why = "[storage] enable_wal_truncation isn't wired up: nothing reads it. Remove the line." },
 };
 
@@ -440,10 +440,6 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
                 return error.InvalidShardCount;
             }
             config.shards = @intCast(s);
-        }
-        if (server.getInt("partition_count") != null) {
-            log.err("[server] {s}", .{PARTITIONS_GONE});
-            return error.InvalidSetting;
         }
         if (server.getInt("max_connections")) |mc| {
             if (mc < 0 or mc > std.math.maxInt(u32)) {
@@ -860,19 +856,19 @@ test "a shard count out of range is refused, not cast, from the file or the comm
     try std.testing.expectEqual(MAX_SHARDS, config.shards);
 }
 
-test "partition_count is refused at any value, the automatic one too" {
+test "partition_count is refused at any value or type, the automatic one too" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try @import("stdx").fs.dirRealpathAlloc(tmp.dir, allocator, ".");
     defer allocator.free(dir);
-    for ([_][]const u8{ "[server]\npartition_count = 0\n", "[server]\npartition_count = 4096\n", "[server]\npartition_count = 16385\n" }) |body| {
+    for ([_][]const u8{ "[server]\npartition_count = 0\n", "[server]\npartition_count = 4096\n", "[server]\npartition_count = 16385\n", "[server]\npartition_count = \"auto\"\n" }) |body| {
         const path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{dir});
         defer allocator.free(path);
         const f = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
         try @import("stdx").fs.writeAll(f, body);
         @import("stdx").fs.closeFile(f);
-        try std.testing.expectError(error.InvalidSetting, load(allocator, path));
+        try std.testing.expectError(error.UnknownSetting, load(allocator, path));
     }
 }
 

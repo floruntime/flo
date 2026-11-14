@@ -38,7 +38,10 @@ const Node = struct {
         if (refused) |says| {
             if (!out.contains(says)) std.debug.print("expected the refusal to say: {s}\ngot: {s}{s}\n", .{ says, out.stdout, out.stderr });
             try testing.expect(out.contains(says));
-            try testing.expect(out.contains("overloaded"));
+            // Its own reason, and the CLI's exit for a refusal to retry.
+            if (!out.contains("[overloaded/queue_full]")) std.debug.print("expected [overloaded/queue_full]: {s}{s}\n", .{ out.stdout, out.stderr });
+            try testing.expect(out.contains("[overloaded/queue_full]"));
+            try testing.expectEqual(@as(u8, 4), out.exit_code);
         } else {
             if (out.exit_code != 0 or out.contains("overloaded")) std.debug.print("enqueue refused: {s}{s}\n", .{ out.stdout, out.stderr });
             try testing.expectEqual(@as(u8, 0), out.exit_code);
@@ -88,7 +91,7 @@ test "e2e/queue-cap: a lowered shard_held_bytes counts every queue on the shard"
     defer testing.allocator.free(big);
     @memset(big, 'x');
     try node.enqueue("a", big, null);
-    try node.enqueue("b", big[0..10_000], "this shard's queues hold 60512 held bytes, at most 65536");
+    try node.enqueue("b", big[0..10_000], "this shard's queues and groups hold 60512 held bytes, at most 65536");
 }
 
 test "e2e/queue-cap: empty messages across many queues fill a shard, each holding its overhead" {
@@ -98,7 +101,7 @@ test "e2e/queue-cap: empty messages across many queues fill a shard, each holdin
     // 65536 / 512: 128 empty messages fit, one to a queue.
     var name_buf: [16]u8 = undefined;
     for (0..128) |i| try node.enqueue(try std.fmt.bufPrint(&name_buf, "q{d}", .{i}), "", null);
-    try node.enqueue("q128", "", "this shard's queues hold 65536 held bytes, at most 65536");
+    try node.enqueue("q128", "", "this shard's queues and groups hold 65536 held bytes, at most 65536");
 }
 
 fn expectRefused(config: ServerProcess.ServerConfig, says: []const u8) !void {
@@ -178,4 +181,23 @@ test "e2e/queue-cap: nodes with other caps than the leader's apply its enqueues,
         counted += 1;
     };
     try testing.expectEqual(@as(usize, 2), counted);
+}
+
+test "e2e/queue-cap: a group read past its caps is refused group_held_full until its records are acked" {
+    const node = try Node.start(.{ .shards = 1, .extra_config = "[queues]\nmax_messages = 2\n" });
+    defer node.deinit();
+    errdefer node.server.dumpLogTail();
+    var append = try node.cli.run(&.{ "stream", "append", "s", "a", "b", "c" });
+    defer append.deinit();
+    try testing.expectEqual(@as(u8, 0), append.exit_code);
+    var first = try node.cli.run(&.{ "stream", "group", "read", "s", "--group", "g", "--consumer", "w", "--limit", "3" });
+    defer first.deinit();
+    try testing.expectEqual(@as(u8, 0), first.exit_code);
+    // Two held, none acked: the next read takes nothing, and says why.
+    var full = try node.cli.run(&.{ "stream", "group", "read", "s", "--group", "g", "--consumer", "w" });
+    defer full.deinit();
+    if (!full.contains("[overloaded/group_held_full]")) std.debug.print("expected [overloaded/group_held_full]: {s}{s}\n", .{ full.stdout, full.stderr });
+    try testing.expect(full.contains("[overloaded/group_held_full]"));
+    try testing.expect(full.contains("group 'g' on stream 's' is full: it holds 2 records (at most 2)"));
+    try testing.expectEqual(@as(u8, 4), full.exit_code);
 }

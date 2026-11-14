@@ -407,11 +407,65 @@ test "e2e/group: a removed group op is refused, naming what replaces it" {
         .{ .op = .stream_group_claim, .says = "groups have no claim: a read takes expired and nacked records" },
         .{ .op = .stream_group_configure_sweeper, .says = "set when it is created" },
     };
-    for (cases) |c| {
-        var r = try conn.sendRequest(c.op, "default", "s", "\x01\x00g");
+    // In a namespace that exists, and in one never created: either way the
+    // answer names what replaces the op.
+    for ([_][]const u8{ "default", "never-made" }) |ns| for (cases) |c| {
+        var r = try conn.sendRequest(c.op, ns, "s", "\x01\x00g");
         defer r.deinit();
         try testing.expect(r.isError());
-        if (std.mem.indexOf(u8, r.errorMessage(), c.says) == null) std.debug.print("{s}: {s}\n", .{ @tagName(c.op), r.errorMessage() });
+        if (std.mem.indexOf(u8, r.errorMessage(), c.says) == null) std.debug.print("{s} in {s}: {s}\n", .{ @tagName(c.op), ns, r.errorMessage() });
         try testing.expect(std.mem.indexOf(u8, r.errorMessage(), c.says) != null);
+    };
+}
+
+test "e2e/group: an ack or nack to a group that isn't there is refused not found, and a nack's error up to 1024 bytes is kept" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "stream", "append", "s", "a" });
+    var r = try read(ctx, "s", "w", "1");
+    defer r.deinit();
+    var db: [256]u8 = undefined;
+    const ds = try deliveries(&db, r.stdout);
+    var none = try ctx.cli.run(&.{ "stream", "group", "ack", "s", "--group", "nope", "--consumer", "w", "--ids", ds });
+    defer none.deinit();
+    try testing.expect(none.exit_code != 0);
+    try testing.expect(none.stderrContains("consumer group not found"));
+    // An error past an option's 255 bytes rides in the body whole.
+    const long: [1000]u8 = @splat('e');
+    var nack = try ctx.cli.run(&.{ "stream", "group", "nack", "s", "--group", "g", "--consumer", "w", "--ids", ds, "--error", &long });
+    defer nack.deinit();
+    try testing.expect(nack.stdoutContains("Failed 1 record(s)"));
+    var pending = try ctx.cli.run(&.{ "stream", "group", "read", "s", "--group", "g", "--consumer", "w", "-o", "json" });
+    defer pending.deinit();
+    try testing.expect(pending.stdoutContains("\"deliveries\":2"));
+}
+
+test "e2e/group: an abandoned record goes again at once and spends no attempt; abandon with a failure's options is refused" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    // One attempt: a single nack would kill it.
+    try ctx.exec(&.{ "stream", "group", "create", "s", "--group", "g", "--max-deliver", "1" });
+    try ctx.exec(&.{ "stream", "append", "s", "job" });
+    var db: [256]u8 = undefined;
+    for (1..4) |n| {
+        var r = try read(ctx, "s", "w", "1");
+        defer r.deinit();
+        try testing.expect(r.stdoutContains("\"data\":\"job\""));
+        var want: [32]u8 = undefined;
+        try testing.expect(r.stdoutContains(try std.fmt.bufPrint(&want, "\"deliveries\":{d}", .{n})));
+        const ds = try deliveries(&db, r.stdout);
+        if (n == 1) {
+            // Abandon is the hand-back alone.
+            for ([_][]const u8{ "--dlq", "--error=boom" }) |extra| {
+                var bad = try ctx.cli.run(&.{ "stream", "group", "nack", "s", "--group", "g", "--consumer", "w", "--ids", ds, "--abandon", extra });
+                defer bad.deinit();
+                try testing.expect(bad.exit_code != 0);
+                try testing.expect(bad.stderrContains("abandon hands records back unstarted, so it takes no dead, delay_ms or error"));
+            }
+        }
+        var back = try ctx.cli.run(&.{ "stream", "group", "nack", "s", "--group", "g", "--consumer", "w", "--ids", ds, "--abandon" });
+        defer back.deinit();
+        try testing.expect(back.stdoutContains("Handed back 1 record(s)"));
     }
+    try testing.expect(try infoHas(ctx, "s", "\"ready\":1,\"leased\":0,\"dead\":0"));
 }

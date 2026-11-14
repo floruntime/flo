@@ -499,7 +499,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         },
         .group_release => {
             const p = ge.Release.decodeAll(e.payload, &diag) catch return error.Halt;
-            try report(view, out, p, .{ .release = .{ .delay_ms = p.delay_ms, .dead = p.dead, .@"error" = p.@"error", .free = p.free } }, stamp);
+            try report(view, out, p, .{ .release = .{ .delay_ms = p.delay_ms, .dead = p.dead, .@"error" = p.@"error", .ended = p.ended } }, stamp);
         },
         .group_extend => {
             const p = ge.Extend.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -667,8 +667,8 @@ fn deliverApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     if (n == 0 and capped) {
         const held = meta.ready + meta.leased + meta.dead;
         if (held + 1 > p.max_held or meta.held_bytes + each > p.max_held_bytes)
-            return out.refuseFmt(.overloaded, .unclassified, FULL, .{ p.group, p.stream, held, p.max_held, meta.held_bytes, p.max_held_bytes });
-        return out.refuseFmt(.overloaded, .unclassified, SHARD_FULL, .{ shard_held, p.shard_held_bytes });
+            return out.refuseFmt(.overloaded, .group_held_full, FULL, .{ p.group, p.stream, held, p.max_held, meta.held_bytes, p.max_held_bytes });
+        return out.refuseFmt(.overloaded, .group_held_full, SHARD_FULL, .{ shard_held, p.shard_held_bytes });
     }
     if (took_fresh > 0) try hold(view, &meta, each * took_fresh);
 
@@ -713,7 +713,7 @@ fn deliverApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
 
 const Report = union(enum) {
     settle,
-    release: struct { delay_ms: u64, dead: bool, @"error": []const u8, free: bool },
+    release: struct { delay_ms: u64, dead: bool, @"error": []const u8, ended: ge.HandBack },
     extend: struct { lease_ms: u64, held_since_ns: u64 },
 };
 
@@ -728,6 +728,8 @@ fn report(view: *View, out: *Result, p: anytype, kind: Report, stamp: u64) Apply
     const found = try view.get(Metas, mk);
     const rec = try streamRec(view, streamOf(ns, p.stream));
     var meta = if (found) |m| (if (live(m.v, rec) and std.mem.eql(u8, m.v.stream, p.stream) and std.mem.eql(u8, m.v.group, p.group)) m else null) else null;
+    // No such group: the whole report is refused, not each record gone.
+    if (meta == null) return out.refuse(.not_found, .not_found, NO_GROUP);
     var applied: u32 = 0;
     var to: u64 = 0;
     // Refused items are said after the count: room for each, then filled.
@@ -747,7 +749,7 @@ fn report(view: *View, out: *Result, p: anytype, kind: Report, stamp: u64) Apply
             const same = delivery.sameDelivery(item.v, p.holder, named.deliveries, p.token);
             const repeat = same and switch (kind) {
                 .settle, .extend => false,
-                .release => item.v.ended == .released,
+                .release => item.v.ended == .released or item.v.ended == .abandoned,
             };
             if (repeat) {
                 applied += 1;
@@ -768,11 +770,12 @@ fn report(view: *View, out: *Result, p: anytype, kind: Report, stamp: u64) Apply
             },
             .release => |r| {
                 try M.endLease(view, ns, &id, item.v, p.holder, null, p.expiry_ns);
-                if (r.free) {
-                    // Handed back by the leader, never seen: no failure,
-                    // and not a delivery.
+                if (r.ended != .failed) {
+                    // Handed back unstarted: ready again at once, no
+                    // failure. The leader's own (`unread`) was never seen,
+                    // so isn't a delivery either.
                     item.v.ended = .abandoned;
-                    try lessU32(&item.v.deliveries);
+                    if (r.ended == .unread) try lessU32(&item.v.deliveries);
                     m.leased -= 1;
                     try M.readyAgain(view, ns, &id, &item.v, stamp);
                     m.ready += 1;
@@ -1188,7 +1191,7 @@ fn release(t: *TestGroups, d: Delivered, records: []const StreamID, dead: bool, 
     var buf: [512]u8 = undefined;
     const items = try itemsOf(&buf, t, records);
     const exp = t.item("s", "g", records[0]).?.expiry_ns;
-    const r = try t.apply(.group_release, ge.Release.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = d.token, .expiry_ns = exp, .items = items, .delay_ms = 0, .dead = dead, .@"error" = "boom", .free = false }, stamp);
+    const r = try t.apply(.group_release, ge.Release.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = d.token, .expiry_ns = exp, .items = items, .delay_ms = 0, .dead = dead, .@"error" = "boom", .ended = .failed }, stamp);
     return Answer.of(r, false);
 }
 
@@ -1226,7 +1229,7 @@ test "group machine: a deliver takes no more than its leader chose: the ready re
     var ib: [512]u8 = undefined;
     const items = try itemsOf(&ib, &t, d.records[0..2]);
     const exp = t.item("s", "g", first).?.expiry_ns;
-    const back = try t.apply(.group_release, ge.Release.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = d.token, .expiry_ns = exp, .items = items, .delay_ms = 0, .dead = false, .@"error" = "", .free = true }, 11 * ms);
+    const back = try t.apply(.group_release, ge.Release.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = d.token, .expiry_ns = exp, .items = items, .delay_ms = 0, .dead = false, .@"error" = "", .ended = .unread }, 11 * ms);
     try testing.expectEqual(@as(u32, 2), Answer.of(back, false).applied);
     try testing.expectEqual(@as(u32, 0), t.item("s", "g", first).?.failures);
     try testing.expectEqual(@as(u32, 0), t.item("s", "g", first).?.deliveries);
@@ -1240,6 +1243,65 @@ test "group machine: a deliver takes no more than its leader chose: the ready re
     try testing.expectEqual(@as(u32, 3), answerInt(u32, r2));
     try testing.expectEqual(Status.ready, t.item("s", "g", first).?.status);
     try testing.expectEqual(@as(u32, 1), t.item("s", "g", sid(first.timestamp_ms, first.sequence + 1)).?.deliveries);
+}
+
+test "group machine: a report to a group that isn't there is refused not_found, not answered record by record" {
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 2);
+    const d = try deliver(&t, 2, 1 << 20, "c1", 10 * ms);
+    var buf: [512]u8 = undefined;
+    const items = try itemsOf(&buf, &t, d.records[0..2]);
+    // Another group's name, and then this one's once it's deleted.
+    for ([_][]const u8{ "other", "g" }) |group| {
+        if (std.mem.eql(u8, group, "g")) _ = try t.apply(.group_delete, ge.Delete.Value{ .ns = NS.int(), .stream = "s", .group = "g" }, 20 * ms);
+        const r = try t.apply(.group_settle, ge.Settle.Value{ .ns = NS.int(), .stream = "s", .group = group, .holder = "c1", .token = d.token, .expiry_ns = 0, .items = items }, 21 * ms);
+        try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, r.refused().?.status);
+    }
+}
+
+fn abandon(t: *TestGroups, d: Delivered, records: []const StreamID, stamp: u64) !Answer {
+    var buf: [512]u8 = undefined;
+    const items = try itemsOf(&buf, t, records);
+    const exp = if (t.item("s", "g", records[0])) |i| i.expiry_ns else 0;
+    const r = try t.apply(.group_release, ge.Release.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = d.token, .expiry_ns = exp, .items = items, .delay_ms = 0, .dead = false, .@"error" = "", .ended = .abandoned }, stamp);
+    return Answer.of(r, false);
+}
+
+test "group machine: an abandoned record is ready at once, its delivery kept and no failure counted; a resend applies, a stale one doesn't" {
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 2);
+    const d = try deliver(&t, 2, 1 << 20, "c1", 10 * ms);
+    const rec = sid(100, 0);
+
+    const a = try abandon(&t, d, &.{rec}, 11 * ms);
+    try testing.expectEqual(@as(u32, 1), a.applied);
+    const it = t.item("s", "g", rec).?;
+    try testing.expectEqual(Status.ready, it.status);
+    try testing.expectEqual(@as(u64, 11 * ms), it.due_ns);
+    try testing.expectEqual(@as(u32, 1), it.deliveries);
+    try testing.expectEqual(@as(u32, 0), it.failures);
+    try testing.expectEqual(@as(u64, 1), t.meta("s", "g").?.ready);
+    try testing.expectEqual(@as(u64, 1), t.meta("s", "g").?.leased);
+
+    // The same abandon again counts as applied, and changes nothing.
+    const sums = t.sums();
+    const again = try abandon(&t, d, &.{rec}, 12 * ms);
+    try testing.expectEqual(@as(u32, 1), again.applied);
+    try testing.expectEqual(@as(usize, 0), again.n);
+    try testing.expectEqual(sums, t.sums());
+
+    // Delivered again: the first delivery's abandon is stale, and applies
+    // nothing to the second.
+    const d2 = try deliver(&t, 1, 1 << 20, "c2", 13 * ms);
+    try testing.expect(d2.records[0].eql(rec));
+    const stale = try abandon(&t, d, &.{rec}, 14 * ms);
+    try testing.expectEqual(@as(u32, 0), stale.applied);
+    try testing.expectEqual(Why.delivered_again, stale.refused[0].why);
+    try testing.expectEqual(Status.leased, t.item("s", "g", rec).?.status);
+    try testing.expectEqualStrings("c2", t.item("s", "g", rec).?.holder);
+    try testing.expectEqual(@as(u32, 2), t.item("s", "g", rec).?.deliveries);
 }
 
 test "group machine: acking one record of an append acks only that record" {
@@ -1452,14 +1514,26 @@ test "group machine: a group takes new records only within its caps, and a settl
     _ = try t.append("s", 100, 3);
     var v: ge.Deliver.Value = .{ .ns = NS.int(), .stream = "s", .group = "g", .count = 3, .max_bytes = 1 << 20, .holder = "c1", .lease_ms = LEASE_MS, .create = true, .ready = .{ .bytes = "", .count = 0 }, .through_ms = std.math.maxInt(u64), .through_seq = std.math.maxInt(u64), .max_held = 2, .max_held_bytes = qe_caps.DEFAULT_MAX_BYTES, .shard_held_bytes = qe_caps.DEFAULT_SHARD_HELD_BYTES };
     const first = try t.apply(.group_deliver, v, 10 * ms);
+    const first_index = t.index;
     try testing.expectEqual(@as(u32, 2), answerInt(u32, first));
     try testing.expectEqual(2 * heldBy(0), t.meta("s", "g").?.held_bytes);
     // Full, nothing ready: refused, and the reader is told why.
     v.count = 1;
     const full = try t.apply(.group_deliver, v, 11 * ms);
     try testing.expect(std.mem.indexOf(u8, full.refused().?.refusal.message, "group 'g' on stream 's' is full: it holds 2 records (at most 2)") != null);
+    const reason = @import("../protocol/reason.zig");
+    try testing.expectEqual(reason.Reason.group_held_full, full.refused().?.refusal.reason);
+    try testing.expectEqual(reason.Ran.no, full.refused().?.refusal.ran);
+    // The shard's total, with the group's own caps clear: the same reason.
+    var w = v;
+    w.max_held = 100;
+    w.shard_held_bytes = 2 * heldBy(0) + heldBy(0) - 1;
+    const shard_full = try t.apply(.group_deliver, w, 11 * ms);
+    try testing.expect(std.mem.indexOf(u8, shard_full.refused().?.refusal.message, "this shard's queues and groups hold") != null);
+    try testing.expectEqual(reason.Reason.group_held_full, shard_full.refused().?.refusal.reason);
+    try testing.expectEqual(reason.Ran.no, shard_full.refused().?.refusal.ran);
     // An ack makes room, and gives its bytes back.
-    var d: Delivered = .{ .token = .{ .term = t.term, .index = t.index - 1 }, .n = 1 };
+    var d: Delivered = .{ .token = .{ .term = t.term, .index = first_index }, .n = 1 };
     d.records[0] = sid(100, 0);
     d.deliveries[0] = 1;
     _ = try settle(&t, d, &.{sid(100, 0)}, "c1", 12 * ms);
