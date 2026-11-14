@@ -495,6 +495,14 @@ pub const RaftNode = struct {
     /// The config entry `committed_config` came from: a removal notice names
     /// it, so a receiver can tell it from a config it already holds.
     committed_config_index: u64 = 0,
+    /// The config as of `last_applied`. `committed_config` moves at commit,
+    /// which runs ahead of apply on a lagging replica; this moves only when a
+    /// config entry applies (set in the shard's `applyRaftConfig`), so a read
+    /// that must match the applied store — the memory budget — joins against a
+    /// membership that is exactly as of the applied index, the same on every
+    /// replica and on replay.
+    applied_config: membership.Config = .{},
+    applied_config_index: u64 = 0,
     /// The highest index `raiseCommit` has read the log through for a
     /// config the records evicted.
     config_scanned_to: u64 = 0,
