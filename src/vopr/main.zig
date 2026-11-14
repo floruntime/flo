@@ -205,7 +205,15 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     else
         Scenario.fromSeed(seed);
     if (args.volatile_mode) scenario.hard_state = .volatile_state;
-    if (args.groups > 0 and args.scenario_in == null) scenario.makeOneNode();
+    if (args.groups > 0) {
+        // These faults need more than the one node every group lives on.
+        const needs_nodes: ?[]const u8 = if (args.wipes) "--wipes" else if (args.membership) "--membership" else if (args.byzantine) "--byzantine" else if (args.catching_up) "--catching-up" else null;
+        if (needs_nodes) |flag| {
+            std.debug.print("--groups runs one node, and {s} needs several: run them apart\n", .{flag});
+            std.process.exit(2);
+        }
+        if (args.scenario_in == null) scenario.makeOneNode();
+    }
     // A planted bug the run never reaches would pass, and say nothing.
     if (args.family_mutant.needsTxnLimits() and !scenario.hasTxnLimits()) {
         std.debug.print("--family-mutant={t} is in a node's transaction limit: run it with --txn-limits, or a scenario that has them\n", .{args.family_mutant});
@@ -358,7 +366,23 @@ fn runGroups(allocator: std.mem.Allocator, args: Args, scenario: Scenario) !bool
         };
         for (groups.oracle.violations.items) |v| vw.print("channel {d}->{d} seq {d}: {s}\n", .{ v.from, v.to, v.seq, v.detail }) catch {};
         std.debug.print("{s}", .{vw.buffered()});
-        std.debug.print("[vopr] reproduce with: vopr --seed={d} --groups={d}{s}\n", .{ scenario.seed, args.groups, if (args.volatile_mode) " --mode=volatile" else "" });
+        var mb: [64]u8 = undefined;
+        const mutant = if (args.family_mutant == .none) "" else std.fmt.bufPrint(&mb, " --family-mutant={t}", .{args.family_mutant}) catch "";
+        var sb: [64]u8 = undefined;
+        const from = if (args.scenario_in) |pin| std.fmt.bufPrint(&sb, "--scenario-in={s}", .{pin}) catch pin else std.fmt.bufPrint(&sb, "--seed={d}", .{scenario.seed}) catch "";
+        std.debug.print("[vopr] reproduce with: vopr {s} --groups={d}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
+            from,
+            args.groups,
+            mutant,
+            // A pinned scenario carries its own families and limits.
+            if (args.scenario_in == null and args.actions) " --actions" else "",
+            if (args.scenario_in == null and args.queues) " --queues" else "",
+            if (args.scenario_in == null and args.small_ring) " --small-ring" else "",
+            if (args.scenario_in == null and args.pending_reads) " --pending-reads" else "",
+            if (args.scenario_in == null and args.halts) " --halts" else "",
+            if (args.scenario_in == null and args.txn_limits) " --txn-limits" else "",
+            if (args.volatile_mode) " --mode=volatile" else "",
+        });
     }
     return s.ok;
 }

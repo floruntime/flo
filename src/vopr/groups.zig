@@ -70,6 +70,8 @@ pub const Mailbox = struct {
     lost_in_crash: u64 = 0,
 
     pub fn init(allocator: Allocator, seed: u64, faults: Faults) Mailbox {
+        // Its own stream, salted apart from the groups' simulators, so a
+        // mailbox fault never moves a group's draws.
         return .{ .allocator = allocator, .faults = faults, .prng = PRNG.init(seed ^ 0x3A11_B0C5) };
     }
 
@@ -138,23 +140,34 @@ pub const ChannelViolation = struct {
     detail: []const u8,
 };
 
-/// What crossed each channel, told by the machines: a sender's sends as it
-/// applies them, a receiver's applies as it applies them, and either side's
-/// rewind when a crash took the suffix it hadn't flushed. It holds every
-/// channel to exactly once, in order: a receiver applies seq n + 1 after n,
-/// never one twice, never one its sender doesn't hold, and in the end every
-/// message its sender holds.
+/// What crossed each channel, told by the machines: each send as its sender
+/// applies it, and each apply as its receiver applies it, both with the log
+/// index they applied at. After a crash the harness says only which index a
+/// group's log kept, never what its machines think they hold: a group that
+/// lost its record of an apply but kept the apply's effect must not take
+/// the message again. It holds every channel to exactly once, in order: a
+/// receiver applies seq n + 1 after n, never one twice, never one its
+/// sender doesn't hold, and in the end every message its sender holds.
 pub const ChannelOracle = struct {
     allocator: Allocator,
     channels: [MAX_GROUPS][MAX_GROUPS]Channel = @splat(@splat(.{})),
     violations: std.ArrayListUnmanaged(ChannelViolation) = .empty,
     applies: u64 = 0,
+    /// A sender may lose what its receiver applied: with no data directory,
+    /// or ephemeral, a crash keeps nothing and promises nothing.
+    sender_loss_legal: bool = false,
+
+    const Logged = struct { hash: u64, index: u64 };
 
     const Channel = struct {
-        /// Each sent message's hash, seq n at [n - 1].
-        sent: std.ArrayListUnmanaged(u64) = .empty,
-        /// The highest seq the receiver holds applied.
-        applied: u64 = 0,
+        /// Each sent message, seq n at [n - 1], with the sender's index.
+        sent: std.ArrayListUnmanaged(Logged) = .empty,
+        /// Each applied message, seq n at [n - 1], with the receiver's index.
+        applied: std.ArrayListUnmanaged(Logged) = .empty,
+
+        fn appliedThrough(c: *const Channel) u64 {
+            return c.applied.items.len;
+        }
     };
 
     pub fn init(allocator: Allocator) ChannelOracle {
@@ -162,7 +175,10 @@ pub const ChannelOracle = struct {
     }
 
     pub fn deinit(self: *ChannelOracle) void {
-        for (&self.channels) |*row| for (row) |*c| c.sent.deinit(self.allocator);
+        for (&self.channels) |*row| for (row) |*c| {
+            c.sent.deinit(self.allocator);
+            c.applied.deinit(self.allocator);
+        };
         self.violations.deinit(self.allocator);
     }
 
@@ -170,45 +186,61 @@ pub const ChannelOracle = struct {
         self.violations.append(self.allocator, .{ .from = from, .to = to, .seq = seq, .detail = detail }) catch @panic("oracle OOM");
     }
 
-    /// The sender applied a send: seqs go up by one per channel.
-    pub fn sent(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, hash: u64) !void {
+    /// The sender applied a send at `index`: seqs go up by one per channel.
+    pub fn sent(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, hash: u64, index: u64) !void {
         const c = &self.channels[from][to];
         if (seq != c.sent.items.len + 1) return self.fail(from, to, seq, "a sender's seqs skipped or repeated");
-        try c.sent.append(self.allocator, hash);
+        try c.sent.append(self.allocator, .{ .hash = hash, .index = index });
     }
 
-    /// The receiver applied a message.
-    pub fn applied(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, hash: u64) void {
+    /// The receiver applied a message at `index`.
+    pub fn applied(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, hash: u64, index: u64) !void {
         const c = &self.channels[from][to];
         self.applies += 1;
-        if (seq <= c.applied) return self.fail(from, to, seq, "applied a message twice");
-        if (seq != c.applied + 1) return self.fail(from, to, seq, "applied a message past a gap");
+        const through = c.appliedThrough();
+        if (seq <= through) return self.fail(from, to, seq, "applied a message twice");
+        if (seq != through + 1) return self.fail(from, to, seq, "applied a message past a gap");
         if (seq > c.sent.items.len) return self.fail(from, to, seq, "applied a message its sender doesn't hold");
-        if (c.sent.items[seq - 1] != hash) return self.fail(from, to, seq, "applied another message than the one sent at its seq");
-        c.applied = seq;
+        if (c.sent.items[seq - 1].hash != hash) return self.fail(from, to, seq, "applied another message than the one sent at its seq");
+        try c.applied.append(self.allocator, .{ .hash = hash, .index = index });
     }
 
-    /// The sender came back holding sends through `seq` on this channel: a
-    /// crash took what it hadn't flushed. A receiver that applied past it
-    /// applied a message whose cause is gone.
-    pub fn senderRewound(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64) void {
-        const c = &self.channels[from][to];
-        if (seq >= c.sent.items.len) return;
-        if (c.applied > seq) self.fail(from, to, c.applied, "applied a message its sender lost");
-        c.sent.shrinkRetainingCapacity(seq);
+    /// `group` came back from a crash with its log through `kept`: its sends
+    /// and applies above that are gone. A receiver that applied a send now
+    /// gone applied a message whose cause is gone.
+    pub fn recovered(self: *ChannelOracle, group: GroupId, kept: u64) void {
+        for (0..MAX_GROUPS) |peer_| {
+            const peer: GroupId = @intCast(peer_);
+            const out = &self.channels[group][peer];
+            var n = out.sent.items.len;
+            while (n > 0 and out.sent.items[n - 1].index > kept) n -= 1;
+            if (n < out.sent.items.len) {
+                if (out.appliedThrough() > n) {
+                    if (!self.sender_loss_legal) self.fail(group, peer, out.appliedThrough(), "applied a message its sender lost");
+                    // Legal here, so the seqs start over on both sides.
+                    out.applied.shrinkRetainingCapacity(n);
+                }
+                out.sent.shrinkRetainingCapacity(n);
+            }
+            const in = &self.channels[peer][group];
+            var m = in.applied.items.len;
+            while (m > 0 and in.applied.items[m - 1].index > kept) m -= 1;
+            in.applied.shrinkRetainingCapacity(m);
+        }
     }
 
-    /// The receiver came back holding applies through `seq`.
-    pub fn receiverRewound(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64) void {
-        const c = &self.channels[from][to];
-        c.applied = @min(c.applied, seq);
+    /// Every message each sender holds was applied: once the channels have
+    /// drained, at the end.
+    pub fn drained(self: *const ChannelOracle) bool {
+        for (&self.channels) |*row| for (row) |*c| {
+            if (c.appliedThrough() < c.sent.items.len) return false;
+        };
+        return true;
     }
 
-    /// At the end, after convergence: every message a sender holds was
-    /// applied.
     pub fn finish(self: *ChannelOracle) void {
         for (&self.channels, 0..) |*row, from| for (row, 0..) |*c, to| {
-            if (c.applied < c.sent.items.len) self.fail(@intCast(from), @intCast(to), c.applied + 1, "a message its sender holds was never applied");
+            if (c.appliedThrough() < c.sent.items.len) self.fail(@intCast(from), @intCast(to), c.appliedThrough() + 1, "a message its sender holds was never applied");
         };
     }
 };
@@ -252,6 +284,8 @@ pub const Groups = struct {
         for (sims, 0..) |*sim, g| {
             var s = scenario;
             if (g > 0) {
+                // Each group its own streams: the golden-ratio constant
+                // spreads consecutive group numbers across the seed space.
                 s.seed = scenario.seed ^ (@as(u64, g) *% 0x9E37_79B9_7F4A_7C15);
                 s.crash_permille = 0;
                 s.restart_permille = 0;
@@ -281,9 +315,25 @@ pub const Groups = struct {
         return self.sims[0].now;
     }
 
+    /// Every group converged, and the channels drained: nothing in flight,
+    /// every message its sender holds applied.
+    fn converged(self: *Groups) bool {
+        for (self.sims) |*s| if (!s.isConverged()) return false;
+        return self.mailbox.queue.items.len == 0 and self.oracle.drained();
+    }
+
     fn failed(self: *const Groups) bool {
         for (self.sims) |*s| if (s.checker.violations.items.len > 0) return true;
         return self.oracle.violations.items.len > 0;
+    }
+
+    /// The node's fate carried from group 0 to every other group, and
+    /// each group that came back told to the oracle by what its log kept.
+    fn followFate(self: *Groups, was_up: bool) !void {
+        const up = self.sims[0].nodeUp(NODE);
+        for (self.sims[1..]) |*s| try s.followFate(NODE, up);
+        if (was_up and !up) self.mailbox.crash();
+        if (!was_up and up) for (self.sims, 0..) |*s, g| self.oracle.recovered(@intCast(g), s.keptIndex(NODE));
     }
 
     /// One tick of every group, the node's fate carried to all of them,
@@ -291,9 +341,8 @@ pub const Groups = struct {
     fn step(self: *Groups) !void {
         const was_up = self.sims[0].nodeUp(NODE);
         for (self.sims) |*s| try s.advance();
+        try self.followFate(was_up);
         const up = self.sims[0].nodeUp(NODE);
-        for (self.sims[1..]) |*s| try s.followFate(NODE, up);
-        if (was_up and !up) self.mailbox.crash();
         self.delivery.clearRetainingCapacity();
         try self.mailbox.deliverDue(self.now(), &self.delivery);
         while (self.delivery.items.len > 0) {
@@ -306,27 +355,29 @@ pub const Groups = struct {
 
     pub fn run(self: *Groups) !Summary {
         while (!self.sims[0].safetyDone() and !self.failed()) try self.step();
-        var converged_ok = false;
+        var converging = false;
         if (!self.failed()) {
+            converging = true;
+            const was_up = self.sims[0].nodeUp(NODE);
             var deadline: u64 = 0;
             for (self.sims) |*s| deadline = @max(deadline, try s.beginConvergence());
-            for (self.sims[1..]) |*s| try s.followFate(NODE, self.sims[0].nodeUp(NODE));
+            try self.followFate(was_up);
+            // The network heals for convergence, and so does the mailbox:
+            // latency stays, losses stop.
+            self.mailbox.faults.drop_percent = 0;
+            self.mailbox.faults.duplicate_percent = 0;
             while (self.now() < deadline and !self.failed()) {
                 try self.step();
-                const all = for (self.sims) |*s| {
-                    if (!s.isConverged()) break false;
-                } else true;
-                if (all) {
-                    converged_ok = true;
-                    break;
-                }
+                if (self.converged()) break;
             }
-            if (converged_ok) self.oracle.finish();
+            // Every message a sender holds was applied by now, or the run
+            // fails: no channel may stall.
+            if (!self.failed()) self.oracle.finish();
         }
         const summaries = try self.allocator.alloc(simulator.Summary, self.sims.len);
         var ok = self.oracle.violations.items.len == 0;
         for (self.sims, summaries) |*s, *out| {
-            out.* = s.finish(converged_ok);
+            out.* = s.finish(converging and s.isConverged());
             ok = ok and out.ok;
         }
         return .{
@@ -429,46 +480,55 @@ test "vopr groups: the mailbox delays, drops, duplicates and reorders, and a cra
 }
 
 test "vopr groups: the channel oracle holds a channel to exactly once, in order" {
+    // Group 0 sends to group 1; indexes are each group's own log's.
     const Case = struct { detail: []const u8, run: *const fn (o: *ChannelOracle) anyerror!void };
     const cases = [_]Case{
         .{
             .detail = "",
             .run = struct {
                 fn f(o: *ChannelOracle) !void {
-                    try o.sent(0, 1, 1, 11);
-                    try o.sent(0, 1, 2, 12);
-                    o.applied(0, 1, 1, 11);
-                    // The receiver lost its unflushed apply and takes it again.
-                    o.receiverRewound(0, 1, 0);
-                    o.applied(0, 1, 1, 11);
-                    o.applied(0, 1, 2, 12);
+                    try o.sent(0, 1, 1, 11, 5);
+                    try o.sent(0, 1, 2, 12, 6);
+                    try o.applied(0, 1, 1, 11, 3);
+                    // The receiver's crash kept its log through 2: the apply at
+                    // 3 is gone, effect and all, and it takes the message again.
+                    o.recovered(1, 2);
+                    try o.applied(0, 1, 1, 11, 3);
+                    try o.applied(0, 1, 2, 12, 4);
                     o.finish();
                 }
             }.f,
         },
-        .{ .detail = "applied a message twice", .run = struct {
-            fn f(o: *ChannelOracle) !void {
-                try o.sent(0, 1, 1, 11);
-                o.applied(0, 1, 1, 11);
-                o.applied(0, 1, 1, 11);
-            }
-        }.f },
+        .{
+            .detail = "applied a message twice",
+            .run = struct {
+                fn f(o: *ChannelOracle) !void {
+                    // The receiver's crash kept the apply at 3, so its effect
+                    // survived; taking the message again applies it twice, even
+                    // if its machine lost its record of the apply.
+                    try o.sent(0, 1, 1, 11, 5);
+                    try o.applied(0, 1, 1, 11, 3);
+                    o.recovered(1, 3);
+                    try o.applied(0, 1, 1, 11, 4);
+                }
+            }.f,
+        },
         .{ .detail = "applied a message past a gap", .run = struct {
             fn f(o: *ChannelOracle) !void {
-                try o.sent(0, 1, 1, 11);
-                try o.sent(0, 1, 2, 12);
-                o.applied(0, 1, 2, 12);
+                try o.sent(0, 1, 1, 11, 1);
+                try o.sent(0, 1, 2, 12, 2);
+                try o.applied(0, 1, 2, 12, 1);
             }
         }.f },
         .{ .detail = "applied a message its sender doesn't hold", .run = struct {
             fn f(o: *ChannelOracle) !void {
-                o.applied(2, 1, 1, 11);
+                try o.applied(2, 1, 1, 11, 1);
             }
         }.f },
         .{ .detail = "applied another message than the one sent at its seq", .run = struct {
             fn f(o: *ChannelOracle) !void {
-                try o.sent(0, 1, 1, 11);
-                o.applied(0, 1, 1, 99);
+                try o.sent(0, 1, 1, 11, 1);
+                try o.applied(0, 1, 1, 99, 1);
             }
         }.f },
         .{
@@ -477,21 +537,21 @@ test "vopr groups: the channel oracle holds a channel to exactly once, in order"
                 fn f(o: *ChannelOracle) !void {
                     // Delivered before its send was durable, then the sender's
                     // crash took the send.
-                    try o.sent(0, 1, 1, 11);
-                    o.applied(0, 1, 1, 11);
-                    o.senderRewound(0, 1, 0);
+                    try o.sent(0, 1, 1, 11, 7);
+                    try o.applied(0, 1, 1, 11, 2);
+                    o.recovered(0, 6);
                 }
             }.f,
         },
         .{ .detail = "a message its sender holds was never applied", .run = struct {
             fn f(o: *ChannelOracle) !void {
-                try o.sent(1, 0, 1, 11);
+                try o.sent(1, 0, 1, 11, 1);
                 o.finish();
             }
         }.f },
         .{ .detail = "a sender's seqs skipped or repeated", .run = struct {
             fn f(o: *ChannelOracle) !void {
-                try o.sent(0, 1, 2, 12);
+                try o.sent(0, 1, 2, 12, 1);
             }
         }.f },
     };
@@ -506,6 +566,17 @@ test "vopr groups: the channel oracle holds a channel to exactly once, in order"
             try testing.expectEqualStrings(c.detail, o.violations.items[0].detail);
         }
     }
+    // With nothing promised across a crash, a sender losing what was
+    // applied is no violation, and both sides start over.
+    var o = ChannelOracle.init(testing.allocator);
+    defer o.deinit();
+    o.sender_loss_legal = true;
+    try o.sent(0, 1, 1, 11, 7);
+    try o.applied(0, 1, 1, 11, 2);
+    o.recovered(0, 6);
+    try o.sent(0, 1, 1, 21, 7);
+    try o.applied(0, 1, 1, 21, 3);
+    try testing.expectEqual(@as(usize, 0), o.violations.items.len);
 }
 
 test "vopr groups: frames reach the handler only while the node is up" {
@@ -518,8 +589,8 @@ test "vopr groups: frames reach the handler only while the node is up" {
         fn handle(gs: *Groups, f: Frame) !void {
             try testing.expect(gs.sims[f.to].nodeUp(NODE));
             handled += 1;
-            // Keep the mailbox busy: every frame answers with another.
-            try gs.mailbox.send(gs.now(), f.to, f.from, f.bytes);
+            // Keep the mailbox busy for a while: a frame answers with another.
+            if (handled < 2000) try gs.mailbox.send(gs.now(), f.to, f.from, f.bytes);
         }
     };
     Counter.handled = 0;

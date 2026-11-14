@@ -371,6 +371,12 @@ jobs:
       - name: Swarm
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --seed-timeout=120 --out-dir=/tmp/vopr
         timeout-minutes: 20
+      - name: Swarm of groups on one node
+        # Four groups on one node, each its own log, through a mailbox that
+        # drops, duplicates and reorders: every group follows the node's
+        # crashes, and every channel drains.
+        run: ./zig-out/bin/vopr --iterations=10 --seed=1 --jobs=4 --groups=4 --seed-timeout=120 --out-dir=/tmp/vopr-groups
+        timeout-minutes: 10
       - name: Swarm with lost disks
         # Crashes that lose a disk or its hard state, up to two nodes at once:
         # the lost-log guard's slice.

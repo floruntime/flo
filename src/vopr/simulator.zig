@@ -2626,6 +2626,12 @@ pub const Simulator = struct {
         return self.nodes[id - 1].up;
     }
 
+    /// The last index node `id`'s log holds: right after a restart, what
+    /// its crash kept.
+    pub fn keptIndex(self: *const Simulator, id: NodeId) u64 {
+        return self.nodes[id - 1].raft.log.lastIndex();
+    }
+
     /// The machines' families at the last index each node applied, which
     /// sampling may have passed over: a divergence in a run's last entries
     /// is caught too.
