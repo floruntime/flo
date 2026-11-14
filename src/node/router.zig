@@ -41,17 +41,12 @@ const HASH_SEED: u64 = 0;
 
 /// Result of a routing decision.
 pub const RouteTarget = union(enum) {
-    /// Slot lives on this shard — handle locally.
-    local: LocalTarget,
-    /// Slot lives on a different shard on the same node — forward via inbox.
+    /// Runs on this shard.
+    local,
+    /// Runs on a different shard on the same node — forward via inbox.
     shard: ShardTarget,
 
-    pub const LocalTarget = struct {
-        slot: u32,
-    };
-
     pub const ShardTarget = struct {
-        slot: u32,
         shard_id: u16,
     };
 };
@@ -82,12 +77,13 @@ pub const Router = struct {
 
     /// Full route: hash → slot → local-or-forward decision (single-node).
     pub fn route(self: Router, hash: u64) RouteTarget {
-        const s = slot(hash);
-        const shard_id = self.slotToShard(s);
-        if (shard_id == self.local_shard_id) {
-            return .{ .local = .{ .slot = s } };
-        }
-        return .{ .shard = .{ .slot = s, .shard_id = shard_id } };
+        return self.toShard(self.hashToShard(hash));
+    }
+
+    /// The target for a request pinned to `shard_id`.
+    pub fn toShard(self: Router, shard_id: u16) RouteTarget {
+        if (shard_id == self.local_shard_id) return .local;
+        return .{ .shard = .{ .shard_id = shard_id } };
     }
 
     /// The shard owning a hash's slot.
@@ -249,15 +245,15 @@ test "Router: route local vs shard" {
     for (0..100) |i| {
         var buf: [16]u8 = undefined;
         const key = std.fmt.bufPrint(&buf, "key-{d}", .{i}) catch unreachable;
-        const target = router.routeKey(key);
-        switch (target) {
-            .local => |t| {
-                try std.testing.expectEqual(@as(u16, 2), @as(u16, @intCast(t.slot % 4)));
+        const s = keySlot(key);
+        switch (router.routeKey(key)) {
+            .local => {
+                try std.testing.expectEqual(@as(u32, 2), s % 4);
                 local_count += 1;
             },
             .shard => |t| {
                 try std.testing.expect(t.shard_id != 2);
-                try std.testing.expectEqual(t.shard_id, @as(u16, @intCast(t.slot % 4)));
+                try std.testing.expectEqual(@as(u32, t.shard_id), s % 4);
                 remote_count += 1;
             },
         }

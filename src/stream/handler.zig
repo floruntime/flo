@@ -313,7 +313,7 @@ pub const StreamHandler = struct {
     /// Route by stream name — single-partition operations.
     /// Routed by the namespace's id and the stream's name (`routeNsKey`).
     fn preRouteByStream(req: Request) ?u64 {
-        if (req.key.len == 0) return 0;
+        if (req.key.len == 0) return null;
         return router.routeNsKey(req.ns_id, req.key);
     }
 
@@ -2818,9 +2818,9 @@ test "stream handler: pre-route by stream" {
     // Different stream → different hash
     try testing.expect(StreamHandler.preRouteByStream(req1) != StreamHandler.preRouteByStream(req3));
 
-    // Empty → 0
+    // No key: no hash; the request runs on group 0
     const req_empty = makeRequest(.stream_append, "", "", "");
-    try testing.expectEqual(@as(?u64, 0), StreamHandler.preRouteByStream(req_empty));
+    try testing.expectEqual(@as(?u64, null), StreamHandler.preRouteByStream(req_empty));
 
     // Same stream, different namespace → different hash (namespace isolation)
     var req_ns = makeRequest(.stream_append, "stream-a", "", "");

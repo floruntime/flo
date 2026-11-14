@@ -1743,7 +1743,8 @@ pub const Shard = struct {
 
     /// A client's request: walked across shards, sent to the shard that
     /// owns it, or run here. Walk opcodes (list/scan) aggregate across
-    /// shards unless the pre-route narrows to a single partition.
+    /// shards unless the pre-route names a key, which narrows them to its
+    /// slot's shard.
     fn route(self: *Shard, conn: *Connection, req: proto.Request, auth: run_mod.Authorized) void {
         conn.recordRequest();
         self.requests_dispatched += 1;
@@ -1823,7 +1824,7 @@ pub const Shard = struct {
     // ─── A run by an id the client chose ─────────────────────────────────
 
     /// Whether `req` names a workflow run by an id the client chose at its
-    /// start. A generated id carries its run's partition, so its op routes
+    /// start. A generated id carries its workflow's slot, so its op routes
     /// straight there; a chosen one carries none, and the run is on the
     /// shard of its workflow's name, which the op doesn't name.
     fn runIdUnplaced(self: *const Shard, req: proto.Request) bool {
@@ -1837,7 +1838,7 @@ pub const Shard = struct {
         };
         // Only the server mints ids of the generated form (a start refuses a
         // chosen one), so this splits them exactly; a chosen id can decode as
-        // a partition (`order-123`), and that partition is no run's.
+        // a slot (`order-123`), and that slot names no run's shard.
         return by_run_id and req.key.len > 0 and self.shardCount() > 1 and !run_id_mod.looksGenerated(.workflow, req.key);
     }
 
@@ -2274,15 +2275,18 @@ pub const Shard = struct {
     /// Pure routing decision: pre-route → the shard that owns the key. No
     /// side effects.
     fn resolveTarget(self: *Shard, op: u16, req: proto.Request) node_router.RouteTarget {
-        if (op >= proto.MAX_OPCODES) return .{ .local = .{ .slot = 0 } };
+        if (op >= proto.MAX_OPCODES) return .local;
         if (self.dispatcher.shard_route[op]) |f| if (f(req)) |shard_id| {
             // A shard that doesn't exist holds no transaction: the request
             // runs here and is refused as one.
             const shards = if (self.peer_shards) |p| p.len else 1;
-            if (shard_id == self.id or shard_id >= shards) return .{ .local = .{ .slot = 0 } };
-            return .{ .shard = .{ .slot = 0, .shard_id = shard_id } };
+            if (shard_id >= shards) return .local;
+            return self.router.toShard(shard_id);
         };
-        const hash = if (self.dispatcher.pre_route[op]) |f| f(req) orelse return .{ .local = .{ .slot = 0 } } else return .{ .local = .{ .slot = 0 } };
+        const f = self.dispatcher.pre_route[op] orelse return .local;
+        // A request that names no key has no slot. It runs on group 0, where
+        // metadata lives, never on whichever group owns slot 0: that can move.
+        const hash = f(req) orelse return self.router.toShard(0);
         return self.router.route(hash);
     }
 
@@ -22128,13 +22132,13 @@ test "an entry repeating an index the partition holds is counted as a duplicate,
     for (snap.silent_loss) |n| try std.testing.expectEqual(@as(u64, 0), n);
 }
 
-test "Shard: action.status for a run on another shard goes there, by the run id's partition bits" {
+test "Shard: action.status for a run on another shard goes there, by the run id's slot bits" {
     var two: TwoShards = undefined;
     try two.init();
     defer two.deinit();
     const a = &two.shards[0];
     // A run minted for a slot shard 1 owns, as an invoke there would.
-    const partition: u32 = for (0..node_router.SLOTS) |p| {
+    const slot: u32 = for (0..node_router.SLOTS) |p| {
         if (a.router.slotToShard(@intCast(p)) == 1) break @intCast(p);
     } else return error.TestUnexpectedResult;
     // One whose text, hashed as a key, lands on shard 0: the old routing
@@ -22142,7 +22146,7 @@ test "Shard: action.status for a run on another shard goes there, by the run id'
     var gen: run_id_mod.Generator = .{ .shard = 1 };
     var id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
     const run_id = for (0..256) |_| {
-        const id = gen.next(.action, partition, &id_buf);
+        const id = gen.next(.action, slot, &id_buf);
         if (a.router.hashToShard(node_router.routeNsKey(.default, id)) == 0) break id;
     } else return error.TestUnexpectedResult;
     _ = try applyActionEntry(&two.shards[1], .action_register, testRegister("echo"), 1, 1);
@@ -22165,6 +22169,57 @@ test "Shard: action.status for a run on another shard goes there, by the run id'
     var diag: schema.Diagnostic = .{};
     const s = try table_run.op("action.status").response.decodeAll(resp.data, &diag);
     try std.testing.expectEqual(@import("../protocol/action_ops.zig").RunStatus.pending, s.status);
+}
+
+test "Shard: a request naming no key runs on group 0, from any shard, by a pin and not slot 0's hash" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const b = &two.shards[1];
+    // Asked on shard 1: one op of each family routed by a key, with none,
+    // and a run id that doesn't decode (before, that ran where it arrived).
+    const cases = [_]struct { op: proto.OpCode, key: []const u8 }{
+        .{ .op = .kv_get, .key = "" },
+        .{ .op = .stream_append, .key = "" },
+        .{ .op = .queue_enqueue, .key = "" },
+        .{ .op = .ts_write, .key = "" },
+        .{ .op = .worker_register, .key = "" },
+        .{ .op = .workflow_get_definition, .key = "" },
+        .{ .op = .action_info, .key = "" },
+        .{ .op = .action_await, .key = "" },
+        .{ .op = .action_status, .key = "" },
+        .{ .op = .action_status, .key = "act-not-hex" },
+        .{ .op = .ts_floql, .key = "" },
+    };
+    for (cases) |case| {
+        const req: proto.Request = .{ .header = proto.RequestHeader.init(case.op, 1), .namespace = "", .key = case.key, .value = "" };
+        switch (b.resolveTarget(@backingInt(case.op), req)) {
+            .local => return error.TestUnexpectedResult,
+            .shard => |t| try std.testing.expectEqual(@as(u16, 0), t.shard_id),
+        }
+    }
+    // On group 0 itself, it runs there.
+    const req: proto.Request = .{ .header = proto.RequestHeader.init(.stream_append, 1), .namespace = "", .key = "", .value = "" };
+    try std.testing.expect(two.shards[0].resolveTarget(@backingInt(proto.OpCode.stream_append), req) == .local);
+}
+
+test "Shard: every processing op is pinned to group 0, whatever its job id's bits say" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const b = &two.shards[1];
+    // A job id minted with slot 1's bits, which shard 1 owns: the old
+    // routing sent status for it to shard 1.
+    var gen: run_id_mod.Generator = .{};
+    var id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const job_id = gen.next(.job, 1, &id_buf);
+    for ([_]proto.OpCode{ .processing_submit, .processing_stop, .processing_cancel, .processing_status, .processing_remove }) |op| {
+        const req: proto.Request = .{ .header = proto.RequestHeader.init(op, 1), .namespace = "", .key = job_id, .value = "" };
+        switch (b.resolveTarget(@backingInt(op), req)) {
+            .local => return error.TestUnexpectedResult,
+            .shard => |t| try std.testing.expectEqual(@as(u16, 0), t.shard_id),
+        }
+    }
 }
 
 /// For tests: "k" in "default", as state and a single-key entry keep it.

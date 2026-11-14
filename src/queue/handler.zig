@@ -342,7 +342,7 @@ pub const QueueHandler = struct {
     }
 
     fn preRouteByQueue(req: Request) ?u64 {
-        if (req.key.len == 0) return 0;
+        if (req.key.len == 0) return null;
         return router.routeNsKey(req.ns_id, req.key);
     }
 
