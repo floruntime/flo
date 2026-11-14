@@ -1691,10 +1691,13 @@ fn boundPort(rn: *const RaftNetwork) !u16 {
     return (try stdx_net.sysLocalIp4(rn.listener_fd)).port;
 }
 
+/// Waits for the link's session, which the loop publishes last, after the
+/// peer's slot is already active: waiting on the slot let a test read the
+/// session in the gap and find none.
 fn waitForPeer(rn: *RaftNetwork, node_id: u32, timeout_ms: u64) bool {
     var waited: u64 = 0;
     while (waited < timeout_ms) : (waited += 20) {
-        if (rn.hasPeer(node_id)) return true;
+        if (rn.linkSession(node_id) != null) return true;
         stdx.time.sleep(20 * std.time.ns_per_ms);
     }
     return false;
