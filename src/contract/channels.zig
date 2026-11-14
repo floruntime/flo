@@ -254,15 +254,19 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
             const before: ?In.Value = if (try view.get(InFam, in_key)) |v| v.v else null;
             var applied = if (before) |b| b.applied else 0;
             var seq = p.first_seq;
+            var ordinal: u32 = 0;
             var it = p.messages.iterator();
-            while (it.next() catch return error.Halt) |m| : (seq += 1) {
+            while (it.next() catch return error.Halt) |m| : ({
+                seq += 1;
+                ordinal += 1;
+            }) {
                 if (seq <= applied) continue;
                 if (seq != applied + 1) return error.Halt;
                 const t = std.enums.fromInt(EntryType, m.entry_type) orelse return error.Halt;
                 const owner = machine_mod.ownerOf(targets, t) orelse return error.Halt;
                 const as = asEntry(e, m);
                 const mark = view.mark();
-                view.message = .{ .from = p.from, .seq = seq };
+                view.message = .{ .from = p.from, .seq = seq, .ordinal = ordinal };
                 defer view.message = null;
                 var r = Result.start(&as);
                 try owner.apply(view, &as, &r);

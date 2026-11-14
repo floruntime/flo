@@ -177,8 +177,11 @@ pub const Send = struct { slot: u16, entry_type: u8, payload: []const u8 };
 /// the same owner.
 pub const Place = struct { group: u16, count: u16 };
 
-/// The message an entry is: the group it came from and its seq there.
-pub const Message = struct { from: u16, seq: u64 };
+/// The message an entry is: the group it came from, its seq there, and its
+/// place in the inbound entry that carried it. Every message in one inbound
+/// entry applies at that entry's index, so a record located by index takes
+/// `(index, ordinal)` to stay unique.
+pub const Message = struct { from: u16, seq: u64, ordinal: u32 };
 
 pub const Mark = struct { ops: usize, sends: usize };
 
