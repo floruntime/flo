@@ -857,6 +857,9 @@ pub const Runtime = struct {
         if (self.metrics_registry) |metrics| {
             for (shards) |*shard| shard.setMetricsRegistry(metrics);
         }
+        // Derive the memory budget once now that boot is done and metrics are
+        // wired: replay applied its entries without the live refresh path.
+        for (shards) |*shard| shard.refreshBudgetOnBoot();
         for (shards) |*shard| shard.publishHealth();
         if (self.dashboard_ctx) |ctx| ctx.markShardsReady();
 

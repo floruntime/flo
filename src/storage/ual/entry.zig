@@ -144,6 +144,11 @@ pub const EntryType = enum(u8) {
     processing_checkpoint = 0x85,
     processing_remove = 0x86,
 
+    // ── Cluster settings (the memory-budget policy and per-node RAM) ──
+    settings_pool_share = 0x90,
+    settings_node_mem = 0x91,
+    settings_node_del = 0x92,
+
     /// Returns true if this type carries a key-value command payload. KV
     /// entries don't: their payloads are schemas (`protocol/kv_entries.zig`).
     pub fn hasKeyValue(self: EntryType) bool {
@@ -158,6 +163,8 @@ pub const EntryType = enum(u8) {
             .cg_create => true,
             .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step_started => true,
             .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint, .processing_remove => true,
+            // Cluster-settings entries touch no namespace projection; they are node-level state on shard 0.
+            .settings_pool_share, .settings_node_mem, .settings_node_del => false,
             .raft_config, .raft_noop, .raft_snapshot, .repair_skip => false,
         };
     }
