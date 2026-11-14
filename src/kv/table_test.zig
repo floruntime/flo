@@ -395,7 +395,7 @@ test "kv table: a request in a transaction goes to the leader, and to the shard 
     const plain: proto.Request = .{ .header = in_txn.header, .namespace = "", .key = "k", .value = try get_op.request.encodeInto(&plain_buf, getBody(.{})) };
     try testing.expect(!table_run.writes(plain));
     try testing.expectEqual(@as(?u64, null), table_run.txnId(plain));
-    try testing.expectEqual(@as(u16, 3), txn_mod.idShard(id));
+    try testing.expectEqual(@as(u32, 3), txn_mod.idSlot(id));
 }
 
 test "kv table: the longest value applies with the longest key, TTL and cas, and one byte more is refused unrun" {

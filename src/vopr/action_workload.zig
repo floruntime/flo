@@ -115,7 +115,6 @@ fn invoke(a: *families.Actions, out: []u8, r: std.Random, spoil: bool, tag: []co
         .source = .direct,
         .caller_run = null,
         .caller_workflow = null,
-        .caller_shard = null,
     });
     return .{ .entry_type = .action_invoke, .payload = p };
 }
@@ -249,6 +248,7 @@ fn report(a: *families.Actions, out: []u8, kind: Kind, l: Leader, r: std.Random,
             .action = v.action,
             .run = p.id,
             .holder = holder,
+            .deliveries = deliveries,
             .token = token,
             // A leader that saw an older expiry: the extend applies, and
             // leaves the lease's real key behind, stale once it moves.

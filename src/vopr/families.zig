@@ -1148,7 +1148,7 @@ const ActionsTest = struct {
     /// Registered, invoked and delivered to `w`; the deliver's token.
     fn delivered(t: *ActionsTest, lease_ms: u64, max_attempts: u32, request_key: ?[]const u8) !ae.Token.Value {
         _ = try t.next(ae.Register, .action_register, .{ .ns = NamespaceId.default.int(), .name = "act", .owner = "", .lease_ms = lease_ms, .max_attempts = max_attempts });
-        _ = try t.next(ae.Invoke, .action_invoke, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .input = "", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null });
+        _ = try t.next(ae.Invoke, .action_invoke, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .input = "", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null });
         const due = t.stamp;
         const d = try t.next(ae.Deliver, .action_deliver, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .due_ns = due, .holder = "w", .request_key = request_key, .lease_ms = lease_ms });
         try testing.expect(!d.refused);
@@ -1189,7 +1189,7 @@ fn brokenUnder(mutant: Mutant, comptime steps: fn (*ActionsTest) anyerror!?[]con
 const mutant_steps = struct {
     fn earlyDeliver(t: *ActionsTest) !?[]const u8 {
         _ = try t.next(ae.Register, .action_register, .{ .ns = NamespaceId.default.int(), .name = "act", .owner = "", .lease_ms = 5_000, .max_attempts = 2 });
-        _ = try t.next(ae.Invoke, .action_invoke, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .input = "", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null });
+        _ = try t.next(ae.Invoke, .action_invoke, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .input = "", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null });
         const due = t.stamp;
         // Due at `due`, delivered a second before it.
         return (try t.at(ae.Deliver, .action_deliver, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .due_ns = due, .holder = "w", .request_key = null, .lease_ms = 5_000 }, due - std.time.ns_per_s)).broke;
@@ -1204,7 +1204,7 @@ const mutant_steps = struct {
         const token = try t.delivered(10_000, 2, null);
         const old = t.live().expiry_ns;
         // Extended past half its lease: the old key stays, now past due.
-        _ = try t.at(ae.Extend, .action_extend, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .holder = "w", .token = token, .expiry_ns = old, .held_since_ns = t.live().delivered_ns, .lease_ms = 10_000 }, t.stamp + 6 * std.time.ns_per_s);
+        _ = try t.at(ae.Extend, .action_extend, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .holder = "w", .deliveries = 1, .token = token, .expiry_ns = old, .held_since_ns = t.live().delivered_ns, .lease_ms = 10_000 }, t.stamp + 6 * std.time.ns_per_s);
         return t.expire(old, old + std.time.ns_per_s);
     }
 
@@ -1229,7 +1229,7 @@ const mutant_steps = struct {
         const token = try t.delivered(lease, 2, null);
         const since = t.live().delivered_ns;
         // Past half the lease: the extend moves it, to the ceiling at most.
-        return (try t.at(ae.Extend, .action_extend, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .holder = "w", .token = token, .expiry_ns = t.live().expiry_ns, .held_since_ns = since, .lease_ms = lease }, since + 7 * 60 * 60 * std.time.ns_per_s)).broke;
+        return (try t.at(ae.Extend, .action_extend, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .holder = "w", .deliveries = 1, .token = token, .expiry_ns = t.live().expiry_ns, .held_since_ns = since, .lease_ms = lease }, since + 7 * 60 * 60 * std.time.ns_per_s)).broke;
     }
 };
 

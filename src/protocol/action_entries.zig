@@ -83,10 +83,10 @@ pub const Invoke = Record(&.{
     .{ .name = "labels", .T = Optional(Bytes(MAX_LABELS)) },
     .{ .name = "source", .T = schema.Enum(Source) },
     .{ .name = "caller_run", .T = Optional(Bytes(limits.MAX_QUALIFIED_KEY)) },
+    // The calling workflow's name. Its runs are placed by that name, a run
+    // id the client chose included, so the name, not the run id, says
+    // which group the run's end is told on.
     .{ .name = "caller_workflow", .T = Optional(Bytes(limits.MAX_QUALIFIED_KEY)) },
-    // The shard the calling workflow's run is on, which its run id may
-    // not say (a client may choose it): the run's end is told there.
-    .{ .name = "caller_shard", .T = Optional(Int(u16)) },
 });
 
 /// A worker given a ready run. `due` is the ready key the leader chose it
@@ -141,14 +141,16 @@ pub const Release = Record(&.{
     .{ .name = "error", .T = Bytes(action_ops.MAX_ERROR) },
 });
 
-/// A delivery's lease moved out. It names the delivery's own lease, when
-/// the delivery began (`held_since_ns`, so the hold ceiling follows from
-/// the entry) and the expiry the leader saw, whose key it replaces.
+/// A delivery's lease moved out. It names the delivery (holder, count and
+/// token, as a settle does), its own lease, when it began (`held_since_ns`,
+/// so the hold ceiling follows from the entry) and the expiry the leader
+/// saw, whose key it replaces.
 pub const Extend = Record(&.{
     .{ .name = "ns", .T = NamespaceId },
     .{ .name = "action", .T = ActionName },
     .{ .name = "run", .T = RunId },
     .{ .name = "holder", .T = Holder },
+    .{ .name = "deliveries", .T = Int(u32) },
     .{ .name = "token", .T = Token },
     .{ .name = "expiry_ns", .T = Int(u64) },
     .{ .name = "held_since_ns", .T = Int(u64) },
