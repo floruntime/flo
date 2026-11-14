@@ -376,6 +376,12 @@ pub const JobDefinition = struct {
         // so a job never runs against a name its writes can't use. A group
         // key separates stream from group with a NUL.
         for (self.sources.items) |src| if (resourceRefusal(src.stream)) |why| return why;
+        // A source another shard owns is read by naming it in a message
+        // whose name fields are 16-bit lengths.
+        for (self.sources.items) |src| {
+            if (src.ts_measurement.len > limits.MAX_QUALIFIED_KEY) return "measurement name too long";
+            if (src.ts_field.len > std.math.maxInt(u16)) return "field name too long";
+        }
         for (self.sinks.items) |snk| if (resourceRefusal(snk.target)) |why| return why;
         return null;
     }

@@ -882,6 +882,7 @@ pub const Shard = struct {
         // them (a kv_lookup, a sink on another shard).
         processing_handler.peer_shard_count = shard_count;
         processing_handler.own_shard = shard_id;
+        processing_handler.local_kv = kv_handler;
         processing_handler.ns_table = namespace_handler.table;
 
         // Create SegmentWriter (persistence — per-shard, not per-partition)
@@ -2786,6 +2787,16 @@ pub const Shard = struct {
             .action_start => self.startActionRun(msg),
             .action_finished, .action_result_ask, .action_abandon, .worker_report, .action_held, .action_unhold => self.actionMessage(msg),
             .sink_write => self.runSinkWrite(msg),
+            .source_read => {
+                const bytes = inboxPayload(msg);
+                defer if (bytes.len > 0) self.allocator.free(bytes);
+                ProcessingHandler.answerSourceRead(self, msg.src_shard, bytes);
+            },
+            .source_page => {
+                const bytes = inboxPayload(msg);
+                defer if (bytes.len > 0) self.allocator.free(bytes);
+                self.processing_handler.takeSourcePage(self, bytes);
+            },
             .reply => self.deliverReply(msg),
             .forward_request => self.runForwardedRequest(msg),
             .cancel_reads => {
@@ -5964,7 +5975,7 @@ pub const Shard = struct {
                     self.deliverDeferredRefusal(reply_to, request_id, .unavailable, proto.notRun(SHUTTING_DOWN_NOT_RUN));
                 },
                 .reply => self.deliverReply(msg),
-                .action_start, .action_finished, .action_result_ask, .action_abandon, .worker_report, .action_held, .action_unhold => {
+                .action_start, .source_read, .source_page, .action_finished, .action_result_ask, .action_abandon, .worker_report, .action_held, .action_unhold => {
                     const bytes = inboxPayload(msg);
                     if (bytes.len > 0) self.allocator.free(bytes);
                 },
@@ -10518,11 +10529,7 @@ test "Shard: a processing sink in a namespace not yet published writes nothing u
     defer two.deinit();
     const a = &two.shards[0];
     const b = &two.shards[1];
-    const streams = [_]*StreamHandler{ a.stream_handler, b.stream_handler };
-    for (&two.shards) |*s| {
-        s.wireHandlerShardPtrs();
-        s.processing_handler.setPeerStreamHandlers(&streams);
-    }
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
     // A sink stream that id 0 would put here and the namespace's real id
     // puts on shard 1: routed before the publish, it lands on the wrong shard.
     const id = nextNamespaceId(a);
@@ -10972,17 +10979,304 @@ test "Shard: a TS sink whose measurement is on another shard writes through that
     try std.testing.expectEqual(@as(usize, 0), try tsPoints(a, .default, measurement, "value"));
 }
 
+/// A job on shard 0 whose source is `source` (a stream, or a measurement
+/// when `ts`), writing each record to stream `out`; its one pipeline.
+fn remoteSourceJob(two: *TwoShards, c: TestClient, source: []const u8, ts: bool, out: []const u8) !*ProcessingHandler.PipelineState {
+    const a = &two.shards[0];
+    var ybuf: [512]u8 = undefined;
+    const yaml = if (ts) try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: far-src
+        \\sources:
+        \\  - name: src
+        \\    ts: {{ measurement: {s}, field: value }}
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: {s} }}
+    , .{ source, out }) else try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: far-src
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: {s} }}
+    , .{ source, out });
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    return pit.next().?;
+}
+
+fn tickNow(a: *Shard, pipe: *ProcessingHandler.PipelineState) void {
+    pipe.last_poll_ms = 0;
+    _ = a.processing_handler.tickPipelines(a);
+}
+
+test "Shard: a pipeline whose source stream is on another shard reads it only through that shard's inbox" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(b, .default, 1, &sbuf);
+    var obuf: [16]u8 = undefined;
+    const out = try keyOn(a, .default, 0, &obuf);
+    for ([_][]const u8{ "r0", "r1", "r2" }) |r| _ = try b.stream_handler.appendPayloadToStream(source, "default", r);
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    const pipe = try remoteSourceJob(&two, c, source, false, out);
+    const from = a.raft_node.log.lastIndex() + 1;
+
+    // The tick asks; nothing is read here until shard 1 answers.
+    tickNow(a, pipe);
+    try std.testing.expect(pipe.read_seq != 0);
+    try std.testing.expectEqual(@as(u64, 0), pipe.records_in);
+    // While it waits, ticks ask nothing more.
+    const asked = pipe.read_seq;
+    tickNow(a, pipe);
+    try std.testing.expectEqual(asked, pipe.read_seq);
+    try std.testing.expectEqual(@as(usize, 1), b.mailbox.inbox.pending());
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 0), pipe.read_seq);
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+    try std.testing.expectEqual(@as(usize, 3), entriesOf(a, .stream_append, from));
+
+    // More appended: the next read takes them, none again.
+    _ = try b.stream_handler.appendPayloadToStream(source, "default", "r3");
+    two.settle();
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 4), pipe.records_in);
+    try std.testing.expectEqual(@as(usize, 4), entriesOf(a, .stream_append, from));
+}
+
+test "Shard: a pipeline whose TS source is on another shard reads its points through that shard's inbox" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var mbuf: [16]u8 = undefined;
+    const measurement = try keyOn(b, .default, 1, &mbuf);
+    var obuf: [16]u8 = undefined;
+    const out = try keyOn(a, .default, 0, &obuf);
+    for (0..4) |i| try b.ts_handler.ts.insert(.default, measurement, "value", @floatFromInt(i), 1_000_000 * (i + 1), i + 1, "host=x");
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    const pipe = try remoteSourceJob(&two, c, measurement, true, out);
+    const from = a.raft_node.log.lastIndex() + 1;
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 4), pipe.records_in);
+    try std.testing.expectEqual(@as(usize, 4), entriesOf(a, .stream_append, from));
+    try std.testing.expectEqual(@as(u64, 4_000_000), pipe.ts_cursor.ns);
+}
+
+test "Shard: a TS source with more points at one time than a tick has room for goes on through them, each written once" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var mbuf: [16]u8 = undefined;
+    const measurement = try keyOn(a, .default, 0, &mbuf);
+    var tbuf: [16]u8 = undefined;
+    const hosts = 400;
+    for (0..hosts) |i| try a.ts_handler.ts.insert(.default, measurement, "value", 1, 5_000_000, 1_000_000 + i, try std.fmt.bufPrint(&tbuf, "host={d}", .{i}));
+    var obuf: [3][16]u8 = undefined;
+    var outs: [3][]const u8 = undefined;
+    var k: usize = 0;
+    var found: usize = 0;
+    while (found < 3) : (k += 1) {
+        const name = try std.fmt.bufPrint(&obuf[found], "out{d}", .{k});
+        if (a.router.hashToShard(node_router.routeNsKey(.default, name)) == 0) {
+            outs[found] = name;
+            found += 1;
+        }
+    }
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: wide
+        \\sources:
+        \\  - name: src
+        \\    ts: {{ measurement: {s}, field: value }}
+        \\sinks:
+        \\  - name: a
+        \\    stream: {{ name: {s} }}
+        \\  - name: b
+        \\    stream: {{ name: {s} }}
+        \\  - name: c
+        \\    stream: {{ name: {s} }}
+    , .{ measurement, outs[0], outs[1], outs[2] });
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    const pipe = pit.next().?;
+    const from = a.raft_node.log.lastIndex() + 1;
+    // A tick has room for about a third of the points' writes: it takes
+    // what fits, and the next goes on from the last point it wrote.
+    for (0..12) |_| {
+        tickNow(a, pipe);
+        two.settle();
+    }
+    try std.testing.expectEqual(@as(u64, hosts), pipe.records_in);
+    try std.testing.expectEqual(@as(usize, 3 * hosts), entriesOf(a, .stream_append, from));
+    try std.testing.expectEqual(@as(u64, 5_000_000), pipe.ts_cursor.ns);
+}
+
+test "Shard: a TS page held partway, among points sharing a time, goes on from the last point written, none written twice" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var mbuf: [16]u8 = undefined;
+    const measurement = try keyOn(b, .default, 1, &mbuf);
+    var tbuf: [16]u8 = undefined;
+    const hosts = 300;
+    for (0..hosts) |i| try b.ts_handler.ts.insert(.default, measurement, "value", 1, 5_000_000, 1_000_000 + i, try std.fmt.bufPrint(&tbuf, "host={d}", .{i}));
+    var obuf: [16]u8 = undefined;
+    const out = try keyOn(a, .default, 0, &obuf);
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    const pipe = try remoteSourceJob(&two, c, measurement, true, out);
+    const from = a.raft_node.log.lastIndex() + 1;
+
+    // The read is asked with room for all of them; before the page comes,
+    // other writes take most of the log, so it is held partway.
+    tickNow(a, pipe);
+    _ = b.drainInbox();
+    var kbuf: [16]u8 = undefined;
+    for (0..900) |i| _ = try KVHandler.testProposePut(a, try std.fmt.bufPrint(&kbuf, "fill{d}", .{i}), "v");
+    _ = a.drainInbox();
+    try std.testing.expect(pipe.records_in > 0 and pipe.records_in < hosts);
+    try std.testing.expect(pipe.held_since_ms != 0);
+    for (0..12) |_| {
+        two.settle();
+        tickNow(a, pipe);
+    }
+    two.settle();
+    try std.testing.expectEqual(@as(u64, hosts), pipe.records_in);
+    try std.testing.expectEqual(@as(usize, hosts), entriesOf(a, .stream_append, from));
+}
+
+test "Shard: a source page that answers no read in flight, comes in another term, or finds the cursor moved is dropped, and a lost read is asked again" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(b, .default, 1, &sbuf);
+    var obuf: [16]u8 = undefined;
+    const out = try keyOn(a, .default, 0, &obuf);
+    for ([_][]const u8{ "r0", "r1" }) |r| _ = try b.stream_handler.appendPayloadToStream(source, "default", r);
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    const pipe = try remoteSourceJob(&two, c, source, false, out);
+
+    // Asked again before the first answer (as after the deadline): the
+    // first answer is stale and dropped, the second processed.
+    tickNow(a, pipe);
+    pipe.read_sent_ms -= 10_000;
+    tickNow(a, pipe);
+    try std.testing.expectEqual(@as(usize, 2), b.mailbox.inbox.pending());
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
+
+    // A page from an earlier term: dropped, and asked again.
+    _ = try b.stream_handler.appendPayloadToStream(source, "default", "r2");
+    two.settle();
+    tickNow(a, pipe);
+    _ = b.drainInbox();
+    a.raft_node.current_term += 1;
+    _ = a.drainInbox();
+    try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
+
+    // A lost read: once its deadline passes, it is asked again, and the
+    // record comes once.
+    a.raft_node.current_term -= 1;
+    pipe.read_sent_ms -= 10_000;
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+
+    // The cursor moved back while a read was out: its page is dropped.
+    _ = try b.stream_handler.appendPayloadToStream(source, "default", "r3");
+    two.settle();
+    tickNow(a, pipe);
+    _ = b.drainInbox();
+    pipe.stream_cursor_seq +%= 1;
+    _ = a.drainInbox();
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+    try std.testing.expectEqual(@as(u64, 0), pipe.read_seq);
+    pipe.stream_cursor_seq -%= 1;
+
+    // Its sinks out of room when the page comes: dropped, the cursor where
+    // it was, and read again once there's room.
+    tickNow(a, pipe);
+    _ = b.drainInbox();
+    const cursor_seq = pipe.stream_cursor_seq;
+    var kbuf: [16]u8 = undefined;
+    var i: usize = 0;
+    while (a.raft_node.log.lastIndex() - a.raft_node.last_applied + 1 < raft_node_mod.MAX_OUTSTANDING) : (i += 1)
+        _ = try KVHandler.testProposePut(a, try std.fmt.bufPrint(&kbuf, "fill{d}", .{i}), "v");
+    _ = a.drainInbox();
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+    try std.testing.expectEqual(cursor_seq, pipe.stream_cursor_seq);
+    two.settle();
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 4), pipe.records_in);
+}
+
+test "Shard: source reads and pages are freed when dropped: a page for a pipeline not here, and either still in the inbox at stop" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const read: @import("../processing/source_page.zig").Read = .{ .term = a.raft_node.current_term, .seq = 1, .kind = .stream, .pipeline = "gone", .namespace = "default", .source = "s", .from_a = 0, .from_b = 0, .limit = 10 };
+    var builder: @import("../processing/source_page.zig").Page.Builder = .{};
+    defer builder.deinit(a.allocator);
+    try builder.begin(a.allocator, read);
+    try builder.record(a.allocator, 1, 0, "x");
+    const page = try builder.finish(a.allocator, 1, 0);
+    // A page for a pipeline that was removed: dropped, freed.
+    try std.testing.expect(a.mailbox.inbox.send(.{ .tag = .source_page, .src_shard = 1, .payload_len = @intCast(page.len), .payload_ptr = page.ptr }));
+    _ = a.drainInbox();
+    // Both kinds unread at stop: freed.
+    const ask = read.encode(b.allocator).?;
+    try std.testing.expect(b.mailbox.inbox.send(.{ .tag = .source_read, .src_shard = 0, .payload_len = @intCast(ask.len), .payload_ptr = ask.ptr }));
+    var builder2: @import("../processing/source_page.zig").Page.Builder = .{};
+    defer builder2.deinit(b.allocator);
+    try builder2.begin(b.allocator, read);
+    const page2 = try builder2.finish(b.allocator, 0, 0);
+    try std.testing.expect(b.mailbox.inbox.send(.{ .tag = .source_page, .src_shard = 0, .payload_len = @intCast(page2.len), .payload_ptr = page2.ptr }));
+    b.refuseUnrunRequests();
+    try std.testing.expectEqual(@as(usize, 0), b.mailbox.inbox.pending());
+}
+
 test "Shard: a pipeline's KV sinks send another shard no more than its inbox has room for, so a tick isn't held at the same record every time" {
     var two: TwoShards = undefined;
     try two.init();
     defer two.deinit();
     const a = &two.shards[0];
     const b = &two.shards[1];
-    const streams = [_]*StreamHandler{ a.stream_handler, b.stream_handler };
-    for (&two.shards) |*s| {
-        s.wireHandlerShardPtrs();
-        s.processing_handler.setPeerStreamHandlers(&streams);
-    }
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
     // Two sinks, each writing one hot key owned by shard 1: two sends a record.
     var pbuf: [2][16]u8 = undefined;
     var prefixes: [2][]const u8 = undefined;
@@ -11057,11 +11351,7 @@ test "Shard: a pipeline tick held partway through a batch resumes at the record 
     defer two.deinit();
     const a = &two.shards[0];
     const b = &two.shards[1];
-    const streams = [_]*StreamHandler{ a.stream_handler, b.stream_handler };
-    for (&two.shards) |*s| {
-        s.wireHandlerShardPtrs();
-        s.processing_handler.setPeerStreamHandlers(&streams);
-    }
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
     // One hot key, owned by shard 1.
     var kbuf: [16]u8 = undefined;
     var i: usize = 0;
@@ -15543,119 +15833,6 @@ test "Shard: a cold group read delivers only what its reply carries" {
     const read: @import("../contract/view.zig").ReadView = .{ .store = &c.shard.defaultPartition().store };
     const meta = (try read.get(@import("../stream/group_machine.zig").Metas, @import("../stream/group_machine.zig").storeKey(&mk, .default, &scope))).?.v;
     try std.testing.expectEqual(@as(u64, delivered), meta.leased);
-}
-
-test "Shard: a job on another shard's thread reads cold records by copy, once the owner has fetched them" {
-    var c: ColdStream = undefined;
-    try c.init(.async_flush, 100, 0, 10);
-    defer c.deinit();
-    // This thread owns the shard's disk cache; the job reads from another.
-    c.shard.stream_disk.?.setOwner();
-    const Job = struct {
-        fn poll(handler: *StreamHandler, out: *StreamHandler.PayloadRead) void {
-            out.* = handler.readPayloadsForStream("s", "", StreamID.MIN, 10);
-        }
-    };
-    var first: StreamHandler.PayloadRead = undefined;
-    var t = try std.Thread.spawn(.{}, Job.poll, .{ c.shard.stream_handler, &first });
-    t.join();
-    defer first.deinit(c.shard.stream_handler.allocator);
-    // Cold: nothing yet, the cursor where it was, and the fetch asked of the
-    // owner, which touched nothing of the cache from the job's thread.
-    try std.testing.expectEqual(@as(usize, 0), first.payloads.len);
-    try std.testing.expect(first.last_id.eql(StreamID.MIN));
-    try std.testing.expectEqual(@as(usize, 0), c.shard.stream_disk.?.cache.count());
-    // The owner's tick fetches it.
-    _ = c.shard.stream_disk.?.drain();
-    _ = c.shard.stream_disk.?.drain();
-    var second: StreamHandler.PayloadRead = undefined;
-    t = try std.Thread.spawn(.{}, Job.poll, .{ c.shard.stream_handler, &second });
-    t.join();
-    defer second.deinit(c.shard.stream_handler.allocator);
-    try std.testing.expect(second.payloads.len > 0);
-    try std.testing.expect(second.copies.len > 0);
-    var all: [1]stream_mod.StreamRecord = undefined;
-    _ = c.shard.stream_handler.stream.readStreamAfter(stream_mod.streamKey(.default, "s"), StreamID.MIN, null, &all);
-    try std.testing.expect(second.ids[0].eql(all[0].id));
-}
-
-/// One poll by a job on another thread: `handler.readPayloadsForStream`
-/// from that thread.
-fn pollElsewhere(handler: *StreamHandler, after: StreamID) !StreamHandler.PayloadRead {
-    const Job = struct {
-        fn poll(h: *StreamHandler, from: StreamID, out: *StreamHandler.PayloadRead) void {
-            out.* = h.readPayloadsForStream("s", "", from, 10);
-        }
-    };
-    var out: StreamHandler.PayloadRead = undefined;
-    const t = try std.Thread.spawn(.{}, Job.poll, .{ handler, after, &out });
-    t.join();
-    return out;
-}
-
-test "Shard: a job on another shard's thread skips records the log no longer holds, once the owner says so" {
-    var c: ColdStream = undefined;
-    try c.init(.async_flush, 100, 0, 10);
-    defer c.deinit();
-    c.shard.stream_disk.?.setOwner();
-    var all: [100]stream_mod.StreamRecord = undefined;
-    _ = c.shard.stream_handler.stream.readStreamAfter(stream_mod.streamKey(.default, "s"), StreamID.MIN, null, &all);
-    // The segments holding the first records are gone from the durable log.
-    const dropped_through = all[25].ual_index;
-    _ = try c.shard.durable_log.?.dropThrough(dropped_through);
-    // Whole segments go: the first record kept is the first in what's left.
-    const kept_from = (try c.shard.durable_log.?.segments())[0].first_index;
-    var first_kept: usize = 0;
-    while (all[first_kept].ual_index < kept_from) first_kept += 1;
-    try std.testing.expect(first_kept > 0);
-
-    // Each poll asks the owner about the record it stops at; the owner finds
-    // it not in the log and says so, and the next poll skips it.
-    var after = StreamID.MIN;
-    for (0..200) |_| {
-        const r = try pollElsewhere(c.shard.stream_handler, after);
-        defer r.deinit(c.shard.stream_handler.allocator);
-        if (r.payloads.len > 0) {
-            try std.testing.expect(r.ids[0].eql(all[first_kept].id));
-            return;
-        }
-        after = r.last_id;
-        _ = c.shard.stream_disk.?.drain();
-    }
-    return error.NeverSkipped;
-}
-
-test "Shard: a job on another shard's thread waits out a blocked disk read rather than skip the record" {
-    var c: ColdStream = undefined;
-    try c.init(.async_flush, 100, 0, 10);
-    defer c.deinit();
-    const d = c.shard.stream_disk.?;
-    d.setOwner();
-    var all: [1]stream_mod.StreamRecord = undefined;
-    _ = c.shard.stream_handler.stream.readStreamAfter(stream_mod.streamKey(.default, "s"), StreamID.MIN, null, &all);
-    c.shard.durable_log.?.test_open_error = error.SystemResources;
-    // Asked, read and blocked; asked again while backing off: still not gone.
-    for (0..3) |_| {
-        const r = try pollElsewhere(c.shard.stream_handler, StreamID.MIN);
-        defer r.deinit(c.shard.stream_handler.allocator);
-        try std.testing.expectEqual(@as(usize, 0), r.payloads.len);
-        try std.testing.expect(r.last_id.eql(StreamID.MIN));
-        _ = d.drain();
-    }
-    try std.testing.expect(!d.isGone(all[0].ual_index));
-    // Readable again, it gets the record.
-    c.shard.durable_log.?.test_open_error = null;
-    d.blocked_until_ms = 0;
-    for (0..20) |_| {
-        const r = try pollElsewhere(c.shard.stream_handler, StreamID.MIN);
-        defer r.deinit(c.shard.stream_handler.allocator);
-        if (r.payloads.len > 0) {
-            try std.testing.expect(r.ids[0].eql(all[0].id));
-            return;
-        }
-        _ = d.drain();
-    }
-    return error.NeverServed;
 }
 
 test "Shard: a stream read of a corrupt sealed segment takes the shard offline, and /status says why" {

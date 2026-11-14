@@ -37,8 +37,6 @@ const RAFT_QUEUE_CAPACITY = @import("../raft/network.zig").RAFT_QUEUE_CAPACITY;
 const cluster_config = @import("../config/cluster.zig");
 const offline = @import("offline.zig");
 const raft_hard_state = @import("../raft/hard_state.zig");
-const StreamHandler = @import("../stream/handler.zig").StreamHandler;
-const KVHandler = @import("../kv/handler.zig").KVHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const manifest = @import("manifest.zig");
 const data_format = @import("data_format.zig");
@@ -365,16 +363,9 @@ pub const Runtime = struct {
     /// The node's namespace table: shard 0 publishes it, every shard reads it.
     namespaces: ?*ns_table.Table = null,
 
-    /// Cross-shard stream handler array — allocated during wirePeerStreamHandlers, freed on deinit.
-    peer_stream_handlers_slice: ?[]const *StreamHandler,
-
     /// Every shard's mailbox — allocated during wirePeerMailboxes, freed on deinit.
     peer_mailboxes_slice: ?[]*Mailbox,
 
-    /// Cross-shard KV handler array — allocated during wirePeerKvHandlers, freed on deinit.
-    peer_kv_handlers_slice: ?[]const *KVHandler,
-
-    /// Cross-shard TS / queue handler arrays — allocated during wirePeer*, freed on deinit.
     /// Cross-shard shard pointer array — allocated during wirePeerShards, freed on deinit.
     peer_shards_slice: ?[]*Shard,
 
@@ -444,8 +435,6 @@ pub const Runtime = struct {
             .metrics_server = null,
             .health = null,
             .data_dir_lock = null,
-            .peer_stream_handlers_slice = null,
-            .peer_kv_handlers_slice = null,
             .peer_mailboxes_slice = null,
             .peer_shards_slice = null,
         };
@@ -502,18 +491,6 @@ pub const Runtime = struct {
                 if (pipe[1] >= 0) _ = std.c.close(pipe[1]);
             }
             self.allocator.free(pipes);
-        }
-
-        // Clean up peer stream handler array
-        if (self.peer_stream_handlers_slice) |s| {
-            self.allocator.free(s);
-            self.peer_stream_handlers_slice = null;
-        }
-
-        // Clean up peer KV handler array
-        if (self.peer_kv_handlers_slice) |s| {
-            self.allocator.free(s);
-            self.peer_kv_handlers_slice = null;
         }
 
         if (self.peer_mailboxes_slice) |s| {
@@ -805,14 +782,6 @@ pub const Runtime = struct {
                 return error.UnwiredWalk;
             }
         }
-
-        // 2.55 Wire cross-shard stream handler references for processing pipelines.
-        try self.wirePeerStreamHandlers(shards);
-
-        // 2.555 Wire cross-shard KV handler references for processing KV lookups + sinks.
-        try self.wirePeerKvHandlers(shards);
-
-        // 2.556 Wire cross-shard TS / queue handler references for processing sinks.
 
         // 2.56 Give every shard every shard's mailbox.
         try self.wirePeerMailboxes(shards);
@@ -1123,35 +1092,6 @@ pub const Runtime = struct {
     fn stopHttp(self: *Runtime) void {
         if (self.dashboard_server) |server| server.stop();
         if (self.metrics_server) |ms| ms.stop();
-    }
-
-    /// Wire cross-shard stream handler references so processing pipelines
-    /// can read/write streams on any shard.
-    fn wirePeerStreamHandlers(self: *Runtime, shards: []Shard) !void {
-        const n = self.shard_count;
-        const handlers = try self.allocator.alloc(*StreamHandler, n);
-        for (0..n) |i| {
-            handlers[i] = shards[i].stream_handler;
-        }
-        self.peer_stream_handlers_slice = handlers;
-
-        for (0..n) |i| {
-            shards[i].processing_handler.setPeerStreamHandlers(handlers);
-        }
-    }
-
-    /// Wire every shard's KV handler into each processing handler.
-    fn wirePeerKvHandlers(self: *Runtime, shards: []Shard) !void {
-        const n = self.shard_count;
-        const handlers = try self.allocator.alloc(*KVHandler, n);
-        for (0..n) |i| {
-            handlers[i] = shards[i].kv_handler;
-        }
-        self.peer_kv_handlers_slice = handlers;
-
-        for (0..n) |i| {
-            shards[i].processing_handler.setPeerKvHandlers(handlers);
-        }
     }
 
     /// Give every shard every shard's mailbox (requests, replies and wakes).

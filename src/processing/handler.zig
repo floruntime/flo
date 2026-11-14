@@ -60,6 +60,9 @@ const Flags = entry_mod.Flags;
 const native_registry = @import("operators/native_registry.zig");
 const kv_lookup_mod = @import("operators/kv_lookup.zig");
 const SinkWrite = @import("sink_write.zig").SinkWrite;
+const source_page = @import("source_page.zig");
+const TsPoint = source_page.TsPoint;
+const ReadAt = ts_mod.TSProjection.ReadAt;
 const operator_mod = @import("operator.zig");
 const Operator = operator_mod.Operator;
 const collector_mod = @import("collector.zig");
@@ -112,17 +115,14 @@ pub const ProcessingHandler = struct {
     /// Per-job pipeline execution state (keyed by same job_id as jobs map).
     pipelines: std.StringHashMap(PipelineState),
 
-    /// Cross-shard stream handlers — one per shard, wired by Runtime.
-    /// Enables pipelines to read/write streams on the shard that owns them.
-    peer_stream_handlers: ?[]const *stream_handler_mod.StreamHandler = null,
     peer_shard_count: u16 = 1,
     /// The node's namespace table, wired by the shard: a sink routes by its
     /// namespace's id, as the dispatcher does.
     ns_table: ?*const @import("../namespace/table.zig").Table = null,
 
-    /// KV handlers — one per shard, wired by Runtime.
-    peer_kv_handlers: ?[]const *kv_handler_mod.KVHandler = null,
-    /// The shard this handler runs on; kv_lookup reads only its KV.
+    /// This shard's KV, wired by the shard: all a kv_lookup reads.
+    local_kv: ?*kv_handler_mod.KVHandler = null,
+    /// The shard this handler runs on.
     own_shard: u16 = 0,
 
     /// Sink enqueues proposed on this shard and not yet applied, from its
@@ -166,7 +166,7 @@ pub const ProcessingHandler = struct {
     /// Per-job pipeline state: source/sink config + read cursor + operator chain.
     /// Where a pipeline reads again from: past this stream id, or from this
     /// time on.
-    pub const Resume = union(enum) { stream: StreamID, ts: u64 };
+    pub const Resume = union(enum) { stream: StreamID, ts: ReadAt };
 
     /// A sink write proposed and not yet applied.
     pub const PendingSink = struct {
@@ -196,7 +196,8 @@ pub const ProcessingHandler = struct {
         sinks: []SinkConfig = &.{},
 
         // Read cursors — track what's been processed
-        ts_cursor_ns: u64, // TS source: next timestamp_ns to read from
+        /// TS source: the last point read, by (time, log index).
+        ts_cursor: ReadAt,
         stream_cursor_ts: u64, // Stream source: last StreamID timestamp_ms read
         stream_cursor_seq: u64, // Stream source: last StreamID sequence read
         last_poll_ms: i64, // last time this pipeline was ticked
@@ -229,7 +230,13 @@ pub const ProcessingHandler = struct {
         /// sink write was refused for room at apply; 0 while they go through.
         held_since_ms: i64 = 0,
         /// Where the record whose sinks are being written is read again from.
-        resume_here: Resume = .{ .ts = 0 },
+        resume_here: Resume = .{ .ts = .{ .ns = 0, .ual = 0 } },
+        /// A read of a source another shard owns, in flight: its number
+        /// (0 for none), the term it was asked in, and when.
+        read_seq: u64 = 0,
+        read_term: u64 = 0,
+        read_sent_ms: i64 = 0,
+        next_read_seq: u64 = 0,
         /// The sink writes this leader proposed on this shard that haven't
         /// applied: one refused at apply is read again or counted, never lost
         /// in silence. Each is a log entry not yet applied, so the log's cap
@@ -315,27 +322,6 @@ pub const ProcessingHandler = struct {
         }
         self.jobs.deinit();
         self.sink_enqueues.deinit(self.allocator);
-    }
-
-    /// Wire cross-shard stream handler references.
-    /// Called by Runtime after all shards are initialized.
-    pub fn setPeerStreamHandlers(self: *ProcessingHandler, handlers: []const *stream_handler_mod.StreamHandler) void {
-        self.peer_stream_handlers = handlers;
-    }
-
-    /// Wire cross-shard KV handler references.
-    /// Called by Runtime after all shards are initialized.
-    pub fn setPeerKvHandlers(self: *ProcessingHandler, handlers: []const *kv_handler_mod.KVHandler) void {
-        self.peer_kv_handlers = handlers;
-    }
-
-    /// Resolve the correct StreamHandler for a given stream name + namespace.
-    /// Routes as the dispatcher routes stream_append (`peerShardId`), so the
-    /// stream's data is on the shard chosen.
-    fn resolveStreamHandler(self: *ProcessingHandler, local: *stream_handler_mod.StreamHandler, stream_name: []const u8, namespace: []const u8) *stream_handler_mod.StreamHandler {
-        const peers = self.peer_stream_handlers orelse return local;
-        if (peers.len <= 1) return local;
-        return peers[self.peerShardId(namespace, stream_name)];
     }
 
     /// Shard that owns `key` in `namespace`, by the router the dispatchers use
@@ -1207,14 +1193,16 @@ pub const ProcessingHandler = struct {
     /// Move a pipeline's read cursor to `(a, b)`, forward only: this is also
     /// the live applier, and a leader may have read further by the time its
     /// checkpoint commits. `(a, b)` is a stream source's (timestamp,
-    /// sequence), or a TS source's next timestamp and 0.
+    /// sequence), or a TS source's last point's (time, log index).
     fn applyCursor(pipe: *PipelineState, a: u64, b: u64) void {
         switch (pipe.source_kind) {
             .stream => if (a > pipe.stream_cursor_ts or (a == pipe.stream_cursor_ts and b > pipe.stream_cursor_seq)) {
                 pipe.stream_cursor_ts = a;
                 pipe.stream_cursor_seq = b;
             },
-            .ts => pipe.ts_cursor_ns = @max(pipe.ts_cursor_ns, a),
+            .ts => if (pipe.ts_cursor.before(.{ .ns = a, .ual = b })) {
+                pipe.ts_cursor = .{ .ns = a, .ual = b };
+            },
         }
     }
 
@@ -1444,9 +1432,8 @@ pub const ProcessingHandler = struct {
     /// of more than one shard, so this KV is all there is.
     fn shardKvLookup(ctx: *anyopaque, namespace: []const u8, key: []const u8) ?[]const u8 {
         const self: *ProcessingHandler = @ptrCast(@alignCast(ctx));
-        const handlers = self.peer_kv_handlers orelse return null;
-        if (self.own_shard >= handlers.len) return null;
-        const entry = handlers[self.own_shard].*.kv.getIn(self.namespaceIdOf(namespace), key) orelse return null;
+        const kv = self.local_kv orelse return null;
+        const entry = kv.kv.getIn(self.namespaceIdOf(namespace), key) orelse return null;
         return entry.value;
     }
 
@@ -1473,7 +1460,7 @@ pub const ProcessingHandler = struct {
             .src_poll_ms = if (src.ts_poll_interval_ms > 0) src.ts_poll_interval_ms else 1000,
             .batch_size = if (src.batch_size > 0) src.batch_size else 100,
             .sinks = &.{},
-            .ts_cursor_ns = 0,
+            .ts_cursor = .{ .ns = 0, .ual = 0 },
             .stream_cursor_ts = 0,
             .stream_cursor_seq = 0,
             .last_poll_ms = 0,
@@ -1582,43 +1569,39 @@ pub const ProcessingHandler = struct {
         return held;
     }
 
-    /// Tick a TS source pipeline: read points from TSProjection, apply operators, write to sink.
+    /// Tick a TS source pipeline: read points, apply operators, write to sinks.
     fn tickTsSource(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
-        var point_buf: [256]StoredPoint = undefined;
-        // Tags are part of the series key now, so a configured tag set selects
-        // the series directly instead of being scanned for after the fact (which
-        // also wasted the point budget on non-matching points).
-        const src_ns = shard.namespaceId(pipe.src_namespace);
-        const result = shard.ts_handler.ts.queryRange(
-            src_ns,
-            pipe.src_measurement,
-            pipe.src_field,
-            if (pipe.src_tag_hash != 0) pipe.src_tag_hash else null,
-            pipe.ts_cursor_ns,
-            std.math.maxInt(u64),
-            &point_buf,
-        ) catch return;
-
         const room = sinkRoom(shard, pipe);
         // Room for none: the source waits, its cursor where it is. So it
         // does while a batch of its writes is still to apply.
         if (room == 0 or pipe.pending.items.len >= pipe.batch_size) return;
-        const points = point_buf[0..@min(result.points_in_buffer, room)];
+        const limit = @min(room, source_page.TS_PAGE_POINTS);
+        const owner = self.sinkOwner(shard, pipe.src_namespace, pipe.src_measurement);
+        if (owner != shard.id) return self.askSource(pipeline_key, pipe, shard, owner, limit);
+        var points: [source_page.TS_PAGE_POINTS]TsPoint = undefined;
+        const n = source_page.readTsPage(shard.ts_handler.ts, shard.namespaceId(pipe.src_namespace), pipe.src_measurement, pipe.src_field, pipe.src_tag_hash, pipe.ts_cursor, limit, &points);
+        self.processTsPage(pipeline_key, pipe, shard, job, points[0..n]);
+    }
+
+    /// A page of a TS source, read here or sent by the shard that owns it,
+    /// in (time, log index) order after the cursor.
+    fn processTsPage(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord, points: []const TsPoint) void {
         if (points.len == 0) return maybePersistCheckpoint(pipeline_key, pipe, shard, job.ns_id);
-        const cursor_before = pipe.ts_cursor_ns;
+        const cursor = pipe.ts_cursor;
         self.sink_overloaded = false;
 
         // One point at a time: its JSON and what its chain allocates are
         // freed once its outputs are written.
         var arena = std.heap.ArenaAllocator.init(shard.allocator);
         defer arena.deinit();
-        for (points) |pt| {
+        for (points, 0..) |pt, i| {
             defer _ = arena.reset(.retain_capacity);
             // Format TS point as JSON record. Short of memory, the tick
             // stops here, the point still ahead of the cursor.
             const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
-            const json = tsPointJson(arena.allocator(), pipe.src_measurement, pt.field_value, ts_ms) catch break;
-            pipe.resume_here = .{ .ts = pt.timestamp_ns };
+            const json = tsPointJson(arena.allocator(), pipe.src_measurement, pt.value, ts_ms) catch break;
+            const before: ReadAt = if (i > 0) .{ .ns = points[i - 1].timestamp_ns, .ual = points[i - 1].ual } else cursor;
+            pipe.resume_here = .{ .ts = before };
 
             // Apply operator chain (or pass through directly). A record
             // the chain failed on is counted and skipped: passing it through
@@ -1630,28 +1613,23 @@ pub const ProcessingHandler = struct {
 
             if (output_records) |records| {
                 for (records) |rec| {
-                    self.writeSinkRecord(pipe, shard, rec.value, pt.field_value, pt.timestamp_ns, shard.ts_handler.ts.tagsForHash(src_ns, pt.tag_hash), rec.tags);
+                    self.writeSinkRecord(pipe, shard, rec.value, pt.value, pt.timestamp_ns, pt.tags, rec.tags);
                 }
             } else {
                 // No operators — direct passthrough
-                self.writeSinkRecord(pipe, shard, json, pt.field_value, pt.timestamp_ns, shard.ts_handler.ts.tagsForHash(src_ns, pt.tag_hash), 0);
+                self.writeSinkRecord(pipe, shard, json, pt.value, pt.timestamp_ns, pt.tags, 0);
             }
 
             // A sink found its shard full: the next tick reads again from
-            // this point's time. Points before it at that time are written
-            // again; those before it are not.
+            // this point, every sink of those before it written.
             if (self.sink_overloaded) {
                 self.sink_overloaded = false;
-                pipe.ts_cursor_ns = @max(cursor_before, pt.timestamp_ns);
+                pipe.ts_cursor = before;
                 self.noteHeld(shard, pipe);
                 return;
             }
 
-            // Advance cursor past this point
-            if (pt.timestamp_ns >= pipe.ts_cursor_ns) {
-                pipe.ts_cursor_ns = pt.timestamp_ns + 1;
-            }
-
+            pipe.ts_cursor = .{ .ns = pt.timestamp_ns, .ual = pt.ual };
             // Event-time watermark = highest source point timestamp seen.
             if (ts_ms > pipe.watermark_ms) pipe.watermark_ms = ts_ms;
 
@@ -1667,27 +1645,28 @@ pub const ProcessingHandler = struct {
 
     /// Tick a stream source pipeline: read payloads from stream, apply operators, write to sink.
     fn tickStreamSource(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
-        log.debug("TICK_ENTRY: src={s} ns={s} cursor_ts={d} cursor_seq={d}", .{ pipe.src_stream, pipe.src_namespace, pipe.stream_cursor_ts, pipe.stream_cursor_seq });
-        // Build cursor from last-read StreamID
-        const cursor = StreamID{ .timestamp_ms = pipe.stream_cursor_ts, .sequence = pipe.stream_cursor_seq };
-
-        // Resolve the stream handler that owns the source stream (may be on a different shard)
-        const src_handler = self.resolveStreamHandler(shard.stream_handler, pipe.src_stream, pipe.src_namespace);
-
         // As many as this shard can write out now; with room for none the
         // source waits, its cursor where it is.
         const room = sinkRoom(shard, pipe);
         if (room == 0 or pipe.pending.items.len >= pipe.batch_size) return;
-        // Read from the named source stream using namespace-qualified name-hash filtering
-        const result = src_handler.readPayloadsForStream(pipe.src_stream, pipe.src_namespace, cursor, @min(pipe.batch_size, room));
+        const limit = @min(pipe.batch_size, room);
+        const owner = self.sinkOwner(shard, pipe.src_namespace, pipe.src_stream);
+        if (owner != shard.id) return self.askSource(pipeline_key, pipe, shard, owner, limit);
+        const cursor = StreamID{ .timestamp_ms = pipe.stream_cursor_ts, .sequence = pipe.stream_cursor_seq };
+        const result = shard.stream_handler.readPayloadsForStream(pipe.src_stream, pipe.src_namespace, cursor, limit);
+        defer result.deinit(shard.stream_handler.allocator);
+        self.processStreamPage(pipeline_key, pipe, shard, job, cursor, result.payloads, result.ids, result.last_id);
+    }
+
+    /// A page of a stream source read from `cursor`, here or sent by the
+    /// shard that owns it: `last_id` is where the read reached.
+    fn processStreamPage(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord, cursor: StreamID, payloads: []const []const u8, ids: []const StreamID, last_id: StreamID) void {
         self.sink_overloaded = false;
-        log.debug("TICK: read {d} payloads, last_id ts={d} seq={d}", .{ result.payloads.len, result.last_id.timestamp_ms, result.last_id.sequence });
-        defer result.deinit(src_handler.allocator);
-        if (result.payloads.len == 0) {
+        if (payloads.len == 0) {
             // Appends that couldn't be read still move the cursor past them
             // (the stream handler logged them), so the source doesn't stall.
-            pipe.stream_cursor_ts = result.last_id.timestamp_ms;
-            pipe.stream_cursor_seq = result.last_id.sequence;
+            pipe.stream_cursor_ts = last_id.timestamp_ms;
+            pipe.stream_cursor_seq = last_id.sequence;
             // Idle, the last batch's cursor still reaches disk: a restart
             // doesn't read it again.
             maybePersistCheckpoint(pipeline_key, pipe, shard, job.ns_id);
@@ -1698,23 +1677,17 @@ pub const ProcessingHandler = struct {
         // outputs are written.
         var arena = std.heap.ArenaAllocator.init(shard.allocator);
         defer arena.deinit();
-        for (result.payloads, 0..) |payload, i| {
+        for (payloads, 0..) |payload, i| {
             defer _ = arena.reset(.retain_capacity);
-            pipe.resume_here = .{ .stream = if (i > 0) result.ids[i - 1] else cursor };
-            log.debug("tickStreamSource: payload len={d} first100='{s}'", .{ payload.len, if (payload.len > 100) payload[0..100] else payload });
+            pipe.resume_here = .{ .stream = if (i > 0) ids[i - 1] else cursor };
             const output_records = applyOperatorChain(pipe.operators, payload, @import("stdx").time.milliTimestamp(), arena.allocator()) catch |err| blk: {
                 self.noteChainError(shard, err);
                 break :blk @as(?[]const ProcessingRecord, &.{});
             };
 
             if (output_records) |records| {
-                log.debug("TICK: chain returned {d} records for job", .{records.len});
-                for (records) |rec| {
-                    log.debug("TICK: value_len={d} first50='{s}'", .{ rec.value.len, if (rec.value.len > 50) rec.value[0..50] else rec.value });
-                    self.writeSinkRecordFromStream(pipe, shard, rec.key, rec.value, rec.tags);
-                }
+                for (records) |rec| self.writeSinkRecordFromStream(pipe, shard, rec.key, rec.value, rec.tags);
             } else {
-                log.debug("tickStreamSource: no operators, passthrough", .{});
                 self.writeSinkRecordFromStream(pipe, shard, "", payload, 0);
             }
 
@@ -1723,8 +1696,8 @@ pub const ProcessingHandler = struct {
             if (self.sink_overloaded) {
                 self.sink_overloaded = false;
                 if (i > 0) {
-                    pipe.stream_cursor_ts = result.ids[i - 1].timestamp_ms;
-                    pipe.stream_cursor_seq = result.ids[i - 1].sequence;
+                    pipe.stream_cursor_ts = ids[i - 1].timestamp_ms;
+                    pipe.stream_cursor_seq = ids[i - 1].sequence;
                 }
                 self.noteHeld(shard, pipe);
                 return;
@@ -1735,8 +1708,8 @@ pub const ProcessingHandler = struct {
         }
 
         // Advance cursor to last StreamID read
-        pipe.stream_cursor_ts = result.last_id.timestamp_ms;
-        pipe.stream_cursor_seq = result.last_id.sequence;
+        pipe.stream_cursor_ts = last_id.timestamp_ms;
+        pipe.stream_cursor_seq = last_id.sequence;
         // Still held while a write it proposed may be refused for room.
         if (pipe.pending.items.len == 0) pipe.held_since_ms = 0;
 
@@ -1745,6 +1718,144 @@ pub const ProcessingHandler = struct {
         // At-least-once: a crash loses at most CHECKPOINT_INTERVAL_MS
         // of progress, which redelivers — it never skips records.
         maybePersistCheckpoint(pipeline_key, pipe, shard, job.ns_id);
+    }
+
+    /// Most a read of another shard's source waits for its page before it
+    /// is asked again: the answer may have found an inbox full.
+    const READ_DEADLINE_MS: i64 = 5_000;
+
+    /// A source another shard owns: ask that shard for a page from the
+    /// cursor, at most one at a time. The page is processed when it comes
+    /// (`takeSourcePage`); until then the pipeline reads nothing more.
+    fn askSource(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, owner: u16, limit: usize) void {
+        _ = self;
+        const raft = shard.raft_node;
+        if (raft.role != .leader) return;
+        const now = @import("stdx").time.milliTimestamp();
+        if (pipe.read_seq != 0 and now - pipe.read_sent_ms < READ_DEADLINE_MS) return;
+        const kind: source_page.Kind = switch (pipe.source_kind) {
+            .stream => .stream,
+            .ts => .ts,
+        };
+        const from_a: u64, const from_b: u64 = switch (pipe.source_kind) {
+            .stream => .{ pipe.stream_cursor_ts, pipe.stream_cursor_seq },
+            .ts => .{ pipe.ts_cursor.ns, pipe.ts_cursor.ual },
+        };
+        const seq = pipe.next_read_seq + 1;
+        const bytes = (source_page.Read{
+            .term = raft.current_term,
+            .seq = seq,
+            .kind = kind,
+            .pipeline = pipeline_key,
+            .namespace = pipe.src_namespace,
+            .source = if (kind == .stream) pipe.src_stream else pipe.src_measurement,
+            .field = pipe.src_field,
+            .tag_hash = pipe.src_tag_hash,
+            .from_a = from_a,
+            .from_b = from_b,
+            .limit = @intCast(limit),
+        }).encode(shard.allocator) orelse return;
+        if (!shard.peer_mailboxes.?[owner].inbox.send(.{ .tag = .source_read, .src_shard = @intCast(shard.id), .payload_len = @intCast(bytes.len), .payload_ptr = bytes.ptr })) {
+            // A full inbox: asked again next tick.
+            shard.allocator.free(bytes);
+            return;
+        }
+        pipe.next_read_seq = seq;
+        pipe.read_seq = seq;
+        pipe.read_term = raft.current_term;
+        pipe.read_sent_ms = now;
+    }
+
+    /// Another shard's pipeline asks for a page of a source this shard
+    /// owns: read here, on this shard's thread, as a client's read is
+    /// (applied data only, nothing logged), and sent back. An answer that
+    /// finds the asker's inbox full is dropped; the asker asks again.
+    pub fn answerSourceRead(shard: *Shard, to: u16, bytes: []const u8) void {
+        const r = source_page.Read.decode(bytes) orelse return;
+        const mailboxes = shard.peer_mailboxes orelse return;
+        if (to >= mailboxes.len) return;
+        var b: source_page.Page.Builder = .{};
+        defer b.deinit(shard.allocator);
+        const page = buildSourcePage(shard, r, &b) catch return;
+        if (!mailboxes[to].inbox.send(.{ .tag = .source_page, .src_shard = @intCast(shard.id), .payload_len = @intCast(page.len), .payload_ptr = page.ptr }))
+            shard.allocator.free(page);
+    }
+
+    fn buildSourcePage(shard: *Shard, r: source_page.Read, b: *source_page.Page.Builder) ![]u8 {
+        try b.begin(shard.allocator, r);
+        switch (r.kind) {
+            .stream => {
+                const from: StreamID = .{ .timestamp_ms = r.from_a, .sequence = r.from_b };
+                const result = shard.stream_handler.readPayloadsForStream(r.source, r.namespace, from, r.limit);
+                defer result.deinit(shard.stream_handler.allocator);
+                for (result.payloads, result.ids) |p, id| try b.record(shard.allocator, id.timestamp_ms, id.sequence, p);
+                return b.finish(shard.allocator, result.last_id.timestamp_ms, result.last_id.sequence);
+            },
+            .ts => {
+                var points: [source_page.TS_PAGE_POINTS]TsPoint = undefined;
+                const n = source_page.readTsPage(shard.ts_handler.ts, shard.namespaceId(r.namespace), r.source, r.field, r.tag_hash, .{ .ns = r.from_a, .ual = r.from_b }, r.limit, &points);
+                for (points[0..n]) |p| try b.point(shard.allocator, p);
+                return b.finish(shard.allocator, 0, 0);
+            },
+        }
+    }
+
+    /// A page another shard sent for a pipeline here. Processed only if it
+    /// answers that pipeline's read in flight, this node still leads in the
+    /// term it asked in, the job runs, and the cursor is still where the
+    /// read began; dropped otherwise. The caller frees the bytes.
+    pub fn takeSourcePage(self: *ProcessingHandler, shard: *Shard, bytes: []const u8) void {
+        const page = source_page.Page.decode(bytes) orelse return;
+        const entry = self.pipelines.getEntry(page.pipeline) orelse return;
+        const pipeline_key = entry.key_ptr.*;
+        const pipe = entry.value_ptr;
+        if (pipe.read_seq != page.seq or pipe.read_term != page.term) return;
+        pipe.read_seq = 0;
+        const raft = shard.raft_node;
+        if (raft.role != .leader or raft.current_term != page.term) return;
+        const base_job_id = if (std.mem.indexOfScalar(u8, pipeline_key, 0)) |nul| pipeline_key[0..nul] else pipeline_key;
+        const job = self.jobs.getPtr(base_job_id) orelse return;
+        if (job.status != .running or job.held) return;
+        // A sink write refused since the read was asked moved the cursor
+        // back: read again from there.
+        const from_a: u64, const from_b: u64 = switch (pipe.source_kind) {
+            .stream => .{ pipe.stream_cursor_ts, pipe.stream_cursor_seq },
+            .ts => .{ pipe.ts_cursor.ns, pipe.ts_cursor.ual },
+        };
+        if (from_a != page.from_a or from_b != page.from_b) return;
+        // As a tick checks before it reads: sinks not ready, held, or out of
+        // room take no page now. Asked again next tick, from the same cursor.
+        if (!self.sinksReady(shard, pipe) or self.sinksHeld(shard, pipe)) return;
+        if (sinkRoom(shard, pipe) == 0 or pipe.pending.items.len >= pipe.batch_size) return;
+
+        self.ticking_job = base_job_id;
+        defer self.ticking_job = "";
+        const before = job.records_processed;
+        switch (pipe.source_kind) {
+            .stream => {
+                if (page.kind != .stream) return;
+                const recs = shard.allocator.alloc(source_page.Page.Record, page.count) catch return;
+                defer shard.allocator.free(recs);
+                const got = page.records(recs) orelse return;
+                const payloads = shard.allocator.alloc([]const u8, got.len) catch return;
+                defer shard.allocator.free(payloads);
+                const ids = shard.allocator.alloc(StreamID, got.len) catch return;
+                defer shard.allocator.free(ids);
+                for (got, payloads, ids) |rec, *p, *id| {
+                    p.* = rec.payload;
+                    id.* = .{ .timestamp_ms = rec.ms, .sequence = rec.seq };
+                }
+                self.processStreamPage(pipeline_key, pipe, shard, job, .{ .timestamp_ms = page.from_a, .sequence = page.from_b }, payloads, ids, .{ .timestamp_ms = page.last_a, .sequence = page.last_b });
+            },
+            .ts => {
+                if (page.kind != .ts) return;
+                var points: [source_page.TS_PAGE_POINTS]TsPoint = undefined;
+                const got = page.points(&points) orelse return;
+                self.processTsPage(pipeline_key, pipe, shard, job, got);
+            },
+        }
+        const processed = job.records_processed - before;
+        if (processed > 0) if (shard.metrics_registry) |m| m.processing.recordProcessed(processed);
     }
 
     /// Minimum wall-clock gap between durable cursor checkpoints per pipeline.
@@ -1758,7 +1869,7 @@ pub const ProcessingHandler = struct {
     fn maybePersistCheckpoint(pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, ns_id: NamespaceId) void {
         var a: u64, var b: u64 = switch (pipe.source_kind) {
             .stream => .{ pipe.stream_cursor_ts, pipe.stream_cursor_seq },
-            .ts => .{ pipe.ts_cursor_ns, 0 },
+            .ts => .{ pipe.ts_cursor.ns, pipe.ts_cursor.ual },
         };
         // Never past a record whose sink write may yet be refused.
         if (earliestPending(pipe)) |at| switch (at) {
@@ -1766,7 +1877,10 @@ pub const ProcessingHandler = struct {
                 a = id.timestamp_ms;
                 b = id.sequence;
             },
-            .ts => |t| a = @min(a, t),
+            .ts => |t| if (t.before(.{ .ns = a, .ual = b })) {
+                a = t.ns;
+                b = t.ual;
+            },
         };
         // Only when the cursor actually advanced past what we last persisted.
         if (a == pipe.persisted_cursor_ts and b == pipe.persisted_cursor_seq) return;
@@ -2196,7 +2310,9 @@ pub const ProcessingHandler = struct {
                     pipe.stream_cursor_seq = id.sequence;
                 }
             },
-            .ts => |t| pipe.ts_cursor_ns = @min(pipe.ts_cursor_ns, t),
+            .ts => |t| if (t.before(pipe.ts_cursor)) {
+                pipe.ts_cursor = t;
+            },
         }
     }
 
@@ -2212,7 +2328,7 @@ pub const ProcessingHandler = struct {
             };
             out = switch (p.again) {
                 .stream => |id| if (id.lessThan(o.stream)) p.again else o,
-                .ts => |t| if (t < o.ts) p.again else o,
+                .ts => |t| if (t.before(o.ts)) p.again else o,
             };
         }
         return out;
@@ -2507,18 +2623,18 @@ test "processing: a TS source's checkpoint restores its cursor, and never moves 
     try handler.pipelines.put(try allocator.dupe(u8, "job-ts"), try ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
     var val: [16]u8 = undefined;
     std.mem.writeInt(u64, val[0..8], 1_700_000_000_123, .little);
-    std.mem.writeInt(u64, val[8..16], 0, .little);
+    std.mem.writeInt(u64, val[8..16], 42, .little);
     try handler.replayCheckpoint("job-ts", &val);
     const pipe = handler.pipelines.getPtr("job-ts").?;
-    try std.testing.expectEqual(@as(u64, 1_700_000_000_123), pipe.ts_cursor_ns);
+    try std.testing.expectEqual(ReadAt{ .ns = 1_700_000_000_123, .ual = 42 }, pipe.ts_cursor);
     try std.testing.expectEqual(@as(u64, 0), pipe.stream_cursor_ts);
     try std.testing.expectEqual(@as(u64, 1_700_000_000_123), pipe.persisted_cursor_ts);
 
     // A checkpoint that commits after the pipeline read further does not
     // move it back.
-    pipe.ts_cursor_ns = 1_700_000_000_500;
+    pipe.ts_cursor = .{ .ns = 1_700_000_000_500, .ual = 7 };
     try handler.replayCheckpoint("job-ts", &val);
-    try std.testing.expectEqual(@as(u64, 1_700_000_000_500), pipe.ts_cursor_ns);
+    try std.testing.expectEqual(ReadAt{ .ns = 1_700_000_000_500, .ual = 7 }, pipe.ts_cursor);
 }
 
 test "processing: a stream source's checkpoint never moves its cursor back" {
@@ -2999,13 +3115,12 @@ test "ProcessingHandler: kv_lookup reads its own shard's KV, whatever the key ha
     var kv0 = t0.state();
     var kv1 = t1.state();
     var h0 = kv_handler_mod.KVHandler.init(allocator, &kv0);
-    var h1 = kv_handler_mod.KVHandler.init(allocator, &kv1);
-    const peers = [_]*kv_handler_mod.KVHandler{ &h0, &h1 };
+    _ = &kv1;
 
     var handler = ProcessingHandler.init(allocator);
     defer handler.deinit();
     handler.peer_shard_count = 2;
-    handler.setPeerKvHandlers(&peers);
+    handler.local_kv = &h0;
 
     // A key whose hash names shard 1, written here.
     var elsewhere: []const u8 = "";
