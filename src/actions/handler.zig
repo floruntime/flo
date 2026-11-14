@@ -401,7 +401,7 @@ pub const ActionsHandler = struct {
         if (name.len > action_ops.MAX_ACTION_NAME) return .{ .err = .{ .code = .invalid_request, .message = "action name too long" } };
         const ns = req.ns_id;
         if (getDef(shard, ns, name) == null and storeOf(shard).family(machine.Defs.ID).count >= MAX_ACTIONS)
-            return .{ .err = .{ .code = .too_many_actions, .ran = .no, .message = std.fmt.comptimePrint("limit: this node holds {d} actions, the most it registers; delete one to register another", .{MAX_ACTIONS}) } };
+            return .{ .err = .{ .code = .too_many_actions, .ran = .no, .message = std.fmt.comptimePrint("limit: this shard holds {d} actions, the most one shard registers; delete one to register another", .{MAX_ACTIONS}) } };
         const v = req.value;
         var timeout_ms: u64 = 0;
         var max_attempts: u32 = 0;

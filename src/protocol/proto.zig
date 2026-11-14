@@ -271,9 +271,10 @@ pub const StatusCode = enum(u8) {
     /// which means a missing key, so a client never mistakes one for the
     /// other.
     no_namespace = 14,
-    /// The node is at a limit an operator sets: retrying won't help until
-    /// something is deleted, the node is given more room, or the setting is
-    /// raised. The reason names which limit; it never ran.
+    /// The node is at a limit on what it holds: retrying won't help until
+    /// something is deleted. Most limits are built in; the memory budget
+    /// also rises with more memory. The reason names which limit; it never
+    /// ran.
     limit = 15,
     _,
 };
