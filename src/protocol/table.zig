@@ -106,6 +106,9 @@ test "no stored layout names a shard or group: a record's place comes from its k
     const a = std.testing.allocator;
     // Quantities, not places: a cap on what the group holds.
     const exempt = [_][]const u8{"shard_held_bytes"};
+    // Cluster settings are group 0's metadata about the nodes themselves: a
+    // node id there is the row's subject, not where the row lives.
+    const exempt_files = [_][]const u8{"settings_entries.zig"};
     const words = [_][]const u8{ "shard", "group_id", "group_index", "node_id" };
     var stack: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
@@ -137,6 +140,10 @@ test "no stored layout names a shard or group: a record's place comes from its k
                 std.mem.eql(u8, entry.name, "group_machine.zig") or
                 std.mem.eql(u8, entry.name, "delivery.zig");
             if (!durable) continue;
+            const skipped = for (exempt_files) |f| {
+                if (std.mem.eql(u8, entry.name, f)) break true;
+            } else false;
+            if (skipped) continue;
             const source = try stdx.fs.readFileAlloc(a, path, 1 << 20);
             defer a.free(source);
             files += 1;
