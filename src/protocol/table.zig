@@ -106,9 +106,15 @@ test "no stored layout names a shard or group: a record's place comes from its k
     const a = std.testing.allocator;
     // Quantities, not places: a cap on what the group holds.
     const exempt = [_][]const u8{"shard_held_bytes"};
-    // Cluster settings are group 0's metadata about the nodes themselves: a
-    // node id there is the row's subject, not where the row lives.
-    const exempt_files = [_][]const u8{"settings_entries.zig"};
+    // Fields exempt in one record only, so a new field in the same file is
+    // still caught. A node's memory row is group 0's metadata about that
+    // node: the id is the row's subject, not where the row lives.
+    const Field = struct { file: []const u8, record: []const u8, name: []const u8 };
+    const exempt_fields = [_]Field{
+        .{ .file = "settings_entries.zig", .record = "NodeMem", .name = "node_id" },
+        .{ .file = "settings_entries.zig", .record = "DelNode", .name = "node_id" },
+    };
+    var exempt_hits: [exempt_fields.len]usize = @splat(0);
     const words = [_][]const u8{ "shard", "group_id", "group_index", "node_id" };
     var stack: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
@@ -140,26 +146,38 @@ test "no stored layout names a shard or group: a record's place comes from its k
                 std.mem.eql(u8, entry.name, "group_machine.zig") or
                 std.mem.eql(u8, entry.name, "delivery.zig");
             if (!durable) continue;
-            const skipped = for (exempt_files) |f| {
-                if (std.mem.eql(u8, entry.name, f)) break true;
-            } else false;
-            if (skipped) continue;
             const source = try stdx.fs.readFileAlloc(a, path, 1 << 20);
             defer a.free(source);
             files += 1;
             var lines = std.mem.splitScalar(u8, source, '\n');
             var line_no: usize = 0;
+            // The record whose fields the following lines declare.
+            var record: []const u8 = "";
             while (lines.next()) |line| {
                 line_no += 1;
+                if (std.mem.indexOf(u8, line, "pub const ")) |c| {
+                    if (std.mem.indexOf(u8, line, "= Record(") != null) {
+                        const decl = line[c + "pub const ".len ..];
+                        record = decl[0 .. std.mem.indexOfScalar(u8, decl, ' ') orelse decl.len];
+                    }
+                }
                 const at = std.mem.indexOf(u8, line, ".name = \"") orelse continue;
                 const rest = line[at + ".name = \"".len ..];
                 const name = rest[0 .. std.mem.indexOfScalar(u8, rest, '"') orelse continue];
                 const named = for (words) |w| {
                     if (std.mem.indexOf(u8, name, w) != null) break true;
                 } else false;
-                const allowed = for (exempt) |e| {
+                var allowed = for (exempt) |e| {
                     if (std.mem.eql(u8, name, e)) break true;
                 } else false;
+                for (exempt_fields, &exempt_hits) |f, *hits| {
+                    if (std.mem.eql(u8, entry.name, f.file) and std.mem.eql(u8, record, f.record) and
+                        std.mem.eql(u8, name, f.name))
+                    {
+                        allowed = true;
+                        hits.* += 1;
+                    }
+                }
                 if (named and !allowed) {
                     std.debug.print("{s}:{d}: stored field \"{s}\" names a place; derive it from the record's key\n", .{ path, line_no, name });
                     found += 1;
@@ -169,4 +187,6 @@ test "no stored layout names a shard or group: a record's place comes from its k
     }
     try std.testing.expectEqual(@as(usize, 0), found);
     try std.testing.expect(files >= 10);
+    // An exemption that matches nothing is stale: its field moved or went.
+    for (exempt_hits) |hits| try std.testing.expectEqual(@as(usize, 1), hits);
 }
