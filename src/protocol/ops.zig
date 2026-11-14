@@ -27,11 +27,12 @@ pub const Scope = enum { namespace, server };
 pub const Route = union(enum) {
     /// Its key's {tag}, or the whole key when it has none.
     key,
-    /// The partition bits in a run id; an id that doesn't decode is refused.
+    /// The slot bits in a run id; an id that doesn't decode runs on group 0,
+    /// where it names no run.
     run_id,
     /// The connection's own shard.
     local,
-    /// Shard 0.
+    /// Group 0 (shard 0), pinned: metadata, not a key's slot.
     shard0,
 };
 

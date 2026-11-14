@@ -149,10 +149,11 @@ fn decodePayload(run_id: []const u8) ?u64 {
 
 /// Pre-route function for run-ID-based opcodes.
 ///
-/// Extracts the slot directly from the packed ID bits in the key.
-/// Returns null (broadcast/walk) if the ID cannot be decoded.
+/// Extracts the slot directly from the packed ID bits in the key. Null
+/// for no key or one that doesn't decode: that request runs on group 0, and
+/// is answered there as naming no run.
 pub fn preRouteByRunId(req: @import("../protocol/proto.zig").Request) ?u64 {
-    if (req.key.len == 0) return 0;
+    if (req.key.len == 0) return null;
     // Returned as the hash: the router's `slot(hash)` gives back a slot
     // unchanged.
     return @as(u64, extractSlot(req.key) orelse return null);

@@ -130,7 +130,7 @@ fn decodeMessage(buf: []u8, comptime name: []const u8, diag: schema.Diagnostic) 
 /// The routing hash of a table op routed by key: its key's {tag}, or the
 /// whole key when it has none.
 pub fn routeByKey(req: proto.Request) ?u64 {
-    if (req.key.len == 0) return 0;
+    if (req.key.len == 0) return null;
     return router.routeNsKey(req.ns_id, req.key);
 }
 
