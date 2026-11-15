@@ -160,10 +160,6 @@ pub fn encodeAppendValue(allocator: Allocator, partition_index: u32, payload: []
     return buf;
 }
 
-/// Split a stored stream-append value into its partition index and inner
-/// payload. An empty append carries exactly the 4-byte prefix; a value shorter
-/// than the prefix (malformed) decodes as partition 0 with the
-/// bytes passed through unchanged.
 /// The stored append a record locates, from its entry's payload and its
 /// `part`: the one way any reader takes a record out of the log. Null for
 /// a payload that isn't what the locator says.
@@ -184,6 +180,13 @@ pub fn appendAt(payload: []const u8, part: u8) ?AppendValue {
     return decodeAppendValue(cmd.value);
 }
 
+/// Whether a `stream_append` payload applies: its applier halts on nothing
+/// else (`stream/handler.zig`, `replayEntry`). A channel checks a message's
+/// before its inbound commits.
+pub fn appendApplies(payload: []const u8) bool {
+    return entry_mod.CommandPayload.deserialize(payload) != null;
+}
+
 /// A record's `part` for message `ordinal` of an inbound.
 pub fn partOf(ordinal: u8) u8 {
     comptime std.debug.assert(ce.MAX_BATCH <= std.math.maxInt(u8));
@@ -191,6 +194,10 @@ pub fn partOf(ordinal: u8) u8 {
     return ordinal + 1;
 }
 
+/// Split a stored stream-append value into its partition index and inner
+/// payload. An empty append carries exactly the 4-byte prefix; a value shorter
+/// than the prefix (malformed) decodes as partition 0 with the
+/// bytes passed through unchanged.
 pub fn decodeAppendValue(value: []const u8) AppendValue {
     if (value.len < APPEND_PARTITION_PREFIX) return .{ .partition_index = 0, .payload = value };
     return .{

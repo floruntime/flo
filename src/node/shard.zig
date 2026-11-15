@@ -5662,6 +5662,9 @@ pub const Shard = struct {
                 }
             },
             .stream_append => {
+                // One refused (a channel message for a slot this shard
+                // doesn't own) appended nothing: no trigger, no count.
+                if (result.refused() != null) return;
                 const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
                 if (cmd.key.len == 0) return;
                 self.notifyStreamTriggers();
@@ -25911,4 +25914,29 @@ test "Shard: a stream record a channel message carries reads back the same on a 
     s.applyDeferredTail();
     try std.testing.expect(s.applyCommitted());
     try expectChannelRecords(&s, 6, 200);
+}
+
+test "Shard: a refused stream append fires no trigger and counts no append" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var s = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer s.deinit();
+    s.wireHandlerShardPtrs();
+    try std.testing.expect(s.applyCommitted());
+    var metrics = MetricsRegistry.init(std.testing.allocator);
+    defer metrics.deinit();
+    s.setMetricsRegistry(&metrics);
+    var pb: [4096]u8 = undefined;
+    var rb: [64]u8 = undefined;
+    const e = entry_mod.buildEntry(.stream_append, 0, 1, s.raft_node.last_applied, 0, try streamAppendCommand(&pb, "s", channelRecord(&rb, 0, 16)));
+    var refused = persistence_mod.Result.start(&e);
+    refused.refuse(.bad_request, .malformed, "bad request: a message for a slot this group doesn't own");
+    s.recordApplied(&e, &refused);
+    try std.testing.expectEqual(@as(u32, 0), metrics.streams.count());
+    try std.testing.expect(!s.workflow_handler.triggers_dirty);
+    // Applied, the same append is counted.
+    var ok = persistence_mod.Result.start(&e);
+    s.recordApplied(&e, &ok);
+    try std.testing.expectEqual(@as(u32, 1), metrics.streams.count());
 }

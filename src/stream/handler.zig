@@ -119,6 +119,8 @@ pub const StreamHandler = struct {
     /// The highest log index counted in `skipped_appends`: reads move
     /// forward, so a re-read or a waiter's next wake doesn't count it again.
     highest_skipped_ual: u64 = 0,
+    /// Its `part`: an inbound holds several appends at one index.
+    highest_skipped_part: u8 = 0,
     /// Backs a refusal message that names request values; sent before the
     /// next command runs.
     err_buf: [128]u8 = undefined,
@@ -1095,11 +1097,13 @@ pub const StreamHandler = struct {
 
     /// An append a read can't return: counted and logged once.
     fn noteUnreadable(self: *StreamHandler, rec: StreamRecord) void {
-        if (rec.ual_index <= self.highest_skipped_ual) return;
+        // Once per append: by (index, part), in that order.
+        if (rec.ual_index < self.highest_skipped_ual or (rec.ual_index == self.highest_skipped_ual and rec.part <= self.highest_skipped_part)) return;
         self.highest_skipped_ual = rec.ual_index;
+        self.highest_skipped_part = rec.part;
         self.skipped_appends += 1;
         if (self.shard_ptr) |sptr| if (shardFromPtr(sptr).shard_metrics) |sm| sm.recordStreamSkippedAppend();
-        log.err("stream: the append at log index {d} is in neither hot nor warm storage, or isn't a batch; its records are skipped", .{rec.ual_index});
+        log.err("stream: the append at log index {d} (part {d}) is in neither hot nor warm storage, or isn't a batch; its records are skipped", .{ rec.ual_index, rec.part });
     }
 
     /// The id of record `j` of an append.
@@ -1450,6 +1454,9 @@ pub const StreamHandler = struct {
         const ual_index = rec.ual_index;
         // Hot path — entry still in the UAL ring buffer.
         if (self.partition.ual.read(ual_index)) |ual_entry| {
+            // Only here is the entry's type at hand: a part past 0 names a
+            // message, which only an inbound carries.
+            std.debug.assert(rec.part == 0 or ual_entry.header.entry_type == @backingInt(entry_mod.EntryType.channel_inbound));
             if (stream_mod.appendAt(ual_entry.payload, rec.part)) |av| {
                 if (self.tiered_metrics) |tm| tm.recordHotHit();
                 return .{ .payload = av.payload, .tier = .hot };

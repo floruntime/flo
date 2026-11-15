@@ -94,8 +94,8 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     .{ .format = 27, .segment_version = 18, .entries = 0xf9606d0319816e24 },
     // A stream append can arrive inside a channel inbound, its record found
     // at its place there; an older build reads such a record as missing.
-    // The layouts are unchanged.
-    .{ .format = 28, .segment_version = 18, .entries = 0xf9606d0319816e24 },
+    // A channel message carries the entry flags it applies with.
+    .{ .format = 28, .segment_version = 19, .entries = 0x336fb98011d1835f },
 };
 
 comptime {
