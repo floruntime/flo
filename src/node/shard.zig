@@ -2290,11 +2290,16 @@ pub const Shard = struct {
                 self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(if (oom) OUT_OF_MEMORY_MESSAGE else DIVERGED_MESSAGE));
                 return;
             }
-            // A replica serves reads and sends writers to the leader
-            // rather than carrying their writes. A repair or a membership
-            // change came over the admin socket, which the leader's client
-            // port would refuse, so it is carried like a voter's.
-            if (!self.raft_node.timer_enabled and self.raft_node.self_named and !repair_op and !membership_op) return self.redirectToLeader(conn, req);
+            // A replica serves reads and sends writers to the leader rather
+            // than carrying their writes. It has no voter link to the leader,
+            // so it can't forward a membership or repair change there either —
+            // the leader never answers a forward from a non-voter, and the
+            // caller would hang until timeout. So a replica points the caller
+            // at the leader for both: a write to the leader's client port, an
+            // admin change to a voter's admin socket. A non-leader voter still
+            // forwards, below, which does reach the leader.
+            if (!self.raft_node.timer_enabled and self.raft_node.self_named)
+                return if (membership_op or repair_op) self.redirectAdminToLeader(conn, req) else self.redirectToLeader(conn, req);
             if (conn.replyTo() == .remote) {
                 // Already forwarded once; a second hop during an election
                 // could bounce between nodes. The client retries instead.
@@ -3463,6 +3468,24 @@ pub const Shard = struct {
     }
 
     const REPLICA_MESSAGE = "unavailable: this node is a replica and knows no leader yet; send writes to a voter — retry";
+
+    /// A replica can't carry a membership or repair change to the leader, so
+    /// it names the leader (a voter) for the operator to send the admin
+    /// command to instead of forwarding it where the leader won't answer.
+    fn redirectAdminToLeader(self: *Shard, conn: *Connection, req: proto.Request) void {
+        const leader = self.raft_node.leader_id;
+        var buf: [200]u8 = undefined;
+        const addr = if (leader != 0) if (self.raft_network) |rn| rn.clientAddress(leader) else null else null;
+        const msg = if (addr) |a|
+            std.fmt.bufPrint(&buf, "unavailable: this node is a replica; a cluster admin command must go to a voter — send it to the leader, node {d} at {d}.{d}.{d}.{d}:{d}", .{ leader, a.ip4[0], a.ip4[1], a.ip4[2], a.ip4[3], a.port }) catch REPLICA_ADMIN_MESSAGE
+        else if (leader != 0)
+            std.fmt.bufPrint(&buf, "unavailable: this node is a replica; a cluster admin command must go to a voter — send it to the leader, node {d}", .{leader}) catch REPLICA_ADMIN_MESSAGE
+        else
+            REPLICA_ADMIN_MESSAGE;
+        self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(msg));
+    }
+
+    const REPLICA_ADMIN_MESSAGE = "unavailable: this node is a replica and knows no leader yet; send cluster admin commands to a voter — retry";
 
     /// Send a client's write to the leader, and
     /// hold the client until the leader answers. With no leader known the
@@ -20389,7 +20412,7 @@ test "Shard: a client's membership change to a follower is refused admin-only, n
     try std.testing.expect(raft.latest_config.names(3));
 }
 
-test "Shard: a replica carries an admin-socket membership change to the leader, but redirects a client write" {
+test "Shard: a replica refuses an admin-socket membership change up front, and redirects a client write" {
     var t: AdminTest = undefined;
     try t.init(3, .join);
     defer t.deinit();
@@ -20404,16 +20427,14 @@ test "Shard: a replica carries an admin-socket membership change to the leader, 
     var buf: [512]u8 = undefined;
     try expectAnswer(try t.ask(.kv_put, "v", &buf), .unavailable, "this node is a replica; send writes to the leader, node 1");
 
-    // But an admin-socket membership change is carried to the leader, the way
-    // a repair is: forwarded (not redirected), and the answer deferred until
-    // the leader commits it. This is what the .client follower test cannot
-    // show, since a .client change never reaches the carry path.
+    // A replica can't carry an admin-socket membership change either — it has
+    // no voter link to the leader, so the leader never answers a forward from
+    // it (the client would see a stray not_found). So the replica refuses the
+    // change up front, naming the leader, and forwards nothing.
     const before = t.shard.forward_count;
-    var pv: [4]u8 = undefined;
-    std.mem.writeInt(u32, &pv, 2, .little);
-    t.shard.runRequest(t.conn, try ParkTest.request(.cluster_promote, 9, "", "", &pv, ""), .admin);
-    try std.testing.expectEqual(before + 1, t.shard.forward_count);
-    try std.testing.expect(t.conn.response_deferred);
+    try expectAnswer(try t.promote(2, &buf), .unavailable, "this node is a replica; a cluster admin command must go to a voter");
+    try std.testing.expectEqual(before, t.shard.forward_count);
+    try std.testing.expect(!t.conn.response_deferred);
 }
 
 test "Shard: a list page whose scan couldn't hold its names is refused, not cut short" {
@@ -23303,7 +23324,7 @@ test "Shard: a skip seals its segment as it applies, under a watermark at or pas
     try std.testing.expect(shard.halted == null);
 }
 
-test "Shard: a replica carries a repair from its admin socket to the leader rather than sending the client there" {
+test "Shard: a replica refuses a repair from its admin socket up front, naming the leader" {
     var t: AdminTest = undefined;
     try t.init(3, .join);
     defer t.deinit();
@@ -23315,9 +23336,12 @@ test "Shard: a replica carries a repair from its admin socket to the leader rath
     raft.leader_id = 1;
     var buf: [256]u8 = undefined;
     const held = t.shard.forward_count;
-    // Held for the leader, unanswered here: not a redirect to its client port.
-    try std.testing.expect((try t.repairSkip(.admin, 5, false, &buf)) == null);
-    try std.testing.expectEqual(held + 1, t.shard.forward_count);
+    // A replica has no voter link to carry a repair to the leader, so it
+    // refuses it up front, naming the leader, rather than holding a forward
+    // the leader won't answer.
+    const answer = (try t.repairSkip(.admin, 5, false, &buf)) orelse return error.TestExpectedRefusal;
+    try expectAnswer(answer, .unavailable, "this node is a replica");
+    try std.testing.expectEqual(held, t.shard.forward_count);
 }
 
 test "checkAppliers: a type a contract machine owns may have no other applier, and needs none" {
