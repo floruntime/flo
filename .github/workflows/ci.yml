@@ -394,6 +394,7 @@ jobs:
         run: |
           check() {
             m=$1; says=$2
+            rm -rf /tmp/vopr-cm-$m
             ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --groups=4 --channel-mutant=$m --seed-timeout=120 --out-dir=/tmp/vopr-cm-$m > /tmp/vopr-cm-$m.out 2>&1 || true
             n=$(grep -lE "channel [0-9]+->[0-9]+ seq [0-9]+: $says" /tmp/vopr-cm-$m/*.log 2>/dev/null | wc -l)
             if [ "$n" -eq 0 ]; then

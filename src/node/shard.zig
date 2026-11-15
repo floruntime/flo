@@ -8221,6 +8221,9 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
         }
     }
     const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
+    // The messages an inbound applied are this entry's alone: one skipped
+    // as applied already, or any other, must not find the last one's.
+    partition.store.messages.clearRetainingCapacity();
     noteNamespace(partition, entry);
     const applied = partition.applyRouted(entry) catch |err| return .{ .partition_reject = err };
     if (contract_machine.ownerOf(machines, etype)) |m| {

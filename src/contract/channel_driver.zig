@@ -160,7 +160,10 @@ pub const Driver = struct {
     counts: Counts = .{},
     /// The last scan left nothing outstanding: no message unsent or
     /// unacked, no trim due or in flight, no answer untold. Until a channel
-    /// record or a frame changes that, a tick has nothing to do.
+    /// record or a frame changes that, a tick has nothing to do. The commit
+    /// counts start over when a store is cleared and loaded again, so a
+    /// store reloaded in place under a live driver needs a `reset`; today
+    /// that happens only at boot, before any driver ticks.
     quiet: bool = false,
     seen: Seen = .{},
     allocator: std.mem.Allocator,
