@@ -257,10 +257,14 @@ pub const View = struct {
         const had = self.ops.items.len;
         self.ops.shrinkRetainingCapacity(m.ops);
         self.sends.shrinkRetainingCapacity(m.sends);
+        // A range delete staged after the mark goes with it: left in, it
+        // would still hide keys from later reads and unlink them at commit.
+        while (self.ranges.items.len > 0 and self.ranges.items[self.ranges.items.len - 1] >= m.ops) _ = self.ranges.pop();
         if (had > SCAN_LIMIT) {
             self.last.clearRetainingCapacity();
             if (self.ops.items.len > SCAN_LIMIT) {
-                for (self.ops.items, 0..) |o, i| try self.last.put(self.arena, .{ .fam = o.fam, .key = o.key }, i);
+                // As `stage` keeps it: single writes only, never a range's prefix.
+                for (self.ops.items, 0..) |o, i| if (!o.range) try self.last.put(self.arena, .{ .fam = o.fam, .key = o.key }, i);
             }
         }
     }
