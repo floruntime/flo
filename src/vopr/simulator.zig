@@ -574,6 +574,9 @@ const StateCanon = struct { history: u64, checksum: u64, rebuilt: bool, sums: ?S
 /// checksum walks a whole family, so one at every index would cost the
 /// run's square. The indices are the same on every replica.
 const SAMPLE_EVERY = 16;
+/// Entries a node reads to apply are copied into a buffer this large at
+/// least: a channel's inbound entry outgrows a workload payload.
+const APPLY_BUF_FLOOR = 64 * 1024;
 
 /// What a checksum mismatch names, by family.
 const MISMATCH = blk: {
@@ -933,8 +936,19 @@ pub const Summary = struct {
     violation_count: usize,
 };
 
+/// Machines a driver of several simulators adds to each (channels, between
+/// groups): it says which entry types it owns, takes each one a node
+/// applies, live or in replay, and starts over when a node restarts.
+pub const Extension = struct {
+    ctx: *anyopaque,
+    owns: *const fn (entry_type: u8) bool,
+    apply: *const fn (ctx: *anyopaque, node: NodeId, e: *const entry_mod.Entry) void,
+    reset: *const fn (ctx: *anyopaque, node: NodeId) void,
+};
+
 pub const Simulator = struct {
     allocator: Allocator,
+    extension: ?Extension = null,
     scenario: Scenario,
     options: Options,
     prng: PRNG,
@@ -1058,7 +1072,9 @@ pub const Simulator = struct {
             .latest_crash_at = 0,
             .started_ms = stdx.time.milliTimestamp(),
             .max_acked_index = 0,
-            .apply_buf = try allocator.alloc(u8, @as(usize, scenario.payload_max) + 64),
+            // Room for the largest workload payload, or a group's inbound
+            // entry of up to 64 small channel messages.
+            .apply_buf = try allocator.alloc(u8, @max(@as(usize, scenario.payload_max), APPLY_BUF_FLOOR) + 64),
             .delivery = .empty,
         };
         for (self.nodes, 0..) |*node, i| {
@@ -1377,6 +1393,7 @@ pub const Simulator = struct {
         node.actions.reset();
         node.queues.reset();
         node.ns.reset();
+        if (self.extension) |x| x.reset(x.ctx, node.id);
         node.apply_paused_until = 0;
         node.families_index = 0;
         node.families_stale = false;
@@ -2186,6 +2203,7 @@ pub const Simulator = struct {
             .txn_limit = if (self.scenario.hasTxnLimits()) self.scenario.txnLimit(node.id) else 0,
         };
         if (is_op and families.Counter.owns(e.header.entry_type)) _ = node.counter.apply(self.allocator, e, replica);
+        if (is_op) if (self.extension) |x| if (x.owns(e.header.entry_type)) x.apply(x.ctx, node.id, e);
         // Counted where the first replica reaches the index, so an entry
         // counts once, not once per replica and replay.
         const first = idx > self.checker.states.items.len or self.checker.states.items[idx - 1] == null;
@@ -2624,6 +2642,36 @@ pub const Simulator = struct {
 
     pub fn nodeUp(self: *const Simulator, id: NodeId) bool {
         return self.nodes[id - 1].up;
+    }
+
+    /// The highest index node `id`'s crash can't lose: what its disk holds
+    /// durably, an entry per index from 1.
+    pub fn durableIndex(self: *const Simulator, id: NodeId) u64 {
+        return self.nodes[id - 1].disk.durable_len;
+    }
+
+    /// Node `id` leads, has applied its earlier terms, and isn't halted:
+    /// where a group's duties run.
+    pub fn leadsReady(self: *const Simulator, id: NodeId) bool {
+        const node = &self.nodes[id - 1];
+        return node.up and node.raft.leaderReady();
+    }
+
+    pub fn isHalted(self: *const Simulator, id: NodeId) bool {
+        return self.nodes[id - 1].halted_at != 0;
+    }
+
+    pub fn termOf(self: *const Simulator, id: NodeId) u64 {
+        return self.nodes[id - 1].raft.current_term;
+    }
+
+    /// Proposes an entry on node `id`'s log, as a duty does; false when
+    /// it isn't taken.
+    pub fn proposeOn(self: *Simulator, id: NodeId, etype: entry_mod.EntryType, payload: []const u8) bool {
+        const node = &self.nodes[id - 1];
+        if (!node.up or node.halted_at != 0) return false;
+        _ = node.raft.propose(etype, entry_mod.Flags.NONE, payload) catch return false;
+        return true;
     }
 
     /// The last index node `id`'s log holds: right after a restart, what

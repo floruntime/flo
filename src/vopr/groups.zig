@@ -16,6 +16,16 @@ const PRNG = @import("stdx").PRNG;
 const simulator = @import("simulator.zig");
 const scenario_mod = @import("scenario.zig");
 
+const channels_mod = @import("../contract/channels.zig");
+const driver_mod = @import("../contract/channel_driver.zig");
+const probe = @import("../contract/channel_probe.zig");
+const machine_mod = @import("../contract/machine.zig");
+const store_mod = @import("../contract/store.zig");
+const view_mod = @import("../contract/view.zig");
+const ce = @import("../protocol/channel_entries.zig");
+const entry_mod = @import("../storage/ual/entry.zig");
+const persistence = @import("../storage/persistence.zig");
+
 const Allocator = std.mem.Allocator;
 const Simulator = simulator.Simulator;
 const Scenario = scenario_mod.Scenario;
@@ -68,6 +78,11 @@ pub const Mailbox = struct {
     duplicated: u64 = 0,
     /// Frames lost because the node crashed with them in flight.
     lost_in_crash: u64 = 0,
+    /// Sends refused because the receiver's queue was full.
+    refused: u64 = 0,
+
+    /// Frames one receiver holds, as a shard's inbox ring does.
+    pub const CAPACITY = 1024;
 
     pub fn init(allocator: Allocator, seed: u64, faults: Faults) Mailbox {
         // Its own stream, salted apart from the groups' simulators, so a
@@ -78,6 +93,19 @@ pub const Mailbox = struct {
     pub fn deinit(self: *Mailbox) void {
         for (self.queue.items) |f| self.allocator.free(f.bytes);
         self.queue.deinit(self.allocator);
+    }
+
+    /// Queues a copy of `bytes` unless `to`'s queue is full, as a shard's
+    /// inbox refuses: false then, and the sender knows.
+    pub fn trySend(self: *Mailbox, now: u64, from: GroupId, to: GroupId, bytes: []const u8) bool {
+        var held: usize = 0;
+        for (self.queue.items) |f| held += @intFromBool(f.to == to);
+        if (held >= CAPACITY) {
+            self.refused += 1;
+            return false;
+        }
+        self.send(now, from, to, bytes) catch return false;
+        return true;
     }
 
     /// Queues a copy of `bytes`, maybe twice, maybe not at all.
@@ -186,7 +214,7 @@ pub const ChannelOracle = struct {
         self.violations.deinit(self.allocator);
     }
 
-    fn fail(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, detail: []const u8) void {
+    pub fn fail(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, detail: []const u8) void {
         self.violations.append(self.allocator, .{ .from = from, .to = to, .seq = seq, .detail = detail }) catch @panic("oracle OOM");
     }
 
@@ -294,16 +322,173 @@ pub const Summary = struct {
     frames_lost_in_crash: u64,
     channel_applies: u64,
     channel_violations: usize,
+    probes_proposed: u64,
+    frames_refused: u64,
+    /// In flight when the run ended, and not applied: 0 once drained.
+    left_in_mailbox: usize,
+};
+
+const Probed = channels_mod.Channels(&.{probe.machine});
+const channel_machines = [_]machine_mod.Machine{ probe.machine, Probed.machine };
+
+/// One group's channels: the store its channel and probe machines keep,
+/// and its leader's driver. Its machines apply through the group's
+/// simulator (`Simulator.Extension`), live and in replay, and tell the
+/// oracle each send and apply.
+pub const GroupChannel = struct {
+    groups: *Groups = undefined,
+    g: GroupId,
+    store: store_mod.Store,
+    scratch: std.heap.ArenaAllocator,
+    driver: driver_mod.Driver,
+    probes_proposed: u64 = 0,
+
+    fn init(allocator: Allocator, g: GroupId, count: u16) GroupChannel {
+        var c: GroupChannel = .{
+            .g = g,
+            .store = store_mod.Store.init(allocator),
+            .scratch = std.heap.ArenaAllocator.init(allocator),
+            .driver = driver_mod.Driver.init(allocator, g, count),
+        };
+        c.store.place = .{ .group = g, .count = count };
+        c.store.strict_keys = true;
+        return c;
+    }
+
+    fn deinit(c: *GroupChannel) void {
+        c.store.deinit();
+        c.scratch.deinit();
+        c.driver.deinit();
+    }
+
+    fn owns(t: u8) bool {
+        return t == @backingInt(entry_mod.EntryType.channel_probe) or
+            t == @backingInt(entry_mod.EntryType.channel_inbound) or
+            t == @backingInt(entry_mod.EntryType.channel_trim);
+    }
+
+    fn applyHook(ctx: *anyopaque, _: @import("network.zig").NodeId, e: *const entry_mod.Entry) void {
+        const c: *GroupChannel = @ptrCast(@alignCast(ctx));
+        c.apply(e) catch |err| c.groups.oracle.fail(c.g, c.g, e.header.index, switch (err) {
+            error.Halt => "a channel entry halted its group",
+            else => "a channel entry's apply failed",
+        });
+    }
+
+    /// A restart: the store starts over and the log replays into it, and
+    /// the driver's memory is gone.
+    fn resetHook(ctx: *anyopaque, _: @import("network.zig").NodeId) void {
+        const c: *GroupChannel = @ptrCast(@alignCast(ctx));
+        c.store.clear();
+        c.driver.reset(0);
+    }
+
+    fn extension(c: *GroupChannel) simulator.Extension {
+        return .{ .ctx = c, .owns = owns, .apply = applyHook, .reset = resetHook };
+    }
+
+    fn read(c: *GroupChannel) view_mod.ReadView {
+        return .{ .store = &c.store };
+    }
+
+    fn apply(c: *GroupChannel, e: *const entry_mod.Entry) !void {
+        const etype = std.enums.fromInt(entry_mod.EntryType, e.header.entry_type) orelse return error.Halt;
+        const count = c.groups.sims.len;
+        const o = &c.groups.oracle;
+        var sent_before: [MAX_GROUPS]u64 = undefined;
+        var diag: @import("../protocol/schema.zig").Diagnostic = .{};
+        const inbound: ?ce.Inbound.Value = if (etype == .channel_inbound) try ce.Inbound.decodeAll(e.payload, &diag) else null;
+        if (etype == .channel_probe) for (0..count) |b| {
+            sent_before[b] = channels_mod.metaOf(c.read(), @intCast(b)).next_seq;
+        };
+        const applied_before = if (inbound) |p| if (channels_mod.inOf(c.read(), p.from)) |x| x.applied else 0 else 0;
+        const m = machine_mod.ownerOf(&channel_machines, etype) orelse return error.Halt;
+        var r = persistence.Result.start(e);
+        try machine_mod.applyEntry(m, &c.store, &c.scratch, e, &r);
+        if (etype == .channel_probe) for (0..count) |b_| {
+            const b: GroupId = @intCast(b_);
+            const now_next = channels_mod.metaOf(c.read(), b).next_seq;
+            var seq = sent_before[b];
+            while (seq < now_next) : (seq += 1) {
+                var k: [channels_mod.OUT_KEY]u8 = undefined;
+                const out = (try c.read().get(channels_mod.OutFam, channels_mod.outKey(&k, b, seq))) orelse return error.Halt;
+                try o.sent(c.g, b, seq, std.hash.Wyhash.hash(0, out.v.payload), e.header.index);
+            }
+        };
+        if (inbound) |p| {
+            const after = if (channels_mod.inOf(c.read(), p.from)) |x| x.applied else 0;
+            var it = p.messages.iterator();
+            var seq = p.first_seq;
+            while (try it.next()) |msg| : (seq += 1) {
+                if (seq > applied_before and seq <= after) try o.applied(@intCast(p.from), c.g, seq, std.hash.Wyhash.hash(0, msg.payload), e.header.index);
+            }
+        }
+    }
+
+    const Io = struct {
+        c: *GroupChannel,
+
+        pub fn sendFrame(io: Io, to: u16, bytes: []const u8) bool {
+            const gs = io.c.groups;
+            return gs.mailbox.trySend(gs.now(), io.c.g, @intCast(to), bytes);
+        }
+
+        pub fn propose(io: Io, etype: entry_mod.EntryType, payload: []const u8) bool {
+            return io.c.groups.sims[io.c.g].proposeOn(NODE, etype, payload);
+        }
+    };
+
+    /// Where this group's duties run, its driver started over on a new
+    /// term.
+    fn leads(c: *GroupChannel) bool {
+        const sim = &c.groups.sims[c.g];
+        if (!sim.leadsReady(NODE)) return false;
+        const term = sim.termOf(NODE);
+        if (c.driver.term != term) c.driver.reset(term);
+        return true;
+    }
+
+    fn tick(c: *GroupChannel) void {
+        if (!c.leads()) return;
+        const sim = &c.groups.sims[c.g];
+        c.driver.tick(c.groups.now(), c.read(), sim.durableIndex(NODE), Io{ .c = c });
+    }
+
+    fn take(c: *GroupChannel, f: Frame) void {
+        if (!c.leads()) return;
+        const sim = &c.groups.sims[c.g];
+        c.driver.onFrame(f.from, f.bytes, c.groups.now(), c.read(), sim.durableIndex(NODE), sim.isHalted(NODE), Io{ .c = c });
+    }
+
+    /// The test machine's send to a random slot: a 16-byte name unique to
+    /// the group, and some bytes more.
+    fn proposeProbe(c: *GroupChannel, r: std.Random) void {
+        if (!c.leads()) return;
+        var body: [16 + 48]u8 = undefined;
+        _ = std.fmt.bufPrint(body[0..16], "g{d:0>2}-{d:0>12}", .{ c.g, c.probes_proposed }) catch return;
+        const extra = r.uintAtMost(usize, 48);
+        r.bytes(body[16..][0..extra]);
+        var buf: [128]u8 = undefined;
+        const payload = ce.Probe.encodeInto(&buf, .{ .slot = r.uintLessThan(u16, 4096), .body = body[0 .. 16 + extra] }) catch return;
+        if (c.groups.sims[c.g].proposeOn(NODE, .channel_probe, payload)) c.probes_proposed += 1;
+    }
 };
 
 pub const Groups = struct {
     allocator: Allocator,
     sims: []Simulator,
+    chans: []GroupChannel,
+    /// The probe workload's own stream, so no group's draws move.
+    probe_prng: PRNG,
+    /// One probe per group per this many ticks, on average; 0 for none.
+    probe_every: u32 = 8,
     mailbox: Mailbox,
     oracle: ChannelOracle,
     delivery: std.ArrayListUnmanaged(Frame) = .empty,
-    /// What a delivered frame does: nothing until a machine sends.
+    /// What a delivered frame does, in place of its group's driver taking
+    /// it: for tests of the mailbox alone.
     on_frame: ?*const fn (groups: *Groups, f: Frame) anyerror!void = null,
+    converging: bool = false,
 
     /// `scenario` is group 0's, run as it would run alone, with one node.
     /// The other groups take its timing but decide no faults: the node's
@@ -330,9 +515,16 @@ pub const Groups = struct {
             sim.* = try Simulator.init(allocator, s, options);
             made += 1;
         }
+        const chans = try allocator.alloc(GroupChannel, group_count);
+        for (chans, sims, 0..) |*c, *sim, g| {
+            c.* = GroupChannel.init(allocator, @intCast(g), group_count);
+            sim.extension = c.extension();
+        }
         return .{
             .allocator = allocator,
             .sims = sims,
+            .chans = chans,
+            .probe_prng = PRNG.init(scenario.seed ^ 0x9B0B_E5E5),
             .mailbox = Mailbox.init(allocator, scenario.seed, Faults.of(&scenario)),
             .oracle = ChannelOracle.init(allocator),
         };
@@ -341,6 +533,8 @@ pub const Groups = struct {
     pub fn deinit(self: *Groups) void {
         for (self.sims) |*s| s.deinit();
         self.allocator.free(self.sims);
+        for (self.chans) |*c| c.deinit();
+        self.allocator.free(self.chans);
         for (self.delivery.items) |f| self.mailbox.release(f);
         self.delivery.deinit(self.allocator);
         self.mailbox.deinit();
@@ -378,22 +572,32 @@ pub const Groups = struct {
     /// One tick of every group, the node's fate carried to all of them,
     /// then the mailbox's due frames.
     fn step(self: *Groups) !void {
+        // `Groups` moves when returned by value: the channels' way back to
+        // it is set each step, as each simulator sets its nodes'.
+        for (self.chans) |*c| c.groups = self;
         const was_up = self.sims[0].nodeUp(NODE);
         for (self.sims) |*s| try s.advance();
         try self.followFate(was_up);
         const up = self.sims[0].nodeUp(NODE);
+        // Probes only in the safety phase, so convergence can drain.
+        if (up and self.probe_every > 0 and !self.converging) for (self.chans) |*c| {
+            if (self.probe_prng.random().uintLessThan(u32, self.probe_every) == 0) c.proposeProbe(self.probe_prng.random());
+        };
         self.delivery.clearRetainingCapacity();
         try self.mailbox.deliverDue(self.now(), &self.delivery);
         while (self.delivery.items.len > 0) {
             const f = self.delivery.orderedRemove(0);
             defer self.mailbox.release(f);
             if (!up) continue;
-            if (self.on_frame) |handle| try handle(self, f);
+            if (self.on_frame) |handle| try handle(self, f) else self.chans[f.to].take(f);
         }
+        if (up) for (self.chans) |*c| c.tick();
     }
 
     pub fn run(self: *Groups) !Summary {
+        for (self.chans) |*c| c.groups = self;
         while (!self.sims[0].safetyDone() and !self.failed()) try self.step();
+        self.converging = true;
         // Each group converges by its own deadline, or fails as it would
         // alone; the run goes on to the latest of them at most.
         var deadlines: [MAX_GROUPS]u64 = @splat(0);
@@ -437,6 +641,13 @@ pub const Groups = struct {
             .frames_delivered = self.mailbox.delivered,
             .frames_lost_in_crash = self.mailbox.lost_in_crash,
             .channel_applies = self.oracle.applies,
+            .probes_proposed = probes: {
+                var n: u64 = 0;
+                for (self.chans) |*c| n += c.probes_proposed;
+                break :probes n;
+            },
+            .frames_refused = self.mailbox.refused,
+            .left_in_mailbox = self.mailbox.queue.items.len,
             .channel_violations = self.oracle.violations.items.len,
         };
     }

@@ -353,8 +353,8 @@ fn runGroups(allocator: std.mem.Allocator, args: Args, scenario: Scenario) !bool
     const s = try groups.run();
     defer allocator.free(s.groups);
     std.debug.print(
-        "[vopr] seed={d} {s}: groups={d} crashes={d} frames_sent={d} frames_delivered={d} frames_lost_in_crash={d} channel_applies={d} channel_violations={d}\n",
-        .{ scenario.seed, if (s.ok) "OK" else "FAILED", s.groups.len, s.crashes, s.frames_sent, s.frames_delivered, s.frames_lost_in_crash, s.channel_applies, s.channel_violations },
+        "[vopr] seed={d} {s}: groups={d} crashes={d} probes={d} frames_sent={d} frames_delivered={d} frames_refused={d} frames_lost_in_crash={d} channel_applies={d} channel_violations={d} left_in_mailbox={d}\n",
+        .{ scenario.seed, if (s.ok) "OK" else "FAILED", s.groups.len, s.crashes, s.probes_proposed, s.frames_sent, s.frames_delivered, s.frames_refused, s.frames_lost_in_crash, s.channel_applies, s.channel_violations, s.left_in_mailbox },
     );
     for (s.groups, 0..) |g, i| std.debug.print("[vopr]   group {d} {s}: ticks={d} acked={d} lost={d} committed={d} state_checks={d}\n", .{ i, if (g.ok) "OK" else "FAILED", g.ticks, g.ops_acked, g.ops_lost, g.max_committed, g.state_checks });
     if (!s.ok) {
@@ -363,6 +363,7 @@ fn runGroups(allocator: std.mem.Allocator, args: Args, scenario: Scenario) !bool
         for (groups.sims, 0..) |*sim, i| if (sim.checker.violations.items.len > 0) {
             vw.print("group {d}:\n", .{i}) catch {};
             sim.printViolations(&vw) catch {};
+            sim.printNodeStates(&vw) catch {};
         };
         for (groups.oracle.violations.items) |v| vw.print("channel {d}->{d} seq {d}: {s}\n", .{ v.from, v.to, v.seq, v.detail }) catch {};
         std.debug.print("{s}", .{vw.buffered()});
