@@ -483,3 +483,42 @@ test "contract: an entry's late time-series count reaches the store only when it
     try view.commit();
     try testing.expectEqualSlices(u64, &.{ 1, 0, 0, 0, 0, 0, 0, 0 }, &store.ts_late_points);
 }
+
+test "contract: a range before a key goes back through the keys with a prefix, last first, from below that key" {
+    const T = struct {
+        fn keys(store: *Store, prefix: []const u8, before: []const u8, out: [][]const u8) usize {
+            var it = store.rangeBefore(Fam.ID, prefix, before);
+            var n: usize = 0;
+            while (it.next()) |rec| : (n += 1) out[n] = rec.key();
+            return n;
+        }
+    };
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    var ks = view_mod.KeySet.init(scratch.allocator());
+    try ks.addRange(Fam.ID, "n", "");
+    var view = View.init(&store, scratch.allocator(), &ks);
+    var kb: [16]u8 = undefined;
+    for ([_][]const u8{ "a1", "a2", "a3", "b1", "c" }) |name| try view.put(Fam, try view_mod.key(&kb, "n", name), .{ .b = name });
+    try view.commit();
+    var out: [8][]const u8 = undefined;
+    var pb: [16]u8 = undefined;
+    var bb: [16]u8 = undefined;
+    // Within a prefix, from below a key in it.
+    var n = T.keys(&store, try view_mod.key(&pb, "n", "a"), try view_mod.key(&bb, "n", "a3"), &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("a2", out[0][2..]);
+    try std.testing.expectEqualStrings("a1", out[1][2..]);
+    // From a key past the prefix: its last key first.
+    n = T.keys(&store, try view_mod.key(&pb, "n", "a"), try view_mod.key(&bb, "n", "b"), &out);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("a3", out[0][2..]);
+    // From past every key: the family's last, then back.
+    n = T.keys(&store, try view_mod.key(&pb, "n", ""), try view_mod.key(&bb, "n", "z"), &out);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqualStrings("c", out[0][2..]);
+    // Below every key: nothing.
+    try std.testing.expectEqual(@as(usize, 0), T.keys(&store, try view_mod.key(&pb, "n", ""), try view_mod.key(&bb, "n", "a"), &out));
+}

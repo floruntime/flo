@@ -130,14 +130,14 @@ pub fn getMeasurementDetail(allocator: Allocator, measurement: []const u8, query
     return try json_aw.toOwnedSlice();
 }
 
-/// GET /timeseries/:measurement/data — One field's raw points (`ts_read`,
-/// answered by the measurement's shard), the earliest `?limit=` of them
-/// (at most, and by default, what one read answers). `?tags=k=v,k=v`
-/// selects matching tag-series; `?from=` / `?to=` bound it in ms. With no
-/// `from`, the range starts late enough to hold about `limit` of the
-/// measurement's points, from its spread in `ts.info`, so a chart shows
-/// recent points rather than its oldest. `window` and `aggregation` are
-/// echoed back, not applied.
+/// GET /timeseries/:measurement/data — One field's raw points (`ts.read`,
+/// answered by the measurement's shard), at most `?limit=` of them (by
+/// default and at most, what one page holds). `?tags=k=v,k=v` selects
+/// matching tag-series; `?from=` / `?to=` bound it in ms. With no `from`,
+/// they are the newest in range, so a chart shows a field's latest points
+/// however they were written; with one, the earliest from it. Either way
+/// they are answered oldest first. `window` and `aggregation` are echoed
+/// back, not applied.
 pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     const field = h.parseQueryParam([]const u8, query_string, "field") orelse "value";
@@ -148,33 +148,37 @@ pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string
     const aggregation = h.parseQueryParam([]const u8, query_string, "aggregation") orelse "none";
     // 0 asks for the default, as no limit does.
     const asked = h.parseQueryParam(u32, query_string, "limit") orelse 0;
-    const limit: u32 = if (asked == 0) MAX_READ_POINTS else @min(asked, MAX_READ_POINTS);
-    var from_val: i64 = if (from_str) |s| std.fmt.parseInt(i64, s, 10) catch 0 else 0;
+    const limit: u32 = if (asked == 0) ts_ops.MAX_READ else @min(asked, ts_ops.MAX_READ);
+    const from_val: i64 = if (from_str) |s| std.fmt.parseInt(i64, s, 10) catch 0 else 0;
     const to_val: i64 = if (to_str) |s| std.fmt.parseInt(i64, s, 10) catch 0 else 0;
+    const newest = from_str == null;
 
     var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "time-series read", err);
     defer reader.deinit();
-    if (from_str == null) {
-        const Info = ts_ops.op("ts.info");
-        var got = reader.call(Info, ns, measurement, .{}) catch |err| return try loopback.readFailed(allocator, "time-series info", err);
-        defer got.deinit();
-        var diag: schema.Diagnostic = .{};
-        if (!got.isError()) if (Info.response.decodeAll(got.data, &diag)) |info| {
-            from_val = recentFromMs(info.points, info.oldest_ms orelse 0, info.newest_ms orelse 0, to_val, limit);
-        } else |_| {};
-    }
-    const client = reader.next() catch |err| return try loopback.readFailed(allocator, "time-series read", err);
-    var got = client_mod.ts.read(client, ns, measurement, .{
-        .tags = tags,
+    const ReadOp = ts_ops.op("ts.read");
+    var got = reader.call(ReadOp, ns, measurement, .{
         .field = field,
-        .from_ms = @max(from_val, 0),
-        .to_ms = @max(to_val, 0),
+        .tags = tags,
+        .from_ns = if (from_val > 0) msToNs(from_val) else null,
+        .to_ns = if (to_val > 0) msToNs(to_val) else null,
         .limit = limit,
+        .order = if (newest) .newest_first else .oldest_first,
+        .cursor = "",
     }) catch |err| return try loopback.readFailed(allocator, "time-series read", err);
     defer got.deinit();
     if (got.isError() and !got.isNotFound()) return try h.jsonError(allocator, got.errorMessage());
     // A namespace never created holds no points.
-    const points: []const u8 = if (got.isNotFound()) "" else got.data;
+    const Point = struct { ms: i64, value: f64 };
+    var points: std.ArrayListUnmanaged(Point) = .empty;
+    defer points.deinit(allocator);
+    if (!got.isNotFound()) {
+        var diag: schema.Diagnostic = .{};
+        const page = ReadOp.response.decodeAll(got.data, &diag) catch return try h.jsonError(allocator, "time-series read: malformed answer");
+        var it = page.points.iterator();
+        while (it.next() catch return try h.jsonError(allocator, "time-series read: malformed answer")) |p|
+            try points.append(allocator, .{ .ms = @divFloor(p.time_ns, std.time.ns_per_ms), .value = p.value });
+        if (newest) std.mem.reverse(Point, points.items);
+    }
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -189,19 +193,14 @@ pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string
     try obj.intField("from_ms", from_val);
     try obj.intField("to_ms", to_val);
     {
-        // [count:u32]([timestamp_ms:i64][value:f64])*
         var series_arr = try obj.arrayField("series");
         try series_arr.begin();
-        var r = WireReader.init(points);
-        const count = r.readU32() orelse 0;
-        for (0..count) |_| {
-            const ts_ms = r.readI64() orelse break;
-            const bits = r.readU64() orelse break;
+        for (points.items) |p| {
             try series_arr.next();
             var pobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
             try pobj.begin();
-            try pobj.intField("timestamp", ts_ms);
-            try pobj.floatField("value", @bitCast(bits));
+            try pobj.intField("timestamp", p.ms);
+            try pobj.floatField("value", p.value);
             try pobj.end();
         }
         try series_arr.end();
@@ -210,32 +209,8 @@ pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string
     return try json_aw.toOwnedSlice();
 }
 
-const MAX_READ_POINTS = @import("../../../ts/handler.zig").MAX_READ_POINTS;
-
-/// Where a range that holds about `limit` of `points`, spread evenly from
-/// `oldest_ms` to `newest_ms`, starts; 0 when they all fit. A range that
-/// ends at `to_ms` (when above 0) counts back from it, never past it.
-/// An estimate: a measurement's points written in bursts, or a field or
-/// tags that stopped writing, chart fewer than `limit`, or none.
-fn recentFromMs(points: u64, oldest_ms: i64, newest_ms: i64, to_ms: i64, limit: u32) i64 {
-    const end = if (to_ms > 0) @min(newest_ms, to_ms) else newest_ms;
-    if (points <= limit or end <= oldest_ms) return 0;
-    const spread: u128 = @intCast(newest_ms - oldest_ms);
-    const span: i64 = @intCast(spread * limit / points);
-    return @max(end - span, 1);
-}
-
-test "dashboard ts: a chart's default range holds about a read's worth of points, the newest" {
-    try std.testing.expectEqual(@as(i64, 0), recentFromMs(4096, 1000, 9000, 0, 4096));
-    try std.testing.expectEqual(@as(i64, 0), recentFromMs(10_000, 5000, 5000, 0, 4096));
-    try std.testing.expectEqual(@as(i64, 9000 - 4000), recentFromMs(8192, 1000, 9000, 0, 4096));
-    // With an end, back from it, and never past it.
-    try std.testing.expectEqual(@as(i64, 7000 - 4000), recentFromMs(8192, 1000, 9000, 7000, 4096));
-    try std.testing.expectEqual(@as(i64, 9000 - 4000), recentFromMs(8192, 1000, 9000, 20_000, 4096));
-    try std.testing.expectEqual(@as(i64, 0), recentFromMs(8192, 1000, 9000, 500, 4096));
-    for ([_]i64{ 1, 1500, 3000, 8999, 9000, 9001 }) |to| try std.testing.expect(recentFromMs(8192, 1000, 9000, to, 4096) <= to);
-    // No overflow at the extremes.
-    try std.testing.expect(recentFromMs(std.math.maxInt(u64), 1, std.math.maxInt(i64), 0, 4096) > std.math.maxInt(i64) - 4096);
+fn msToNs(ms: i64) i64 {
+    return std.math.mul(i64, ms, std.time.ns_per_ms) catch std.math.maxInt(i64);
 }
 
 /// POST /timeseries/floql — Execute a FloQL query (`ts_floql`), on the

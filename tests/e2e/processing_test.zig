@@ -751,11 +751,9 @@ fn readTsBlocking(ctx: *stdx.testing.TestContext, measurement: []const u8, ns: [
     return result.succeeded() and tsReadHasPoints(result.stdout);
 }
 
-/// A `ts read -o json` answer holding at least one point: an empty read
-/// prints `[]`.
+/// A `ts read -o json` answer holding at least one point.
 fn tsReadHasPoints(stdout: []const u8) bool {
-    const out = std.mem.trim(u8, stdout, &std.ascii.whitespace);
-    return out.len > 2 and out[0] == '[';
+    return std.mem.indexOf(u8, stdout, "\"time_ns\"") != null;
 }
 
 test "e2e/processing: ts sink - JSON records flow to time-series measurement" {

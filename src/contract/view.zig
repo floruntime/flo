@@ -584,6 +584,11 @@ pub const ReadView = struct {
     pub fn rangeAfter(self: ReadView, comptime F: type, prefix: []const u8, after: []const u8) ReadRange(F) {
         return .{ .inner = self.store.rangeAfter(F.ID, prefix, after) };
     }
+
+    /// The keys starting with `prefix` and before `before`, last first.
+    pub fn rangeBefore(self: ReadView, comptime F: type, prefix: []const u8, before: []const u8) ReadRange(F) {
+        return .{ .inner = self.store.rangeBefore(F.ID, prefix, before) };
+    }
 };
 
 pub fn ReadRange(comptime F: type) type {

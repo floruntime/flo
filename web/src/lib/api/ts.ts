@@ -22,7 +22,7 @@ export function useMeasurementDetail(ns: string, name: string | null) {
 }
 
 /** Raw points for one measurement+field: with no range given, the server
-    answers its most recent points, about as many as one read returns. */
+    answers its newest points, up to as many as one read returns, oldest first. */
 export function useSeriesData(ns: string, name: string | null, field: string) {
   return useQuery({
     queryKey: ['timeseries', ns, 'data', name, field],

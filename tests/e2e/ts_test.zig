@@ -1745,7 +1745,7 @@ test "e2e/ts: a read or query with no data is still JSON under -o json" {
     for ([_][]const u8{ "json_nosuch", "json_empty" }) |m| {
         var read = try ctx.cli.run(&.{ "ts", "read", m, "--from", "1", "--to", "2", "-o", "json" });
         defer read.deinit();
-        try testing.expectEqualStrings("[]", std.mem.trim(u8, read.stdout, &std.ascii.whitespace));
+        try testing.expectEqualStrings("{\"points\": [], \"cursor\": null}", std.mem.trim(u8, read.stdout, &std.ascii.whitespace));
 
         var query = try ctx.cli.run(&.{ "ts", "query", m, "--from", "1", "--to", "2", "--window", "1m", "--agg", "avg", "-o", "json" });
         defer query.deinit();
@@ -1807,17 +1807,35 @@ test "e2e/ts: every point of a series past what a buffer used to hold reads back
         try testing.expectEqual(@as(u8, 0), first.exit_code);
         var want: [64]u8 = undefined;
         try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{d} 0.000000\n", .{base}), first.stdout);
-        // By default, the earliest 4096 in range.
+        // A default page is the earliest 4096 in range, and says how to go on.
         var dflt = try ctx.cli.run(&.{ "ts", "read", "many", "--field", "v", "--from", "1", "-o", "raw" });
         defer dflt.deinit();
         try testing.expectEqual(@as(u8, 0), dflt.exit_code);
         try testing.expectEqual(@as(usize, 4096), std.mem.count(u8, dflt.stdout, "\n"));
         try testing.expect(std.mem.endsWith(u8, dflt.stdout, try std.fmt.bufPrint(&want, "{d} 4095.000000\n", .{base + 4095})));
-        // More than a read returns is refused, not cut short.
-        var all = try ctx.cli.run(&.{ "ts", "read", "many", "--field", "v", "--from", "1", "--limit", "5000", "-o", "raw" });
+        const more = "Note: more points follow: --cursor ";
+        try testing.expect(std.mem.startsWith(u8, dflt.stderr, more));
+        // That cursor reads the rest.
+        const hex = std.mem.trim(u8, dflt.stderr[more.len..], " \n");
+        var rest = try ctx.cli.run(&.{ "ts", "read", "many", "--field", "v", "--from", "1", "--cursor", hex, "-o", "raw" });
+        defer rest.deinit();
+        try testing.expectEqual(@as(u8, 0), rest.exit_code);
+        try testing.expectEqual(@as(usize, n - 4096), std.mem.count(u8, rest.stdout, "\n"));
+        try testing.expectEqualStrings("", rest.stderr);
+        // --all follows the pages: every point, once.
+        var all = try ctx.cli.run(&.{ "ts", "read", "many", "--field", "v", "--from", "1", "--all", "-o", "raw" });
         defer all.deinit();
-        try testing.expectEqual(@as(u8, 3), all.exit_code);
-        try testing.expectEqualStrings("Error: bad request: more than 4096 points match; pass --limit (at most 4096) or narrow the range [bad_request]\n", all.stderr);
+        try testing.expectEqual(@as(u8, 0), all.exit_code);
+        try testing.expectEqual(@as(usize, n), std.mem.count(u8, all.stdout, "\n"));
+        // Newest first: the last point written.
+        var last = try ctx.cli.run(&.{ "ts", "read", "many", "--field", "v", "--newest", "--limit", "1", "-o", "raw" });
+        defer last.deinit();
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{d} {d}.000000\n", .{ base + n - 1, n - 1 }), last.stdout);
+        // A page past what one holds is refused before it is sent.
+        var big = try ctx.cli.run(&.{ "ts", "read", "many", "--field", "v", "--limit", "5000" });
+        defer big.deinit();
+        try testing.expect(big.exit_code != 0);
+        try testing.expect(big.stderrContains("--limit 5000 must be 1 to 4096"));
         if (round == 0) try ctx.restartServer();
     }
 }

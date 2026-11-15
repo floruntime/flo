@@ -7,6 +7,7 @@ const testing = std.testing;
 const stdx = @import("stdx");
 const proto = @import("src").protocol.proto;
 const kv_ops = @import("src").protocol.kv_ops;
+const ts_ops = @import("src").protocol.ts_ops;
 
 const Reply = struct { status: u8, data: []const u8 };
 
@@ -52,6 +53,17 @@ fn kvValue(ctx: *stdx.testing.TestContext, key: []const u8, out: []u8) ![]const 
 }
 
 /// The point or series count leading a ts read or query answer.
+/// How many points a `ts.read` of "m" from `from_ns` answers.
+fn tsReadCount(ctx: *stdx.testing.TestContext, from_ns: i64, out: []u8) !u32 {
+    const Read = ts_ops.op("ts.read");
+    var body: [Read.request.max_size]u8 = undefined;
+    const encoded = try Read.request.encodeInto(&body, .{ .field = "value", .tags = "", .from_ns = from_ns, .to_ns = null, .limit = ts_ops.MAX_READ, .order = .oldest_first, .cursor = "" });
+    const r = try rawCall(ctx, .ts_read, "m", encoded, "", out);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), r.status);
+    var diag: @import("src").protocol.schema.Diagnostic = .{};
+    return (try Read.response.decodeAll(r.data, &diag)).points.count;
+}
+
 fn leadingCount(r: Reply) !u32 {
     try testing.expectEqual(@backingInt(proto.StatusCode.ok), r.status);
     return std.mem.readInt(u32, r.data[0..4], .little);
@@ -130,8 +142,8 @@ test "e2e/time: a lower bound past the clock matches nothing, and an age past it
     try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), absurd.status);
 
     // The point is there from zero; from past the clock, nothing is.
-    try testing.expectEqual(@as(u32, 1), try leadingCount(try rawCall(ctx, .ts_read, "m", "", try option(&obuf, .ts_from_ms, i64, 1), &out)));
-    try testing.expectEqual(@as(u32, 0), try leadingCount(try rawCall(ctx, .ts_read, "m", "", try option(&obuf, .ts_from_ms, i64, std.math.maxInt(i64)), &out)));
+    try testing.expectEqual(@as(u32, 1), try tsReadCount(ctx, 1, &out));
+    try testing.expectEqual(@as(u32, 0), try tsReadCount(ctx, std.math.maxInt(i64), &out));
     try testing.expectEqual(@as(u32, 0), try leadingCount(try rawCall(ctx, .ts_query, "m", "", try option(&obuf, .ts_from_ms, i64, std.math.maxInt(i64)), &out)));
     const query = try rawCall(ctx, .ts_floql, "", "m[20000000000000]", "", &out);
     try testing.expectEqual(@backingInt(proto.StatusCode.ok), query.status);
