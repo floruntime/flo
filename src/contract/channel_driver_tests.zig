@@ -257,3 +257,64 @@ test "channel driver: an ack above what was sent is refused, and a frame's sende
     g.driver.onFrame(7, buf[0 .. 1 + body.len], 1, .{ .store = &g.store }, 0, false, Sim.Io{ .sim = &sim, .me = 0 });
     try testing.expectEqual(@as(u64, 1), g.driver.counts.acks_refused);
 }
+
+fn answerFrame(buf: []u8, v: driver_mod.Answer.Value) []const u8 {
+    buf[0] = @backingInt(driver_mod.Kind.answer);
+    const body = driver_mod.Answer.encodeInto(buf[1..], v) catch unreachable;
+    return buf[0 .. 1 + body.len];
+}
+
+test "channel driver: a gap rewinds once per generation; one from an older batch rewinds nothing" {
+    for ([_]driver_mod.Mutant{ .none, .no_gen_filter }) |mutant| {
+        var sim = try Sim.init(testing.allocator, 2, 13, .{});
+        defer sim.deinit();
+        const g = &sim.groups[0];
+        g.driver.mutant = mutant;
+        for (0..5) |_| try sim.probeFrom(g, 1);
+        // Seqs 1..5 go out in generation 0.
+        g.driver.tick(1, .{ .store = &g.store }, 100, Sim.Io{ .sim = &sim, .me = 0 });
+        try testing.expectEqual(@as(u64, 5), g.driver.peers[1].sent_through);
+        var buf: [64]u8 = undefined;
+        // The receiver lost 3..5: it says gap at 3, to generation 0.
+        const gap = answerFrame(&buf, .{ .gen_term = 1, .gen_counter = 0, .applied = 2, .durable = 2, .gap = 3, .status = 0 });
+        g.driver.onFrame(1, gap, 2, .{ .store = &g.store }, 100, false, Sim.Io{ .sim = &sim, .me = 0 });
+        try testing.expectEqual(@as(u64, 2), g.driver.peers[1].sent_through);
+        try testing.expectEqual(@as(u32, 1), g.driver.peers[1].gen_counter);
+        // Generation 1 resends 3..5.
+        g.driver.tick(3, .{ .store = &g.store }, 100, Sim.Io{ .sim = &sim, .me = 0 });
+        try testing.expectEqual(@as(u64, 5), g.driver.peers[1].sent_through);
+        // A duplicate of the first gap, late: it answers an older batch.
+        g.driver.onFrame(1, gap, 4, .{ .store = &g.store }, 100, false, Sim.Io{ .sim = &sim, .me = 0 });
+        switch (mutant) {
+            .none => {
+                try testing.expectEqual(@as(u64, 5), g.driver.peers[1].sent_through);
+                try testing.expectEqual(@as(u32, 1), g.driver.peers[1].gen_counter);
+            },
+            // Without the filter it rewinds again: the guard is what stops it.
+            else => try testing.expectEqual(@as(u64, 2), g.driver.peers[1].sent_through),
+        }
+    }
+}
+
+test "channel driver: an ack past what this group's state says was sent is refused, and moves nothing" {
+    for ([_]driver_mod.Mutant{ .none, .unbounded_ack }) |mutant| {
+        var sim = try Sim.init(testing.allocator, 2, 17, .{});
+        defer sim.deinit();
+        const g = &sim.groups[0];
+        g.driver.mutant = mutant;
+        for (0..2) |_| try sim.probeFrom(g, 1);
+        var buf: [64]u8 = undefined;
+        // Two were sent; a receiver claiming 5 applied and durable is wrong.
+        const ack = answerFrame(&buf, .{ .gen_term = 1, .gen_counter = 0, .applied = 5, .durable = 5, .gap = 0, .status = 0 });
+        g.driver.onFrame(1, ack, 1, .{ .store = &g.store }, 100, false, Sim.Io{ .sim = &sim, .me = 0 });
+        switch (mutant) {
+            .none => {
+                try testing.expectEqual(@as(u64, 1), g.driver.counts.acks_refused);
+                try testing.expectEqual(@as(u64, 0), g.driver.peers[1].durable_ack);
+                try testing.expectEqual(@as(u64, 0), g.driver.peers[1].applied_ack);
+            },
+            // Without the bound it would trim past what was sent.
+            else => try testing.expectEqual(@as(u64, 5), g.driver.peers[1].durable_ack),
+        }
+    }
+}

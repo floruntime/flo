@@ -1460,8 +1460,8 @@ pub const Simulator = struct {
                     // Drawn either way, so holding crashes off moves no draw.
                     const held = self.now < self.no_crash_before;
                     if (r.uintLessThan(u16, 1000) < self.scenario.wipe_permille and self.mayLose(node.id)) {
-                        const hard_state_only = r.boolean();
-                        if (!held) if (hard_state_only) self.wipeHardState(node) else self.wipeNode(node);
+                        const whole_disk = r.boolean();
+                        if (!held) if (whole_disk) self.wipeNode(node) else self.wipeHardState(node);
                     } else if (!held) {
                         self.crashNode(node);
                     }
