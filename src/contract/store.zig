@@ -82,6 +82,12 @@ pub const Store = struct {
     /// Keys an entry touched without declaring them, where `strict_keys`
     /// is off; each power of two is logged.
     undeclared_keys: u64 = 0,
+    /// Time-series points this node applied late, past each lateness edge
+    /// (`ts/machine.zig`), added as each entry commits. A count of applies,
+    /// not state: no snapshot carries it, it starts again from zero with
+    /// the process, and boot's replay of the log's tail counts those
+    /// entries again.
+    ts_late_points: [8]u64 = @splat(0),
     /// Where this store's group sits among the node's groups, for an
     /// apply's sends: null where nothing may send.
     place: ?@import("view.zig").Place = null,

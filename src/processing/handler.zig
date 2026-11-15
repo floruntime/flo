@@ -87,6 +87,8 @@ const SUBMIT_LAYOUT: u8 = 0x80;
 
 pub const ProcessingHandler = struct {
     allocator: Allocator,
+    /// The clock a TS source's idle window runs on; a test seam.
+    mono_ms: *const fn () u64 = @import("stdx").time.monotonicMs,
 
     /// In-memory job store: job_id → JobRecord.
     jobs: std.StringHashMap(JobRecord),
@@ -198,6 +200,15 @@ pub const ProcessingHandler = struct {
         // Read cursors — track what's been processed
         /// TS source: the last point read, by (time, position).
         ts_cursor: ReadAt,
+        /// TS source: how far behind its field's newest point it reads
+        /// (`holdBackNs`), and the field's write count as it last saw it
+        /// (null: the field has no series), and when, by this leader's
+        /// monotonic clock. Seen again after a restart or a leader change,
+        /// so the window starts over and nothing is skipped.
+        lateness_ms: u32 = 0,
+        seen_writes: ?u64 = null,
+        seen_known: bool = false,
+        seen_at_ms: u64 = 0,
         stream_cursor_ts: u64, // Stream source: last StreamID timestamp_ms read
         stream_cursor_seq: u64, // Stream source: last StreamID sequence read
         last_poll_ms: i64, // last time this pipeline was ticked
@@ -247,6 +258,38 @@ pub const ProcessingHandler = struct {
         tick_ns_max: u64 = 0,
         tick_ns_sum: u64 = 0,
         tick_count: u64 = 0,
+
+        /// The field's write count as read now (null: it has no series).
+        /// Any write, late or not, restarts the idle clock.
+        pub fn noteWrites(self: *PipelineState, writes: ?u64, now_ms: u64) void {
+            if (self.seen_known and std.meta.eql(self.seen_writes, writes)) return;
+            self.seen_writes = writes;
+            self.seen_known = true;
+            self.seen_at_ms = now_ms;
+        }
+
+        /// How far behind its field's newest point the next read stops:
+        /// `lateness_ms`, so a point that arrives up to that late is still
+        /// ahead of the cursor; 0 once the field has had no write for that
+        /// long, or has no series. The shard holding the field applies it
+        /// to the newest time it holds (`throughFor`).
+        /// The field's write count once it has had no write for the
+        /// window, 0 while it hasn't: a read of another shard's field sends
+        /// it, and that shard releases the window only if its own count is
+        /// still the same.
+        pub fn idleAt(self: *const PipelineState, now_ms: u64) u64 {
+            if (self.lateness_ms == 0 or !self.seen_known) return 0;
+            const writes = self.seen_writes orelse return 0;
+            return if (now_ms -| self.seen_at_ms >= self.lateness_ms) writes else 0;
+        }
+
+        pub fn holdBackNs(self: *const PipelineState, now_ms: u64) u64 {
+            const w: u64 = @as(u64, self.lateness_ms) * std.time.ns_per_ms;
+            if (w == 0 or !self.seen_known) return w;
+            if (self.seen_writes == null) return 0;
+            if (now_ms -| self.seen_at_ms >= self.lateness_ms) return 0;
+            return w;
+        }
     };
 
     pub const JobStatus = enum(u8) {
@@ -1458,6 +1501,7 @@ pub const ProcessingHandler = struct {
             .src_stream = "",
             .src_namespace = "",
             .src_poll_ms = if (src.ts_poll_interval_ms > 0) src.ts_poll_interval_ms else 1000,
+            .lateness_ms = src.ts_lateness_ms,
             .batch_size = if (src.batch_size > 0) src.batch_size else 100,
             .sinks = &.{},
             .ts_cursor = .{ .ns = 0, .ual = 0 },
@@ -1569,6 +1613,15 @@ pub const ProcessingHandler = struct {
         return held;
     }
 
+    /// The latest time a TS source's read reaches, on the shard holding
+    /// its field: `behind` short of the field's newest point, or every
+    /// point when `behind` is 0 or the field has no series.
+    pub fn throughFor(f: ?@import("../ts/machine.zig").FieldValue, behind: u64) u64 {
+        if (behind == 0) return std.math.maxInt(u64);
+        const v = f orelse return std.math.maxInt(u64);
+        return v.newest_ns -| behind;
+    }
+
     /// Tick a TS source pipeline: read points, apply operators, write to sinks.
     /// It reads in time order, so a point written with a time behind its
     /// cursor (late, or from a writer whose clock lags) is never read.
@@ -1581,7 +1634,11 @@ pub const ProcessingHandler = struct {
         const owner = self.sinkOwner(shard, pipe.src_namespace, pipe.src_measurement);
         if (owner != shard.id) return self.askSource(pipeline_key, pipe, shard, owner, limit);
         var points: [source_page.TS_PAGE_POINTS]TsPoint = undefined;
-        const n = source_page.readTsPage(shard.ts_handler.ts, shard.namespaceId(pipe.src_namespace), pipe.src_measurement, pipe.src_field, pipe.src_tag_hash, pipe.ts_cursor, limit, &points);
+        const ns = shard.namespaceId(pipe.src_namespace);
+        const now = self.mono_ms();
+        const f = shard.ts_handler.ts.fieldRecord(ns, pipe.src_measurement, pipe.src_field);
+        pipe.noteWrites(if (f) |v| v.writes else null, now);
+        const n = source_page.readTsPage(shard.ts_handler.ts, ns, pipe.src_measurement, pipe.src_field, pipe.src_tag_hash, pipe.ts_cursor, throughFor(f, pipe.holdBackNs(now)), limit, &points);
         self.processTsPage(pipeline_key, pipe, shard, job, points[0..n]);
     }
 
@@ -1730,7 +1787,6 @@ pub const ProcessingHandler = struct {
     /// cursor, at most one at a time. The page is processed when it comes
     /// (`takeSourcePage`); until then the pipeline reads nothing more.
     fn askSource(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, owner: u16, limit: usize) void {
-        _ = self;
         const raft = shard.raft_node;
         if (raft.role != .leader) return;
         const now = @import("stdx").time.milliTimestamp();
@@ -1756,6 +1812,8 @@ pub const ProcessingHandler = struct {
             .from_a = from_a,
             .from_b = from_b,
             .limit = @intCast(limit),
+            .behind_ns = if (kind == .ts) @as(u64, pipe.lateness_ms) * std.time.ns_per_ms else 0,
+            .idle_at = if (kind == .ts) pipe.idleAt(self.mono_ms()) else 0,
         }).encode(shard.allocator) orelse return;
         if (!shard.peer_mailboxes.?[owner].inbox.send(.{ .tag = .source_read, .src_shard = @intCast(shard.id), .payload_len = @intCast(bytes.len), .payload_ptr = bytes.ptr })) {
             // A full inbox: asked again next tick.
@@ -1795,9 +1853,14 @@ pub const ProcessingHandler = struct {
             },
             .ts => {
                 var points: [source_page.TS_PAGE_POINTS]TsPoint = undefined;
-                const n = source_page.readTsPage(shard.ts_handler.ts, shard.namespaceId(r.namespace), r.source, r.field, r.tag_hash, .{ .ns = r.from_a, .ual = r.from_b }, r.limit, &points);
+                const ns = shard.namespaceId(r.namespace);
+                const f = shard.ts_handler.ts.fieldRecord(ns, r.source, r.field);
+                // The asker judged the field idle at a write count; a write
+                // since, which it hasn't seen, holds the window again.
+                const idle = r.idle_at != 0 and f != null and f.?.writes == r.idle_at;
+                const n = source_page.readTsPage(shard.ts_handler.ts, ns, r.source, r.field, r.tag_hash, .{ .ns = r.from_a, .ual = r.from_b }, throughFor(f, if (idle) 0 else r.behind_ns), r.limit, &points);
                 for (points[0..n]) |p| try b.point(shard.allocator, p);
-                return b.finish(shard.allocator, 0, 0);
+                return b.finish(shard.allocator, if (f) |v| v.newest_ns else 0, if (f) |v| v.writes else 0);
             },
         }
     }
@@ -1853,6 +1916,7 @@ pub const ProcessingHandler = struct {
                 if (page.kind != .ts) return;
                 var points: [source_page.TS_PAGE_POINTS]TsPoint = undefined;
                 const got = page.points(&points) orelse return;
+                pipe.noteWrites(if (page.last_b != 0) page.last_b else null, self.mono_ms());
                 self.processTsPage(pipeline_key, pipe, shard, job, got);
             },
         }
@@ -3441,4 +3505,45 @@ test "ProcessingHandler: jobs that share a name are each listed" {
     }
     for (seen) |s| try std.testing.expect(s);
     try std.testing.expect(handler.listedJob(.of(16), "job-a") == null);
+}
+
+test "processing: a TS source holds back its lateness window until its field has had no write, late or not, for that long" {
+    var pipe: ProcessingHandler.PipelineState = undefined;
+    pipe.lateness_ms = 3000;
+    pipe.seen_writes = null;
+    pipe.seen_known = false;
+    pipe.seen_at_ms = 0;
+    const w = 3 * std.time.ns_per_s;
+    // Before the field is seen: held back, and the shard holding it says
+    // from what (the first ask reads up to its newest less the window).
+    try std.testing.expectEqual(w, pipe.holdBackNs(1000));
+    // A field with no series has nothing to hold back.
+    pipe.noteWrites(null, 1000);
+    try std.testing.expectEqual(@as(u64, 0), pipe.holdBackNs(1000));
+    pipe.noteWrites(1, 1000);
+    try std.testing.expectEqual(w, pipe.holdBackNs(3999));
+    try std.testing.expectEqual(@as(u64, 0), pipe.holdBackNs(4000));
+    // Host a wrote t=100 s and stopped; host b uploads t=71..99 s, each one
+    // late: every write restarts the clock, so the window holds and b's
+    // points stay ahead of the cursor.
+    for (0..29) |i| {
+        const now: u64 = 5000 + 2000 * i;
+        pipe.noteWrites(2 + i, now);
+        try std.testing.expectEqual(w, pipe.holdBackNs(now + 2999));
+    }
+    // The same count again isn't a write.
+    pipe.noteWrites(30, 70_000);
+    try std.testing.expectEqual(@as(u64, 0), pipe.holdBackNs(61_000 + 3000));
+    // A window of 0 never holds back.
+    pipe.lateness_ms = 0;
+    pipe.seen_known = false;
+    try std.testing.expectEqual(@as(u64, 0), pipe.holdBackNs(0));
+
+    const F = @import("../ts/machine.zig").FieldValue;
+    const max = std.math.maxInt(u64);
+    try std.testing.expectEqual(max, ProcessingHandler.throughFor(null, w));
+    try std.testing.expectEqual(max, ProcessingHandler.throughFor(F{ .newest_ns = 100 * std.time.ns_per_s }, 0));
+    try std.testing.expectEqual(@as(u64, 97 * std.time.ns_per_s), ProcessingHandler.throughFor(F{ .newest_ns = 100 * std.time.ns_per_s }, w));
+    // Under the window: from time 0, not wrapped.
+    try std.testing.expectEqual(@as(u64, 0), ProcessingHandler.throughFor(F{ .newest_ns = std.time.ns_per_s }, w));
 }

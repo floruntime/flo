@@ -459,3 +459,27 @@ test "contract: random puts, deletes and range deletes read and commit as a plai
         try testing.expectEqual(@as(u64, bx.len - 10), store.family(Fam.ID).encoded_bytes);
     }
 }
+
+test "contract: an entry's late time-series count reaches the store only when it commits, and a rollback takes its share back" {
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    var ks = view_mod.KeySet.init(scratch.allocator());
+    try ks.addRange(Fam.ID, NS, "");
+    {
+        // Refused: never committed, nothing counted.
+        var view = View.init(&store, scratch.allocator(), &ks);
+        view.ts_late_points[0] += 1;
+    }
+    try testing.expectEqualSlices(u64, &@as([8]u64, @splat(0)), &store.ts_late_points);
+    var view = View.init(&store, scratch.allocator(), &ks);
+    view.ts_late_points[0] += 1;
+    const mark = view.mark();
+    // A message after the mark counts two more, and is rolled back.
+    view.ts_late_points[0] += 1;
+    view.ts_late_points[1] += 1;
+    try view.rollback(mark);
+    try view.commit();
+    try testing.expectEqualSlices(u64, &.{ 1, 0, 0, 0, 0, 0, 0, 0 }, &store.ts_late_points);
+}

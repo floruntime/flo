@@ -521,6 +521,10 @@ const SimIo = struct {
             of(r).sim.stranger_frames += 1;
         }
 
+        // The simulator routes no client write through a replica, so no
+        // replica forwards one to refuse: a no-op keeps the sim unchanged.
+        pub fn refuseReplicaForward(_: *Replica, _: RaftFrame) void {}
+
         // The simulator sends none of these: joiners are added by the
         // leader, and clients propose on the leader directly.
         pub fn handleJoinRequest(r: *Replica, _: u32) void {
