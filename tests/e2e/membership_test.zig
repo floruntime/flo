@@ -107,12 +107,25 @@ test "e2e/membership: a fourth node stays a replica until promoted; removal is r
     var id_buf: [16]u8 = undefined;
     const fourth_s = try std.fmt.bufPrint(&id_buf, "{d}", .{fourth});
 
-    // Promoted from a non-leader, so the carry is exercised: the change goes
-    // to that node's admin socket, which forwards it to the leader over the
-    // peer link.
+    // Promoted from a non-leader VOTER, so the carry is exercised: the change
+    // goes to that node's admin socket, which forwards it to the leader over
+    // the peer link. Never via the replica — it can't forward (it has no voter
+    // link to the leader) and refuses the command up front, by design.
     const leader_before = try leaderIndex(&cluster);
     var via: usize = 0;
-    while (via == leader_before) via += 1;
+    while (via == leader_before or via == replica) via += 1;
+
+    // The replica itself refuses a cluster admin command up front, naming the
+    // leader, rather than forwarding it where the leader won't answer — so it
+    // is never a silent not_found.
+    {
+        const cfg = cluster.configFileOf(replica).?;
+        var refused = try cluster.clis[replica].?.run(&.{ "cluster", "promote", fourth_s, "--config", cfg });
+        defer refused.deinit();
+        try stdx.testing.assertFailed(refused);
+        try testing.expect(refused.contains("cluster admin command must go to a voter"));
+    }
+
     try cluster.execAdminOn(via, &.{ "cluster", "promote", fourth_s });
     var view = try members(&cluster, 0);
     try testing.expectEqual(@as(usize, 4), countRole(view.value, "voter"));

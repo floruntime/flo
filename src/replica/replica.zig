@@ -101,6 +101,9 @@ pub fn Replica(comptime Io: type) type {
         strangers_quiet_ms: u64 = 0,
         /// For the host's metrics.
         strangers_dropped: u64 = 0,
+        /// Forwarded writes from a peer this node's config calls a replica,
+        /// refused not-run (it is not a voter and can't carry them).
+        replica_forwards_refused: u64 = 0,
         vouch_asks: u64 = 0,
         vouches_taken: u64 = 0,
 
@@ -492,10 +495,19 @@ pub fn Replica(comptime Io: type) type {
         }
 
         fn replicaFrame(self: *Self, frame: RaftFrame) void {
+            // Only a forward_write reaches here (`replicaMaySend` admits every
+            // other type). Its forwarder holds a client, so the leader answers
+            // it not-run — "you look like a replica here, retry on a voter" —
+            // rather than dropping it to the backstop. The reply is terminal:
+            // the forwarder delivers it and does not re-forward, so a peer that
+            // still believes it's a voter stops once catch-up corrects its
+            // config, not by spinning here.
+            self.replica_forwards_refused += 1;
+            Io.Host.refuseReplicaForward(self, frame);
             const now = Io.nowMs(self);
             if (now -| self.replica_frame_warn_ms < WARN_INTERVAL_MS) return;
             self.replica_frame_warn_ms = now;
-            log.warn("shard {d}: replica {d} sent a {s} frame; a replica only takes the log, so it was dropped", .{ self.id, frame.source_node, @tagName(frame.msg_type) });
+            log.warn("shard {d}: replica {d} sent a {s} frame; a replica only takes the log, so it was refused not-run", .{ self.id, frame.source_node, @tagName(frame.msg_type) });
         }
 
         /// Committed, applied history and the leader's log disagree. The
@@ -841,6 +853,7 @@ const TestIo = struct {
         }
         pub fn clearRemovalNotices(_: *TestReplica) void {}
         pub fn strangerFrame(_: *TestReplica, _: RaftFrame) void {}
+        pub fn refuseReplicaForward(_: *TestReplica, _: RaftFrame) void {}
         pub fn handleJoinRequest(_: *TestReplica, _: u32) void {}
         pub fn takeRemovedNotice(_: *TestReplica, _: RaftFrame) void {}
         pub fn runForwardedWrite(_: *TestReplica, _: RaftFrame) void {}
@@ -1140,6 +1153,7 @@ const VouchIo = struct {
         pub fn strangerFrame(r: *VouchReplica, _: RaftFrame) void {
             of(r).host_strangers += 1;
         }
+        pub fn refuseReplicaForward(_: *VouchReplica, _: RaftFrame) void {}
         pub fn handleJoinRequest(_: *VouchReplica, _: u32) void {}
         pub fn takeRemovedNotice(_: *VouchReplica, _: RaftFrame) void {}
         pub fn runForwardedWrite(r: *VouchReplica, _: RaftFrame) void {
