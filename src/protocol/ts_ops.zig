@@ -31,7 +31,7 @@ pub const table = [_]ops.Op{
             .{ .name = "field_count", .T = Int(u32), .doc = "Its distinct fields, counted up to 256" },
             .{ .name = "fields_capped", .T = schema.Bool, .doc = "It has more fields than were counted or listed" },
             .{ .name = "fields", .T = FieldNames, .doc = "Its fields' names, up to 256 and 128 KiB of them" },
-            .{ .name = "points", .T = Int(u64), .doc = "Its points, flushed and buffered" },
+            .{ .name = "points", .T = Int(u64), .doc = "Its points" },
             .{ .name = "oldest_ms", .T = Optional(Int(i64)), .doc = "Its oldest point's time, in Unix milliseconds; none without points" },
             .{ .name = "newest_ms", .T = Optional(Int(i64)), .doc = "Its newest point's time" },
         }),

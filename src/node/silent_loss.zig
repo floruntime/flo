@@ -9,8 +9,6 @@ const log = @import("stdx").log;
 pub const Path = enum {
     /// The partition refused the entry (the hot ring could not take it).
     partition_reject,
-    /// A projection the router owns (KV, queue, TS) failed to apply it.
-    router_error,
     /// A registry applier could not apply it (a payload that would not
     /// decode, an allocation that failed).
     applier_failed,

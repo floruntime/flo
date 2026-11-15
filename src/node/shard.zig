@@ -4806,6 +4806,8 @@ pub const Shard = struct {
             sm.snapshot_skipped_leader_not_ready.store(self.snapshot_skips_leader_not_ready, .monotonic);
             sm.sink_retry_pending.store(self.sink_retries.items.len, .monotonic);
             sm.sink_retry_bytes.store(self.sink_retry_bytes, .monotonic);
+            sm.ts_points.store(self.ts_handler.ts.pointCount(), .monotonic);
+            sm.ts_point_bytes.store(self.ts_handler.ts.pointBytes(), .monotonic);
             sm.sink_retry_overflow.store(self.sink_retry_overflow, .monotonic);
             sm.bar_last.store(self.defaultPartition().last_bar, .monotonic);
             sm.bar_bytes.store(self.defaultPartition().bar_bytes, .monotonic);
@@ -8114,8 +8116,6 @@ pub const ApplyResult = union(enum) {
     applied,
     /// The partition refused it; nothing else saw it.
     partition_reject: anyerror,
-    /// The projection the router owns could not apply it, and why.
-    router_error: persistence_mod.ApplyError,
     /// Its registry applier could not apply it, and why.
     applier_failed: persistence_mod.ApplyError,
     /// No applier owns its type.
@@ -8172,10 +8172,6 @@ fn verdictOf(counts: *silent_loss.Counts, shard_id: u16, now_ms: u64, entry: *co
             .{ .local = outOfMemory(silent_loss.Damage.init(.partition_reject, "entry {d} ({s}) could not be held: the partition is out of memory", .{ index, type_name })) }
         else
             .{ .halt = "the partition refused it" },
-        .router_error => |err| if (err == error.Halt)
-            .{ .halt = "its projection refused it as malformed" }
-        else
-            .{ .local = localDamage(err, silent_loss.Damage.init(.router_error, "entry {d} ({s}) could not be applied on this node: {s}", .{ index, type_name, applyErrorName(err) })) },
         .applier_failed => |err| if (err == error.Halt)
             .{ .halt = "its applier refused it as malformed" }
         else
@@ -8206,17 +8202,10 @@ fn listed(list: []const entry_mod.EntryType, etype: entry_mod.EntryType) bool {
     return std.mem.indexOfScalar(entry_mod.EntryType, list, etype) != null;
 }
 
-fn routedToProjection(etype: entry_mod.EntryType) bool {
-    return switch (projection_router.routeTarget(etype)) {
-        .ts => true,
-        .none, .snapshot => false,
-    };
-}
-
-/// The one apply path: the partition (hot ring plus the projection the
-/// router owns: TS), then a contract machine for the types one owns (KV's,
-/// actions', queues'), then the registry appliers for every other entry
-/// type.
+/// The one apply path: the partition (its hot ring, and the router's
+/// index), then a contract machine for the types one owns (KV's, actions',
+/// queues', groups', time series'), then the registry appliers for every
+/// other entry type.
 pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry, out: *persistence_mod.Result) ApplyResult {
     return applyEntryCoreWith(&contract_machines.list, partition, registry, entry, out);
 }
@@ -8233,8 +8222,7 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
     }
     const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
     noteNamespace(partition, entry);
-    const applied = partition.applyRouted(entry, out) catch |err| return .{ .partition_reject = err };
-    if (routedToProjection(etype)) return if (applied.failed) |err| .{ .router_error = err } else .applied;
+    const applied = partition.applyRouted(entry) catch |err| return .{ .partition_reject = err };
     if (contract_machine.ownerOf(machines, etype)) |m| {
         // The router has seen every index up to its own: one at or below it
         // was applied already, and must not be twice.
@@ -8278,18 +8266,13 @@ fn checkAppliersWith(comptime machines: []const contract_machine.Machine, shard_
     const einfo = @typeInfo(entry_mod.EntryType).@"enum";
     inline for (einfo.field_names, einfo.field_values) |fname, fvalue| {
         const etype: entry_mod.EntryType = @fromBackingInt(@intCast(fvalue));
-        const routed = routedToProjection(etype);
         // A machine's type has no other applier.
         const owner = contract_machine.ownerOf(machines, etype);
-        if (owner) |m| if (routed or registry.has(etype)) {
+        if (owner) |m| if (registry.has(etype)) {
             log.err("shard {d}: entry type {s} is owned by the {s} machine and has another applier too; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, fname, m.name });
             return error.EntryTypeHasTwoAppliers;
         };
-        if (owner == null and routed and registry.has(etype)) {
-            log.err("shard {d}: entry type {s} has two appliers (the projection router and a registry callback); this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, fname });
-            return error.EntryTypeHasTwoAppliers;
-        }
-        if (owner == null and !routed and !registry.has(etype) and !listed(&APPLIES_NOTHING, etype) and !listed(&NEVER_WRITTEN, etype)) {
+        if (owner == null and !registry.has(etype) and !listed(&APPLIES_NOTHING, etype) and !listed(&NEVER_WRITTEN, etype)) {
             log.err("shard {d}: entry type {s} has no applier; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, fname });
             return error.EntryTypeHasNoApplier;
         }
@@ -10137,7 +10120,7 @@ test "Shard: a gathered kv.mget whose part is refused answers with that refusal,
     var f: MgetGatherFixture = undefined;
     try f.init(8);
     defer f.deinit();
-    f.two.shards[1].offline = silent_loss.Damage.init(.router_error, "test", .{});
+    f.two.shards[1].offline = silent_loss.Damage.init(.applier_failed, "test", .{});
     try f.ask(1, &f.keys);
     f.two.settle();
     const resp = try f.answer();
@@ -10261,7 +10244,7 @@ test "Shard: a gather of another op whose part is refused, or misses its deadlin
         var f: MgetGatherFixture = undefined;
         try f.init(8);
         defer f.deinit();
-        f.two.shards[1].offline = silent_loss.Damage.init(.router_error, "test", .{});
+        f.two.shards[1].offline = silent_loss.Damage.init(.applier_failed, "test", .{});
         var c: ConcatOp = .{};
         try c.start(&f, f.keys[1]);
         f.two.settle();
@@ -11072,6 +11055,16 @@ test "Shard: a TS sink whose measurement is on another shard writes through that
     try std.testing.expectEqual(@as(usize, 0), try tsPoints(a, .default, measurement, "value"));
 }
 
+/// A point of `measurement`'s field "value", written to `shard` as a
+/// client's write is and applied.
+fn tsPut(shard: *Shard, measurement: []const u8, value: f64, ts_ns: u64, tags: []const u8) !void {
+    switch (@import("../ts/handler.zig").TSHandler.proposeWrite(shard, "default", measurement, "value", value, ts_ns, tags, entry_mod.Flags.NONE)) {
+        .parked => {},
+        else => return error.NotProposed,
+    }
+    _ = shard.applyCommitted();
+}
+
 /// A job on shard 0 whose source is `source` (a stream, or a measurement
 /// when `ts`), writing each record to stream `out`; its one pipeline.
 fn remoteSourceJob(two: *TwoShards, c: TestClient, source: []const u8, ts: bool, out: []const u8) !*ProcessingHandler.PipelineState {
@@ -11159,7 +11152,7 @@ test "Shard: a pipeline whose TS source is on another shard reads its points thr
     const measurement = try keyOn(b, .default, 1, &mbuf);
     var obuf: [16]u8 = undefined;
     const out = try keyOn(a, .default, 0, &obuf);
-    for (0..4) |i| try b.ts_handler.ts.insert(.default, measurement, "value", @floatFromInt(i), 1_000_000 * (i + 1), i + 1, "host=x");
+    for (0..4) |i| try tsPut(b, measurement, @floatFromInt(i), 1_000_000 * (i + 1), "host=x");
     const c = try TestClient.open(a);
     defer _ = std.c.close(c.pair[1]);
     const pipe = try remoteSourceJob(&two, c, measurement, true, out);
@@ -11181,7 +11174,7 @@ test "Shard: a TS source with more points at one time than a tick has room for g
     const measurement = try keyOn(a, .default, 0, &mbuf);
     var tbuf: [16]u8 = undefined;
     const hosts = 400;
-    for (0..hosts) |i| try a.ts_handler.ts.insert(.default, measurement, "value", 1, 5_000_000, 1_000_000 + i, try std.fmt.bufPrint(&tbuf, "host={d}", .{i}));
+    for (0..hosts) |i| try tsPut(a, measurement, 1, 5_000_000, try std.fmt.bufPrint(&tbuf, "host={d}", .{i}));
     var obuf: [3][16]u8 = undefined;
     var outs: [3][]const u8 = undefined;
     var k: usize = 0;
@@ -11237,7 +11230,7 @@ test "Shard: a TS page held partway, among points sharing a time, goes on from t
     const measurement = try keyOn(b, .default, 1, &mbuf);
     var tbuf: [16]u8 = undefined;
     const hosts = 300;
-    for (0..hosts) |i| try b.ts_handler.ts.insert(.default, measurement, "value", 1, 5_000_000, 1_000_000 + i, try std.fmt.bufPrint(&tbuf, "host={d}", .{i}));
+    for (0..hosts) |i| try tsPut(b, measurement, 1, 5_000_000, try std.fmt.bufPrint(&tbuf, "host={d}", .{i}));
     var obuf: [16]u8 = undefined;
     const out = try keyOn(a, .default, 0, &obuf);
     const c = try TestClient.open(a);
@@ -16573,7 +16566,7 @@ test "every entry type has exactly one applier, or is listed as needing none, or
     var full: ReplayRegistry = .{};
     inline for (@typeInfo(entry_mod.EntryType).@"enum".field_values) |value| {
         const t: entry_mod.EntryType = @fromBackingInt(@intCast(value));
-        if (!routedToProjection(t) and contract_machine.ownerOf(&contract_machines.list, t) == null and !listed(&APPLIES_NOTHING, t) and !listed(&NEVER_WRITTEN, t)) full.register(t, @ptrCast(&ctx), Noop.apply);
+        if (contract_machine.ownerOf(&contract_machines.list, t) == null and !listed(&APPLIES_NOTHING, t) and !listed(&NEVER_WRITTEN, t)) full.register(t, @ptrCast(&ctx), Noop.apply);
     }
     try checkAppliers(0, &full);
 
@@ -21162,7 +21155,7 @@ test "a shard that runs out of memory applying an entry is told to restart once 
     var losses: silent_loss.Counts = .{};
     var e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 7, 0, "");
     e.header.crc32c = e.computeCrc();
-    const oom = verdictOf(&losses, 0, 0, &e, .{ .router_error = error.OutOfMemory }).local;
+    const oom = verdictOf(&losses, 0, 0, &e, .{ .applier_failed = error.OutOfMemory }).local;
     try std.testing.expect(oom.out_of_memory);
     try std.testing.expect(!verdictOf(&losses, 0, 0, &e, .{ .applier_failed = error.Io }).local.out_of_memory);
 
@@ -23341,8 +23334,7 @@ test "checkAppliers: a type a contract machine owns may have no other applier, a
     try checkAppliersWith(&listed_now, 0, &shard.replay_registry);
     // A type nothing else applies: the machine is its applier.
     try checkAppliersWith(&(listed_now ++ .{Toy.owning(.raft_snapshot)}), 0, &shard.replay_registry);
-    // Routed to a projection, or registered by a handler, too: refused.
-    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.ts_write)}), 0, &shard.replay_registry));
+    // Registered by a handler too: refused.
     try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.stream_append)}), 0, &shard.replay_registry));
     // KV's types are its machine's: without it, they have no applier.
     try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliersWith(&.{}, 0, &shard.replay_registry));

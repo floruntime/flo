@@ -11,6 +11,7 @@ const targets = [_]machine.Machine{
     @import("../queue/machine.zig").machine,
     @import("../stream/group_machine.zig").machine,
     @import("../settings/machine.zig").machine,
+    @import("../ts/machine.zig").machine,
 };
 
 pub const list = targets ++ [_]machine.Machine{@import("channels.zig").Channels(&targets).machine};
