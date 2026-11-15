@@ -377,6 +377,25 @@ jobs:
         # crashes, and every channel drains.
         run: ./zig-out/bin/vopr --iterations=10 --seed=1 --jobs=4 --groups=4 --seed-timeout=120 --out-dir=/tmp/vopr-groups
         timeout-minutes: 10
+      - name: Swarm of groups whose disks stop flushing
+        # A group's durable index stalls now and then: what it sent waits,
+        # and goes once it flushes again.
+        run: ./zig-out/bin/vopr --iterations=10 --seed=1 --jobs=4 --groups=4 --flush-stalls --seed-timeout=120 --out-dir=/tmp/vopr-groups-stalls
+        timeout-minutes: 10
+      - name: Swarm of groups with a halting entry
+        # A group that halts takes in nothing, and what's sent to it waits
+        # for its repair; a halted sender still delivers what it sent.
+        run: ./zig-out/bin/vopr --iterations=10 --seed=1 --jobs=4 --groups=4 --halts --seed-timeout=120 --out-dir=/tmp/vopr-groups-halts
+        timeout-minutes: 10
+      - name: Channel mutants are caught
+        # Each planted bug in the channel driver fails at least one seed.
+        run: |
+          for m in past_durable trim_on_applied ack_last_seq; do
+            if ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --groups=4 --channel-mutant=$m --seed-timeout=120 --out-dir=/tmp/vopr-cm-$m 2>&1 | grep -q "20 ok, 0 failed"; then
+              echo "::error::channel mutant $m passed every seed"; exit 1
+            fi
+          done
+        timeout-minutes: 20
       - name: Swarm with lost disks
         # Crashes that lose a disk or its hard state, up to two nodes at once:
         # the lost-log guard's slice.

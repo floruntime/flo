@@ -188,6 +188,8 @@ pub const ChannelOracle = struct {
     /// Reports of what a group already reported, as its restart replays its
     /// log: each matched what was recorded.
     replays: u64 = 0,
+    /// Messages waiting at the end on a receiver that is halted.
+    held_by_halts: u64 = 0,
 
     const Logged = struct { hash: u64, index: u64 };
 
@@ -293,18 +295,27 @@ pub const ChannelOracle = struct {
         };
     }
 
-    /// Every message each sender holds was applied: once the channels have
-    /// drained, at the end.
-    pub fn drained(self: *const ChannelOracle) bool {
-        for (&self.channels) |*row| for (row) |*c| {
+    /// Every message each sender holds was applied, but to a receiver that
+    /// is halted, where messages wait for its repair: once the channels
+    /// have drained, at the end.
+    pub fn drained(self: *const ChannelOracle, halted: []const bool) bool {
+        for (&self.channels) |*row| for (row, 0..) |*c, to| {
+            if (to < halted.len and halted[to]) continue;
             if (c.appliedThrough() < c.sent.items.len) return false;
         };
         return true;
     }
 
-    pub fn finish(self: *ChannelOracle) void {
+    /// Fails each channel whose receiver isn't halted and didn't apply all
+    /// its sender holds; counts what waits on a halted one.
+    pub fn finish(self: *ChannelOracle, halted: []const bool) void {
         for (&self.channels, 0..) |*row, from| for (row, 0..) |*c, to| {
-            if (c.appliedThrough() < c.sent.items.len) self.fail(@intCast(from), @intCast(to), c.appliedThrough() + 1, "a message its sender holds was never applied");
+            if (c.appliedThrough() >= c.sent.items.len) continue;
+            if (to < halted.len and halted[to]) {
+                self.held_by_halts += c.sent.items.len - c.appliedThrough();
+                continue;
+            }
+            self.fail(@intCast(from), @intCast(to), c.appliedThrough() + 1, "a message its sender holds was never applied");
         };
     }
 };
@@ -324,9 +335,13 @@ pub const Summary = struct {
     channel_violations: usize,
     probes_proposed: u64,
     frames_refused: u64,
+    flush_stalls: u64,
+    held_by_halts: u64,
     /// In flight when the run ended, and not applied: 0 once drained.
     left_in_mailbox: usize,
 };
+
+pub const ChannelMutant = driver_mod.Mutant;
 
 const Probed = channels_mod.Channels(&.{probe.machine});
 const channel_machines = [_]machine_mod.Machine{ probe.machine, Probed.machine };
@@ -442,7 +457,7 @@ pub const GroupChannel = struct {
     /// term.
     fn leads(c: *GroupChannel) bool {
         const sim = &c.groups.sims[c.g];
-        if (!sim.leadsReady(NODE)) return false;
+        if (!sim.leadsReady(NODE) and !sim.leadsHalted(NODE)) return false;
         const term = sim.termOf(NODE);
         if (c.driver.term != term) c.driver.reset(term);
         return true;
@@ -482,6 +497,11 @@ pub const Groups = struct {
     probe_prng: PRNG,
     /// One probe per group per this many ticks, on average; 0 for none.
     probe_every: u32 = 8,
+    /// Per 10,000 ticks, the chance a group's disk stops flushing (0: none).
+    /// A stall holds the node's crashes until it has flushed again, so a run
+    /// with stalls crashes less: they get a swarm of their own.
+    stall_permille: u16 = 0,
+    flush_stalls: u64 = 0,
     mailbox: Mailbox,
     oracle: ChannelOracle,
     delivery: std.ArrayListUnmanaged(Frame) = .empty,
@@ -519,6 +539,10 @@ pub const Groups = struct {
         for (chans, sims, 0..) |*c, *sim, g| {
             c.* = GroupChannel.init(allocator, @intCast(g), group_count);
             sim.extension = c.extension();
+            // Each group flushes at its own point in the interval, as each
+            // shard's flush timer does: a crash takes a different suffix
+            // from each. Group 0 keeps its phase, so it replays as alone.
+            sim.flush_phase_ms = (@as(u64, g) * scenario.flush_interval_ms) / group_count;
         }
         return .{
             .allocator = allocator,
@@ -546,9 +570,18 @@ pub const Groups = struct {
     }
 
     /// The channels drained: nothing in flight, every message its sender
-    /// holds applied.
+    /// holds applied, but what waits on a halted group.
     fn drained(self: *const Groups) bool {
-        return self.mailbox.queue.items.len == 0 and self.oracle.drained();
+        var buf: [MAX_GROUPS]bool = undefined;
+        const halted = self.haltedGroups(&buf);
+        for (self.mailbox.queue.items) |f| if (!halted[f.to]) return false;
+        return self.oracle.drained(halted);
+    }
+
+    /// Which groups are halted: messages to one wait for its repair.
+    fn haltedGroups(self: *const Groups, buf: *[MAX_GROUPS]bool) []const bool {
+        for (self.sims, 0..) |*s, g| buf[g] = s.isHalted(NODE);
+        return buf[0..self.sims.len];
     }
 
     fn failed(self: *const Groups) bool {
@@ -579,6 +612,18 @@ pub const Groups = struct {
         for (self.sims) |*s| try s.advance();
         try self.followFate(was_up);
         const up = self.sims[0].nodeUp(NODE);
+        // A group's disk stops flushing for a while, now and then: its
+        // durable index stalls, and so does what it delivers.
+        if (up and !self.converging and self.stall_permille > 0) for (self.sims) |*s| {
+            if (self.now() >= s.flush_stalled_until and self.probe_prng.random().uintLessThan(u16, 10_000) < self.stall_permille) {
+                s.flush_stalled_until = self.now() + self.probe_prng.random().intRangeAtMost(u64, 2_000, 8_000);
+                self.flush_stalls += 1;
+                // The node's crashes wait until the stalled disk has flushed
+                // again: an async crash may lose one flush interval, no more.
+                const clear = s.flush_stalled_until + 2 * s.scenario.flush_interval_ms;
+                self.sims[0].no_crash_before = @max(self.sims[0].no_crash_before, clear);
+            }
+        };
         // Probes only in the safety phase, so convergence can drain.
         if (up and self.probe_every > 0 and !self.converging) for (self.chans) |*c| {
             if (self.probe_prng.random().uintLessThan(u32, self.probe_every) == 0) c.proposeProbe(self.probe_prng.random());
@@ -598,6 +643,8 @@ pub const Groups = struct {
         for (self.chans) |*c| c.groups = self;
         while (!self.sims[0].safetyDone() and !self.failed()) try self.step();
         self.converging = true;
+        // Disks flush again for convergence.
+        for (self.sims) |*s| s.flush_stalled_until = 0;
         // Each group converges by its own deadline, or fails as it would
         // alone; the run goes on to the latest of them at most.
         var deadlines: [MAX_GROUPS]u64 = @splat(0);
@@ -625,7 +672,10 @@ pub const Groups = struct {
             }
             // Every message a sender holds was applied by now, or the run
             // fails: no channel may stall.
-            if (!self.failed()) self.oracle.finish();
+            if (!self.failed()) {
+                var buf: [MAX_GROUPS]bool = undefined;
+                self.oracle.finish(self.haltedGroups(&buf));
+            }
         }
         const summaries = try self.allocator.alloc(simulator.Summary, self.sims.len);
         var ok = self.oracle.violations.items.len == 0;
@@ -647,6 +697,8 @@ pub const Groups = struct {
                 break :probes n;
             },
             .frames_refused = self.mailbox.refused,
+            .flush_stalls = self.flush_stalls,
+            .held_by_halts = self.oracle.held_by_halts,
             .left_in_mailbox = self.mailbox.queue.items.len,
             .channel_violations = self.oracle.violations.items.len,
         };
@@ -698,6 +750,8 @@ test "vopr groups: group 0 of a multi-group run replays as the same scenario run
     const a = alone.finish(false);
     var groups = try Groups.init(testing.allocator, scenario, 3, .{});
     defer groups.deinit();
+    // No probes: idle channels move none of group 0's draws.
+    groups.probe_every = 0;
     while (!groups.sims[0].safetyDone()) try groups.step();
     const g = groups.sims[0].finish(false);
     try testing.expect(a.ok and g.ok);
@@ -755,7 +809,7 @@ test "vopr groups: the channel oracle holds a channel to exactly once, in order"
                     o.recovered(1, 2);
                     try o.applied(0, 1, 1, 11, 3);
                     try o.applied(0, 1, 2, 12, 4);
-                    o.finish();
+                    o.finish(&.{});
                 }
             }.f,
         },
@@ -806,7 +860,7 @@ test "vopr groups: the channel oracle holds a channel to exactly once, in order"
         .{ .detail = "a message its sender holds was never applied", .run = struct {
             fn f(o: *ChannelOracle) !void {
                 try o.sent(1, 0, 1, 11, 1);
-                o.finish();
+                o.finish(&.{});
             }
         }.f },
         .{ .detail = "a sender's seqs skipped or repeated", .run = struct {
@@ -846,7 +900,7 @@ test "vopr groups: a crash that takes a send and its apply together is no violat
         // Both start over: the send again, at the sender's next index.
         try o.sent(sender, receiver, 1, 12, 7);
         try o.applied(sender, receiver, 1, 12, 3);
-        o.finish();
+        o.finish(&.{});
         try testing.expectEqual(@as(usize, 0), o.violations.items.len);
     }
 }
@@ -873,7 +927,7 @@ test "vopr groups: a clean restart's replay reports what was recorded, and nothi
     // Traffic after the restart goes on as before.
     try o.sent(0, 1, 3, 13, 6);
     try o.applied(0, 1, 3, 13, 4);
-    o.finish();
+    o.finish(&.{});
     try testing.expectEqual(@as(usize, 0), o.violations.items.len);
     // A replay that isn't what was recorded is caught: another send at a
     // recorded seq, or a recorded message applied at another index.
@@ -899,6 +953,8 @@ test "vopr groups: frames reach the handler only while the node is up" {
         }
     };
     Counter.handled = 0;
+    // The mailbox alone: no channel traffic, and the frames go to the test.
+    groups.probe_every = 0;
     groups.on_frame = Counter.handle;
     for (0..8) |_| try groups.mailbox.send(0, 0, 1, "ping");
     const s = try groups.run();
@@ -907,4 +963,26 @@ test "vopr groups: frames reach the handler only while the node is up" {
     try testing.expect(s.crashes > 0);
     try testing.expect(Counter.handled > 100);
     try testing.expect(s.frames_lost_in_crash > 0);
+}
+
+test "vopr groups: channel traffic between groups is applied once and in order through crashes, and drains" {
+    for ([_]scenario_mod.DurabilityMode{ .sync, .async_flush }) |durability| {
+        var scenario = oneNodeScenario(21);
+        scenario.durability = durability;
+        var groups = try Groups.init(testing.allocator, scenario, 3, .{});
+        defer groups.deinit();
+        const s = try groups.run();
+        defer testing.allocator.free(s.groups);
+        if (!s.ok) for (groups.oracle.violations.items) |v| std.debug.print("channel {d}->{d} seq {d}: {s}\n", .{ v.from, v.to, v.seq, v.detail });
+        try testing.expect(s.ok);
+        try testing.expect(s.crashes > 0);
+        try testing.expect(s.probes_proposed > 50);
+        try testing.expect(s.channel_applies > 50);
+        try testing.expect(s.frames_lost_in_crash > 0);
+        try testing.expectEqual(@as(usize, 0), s.channel_violations);
+        // Drained: nothing in flight, and every message its sender holds
+        // was applied.
+        try testing.expectEqual(@as(usize, 0), s.left_in_mailbox);
+        try testing.expect(groups.oracle.drained(&.{}));
+    }
 }

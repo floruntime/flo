@@ -949,6 +949,16 @@ pub const Extension = struct {
 pub const Simulator = struct {
     allocator: Allocator,
     extension: ?Extension = null,
+    /// How far ahead of the tick this simulator's flush clock runs: 0 alone,
+    /// and each group its own on one node.
+    flush_phase_ms: u64 = 0,
+    /// Under `async_flush`, nothing is flushed before this tick: a disk that
+    /// stopped flushing.
+    flush_stalled_until: u64 = 0,
+    /// No crash before this tick. A stalled disk's acked writes would
+    /// outgrow the one flush interval an async crash may lose; production
+    /// refuses writes it can't flush instead, which this doesn't model.
+    no_crash_before: u64 = 0,
     scenario: Scenario,
     options: Options,
     prng: PRNG,
@@ -1447,9 +1457,12 @@ pub const Simulator = struct {
         for (self.nodes) |*node| {
             if (node.up) {
                 if (r.uintLessThan(u16, 1000) < self.scenario.crash_permille) {
+                    // Drawn either way, so holding crashes off moves no draw.
+                    const held = self.now < self.no_crash_before;
                     if (r.uintLessThan(u16, 1000) < self.scenario.wipe_permille and self.mayLose(node.id)) {
-                        if (r.boolean()) self.wipeNode(node) else self.wipeHardState(node);
-                    } else {
+                        const hard_state_only = r.boolean();
+                        if (!held) if (hard_state_only) self.wipeHardState(node) else self.wipeNode(node);
+                    } else if (!held) {
                         self.crashNode(node);
                     }
                 }
@@ -2329,11 +2342,16 @@ pub const Simulator = struct {
 
     fn syncStableStorage(self: *Simulator) void {
         if (self.scenario.durability != .async_flush) return;
+        // A disk that stopped flushing writes nothing until it starts again.
+        if (self.now < self.flush_stalled_until) return;
+        // Flushes run on their own clock, `flush_phase_ms` ahead: groups on
+        // one node flush at their own times, as each shard's timer does.
+        const at = self.now + self.flush_phase_ms;
         for (self.nodes) |*node| {
             if (!node.up) continue;
-            if (self.now - node.disk.last_flush >= self.scenario.flush_interval_ms) {
+            if (at - node.disk.last_flush >= self.scenario.flush_interval_ms) {
                 node.disk.flush();
-                node.disk.last_flush = self.now;
+                node.disk.last_flush = at;
             }
         }
     }
@@ -2655,6 +2673,13 @@ pub const Simulator = struct {
     pub fn leadsReady(self: *const Simulator, id: NodeId) bool {
         const node = &self.nodes[id - 1];
         return node.up and node.raft.leaderReady();
+    }
+
+    /// Node `id` leads and is halted: it still delivers what it sent before
+    /// the halt, as a shard's halted leader does.
+    pub fn leadsHalted(self: *const Simulator, id: NodeId) bool {
+        const node = &self.nodes[id - 1];
+        return node.up and node.raft.role == .leader and node.halted_at != 0;
     }
 
     pub fn isHalted(self: *const Simulator, id: NodeId) bool {

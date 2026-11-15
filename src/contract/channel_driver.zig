@@ -124,8 +124,25 @@ pub const Counts = struct {
     acks_refused: u64 = 0,
 };
 
+/// A bug planted on purpose, for VOPR to show it catches it. Only VOPR
+/// sets one; a server never does.
+pub const Mutant = enum {
+    none,
+    /// Deliver a message before its sending entry is durable.
+    past_durable,
+    /// Trim on the applied ack, not the durable one.
+    trim_on_applied,
+    /// Answer an all-duplicate batch with its last seq, not the receiver's marks.
+    ack_last_seq,
+    /// Let a gap from an older generation's batch rewind again.
+    no_gen_filter,
+    /// Take an ack above what this group's state says was sent.
+    unbounded_ack,
+};
+
 pub const Driver = struct {
     group: u16,
+    mutant: Mutant = .none,
     count: u16,
     term: u64 = 0,
     peers: [MAX_GROUPS]Peer = @splat(.{}),
@@ -213,7 +230,7 @@ pub const Driver = struct {
         if (p.sent_through < last and p.sent_through - floor < WINDOW) {
             // Own-group sends don't wait for durability: their inbound entry
             // follows them in the same log.
-            const ready = if (b == self.group) std.math.maxInt(u64) else durable;
+            const ready = if (b == self.group or self.mutant == .past_durable) std.math.maxInt(u64) else durable;
             if (self.sendBatch(b, p.sent_through + 1, last, floor, ready, read, io)) |sent| {
                 if (p.sent_through == floor) p.progress_ms = now_ms;
                 p.sent_through = sent;
@@ -318,7 +335,10 @@ pub const Driver = struct {
         if (b.messages.count == 0) return self.answer(from, p, applied, dur, 0, .ok, io);
         const accepted = p.accepted.?;
         const last = b.first_seq + b.messages.count - 1;
-        if (last <= accepted) return self.answer(from, p, applied, dur, 0, .ok, io);
+        if (last <= accepted) {
+            if (self.mutant == .ack_last_seq) return self.answer(from, p, last, last, 0, .ok, io);
+            return self.answer(from, p, applied, dur, 0, .ok, io);
+        }
         if (b.first_seq > accepted + 1) {
             self.counts.gaps += 1;
             return self.answer(from, p, applied, dur, accepted + 1, .ok, io);
@@ -350,7 +370,7 @@ pub const Driver = struct {
         // Acks are bounded by what this group's state says was sent, never
         // by what this leader sent: a new leader resends from `acked` while
         // the receiver is already ahead.
-        if (a.applied > meta.next_seq - 1 or a.durable > meta.next_seq - 1 or a.durable > a.applied) {
+        if (self.mutant != .unbounded_ack and (a.applied > meta.next_seq - 1 or a.durable > meta.next_seq - 1 or a.durable > a.applied)) {
             self.counts.acks_refused += 1;
             return;
         }
@@ -359,8 +379,8 @@ pub const Driver = struct {
             p.progress_ms = now_ms;
             p.backoff_ms = RESEND_MIN_MS;
         }
-        p.durable_ack = @max(p.durable_ack, a.durable);
-        const current = a.gen_term == self.term and a.gen_counter == p.gen_counter;
+        p.durable_ack = @max(p.durable_ack, if (self.mutant == .trim_on_applied) a.applied else a.durable);
+        const current = self.mutant == .no_gen_filter or (a.gen_term == self.term and a.gen_counter == p.gen_counter);
         if (a.gap != 0 and current) {
             const n = std.math.clamp(a.gap, meta.acked + 1, meta.next_seq);
             p.sent_through = n - 1;
