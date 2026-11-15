@@ -4808,6 +4808,7 @@ pub const Shard = struct {
             sm.sink_retry_bytes.store(self.sink_retry_bytes, .monotonic);
             sm.ts_points.store(self.ts_handler.ts.pointCount(), .monotonic);
             sm.ts_point_bytes.store(self.ts_handler.ts.pointBytes(), .monotonic);
+            for (&sm.ts_late, self.defaultPartition().store.ts_late_points) |*m, n| m.store(n, .monotonic);
             sm.sink_retry_overflow.store(self.sink_retry_overflow, .monotonic);
             sm.bar_last.store(self.defaultPartition().last_bar, .monotonic);
             sm.bar_bytes.store(self.defaultPartition().bar_bytes, .monotonic);
@@ -11085,6 +11086,11 @@ fn tsPut(shard: *Shard, measurement: []const u8, value: f64, ts_ns: u64, tags: [
 /// A job on shard 0 whose source is `source` (a stream, or a measurement
 /// when `ts`), writing each record to stream `out`; its one pipeline.
 fn remoteSourceJob(two: *TwoShards, c: TestClient, source: []const u8, ts: bool, out: []const u8) !*ProcessingHandler.PipelineState {
+    return remoteSourceJobLate(two, c, source, ts, out, 0);
+}
+
+/// `remoteSourceJob`, its TS source holding back `lateness_ms`.
+fn remoteSourceJobLate(two: *TwoShards, c: TestClient, source: []const u8, ts: bool, out: []const u8, lateness_ms: u32) !*ProcessingHandler.PipelineState {
     const a = &two.shards[0];
     var ybuf: [512]u8 = undefined;
     const yaml = if (ts) try std.fmt.bufPrint(&ybuf,
@@ -11092,11 +11098,11 @@ fn remoteSourceJob(two: *TwoShards, c: TestClient, source: []const u8, ts: bool,
         \\name: far-src
         \\sources:
         \\  - name: src
-        \\    ts: {{ measurement: {s}, field: value }}
+        \\    ts: {{ measurement: {s}, field: value, lateness_ms: {d} }}
         \\sinks:
         \\  - name: out
         \\    stream: {{ name: {s} }}
-    , .{ source, out }) else try std.fmt.bufPrint(&ybuf,
+    , .{ source, lateness_ms, out }) else try std.fmt.bufPrint(&ybuf,
         \\kind: Processing
         \\name: far-src
         \\sources:
@@ -11181,6 +11187,79 @@ test "Shard: a pipeline whose TS source is on another shard reads its points thr
     try std.testing.expectEqual(@as(u64, 4_000_000), pipe.ts_cursor.ns);
 }
 
+test "Shard: a TS source on another shard holds back its window from that shard's newest point, and reads the rest once the field is idle" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var mbuf: [16]u8 = undefined;
+    const measurement = try keyOn(b, .default, 1, &mbuf);
+    var obuf: [16]u8 = undefined;
+    const out = try keyOn(a, .default, 0, &obuf);
+    const s = std.time.ns_per_s;
+    try tsPut(b, measurement, 1, 10 * s, "host=a");
+    try tsPut(b, measurement, 2, 20 * s, "host=a");
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    // The source's idle clock, advanced by hand.
+    const Clock = struct {
+        var now: u64 = 1_000_000;
+        fn read() u64 {
+            return now;
+        }
+    };
+    a.processing_handler.mono_ms = Clock.read;
+    const pipe = try remoteSourceJobLate(&two, c, measurement, true, out, 5000);
+    // The first ask, before this shard has seen the field, already reads
+    // up to shard 1's newest less the window: the point at 10 s.
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
+    try std.testing.expectEqual(10 * s, pipe.ts_cursor.ns);
+    // The page said how many writes the field has had.
+    try std.testing.expectEqual(@as(?u64, 2), pipe.seen_writes);
+    // A point 2 s behind the newest, from another host: inside the window,
+    // so ahead of the cursor, and not read yet.
+    try tsPut(b, measurement, 3, 18 * s, "host=b");
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
+    try std.testing.expectEqual(@as(?u64, 3), pipe.seen_writes);
+    // Once the field has had no write for the window: the rest, in order.
+    Clock.now += 5000;
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+    try std.testing.expectEqual(20 * s, pipe.ts_cursor.ns);
+
+    // Idle again, judged from the last page; then a write lands on shard 1
+    // before the next ask. Its count no longer matches what this shard
+    // judged idle at, so shard 1 holds the window from the new newest:
+    // a point that then arrives 2 s behind it is still ahead of the cursor.
+    Clock.now += 5000;
+    try tsPut(b, measurement, 4, 40 * s, "host=a");
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+    try std.testing.expectEqual(20 * s, pipe.ts_cursor.ns);
+    try tsPut(b, measurement, 5, 38 * s, "host=b");
+    // The window passes since the last page, but that page saw 4 writes,
+    // not 5: still held, and this ask learns of the fifth.
+    Clock.now += 5000;
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+    try std.testing.expectEqual(@as(?u64, 5), pipe.seen_writes);
+    // No write since, for the window: both read, in time order.
+    Clock.now += 5000;
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 5), pipe.records_in);
+    try std.testing.expectEqual(40 * s, pipe.ts_cursor.ns);
+}
+
 test "Shard: a TS source with more points at one time than a tick has room for goes on through them, each written once" {
     var two: TwoShards = undefined;
     try two.init();
@@ -11211,7 +11290,7 @@ test "Shard: a TS source with more points at one time than a tick has room for g
         \\name: wide
         \\sources:
         \\  - name: src
-        \\    ts: {{ measurement: {s}, field: value }}
+        \\    ts: {{ measurement: {s}, field: value, lateness_ms: 0 }}
         \\sinks:
         \\  - name: a
         \\    stream: {{ name: {s} }}

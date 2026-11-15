@@ -10,6 +10,11 @@
 //!   entry it was applied from, then its place among the writes that entry
 //!   carries (`positionOf`), so a series' points sort by time and then by
 //!   apply order, and no two share a key.
+//! - `ts.field`: each measurement field, keyed (ns id, measurement, field):
+//!   the newest time any of its series applied, how many series it has,
+//!   and how many points arrived behind that newest time, bucketed by how
+//!   far (`LATE_EDGES_NS`). A field goes with its last series. Its own
+//!   family, so a range over series or points never reaches it.
 //!
 //! Names end at a NUL, so a measurement's keys are a prefix no other
 //! measurement's start with; a name holding one is refused.
@@ -71,8 +76,63 @@ pub const PointValue = struct {
     }
 };
 
+/// How far behind its field's newest time a late point is counted: past
+/// each of these. A processing source's lateness window reports against
+/// the smallest edge at or above it.
+pub const LATE_EDGES_NS = [_]u64{ 0, 1 * NS_PER_S, 5 * NS_PER_S, 15 * NS_PER_S, 30 * NS_PER_S, 60 * NS_PER_S, 300 * NS_PER_S, 3600 * NS_PER_S };
+const NS_PER_S = std.time.ns_per_s;
+/// The edges as the metric labels them.
+pub const LATE_EDGE_NAMES = [_][]const u8{ "0s", "1s", "5s", "15s", "30s", "1m", "5m", "1h" };
+
+/// A measurement field: `[newest_ns u64][series u64][writes u64][late u64
+/// × edges]`, little-endian.
+pub const FieldValue = struct {
+    newest_ns: u64 = 0,
+    series: u64 = 0,
+    /// Points applied to it, ever: a source sees from it whether the field
+    /// is still being written, late or not.
+    writes: u64 = 0,
+    /// Points that arrived more than each edge behind `newest_ns`.
+    late: [LATE_EDGES_NS.len]u64 = @splat(0),
+
+    pub fn encode(self: FieldValue, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeInt(u64, self.newest_ns, .little);
+        try w.writeInt(u64, self.series, .little);
+        try w.writeInt(u64, self.writes, .little);
+        for (self.late) |n| try w.writeInt(u64, n, .little);
+    }
+
+    pub fn decode(bytes: []const u8) error{Malformed}!FieldValue {
+        if (bytes.len != 24 + 8 * LATE_EDGES_NS.len) return error.Malformed;
+        var v: FieldValue = .{ .newest_ns = std.mem.readInt(u64, bytes[0..8], .little), .series = std.mem.readInt(u64, bytes[8..16], .little), .writes = std.mem.readInt(u64, bytes[16..24], .little) };
+        for (&v.late, 0..) |*n, i| n.* = std.mem.readInt(u64, bytes[24 + 8 * i ..][0..8], .little);
+        return v;
+    }
+
+    /// The point at `ts_ns` applied: counted late past each edge it trails
+    /// the newest by, into the record and into `applied` (the node's count
+    /// of late applies), then the newest moves up to it.
+    pub fn note(self: *FieldValue, ts_ns: u64, had_points: bool, applied: *[LATE_EDGES_NS.len]u64) void {
+        self.writes += 1;
+        if (had_points and ts_ns < self.newest_ns) {
+            const behind = self.newest_ns - ts_ns;
+            for (LATE_EDGES_NS, &self.late, applied) |edge, *n, *m| if (behind > edge) {
+                n.* += 1;
+                m.* += 1;
+            };
+        }
+        self.newest_ns = if (had_points) @max(self.newest_ns, ts_ns) else ts_ns;
+    }
+};
+
 pub const Series = view_mod.Family(60, "ts.series", SeriesValue);
 pub const Points = view_mod.Family(61, "ts.point", PointValue);
+pub const Fields = view_mod.Family(62, "ts.field", FieldValue);
+
+comptime {
+    std.debug.assert(@typeInfo(@FieldType(@import("../contract/store.zig").Store, "ts_late_points")).array.len == LATE_EDGES_NS.len);
+    std.debug.assert(@typeInfo(@FieldType(View, "ts_late_points")).array.len == LATE_EDGES_NS.len);
+}
 
 // ─── Keys ────────────────────────────────────────────────────────────────
 
@@ -178,6 +238,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             const ns = w.cmd.namespace_id;
             const sk = try seriesKey(a, ns, w.cmd.key, w.rec.field_name, w.tag_hash);
             try out.addIn(Series.ID, ns, rest(sk));
+            try out.addIn(Fields.ID, ns, rest(fieldOf(sk)));
             // Every place in the entry: which one a write takes is the
             // batch's, not the entry's own to say.
             const first = try pointKey(a, sk, w.rec.timestamp_ns, positionOf(e.header.index, 0));
@@ -190,7 +251,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         .ts_delete, .ts_retention => {
             const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return;
             const prefix = try measurementPrefix(a, cmd.namespace_id, cmd.key);
-            inline for (.{ Series.ID, Points.ID }) |fam| out.addRangeIn(fam, cmd.namespace_id, rest(prefix)) catch |err| switch (err) {
+            inline for (.{ Series.ID, Points.ID, Fields.ID }) |fam| out.addRangeIn(fam, cmd.namespace_id, rest(prefix)) catch |err| switch (err) {
                 error.NoNamespace => return,
                 else => |o| return o,
             };
@@ -213,7 +274,12 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 return out.refuse(.bad_request, .unclassified, NUL_IN_NAME);
             const ts = w.rec.timestamp_ns;
             const sk = try seriesKey(a, w.cmd.namespace_id, w.cmd.key, w.rec.field_name, w.tag_hash);
-            var series: SeriesValue = (try view.get(Series, sk)) orelse .{ .points = 0, .oldest_ns = std.math.maxInt(u64), .newest_ns = 0, .tags = w.canonical };
+            const existing = try view.get(Series, sk);
+            var field: FieldValue = (try view.get(Fields, fieldOf(sk))) orelse .{};
+            if (existing == null) field.series += 1;
+            field.note(ts, field.series > 1 or existing != null, &view.ts_late_points);
+            try view.put(Fields, fieldOf(sk), field);
+            var series: SeriesValue = existing orelse .{ .points = 0, .oldest_ns = std.math.maxInt(u64), .newest_ns = 0, .tags = w.canonical };
             series.points += 1;
             series.oldest_ns = @min(series.oldest_ns, ts);
             series.newest_ns = @max(series.newest_ns, ts);
@@ -268,10 +334,13 @@ fn deleteSeries(view: *View, ns: NamespaceId, measurement: []const u8, preds: []
     var series: std.ArrayListUnmanaged([]const u8) = .empty;
     var it = try view.range(Series, try measurementPrefix(a, ns, measurement));
     while (try it.next()) |s| if (tsp.tagsMatch(s.value.tags, preds)) try series.append(a, try a.dupe(u8, s.key));
+    var gone: Gone = .{};
     for (series.items) |sk| {
         try view.deleteRange(Points, sk, null);
         try view.delete(Series, sk);
+        try gone.add(a, sk);
     }
+    try gone.apply(view);
     return series.items.len;
 }
 
@@ -300,11 +369,13 @@ fn applyRetention(view: *View, ns: NamespaceId, measurement: []const u8, cutoff_
         }
     }
     var evicted: usize = 0;
+    var gone: Gone = .{};
     for (trims.items) |t| {
         evicted += t.gone;
         const oldest = t.kept orelse {
             try view.deleteRange(Points, t.key, null);
             try view.delete(Series, t.key);
+            try gone.add(a, t.key);
             continue;
         };
         try view.deleteRange(Points, t.key, try pointKey(a, t.key, cutoff_ns, 0));
@@ -313,13 +384,48 @@ fn applyRetention(view: *View, ns: NamespaceId, measurement: []const u8, cutoff_
         v.oldest_ns = oldest;
         try view.put(Series, t.key, v);
     }
+    try gone.apply(view);
     return evicted;
 }
+
+/// The field a series key belongs to: its key less the tag hash.
+fn fieldOf(series_key: []const u8) []const u8 {
+    return series_key[0 .. series_key.len - TAG_LEN];
+}
+
+/// Series an entry removed, by field: each field's count goes down by its
+/// share, and a field left with none goes.
+const Gone = struct {
+    fields: std.StringArrayHashMapUnmanaged(u64) = .empty,
+
+    fn add(g: *Gone, a: Allocator, series_key: []const u8) Allocator.Error!void {
+        const gop = try g.fields.getOrPut(a, fieldOf(series_key));
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+    }
+
+    fn apply(g: *Gone, view: *View) ApplyError!void {
+        for (g.fields.keys(), g.fields.values()) |fk, n| {
+            var f = (try view.get(Fields, fk)) orelse return error.Halt;
+            if (f.series <= n) {
+                try view.delete(Fields, fk);
+                continue;
+            }
+            f.series -= n;
+            // The newest of the series left: one that went may have held it.
+            var newest: u64 = 0;
+            var it = try view.range(Series, fk);
+            while (try it.next()) |s| newest = @max(newest, s.value.newest_ns);
+            f.newest_ns = newest;
+            try view.put(Fields, fk, f);
+        }
+    }
+};
 
 pub const machine: machine_mod.Machine = .{
     .name = "time series",
     .entry_types = &.{ .ts_write, .ts_write_batch, .ts_delete, .ts_retention },
-    .families = &.{ machine_mod.info(Series), machine_mod.info(Points) },
+    .families = &.{ machine_mod.info(Series), machine_mod.info(Points), machine_mod.info(Fields) },
     .keys = keys,
     .apply = apply,
 };
@@ -414,9 +520,11 @@ test "time series: replaying the log gives byte-identical families" {
     defer b.deinit();
     try log.applyAll(&a);
     try log.applyAll(&b);
-    inline for (.{ Series.ID, Points.ID }) |fam| try testing.expectEqual(store_mod.checksum(&a, fam), store_mod.checksum(&b, fam));
+    inline for (.{ Series.ID, Points.ID, Fields.ID }) |fam| try testing.expectEqual(store_mod.checksum(&a, fam), store_mod.checksum(&b, fam));
     // host=b went whole; the others kept their 31 points at or after 10 µs.
     try testing.expectEqual(@as(usize, 3), a.family(Series.ID).count);
+    // Each field left one series: (7, usage), (7, idle), (8, usage).
+    try testing.expectEqual(@as(usize, 3), a.family(Fields.ID).count);
     try testing.expectEqual(@as(usize, 2 * 31 + 40), a.family(Points.ID).count);
 }
 
@@ -429,7 +537,7 @@ test "time series: the families' snapshot bytes load into a store that reads the
     try log.applyAll(&a);
     var c = store_mod.Store.init(testing.allocator);
     defer c.deinit();
-    inline for (.{ Series.ID, Points.ID }) |fam| {
+    inline for (.{ Series.ID, Points.ID, Fields.ID }) |fam| {
         const bytes = try familyBytes(&a, fam);
         defer testing.allocator.free(bytes);
         try loadFamily(&c, bytes);
@@ -526,4 +634,91 @@ test "time series: a position orders by log index, then by place in the entry, a
     // An entry declares the range its places share.
     try testing.expect(std.mem.startsWith(u8, k1, k0[0 .. k0.len - 1]));
     try testing.expectEqual(positionOf(7, 1), pointAt(k1).ual);
+}
+
+fn fieldIn(store: *store_mod.Store, ns: NamespaceId, m: []const u8, f: []const u8) !?FieldValue {
+    const k = try fieldPrefix(testing.allocator, ns, m, f);
+    defer testing.allocator.free(k);
+    const rv = view_mod.ReadView{ .store = store };
+    return rv.get(Fields, k);
+}
+
+test "time series: a late point counts past each edge it trails its field's newest time by, not at the edge" {
+    var log: TestLog = .{};
+    defer log.deinit();
+    const newest: u64 = 10_000 * NS_PER_S;
+    // Two series of one field: lateness is the field's, not a series'.
+    try log.write(.of(7), "cpu", "usage", 1, newest, "host=a");
+    for (LATE_EDGES_NS) |edge| {
+        try log.write(.of(7), "cpu", "usage", 1, newest - edge, "host=b");
+        try log.write(.of(7), "cpu", "usage", 1, newest - edge - 1, "host=b");
+    }
+    var s = store_mod.Store.init(testing.allocator);
+    defer s.deinit();
+    try log.applyAll(&s);
+    const f = (try fieldIn(&s, .of(7), "cpu", "usage")).?;
+    try testing.expectEqual(newest, f.newest_ns);
+    try testing.expectEqual(@as(u64, 2), f.series);
+    // Past edge i: the points one past each edge at or above it, and those
+    // at each edge above it; at edge 0 the one at the newest itself isn't.
+    for (LATE_EDGES_NS, 0..) |_, i| {
+        const past_or_at_higher = 2 * (LATE_EDGES_NS.len - 1 - i) + 1;
+        try testing.expectEqual(@as(u64, past_or_at_higher), f.late[i]);
+    }
+    // Every write counts, late or not; the node's count of late applies
+    // matches the field's.
+    try testing.expectEqual(@as(u64, 1 + 2 * LATE_EDGES_NS.len), f.writes);
+    try testing.expectEqualSlices(u64, &f.late, &s.ts_late_points);
+    // A point ahead of the newest is never late, and moves it.
+    try log.write(.of(7), "cpu", "usage", 1, newest + 5, "host=b");
+    var t = store_mod.Store.init(testing.allocator);
+    defer t.deinit();
+    try log.applyAll(&t);
+    const g = (try fieldIn(&t, .of(7), "cpu", "usage")).?;
+    try testing.expectEqual(newest + 5, g.newest_ns);
+    try testing.expectEqualSlices(u64, &f.late, &g.late);
+}
+
+test "time series: a field goes with its last series, to a delete or retention, and no series or point range reaches it" {
+    var log: TestLog = .{};
+    defer log.deinit();
+    try log.write(.of(7), "cpu", "usage", 1, 1000, "host=a");
+    try log.write(.of(7), "cpu", "usage", 1, 2000, "host=b");
+    try log.write(.of(7), "cpu", "idle", 1, 5000, "host=a");
+    // Deleting one of usage's series keeps the field, one series fewer.
+    try log.add(.ts_delete, .of(7), "cpu", "host=b", 10_000);
+    var s = store_mod.Store.init(testing.allocator);
+    defer s.deinit();
+    try log.applyAll(&s);
+    try testing.expectEqual(@as(u64, 1), (try fieldIn(&s, .of(7), "cpu", "usage")).?.series);
+    // host=b held the newest time; the newest is now host=a's.
+    try testing.expectEqual(@as(u64, 1000), (try fieldIn(&s, .of(7), "cpu", "usage")).?.newest_ns);
+    try testing.expectEqual(@as(usize, 2), s.family(Fields.ID).count);
+    // Retention empties usage (its point is at 1000) but not idle's.
+    var age: [8]u8 = undefined;
+    std.mem.writeInt(u64, &age, 0, .little);
+    try log.add(.ts_retention, .of(7), "cpu", &age, 3000);
+    var t = store_mod.Store.init(testing.allocator);
+    defer t.deinit();
+    try log.applyAll(&t);
+    try testing.expect((try fieldIn(&t, .of(7), "cpu", "usage")) == null);
+    try testing.expectEqual(@as(u64, 1), (try fieldIn(&t, .of(7), "cpu", "idle")).?.series);
+    // A whole-measurement delete takes the rest.
+    try log.add(.ts_delete, .of(7), "cpu", "", 20_000);
+    var u = store_mod.Store.init(testing.allocator);
+    defer u.deinit();
+    try log.applyAll(&u);
+    inline for (.{ Series.ID, Points.ID, Fields.ID }) |fam| try testing.expectEqual(@as(usize, 0), u.family(fam).count);
+    // The node's count of late applies never falls with what's deleted.
+    var late = store_mod.Store.init(testing.allocator);
+    defer late.deinit();
+    var l2: TestLog = .{};
+    defer l2.deinit();
+    try l2.write(.of(7), "m", "f", 1, 10 * NS_PER_S, "host=a");
+    try l2.write(.of(7), "m", "f", 1, 1 * NS_PER_S, "host=b");
+    try l2.add(.ts_delete, .of(7), "m", "", 20 * NS_PER_S);
+    try l2.applyAll(&late);
+    try testing.expectEqual(@as(usize, 0), late.family(Fields.ID).count);
+    // 9 s behind: past 0 s, 1 s and 5 s, not 15 s.
+    try testing.expectEqualSlices(u64, &.{ 1, 1, 1, 0, 0, 0, 0, 0 }, &late.ts_late_points);
 }

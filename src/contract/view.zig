@@ -197,7 +197,7 @@ pub const Place = struct { group: u16, count: u16 };
 /// `(index, ordinal)` to stay unique.
 pub const Message = struct { from: u16, seq: u64, ordinal: u8 };
 
-pub const Mark = struct { ops: usize, sends: usize };
+pub const Mark = struct { ops: usize, sends: usize, late: [8]u64 };
 
 pub const View = struct {
     store: *Store,
@@ -211,6 +211,10 @@ pub const View = struct {
     /// `SCAN_LIMIT`, so a read or the commit finds it without a scan.
     /// Range deletes aren't in it.
     last: FamKey.Map(usize) = .empty,
+    /// Late time-series points this entry applied, past each edge
+    /// (`Store.ts_late_points`): added to the store's count only at commit,
+    /// so a refused entry or rolled-back message counts none.
+    ts_late_points: [8]u64 = @splat(0),
     /// Where the range deletes are in `ops`, in order: an entry makes few.
     ranges: std.ArrayListUnmanaged(usize) = .empty,
     /// Fail on an undeclared key rather than count it (`Store.strict_keys`).
@@ -254,7 +258,7 @@ pub const View = struct {
 
     /// A point `rollback` returns the staged writes and sends to.
     pub fn mark(self: *const View) Mark {
-        return .{ .ops = self.ops.items.len, .sends = self.sends.items.len };
+        return .{ .ops = self.ops.items.len, .sends = self.sends.items.len, .late = self.ts_late_points };
     }
 
     /// Drops what was staged after `m`: a refused message inside a batch
@@ -263,6 +267,7 @@ pub const View = struct {
         const had = self.ops.items.len;
         self.ops.shrinkRetainingCapacity(m.ops);
         self.sends.shrinkRetainingCapacity(m.sends);
+        self.ts_late_points = m.late;
         // A range delete staged after the mark goes with it: left in, it
         // would still hide keys from later reads and unlink them at commit.
         while (self.ranges.items.len > 0 and self.ranges.items[self.ranges.items.len - 1] >= m.ops) _ = self.ranges.pop();
@@ -457,6 +462,7 @@ pub const View = struct {
             }
         }
         for (plan.items) |*s| self.apply(s);
+        for (&self.store.ts_late_points, self.ts_late_points) |*n, d| n.* += d;
     }
 
     const Step = struct {

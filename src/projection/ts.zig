@@ -552,9 +552,18 @@ pub const TSProjection = struct {
     /// one series (`tag_hash`) or every tag-series of a measurement's field
     /// (null): a reader going on from its last point neither skips nor
     /// repeats one, even among points sharing a time.
-    pub fn readAfter(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, tag_hash: ?u64, after: ReadAt, out: []StoredPoint) !usize {
+    pub fn readAfter(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, tag_hash: ?u64, after: ReadAt, through_ns: u64, out: []StoredPoint) !usize {
         const pick: Pick = if (tag_hash) |h| .{ .exact = h } else .{ .matching = &.{} };
-        return (try self.fill(ns_id, measurement, field_name, pick, .{ .after = after }, std.math.maxInt(u64), out)).points_in_buffer;
+        return (try self.fill(ns_id, measurement, field_name, pick, .{ .after = after }, through_ns, out)).points_in_buffer;
+    }
+
+    /// A measurement field's record: its newest time and lateness counts;
+    /// null when it has no series.
+    pub fn fieldRecord(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8) ?ts_machine.FieldValue {
+        var kbuf: [4096]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&kbuf);
+        const k = ts_machine.fieldPrefix(fba.allocator(), ns_id, measurement, field_name) catch return null;
+        return self.read().get(ts_machine.Fields, k) catch null;
     }
 
     /// Distinct tag-series under one measurement+field, as canonical tag
