@@ -1920,7 +1920,8 @@ test "registry: register and export stream metrics" {
 test "registry: paused connections are exported by what they wait for" {
     var sm = ShardMetrics.init(3);
     sm.setConnectionsPaused(.{ 1, 2, 3, 4, 5 });
-    var buf: [4096]u8 = undefined;
+    // Every shard metric, with room for more.
+    var buf: [16384]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try writeShardMetrics(&w, sm.snapshot());
     const text = w.buffered();
