@@ -158,6 +158,10 @@ pub const Driver = struct {
     /// One per group on the node.
     peers: []Peer,
     counts: Counts = .{},
+    /// Messages each group sent this one that were refused as its own bug,
+    /// by reason (`store.SenderBug`). Counted where they apply, on every
+    /// replica, and kept across terms, unlike `peers`.
+    sender_bugs: [][2]u64,
     /// The last scan left nothing outstanding: no message unsent or
     /// unacked, no trim due or in flight, no answer untold. Until a channel
     /// record or a frame changes that, a tick has nothing to do. The commit
@@ -176,12 +180,16 @@ pub const Driver = struct {
     pub fn init(allocator: std.mem.Allocator, group: u16, count: u16) error{OutOfMemory}!Driver {
         std.debug.assert(group < count);
         const peers = try allocator.alloc(Peer, count);
+        errdefer allocator.free(peers);
         @memset(peers, .{});
-        return .{ .allocator = allocator, .group = group, .count = count, .peers = peers };
+        const bugs = try allocator.alloc([2]u64, count);
+        @memset(bugs, .{ 0, 0 });
+        return .{ .allocator = allocator, .group = group, .count = count, .peers = peers, .sender_bugs = bugs };
     }
 
     pub fn deinit(self: *Driver) void {
         self.allocator.free(self.peers);
+        self.allocator.free(self.sender_bugs);
         self.allocator.free(self.buf);
         self.allocator.free(self.msgs);
     }

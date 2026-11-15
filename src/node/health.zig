@@ -339,7 +339,15 @@ pub const NodeHealth = struct {
                 const n = if (sm) |m| m.silent_loss[p].load(.monotonic) else 0;
                 try w.print("\"{s}\":{d}", .{ name, n });
             }
-            try w.print("}},\"duplicate_index\":{d},\"processing_failed_jobs\":{d},\"processing_held_jobs\":{d}}}", .{
+            try w.writeByte('}');
+            // Shown once another shard has sent this one a message it built
+            // wrong: a bug in this build, counted by reason.
+            if (sm) |m| {
+                const wrong_slot = m.channel_sender_bugs[0].load(.monotonic);
+                const bad_payload = m.channel_sender_bugs[1].load(.monotonic);
+                if (wrong_slot + bad_payload > 0) try w.print(",\"channel_sender_bugs\":{{\"wrong_slot\":{d},\"bad_payload\":{d}}}", .{ wrong_slot, bad_payload });
+            }
+            try w.print(",\"duplicate_index\":{d},\"processing_failed_jobs\":{d},\"processing_held_jobs\":{d}}}", .{
                 if (sm) |m| m.duplicate_index.load(.monotonic) else 0,
                 if (sm) |m| m.processing_failed_jobs.load(.monotonic) else 0,
                 if (sm) |m| m.processing_held_jobs.load(.monotonic) else 0,

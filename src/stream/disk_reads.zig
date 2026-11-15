@@ -462,20 +462,20 @@ pub const DiskReads = struct {
         var taken: [MAX_WANTS]u32 = @splat(0);
         for (entries) |*e| {
             // A stream's appends: its own entries, and the messages a
-            // channel inbound carries to it, each counted as one.
-            // One that doesn't decode is damage to what the log holds: a
-            // reader that asks for it again finds it gone and skips it,
-            // counted, rather than reading it back forever.
-            var appends = (Appends.of(e) catch {
-                self.markGone(e.header.index);
-                continue;
-            }) orelse continue;
-            var wanted = false;
-            while (appends.next()) |stream| {
-                for (wants, 0..) |w, k| {
-                    if (!std.mem.eql(u8, &w.stream, &stream) or e.header.index < w.from or taken[k] >= w.limit) continue;
-                    taken[k] += 1;
-                    wanted = true;
+            // channel inbound carries to it, each counted as one. One of
+            // those two kinds that doesn't decode is checked as a wanted
+            // one is, and then is damage.
+            const of = Appends.of(e);
+            const damaged = if (of) |_| false else |_| true;
+            var wanted = damaged;
+            if (of catch null) |found| {
+                var appends = found;
+                while (appends.next()) |stream| {
+                    for (wants, 0..) |w, k| {
+                        if (!std.mem.eql(u8, &w.stream, &stream) or e.header.index < w.from or taken[k] >= w.limit) continue;
+                        taken[k] += 1;
+                        wanted = true;
+                    }
                 }
             }
             if (!wanted) continue;
@@ -485,6 +485,13 @@ pub const DiskReads = struct {
                 self.mismatches += 1;
                 _ = self.blocked(now, .mismatch);
                 self.warn(now, "a stream entry read from the durable log at index {d} doesn't match the log's term; holding and reading it again", .{e.header.index});
+                continue;
+            }
+            // Committed, and the log's own: damage to what it holds,
+            // reported as boot and apply report it, and never read again.
+            if (damaged) {
+                self.damaged += 1;
+                self.damage(e.header.index, .corrupt);
                 continue;
             }
             self.put(e, now);
@@ -583,6 +590,9 @@ const Appends = struct {
             self.single = null;
             return s;
         }
+        // Every stream append a message carries counts toward a want's
+        // limit, even one its receiver refused, which no record locates:
+        // at worst a read lands a little short and reads again.
         const it = &(self.messages orelse return null);
         while (it.next() catch return null) |m| {
             if (m.entry_type != @backingInt(entry_mod.EntryType.stream_append)) continue;
@@ -1086,7 +1096,7 @@ test "stream disk reads: an inbound names each stream it appends to, one per app
     try testing.expectError(error.Damaged, Appends.of(&cut));
 }
 
-test "stream disk reads: a landing counts each append in an inbound toward a want, and marks one that doesn't decode gone" {
+test "stream disk reads: a landing counts each append in an inbound toward a want, and reports one that doesn't decode as damage" {
     var f: Fixture = undefined;
     try f.init(1, true);
     defer f.deinit();
@@ -1110,4 +1120,5 @@ test "stream disk reads: a landing counts each append in an inbound toward a wan
     try testing.expect(d.get(2) == null);
     try testing.expect(d.get(3) == null);
     try testing.expectEqual(Want.absent, d.want(3, a));
+    try testing.expectEqual(@as(u64, 1), d.damaged);
 }

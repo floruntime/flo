@@ -184,6 +184,11 @@ const Op = struct {
 /// view is partial (a write staged but not indexed) and must not be read
 /// or committed: the machine drops the entry and its view.
 /// One send an entry makes: its target's slot, entry type and payload.
+/// The entry flags a channel message may carry: a sink's mark, and nothing
+/// a receiver's applier would act on otherwise (`FORCE`, say), so a type
+/// that reads one never gets it from another group by accident.
+pub const MESSAGE_FLAGS: u16 = @import("../storage/ual/entry.zig").Flags.SINK;
+
 pub const Send = struct { slot: u16, entry_type: u8, flags: u16 = 0, payload: []const u8 };
 
 /// This group among the groups on the node: a slot's owner is the group
@@ -249,10 +254,13 @@ pub const View = struct {
     }
 
     /// `send`, with the entry flags the message applies with at its
-    /// receiver (a sink's write is `Flags.SINK`).
+    /// receiver (a sink's write is `Flags.SINK`): only `MESSAGE_FLAGS`.
     pub fn sendFlagged(self: *View, slot: u16, etype: u8, flags: u16, payload: []const u8) ApplyError!void {
-        // A send from an apply that isn't wired for one is a Flo bug.
+        // A send from an apply that isn't wired for one is a Flo bug, and so
+        // is one with a flag no message may carry.
         if (self.place == null) return error.Halt;
+        std.debug.assert(flags & ~MESSAGE_FLAGS == 0);
+        if (flags & ~MESSAGE_FLAGS != 0) return error.Halt;
         try self.sends.append(self.arena, .{ .slot = slot, .entry_type = etype, .flags = flags, .payload = try self.arena.dupe(u8, payload) });
     }
 
