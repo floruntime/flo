@@ -183,6 +183,22 @@ const Op = struct {
 /// One entry's staged reads and writes. After any of its calls fails, the
 /// view is partial (a write staged but not indexed) and must not be read
 /// or committed: the machine drops the entry and its view.
+/// One send an entry makes: its target's slot, entry type and payload.
+pub const Send = struct { slot: u16, entry_type: u8, payload: []const u8 };
+
+/// This group among the groups on the node: a slot's owner is the group
+/// `slot % count`. Fixed for a data directory, so every replica derives
+/// the same owner.
+pub const Place = struct { group: u16, count: u16 };
+
+/// The message an entry is: the group it came from, its seq there, and its
+/// place in the inbound entry that carried it. Every message in one inbound
+/// entry applies at that entry's index, so a record located by index takes
+/// `(index, ordinal)` to stay unique.
+pub const Message = struct { from: u16, seq: u64, ordinal: u8 };
+
+pub const Mark = struct { ops: usize, sends: usize };
+
 pub const View = struct {
     store: *Store,
     /// The entry's scratch: staged bytes and the key set live here until
@@ -201,9 +217,17 @@ pub const View = struct {
     strict: bool,
     /// The shard's streams, read-only, when the apply was handed them.
     streams_read: ?Streams = null,
+    /// What the entry sends to other groups, in the order sent. The channel
+    /// writes them to its outbox when the entry commits (`machine.applyEntryWith`).
+    sends: std.ArrayListUnmanaged(Send) = .empty,
+    /// Where this group sits, for `send`; null where nothing may send.
+    place: ?Place = null,
+    /// The message being applied, when the entry is another group's message
+    /// this group took in: what a target's apply reads to know it.
+    message: ?Message = null,
 
     pub fn init(store: *Store, arena: Allocator, declared: *const KeySet) View {
-        return .{ .store = store, .arena = arena, .declared = declared, .strict = store.strict_keys };
+        return .{ .store = store, .arena = arena, .declared = declared, .strict = store.strict_keys, .place = store.place };
     }
 
     /// The shard's streams as of this entry. A machine that reads them is
@@ -211,6 +235,47 @@ pub const View = struct {
     /// this is a Flo bug, and the entry halts.
     pub fn streams(self: *const View) ApplyError!Streams {
         return self.streams_read orelse error.Halt;
+    }
+
+    /// Sends `payload`, an entry of type `etype`, to the group that owns
+    /// `slot`, which applies it through that type's machine. It leaves with
+    /// this entry's writes, or not at all.
+    pub fn send(self: *View, slot: u16, etype: u8, payload: []const u8) ApplyError!void {
+        // A send from an apply that isn't wired for one is a Flo bug.
+        if (self.place == null) return error.Halt;
+        try self.sends.append(self.arena, .{ .slot = slot, .entry_type = etype, .payload = try self.arena.dupe(u8, payload) });
+    }
+
+    /// A point `rollback` returns the staged writes and sends to.
+    pub fn mark(self: *const View) Mark {
+        return .{ .ops = self.ops.items.len, .sends = self.sends.items.len };
+    }
+
+    /// Drops what was staged after `m`: a refused message inside a batch
+    /// undoes only its own writes.
+    pub fn rollback(self: *View, m: Mark) Allocator.Error!void {
+        const had = self.ops.items.len;
+        self.ops.shrinkRetainingCapacity(m.ops);
+        self.sends.shrinkRetainingCapacity(m.sends);
+        if (had > SCAN_LIMIT) {
+            self.last.clearRetainingCapacity();
+            if (self.ops.items.len > SCAN_LIMIT) {
+                for (self.ops.items, 0..) |o, i| try self.last.put(self.arena, .{ .fam = o.fam, .key = o.key }, i);
+            }
+        }
+    }
+
+    /// The channel's own reads and writes of its families, which a sending
+    /// entry's keys can't name: the seq it takes is state, not the entry's.
+    pub fn getOwn(self: *View, comptime F: type, k: []const u8) ApplyError!?F.Value {
+        const bytes = self.bytesOf(F.ID, k) orelse return null;
+        return F.Value.decode(bytes) catch error.Halt;
+    }
+
+    pub fn putOwn(self: *View, comptime F: type, k: []const u8, value: F.Value) ApplyError!void {
+        var w: std.Io.Writer.Allocating = .init(self.arena);
+        value.encode(&w.writer) catch return error.OutOfMemory;
+        try self.stage(.{ .fam = F.ID, .key = try self.arena.dupe(u8, k), .value = w.written() });
     }
 
     pub fn get(self: *View, comptime F: type, k: []const u8) ApplyError!?F.Value {

@@ -653,6 +653,11 @@ pub const Workload = struct {
     /// no workload op has (e.g. raft_noop).
     pub fn opIdFromPayload(entry_type: u8, payload: []const u8) ?u64 {
         var diag: schema.Diagnostic = .{};
+        // Channel entries are the groups' own, never a workload op.
+        switch (entry_type) {
+            @backingInt(EntryType.channel_probe), @backingInt(EntryType.channel_inbound), @backingInt(EntryType.channel_trim) => return null,
+            else => {},
+        }
         if (entry_type == @backingInt(EntryType.kv_put)) {
             const p = kv_entries.Put.decodeAll(payload, &diag) catch return null;
             if (p.value.len < 8) return null;

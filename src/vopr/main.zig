@@ -69,6 +69,10 @@ const Args = struct {
     /// Run this many groups on one node, through the mailbox, instead of
     /// one replicated group (0: one group, as always).
     groups: u8 = 0,
+    /// A planted bug in the channel driver, with --groups.
+    channel_mutant: vopr.groups.ChannelMutant = .none,
+    /// With --groups: group disks that stop flushing now and then.
+    flush_stalls: bool = false,
     max_delivered: u64 = 0,
     skip: [8]u64 = undefined,
     skip_len: usize = 0,
@@ -130,6 +134,10 @@ fn parseArgs(argv: []const []const u8) !Args {
         } else if (std.mem.startsWith(u8, arg, "--groups=")) {
             args.groups = try std.fmt.parseInt(u8, arg["--groups=".len..], 10);
             if (args.groups == 0 or args.groups > vopr.groups.MAX_GROUPS) return error.Usage;
+        } else if (std.mem.eql(u8, arg, "--flush-stalls")) {
+            args.flush_stalls = true;
+        } else if (std.mem.startsWith(u8, arg, "--channel-mutant=")) {
+            args.channel_mutant = std.meta.stringToEnum(vopr.groups.ChannelMutant, arg["--channel-mutant=".len..]) orelse return error.Usage;
         } else if (std.mem.eql(u8, arg, "--txn-limits")) {
             args.txn_limits = true;
         } else if (std.mem.startsWith(u8, arg, "--skip=")) {
@@ -350,11 +358,13 @@ fn runGroups(allocator: std.mem.Allocator, args: Args, scenario: Scenario) !bool
         .progress_every = if (args.log_path != null) 10_000 else 0,
     });
     defer groups.deinit();
+    for (groups.chans) |*c| c.driver.mutant = args.channel_mutant;
+    if (args.flush_stalls) groups.stall_permille = 2;
     const s = try groups.run();
     defer allocator.free(s.groups);
     std.debug.print(
-        "[vopr] seed={d} {s}: groups={d} crashes={d} frames_sent={d} frames_delivered={d} frames_lost_in_crash={d} channel_applies={d} channel_violations={d}\n",
-        .{ scenario.seed, if (s.ok) "OK" else "FAILED", s.groups.len, s.crashes, s.frames_sent, s.frames_delivered, s.frames_lost_in_crash, s.channel_applies, s.channel_violations },
+        "[vopr] seed={d} {s}: groups={d} crashes={d} probes={d} frames_sent={d} frames_delivered={d} frames_refused={d} flush_stalls={d} frames_lost_in_crash={d} channel_applies={d} channel_violations={d} held_by_halts={d} left_in_mailbox={d}\n",
+        .{ scenario.seed, if (s.ok) "OK" else "FAILED", s.groups.len, s.crashes, s.probes_proposed, s.frames_sent, s.frames_delivered, s.frames_refused, s.flush_stalls, s.frames_lost_in_crash, s.channel_applies, s.channel_violations, s.held_by_halts, s.left_in_mailbox },
     );
     for (s.groups, 0..) |g, i| std.debug.print("[vopr]   group {d} {s}: ticks={d} acked={d} lost={d} committed={d} state_checks={d}\n", .{ i, if (g.ok) "OK" else "FAILED", g.ticks, g.ops_acked, g.ops_lost, g.max_committed, g.state_checks });
     if (!s.ok) {
@@ -363,6 +373,7 @@ fn runGroups(allocator: std.mem.Allocator, args: Args, scenario: Scenario) !bool
         for (groups.sims, 0..) |*sim, i| if (sim.checker.violations.items.len > 0) {
             vw.print("group {d}:\n", .{i}) catch {};
             sim.printViolations(&vw) catch {};
+            sim.printNodeStates(&vw) catch {};
         };
         for (groups.oracle.violations.items) |v| vw.print("channel {d}->{d} seq {d}: {s}\n", .{ v.from, v.to, v.seq, v.detail }) catch {};
         std.debug.print("{s}", .{vw.buffered()});
@@ -370,10 +381,14 @@ fn runGroups(allocator: std.mem.Allocator, args: Args, scenario: Scenario) !bool
         const mutant = if (args.family_mutant == .none) "" else std.fmt.bufPrint(&mb, " --family-mutant={t}", .{args.family_mutant}) catch "";
         var sb: [64]u8 = undefined;
         const from = if (args.scenario_in) |pin| std.fmt.bufPrint(&sb, "--scenario-in={s}", .{pin}) catch pin else std.fmt.bufPrint(&sb, "--seed={d}", .{scenario.seed}) catch "";
-        std.debug.print("[vopr] reproduce with: vopr {s} --groups={d}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
+        var cmb: [48]u8 = undefined;
+        const cmutant = if (args.channel_mutant == .none) "" else std.fmt.bufPrint(&cmb, " --channel-mutant={t}", .{args.channel_mutant}) catch "";
+        std.debug.print("[vopr] reproduce with: vopr {s} --groups={d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
             from,
             args.groups,
             mutant,
+            cmutant,
+            if (args.flush_stalls) " --flush-stalls" else "",
             // A pinned scenario carries its own families and limits.
             if (args.scenario_in == null and args.actions) " --actions" else "",
             if (args.scenario_in == null and args.queues) " --queues" else "",
@@ -544,6 +559,9 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
     if (args.txn_limits) try argv.append(allocator, "--txn-limits");
     var groups_arg: [16]u8 = undefined;
     if (args.groups > 0) try argv.append(allocator, try std.fmt.bufPrint(&groups_arg, "--groups={d}", .{args.groups}));
+    var cm_arg: [48]u8 = undefined;
+    if (args.channel_mutant != .none) try argv.append(allocator, try std.fmt.bufPrint(&cm_arg, "--channel-mutant={t}", .{args.channel_mutant}));
+    if (args.flush_stalls) try argv.append(allocator, "--flush-stalls");
     if (args.verbose) try argv.append(allocator, "--verbose");
 
     var child = stdx.process.Child.init(argv.items, allocator);
