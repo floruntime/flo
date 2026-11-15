@@ -222,7 +222,27 @@ fn asEntry(e: *const Entry, m: ce.Message.Value) Entry {
 
 /// The channels machine over `targets`, the machines a message may be for.
 pub fn Channels(comptime targets: []const machine_mod.Machine) type {
+    return ChannelsWith(targets, &.{});
+}
+
+/// `Channels`, with `after_commit` the entry types a message may also be
+/// whose applier works outside the view (a stream's append, kept in its
+/// projection and read back from the log): the inbound takes their seq and
+/// reports them, and the shard applies each once the inbound has committed,
+/// in order, live and in replay alike. So within one inbound such a
+/// message's state lands after every view message's, whatever their seqs: a
+/// view message never sees an earlier one's (a deliver after an append in
+/// the same batch doesn't hand out that record; the next deliver does).
+/// The shard's after-apply steps then run per message in seq order, over
+/// the whole inbound's state.
+pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime after_commit: []const EntryType) type {
+    comptime for (after_commit) |t| std.debug.assert(machine_mod.ownerOf(targets, t) == null);
     return struct {
+        fn appliedAfter(t: EntryType) bool {
+            inline for (after_commit) |a| if (a == t) return true;
+            return false;
+        }
+
         fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             var diag: schema.Diagnostic = .{};
             switch (typeOf(e) orelse return) {
@@ -284,7 +304,9 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 if (seq <= applied) continue;
                 if (seq != applied + 1) return error.Halt;
                 const t = std.enums.fromInt(EntryType, m.entry_type) orelse return error.Halt;
-                const owner = machine_mod.ownerOf(targets, t) orelse return error.Halt;
+                const owner = machine_mod.ownerOf(targets, t);
+                const later = owner == null and appliedAfter(t);
+                if (owner == null and !later) return error.Halt;
                 const as = asEntry(e, m);
                 const mark = view.mark();
                 view.message = .{ .from = p.from, .seq = seq, .ordinal = ordinal };
@@ -294,14 +316,14 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 // the wrong group: refused, never applied over another's state.
                 if (m.slot >= node_router.SLOTS or ownerOf(place, m.slot) != place.group) {
                     r.refuse(.bad_request, .malformed, "bad request: a message for a slot this group doesn't own");
-                } else {
-                    try owner.apply(view, &as, &r);
+                } else if (owner) |o| {
+                    try o.apply(view, &as, &r);
                     // Its sends are held to an apply's limits on their own,
                     // and leave with it.
                     if (r.refused() == null) if (tooMuchSent(view.sends.items[mark.sends..])) |why| r.refuse(.bad_request, .malformed, why);
                 }
                 if (r.refused() != null) try view.rollback(mark) else try writeSends(view, e.header.index);
-                try store.messages.append(store.allocator, .{ .entry = as, .result = r });
+                try store.messages.append(store.allocator, .{ .entry = as, .result = r, .ordinal = ordinal, .after_commit = later and r.refused() == null });
                 applied = seq;
             }
             if (before != null and applied == before.?.applied) return;
@@ -555,6 +577,28 @@ test "channels: a message for a slot its receiver doesn't own is refused, and ta
     try testing.expect(b.got("message-one-0001") != null);
     try testing.expect(b.got("message-two-0002") == null);
     try testing.expect(b.store.messages.items[1].result.refused() != null);
+}
+
+test "channels: a message whose applier runs after the commit takes its seq and is reported for it, unless refused" {
+    const Later = ChannelsWith(&.{probe.machine}, &.{.stream_append});
+    var b = Group.init(1, 3);
+    defer b.deinit();
+    var mw: schema.Writer = .{ .buf = try testing.allocator.alloc(u8, 1024) };
+    defer testing.allocator.free(mw.buf);
+    // Slot 1 is b's; slot 3 is group 0's.
+    for ([_]u16{ 1, 3, 1 }) |slot| try ce.Message.encode(&mw, .{ .slot = slot, .entry_type = @backingInt(EntryType.stream_append), .layout_epoch = 0, .payload = "append" });
+    var buf: [2048]u8 = undefined;
+    const inbound = try ce.Inbound.encodeInto(&buf, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 3 } });
+    _ = try b.run(&Later.machine, .channel_inbound, inbound);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
+    const reported = b.store.messages.items;
+    try testing.expectEqual(@as(usize, 3), reported.len);
+    for (reported, [_]bool{ true, false, true }, 0..) |m, later, i| {
+        try testing.expectEqual(later, m.after_commit);
+        try testing.expectEqual(@as(u8, @intCast(i)), m.ordinal);
+    }
+    // A type with no applier at all is still a Flo bug.
+    try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, try ce.Inbound.encodeInto(&buf, .{ .from = 2, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 3 } })));
 }
 
 test "channels: a durable ack names what was applied as of a durable index" {

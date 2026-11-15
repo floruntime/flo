@@ -28,6 +28,8 @@ const DurableLog = @import("../storage/durable_log.zig").DurableLog;
 const bulk_io = @import("../storage/bulk_io.zig");
 const RaftLog = @import("../raft/log.zig").RaftLog;
 const router = @import("../node/router.zig");
+const ce = @import("../protocol/channel_entries.zig");
+const schema = @import("../protocol/schema.zig");
 
 const Entry = entry_mod.Entry;
 const log = std.log.scoped(.stream_disk);
@@ -457,14 +459,16 @@ pub const DiskReads = struct {
         self.evict(now);
         var taken: [MAX_WANTS]u32 = @splat(0);
         for (entries) |*e| {
-            if (e.header.entry_type != @backingInt(entry_mod.EntryType.stream_append)) continue;
-            const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse continue;
-            const stream = router.nsNameKey(cmd.namespace_id, cmd.key);
+            // A stream's appends: its own entries, and the messages a
+            // channel inbound carries to it, each counted as one.
+            var appends = Appends.of(e) orelse continue;
             var wanted = false;
-            for (wants, 0..) |w, k| {
-                if (!std.mem.eql(u8, &w.stream, &stream) or e.header.index < w.from or taken[k] >= w.limit) continue;
-                taken[k] += 1;
-                wanted = true;
+            while (appends.next()) |stream| {
+                for (wants, 0..) |w, k| {
+                    if (!std.mem.eql(u8, &w.stream, &stream) or e.header.index < w.from or taken[k] >= w.limit) continue;
+                    taken[k] += 1;
+                    wanted = true;
+                }
             }
             if (!wanted) continue;
             // Above commit a cut may still replace it.
@@ -552,6 +556,41 @@ const testing = std.testing;
 const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
 
 /// A stream append to `stream` in the default namespace.
+/// The streams an entry appends to, one per append it holds: a
+/// `stream_append` holds one, a `channel_inbound` one per `stream_append`
+/// message it carries.
+const Appends = struct {
+    single: ?[12]u8,
+    messages: ?MessageIterator,
+
+    const MessageIterator = @TypeOf(@as(ce.Messages.Value, undefined).iterator());
+
+    fn of(e: *const Entry) ?Appends {
+        if (e.header.entry_type == @backingInt(entry_mod.EntryType.stream_append)) {
+            const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return null;
+            return .{ .single = router.nsNameKey(cmd.namespace_id, cmd.key), .messages = null };
+        }
+        if (e.header.entry_type != @backingInt(entry_mod.EntryType.channel_inbound)) return null;
+        var diag: schema.Diagnostic = .{};
+        const inbound = ce.Inbound.decodeAll(e.payload, &diag) catch return null;
+        return .{ .single = null, .messages = inbound.messages.iterator() };
+    }
+
+    fn next(self: *Appends) ?[12]u8 {
+        if (self.single) |s| {
+            self.single = null;
+            return s;
+        }
+        const it = &(self.messages orelse return null);
+        while (it.next() catch return null) |m| {
+            if (m.entry_type != @backingInt(entry_mod.EntryType.stream_append)) continue;
+            const cmd = entry_mod.CommandPayload.deserialize(m.payload) orelse continue;
+            return router.nsNameKey(cmd.namespace_id, cmd.key);
+        }
+        return null;
+    }
+};
+
 fn appendEntry(buf: []u8, index: u64, term: u64, stream: []const u8, value: []const u8) Entry {
     const cmd: entry_mod.CommandPayload = .{ .namespace_id = .default, .key_length = @intCast(stream.len), .value_length = @intCast(value.len), .key = stream, .value = value };
     const n = cmd.serialize(buf).?;

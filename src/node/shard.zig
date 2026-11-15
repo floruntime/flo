@@ -8231,7 +8231,18 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
         // was applied already, and must not be twice.
         if (applied.route == .skipped_already_applied) return .applied;
         contract_machine.applyEntryWith(m, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, entry, out) catch |err| return .{ .applier_failed = err };
-        if (etype == .channel_inbound) for (partition.store.messages.items) |*msg| noteNamespace(partition, &msg.entry);
+        if (etype == .channel_inbound) for (partition.store.messages.items) |*msg| {
+            noteNamespace(partition, &msg.entry);
+            if (!msg.after_commit) continue;
+            // A stream append a message carries: its record lives in this
+            // inbound, at the message's part (`StreamRecord.part`). It
+            // lands after every message the view applied, whatever their
+            // seqs (`ChannelsWith`); `afterApply` runs over them all after.
+            partition.stream.applying_part = stream_mod.partOf(msg.ordinal);
+            defer partition.stream.applying_part = 0;
+            const had = registry.dispatch(&msg.entry, &msg.result) catch |err| return .{ .applier_failed = err };
+            if (!had) return .no_applier;
+        };
         return .applied;
     }
     const had = registry.dispatch(entry, out) catch |err| return .{ .applier_failed = err };
@@ -11618,7 +11629,7 @@ test "Shard: stream.group.members answers the named group's members by id, and a
     // the stream. Its members are the consumers holding its records.
     for (&f.two.shards) |*s| {
         const p = s.defaultPartition();
-        for (0..4) |i| _ = try p.stream.appendToStreamAt(stream_mod.streamKey(.default, "s"), i + 1, 0, 1, 1, 10);
+        for (0..4) |i| _ = try p.stream.appendToStreamAt(stream_mod.streamKey(.default, "s"), i + 1, 0, 0, 1, 1, 10);
         // Delivered out of order; listed by id.
         for ([_][]const u8{ "c-9", "c-1", "c-5", "c-3" }, 0..) |id, i| {
             var pb: [ge_mod.Deliver.max_size]u8 = undefined;
@@ -20461,8 +20472,8 @@ test "a stream's retention age counts in seconds when the sweeper trims by it" {
     var k_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
     try stream.registerStreamMetadata(stream_mod.nameKey(&k_buf, .default, "aged").?, .{ .retention_age_s = 5 });
     const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
-    _ = try stream.appendToStreamAt(h, 1, 0, now_ms - 10_000, 1, 10);
-    _ = try stream.appendToStreamAt(h, 2, 0, now_ms - 1_000, 1, 10);
+    _ = try stream.appendToStreamAt(h, 1, 0, 0, now_ms - 10_000, 1, 10);
+    _ = try stream.appendToStreamAt(h, 2, 0, 0, now_ms - 1_000, 1, 10);
     // Older than 5 seconds: the 10 s old record goes, the 1 s old one stays.
     try std.testing.expectEqual(@as(u64, 1), Shard.streamRetentionTask(@ptrCast(&shard)));
     try std.testing.expect(shard.applyCommitted());
@@ -21509,7 +21520,7 @@ test "a halted shard's duties stop, and one with work counts as held until the s
     const h = stream_mod.streamKey(.default, "kept");
     var k_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
     try shard.stream_handler.stream.registerStreamMetadata(stream_mod.nameKey(&k_buf, .default, "kept").?, .{ .retention_count = 1 });
-    for (1..4) |i| _ = try shard.stream_handler.stream.appendToStreamAt(h, i, 0, 1, 1, 1);
+    for (1..4) |i| _ = try shard.stream_handler.stream.appendToStreamAt(h, i, 0, 0, 1, 1, 1);
     shard.halted = .{ .index = 1, .term = 1, .crc = 0 };
     try std.testing.expectEqual(@as(u64, 0), Shard.streamRetentionTask(@ptrCast(&shard)));
     try std.testing.expectEqual(@as(u32, 1), shard.duties.held());
@@ -25732,4 +25743,172 @@ test "Shard: a channel's durable index is what fsynced under sync, what the last
             },
         }
     }
+}
+
+/// A stream append's command payload, as a client's append logs it: one
+/// record, under the default namespace.
+fn streamAppendCommand(buf: []u8, name: []const u8, record: []const u8) ![]const u8 {
+    var batch: [4 + 4 + 2048 + 2]u8 = undefined;
+    std.debug.assert(record.len <= 2048);
+    std.mem.writeInt(u32, batch[0..4], 1, .little);
+    std.mem.writeInt(u32, batch[4..8], @intCast(record.len), .little);
+    @memcpy(batch[8..][0..record.len], record);
+    std.mem.writeInt(u16, batch[8 + record.len ..][0..2], 0, .little);
+    const value = try stream_mod.encodeAppendValue(std.testing.allocator, 0, batch[0 .. 10 + record.len]);
+    defer std.testing.allocator.free(value);
+    return (entry_mod.buildCommandEntry(.stream_append, 0, 1, 1, 0, .default, name, value, buf) orelse return error.NoSpaceLeft).payload;
+}
+
+/// Record `i` of a test stream: `size` bytes, its number first.
+fn channelRecord(buf: []u8, i: usize, size: usize) []const u8 {
+    @memset(buf[0..size], @intCast('a' + i % 26));
+    std.mem.writeInt(u32, buf[0..4], @intCast(i), .little);
+    return buf[0..size];
+}
+
+/// `n` records of stream "s" sent by `s` to its own slot over its own
+/// channel, `per_inbound` to a batch, each batch applied as one inbound.
+/// Stops once the last applies, before any trim, so its log holds the
+/// inbounds and nothing that needs the outbox again.
+fn appendByChannel(s: *Shard, n: usize, size: usize, per_inbound: usize, flush_each: bool) !void {
+    var sent: u64 = 0;
+    var i: usize = 0;
+    while (i < n) {
+        const batch = @min(per_inbound, n - i);
+        for (0..batch) |_| {
+            var rb: [2048]u8 = undefined;
+            var pb: [4096]u8 = undefined;
+            try sendFromApply(s, 0, .stream_append, try streamAppendCommand(&pb, "s", channelRecord(&rb, i, size)));
+            i += 1;
+        }
+        sent += batch;
+        var rounds: usize = 0;
+        while (true) : (rounds += 1) {
+            try std.testing.expect(rounds < 50);
+            const in = channels_mod.inOf(.{ .store = &s.defaultPartition().store }, @intCast(s.id));
+            if (in != null and in.?.applied == sent) break;
+            s.tickChannels();
+            _ = s.drainInbox();
+            try std.testing.expect(s.applyCommitted());
+        }
+        if (flush_each) try s.flushSegmentToDisk();
+    }
+}
+
+/// Every record of stream "s", read as a pipeline reads, landing disk reads
+/// as the shard's tick does; each checked against `channelRecord`.
+fn expectChannelRecords(s: *Shard, n: usize, size: usize) !void {
+    var after = StreamID.MIN;
+    var got: usize = 0;
+    var idle: usize = 0;
+    while (got < n) {
+        const r = s.stream_handler.readPayloadsForStreamIn("s", .default, after, 64);
+        defer r.deinit(std.testing.allocator);
+        for (r.payloads) |p| {
+            var want: [2048]u8 = undefined;
+            try std.testing.expectEqualSlices(u8, channelRecord(&want, got, size), p);
+            got += 1;
+        }
+        after = r.last_id;
+        if (r.payloads.len > 0) {
+            idle = 0;
+            continue;
+        }
+        idle += 1;
+        try std.testing.expect(idle < 2_000);
+        if (s.stream_disk) |d| _ = d.drain();
+        @import("stdx").time.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(n, got);
+}
+
+test "Shard: two stream appends in one channel inbound are two records, in order, located in that inbound" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var s = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer s.deinit();
+    s.wireHandlerShardPtrs();
+    try std.testing.expect(s.applyCommitted());
+    try appendByChannel(&s, 2, 64, 2, false);
+    var recs: [4]stream_mod.StreamRecord = undefined;
+    try std.testing.expectEqual(@as(usize, 2), s.stream_handler.stream.readStreamAfter(stream_mod.streamKey(.default, "s"), StreamID.MIN, null, &recs));
+    try std.testing.expect(recs[0].id.lessThan(recs[1].id));
+    try std.testing.expectEqual(recs[0].ual_index, recs[1].ual_index);
+    try std.testing.expectEqual(@backingInt(entry_mod.EntryType.channel_inbound), s.raft_node.log.getEntry(recs[0].ual_index).?.header.entry_type);
+    try std.testing.expectEqual(@as(u8, 1), recs[0].part);
+    try std.testing.expectEqual(@as(u8, 2), recs[1].part);
+    try expectChannelRecords(&s, 2, 64);
+}
+
+test "Shard: a stream record a channel message carries reads back the same from the hot ring, the warm store and the durable log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var s = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], data_dir, 64 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer s.deinit();
+    // Each flush its own sealed segment, as the bulk thread reads them.
+    s.durable_log.?.max_segment_bytes = 1;
+    s.wireHandlerShardPtrs();
+    try std.testing.expect(s.applyCommitted());
+    s.defaultPartition().setWarmBudget(4096);
+    // 90 KB of records through a 64 KiB ring and a 4 KiB warm store.
+    try appendByChannel(&s, 60, 1500, 2, true);
+    var recs: [64]stream_mod.StreamRecord = undefined;
+    try std.testing.expectEqual(@as(usize, 60), s.stream_handler.stream.readStreamAfter(stream_mod.streamKey(.default, "s"), StreamID.MIN, null, &recs));
+    // The first records are only on disk now; the last still hot.
+    const p = s.defaultPartition();
+    try std.testing.expect(!p.isInHot(recs[0].ual_index) and p.readPayloadWarm(recs[0].ual_index) == null);
+    try std.testing.expect(p.isInHot(recs[59].ual_index));
+    try expectChannelRecords(&s, 60, 1500);
+}
+
+test "Shard: a stream record a channel message carries reads back the same on a replica that applies the same log, and after a restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var entries: std.ArrayListUnmanaged(entry_mod.Entry) = .empty;
+    defer {
+        for (entries.items) |e| std.testing.allocator.free(e.payload);
+        entries.deinit(std.testing.allocator);
+    }
+    {
+        var s = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+        defer s.deinit();
+        s.wireHandlerShardPtrs();
+        try std.testing.expect(s.applyCommitted());
+        try appendByChannel(&s, 6, 200, 3, false);
+        try s.flushSegmentToDisk();
+        var i: u64 = 1;
+        while (i <= s.raft_node.last_applied) : (i += 1) {
+            const e = s.raft_node.log.getEntry(i).?;
+            try entries.append(std.testing.allocator, .{ .header = e.header, .payload = try std.testing.allocator.dupe(u8, e.payload) });
+        }
+    }
+    // A replica: the same entries, applied as replication applies them.
+    {
+        var r = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+        defer r.deinit();
+        r.wireHandlerShardPtrs();
+        for (entries.items) |*e| {
+            var out = persistence_mod.Result.start(e);
+            try std.testing.expect(r.applyEntry(e, &out));
+        }
+        try expectChannelRecords(&r, 6, 200);
+    }
+    // A restart: boot replays the log.
+    var s = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer s.deinit();
+    s.wireHandlerShardPtrs();
+    s.applyDeferredTail();
+    try std.testing.expect(s.applyCommitted());
+    try expectChannelRecords(&s, 6, 200);
 }

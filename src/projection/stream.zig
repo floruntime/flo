@@ -16,6 +16,8 @@ const router_mod = @import("router.zig");
 const stream_id_mod = @import("../stream/stream_id.zig");
 const node_router = @import("../node/router.zig");
 const MAX_QUALIFIED_KEY = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
+const ce = @import("../protocol/channel_entries.zig");
+const schema = @import("../protocol/schema.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -111,8 +113,11 @@ pub const StreamRecord = struct {
     /// The StreamID assigned to this record. For a batch this is the *first*
     /// ID; the batch occupies `record_count` consecutive sequences from here.
     id: StreamID,
-    /// UAL index where the record's data lives.
+    /// UAL index of the entry the record's data lives in.
     ual_index: u64,
+    /// Where in that entry: 0 for a `stream_append` itself, `m + 1` for
+    /// message `m` of a `channel_inbound` (`appendAt` resolves either).
+    part: u8 = 0,
     /// User partition index (for multi-partition streams).
     partition_index: u32,
     /// Number of logical records packed into this entry's batch blob. One
@@ -159,6 +164,33 @@ pub fn encodeAppendValue(allocator: Allocator, partition_index: u32, payload: []
 /// payload. An empty append carries exactly the 4-byte prefix; a value shorter
 /// than the prefix (malformed) decodes as partition 0 with the
 /// bytes passed through unchanged.
+/// The stored append a record locates, from its entry's payload and its
+/// `part`: the one way any reader takes a record out of the log. Null for
+/// a payload that isn't what the locator says.
+pub fn appendAt(payload: []const u8, part: u8) ?AppendValue {
+    const bytes = if (part == 0) payload else blk: {
+        var diag: schema.Diagnostic = .{};
+        const inbound = ce.Inbound.decodeAll(payload, &diag) catch return null;
+        var it = inbound.messages.iterator();
+        var i: usize = 0;
+        while (it.next() catch return null) |m| : (i += 1) {
+            if (i + 1 != part) continue;
+            if (m.entry_type != @backingInt(EntryType.stream_append)) return null;
+            break :blk m.payload;
+        }
+        return null;
+    };
+    const cmd = entry_mod.CommandPayload.deserialize(bytes) orelse return null;
+    return decodeAppendValue(cmd.value);
+}
+
+/// A record's `part` for message `ordinal` of an inbound.
+pub fn partOf(ordinal: u8) u8 {
+    comptime std.debug.assert(ce.MAX_BATCH <= std.math.maxInt(u8));
+    std.debug.assert(ordinal < ce.MAX_BATCH);
+    return ordinal + 1;
+}
+
 pub fn decodeAppendValue(value: []const u8) AppendValue {
     if (value.len < APPEND_PARTITION_PREFIX) return .{ .partition_index = 0, .payload = value };
     return .{
@@ -334,7 +366,7 @@ pub const StreamState = struct {
 
     /// Append anchored to an explicit timestamp (the originating UAL entry's
     /// timestamp, in ms) so replay reproduces identical StreamIDs.
-    pub fn appendAt(self: *StreamState, allocator: Allocator, ual_index: u64, partition_index: u32, ts_ms: u64, record_count: u32, byte_len: u32) !StreamID {
+    pub fn appendAt(self: *StreamState, allocator: Allocator, ual_index: u64, part: u8, partition_index: u32, ts_ms: u64, record_count: u32, byte_len: u32) !StreamID {
         // Reserve one sequence per logical record: reads expand a batch into
         // `id.sequence + 0..n-1`, so reserving a single sequence for an
         // N-record batch would let the next append in the same millisecond
@@ -344,6 +376,7 @@ pub const StreamState = struct {
         try self.records.append(allocator, .{
             .id = batch.first,
             .ual_index = ual_index,
+            .part = part,
             .partition_index = partition_index,
             .record_count = n,
             .byte_len = byte_len,
@@ -574,6 +607,11 @@ pub const StreamProjection = struct {
     /// Per-stream state — each stream has its own StreamID space.
     streams: std.AutoHashMap(StreamKey, StreamState),
 
+    /// The `part` the append applying now takes (`StreamRecord.part`): the
+    /// shard sets it around a `stream_append` a channel message carries,
+    /// and it is 0 for a plain one.
+    applying_part: u8 = 0,
+
     /// Stats.
     stats: Stats,
 
@@ -651,9 +689,9 @@ pub const StreamProjection = struct {
 
     /// Append anchored to the originating UAL entry's timestamp (ms), so
     /// replay reproduces identical StreamIDs.
-    pub fn appendToStreamAt(self: *StreamProjection, key: StreamKey, ual_index: u64, partition_index: u32, ts_ms: u64, record_count: u32, byte_len: u32) !StreamID {
+    pub fn appendToStreamAt(self: *StreamProjection, key: StreamKey, ual_index: u64, part: u8, partition_index: u32, ts_ms: u64, record_count: u32, byte_len: u32) !StreamID {
         const ss = try self.getOrCreateStream(key);
-        const id = try ss.appendAt(self.allocator, ual_index, partition_index, ts_ms, record_count, byte_len);
+        const id = try ss.appendAt(self.allocator, ual_index, part, partition_index, ts_ms, record_count, byte_len);
         self.stats.appended += 1;
         return id;
     }
@@ -906,8 +944,8 @@ test "stream: same-named streams in two namespaces share no state, even when the
     b[4..12].* = a[4..12].*;
     try testing.expect(!std.mem.eql(u8, &a, &b));
 
-    _ = try s.appendToStreamAt(a, 1, 0, TEST_MS, 3, 30);
-    _ = try s.appendToStreamAt(b, 2, 0, TEST_MS, 1, 10);
+    _ = try s.appendToStreamAt(a, 1, 0, 0, TEST_MS, 3, 30);
+    _ = try s.appendToStreamAt(b, 2, 0, 0, TEST_MS, 1, 10);
     try testing.expectEqual(@as(u64, 3), s.streamLogicalCount(a));
     try testing.expectEqual(@as(u64, 1), s.streamLogicalCount(b));
 
@@ -934,8 +972,8 @@ test "stream: stats tracking" {
     defer s.deinit();
 
     const hash = testKey(42);
-    _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-    _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash, 100, 0, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash, 101, 0, 0, TEST_MS, 1, 0);
     try testing.expectEqual(@as(u64, 2), s.stats.appended);
 }
 
@@ -943,7 +981,7 @@ test "stream: memory usage estimate" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    _ = try s.appendToStreamAt(testKey(42), 100, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(testKey(42), 100, 0, 0, TEST_MS, 1, 0);
 
     try testing.expect(s.memoryUsage() > 0);
 }
@@ -956,9 +994,9 @@ test "stream: StreamState append and read" {
     var ss = StreamState.init(testKey(42));
     defer ss.deinit(testing.allocator);
 
-    const id1 = try ss.appendAt(testing.allocator, 100, 0, TEST_MS, 1, 0);
-    const id2 = try ss.appendAt(testing.allocator, 101, 0, TEST_MS, 1, 0);
-    const id3 = try ss.appendAt(testing.allocator, 102, 1, TEST_MS, 1, 0);
+    const id1 = try ss.appendAt(testing.allocator, 100, 0, 0, TEST_MS, 1, 0);
+    const id2 = try ss.appendAt(testing.allocator, 101, 0, 0, TEST_MS, 1, 0);
+    const id3 = try ss.appendAt(testing.allocator, 102, 0, 1, TEST_MS, 1, 0);
 
     try testing.expectEqual(@as(usize, 3), ss.count());
     try testing.expect(ss.first_id.eql(id1));
@@ -984,10 +1022,10 @@ test "stream: StreamState readByIds preserves order and skips missing" {
     var ss = StreamState.init(testKey(42));
     defer ss.deinit(testing.allocator);
 
-    const id1 = try ss.appendAt(testing.allocator, 100, 0, TEST_MS, 1, 0);
-    const id2 = try ss.appendAt(testing.allocator, 101, 0, TEST_MS, 1, 0);
-    const id3 = try ss.appendAt(testing.allocator, 102, 0, TEST_MS, 1, 0);
-    const id4 = try ss.appendAt(testing.allocator, 103, 0, TEST_MS, 1, 0);
+    const id1 = try ss.appendAt(testing.allocator, 100, 0, 0, TEST_MS, 1, 0);
+    const id2 = try ss.appendAt(testing.allocator, 101, 0, 0, TEST_MS, 1, 0);
+    const id3 = try ss.appendAt(testing.allocator, 102, 0, 0, TEST_MS, 1, 0);
+    const id4 = try ss.appendAt(testing.allocator, 103, 0, 0, TEST_MS, 1, 0);
 
     // Sparse query: id3, id1 (out-of-order), id4 — should preserve input order
     const query = [_]StreamID{ id3, id1, id4 };
@@ -1020,9 +1058,9 @@ test "stream: StreamState trim" {
     var ss = StreamState.init(testKey(42));
     defer ss.deinit(testing.allocator);
 
-    const id1 = try ss.appendAt(testing.allocator, 100, 0, TEST_MS, 1, 0);
-    const id2 = try ss.appendAt(testing.allocator, 101, 0, TEST_MS, 1, 0);
-    _ = try ss.appendAt(testing.allocator, 102, 0, TEST_MS, 1, 0);
+    const id1 = try ss.appendAt(testing.allocator, 100, 0, 0, TEST_MS, 1, 0);
+    const id2 = try ss.appendAt(testing.allocator, 101, 0, 0, TEST_MS, 1, 0);
+    _ = try ss.appendAt(testing.allocator, 102, 0, 0, TEST_MS, 1, 0);
 
     const trimmed = ss.trim(testing.allocator, id2);
     try testing.expectEqual(@as(u64, 2), trimmed);
@@ -1036,8 +1074,8 @@ test "stream: appendToStreamAt creates stream and returns StreamID" {
     defer s.deinit();
 
     const hash = testKey(12345);
-    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-    const id2 = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
+    const id1 = try s.appendToStreamAt(hash, 100, 0, 0, TEST_MS, 1, 0);
+    const id2 = try s.appendToStreamAt(hash, 101, 0, 0, TEST_MS, 1, 0);
 
     // StreamIDs are monotonically increasing
     try testing.expect(id2.greaterThan(id1));
@@ -1053,8 +1091,8 @@ test "stream: the next append in the same millisecond is past a cursor at the pr
     defer s.deinit();
 
     const hash = testKey(7);
-    const first = try s.appendToStreamAt(hash, 1, 0, 1_000, 1, 0);
-    const second = try s.appendToStreamAt(hash, 2, 0, 1_000, 1, 0);
+    const first = try s.appendToStreamAt(hash, 1, 0, 0, 1_000, 1, 0);
+    const second = try s.appendToStreamAt(hash, 2, 0, 0, 1_000, 1, 0);
     try testing.expectEqual(first.timestamp_ms, second.timestamp_ms);
 
     var buf: [4]StreamRecord = undefined;
@@ -1069,9 +1107,9 @@ test "stream: readStreamRange and readStreamAfter" {
     defer s.deinit();
 
     const hash = testKey(42);
-    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-    _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
-    const id3 = try s.appendToStreamAt(hash, 102, 1, TEST_MS, 1, 0);
+    const id1 = try s.appendToStreamAt(hash, 100, 0, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash, 101, 0, 0, TEST_MS, 1, 0);
+    const id3 = try s.appendToStreamAt(hash, 102, 0, 1, TEST_MS, 1, 0);
 
     // readStreamRange: all
     var buf: [10]StreamRecord = undefined;
@@ -1097,9 +1135,9 @@ test "stream: trimStream" {
     defer s.deinit();
 
     const hash = testKey(42);
-    _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-    const id2 = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
-    _ = try s.appendToStreamAt(hash, 102, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash, 100, 0, 0, TEST_MS, 1, 0);
+    const id2 = try s.appendToStreamAt(hash, 101, 0, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash, 102, 0, 0, TEST_MS, 1, 0);
 
     const trimmed = s.trimStream(hash, id2);
     try testing.expectEqual(@as(u64, 2), trimmed);
@@ -1113,9 +1151,9 @@ test "stream: multiple streams are independent" {
     const hash_a = testKey(1);
     const hash_b = testKey(2);
 
-    const a1 = try s.appendToStreamAt(hash_a, 100, 0, TEST_MS, 1, 0);
-    const a2 = try s.appendToStreamAt(hash_a, 101, 0, TEST_MS, 1, 0);
-    _ = try s.appendToStreamAt(hash_b, 200, 0, TEST_MS, 1, 0);
+    const a1 = try s.appendToStreamAt(hash_a, 100, 0, 0, TEST_MS, 1, 0);
+    const a2 = try s.appendToStreamAt(hash_a, 101, 0, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash_b, 200, 0, 0, TEST_MS, 1, 0);
 
     try testing.expectEqual(@as(usize, 2), s.streamRecordCount(hash_a));
     try testing.expectEqual(@as(usize, 1), s.streamRecordCount(hash_b));
@@ -1135,8 +1173,8 @@ test "stream: batch append reserves one sequence per record" {
     const ts: u64 = 1_700_000_000_000;
 
     // A 3-record batch, then a single record in the SAME millisecond.
-    const first = try s.appendToStreamAt(hash, 10, 0, ts, 3, 25);
-    const next = try s.appendToStreamAt(hash, 11, 0, ts, 1, 9);
+    const first = try s.appendToStreamAt(hash, 10, 0, 0, ts, 3, 25);
+    const next = try s.appendToStreamAt(hash, 11, 0, 0, ts, 1, 9);
 
     // Reads expand the batch across sequences 0,1,2, so the following append
     // must start at 3. Reserving one sequence per batch would hand out
@@ -1153,8 +1191,8 @@ test "stream: info counts logical records and bytes, not entries" {
     const hash = testKey(43);
     const ts: u64 = 1_700_000_000_000;
 
-    _ = try s.appendToStreamAt(hash, 10, 0, ts, 3, 25);
-    _ = try s.appendToStreamAt(hash, 11, 0, ts + 1, 2, 14);
+    _ = try s.appendToStreamAt(hash, 10, 0, 0, ts, 3, 25);
+    _ = try s.appendToStreamAt(hash, 11, 0, 0, ts + 1, 2, 14);
 
     // Two append entries carrying five records between them.
     try testing.expectEqual(@as(usize, 2), s.streamRecordCount(hash));
@@ -1173,8 +1211,8 @@ test "stream: trim decrements logical counters" {
     const hash = testKey(44);
     const ts: u64 = 1_700_000_000_000;
 
-    const b1 = try s.appendToStreamAt(hash, 10, 0, ts, 3, 25);
-    _ = try s.appendToStreamAt(hash, 11, 0, ts + 1, 2, 14);
+    const b1 = try s.appendToStreamAt(hash, 10, 0, 0, ts, 3, 25);
+    _ = try s.appendToStreamAt(hash, 11, 0, 0, ts + 1, 2, 14);
 
     // Trim through the first batch's last record.
     _ = s.trimStream(hash, .{ .timestamp_ms = ts, .sequence = b1.sequence + 2 });
@@ -1195,9 +1233,9 @@ test "stream: count retention resolves by records, not batches" {
     const hash = testKey(45);
     const ts: u64 = 1_700_000_000_000;
 
-    _ = try s.appendToStreamAt(hash, 10, 0, ts, 3, 25);
-    _ = try s.appendToStreamAt(hash, 11, 0, ts + 1, 3, 25);
-    _ = try s.appendToStreamAt(hash, 12, 0, ts + 2, 3, 25);
+    _ = try s.appendToStreamAt(hash, 10, 0, 0, ts, 3, 25);
+    _ = try s.appendToStreamAt(hash, 11, 0, 0, ts + 1, 3, 25);
+    _ = try s.appendToStreamAt(hash, 12, 0, 0, ts + 2, 3, 25);
 
     // Nine records across three batches. Dropping "the oldest four" can only
     // cut on an entry boundary, so it cuts after the first batch (3 records) —
@@ -1224,9 +1262,9 @@ test "stream: trimCount predicts trim in records, not batches" {
     const hash = testKey(45);
     const ts: u64 = 1_700_000_000_000;
 
-    const b1 = try s.appendToStreamAt(hash, 10, 0, ts, 3, 25);
-    const b2 = try s.appendToStreamAt(hash, 11, 0, ts + 1, 2, 14);
-    _ = try s.appendToStreamAt(hash, 12, 0, ts + 2, 4, 30);
+    const b1 = try s.appendToStreamAt(hash, 10, 0, 0, ts, 3, 25);
+    const b2 = try s.appendToStreamAt(hash, 11, 0, 0, ts + 1, 2, 14);
+    _ = try s.appendToStreamAt(hash, 12, 0, 0, ts + 2, 4, 30);
 
     const through: StreamID = .{ .timestamp_ms = ts + 1, .sequence = b2.sequence + 1 };
     try testing.expectEqual(@as(u64, 5), s.trimCount(hash, through));

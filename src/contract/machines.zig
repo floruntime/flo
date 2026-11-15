@@ -14,7 +14,9 @@ const targets = [_]machine.Machine{
     @import("../ts/machine.zig").machine,
 };
 
-pub const list = targets ++ [_]machine.Machine{@import("channels.zig").Channels(&targets).machine};
+/// A stream append is the one message type applied outside a view: the
+/// shard runs its applier once the inbound commits.
+pub const list = targets ++ [_]machine.Machine{@import("channels.zig").ChannelsWith(&targets, &.{.stream_append}).machine};
 
 comptime {
     machine.check(&list);

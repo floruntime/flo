@@ -738,7 +738,7 @@ pub const StreamHandler = struct {
             const rec = self.stream.streamAppendOf(key, id) orelse continue;
             self.disk_window.from = rec.ual_index;
             self.disk_window.limit = @intCast(ids.len - i);
-            if (self.getPayloadAndTier(rec.ual_index) == null and self.held != .no) return i;
+            if (self.getPayloadAndTier(rec) == null and self.held != .no) return i;
         }
         return ids.len;
     }
@@ -1170,7 +1170,7 @@ pub const StreamHandler = struct {
         for (records, 0..) |rec, i| {
             self.disk_window.from = rec.ual_index;
             self.disk_window.limit = @intCast(records.len - i);
-            const r = self.getPayloadAndTier(rec.ual_index);
+            const r = self.getPayloadAndTier(rec);
             if (r == null and self.held != .no) {
                 served = i;
                 break;
@@ -1259,7 +1259,7 @@ pub const StreamHandler = struct {
             // Asked of the disk now, or waiting on it: on its way back.
             const before = self.held;
             self.held = .no;
-            const got = self.getPayloadAndTier(rec.ual_index);
+            const got = self.getPayloadAndTier(rec);
             const fetching = self.held != .no;
             if (before == .pending or (before == .blocked and self.held == .no)) self.held = before;
             const r = got orelse {
@@ -1401,7 +1401,7 @@ pub const StreamHandler = struct {
         for (rec_buf[0..n], 0..) |rec, i| {
             self.disk_window.from = rec.ual_index;
             self.disk_window.limit = @intCast(n - i);
-            const result = self.getPayloadAndTier(rec.ual_index);
+            const result = self.getPayloadAndTier(rec);
             // Being read from disk: stop before it, and the next poll, once
             // the read is back, resumes there.
             if (result == null and self.held != .no) break;
@@ -1432,8 +1432,11 @@ pub const StreamHandler = struct {
         return .{ .payloads = out, .ids = ids, .last_id = last_id };
     }
 
-    /// A record's payload by its log index: from the hot ring (zero-copy),
-    /// then the warm store, then the durable log (`disk`). Null when it is
+    /// A record's batch blob by its locator (`ual_index`, `part`): from the
+    /// hot ring (zero-copy), then the warm store, then the durable log
+    /// (`disk`). Every tier hands `stream_mod.appendAt` its entry's payload,
+    /// which strips the partition prefix and, for a channel message, the
+    /// inbound around it: no reader decodes a stored append itself. Null when it is
     /// in none, and the readers skip and count it; or when it is being read
     /// back (`held` says so), and the readers stop before it.
     ///
@@ -1443,26 +1446,26 @@ pub const StreamHandler = struct {
     /// warm fallback serves the wrapped entry as tier=1. This is the canonical
     /// "null is OK, fall through" use of `read` — do not switch it to readCopy
     /// (that would force a copy + a response-lived buffer for no correctness gain).
-    fn getPayloadAndTier(self: *StreamHandler, ual_index: u64) ?struct { payload: []const u8, tier: proto.StorageTier } {
-        // Hot path — entry still in the UAL ring buffer. Strip the partition
-        // prefix so callers see the bare batch blob `BatchIterator` reads.
+    fn getPayloadAndTier(self: *StreamHandler, rec: StreamRecord) ?struct { payload: []const u8, tier: proto.StorageTier } {
+        const ual_index = rec.ual_index;
+        // Hot path — entry still in the UAL ring buffer.
         if (self.partition.ual.read(ual_index)) |ual_entry| {
-            if (ual_entry.commandPayload()) |cmd| {
+            if (stream_mod.appendAt(ual_entry.payload, rec.part)) |av| {
                 if (self.tiered_metrics) |tm| tm.recordHotHit();
-                return .{ .payload = stream_mod.decodeAppendValue(cmd.value).payload, .tier = .hot };
+                return .{ .payload = av.payload, .tier = .hot };
             }
         }
         // Warm fallback — payload copied to partition warm store on apply()
         if (self.partition.readPayloadWarm(ual_index)) |raw| {
-            if (entry_mod.CommandPayload.deserialize(raw)) |cmd| {
+            if (stream_mod.appendAt(raw, rec.part)) |av| {
                 if (self.tiered_metrics) |tm| tm.recordWarmHit();
-                return .{ .payload = stream_mod.decodeAppendValue(cmd.value).payload, .tier = .warm };
+                return .{ .payload = av.payload, .tier = .warm };
             }
         }
         // Then the durable log: its sealed segment, or the writer's buffer.
         if (self.disk) |d| {
-            if (d.get(ual_index)) |raw| if (entry_mod.CommandPayload.deserialize(raw)) |cmd| {
-                return .{ .payload = stream_mod.decodeAppendValue(cmd.value).payload, .tier = .disk };
+            if (d.get(ual_index)) |raw| if (stream_mod.appendAt(raw, rec.part)) |av| {
+                return .{ .payload = av.payload, .tier = .disk };
             };
             switch (d.want(ual_index, self.disk_window)) {
                 .pending => {
@@ -1560,7 +1563,7 @@ pub const StreamHandler = struct {
                 // Anchor to the entry timestamp so replay reproduces the same
                 // StreamIDs as the original live apply.
                 const ts_ms = entry.header.timestamp_ns / 1_000_000;
-                const id = self.stream.appendToStreamAt(key, entry.header.index, av.partition_index, ts_ms, record_count, byte_len) catch |err| {
+                const id = self.stream.appendToStreamAt(key, entry.header.index, self.stream.applying_part, av.partition_index, ts_ms, record_count, byte_len) catch |err| {
                     log.err("stream '{s}': append at index {d} not applied: {s}", .{ cmd.key, entry.header.index, @errorName(err) });
                     return if (err == error.OutOfMemory) error.OutOfMemory else error.Halt;
                 };
@@ -2161,7 +2164,7 @@ test "stream handler: a read steps past an append it can't read" {
 
     // An append the projection knows but whose payload is in no tier.
     const h = stream_mod.streamKey(.default, "s1");
-    const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 1_700_000_000_000, 1, 10);
+    const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 0, 1_700_000_000_000, 1, 10);
     var vb: [64]u8 = undefined;
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
 
@@ -2197,7 +2200,7 @@ test "stream handler: a processing read skips and counts an append in no tier, a
     defer handler.deinit();
 
     const h = stream_mod.streamKey(.default, "s1");
-    const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 1_700_000_000_000, 1, 10);
+    const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 0, 1_700_000_000_000, 1, 10);
 
     const read = handler.readPayloadsForStream("s1", "default", StreamID.MIN, 10);
     defer allocator.free(read.payloads);
@@ -2537,7 +2540,7 @@ test "stream handler: a trim by age cuts at its entry's stamp, not the host's cl
         const h = stream_mod.streamKey(.default, "aged");
         // 3 s old exactly is not older than 3 s: it stays.
         for ([_]u64{ 10_000, 5_000, 3_000, 1_000 }, 1..) |age, i| {
-            _ = try handler.stream.appendToStreamAt(h, i, 0, stamp_ms - age, 1, 10);
+            _ = try handler.stream.appendToStreamAt(h, i, 0, 0, stamp_ms - age, 1, 10);
         }
         var key_buf: [TrimBound.MAX_SIZE]u8 = undefined;
         // The entry carries the namespace; its value, the rest of the key.
@@ -2570,8 +2573,8 @@ test "stream handler: a trim applies in its entry's namespace alone, though the 
     const ours = stream_mod.streamKey(.of(16), "same");
     const theirs = stream_mod.streamKey(.of(17), "same");
     for (1..4) |i| {
-        _ = try handler.stream.appendToStreamAt(ours, 2 * i - 1, 0, 1_000 + i, 1, 10);
-        _ = try handler.stream.appendToStreamAt(theirs, 2 * i, 0, 1_000 + i, 1, 10);
+        _ = try handler.stream.appendToStreamAt(ours, 2 * i - 1, 0, 0, 1_000 + i, 1, 10);
+        _ = try handler.stream.appendToStreamAt(theirs, 2 * i, 0, 0, 1_000 + i, 1, 10);
     }
     var key_buf: [TrimBound.MAX_SIZE]u8 = undefined;
     const t = StreamHandler.trimCommand(&ours, .{ .id = StreamID.MAX }, &key_buf);
@@ -2594,8 +2597,8 @@ test "stream handler: --maxage counts in seconds" {
 
     const h = stream_mod.streamKey(.default, "s1");
     const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
-    _ = try handler.stream.appendToStreamAt(h, 1, 0, now_ms - 10_000, 1, 10);
-    _ = try handler.stream.appendToStreamAt(h, 2, 0, now_ms - 1_000, 1, 10);
+    _ = try handler.stream.appendToStreamAt(h, 1, 0, 0, now_ms - 10_000, 1, 10);
+    _ = try handler.stream.appendToStreamAt(h, 2, 0, 0, now_ms - 1_000, 1, 10);
     // Older than 5 seconds: the 10 s old record, not the 1 s old one.
     var ob: [16]u8 = undefined;
     var b = OptionsBuilder.init(&ob);
