@@ -388,13 +388,22 @@ jobs:
         run: ./zig-out/bin/vopr --iterations=10 --seed=1 --jobs=4 --groups=4 --halts --seed-timeout=120 --out-dir=/tmp/vopr-groups-halts
         timeout-minutes: 10
       - name: Channel mutants are caught
-        # Each planted bug in the channel driver fails at least one seed.
+        # Each planted bug in the channel driver fails at least one seed, and
+        # fails it as the channel oracle names that bug: a panic, a usage
+        # error or a timeout catches nothing.
         run: |
-          for m in past_durable trim_on_applied ack_last_seq; do
-            if ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --groups=4 --channel-mutant=$m --seed-timeout=120 --out-dir=/tmp/vopr-cm-$m 2>&1 | grep -q "20 ok, 0 failed"; then
-              echo "::error::channel mutant $m passed every seed"; exit 1
+          check() {
+            m=$1; says=$2
+            ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --groups=4 --channel-mutant=$m --seed-timeout=120 --out-dir=/tmp/vopr-cm-$m > /tmp/vopr-cm-$m.out 2>&1 || true
+            n=$(grep -lE "channel [0-9]+->[0-9]+ seq [0-9]+: $says" /tmp/vopr-cm-$m/*.log 2>/dev/null | wc -l)
+            if [ "$n" -eq 0 ]; then
+              tail -20 /tmp/vopr-cm-$m.out; echo "::error::channel mutant $m: no seed failed with 'channel ... seq ...: $says'"; exit 1
             fi
-          done
+            echo "$m: $n seeds caught it"
+          }
+          check past_durable "applied a message its sender lost"
+          check trim_on_applied "a message its sender holds was never applied"
+          check ack_last_seq "a message its sender holds was never applied"
         timeout-minutes: 20
       - name: Swarm with lost disks
         # Crashes that lose a disk or its hard state, up to two nodes at once:

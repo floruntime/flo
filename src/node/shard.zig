@@ -1210,6 +1210,8 @@ pub const Shard = struct {
             memory_budget.reserve(shard_count, memory_budget.ringBytesPerShard(ual_capacity), memory_budget.DEFAULT_MARGIN_BYTES)
         else
             0;
+        var channel = try channel_driver.Driver.init(allocator, shard_id, shard_count);
+        errdefer channel.deinit();
 
         return .{
             .id = shard_id,
@@ -1223,7 +1225,7 @@ pub const Shard = struct {
             .dispatcher = dispatcher,
             .connections = .{},
             .router = Router.init(shard_count, shard_id),
-            .channel = channel_driver.Driver.init(allocator, shard_id, shard_count),
+            .channel = channel,
             // Everything replay put in the log came from disk.
             .flushed_index = raft_node.log.lastIndex(),
             .slab = slab,
@@ -1401,7 +1403,8 @@ pub const Shard = struct {
     }
 
     /// Delivery, resends, trims and acks, on a leader. Inert with no channel
-    /// traffic: two counts and nothing else.
+    /// traffic (two counts), and once everything sent is acked and trimmed
+    /// (the driver's three commit counts, unchanged).
     fn tickChannels(self: *Shard) void {
         const st = &self.defaultPartition().store;
         if (st.families[channels_mod.OutFam.ID].count == 0 and st.families[channels_mod.InFam.ID].count == 0) return;
@@ -5458,6 +5461,11 @@ pub const Shard = struct {
             if (leads and @import("test_faults.zig").of(entry) == .panic_leader_step) @panic("test fault: panic in the leader's step after apply");
         }
         self.workflow_handler.startApplied(self, entry, result);
+        // Each message an inbound applied is, to these steps, an entry of
+        // its own: a blocking read waits on its key, a dequeue on its queue.
+        if (entry.header.entry_type == @backingInt(entry_mod.EntryType.channel_inbound)) {
+            for (self.defaultPartition().store.messages.items) |*m| self.afterApply(&m.entry, &m.result);
+        }
 
         // Shard 0 carries the memory budget: a settings row or a membership
         // change can move it, so re-derive and refresh what `/status` and
@@ -8232,6 +8240,7 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
         // was applied already, and must not be twice.
         if (applied.route == .skipped_already_applied) return .applied;
         contract_machine.applyEntryWith(m, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, entry, out) catch |err| return .{ .applier_failed = err };
+        if (etype == .channel_inbound) for (partition.store.messages.items) |*msg| noteNamespace(partition, &msg.entry);
         return .applied;
     }
     const had = registry.dispatch(entry, out) catch |err| return .{ .applier_failed = err };
@@ -25600,6 +25609,78 @@ test "Shard: a message to another shard's slot is applied there once, through it
         two.settle();
     }
     try std.testing.expectEqual(b_log, b.raft_node.log.lastIndex());
+}
+
+test "Shard: a blocking get waiting on a key wakes when a channel message writes it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    var kbuf: [16]u8 = undefined;
+    var ki: usize = 0;
+    const key = while (true) : (ki += 1) {
+        const k = try std.fmt.bufPrint(&kbuf, "k{d}", .{ki});
+        if (a.router.hashToShard(node_router.routeNsKey(.default, k)) == 1) break k;
+    };
+    const slot: u16 = @intCast(node_router.slot(node_router.routeNsKey(.default, key)));
+    var qbuf: [limits.MAX_KV_KEY]u8 = undefined;
+    const stored = testKvKey(&qbuf, key);
+    // A client on shard 1 waits for the key, which doesn't exist yet.
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    try std.testing.expect(b.waiter_pool.register(.{ .kind = .kv_get, .reply_to = c.conn.replyTo(), .request_id = 9, .key = stored, .min_version = 0, .timeout_ms = 60_000 }));
+    var pbuf: [128]u8 = undefined;
+    const put = try kv_entries.Put.encodeInto(&pbuf, .{ .key = stored, .value = "from-a", .ttl_ms = null, .condition = .always, .cas_version = null });
+    try sendFromApply(a, slot, .kv_put, put);
+    for (0..8) |_| {
+        a.tickChannels();
+        b.tickChannels();
+        two.settle();
+    }
+    try std.testing.expectEqualStrings("from-a", b.kv_handler.kv.getIn(.default, key).?.value);
+    var out: [512]u8 = undefined;
+    const n = try readAnswer(c.pair[1], b, c.conn.fd, &out, @sizeOf(proto.ResponseHeader) + 8);
+    const resp = try proto.Response.parse(out[0..n]);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 9), resp.header.request_id);
+    var diag: schema.Diagnostic = .{};
+    try std.testing.expectEqualStrings("from-a", (try KVHandler.GetResponse.decodeAll(resp.data, &diag)).value);
+}
+
+test "Shard: once a channel's messages are applied, acked and trimmed, a tick reads nothing more" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    var pbuf: [128]u8 = undefined;
+    var full: [32]u8 = undefined;
+    const ns_key = try std.fmt.bufPrint(&full, "{s}k", .{ns_table.DEFAULT.bytes()});
+    const put = try kv_entries.Put.encodeInto(&pbuf, .{ .key = ns_key, .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null });
+    try sendFromApply(a, 1, .kv_put, put);
+    for (0..8) |_| {
+        a.tickChannels();
+        b.tickChannels();
+        two.settle();
+    }
+    try std.testing.expectEqual(@as(u64, 1), channels_mod.metaOf(.{ .store = &a.defaultPartition().store }, 1).acked);
+    // Both have channel records now, so the shard's gate is open; the
+    // driver's own finds nothing changed.
+    const scans = [2]u64{ a.channel.counts.scans, b.channel.counts.scans };
+    for (0..100) |_| {
+        a.tickChannels();
+        b.tickChannels();
+        two.settle();
+    }
+    try std.testing.expectEqual(scans[0], a.channel.counts.scans);
+    try std.testing.expectEqual(scans[1], b.channel.counts.scans);
+    try std.testing.expectEqual(@as(usize, 0), a.mailbox.inbox.pending());
+    try std.testing.expectEqual(@as(usize, 0), b.mailbox.inbox.pending());
 }
 
 test "Shard: with no channel traffic a tick sends no frame and proposes nothing" {

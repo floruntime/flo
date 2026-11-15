@@ -31,7 +31,6 @@ const ReadView = view_mod.ReadView;
 const Int = schema.Int;
 const Record = schema.Record;
 
-pub const MAX_GROUPS = 64;
 /// Most messages in flight past the receiver's applied ack.
 pub const WINDOW = 1024;
 /// Most payload bytes in one batch.
@@ -122,7 +121,18 @@ pub const Counts = struct {
     busy: u64 = 0,
     trims_proposed: u64 = 0,
     acks_refused: u64 = 0,
+    /// Ticks that read every peer's records; the rest found nothing changed.
+    scans: u64 = 0,
 };
+
+/// What the channel families have been through, from their commit counts:
+/// unchanged, no record changed.
+const Seen = struct { out: u64 = 0, meta: u64 = 0, in: u64 = 0 };
+
+fn seenOf(read: ReadView) Seen {
+    const f = &read.store.families;
+    return .{ .out = f[channels.OutFam.ID].commits, .meta = f[channels.MetaFam.ID].commits, .in = f[channels.InFam.ID].commits };
+}
 
 /// A bug planted on purpose, for VOPR to show it catches it. Only VOPR
 /// sets one; a server never does.
@@ -145,8 +155,14 @@ pub const Driver = struct {
     mutant: Mutant = .none,
     count: u16,
     term: u64 = 0,
-    peers: [MAX_GROUPS]Peer = @splat(.{}),
+    /// One per group on the node.
+    peers: []Peer,
     counts: Counts = .{},
+    /// The last scan left nothing outstanding: no message unsent or
+    /// unacked, no trim due or in flight, no answer untold. Until a channel
+    /// record or a frame changes that, a tick has nothing to do.
+    quiet: bool = false,
+    seen: Seen = .{},
     allocator: std.mem.Allocator,
     /// A frame or an inbound entry is built here, one at a time, over a
     /// message list built in `msgs`. Allocated at the first batch either
@@ -154,12 +170,15 @@ pub const Driver = struct {
     buf: []u8 = &.{},
     msgs: []u8 = &.{},
 
-    pub fn init(allocator: std.mem.Allocator, group: u16, count: u16) Driver {
-        std.debug.assert(count <= MAX_GROUPS and group < count);
-        return .{ .allocator = allocator, .group = group, .count = count };
+    pub fn init(allocator: std.mem.Allocator, group: u16, count: u16) error{OutOfMemory}!Driver {
+        std.debug.assert(group < count);
+        const peers = try allocator.alloc(Peer, count);
+        @memset(peers, .{});
+        return .{ .allocator = allocator, .group = group, .count = count, .peers = peers };
     }
 
     pub fn deinit(self: *Driver) void {
+        self.allocator.free(self.peers);
         self.allocator.free(self.buf);
         self.allocator.free(self.msgs);
     }
@@ -182,18 +201,40 @@ pub const Driver = struct {
     /// message an earlier leader sent is in state by then.
     pub fn reset(self: *Driver, term: u64) void {
         self.term = term;
-        self.peers = @splat(.{});
+        @memset(self.peers, .{});
+        self.quiet = false;
     }
 
     /// The periodic work: deliver, resend, probe, trim, and tell senders
-    /// what was applied. With no channel traffic it reads one meta record
-    /// and one in record per group, and sends nothing.
+    /// what was applied. Once everything is delivered, acked, trimmed and
+    /// told, it reads three commit counts and stops there, until a channel
+    /// record changes or a frame arrives.
     pub fn tick(self: *Driver, now_ms: u64, read: ReadView, durable: u64, io: anytype) void {
+        const seen = seenOf(read);
+        if (self.quiet and std.meta.eql(seen, self.seen)) return;
+        self.counts.scans += 1;
+        var quiet = true;
         for (0..self.count) |b_| {
             const b: u16 = @intCast(b_);
             self.tickSend(b, now_ms, read, durable, io);
             self.tickAnswer(b, read, durable, io);
+            if (!self.settled(b, read, durable)) quiet = false;
         }
+        self.quiet = quiet;
+        self.seen = seen;
+    }
+
+    /// Nothing outstanding with `b` either way: every message sent is
+    /// acked durably and trimmed, and every one received is told durably.
+    /// Durable progress is only waited on when something isn't, so a
+    /// settled channel needn't watch the durable index.
+    fn settled(self: *const Driver, b: u16, read: ReadView, durable: u64) bool {
+        const p = &self.peers[b];
+        const meta = channels.metaOf(read, b);
+        const last = meta.next_seq - 1;
+        if (meta.acked != last or p.trim_at_ms != null or p.durable_ack > meta.acked or p.applied_ack > meta.acked) return false;
+        const in = channels.inOf(read, b) orelse return true;
+        return self.durableAck(b, in, durable) == in.applied and p.told_applied >= in.applied and p.told_durable >= in.applied;
     }
 
     fn tickSend(self: *Driver, b: u16, now_ms: u64, read: ReadView, durable: u64, io: anytype) void {
@@ -318,6 +359,8 @@ pub const Driver = struct {
     pub fn onFrame(self: *Driver, from: u16, bytes: []const u8, now_ms: u64, read: ReadView, durable: u64, halted: bool, io: anytype) void {
         if (from >= self.count) return;
         const f = Frame.decode(bytes) orelse return;
+        // An answer can move an ack, and a batch be owed one: look again.
+        self.quiet = false;
         switch (f) {
             .batch => |b| self.onBatch(from, b, read, durable, halted, io),
             .answer => |a| self.onAnswer(from, a, now_ms, read),

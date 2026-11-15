@@ -358,12 +358,12 @@ pub const GroupChannel = struct {
     driver: driver_mod.Driver,
     probes_proposed: u64 = 0,
 
-    fn init(allocator: Allocator, g: GroupId, count: u16) GroupChannel {
+    fn init(allocator: Allocator, g: GroupId, count: u16) !GroupChannel {
         var c: GroupChannel = .{
             .g = g,
             .store = store_mod.Store.init(allocator),
             .scratch = std.heap.ArenaAllocator.init(allocator),
-            .driver = driver_mod.Driver.init(allocator, g, count),
+            .driver = try driver_mod.Driver.init(allocator, g, count),
         };
         c.store.place = .{ .group = g, .count = count };
         c.store.strict_keys = true;
@@ -537,7 +537,7 @@ pub const Groups = struct {
         }
         const chans = try allocator.alloc(GroupChannel, group_count);
         for (chans, sims, 0..) |*c, *sim, g| {
-            c.* = GroupChannel.init(allocator, @intCast(g), group_count);
+            c.* = try GroupChannel.init(allocator, @intCast(g), group_count);
             sim.extension = c.extension();
             // Each group flushes at its own point in the interval, as each
             // shard's flush timer does: a crash takes a different suffix

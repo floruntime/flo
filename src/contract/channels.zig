@@ -10,7 +10,17 @@
 //!   if it were that entry, at the inbound's index and stamp. A message at
 //!   or below `in_hwm` is a duplicate and skipped; one past `in_hwm + 1` is a
 //!   gap, which no correct delivery makes, and halts. A refused message
-//!   undoes only its own writes and still takes its seq.
+//!   undoes only its own writes and still takes its seq, and so does one
+//!   for a slot this group doesn't own, or one whose own sends are past an
+//!   apply's limits. What a message sends is written under the inbound's
+//!   index, as if sent by an entry of its own.
+//! - **One index, many messages.** Every message in an inbound applies at
+//!   its index and term. What a machine keys by them stays unique: a KV
+//!   write's `lsn` is informational (its `version` orders the key's
+//!   writes); a delivery's `{term, index}` token is always checked with
+//!   the item's delivery count, which every delivery raises, so two
+//!   deliveries in one inbound still differ; a record located by index
+//!   takes `(index, view.message.ordinal)`.
 //! - **Trims** drop what the receiver durably applied.
 //!
 //! Delivering, acks and resends are the leader's (`channel_driver.zig`):
@@ -24,6 +34,7 @@ const machine_mod = @import("machine.zig");
 const delivery = @import("delivery.zig");
 const persistence = @import("../storage/persistence.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
+const node_router = @import("../node/router.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -138,12 +149,19 @@ pub fn tooMuchSent(sends: []const view_mod.Send) ?[]const u8 {
     return null;
 }
 
+/// The group that owns `slot`, as the node's router says.
+pub fn ownerOf(place: view_mod.Place, slot: u16) u16 {
+    return node_router.Router.init(place.count, place.group).slotToShard(slot);
+}
+
 /// The view's sends into the outbox, under the sending entry's `index`.
 pub fn writeSends(view: *View, index: u64) ApplyError!void {
     const place = view.place orelse return error.Halt;
     if (place.count == 0) return error.Halt;
     for (view.sends.items) |s| {
-        const to: u16 = @intCast(s.slot % place.count);
+        // A slot past the table is a Flo bug in the sender.
+        if (s.slot >= node_router.SLOTS) return error.Halt;
+        const to = ownerOf(place, s.slot);
         var mk: [GROUP_KEY]u8 = undefined;
         const meta_key = groupKey(&mk, to);
         var meta: Meta.Value = if (try view.getOwn(MetaFam, meta_key)) |m| m.v else .{ .next_seq = 1, .acked = 0 };
@@ -246,6 +264,9 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
 
         fn applyInbound(view: *View, e: *const Entry) ApplyError!void {
             var diag: schema.Diagnostic = .{};
+            const store = view.store;
+            store.messages.clearRetainingCapacity();
+            const place = view.place orelse return error.Halt;
             // Only a leader makes these, from its own outbox's frames: one that
             // doesn't decode is a Flo bug.
             const p = ce.Inbound.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -269,8 +290,18 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 view.message = .{ .from = p.from, .seq = seq, .ordinal = ordinal };
                 defer view.message = null;
                 var r = Result.start(&as);
-                try owner.apply(view, &as, &r);
-                if (r.refused() != null) try view.rollback(mark);
+                // A message for a slot this group doesn't own was sent to
+                // the wrong group: refused, never applied over another's state.
+                if (m.slot >= node_router.SLOTS or ownerOf(place, m.slot) != place.group) {
+                    r.refuse(.bad_request, .malformed, "bad request: a message for a slot this group doesn't own");
+                } else {
+                    try owner.apply(view, &as, &r);
+                    // Its sends are held to an apply's limits on their own,
+                    // and leave with it.
+                    if (r.refused() == null) if (tooMuchSent(view.sends.items[mark.sends..])) |why| r.refuse(.bad_request, .malformed, why);
+                }
+                if (r.refused() != null) try view.rollback(mark) else try writeSends(view, e.header.index);
+                try store.messages.append(store.allocator, .{ .entry = as, .result = r });
                 applied = seq;
             }
             if (before != null and applied == before.?.applied) return;
@@ -478,6 +509,52 @@ test "channels: a refused message undoes only its own writes, and still takes it
     try testing.expect(b.got("message-one-0001") != null);
     try testing.expect(b.got("refuse-this-0002") == null);
     try testing.expect(b.got("message-thr-0003") != null);
+}
+
+test "channels: a message's sends are held to an apply's limits on their own: past them, only it is refused, and the channel goes on" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    var b = Group.init(1, 2);
+    defer b.deinit();
+    try a.probeTo(1, "relay-this-00001");
+    try a.probeTo(1, "flood-this-00002");
+    try a.probeTo(1, "message-thr-0003");
+    var buf: [8192]u8 = undefined;
+    _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
+    try testing.expect(b.got("relay-this-00001") != null);
+    try testing.expect(b.got("flood-this-00002") == null);
+    try testing.expect(b.got("message-thr-0003") != null);
+    // The relay's one send is in b's outbox, under the inbound's index;
+    // the flood sent nothing.
+    try testing.expectEqual(@as(u64, 2), metaOf(b.read(), 1).next_seq);
+    try testing.expectEqual(b.index, b.outRecord(1, 1).?.sent_at);
+    // Each message was reported with its result, the flood's refused.
+    const reported = b.store.messages.items;
+    try testing.expectEqual(@as(usize, 3), reported.len);
+    try testing.expect(reported[0].result.refused() == null);
+    try testing.expect(reported[1].result.refused() != null);
+    try testing.expect(reported[2].result.refused() == null);
+    // The next inbound follows on, with no halt.
+    try a.probeTo(1, "message-fou-0004");
+    _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 4, 1, &buf));
+    try testing.expectEqual(@as(u64, 4), inOf(b.read(), 0).?.applied);
+}
+
+test "channels: a message for a slot its receiver doesn't own is refused, and takes its seq" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    // b is group 1 of 3: slot 1 is its own, slot 3 is group 0's.
+    var b = Group.init(1, 3);
+    defer b.deinit();
+    try a.probeTo(1, "message-one-0001");
+    try a.probeTo(3, "message-two-0002");
+    var buf: [8192]u8 = undefined;
+    _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 2, &buf));
+    try testing.expectEqual(@as(u64, 2), inOf(b.read(), 0).?.applied);
+    try testing.expect(b.got("message-one-0001") != null);
+    try testing.expect(b.got("message-two-0002") == null);
+    try testing.expect(b.store.messages.items[1].result.refused() != null);
 }
 
 test "channels: a durable ack names what was applied as of a durable index" {

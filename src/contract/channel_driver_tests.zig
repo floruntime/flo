@@ -53,7 +53,7 @@ const Sim = struct {
                 .id = @intCast(i),
                 .store = store_mod.Store.init(allocator),
                 .scratch = std.heap.ArenaAllocator.init(allocator),
-                .driver = driver_mod.Driver.init(allocator, @intCast(i), count),
+                .driver = try driver_mod.Driver.init(allocator, @intCast(i), count),
             };
             g.store.place = .{ .group = @intCast(i), .count = count };
             g.store.strict_keys = true;
@@ -124,7 +124,7 @@ const Sim = struct {
 
     fn probeFrom(self: *Sim, g: *Group, slot: u16) !void {
         var body: [16]u8 = undefined;
-        _ = std.fmt.bufPrint(&body, "g{d}-{d:0>13}", .{ g.id, g.sent }) catch unreachable;
+        _ = std.fmt.bufPrint(&body, "g{d:0>3}-{d:0>11}", .{ g.id, g.sent }) catch unreachable;
         g.sent += 1;
         var buf: [64]u8 = undefined;
         try self.apply(g, .channel_probe, try ce.Probe.encodeInto(&buf, .{ .slot = slot, .body = &body }));
@@ -202,7 +202,7 @@ fn runWorkload(seed: u64, count: u16, probes: u64, faults: Faults) !driver_mod.C
     for (sim.groups) |*a| {
         for (0..a.sent) |n| {
             var body: [16]u8 = undefined;
-            _ = std.fmt.bufPrint(&body, "g{d}-{d:0>13}", .{ a.id, n }) catch unreachable;
+            _ = std.fmt.bufPrint(&body, "g{d:0>3}-{d:0>11}", .{ a.id, n }) catch unreachable;
             var found: u8 = 0;
             for (sim.groups) |*b| {
                 var kb: [1 + probe.NAME_LEN]u8 = undefined;
@@ -294,6 +294,57 @@ test "channel driver: a gap rewinds once per generation; one from an older batch
             else => try testing.expectEqual(@as(u64, 2), g.driver.peers[1].sent_through),
         }
     }
+}
+
+test "channel driver: a gap from an earlier term's generation of the same counter rewinds nothing" {
+    for ([_]driver_mod.Mutant{ .none, .no_gen_filter }) |mutant| {
+        var sim = try Sim.init(testing.allocator, 2, 19, .{});
+        defer sim.deinit();
+        const g = &sim.groups[0];
+        g.driver.mutant = mutant;
+        for (0..5) |_| try sim.probeFrom(g, 1);
+        g.driver.tick(1, .{ .store = &g.store }, 100, Sim.Io{ .sim = &sim, .me = 0 });
+        // A new term: its first generation is counter 0 again, and sends 1..5.
+        g.driver.reset(2);
+        g.driver.tick(2, .{ .store = &g.store }, 100, Sim.Io{ .sim = &sim, .me = 0 });
+        try testing.expectEqual(@as(u64, 5), g.driver.peers[1].sent_through);
+        // A late gap answering term 1's batch, with the same counter.
+        var buf: [64]u8 = undefined;
+        const gap = answerFrame(&buf, .{ .gen_term = 1, .gen_counter = 0, .applied = 2, .durable = 2, .gap = 3, .status = 0 });
+        g.driver.onFrame(1, gap, 3, .{ .store = &g.store }, 100, false, Sim.Io{ .sim = &sim, .me = 0 });
+        switch (mutant) {
+            .none => {
+                try testing.expectEqual(@as(u64, 5), g.driver.peers[1].sent_through);
+                try testing.expectEqual(@as(u32, 0), g.driver.peers[1].gen_counter);
+            },
+            else => try testing.expectEqual(@as(u64, 2), g.driver.peers[1].sent_through),
+        }
+    }
+}
+
+test "channel driver: an applied ack past what was sent is refused even when its durable ack is in range" {
+    for ([_]driver_mod.Mutant{ .none, .unbounded_ack }) |mutant| {
+        var sim = try Sim.init(testing.allocator, 2, 23, .{});
+        defer sim.deinit();
+        const g = &sim.groups[0];
+        g.driver.mutant = mutant;
+        for (0..2) |_| try sim.probeFrom(g, 1);
+        var buf: [64]u8 = undefined;
+        const ack = answerFrame(&buf, .{ .gen_term = 1, .gen_counter = 0, .applied = 5, .durable = 1, .gap = 0, .status = 0 });
+        g.driver.onFrame(1, ack, 1, .{ .store = &g.store }, 100, false, Sim.Io{ .sim = &sim, .me = 0 });
+        switch (mutant) {
+            .none => {
+                try testing.expectEqual(@as(u64, 1), g.driver.counts.acks_refused);
+                try testing.expectEqual(@as(u64, 0), g.driver.peers[1].applied_ack);
+                try testing.expectEqual(@as(u64, 0), g.driver.peers[1].durable_ack);
+            },
+            else => try testing.expectEqual(@as(u64, 5), g.driver.peers[1].applied_ack),
+        }
+    }
+}
+
+test "channel driver: a node of more groups than any fixed table, every message applied once" {
+    _ = try runWorkload(29, 70, 3, .{});
 }
 
 test "channel driver: an ack past what this group's state says was sent is refused, and moves nothing" {

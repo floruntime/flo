@@ -84,7 +84,7 @@ pub fn main() !void {
             .id = @intCast(i),
             .store = contract.store.Store.init(allocator),
             .scratch = std.heap.ArenaAllocator.init(allocator),
-            .driver = driver_mod.Driver.init(allocator, @intCast(i), 2),
+            .driver = try driver_mod.Driver.init(allocator, @intCast(i), 2),
         };
         g.store.place = .{ .group = @intCast(i), .count = 2 };
         g.driver.reset(1);

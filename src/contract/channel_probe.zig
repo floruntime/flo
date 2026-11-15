@@ -5,6 +5,8 @@
 //! A body is at least 16 bytes, its first 16 naming it, so the receiver's
 //! record is keyed by the entry alone. A body starting "refuse" is refused
 //! at the receiver after writing its record, which the refusal must undo.
+//! One starting "relay" is sent on again by its receiver, to the same slot;
+//! one starting "flood" is sent on more times than an apply may send.
 
 const std = @import("std");
 const schema = @import("../protocol/schema.zig");
@@ -56,6 +58,8 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     var kb: [1 + NAME_LEN]u8 = undefined;
     try view.put(GotFam, gotKey(&kb, p.body[0..NAME_LEN]), .{ .v = .{ .from = m.from, .seq = m.seq, .hash = hashOf(p.body) } });
     if (std.mem.startsWith(u8, p.body, "refuse")) out.refuse(.bad_request, .malformed, "refused, as asked");
+    const again: usize = if (std.mem.startsWith(u8, p.body, "relay")) 1 else if (std.mem.startsWith(u8, p.body, "flood")) @import("channels.zig").MAX_SENDS + 1 else 0;
+    for (0..again) |_| try view.send(p.slot, @backingInt(entry_mod.EntryType.channel_probe), e.payload);
 }
 
 pub const machine: machine_mod.Machine = .{

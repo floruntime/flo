@@ -9,6 +9,11 @@ const builtin = @import("builtin");
 const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 
+pub const AppliedMessage = struct {
+    entry: @import("../storage/ual/entry.zig").Entry,
+    result: @import("../storage/persistence.zig").Result,
+};
+
 /// Family ids are below this; a family's state is a slot of its own.
 pub const MAX_FAMILIES = 64;
 
@@ -61,6 +66,12 @@ pub const Store = struct {
     /// Where this store's group sits among the node's groups, for an
     /// apply's sends: null where nothing may send.
     place: ?@import("view.zig").Place = null,
+    /// The messages the last `channel_inbound` applied, refused ones too,
+    /// each as the entry it applied as and its result: the shard's
+    /// after-apply steps run for each, as for an entry of its own. The
+    /// entries' payloads are the inbound's, so this holds until the next
+    /// apply.
+    messages: std.ArrayListUnmanaged(AppliedMessage) = .empty,
 
     pub fn init(allocator: Allocator) Store {
         var store: Store = .{ .allocator = allocator };
@@ -80,6 +91,7 @@ pub const Store = struct {
 
     pub fn deinit(self: *Store) void {
         self.clear();
+        self.messages.deinit(self.allocator);
     }
 
     /// Empty every family, seeded again: a store loaded afresh (from a
