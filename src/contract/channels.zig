@@ -35,6 +35,7 @@ const delivery = @import("delivery.zig");
 const persistence = @import("../storage/persistence.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const node_router = @import("../node/router.zig");
+const store_mod = @import("store.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -329,14 +330,19 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                 view.message = .{ .from = p.from, .seq = seq, .ordinal = ordinal };
                 defer view.message = null;
                 var r = Result.start(&as);
+                var bug: ?store_mod.SenderBug = null;
                 // A message for a slot this group doesn't own was sent to
                 // the wrong group: refused, never applied over another's state.
                 if (m.slot >= node_router.SLOTS or ownerOf(place, m.slot) != place.group) {
                     r.refuse(.bad_request, .malformed, "bad request: a message for a slot this group doesn't own");
+                    bug = .wrong_slot;
                 } else if (after) |a| {
                     // Checked now: past the commit its applier may only run
                     // out of memory.
-                    if (a.refusal(m.payload)) |why| r.refuse(.bad_request, .malformed, why);
+                    if (a.refusal(m.payload)) |why| {
+                        r.refuse(.bad_request, .malformed, why);
+                        bug = .bad_payload;
+                    }
                 } else if (owner) |o| {
                     try o.apply(view, &as, &r);
                     // Its sends are held to an apply's limits on their own,
@@ -344,7 +350,7 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                     if (r.refused() == null) if (tooMuchSent(view.sends.items[mark.sends..])) |why| r.refuse(.bad_request, .malformed, why);
                 }
                 if (r.refused() != null) try view.rollback(mark) else try writeSends(view, e.header.index);
-                try store.messages.append(store.allocator, .{ .entry = as, .result = r, .ordinal = ordinal, .after_commit = later and r.refused() == null });
+                try store.messages.append(store.allocator, .{ .entry = as, .result = r, .ordinal = ordinal, .after_commit = later and r.refused() == null, .from = p.from, .sender_bug = bug });
                 applied = seq;
             }
             if (before != null and applied == before.?.applied) return;
@@ -416,7 +422,6 @@ fn withPoint(arena: std.mem.Allocator, before: ?In.Value, applied: u64, index: u
 
 const testing = std.testing;
 const probe = @import("channel_probe.zig");
-const store_mod = @import("store.zig");
 
 const Probed = Channels(&.{probe.machine});
 
@@ -551,6 +556,8 @@ test "channels: a refused message undoes only its own writes, and still takes it
     try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
     try testing.expect(b.got("message-one-0001") != null);
     try testing.expect(b.got("refuse-this-0002") == null);
+    // The target's own refusal: not the sender's bug.
+    try testing.expectEqual(@as(?store_mod.SenderBug, null), b.store.messages.items[1].sender_bug);
     try testing.expect(b.got("message-thr-0003") != null);
 }
 
@@ -598,6 +605,7 @@ test "channels: a message for a slot its receiver doesn't own is refused, and ta
     try testing.expect(b.got("message-one-0001") != null);
     try testing.expect(b.got("message-two-0002") == null);
     try testing.expect(b.store.messages.items[1].result.refused() != null);
+    try testing.expectEqual(@as(?store_mod.SenderBug, .wrong_slot), b.store.messages.items[1].sender_bug);
 }
 
 test "channels: a message applies with the flags its send gave it, not its inbound's" {
@@ -668,6 +676,11 @@ test "channels: an after-commit message its applier would halt on, or its client
     const reported = b.store.messages.items;
     try testing.expect(reported[1].result.refused() != null and !reported[1].after_commit);
     try testing.expect(reported[2].result.refused() != null and !reported[2].after_commit);
+    // Counted as the sender's bugs, apart from the probe's own refusals.
+    try testing.expectEqual(@as(?store_mod.SenderBug, null), reported[0].sender_bug);
+    try testing.expectEqual(@as(?store_mod.SenderBug, .bad_payload), reported[1].sender_bug);
+    try testing.expectEqual(@as(?store_mod.SenderBug, .bad_payload), reported[2].sender_bug);
+    try testing.expectEqual(@as(u16, 0), reported[1].from);
 }
 
 test "channels: a message whose applier runs after the commit takes its seq and is reported for it, unless refused" {

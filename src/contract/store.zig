@@ -17,6 +17,20 @@ pub const AppliedMessage = struct {
     /// Its type's applier runs once the inbound has committed: the
     /// channels machine only took its seq.
     after_commit: bool = false,
+    /// The group that sent it.
+    from: u16 = 0,
+    /// Refused because its sender built it wrong, not because its target
+    /// said no: counted and logged apart from ordinary refusals.
+    sender_bug: ?SenderBug = null,
+};
+
+/// Why a message was refused as its sender's bug.
+pub const SenderBug = enum(u8) {
+    /// For a slot this group doesn't own.
+    wrong_slot,
+    /// A message applied after the commit that wouldn't apply, or that its
+    /// client path refuses (`channels.AfterCommit`).
+    bad_payload,
 };
 
 /// Family ids are below this; a family's state is a slot of its own.

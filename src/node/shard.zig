@@ -84,6 +84,7 @@ const contract_machine = @import("../contract/machine.zig");
 const contract_machines = @import("../contract/machines.zig");
 const channel_driver = @import("../contract/channel_driver.zig");
 const channels_mod = @import("../contract/channels.zig");
+const contract_store = @import("../contract/store.zig");
 const kv_machine = @import("../kv/machine.zig");
 const repair = @import("repair.zig");
 const Scratch = @import("scratch.zig").Scratch;
@@ -558,6 +559,8 @@ pub const Shard = struct {
     flushed_index: u64 = 0,
     /// This shard's side of its channels, while it leads.
     channel: channel_driver.Driver,
+    /// When `noteSenderBug` last logged.
+    sender_bug_warn_ms: u64 = 0,
 
     /// Where the Raft node persists its term and vote (null if ephemeral).
     hard_state_store: ?*HardStateStore,
@@ -1396,6 +1399,17 @@ pub const Shard = struct {
             return true;
         }
     };
+
+    /// A message another shard built wrong: counted by sender and reason,
+    /// apart from ordinary refusals, and logged at most once a minute.
+    fn noteSenderBug(self: *Shard, m: *const contract_store.AppliedMessage, bug: contract_store.SenderBug) void {
+        if (m.from < self.channel.sender_bugs.len) self.channel.sender_bugs[m.from][@backingInt(bug)] += 1;
+        const now = nowMs();
+        if (self.sender_bug_warn_ms != 0 and now -| self.sender_bug_warn_ms < 60_000) return;
+        self.sender_bug_warn_ms = now;
+        const why = if (m.result.refused()) |r| r.refusal.message else "";
+        log.err("shard {d}: a channel message from shard {d} was refused as that shard's bug ({s}): {s}; this is a bug in this build, not in the data", .{ self.id, m.from, @tagName(bug), why });
+    }
 
     /// The channel driver's memory is a term's: a new one starts over.
     fn channelTerm(self: *Shard) void {
@@ -5466,7 +5480,10 @@ pub const Shard = struct {
         // Each message an inbound applied is, to these steps, an entry of
         // its own: a blocking read waits on its key, a dequeue on its queue.
         if (entry.header.entry_type == @backingInt(entry_mod.EntryType.channel_inbound)) {
-            for (self.defaultPartition().store.messages.items) |*m| self.afterApply(&m.entry, &m.result);
+            for (self.defaultPartition().store.messages.items) |*m| {
+                if (m.sender_bug) |bug| self.noteSenderBug(m, bug);
+                self.afterApply(&m.entry, &m.result);
+            }
         }
 
         // Shard 0 carries the memory budget: a settings row or a membership
@@ -25939,4 +25956,25 @@ test "Shard: a refused stream append fires no trigger and counts no append" {
     var ok = persistence_mod.Result.start(&e);
     s.recordApplied(&e, &ok);
     try std.testing.expectEqual(@as(u32, 1), metrics.streams.count());
+}
+
+test "Shard: a channel message refused as its sender's bug is counted by sender and reason, apart from a target's refusals" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    // From shard 0: a put for slot 0, which is shard 0's own, not b's.
+    var mb: [256]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &mb };
+    try @import("../protocol/channel_entries.zig").Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.kv_put), .layout_epoch = 0, .flags = 0, .payload = "x" });
+    var ib: [512]u8 = undefined;
+    const inbound = try @import("../protocol/channel_entries.zig").Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } });
+    const e = entry_mod.buildEntry(.channel_inbound, 0, b.raft_node.current_term, b.raft_node.last_applied + 1, 1, inbound);
+    var out = persistence_mod.Result.start(&e);
+    try std.testing.expect(b.applyEntry(&e, &out));
+    try std.testing.expectEqual(@as(u64, 1), b.channel.sender_bugs[0][@backingInt(contract_store.SenderBug.wrong_slot)]);
+    try std.testing.expectEqual(@as(u64, 0), b.channel.sender_bugs[0][@backingInt(contract_store.SenderBug.bad_payload)]);
+    try std.testing.expectEqual(@as(u64, 1), channels_mod.inOf(.{ .store = &b.defaultPartition().store }, 0).?.applied);
 }
