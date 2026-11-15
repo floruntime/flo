@@ -200,6 +200,11 @@ pub const SourceSpec = struct {
     ts_field: []const u8 = "",
     /// Polling interval in milliseconds for TS source (default: 1000)
     ts_poll_interval_ms: u32 = 1000,
+    /// How far behind its field's newest point a TS source reads, so a
+    /// point that arrives up to this late is still read: it reads
+    /// everything once the field has had no write for this long. 0 reads
+    /// up to the newest point, and misses any that arrive behind it.
+    ts_lateness_ms: u32 = 30_000,
 };
 
 // =============================================================================

@@ -20,7 +20,7 @@ pub const TS_PAGE_POINTS: usize = 512;
 ///
 /// `[term u64][seq u64][kind u8][pipeline len u16][pipeline][ns len u16][ns]
 /// [source len u16][source][field len u16][field][tag_hash u64][from_a u64]
-/// [from_b u64][limit u32]`
+/// [from_b u64][limit u32][behind_ns u64][idle_at u64]`
 pub const Read = struct {
     /// The asker's term and the read's number: an answer to another is dropped.
     term: u64,
@@ -39,6 +39,13 @@ pub const Read = struct {
     from_a: u64,
     from_b: u64,
     limit: u32,
+    /// TS only: how far behind the field's newest point the page stops
+    /// (the source's lateness window, or 0 to read every point).
+    behind_ns: u64 = 0,
+    /// TS only: the field's write count at which the asker found it idle
+    /// (no write for the window), or 0. Read through to the newest only
+    /// while the field's count is still that.
+    idle_at: u64 = 0,
 
     /// Whether every name fits its length field; a pipeline whose names
     /// don't can't ask, and is refused (`ProcessingHandler.askSource`).
@@ -49,7 +56,7 @@ pub const Read = struct {
 
     pub fn encode(self: Read, allocator: Allocator) ?[]u8 {
         if (!fits(self)) return null;
-        const size = 8 + 8 + 1 + 2 + self.pipeline.len + 2 + self.namespace.len + 2 + self.source.len + 2 + self.field.len + 8 + 8 + 8 + 4;
+        const size = 8 + 8 + 1 + 2 + self.pipeline.len + 2 + self.namespace.len + 2 + self.source.len + 2 + self.field.len + 8 + 8 + 8 + 4 + 8 + 8;
         const buf = allocator.alloc(u8, size) catch return null;
         var w: Writer = .{ .buf = buf };
         w.int(u64, self.term);
@@ -67,6 +74,8 @@ pub const Read = struct {
         w.int(u64, self.from_a);
         w.int(u64, self.from_b);
         w.int(u32, self.limit);
+        w.int(u64, self.behind_ns);
+        w.int(u64, self.idle_at);
         std.debug.assert(w.at == buf.len);
         return buf;
     }
@@ -84,8 +93,10 @@ pub const Read = struct {
         const from_a = r.int(u64) orelse return null;
         const from_b = r.int(u64) orelse return null;
         const limit = r.int(u32) orelse return null;
+        const behind_ns = r.int(u64) orelse return null;
+        const idle_at = r.int(u64) orelse return null;
         if (r.at != bytes.len) return null;
-        return .{ .term = term, .seq = seq, .kind = kind, .pipeline = pipeline, .namespace = namespace, .source = source, .field = field, .tag_hash = tag_hash, .from_a = from_a, .from_b = from_b, .limit = limit };
+        return .{ .term = term, .seq = seq, .kind = kind, .pipeline = pipeline, .namespace = namespace, .source = source, .field = field, .tag_hash = tag_hash, .from_a = from_a, .from_b = from_b, .limit = limit, .behind_ns = behind_ns, .idle_at = idle_at };
     }
 };
 
@@ -107,8 +118,9 @@ pub const Page = struct {
     pipeline: []const u8,
     from_a: u64,
     from_b: u64,
-    /// Stream only: the id the read reached, past appends it couldn't
-    /// read, so the cursor still moves past them.
+    /// Stream: the id the read reached, past appends it couldn't read, so
+    /// the cursor still moves past them. TS: the field's newest time and
+    /// its write count (0 when it has no series).
     last_a: u64,
     last_b: u64,
     count: u32,
@@ -217,14 +229,15 @@ pub const Page = struct {
     }
 };
 
-/// Up to `limit` of a series' points after `after`, in (time, position)
+/// Up to `limit` of a series' points after `after` and at or before
+/// `through_ns`, in (time, position)
 /// order, into `out`. A page may end among points sharing a time: the
 /// next goes on from its last point's (time, position). The tag strings
 /// are the projection's, good until it next changes.
-pub fn readTsPage(ts: *ts_mod.TSProjection, ns: NamespaceId, measurement: []const u8, field: []const u8, tag_hash: u64, after: ts_mod.TSProjection.ReadAt, limit: usize, out: *[TS_PAGE_POINTS]TsPoint) usize {
+pub fn readTsPage(ts: *ts_mod.TSProjection, ns: NamespaceId, measurement: []const u8, field: []const u8, tag_hash: u64, after: ts_mod.TSProjection.ReadAt, through_ns: u64, limit: usize, out: *[TS_PAGE_POINTS]TsPoint) usize {
     var buf: [TS_PAGE_POINTS]ts_mod.StoredPoint = undefined;
     const want = @min(limit, buf.len);
-    const n = ts.readAfter(ns, measurement, field, if (tag_hash != 0) tag_hash else null, after, buf[0..want]) catch return 0;
+    const n = ts.readAfter(ns, measurement, field, if (tag_hash != 0) tag_hash else null, after, through_ns, buf[0..want]) catch return 0;
     for (buf[0..n], out[0..n]) |p, *o| o.* = .{ .timestamp_ns = p.timestamp_ns, .ual = p.ual_index, .value = p.field_value, .tags = p.tags };
     return n;
 }
@@ -307,7 +320,7 @@ test "readTsPage: pages may end among points sharing a time, and together read e
     var seen: [16]bool = @splat(false);
     var pages: usize = 0;
     while (true) : (pages += 1) {
-        const n = readTsPage(&ts, .default, "m", "v", 0, after, 4, &out);
+        const n = readTsPage(&ts, .default, "m", "v", 0, after, std.math.maxInt(u64), 4, &out);
         if (n == 0) break;
         for (out[0..n]) |p| {
             try std.testing.expect(!seen[p.ual >> ts_machine.ORDINAL_BITS]);
@@ -329,7 +342,7 @@ test "readTsPage: one time with more points than a page is read across pages, no
     var after: ts_mod.TSProjection.ReadAt = .{ .ns = 0, .ual = 0 };
     var total: usize = 0;
     while (true) {
-        const n = readTsPage(&ts, .default, "m", "v", 0, after, TS_PAGE_POINTS, &out);
+        const n = readTsPage(&ts, .default, "m", "v", 0, after, std.math.maxInt(u64), TS_PAGE_POINTS, &out);
         if (n == 0) break;
         total += n;
         after = .{ .ns = out[n - 1].timestamp_ns, .ual = out[n - 1].ual };
@@ -344,7 +357,7 @@ test "readTsPage: an earlier point in a series past the first is read first, how
     for (0..1200) |i| try ts.insert(.default, "m", "v", 1, 1000, i + 1, try std.fmt.bufPrint(&tbuf, "h={d}", .{i}));
     try ts.insert(.default, "m", "v", 2, 5, 5000, "h=early");
     var out: [TS_PAGE_POINTS]TsPoint = undefined;
-    const n = readTsPage(&ts, .default, "m", "v", 0, .{ .ns = 0, .ual = 0 }, 100, &out);
+    const n = readTsPage(&ts, .default, "m", "v", 0, .{ .ns = 0, .ual = 0 }, std.math.maxInt(u64), 100, &out);
     try std.testing.expectEqual(@as(usize, 100), n);
     try std.testing.expectEqual(@as(u64, 5), out[0].timestamp_ns);
     try std.testing.expectEqualStrings("h=early", out[0].tags);

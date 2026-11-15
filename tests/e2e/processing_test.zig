@@ -1016,6 +1016,7 @@ test "e2e/processing: ts source - TS measurement data flows to stream sink" {
         \\sources.[0].ts.measurement: src_cpu
         \\sources.[0].ts.field: value
         \\sources.[0].ts.poll_interval_ms: 200
+        \\sources.[0].ts.lateness_ms: 0
         \\sinks.[0].stream.name: ts-src-stream-out
         \\batch_size: 100
     ;
@@ -1075,6 +1076,7 @@ test "e2e/processing: ts source - late data written after job starts" {
         \\sources.[0].ts.measurement: src_late_cpu
         \\sources.[0].ts.field: value
         \\sources.[0].ts.poll_interval_ms: 200
+        \\sources.[0].ts.lateness_ms: 0
         \\sinks.[0].stream.name: ts-src-late-out
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ts-src-late.yaml");
@@ -1108,6 +1110,62 @@ test "e2e/processing: ts source - late data written after job starts" {
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_tsslat" });
 }
 
+test "e2e/processing: ts source - a point up to its lateness window behind is still read; one behind the cursor is not" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "ns", "create", "proc_tswin" });
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-ts-src-window
+        \\namespace: proc_tswin
+        \\sources.[0].ts.measurement: src_window
+        \\sources.[0].ts.field: value
+        \\sources.[0].ts.poll_interval_ms: 100
+        \\sources.[0].ts.lateness_ms: 3000
+        \\sinks.[0].stream.name: ts-src-window-out
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ts-src-window.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    const job_id = extractJobId(try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_tswin" })) orelse return error.NoJobId;
+
+    const W = struct {
+        fn point(c: *stdx.testing.TestContext, host: []const u8, ts_ms: u64) !void {
+            var tb: [24]u8 = undefined;
+            var hb: [16]u8 = undefined;
+            try c.exec(&.{ "ts", "write", "src_window", "--tags", try std.fmt.bufPrint(&hb, "host={s}", .{host}), "--value", "1", "--timestamp", try std.fmt.bufPrint(&tb, "{d}", .{ts_ms}), "-n", "proc_tswin" });
+        }
+        fn seen(c: *stdx.testing.TestContext, ts_ms: u64, timeout: []const u8) !bool {
+            var b: [40]u8 = undefined;
+            return readStreamBlocking(c, "ts-src-window-out", "proc_tswin", try std.fmt.bufPrint(&b, "\"timestamp_ms\":{d}", .{ts_ms}), timeout);
+        }
+    };
+    const base: u64 = 1_708_700_000_000;
+    // Read once the field has had no write for the window: the cursor
+    // reaches base + 10 s.
+    try W.point(ctx, "a", base + 10_000);
+    try testing.expect(try W.seen(ctx, base + 10_000, "10000"));
+    // A newer point, then one 2 s behind it from another host: inside the
+    // window, so both are read.
+    try W.point(ctx, "a", base + 20_000);
+    try W.point(ctx, "b", base + 18_000);
+    try testing.expect(try W.seen(ctx, base + 18_000, "10000"));
+    try testing.expect(try W.seen(ctx, base + 20_000, "10000"));
+    // One behind the cursor is past any window, and not read.
+    try W.point(ctx, "b", base + 9_000);
+    try W.point(ctx, "a", base + 30_000);
+    try testing.expect(try W.seen(ctx, base + 30_000, "10000"));
+    // Past the window again with the field idle, so everything it would
+    // ever read is out: the point behind the cursor is not among it.
+    @import("stdx").time.sleep(4 * std.time.ns_per_s);
+    var all = try ctx.cli.run(&.{ "stream", "read", "ts-src-window-out", "-n", "proc_tswin", "--start", "0-0", "--limit", "100" });
+    defer all.deinit();
+    try testing.expectEqual(@as(u8, 0), all.exit_code);
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, all.stdout, "\"timestamp_ms\""));
+    var b9: [40]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, all.stdout, try std.fmt.bufPrint(&b9, "\"timestamp_ms\":{d}", .{base + 9_000})) == null);
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_tswin" });
+}
+
 test "e2e/processing: ts source - with tag filter reads subset of data" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
@@ -1129,6 +1187,7 @@ test "e2e/processing: ts source - with tag filter reads subset of data" {
         \\sources.[0].ts.field: value
         \\sources.[0].ts.tags.host: web-01
         \\sources.[0].ts.poll_interval_ms: 200
+        \\sources.[0].ts.lateness_ms: 0
         \\sinks.[0].stream.name: ts-src-filtered-out
         \\batch_size: 100
     ;
@@ -1178,6 +1237,7 @@ test "e2e/processing: ts source to ts sink - derived metrics pipeline" {
         \\sources.[0].ts.measurement: raw_temperature
         \\sources.[0].ts.field: value
         \\sources.[0].ts.poll_interval_ms: 200
+        \\sources.[0].ts.lateness_ms: 0
         \\sinks.[0].ts.measurement: derived_temp
         \\sinks.[0].ts.value_field: value
         \\sinks.[0].ts.tags.sensor: sensor
@@ -1253,6 +1313,7 @@ test "e2e/processing: ts source - job status shows RUNNING" {
         \\sources.[0].ts.measurement: src_status_check
         \\sources.[0].ts.field: value
         \\sources.[0].ts.poll_interval_ms: 500
+        \\sources.[0].ts.lateness_ms: 0
         \\sinks.[0].stream.name: ts-src-status-out
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ts-src-status.yaml");
@@ -1287,6 +1348,7 @@ test "e2e/processing: ts source - stop and cancel lifecycle" {
         \\sources.[0].ts.measurement: src_lifecycle
         \\sources.[0].ts.field: value
         \\sources.[0].ts.poll_interval_ms: 500
+        \\sources.[0].ts.lateness_ms: 0
         \\sinks.[0].stream.name: ts-src-lifecycle-out
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ts-src-lifecycle.yaml");
@@ -2935,6 +2997,7 @@ test "e2e/processing: ts sink drops a value past f64's range, and a ts source wr
         \\name: e2e-ts-source-json
         \\namespace: proc_tsfin
         \\sources.[0].ts.measurement: fin_m
+        \\sources.[0].ts.lateness_ms: 0
         \\sources.[0].ts.field: value
         \\sources.[0].ts.poll_interval_ms: 200
         \\sinks.[0].stream.name: fin-out

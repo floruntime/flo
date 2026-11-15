@@ -522,6 +522,7 @@ fn freeSource(allocator: Allocator, src: SourceSpec) void {
 ///         host: web-01
 ///       field: usage_idle
 ///       poll_interval_ms: 500
+///       lateness_ms: 30000     # how far behind the newest point it reads
 ///   ```
 fn parseOneSource(allocator: Allocator, d: D, item: JsonValue, index: usize, default_batch_size: u32, default_namespace: []const u8, sources: *std.ArrayList(SourceSpec)) ParseError!void {
     if (item != .object) return d.fail(ParseError.InvalidFieldType, "a source must be a map, not {s}", .{kindName(item)});
@@ -575,6 +576,10 @@ fn parseStringPairs(allocator: Allocator, d: D, obj: JsonValue, key: []const u8)
     return pairs;
 }
 
+/// A TS source's lateness window by default, and at most: a day.
+pub const DEFAULT_LATENESS_MS: u32 = 30_000;
+pub const MAX_LATENESS_MS: u32 = 24 * 60 * 60 * 1000;
+
 fn appendTsSource(
     allocator: Allocator,
     d: D,
@@ -585,14 +590,18 @@ fn appendTsSource(
     sources: *std.ArrayList(SourceSpec),
 ) ParseError!void {
     try refuseNotYet(d, ts_obj, &not_yet_source_keys);
-    try checkKeys(d, ts_obj, &.{ "measurement", "namespace", "field", "tags", "batch_size", "poll_interval_ms" });
+    try checkKeys(d, ts_obj, &.{ "measurement", "namespace", "field", "tags", "batch_size", "poll_interval_ms", "lateness_ms" });
     const measurement = try reqString(d, ts_obj, "measurement", ParseError.MissingSourceStream);
     const ns = try optString(d, ts_obj, "namespace") orelse default_namespace;
     const field = try optString(d, ts_obj, "field") orelse "";
     const bs = try optPositive(u32, d, ts_obj, "batch_size", ParseError.InvalidFormat) orelse default_batch_size;
     const poll_ms = try optPositive(u32, d, ts_obj, "poll_interval_ms", ParseError.InvalidFormat) orelse 1000;
+    const lateness_ms: u32 = if (try optInt(d, ts_obj, "lateness_ms")) |v| blk: {
+        if (v < 0 or v > MAX_LATENESS_MS) return d.fail(ParseError.InvalidFormat, "\"lateness_ms\" must be 0 to {d}, not {d}", .{ MAX_LATENESS_MS, v });
+        break :blk @intCast(v);
+    } else DEFAULT_LATENESS_MS;
 
-    var src: SourceSpec = .{ .kind = .ts, .name = "", .stream = "", .namespace = "", .batch_size = bs, .ts_poll_interval_ms = poll_ms };
+    var src: SourceSpec = .{ .kind = .ts, .name = "", .stream = "", .namespace = "", .batch_size = bs, .ts_poll_interval_ms = poll_ms, .ts_lateness_ms = lateness_ms };
     errdefer freeSource(allocator, src);
     src.name = try dupe(allocator, source_name);
     src.namespace = try dupe(allocator, ns);
@@ -2188,4 +2197,35 @@ test "parser: window_count is a count window's size, the same as window_size" {
     try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"count\", \"window_count\": 0 } ],", "", ""), ParseError.InvalidFormat, "\"window_count\" must be at least 1, not 0 at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"count\" } ],", "", ""), ParseError.MissingRequiredField, "missing required key \"window_count\" at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window_count\": 5 } ],", "", ""), ParseError.MissingRequiredField, "\"window_count\" needs \"window\": count at operators[0]");
+}
+
+test "parser: a TS source's lateness window defaults to 30 s, takes 0, and is refused past a day or below 0" {
+    const allocator = std.testing.allocator;
+    const Case = struct { line: []const u8, want: ?u32 };
+    for ([_]Case{
+        .{ .line = "", .want = DEFAULT_LATENESS_MS },
+        .{ .line = "      lateness_ms: 0\n", .want = 0 },
+        .{ .line = "      lateness_ms: 5000\n", .want = 5000 },
+        .{ .line = "      lateness_ms: 86400001\n", .want = null },
+        .{ .line = "      lateness_ms: -1\n", .want = null },
+    }) |c| {
+        const text = try std.fmt.allocPrint(allocator,
+            \\kind: Processing
+            \\sources:
+            \\  - ts:
+            \\      measurement: cpu
+            \\{s}sinks:
+            \\  - stream:
+            \\      name: out
+            \\
+        , .{c.line});
+        defer allocator.free(text);
+        if (c.want) |w| {
+            var def = try parseJobDefinition(allocator, text, null);
+            defer def.deinit(allocator);
+            try std.testing.expectEqual(w, def.primarySource().?.ts_lateness_ms);
+        } else {
+            try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, null));
+        }
+    }
 }
