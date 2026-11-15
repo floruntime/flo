@@ -3938,7 +3938,7 @@ pub const Shard = struct {
             const request_id: u64 = if (body.len >= 16) std.mem.readInt(u64, body[8..16], .little) else 0;
             var err_buf: [256]u8 = undefined;
             const serialized = proto.Response.serializeRefusal(.internal_error, request_id, proto.notRun("internal error: the leader cannot read this forwarded request — are all nodes on the same version?"), &err_buf);
-            return self.sendForwardReply(frame.source_node, id, serialized);
+            return self.sendForwardReply(frame.source_node, id, serialized, 0);
         }
         const ns_id: ns_table.Id = .of(std.mem.readInt(u32, frame.payload[FORWARD_PREFIX..][0..4], .little));
         const published = std.mem.readInt(u64, frame.payload[FORWARD_PREFIX + 4 ..][0..8], .little);
@@ -3952,7 +3952,7 @@ pub const Shard = struct {
             // The forwarder parsed it first, so the likely cause is two
             // nodes running different versions.
             const serialized = proto.Response.serializeRefusal(.internal_error, request_id, proto.notRun("internal error: the leader could not read this request — are all nodes on the same version?"), &err_buf);
-            return self.sendForwardReply(frame.source_node, id, serialized);
+            return self.sendForwardReply(frame.source_node, id, serialized, 0);
         };
         // A namespace the forwarder resolved is admitted only as this node's
         // table has it, under the same name: an id it doesn't know yet, or
@@ -3974,7 +3974,7 @@ pub const Shard = struct {
             // that name, but can't say there is none: the client retries,
             // and the forwarder resolves the name again.
             if (name == null or !std.mem.eql(u8, name.?, want))
-                return self.sendForwardReply(frame.source_node, id, proto.Response.serializeRefusal(.unavailable, req.header.request_id, FORWARD_ID_UNKNOWN, &err_buf));
+                return self.sendForwardReply(frame.source_node, id, proto.Response.serializeRefusal(.unavailable, req.header.request_id, FORWARD_ID_UNKNOWN, &err_buf), 0);
         }
         const proxy = self.forward_proxy;
         loadProxy(proxy, .{ .remote = .{ .node = frame.source_node, .forward_id = id } });
@@ -3984,12 +3984,12 @@ pub const Shard = struct {
         var err_buf: [256]u8 = undefined;
         if (self.takeProxyAnswer(proxy, req.header.request_id, &err_buf)) |answer| {
             defer answer.free(self.allocator);
-            self.sendForwardReply(frame.source_node, id, answer.bytes());
+            self.sendForwardReply(frame.source_node, id, answer.bytes(), self.raft_node.last_applied);
         } else if (!proxy.response_deferred and answered_deferred) {
             self.answeredAsDeferred(req.header.request_id, req.header.op_code);
         } else if (!proxy.response_deferred) {
             const serialized = proto.Response.serializeRefusal(.internal_error, req.header.request_id, proto.unclassified(.internal_error, self.noAnswer(req)), &err_buf);
-            self.sendForwardReply(frame.source_node, id, serialized);
+            self.sendForwardReply(frame.source_node, id, serialized, self.raft_node.last_applied);
         }
     }
 
@@ -4002,9 +4002,9 @@ pub const Shard = struct {
     fn holdForwardForTable(self: *Shard, frame: RaftFrame, id: u32, request_id: u64, published: u64) void {
         var err_buf: [256]u8 = undefined;
         const h = self.edge.freeHeld() orelse
-            return self.sendForwardReply(frame.source_node, id, proto.Response.serializeRefusal(.overloaded, request_id, HELD_FORWARDS_FULL, &err_buf));
+            return self.sendForwardReply(frame.source_node, id, proto.Response.serializeRefusal(.overloaded, request_id, HELD_FORWARDS_FULL, &err_buf), 0);
         const payload = self.allocator.dupe(u8, frame.payload) catch
-            return self.sendForwardReply(frame.source_node, id, proto.Response.serializeRefusal(.internal_error, request_id, proto.notRun("internal error: out of memory"), &err_buf));
+            return self.sendForwardReply(frame.source_node, id, proto.Response.serializeRefusal(.internal_error, request_id, proto.notRun("internal error: out of memory"), &err_buf), 0);
         h.* = .{
             .active = true,
             .payload = payload,
@@ -4033,7 +4033,7 @@ pub const Shard = struct {
                 self.runForwardedWrite(frame);
             } else if (now >= h.deadline_ms) {
                 var err_buf: [256]u8 = undefined;
-                self.sendForwardReply(h.source_node, h.forward_id, proto.Response.serializeRefusal(.unavailable, h.request_id, FORWARD_NOT_CAUGHT_UP, &err_buf));
+                self.sendForwardReply(h.source_node, h.forward_id, proto.Response.serializeRefusal(.unavailable, h.request_id, FORWARD_NOT_CAUGHT_UP, &err_buf), 0);
                 self.edge.dropHeld(self.allocator, h);
             }
         }
@@ -4042,14 +4042,20 @@ pub const Shard = struct {
     /// The answer to a forwarded write, with the index the client's node
     /// must have applied before handing it over: read-your-writes on the
     /// node the client wrote to.
-    fn sendForwardReply(self: *Shard, peer: u32, id: u32, bytes: []const u8) void {
+    /// Reply to a forwarded request. `applied_by` is the index the forwarder
+    /// must have applied before it hands the answer to its client, so a client
+    /// reads its own write on the node it wrote to; a not-run reply (a refusal)
+    /// sends 0, since there is no write to read back and the forwarder must not
+    /// hold it until its own log catches up (which also logs a false "behind").
+    fn sendForwardReply(self: *Shard, peer: u32, id: u32, bytes: []const u8, applied_by: u64) void {
         // The forwarder holds its client until a reply comes: one that
-        // cannot be sent whole is replaced by one that can.
+        // cannot be sent whole is replaced by one that can — and the answer is
+        // lost, so there is nothing to read back: deliver it at once (0).
         if (12 + bytes.len > transport.MAX_PAYLOAD_SIZE) {
             var err_buf: [256]u8 = undefined;
             const request_id: u64 = if (bytes.len >= 16) std.mem.readInt(u64, bytes[8..16], .little) else 0;
             const serialized = proto.Response.serializeRefusal(.internal_error, request_id, .{ .reason = .answer_lost, .ran = .unknown, .message = "internal error: answer too large to send" }, &err_buf);
-            return self.sendForwardReply(peer, id, serialized);
+            return self.sendForwardReply(peer, id, serialized, 0);
         }
         const buf = self.allocator.alloc(u8, 12 + bytes.len) catch {
             log.warn("shard {d}: out of memory for a forwarded write's reply to node {d}", .{ self.id, peer });
@@ -4057,7 +4063,7 @@ pub const Shard = struct {
         };
         defer self.allocator.free(buf);
         std.mem.writeInt(u32, buf[0..4], id, .little);
-        std.mem.writeInt(u64, buf[4..12], self.raft_node.last_applied, .little);
+        std.mem.writeInt(u64, buf[4..12], applied_by, .little);
         @memcpy(buf[12..], bytes);
         const rn = self.raft_network orelse return;
         // A reply that cannot be queued is lost; the forwarder's backstop
@@ -4178,7 +4184,7 @@ pub const Shard = struct {
         const request_id: u64 = if (body.len >= 16) std.mem.readInt(u64, body[8..16], .little) else 0;
         var err_buf: [256]u8 = undefined;
         const serialized = proto.Response.serializeRefusal(.unavailable, request_id, proto.notRun(message), &err_buf);
-        self.sendForwardReply(frame.source_node, id, serialized);
+        self.sendForwardReply(frame.source_node, id, serialized, 0);
     }
 
     /// Tell a removed node so, at most once a second: it stops, rather than
@@ -7396,7 +7402,7 @@ pub const Shard = struct {
         }
         const my_id: u16 = @intCast(self.id);
         const to = switch (reply_to) {
-            .remote => |r| return self.sendForwardReply(r.node, r.forward_id, bytes),
+            .remote => |r| return self.sendForwardReply(r.node, r.forward_id, bytes, self.raft_node.last_applied),
             .socket => |s| s,
         };
         const owner_shard = to.shard;
@@ -9195,6 +9201,82 @@ test "Shard: the leader answers a stranger's forwarded write with a not-run refu
     const answer = (try forwardReplyFor(&rn, 7)) orelse return error.TestNoReplySent;
     try expectAnswer(answer, .unavailable, "does not see this node as a member");
     try std.testing.expectEqual(@as(u64, 907), answer.header.request_id);
+}
+
+/// Forge an active write forwarded to `leader`, its client (`conn`) still
+/// waiting, so a reply can be fed straight into `takeForwardReply`.
+fn forgeForward(shard: *Shard, conn: *Connection, forward_id: u32, request_id: u64, leader: u32) void {
+    const slot = blk: {
+        for (shard.forwards) |*f| if (!f.active) break :blk f;
+        unreachable;
+    };
+    slot.* = .{ .active = true, .id = forward_id, .reply_to = conn.replyTo(), .request_id = request_id, .sent_to = leader, .read = false };
+    shard.forward_count += 1;
+    conn.response_deferred = true;
+}
+
+/// A reply the leader queued to `forward_id`'s forwarder: `applied_by` is the
+/// index it says the answer reflects (0 for a not-run refusal), `bytes` the
+/// serialized Response. The buffer is the caller's.
+fn forwardReplyFrame(forward_id: u32, applied_by: u64, bytes: []const u8, buf: []u8) RaftFrame {
+    std.mem.writeInt(u32, buf[0..4], forward_id, .little);
+    std.mem.writeInt(u64, buf[4..12], applied_by, .little);
+    @memcpy(buf[12..][0..bytes.len], bytes);
+    return .{ .source_node = 1, .group_id = 0, .msg_type = .forward_reply, .payload = buf[0 .. 12 + bytes.len] };
+}
+
+test "Shard: a forwarded answer stamped applied_by 0 reaches the waiting client at once, though this node is behind" {
+    // takeForwardReply gates read-your-writes on the frame's applied_by, not on
+    // the payload: a committed write's answer waits until this node has caught
+    // up to that index, but a not-run refusal (stamped 0) is delivered now. The
+    // leader-side fix stamps its refusals 0 so a forwarder that is still behind
+    // doesn't hold them to the deadline — and log a false "this node is behind".
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{});
+    defer shard.deinit();
+    shard.raft_node.last_applied = 0; // this node has applied nothing: it is behind
+
+    var buf: [256]u8 = undefined;
+    var err_buf: [128]u8 = undefined;
+
+    // A real committed answer (applied_by 5) waits while this node is behind.
+    var pair_a: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair_a));
+    defer _ = std.c.close(pair_a[1]);
+    const conn_a = try shard.addConnection(pair_a[0]);
+    forgeForward(&shard, conn_a, FORWARD_ID_FIRST, 901, 1);
+    const committed = proto.Response.serializeRefusal(.unavailable, 901, proto.notRun("unavailable: a stand-in for a committed answer"), &err_buf);
+    shard.takeForwardReply(forwardReplyFrame(FORWARD_ID_FIRST, 5, committed, &buf));
+    try std.testing.expectEqual(@as(u32, 1), shard.replies_held); // held, not delivered
+    try std.testing.expectEqual(@as(usize, 0), conn_a.write_buf.readable());
+
+    // Catching up to its index releases it to the client.
+    shard.raft_node.last_applied = 5;
+    shard.releaseReplies();
+    try std.testing.expectEqual(@as(u32, 0), shard.replies_held);
+    var out: [256]u8 = undefined;
+    const na = std.c.read(pair_a[1], &out, out.len);
+    try std.testing.expect(na > 0);
+    try std.testing.expectEqual(@as(u64, 901), (try proto.Response.parse(out[0..@intCast(na)])).header.request_id);
+
+    // A not-run refusal (applied_by 0) is delivered at once, behind or not.
+    shard.raft_node.last_applied = 0;
+    var pair_b: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair_b));
+    defer _ = std.c.close(pair_b[1]);
+    const conn_b = try shard.addConnection(pair_b[0]);
+    forgeForward(&shard, conn_b, FORWARD_ID_FIRST, 907, 1);
+    const refusal = proto.Response.serializeRefusal(.unavailable, 907, proto.notRun("unavailable: not a voter"), &err_buf);
+    shard.takeForwardReply(forwardReplyFrame(FORWARD_ID_FIRST, 0, refusal, &buf));
+    try std.testing.expectEqual(@as(u32, 0), shard.replies_held); // never held
+    try std.testing.expectEqual(@as(u32, 0), shard.forward_count); // the slot was freed
+    const nb = std.c.read(pair_b[1], &out, out.len);
+    try std.testing.expect(nb > 0);
+    const answer = try proto.Response.parse(out[0..@intCast(nb)]);
+    try std.testing.expectEqual(@as(u64, 907), answer.header.request_id);
+    try expectAnswer(answer, .unavailable, "not a voter");
 }
 
 test "Shard: a frame from a node the membership does not name is dropped, a join request is not, and the ids inside must be the sender's" {
