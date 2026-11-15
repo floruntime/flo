@@ -191,13 +191,17 @@ pub const ChannelOracle = struct {
     /// Messages waiting at the end on a receiver that is halted.
     held_by_halts: u64 = 0,
 
-    const Logged = struct { hash: u64, index: u64 };
+    const Logged = struct { hash: u64, index: u64, target: ?u16 = null };
 
     const Channel = struct {
         /// Each sent message, seq n at [n - 1], with the sender's index.
         sent: std.ArrayListUnmanaged(Logged) = .empty,
-        /// Each applied message, seq n at [n - 1], with the receiver's index.
+        /// Each applied message, seq n at [n - 1], with the receiver's index:
+        /// taken in, whether it applied then or parked.
         applied: std.ArrayListUnmanaged(Logged) = .empty,
+        /// Each message with a target that reached it, by seq, at the
+        /// receiver's index: on arrival, or from parking.
+        delivered: std.AutoHashMapUnmanaged(u64, u64) = .empty,
 
         fn appliedThrough(c: *const Channel) u64 {
             return c.applied.items.len;
@@ -212,6 +216,7 @@ pub const ChannelOracle = struct {
         for (&self.channels) |*row| for (row) |*c| {
             c.sent.deinit(self.allocator);
             c.applied.deinit(self.allocator);
+            c.delivered.deinit(self.allocator);
         };
         self.violations.deinit(self.allocator);
     }
@@ -223,7 +228,7 @@ pub const ChannelOracle = struct {
     /// The sender applied a send at `index`: seqs go up by one per channel.
     /// One already recorded is the sender's restart replaying its log, and
     /// must be the same send at the same index.
-    pub fn sent(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, hash: u64, index: u64) !void {
+    pub fn sent(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, hash: u64, index: u64, target: ?u16) !void {
         const c = &self.channels[from][to];
         if (seq >= 1 and seq <= c.sent.items.len) {
             const was = c.sent.items[seq - 1];
@@ -234,7 +239,26 @@ pub const ChannelOracle = struct {
             return self.fail(from, to, seq, "a sender's seqs skipped or repeated");
         }
         if (seq != c.sent.items.len + 1) return self.fail(from, to, seq, "a sender's seqs skipped or repeated");
-        try c.sent.append(self.allocator, .{ .hash = hash, .index = index });
+        try c.sent.append(self.allocator, .{ .hash = hash, .index = index, .target = target });
+    }
+
+    /// A message with a target reached it at the receiver's `index`: once,
+    /// and after every earlier message from its sender to the same target.
+    pub fn delivered(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, index: u64) !void {
+        const c = &self.channels[from][to];
+        if (c.delivered.get(seq)) |was| {
+            if (was == index) {
+                self.replays += 1;
+                return;
+            }
+            return self.fail(from, to, seq, "a parked message reached its target twice");
+        }
+        if (seq == 0 or seq > c.sent.items.len) return self.fail(from, to, seq, "a message reached its target that its sender doesn't hold");
+        const target = c.sent.items[seq - 1].target orelse return self.fail(from, to, seq, "a message without a target was delivered as one");
+        var it = c.delivered.keyIterator();
+        while (it.next()) |s| if (s.* > seq and c.sent.items[s.* - 1].target == target)
+            return self.fail(from, to, seq, "a message reached its target after a later one to it");
+        try c.delivered.put(self.allocator, seq, index);
     }
 
     /// The receiver applied a message at `index`. One already recorded at
@@ -277,6 +301,11 @@ pub const ChannelOracle = struct {
             var m = in.applied.items.len;
             while (m > 0 and in.applied.items[m - 1].index > keep) m -= 1;
             in.applied.shrinkRetainingCapacity(m);
+            var gone: std.ArrayListUnmanaged(u64) = .empty;
+            defer gone.deinit(self.allocator);
+            var it = in.delivered.iterator();
+            while (it.next()) |d| if (d.value_ptr.* > keep) gone.append(self.allocator, d.key_ptr.*) catch @panic("oracle OOM");
+            for (gone.items) |s| _ = in.delivered.remove(s);
         };
         for (kept, 0..) |k, g_| if (k) |keep| for (0..MAX_GROUPS) |peer_| {
             const g: GroupId = @intCast(g_);
@@ -291,6 +320,11 @@ pub const ChannelOracle = struct {
                 // the run goes on past it.
                 out.applied.shrinkRetainingCapacity(n);
             }
+            var lost: std.ArrayListUnmanaged(u64) = .empty;
+            defer lost.deinit(self.allocator);
+            var dit = out.delivered.keyIterator();
+            while (dit.next()) |s| if (s.* > n) lost.append(self.allocator, s.*) catch @panic("oracle OOM");
+            for (lost.items) |s| _ = out.delivered.remove(s);
             out.sent.shrinkRetainingCapacity(n);
         };
     }
@@ -302,6 +336,9 @@ pub const ChannelOracle = struct {
         for (&self.channels) |*row| for (row, 0..) |*c, to| {
             if (to < halted.len and halted[to]) continue;
             if (c.appliedThrough() < c.sent.items.len) return false;
+            for (c.sent.items[0..c.appliedThrough()], 1..) |s, seq| {
+                if (s.target != null and !c.delivered.contains(seq)) return false;
+            }
         };
         return true;
     }
@@ -316,6 +353,15 @@ pub const ChannelOracle = struct {
                 continue;
             }
             self.fail(@intCast(from), @intCast(to), c.appliedThrough() + 1, "a message its sender holds was never applied");
+        };
+        // Taken in and parked, but never reached its target.
+        for (&self.channels, 0..) |*row, from| for (row, 0..) |*c, to| {
+            if (to < halted.len and halted[to]) continue;
+            for (c.sent.items[0..c.appliedThrough()], 1..) |s, seq| {
+                if (s.target == null or c.delivered.contains(seq)) continue;
+                self.fail(@intCast(from), @intCast(to), seq, "a parked message never reached its target");
+                break;
+            }
         };
     }
 };
@@ -334,6 +380,8 @@ pub const Summary = struct {
     channel_applies: u64,
     channel_violations: usize,
     probes_proposed: u64,
+    /// Unparks the groups' leaders proposed: each a full target with room again.
+    unparks: u64,
     frames_refused: u64,
     flush_stalls: u64,
     held_by_halts: u64,
@@ -342,9 +390,19 @@ pub const Summary = struct {
 };
 
 pub const ChannelMutant = driver_mod.Mutant;
+/// The channels module, for the planted bugs that live there.
+pub const channels = channels_mod;
 
 const Probed = channels_mod.Channels(&.{probe.machine});
 const channel_machines = [_]machine_mod.Machine{ probe.machine, Probed.machine };
+
+/// A probe's target slot, or null for a fill or drain mark, which has none.
+fn probeTarget(payload: []const u8) ?u16 {
+    var diag: @import("../protocol/schema.zig").Diagnostic = .{};
+    const p = ce.Probe.decodeAll(payload, &diag) catch return null;
+    if (std.mem.startsWith(u8, p.body, "fill") or std.mem.startsWith(u8, p.body, "drai")) return null;
+    return p.slot;
+}
 
 /// One group's channels: the store its channel and probe machines keep,
 /// and its leader's driver. Its machines apply through the group's
@@ -357,6 +415,10 @@ pub const GroupChannel = struct {
     scratch: std.heap.ArenaAllocator,
     driver: driver_mod.Driver,
     probes_proposed: u64 = 0,
+    unparks: u64 = 0,
+    /// The unpark this group's leader last proposed: one at a time.
+    unpark_index: u64 = 0,
+    unpark_term: u64 = 0,
 
     fn init(allocator: Allocator, g: GroupId, count: u16) !GroupChannel {
         const driver = try driver_mod.Driver.init(allocator, g, count);
@@ -368,6 +430,7 @@ pub const GroupChannel = struct {
         };
         c.store.place = .{ .group = g, .count = count };
         c.store.strict_keys = true;
+        c.driver.admits = Probed.admits;
         return c;
     }
 
@@ -380,7 +443,8 @@ pub const GroupChannel = struct {
     fn owns(t: u8) bool {
         return t == @backingInt(entry_mod.EntryType.channel_probe) or
             t == @backingInt(entry_mod.EntryType.channel_inbound) or
-            t == @backingInt(entry_mod.EntryType.channel_trim);
+            t == @backingInt(entry_mod.EntryType.channel_trim) or
+            t == @backingInt(entry_mod.EntryType.channel_unpark);
     }
 
     fn applyHook(ctx: *anyopaque, _: @import("network.zig").NodeId, e: *const entry_mod.Entry) void {
@@ -428,8 +492,15 @@ pub const GroupChannel = struct {
             while (seq < now_next) : (seq += 1) {
                 var k: [channels_mod.OUT_KEY]u8 = undefined;
                 const out = (try c.read().get(channels_mod.OutFam, channels_mod.outKey(&k, b, seq))) orelse return error.Halt;
-                try o.sent(c.g, b, seq, std.hash.Wyhash.hash(0, out.v.payload), e.header.index);
+                try o.sent(c.g, b, seq, std.hash.Wyhash.hash(0, out.v.payload), e.header.index, probeTarget(out.v.payload));
             }
+        };
+        // What reached its target: a message applied on arrival, or one an
+        // unpark applied from parking.
+        if (etype == .channel_inbound or etype == .channel_unpark) for (c.store.messages.items) |msg| {
+            if (msg.entry.header.entry_type != @backingInt(entry_mod.EntryType.channel_probe)) continue;
+            if (probeTarget(msg.entry.payload) == null) continue;
+            try o.delivered(@intCast(msg.from), c.g, msg.seq, e.header.index);
         };
         if (inbound) |p| {
             const after = if (channels_mod.inOf(c.read(), p.from)) |x| x.applied else 0;
@@ -468,6 +539,28 @@ pub const GroupChannel = struct {
         if (!c.leads()) return;
         const sim = &c.groups.sims[c.g];
         c.driver.tick(c.groups.now(), c.read(), sim.durableIndex(NODE), Io{ .c = c });
+        // Its parked targets with room, one unpark at a time.
+        if (sim.isHalted(NODE)) return;
+        if (c.unpark_term == sim.termOf(NODE) and c.unpark_index > sim.appliedIndex(NODE)) return;
+        if (!c.driver.buffers()) return;
+        const entry = Probed.nextUnpark(c.read(), c.driver.buf, c.driver.msgs) orelse return;
+        if (!sim.proposeOn(NODE, .channel_unpark, entry)) return;
+        c.unpark_term = sim.termOf(NODE);
+        c.unpark_index = sim.lastIndex(NODE);
+        c.unparks += 1;
+    }
+
+    /// Slots most probes go to, so a target is written again while it is
+    /// full, and parks.
+    const POOL = [_]u16{ 7, 101, 202, 303, 404, 505, 606, 707, 808, 909, 1111, 1212, 1313, 1414, 1515, 1616 };
+
+    /// A fill or drain mark to a pool slot: `kind` is "fill" or "drain".
+    fn proposeMark(c: *GroupChannel, kind: []const u8, slot: u16) void {
+        var body: [16]u8 = undefined;
+        _ = std.fmt.bufPrint(&body, "{s}{d:0>2}{d:0>10}", .{ kind[0..4], c.g, c.probes_proposed }) catch return;
+        var buf: [64]u8 = undefined;
+        const payload = ce.Probe.encodeInto(&buf, .{ .slot = slot, .body = &body }) catch return;
+        if (c.groups.sims[c.g].proposeOn(NODE, .channel_probe, payload)) c.probes_proposed += 1;
     }
 
     fn take(c: *GroupChannel, f: Frame) void {
@@ -484,8 +577,13 @@ pub const GroupChannel = struct {
         _ = std.fmt.bufPrint(body[0..16], "g{d:0>2}-{d:0>12}", .{ c.g, c.probes_proposed }) catch return;
         const extra = r.uintAtMost(usize, 48);
         r.bytes(body[16..][0..extra]);
+        // Now and then a pool slot fills, and more often drains.
+        const roll = r.uintLessThan(u8, 100);
+        if (roll < 3) return c.proposeMark("fill", POOL[r.uintLessThan(usize, POOL.len)]);
+        if (roll < 8) return c.proposeMark("drai", POOL[r.uintLessThan(usize, POOL.len)]);
+        const slot = if (r.uintLessThan(u8, 4) == 0) r.uintLessThan(u16, 4096) else POOL[r.uintLessThan(usize, POOL.len)];
         var buf: [128]u8 = undefined;
-        const payload = ce.Probe.encodeInto(&buf, .{ .slot = r.uintLessThan(u16, 4096), .body = body[0 .. 16 + extra] }) catch return;
+        const payload = ce.Probe.encodeInto(&buf, .{ .slot = slot, .body = body[0 .. 16 + extra] }) catch return;
         if (c.groups.sims[c.g].proposeOn(NODE, .channel_probe, payload)) c.probes_proposed += 1;
     }
 };
@@ -633,6 +731,17 @@ pub const Groups = struct {
         if (up and self.probe_every > 0 and !self.converging) for (self.chans) |*c| {
             if (self.probe_prng.random().uintLessThan(u32, self.probe_every) == 0) c.proposeProbe(self.probe_prng.random());
         };
+        // In convergence a pool slot still full at its owner is drained, so
+        // no message stays parked at the end; one drained once is never
+        // filled again, so this stops by itself.
+        if (up and self.probe_every > 0 and self.converging and self.now() % 1_000 == 0) for (GroupChannel.POOL) |slot| {
+            const owner = &self.chans[slot % self.chans.len];
+            if (!probe.slotFull(owner.read(), slot)) continue;
+            for (self.chans) |*c| if (c.leads()) {
+                c.proposeMark("drai", slot);
+                break;
+            };
+        };
         self.delivery.clearRetainingCapacity();
         try self.mailbox.deliverDue(self.now(), &self.delivery);
         while (self.delivery.items.len > 0) {
@@ -705,6 +814,11 @@ pub const Groups = struct {
             .flush_stalls = self.flush_stalls,
             .held_by_halts = self.oracle.held_by_halts,
             .left_in_mailbox = self.mailbox.queue.items.len,
+            .unparks = unparks: {
+                var n: u64 = 0;
+                for (self.chans) |*c| n += c.unparks;
+                break :unparks n;
+            },
             .channel_violations = self.oracle.violations.items.len,
         };
     }
@@ -806,8 +920,8 @@ test "vopr groups: the channel oracle holds a channel to exactly once, in order"
             .detail = "",
             .run = struct {
                 fn f(o: *ChannelOracle) !void {
-                    try o.sent(0, 1, 1, 11, 5);
-                    try o.sent(0, 1, 2, 12, 6);
+                    try o.sent(0, 1, 1, 11, 5, null);
+                    try o.sent(0, 1, 2, 12, 6, null);
                     try o.applied(0, 1, 1, 11, 3);
                     // The receiver's crash kept its log through 2: the apply at
                     // 3 is gone, effect and all, and it takes the message again.
@@ -825,7 +939,7 @@ test "vopr groups: the channel oracle holds a channel to exactly once, in order"
                     // The receiver's crash kept the apply at 3, so its effect
                     // survived; taking the message again applies it twice, even
                     // if its machine lost its record of the apply.
-                    try o.sent(0, 1, 1, 11, 5);
+                    try o.sent(0, 1, 1, 11, 5, null);
                     try o.applied(0, 1, 1, 11, 3);
                     o.recovered(1, 3);
                     try o.applied(0, 1, 1, 11, 4);
@@ -834,8 +948,8 @@ test "vopr groups: the channel oracle holds a channel to exactly once, in order"
         },
         .{ .detail = "applied a message past a gap", .run = struct {
             fn f(o: *ChannelOracle) !void {
-                try o.sent(0, 1, 1, 11, 1);
-                try o.sent(0, 1, 2, 12, 2);
+                try o.sent(0, 1, 1, 11, 1, null);
+                try o.sent(0, 1, 2, 12, 2, null);
                 try o.applied(0, 1, 2, 12, 1);
             }
         }.f },
@@ -846,7 +960,7 @@ test "vopr groups: the channel oracle holds a channel to exactly once, in order"
         }.f },
         .{ .detail = "applied another message than the one sent at its seq", .run = struct {
             fn f(o: *ChannelOracle) !void {
-                try o.sent(0, 1, 1, 11, 1);
+                try o.sent(0, 1, 1, 11, 1, null);
                 try o.applied(0, 1, 1, 99, 1);
             }
         }.f },
@@ -856,7 +970,7 @@ test "vopr groups: the channel oracle holds a channel to exactly once, in order"
                 fn f(o: *ChannelOracle) !void {
                     // Delivered before its send was durable, then the sender's
                     // crash took the send.
-                    try o.sent(0, 1, 1, 11, 7);
+                    try o.sent(0, 1, 1, 11, 7, null);
                     try o.applied(0, 1, 1, 11, 2);
                     o.recovered(0, 6);
                 }
@@ -864,13 +978,13 @@ test "vopr groups: the channel oracle holds a channel to exactly once, in order"
         },
         .{ .detail = "a message its sender holds was never applied", .run = struct {
             fn f(o: *ChannelOracle) !void {
-                try o.sent(1, 0, 1, 11, 1);
+                try o.sent(1, 0, 1, 11, 1, null);
                 o.finish(&.{});
             }
         }.f },
         .{ .detail = "a sender's seqs skipped or repeated", .run = struct {
             fn f(o: *ChannelOracle) !void {
-                try o.sent(0, 1, 2, 12, 1);
+                try o.sent(0, 1, 2, 12, 1, null);
             }
         }.f },
     };
@@ -895,7 +1009,7 @@ test "vopr groups: a crash that takes a send and its apply together is no violat
         defer o.deinit();
         // The sender sends seq 1 at its index 7, the receiver applies it at
         // its 3; the crash keeps the sender through 6, the receiver through 2.
-        try o.sent(sender, receiver, 1, 11, 7);
+        try o.sent(sender, receiver, 1, 11, 7, null);
         try o.applied(sender, receiver, 1, 11, 3);
         var kept: [MAX_GROUPS]?u64 = @splat(null);
         kept[sender] = 6;
@@ -903,7 +1017,7 @@ test "vopr groups: a crash that takes a send and its apply together is no violat
         o.recoveredAll(&kept);
         try testing.expectEqual(@as(usize, 0), o.violations.items.len);
         // Both start over: the send again, at the sender's next index.
-        try o.sent(sender, receiver, 1, 12, 7);
+        try o.sent(sender, receiver, 1, 12, 7, null);
         try o.applied(sender, receiver, 1, 12, 3);
         o.finish(&.{});
         try testing.expectEqual(@as(usize, 0), o.violations.items.len);
@@ -913,8 +1027,8 @@ test "vopr groups: a crash that takes a send and its apply together is no violat
 test "vopr groups: a clean restart's replay reports what was recorded, and nothing else passes for one" {
     var o = ChannelOracle.init(testing.allocator);
     defer o.deinit();
-    try o.sent(0, 1, 1, 11, 4);
-    try o.sent(0, 1, 2, 12, 5);
+    try o.sent(0, 1, 1, 11, 4, null);
+    try o.sent(0, 1, 2, 12, 5, null);
     try o.applied(0, 1, 1, 11, 2);
     try o.applied(0, 1, 2, 12, 3);
     // A crash that kept everything, then replay from index 1: every report
@@ -925,18 +1039,18 @@ test "vopr groups: a clean restart's replay reports what was recorded, and nothi
     o.recoveredAll(&kept);
     try o.applied(0, 1, 1, 11, 2);
     try o.applied(0, 1, 2, 12, 3);
-    try o.sent(0, 1, 1, 11, 4);
-    try o.sent(0, 1, 2, 12, 5);
+    try o.sent(0, 1, 1, 11, 4, null);
+    try o.sent(0, 1, 2, 12, 5, null);
     try testing.expectEqual(@as(u64, 4), o.replays);
     try testing.expectEqual(@as(usize, 0), o.violations.items.len);
     // Traffic after the restart goes on as before.
-    try o.sent(0, 1, 3, 13, 6);
+    try o.sent(0, 1, 3, 13, 6, null);
     try o.applied(0, 1, 3, 13, 4);
     o.finish(&.{});
     try testing.expectEqual(@as(usize, 0), o.violations.items.len);
     // A replay that isn't what was recorded is caught: another send at a
     // recorded seq, or a recorded message applied at another index.
-    try o.sent(0, 1, 2, 99, 5);
+    try o.sent(0, 1, 2, 99, 5, null);
     try o.applied(0, 1, 1, 11, 9);
     try testing.expectEqual(@as(usize, 2), o.violations.items.len);
     try testing.expectEqualStrings("a sender's seqs skipped or repeated", o.violations.items[0].detail);

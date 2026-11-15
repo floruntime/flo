@@ -2694,6 +2694,15 @@ pub const Simulator = struct {
         return self.nodes[id - 1].raft.current_term;
     }
 
+    /// What node `id` has applied, and the last index its log holds.
+    pub fn appliedIndex(self: *const Simulator, id: NodeId) u64 {
+        return self.nodes[id - 1].raft.last_applied;
+    }
+
+    pub fn lastIndex(self: *const Simulator, id: NodeId) u64 {
+        return self.nodes[id - 1].raft.log.lastIndex();
+    }
+
     /// Proposes an entry on node `id`'s log, as a duty does; false when
     /// it isn't taken.
     pub fn proposeOn(self: *Simulator, id: NodeId, etype: entry_mod.EntryType, payload: []const u8) bool {

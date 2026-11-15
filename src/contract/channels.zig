@@ -95,7 +95,116 @@ pub const OutFam = view_mod.Family(55, "channel.out", Stored(Out));
 pub const MetaFam = view_mod.Family(56, "channel.out_meta", Stored(Meta));
 pub const InFam = view_mod.Family(57, "channel.in", Stored(In));
 
-pub const families = [_]machine_mod.FamilyInfo{ machine_mod.info(OutFam), machine_mod.info(MetaFam), machine_mod.info(InFam) };
+/// A message parked under its target, which was full for it (`park`); a
+/// target's count of parked messages and bytes, and since when it has had
+/// any; and the shard's totals. One record shape for all three, by key:
+/// `p` target from seq, `m` target, and `t`.
+pub const Parked = Record(&.{
+    .{ .name = "entry_type", .T = Int(u8) },
+    .{ .name = "flags", .T = Int(u16) },
+    // A parked message: when it parked. A target's: since when it has had
+    // any parked, without a break.
+    .{ .name = "since_ns", .T = Int(u64) },
+    .{ .name = "count", .T = Int(u64) },
+    .{ .name = "bytes", .T = Int(u64) },
+    .{ .name = "payload", .T = schema.Bytes(ce.MAX_MESSAGE_PAYLOAD) },
+});
+
+pub const ParkFam = view_mod.Family(59, "channel.parked", Stored(Parked));
+
+pub const families = [_]machine_mod.FamilyInfo{ machine_mod.info(OutFam), machine_mod.info(MetaFam), machine_mod.info(InFam), machine_mod.info(ParkFam) };
+
+/// Parked keys live under a namespace of their own, so an unpark can declare
+/// the range of one target's parked messages.
+pub const PARK_NS = "~park";
+/// Most parked bytes under one target, and in a shard. Past either, its
+/// receiver answers `busy` for that target's messages (`admits`).
+pub const PARKED_TARGET_MAX: u64 = 16 << 20;
+pub const PARKED_SHARD_MAX: u64 = 128 << 20;
+/// Tests lower the target cap rather than park 16 MiB.
+pub var test_parked_target_max: ?u64 = null;
+/// VOPR's planted bug `no_park_behind`: a message for a target with room is
+/// applied even while earlier ones to it are parked. Never set in a server.
+pub var mutant_no_park_behind = false;
+
+const Target = [ce.TARGET_LEN]u8;
+
+fn parkedRaw(buf: *[1 + ce.TARGET_LEN + 2 + 8]u8, target: Target, from: u16, seq: u64) []const u8 {
+    buf[0] = 'p';
+    buf[1..][0..ce.TARGET_LEN].* = target;
+    std.mem.writeInt(u16, buf[1 + ce.TARGET_LEN ..][0..2], from, .big);
+    std.mem.writeInt(u64, buf[1 + ce.TARGET_LEN + 2 ..][0..8], seq, .big);
+    return buf;
+}
+
+fn targetRaw(buf: *[1 + ce.TARGET_LEN]u8, target: Target) []const u8 {
+    buf[0] = 'm';
+    buf[1..].* = target;
+    return buf;
+}
+
+const TOTALS_RAW = "t";
+
+/// A parked key as the family stores it: under `PARK_NS`.
+fn parkKey(buf: []u8, raw: []const u8) []const u8 {
+    return view_mod.key(buf, PARK_NS, raw) catch unreachable;
+}
+
+const PARK_KEY_MAX = 1 + PARK_NS.len + 1 + ce.TARGET_LEN + 2 + 8;
+
+const empty_parked: Parked.Value = .{ .entry_type = 0, .flags = 0, .since_ns = 0, .count = 0, .bytes = 0, .payload = "" };
+
+/// A target's parked count, bytes and since; zeros for none.
+pub fn targetParked(read: ReadView, target: Target) Parked.Value {
+    var rb: [1 + ce.TARGET_LEN]u8 = undefined;
+    var kb: [PARK_KEY_MAX]u8 = undefined;
+    const v = read.get(ParkFam, parkKey(&kb, targetRaw(&rb, target))) catch null;
+    return if (v) |x| x.v else empty_parked;
+}
+
+/// The shard's parked count and bytes; zeros for none.
+pub fn shardParked(read: ReadView) Parked.Value {
+    var kb: [PARK_KEY_MAX]u8 = undefined;
+    const v = read.get(ParkFam, parkKey(&kb, TOTALS_RAW)) catch null;
+    return if (v) |x| x.v else empty_parked;
+}
+
+/// The keys parking a message under `target` may touch.
+fn parkKeys(out: *KeySet, target: Target, from: u16, seq: u64) error{OutOfMemory}!void {
+    var pb: [1 + ce.TARGET_LEN + 2 + 8]u8 = undefined;
+    var rb: [1 + ce.TARGET_LEN]u8 = undefined;
+    try out.add(ParkFam.ID, PARK_NS, parkedRaw(&pb, target, from, seq));
+    try out.add(ParkFam.ID, PARK_NS, targetRaw(&rb, target));
+    try out.add(ParkFam.ID, PARK_NS, TOTALS_RAW);
+}
+
+/// Parks a message under `target`: kept whole, by sender and seq, until an
+/// unpark applies it. `stamp` is when.
+fn park(view: *View, target: Target, from: u16, seq: u64, m: ce.Message.Value, stamp: u64) ApplyError!void {
+    var pb: [1 + ce.TARGET_LEN + 2 + 8]u8 = undefined;
+    var kb: [PARK_KEY_MAX]u8 = undefined;
+    try view.put(ParkFam, parkKey(&kb, parkedRaw(&pb, target, from, seq)), .{ .v = .{ .entry_type = m.entry_type, .flags = m.flags, .since_ns = stamp, .count = 1, .bytes = m.payload.len, .payload = m.payload } });
+    try addParked(view, target, 1, @intCast(m.payload.len), stamp);
+}
+
+/// Moves a target's and the shard's parked counts by `n` messages of
+/// `bytes`, up or down.
+fn addParked(view: *View, target: Target, n: i64, bytes: i64, stamp: u64) ApplyError!void {
+    var rb: [1 + ce.TARGET_LEN]u8 = undefined;
+    var kb: [PARK_KEY_MAX]u8 = undefined;
+    const tk = parkKey(&kb, targetRaw(&rb, target));
+    var t: Parked.Value = if (try view.get(ParkFam, tk)) |v| v.v else empty_parked;
+    if (t.count == 0) t.since_ns = stamp;
+    t.count = @intCast(@as(i64, @intCast(t.count)) + n);
+    t.bytes = @intCast(@as(i64, @intCast(t.bytes)) + bytes);
+    if (t.count == 0) try view.delete(ParkFam, tk) else try view.put(ParkFam, tk, .{ .v = t });
+    var sb: [PARK_KEY_MAX]u8 = undefined;
+    const sk = parkKey(&sb, TOTALS_RAW);
+    var s: Parked.Value = if (try view.get(ParkFam, sk)) |v| v.v else empty_parked;
+    s.count = @intCast(@as(i64, @intCast(s.count)) + n);
+    s.bytes = @intCast(@as(i64, @intCast(s.bytes)) + bytes);
+    if (s.count == 0) try view.delete(ParkFam, sk) else try view.put(ParkFam, sk, .{ .v = s });
+}
 
 // ─── Keys ──────────────────────────────────────────────────────────────────
 
@@ -214,6 +323,23 @@ fn typeOf(e: *const Entry) ?EntryType {
     return std.enums.fromInt(EntryType, e.header.entry_type);
 }
 
+/// How many messages `target` has parked, as this view sees it.
+fn targetParkedIn(view: *View, target: Target) ApplyError!u64 {
+    var rb: [1 + ce.TARGET_LEN]u8 = undefined;
+    var kb: [PARK_KEY_MAX]u8 = undefined;
+    return if (try view.get(ParkFam, parkKey(&kb, targetRaw(&rb, target)))) |v| v.v.count else 0;
+}
+
+/// A parked message as the entry its target applies: the unpark's header,
+/// with the message's type, flags and payload.
+fn unparkedEntry(e: *const Entry, u: ce.Unparked.Value) Entry {
+    var h = e.header;
+    h.entry_type = u.entry_type;
+    h.flags = u.flags;
+    h.payload_len = @intCast(u.payload.len);
+    return .{ .header = h, .payload = u.payload };
+}
+
 /// A message as the entry its target applies: the inbound's header, with
 /// the message's type, flags and payload.
 fn asEntry(e: *const Entry, m: ce.Message.Value) Entry {
@@ -265,11 +391,36 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                     const b = peerBytes(p.from);
                     try out.add(InFam.ID, "", &b);
                     var it = p.messages.iterator();
-                    while (it.next() catch return) |m| {
+                    var seq = p.first_seq;
+                    while (it.next() catch return) |m| : (seq += 1) {
                         const t = std.enums.fromInt(EntryType, m.entry_type) orelse continue;
                         const owner = machine_mod.ownerOf(targets, t) orelse continue;
                         const as = asEntry(e, m);
                         try owner.keys(&as, out);
+                        // One it may park.
+                        if (owner.target) |tf| if (tf(&as)) |target| try parkKeys(out, target, p.from, seq);
+                    }
+                },
+                .channel_unpark => {
+                    const p = ce.Unpark.decodeAll(e.payload, &diag) catch return;
+                    if (p.target.len != ce.TARGET_LEN) return;
+                    const target: Target = p.target[0..ce.TARGET_LEN].*;
+                    // Each sender's parked messages under the target, to
+                    // check each is its sender's next.
+                    var rb: [1 + ce.TARGET_LEN]u8 = undefined;
+                    _ = targetRaw(&rb, target);
+                    rb[0] = 'p';
+                    out.addRange(ParkFam.ID, PARK_NS, &rb) catch |err| switch (err) {
+                        error.NoNamespace => unreachable,
+                        else => |o| return o,
+                    };
+                    var it = p.messages.iterator();
+                    while (it.next() catch return) |u| {
+                        const t = std.enums.fromInt(EntryType, u.entry_type) orelse continue;
+                        const owner = machine_mod.ownerOf(targets, t) orelse continue;
+                        const as = unparkedEntry(e, u);
+                        try owner.keys(&as, out);
+                        try parkKeys(out, target, u.from, u.seq);
                     }
                 },
                 .channel_trim => {
@@ -291,6 +442,7 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
             switch (typeOf(e) orelse return error.Halt) {
                 .channel_inbound => try applyInbound(view, e),
                 .channel_trim => try applyTrim(view, e),
+                .channel_unpark => try applyUnpark(view, e),
                 else => {},
             }
             _ = out;
@@ -344,17 +496,191 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                         bug = .bad_payload;
                     }
                 } else if (owner) |o| {
+                    const target = if (o.target) |tf| tf(&as) else null;
+                    // A target with messages parked takes this one after
+                    // them: it parks behind, even if it has room now.
+                    if (target != null and !mutant_no_park_behind and try targetParkedIn(view, target.?) > 0) {
+                        try park(view, target.?, p.from, seq, m, e.header.timestamp_ns);
+                        applied = seq;
+                        continue;
+                    }
                     try o.apply(view, &as, &r);
+                    // A sink's write its target is full for: parked, not
+                    // lost; it takes its seq, and the channel goes on.
+                    if (target != null and m.flags & entry_mod.Flags.SINK != 0) if (r.refused()) |rf| if (rf.status == .overloaded) {
+                        try view.rollback(mark);
+                        try park(view, target.?, p.from, seq, m, e.header.timestamp_ns);
+                        applied = seq;
+                        continue;
+                    };
                     // Its sends are held to an apply's limits on their own,
                     // and leave with it.
                     if (r.refused() == null) if (tooMuchSent(view.sends.items[mark.sends..])) |why| r.refuse(.bad_request, .malformed, why);
                 }
                 if (r.refused() != null) try view.rollback(mark) else try writeSends(view, e.header.index);
-                try store.messages.append(store.allocator, .{ .entry = as, .result = r, .ordinal = ordinal, .after_commit = later and r.refused() == null, .from = p.from, .sender_bug = bug });
+                try store.messages.append(store.allocator, .{ .entry = as, .result = r, .ordinal = ordinal, .after_commit = later and r.refused() == null, .from = p.from, .seq = seq, .sender_bug = bug });
                 applied = seq;
             }
             if (before != null and applied == before.?.applied) return;
             try view.put(InFam, in_key, .{ .v = try withPoint(view.arena, before, applied, e.header.index) });
+        }
+
+        /// A target's parked messages its leader saw room for: each still its
+        /// sender's next parked one is applied through its machine, as it
+        /// would have been on arrival, in order, until one doesn't fit.
+        /// That one and those after stay parked. One its target refuses for
+        /// good leaves parking refused, reported as any message is.
+        fn applyUnpark(view: *View, e: *const Entry) ApplyError!void {
+            var diag: schema.Diagnostic = .{};
+            const store = view.store;
+            store.messages.clearRetainingCapacity();
+            const p = ce.Unpark.decodeAll(e.payload, &diag) catch return error.Halt;
+            if (p.target.len != ce.TARGET_LEN) return error.Halt;
+            const target: Target = p.target[0..ce.TARGET_LEN].*;
+            var ordinal: u8 = 0;
+            var it = p.messages.iterator();
+            while (it.next() catch return error.Halt) |u| : (ordinal += 1) {
+                var pb: [1 + ce.TARGET_LEN + 2 + 8]u8 = undefined;
+                var kb: [PARK_KEY_MAX]u8 = undefined;
+                const raw = parkedRaw(&pb, target, u.from, u.seq);
+                const key = parkKey(&kb, raw);
+                // Applied by an earlier unpark, or not its sender's next: a
+                // stale unpark stops here, and changes nothing more.
+                if (try view.get(ParkFam, key) == null) break;
+                if (!try firstOfSender(view, raw)) break;
+                const t = std.enums.fromInt(EntryType, u.entry_type) orelse return error.Halt;
+                const owner = machine_mod.ownerOf(targets, t) orelse return error.Halt;
+                const as = unparkedEntry(e, u);
+                const mark = view.mark();
+                view.message = .{ .from = u.from, .seq = u.seq, .ordinal = ordinal };
+                defer view.message = null;
+                var r = Result.start(&as);
+                try owner.apply(view, &as, &r);
+                if (r.refused()) |rf| if (rf.status == .overloaded) {
+                    try view.rollback(mark);
+                    break;
+                };
+                if (r.refused() == null) if (tooMuchSent(view.sends.items[mark.sends..])) |why| r.refuse(.bad_request, .malformed, why);
+                if (r.refused() != null) try view.rollback(mark) else try writeSends(view, e.header.index);
+                try view.delete(ParkFam, key);
+                try addParked(view, target, -1, -@as(i64, @intCast(u.payload.len)), e.header.timestamp_ns);
+                try store.messages.append(store.allocator, .{ .entry = as, .result = r, .ordinal = ordinal, .from = u.from, .seq = u.seq });
+            }
+        }
+
+        /// A message as an entry, for its machine's `target` and `room`,
+        /// which read only its type and payload.
+        fn bare(etype: u8, flags: u16, payload: []const u8) Entry {
+            var h = std.mem.zeroes(entry_mod.Header);
+            h.entry_type = etype;
+            h.flags = flags;
+            h.payload_len = @intCast(payload.len);
+            return .{ .header = h, .payload = payload };
+        }
+
+        /// Whether this group's leader takes message `m` in now. One whose
+        /// target has messages parked would park too, so past the target's
+        /// or the shard's parked cap it waits at its sender (`busy`); every
+        /// other message is taken, so only that target pushes back.
+        pub fn admits(read: ReadView, m: ce.Message.Value) bool {
+            const t = std.enums.fromInt(EntryType, m.entry_type) orelse return true;
+            const owner = machine_mod.ownerOf(targets, t) orelse return true;
+            const tf = owner.target orelse return true;
+            const as = bare(m.entry_type, m.flags, m.payload);
+            const target = tf(&as) orelse return true;
+            const parked = targetParked(read, target);
+            if (parked.count == 0) return true;
+            return parked.bytes < (test_parked_target_max orelse PARKED_TARGET_MAX) and shardParked(read).bytes < PARKED_SHARD_MAX;
+        }
+
+        /// What this group has parked: messages, bytes, targets, and the
+        /// target that has had some parked longest, named into `buf`.
+        pub const Summary = struct { messages: u64 = 0, bytes: u64 = 0, targets: u64 = 0, oldest_since_ns: u64 = 0, oldest: []const u8 = "" };
+
+        pub fn parkedSummary(read: ReadView, buf: []u8) Summary {
+            const totals = shardParked(read);
+            var s: Summary = .{ .messages = totals.count, .bytes = totals.bytes };
+            if (totals.count == 0) return s;
+            var mk: [PARK_KEY_MAX]u8 = undefined;
+            var it = read.range(ParkFam, parkKey(&mk, "m"));
+            var oldest_target: ?Target = null;
+            while (it.next() catch null) |rec| {
+                const raw = rec.key[1 + PARK_NS.len ..];
+                if (raw.len != 1 + ce.TARGET_LEN) continue;
+                s.targets += 1;
+                if (oldest_target == null or rec.value.v.since_ns < s.oldest_since_ns) {
+                    s.oldest_since_ns = rec.value.v.since_ns;
+                    oldest_target = raw[1..][0..ce.TARGET_LEN].*;
+                }
+            }
+            // Named from its first parked message, as its machine names it.
+            if (oldest_target) |t| {
+                var pb: [1 + ce.TARGET_LEN]u8 = undefined;
+                pb[0] = 'p';
+                pb[1..].* = t;
+                var kb: [PARK_KEY_MAX]u8 = undefined;
+                var pit = read.range(ParkFam, parkKey(&kb, &pb));
+                if (pit.next() catch null) |first| {
+                    if (std.enums.fromInt(EntryType, first.value.v.entry_type)) |et| if (machine_mod.ownerOf(targets, et)) |owner| if (owner.label) |label| {
+                        const as = bare(first.value.v.entry_type, first.value.v.flags, first.value.v.payload);
+                        s.oldest = label(&as, buf);
+                    };
+                }
+            }
+            return s;
+        }
+
+        /// The unpark this group's leader should propose next, encoded in
+        /// `buf` (over a message list built in `msgs`), or null: the first
+        /// target with parked messages whose first one has room now, with
+        /// its parked messages in order, as many as one entry takes. Apply
+        /// decides how many of them fit.
+        pub fn nextUnpark(read: ReadView, buf: []u8, msgs: []u8) ?[]const u8 {
+            var mk: [PARK_KEY_MAX]u8 = undefined;
+            var targets_it = read.range(ParkFam, parkKey(&mk, "m"));
+            while (targets_it.next() catch return null) |rec| {
+                const raw = rec.key[1 + PARK_NS.len ..];
+                if (raw.len != 1 + ce.TARGET_LEN) continue;
+                const target: Target = raw[1..][0..ce.TARGET_LEN].*;
+                var pb: [1 + ce.TARGET_LEN]u8 = undefined;
+                pb[0] = 'p';
+                pb[1..].* = target;
+                var kb: [PARK_KEY_MAX]u8 = undefined;
+                var it = read.range(ParkFam, parkKey(&kb, &pb));
+                var w: schema.Writer = .{ .buf = msgs };
+                var n: u32 = 0;
+                var bytes: usize = 0;
+                while (it.next() catch return null) |p| {
+                    const praw = p.key[1 + PARK_NS.len ..];
+                    const from = std.mem.readInt(u16, praw[1 + ce.TARGET_LEN ..][0..2], .big);
+                    const seq = std.mem.readInt(u64, praw[1 + ce.TARGET_LEN + 2 ..][0..8], .big);
+                    if (n == 0) {
+                        const t = std.enums.fromInt(EntryType, p.value.v.entry_type) orelse break;
+                        const owner = machine_mod.ownerOf(targets, t) orelse break;
+                        const room = owner.room orelse break;
+                        const as = bare(p.value.v.entry_type, p.value.v.flags, p.value.v.payload);
+                        if (!room(read, &as)) break;
+                    }
+                    if (n == ce.MAX_BATCH or (n > 0 and bytes + p.value.v.payload.len > MAX_SEND_BYTES)) break;
+                    ce.Unparked.encode(&w, .{ .from = from, .seq = seq, .entry_type = p.value.v.entry_type, .flags = p.value.v.flags, .payload = p.value.v.payload }) catch break;
+                    n += 1;
+                    bytes += p.value.v.payload.len;
+                }
+                if (n == 0) continue;
+                return ce.Unpark.encodeInto(buf, .{ .target = &target, .messages = .{ .bytes = w.written(), .count = n } }) catch null;
+            }
+            return null;
+        }
+
+        /// Whether `raw` is the first parked key of its sender under its
+        /// target: per-sender order.
+        fn firstOfSender(view: *View, raw: []const u8) ApplyError!bool {
+            var kb: [PARK_KEY_MAX]u8 = undefined;
+            const prefix = parkKey(&kb, raw[0 .. 1 + ce.TARGET_LEN + 2]);
+            var it = try view.range(ParkFam, prefix);
+            const first = (try it.next()) orelse return false;
+            var fb: [PARK_KEY_MAX]u8 = undefined;
+            return std.mem.eql(u8, first.key, parkKey(&fb, raw));
         }
 
         fn applyTrim(view: *View, e: *const Entry) ApplyError!void {
@@ -379,7 +705,7 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
 
         pub const machine: machine_mod.Machine = .{
             .name = "channels",
-            .entry_types = &.{ .channel_inbound, .channel_trim },
+            .entry_types = &.{ .channel_inbound, .channel_trim, .channel_unpark },
             .families = &families,
             .keys = keys,
             .apply = apply,
@@ -722,6 +1048,139 @@ test "channels: a message carrying a flag no message may carry halts its inbound
     try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, inbound));
     try testing.expect(b.got("message-one-0001") == null);
     try testing.expect(inOf(b.read(), 0) == null);
+}
+
+/// The inbound of `a`'s outbox to `b` from `first` through `last`, applied
+/// by `b`.
+fn deliver(a: *Group, b: *Group, first: u64, last: u64) !void {
+    var buf: [8192]u8 = undefined;
+    _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(a, 0, 1, first, last - first + 1, &buf));
+}
+
+/// `b`'s next unpark, applied; false if it has none.
+fn unparkNext(b: *Group) !bool {
+    var buf: [8192]u8 = undefined;
+    var msgs: [8192]u8 = undefined;
+    const entry = Probed.nextUnpark(b.read(), &buf, &msgs) orelse return false;
+    _ = try b.run(&Probed.machine, .channel_unpark, entry);
+    return true;
+}
+
+fn probeTarget(slot: u16) Target {
+    var t: Target = @splat(0);
+    t[0..5].* = "probe".*;
+    std.mem.writeInt(u16, t[5..7], slot, .big);
+    return t;
+}
+
+test "channels: a sink's message to a full target parks, later ones for it park behind, and other targets go on" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    var b = Group.init(1, 2);
+    defer b.deinit();
+    try a.probeTo(1, "fill-slot1-00001");
+    try a.probeTo(1, "message-two-0002");
+    try a.probeTo(3, "message-thr-0003");
+    try a.probeTo(1, "message-fou-0004");
+    try deliver(&a, &b, 1, 4);
+    // Every message took its seq: the channel goes on.
+    try testing.expectEqual(@as(u64, 4), inOf(b.read(), 0).?.applied);
+    try testing.expect(b.got("message-two-0002") == null);
+    try testing.expect(b.got("message-fou-0004") == null);
+    // Slot 3 is another target: applied at once.
+    try testing.expectEqual(Got{ .from = 0, .seq = 3 }, b.got("message-thr-0003").?);
+    try testing.expectEqual(@as(u64, 2), targetParked(b.read(), probeTarget(1)).count);
+    try testing.expectEqual(@as(u64, 2), shardParked(b.read()).count);
+    // Still full: nothing to unpark.
+    try testing.expect(!try unparkNext(&b));
+    // Drained: one unpark applies both, in order, and parking empties.
+    try a.probeTo(1, "drain-slot1-0005");
+    try deliver(&a, &b, 5, 5);
+    try testing.expect(try unparkNext(&b));
+    try testing.expectEqual(Got{ .from = 0, .seq = 2 }, b.got("message-two-0002").?);
+    try testing.expectEqual(Got{ .from = 0, .seq = 4 }, b.got("message-fou-0004").?);
+    try testing.expectEqual(@as(u64, 0), targetParked(b.read(), probeTarget(1)).count);
+    try testing.expectEqual(@as(u64, 0), shardParked(b.read()).count);
+    try testing.expect(!try unparkNext(&b));
+}
+
+test "channels: a message parked behind others parks even with room, and one its target refuses for good leaves parking refused" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    var b = Group.init(1, 2);
+    defer b.deinit();
+    try a.probeTo(1, "fill-slot1-00001");
+    try a.probeTo(1, "message-two-0002");
+    try a.probeTo(1, "drain-slot1-0003");
+    // Room again, but a message is parked: this one parks behind it.
+    try a.probeTo(1, "refuse-this-0004");
+    try a.probeTo(1, "message-fiv-0005");
+    try deliver(&a, &b, 1, 5);
+    try testing.expectEqual(@as(u64, 3), targetParked(b.read(), probeTarget(1)).count);
+    try testing.expect(try unparkNext(&b));
+    try testing.expectEqual(@as(u64, 0), targetParked(b.read(), probeTarget(1)).count);
+    try testing.expect(b.got("message-two-0002") != null);
+    try testing.expect(b.got("refuse-this-0004") == null);
+    try testing.expect(b.got("message-fiv-0005") != null);
+    // Reported in order, the refused one with its refusal.
+    const reported = b.store.messages.items;
+    try testing.expectEqual(@as(usize, 3), reported.len);
+    try testing.expect(reported[0].result.refused() == null);
+    try testing.expect(reported[1].result.refused() != null);
+    try testing.expect(reported[2].result.refused() == null);
+}
+
+test "channels: an unpark applies only each sender's next parked message, and stops at a full target" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    var b = Group.init(1, 2);
+    defer b.deinit();
+    try a.probeTo(1, "fill-slot1-00001");
+    try a.probeTo(1, "message-two-0002");
+    try a.probeTo(1, "message-thr-0003");
+    try deliver(&a, &b, 1, 3);
+    var mb: [1024]u8 = undefined;
+    var buf: [2048]u8 = undefined;
+    const t = probeTarget(1);
+    // Out of order: seq 3 before 2. Stale at its first message: nothing applies.
+    {
+        var w: schema.Writer = .{ .buf = &mb };
+        for ([_]u64{ 3, 2 }) |seq| {
+            const o = a.outRecord(1, seq).?;
+            try ce.Unparked.encode(&w, .{ .from = 0, .seq = seq, .entry_type = o.entry_type, .flags = o.flags, .payload = o.payload });
+        }
+        _ = try b.run(&Probed.machine, .channel_unpark, try ce.Unpark.encodeInto(&buf, .{ .target = &t, .messages = .{ .bytes = w.written(), .count = 2 } }));
+        try testing.expectEqual(@as(u64, 2), targetParked(b.read(), t).count);
+    }
+    // In order, but the target is still full: the first doesn't fit, and
+    // nothing moves.
+    {
+        var w: schema.Writer = .{ .buf = &mb };
+        const o = a.outRecord(1, 2).?;
+        try ce.Unparked.encode(&w, .{ .from = 0, .seq = 2, .entry_type = o.entry_type, .flags = o.flags, .payload = o.payload });
+        _ = try b.run(&Probed.machine, .channel_unpark, try ce.Unpark.encodeInto(&buf, .{ .target = &t, .messages = .{ .bytes = w.written(), .count = 1 } }));
+        try testing.expectEqual(@as(u64, 2), targetParked(b.read(), t).count);
+        try testing.expect(b.got("message-two-0002") == null);
+    }
+}
+
+test "channels: past a target's parked cap, only that target's messages wait at their sender" {
+    test_parked_target_max = 16;
+    defer test_parked_target_max = null;
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    var b = Group.init(1, 2);
+    defer b.deinit();
+    try a.probeTo(1, "fill-slot1-00001");
+    try a.probeTo(1, "message-two-0002");
+    try deliver(&a, &b, 1, 2);
+    try testing.expect(targetParked(b.read(), probeTarget(1)).bytes >= 16);
+    const full = a.outRecord(1, 2).?;
+    try testing.expect(!Probed.admits(b.read(), .{ .slot = full.slot, .entry_type = full.entry_type, .layout_epoch = 0, .flags = full.flags, .payload = full.payload }));
+    // Another target on the same channel is taken.
+    try a.probeTo(3, "message-thr-0003");
+    const other = a.outRecord(1, 3).?;
+    try testing.expect(Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = other.flags, .payload = other.payload }));
 }
 
 test "channels: a durable ack names what was applied as of a durable index" {

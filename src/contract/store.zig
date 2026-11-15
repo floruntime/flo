@@ -17,8 +17,9 @@ pub const AppliedMessage = struct {
     /// Its type's applier runs once the inbound has committed: the
     /// channels machine only took its seq.
     after_commit: bool = false,
-    /// The group that sent it.
+    /// The group that sent it, and its seq there.
     from: u16 = 0,
+    seq: u64 = 0,
     /// Refused because its sender built it wrong, not because its target
     /// said no: counted and logged apart from ordinary refusals.
     sender_bug: ?SenderBug = null,

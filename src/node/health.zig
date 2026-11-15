@@ -347,6 +347,11 @@ pub const NodeHealth = struct {
                 const bad_payload = m.channel_sender_bugs[1].load(.monotonic);
                 if (wrong_slot + bad_payload > 0) try w.print(",\"channel_sender_bugs\":{{\"wrong_slot\":{d},\"bad_payload\":{d}}}", .{ wrong_slot, bad_payload });
             }
+            // Shown while any channel message waits here for a full target.
+            if (sm) |m| {
+                const parked = m.channel_parked_messages.load(.monotonic);
+                if (parked > 0) try w.print(",\"parked\":{{\"messages\":{d},\"bytes\":{d},\"targets\":{d},\"oldest_ms\":{d}}}", .{ parked, m.channel_parked_bytes.load(.monotonic), m.channel_parked_targets.load(.monotonic), m.channel_parked_oldest_ms.load(.monotonic) });
+            }
             try w.print(",\"duplicate_index\":{d},\"processing_failed_jobs\":{d},\"processing_held_jobs\":{d}}}", .{
                 if (sm) |m| m.duplicate_index.load(.monotonic) else 0,
                 if (sm) |m| m.processing_failed_jobs.load(.monotonic) else 0,

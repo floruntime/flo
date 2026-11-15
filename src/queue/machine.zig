@@ -638,7 +638,45 @@ pub const machine: machine_mod.Machine = .{
     .families = &.{ machine_mod.info(Metas), machine_mod.info(Msgs), machine_mod.info(Dead), machine_mod.info(Ready), machine_mod.info(Deadlines), machine_mod.info(Helds) },
     .keys = keys,
     .apply = apply,
+    .target = targetOf,
+    .room = roomFor,
+    .label = labelOf,
 };
+
+fn labelOf(e: *const Entry, buf: []u8) []const u8 {
+    var diag: schema.Diagnostic = .{};
+    const p = qe.Enqueue.decodeAll(e.payload, &diag) catch return "a queue";
+    return std.fmt.bufPrint(buf, "queue {s}", .{p.queue}) catch "a queue";
+}
+
+/// An enqueue's target: its queue, by namespace and name hash. Only an
+/// enqueue can find a queue full.
+fn targetOf(e: *const Entry) ?[machine_mod.TARGET_LEN]u8 {
+    if (typeOf(e) != .queue_enqueue) return null;
+    var diag: schema.Diagnostic = .{};
+    const p = qe.Enqueue.decodeAll(e.payload, &diag) catch return null;
+    var t: [machine_mod.TARGET_LEN]u8 = undefined;
+    t[0..4].* = NamespaceId.of(p.ns).bytes();
+    t[4..12].* = hashOf(p.queue);
+    return t;
+}
+
+/// Whether an enqueue fits its queue's caps and the shard's held bytes now,
+/// by the test its apply makes.
+fn roomFor(read: view_mod.ReadView, e: *const Entry) bool {
+    if (typeOf(e) != .queue_enqueue) return true;
+    var diag: schema.Diagnostic = .{};
+    const p = qe.Enqueue.decodeAll(e.payload, &diag) catch return true;
+    const ns: NamespaceId = .of(p.ns);
+    if (ns == .invalid) return true;
+    const hash = hashOf(p.queue);
+    var kb: [4 + 8]u8 = undefined;
+    const meta: Meta.Value = if (read.get(Metas, storeKey(&kb, ns, &hash)) catch null) |m| m.v else emptyMeta(p.queue);
+    const size = heldBy(p.payload.len, 0);
+    if (meta.ready + meta.leased + meta.dead + 1 > p.max_messages or meta.held_bytes + size > p.max_bytes) return false;
+    const shard_held = if (read.get(Helds, HELD_KEY) catch null) |h| h.v.bytes else 0;
+    return shard_held + size <= p.shard_held_bytes;
+}
 
 // ─── Reads ───────────────────────────────────────────────────────────────
 

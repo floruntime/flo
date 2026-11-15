@@ -148,6 +148,9 @@ pub const Mutant = enum {
     no_gen_filter,
     /// Take an ack above what this group's state says was sent.
     unbounded_ack,
+    /// Apply a message whose target has room even while earlier ones to it
+    /// are parked (`channels.zig`), not park it behind them.
+    no_park_behind,
 };
 
 pub const Driver = struct {
@@ -157,6 +160,9 @@ pub const Driver = struct {
     term: u64 = 0,
     /// One per group on the node.
     peers: []Peer,
+    /// Whether this group takes a message in now (`Channels.admits`); null
+    /// takes every one.
+    admits: ?*const fn (read: ReadView, m: ce.Message.Value) bool = null,
     counts: Counts = .{},
     /// Messages each group sent this one that were refused as its own bug,
     /// by reason (`store.SenderBug`). Counted where they apply, on every
@@ -196,7 +202,7 @@ pub const Driver = struct {
 
     /// The batch buffers, allocated once; false when there's no memory for
     /// them, and the batch waits.
-    fn buffers(self: *Driver) bool {
+    pub fn buffers(self: *Driver) bool {
         if (self.buf.len > 0) return true;
         self.buf = self.allocator.alloc(u8, 1 + ce.Inbound.max_size) catch return false;
         self.msgs = self.allocator.alloc(u8, ce.Messages.max_size) catch {
@@ -405,15 +411,22 @@ pub const Driver = struct {
         var n: u32 = 0;
         while (it.next() catch null) |m| : (seq += 1) {
             if (seq <= accepted) continue;
+            // A message whose target is over its parked cap waits at its
+            // sender, and so do those after it: the batch's prefix goes.
+            if (self.admits) |admits| if (!admits(read, m)) break;
             ce.Message.encode(&w, m) catch return;
             n += 1;
+        }
+        if (n == 0) {
+            self.counts.busy += 1;
+            return self.answer(from, p, applied, dur, 0, .busy, io);
         }
         const entry = ce.Inbound.encodeInto(self.buf, .{ .from = from, .first_seq = accepted + 1, .messages = .{ .bytes = w.written(), .count = n } }) catch return;
         if (!io.propose(.channel_inbound, entry)) {
             self.counts.busy += 1;
             return self.answer(from, p, applied, dur, 0, .busy, io);
         }
-        p.accepted = last;
+        p.accepted = accepted + n;
         self.counts.inbound_proposed += 1;
         self.answer(from, p, applied, dur, 0, .ok, io);
     }

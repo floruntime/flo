@@ -405,6 +405,7 @@ jobs:
           check past_durable "applied a message its sender lost"
           check trim_on_applied "a message its sender holds was never applied"
           check ack_last_seq "a message its sender holds was never applied"
+          check no_park_behind "a message reached its target after a later one to it"
         timeout-minutes: 20
       - name: Swarm with lost disks
         # Crashes that lose a disk or its hard state, up to two nodes at once:
