@@ -50,6 +50,7 @@ pub const Tag = enum(u8) {
     worker_report, // a report counted toward its worker's stats, where the worker is registered
     action_held, // a run a workflow on the receiver waits on is held for want of its action: payload [run_len:u16][run][action]
     action_unhold, // a workflow run ended while the receiver held the start of its step: payload the action run's id
+    channel, // a channel frame, a batch or an answer: payload from contract/channel_driver.zig; its sender is src_shard
 };
 
 /// 32-byte compact envelope — the payload is allocated separately.

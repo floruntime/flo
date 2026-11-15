@@ -218,7 +218,10 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             series.oldest_ns = @min(series.oldest_ns, ts);
             series.newest_ns = @max(series.newest_ns, ts);
             try view.put(Series, sk, series);
-            try view.put(Points, try pointKey(a, sk, ts, positionOf(e.header.index, 0)), .{ .value = w.rec.value });
+            // Every message in a channel's inbound applies at its index: its
+            // place in the batch keeps two at one timestamp apart.
+            const ordinal: u8 = if (view.message) |m| m.ordinal else 0;
+            try view.put(Points, try pointKey(a, sk, ts, positionOf(e.header.index, ordinal)), .{ .value = w.rec.value });
             out.putBytes(w.cmd.key);
             out.putInt(u64, ts);
         },
@@ -479,6 +482,33 @@ test "time series: a name holding NUL is refused, and changes nothing" {
     }
     try testing.expectEqual(@as(usize, 1), s.family(Points.ID).count);
     try testing.expectEqual(@as(usize, 1), s.family(Series.ID).count);
+}
+
+test "time series: two writes at one timestamp in one channel inbound are two points" {
+    var log: TestLog = .{};
+    defer log.deinit();
+    try log.write(.of(7), "cpu", "v", 1, 1000, "");
+    try log.write(.of(7), "cpu", "v", 2, 1000, "");
+    const ce = @import("../protocol/channel_entries.zig");
+    const schema = @import("../protocol/schema.zig");
+    var mb: [4096]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &mb };
+    for (log.entries.items) |e| try ce.Message.encode(&w, .{ .slot = 0, .entry_type = e.header.entry_type, .layout_epoch = 0, .payload = e.payload });
+    var ib: [8192]u8 = undefined;
+    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
+    var h = std.mem.zeroes(entry_mod.Header);
+    h.entry_type = @backingInt(EntryType.channel_inbound);
+    h.index = 9;
+    h.payload_len = @intCast(inbound.len);
+    const e: Entry = .{ .header = h, .payload = inbound };
+    var s = store_mod.Store.init(testing.allocator);
+    defer s.deinit();
+    s.place = .{ .group = 0, .count = 1 };
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    var out = Result.start(&e);
+    try machine_mod.applyEntry(&@import("../contract/channels.zig").Channels(&.{machine}).machine, &s, &scratch, &e, &out);
+    try testing.expectEqual(@as(usize, 2), s.family(Points.ID).count);
 }
 
 test "time series: a position orders by log index, then by place in the entry, and two places never share a key" {

@@ -149,6 +149,11 @@ pub const EntryType = enum(u8) {
     settings_node_mem = 0x91,
     settings_node_del = 0x92,
 
+    // ── Channels (messages between groups) ──
+    channel_inbound = 0xA0,
+    channel_trim = 0xA1,
+    channel_probe = 0xA2,
+
     /// Returns true if this type carries a key-value command payload. KV
     /// entries don't: their payloads are schemas (`protocol/kv_entries.zig`).
     pub fn hasKeyValue(self: EntryType) bool {
@@ -165,6 +170,8 @@ pub const EntryType = enum(u8) {
             .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint, .processing_remove => true,
             // Cluster-settings entries touch no namespace projection; they are node-level state on shard 0.
             .settings_pool_share, .settings_node_mem, .settings_node_del => false,
+            // A message's own target says what it touches, at its apply.
+            .channel_inbound, .channel_trim, .channel_probe => false,
             .raft_config, .raft_noop, .raft_snapshot, .repair_skip => false,
         };
     }
