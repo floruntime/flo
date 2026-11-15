@@ -17,11 +17,9 @@
 //! `PIN_MS` passes, so later landings don't evict it before the reader that
 //! asked is made again. Each is checked against the log's terms first.
 //!
-//! Only the owning shard's thread asks, lands and evicts. Another shard's
-//! thread (a processing job, a stream trigger reading the stream it watches)
-//! may only copy a cached payload out (`copyFor`), under `mutex`, and ask
-//! the owner to fetch one (`askFor`); its read stops there and it reads
-//! again on its next poll.
+//! Only the owning shard's thread uses it: asks, lands, evicts and reads.
+//! Another shard's work that needs a stream's records asks that shard,
+//! which reads them here on its own thread.
 
 const std = @import("std");
 const stdx = @import("stdx");
@@ -155,17 +153,11 @@ pub const DiskReads = struct {
     cache_bytes: usize = 0,
     cache_budget: usize = DEFAULT_CACHE_BYTES,
 
-    /// Held while the cache, `gone` or `asked` change, and by any read of
-    /// them from a thread other than the owner's.
-    mutex: stdx.Mutex = .{},
-    /// The owning shard's thread, set as it starts (`setOwner`). Unset with
-    /// a bulk thread attached, no thread is the owner yet: another shard's
-    /// job takes the copy path. Unset with none (unit tests), every caller
-    /// is.
+    /// The owning shard's thread, set as it starts (`setOwner`), and
+    /// asserted by its reads and drains. Unset with a bulk thread attached,
+    /// no thread is the owner yet; unset with none (unit tests), every
+    /// caller is.
     owner: std.atomic.Value(u64) = .init(0),
-    /// Windows other threads asked for, taken by the owner's next drain.
-    asked: [MAX_WANTS]Window = undefined,
-    n_asked: usize = 0,
     /// Indices that won't be read: not in the durable log, or damaged.
     /// Readers skip and count them, as before reads went to disk.
     gone: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -248,49 +240,14 @@ pub const DiskReads = struct {
     /// thread only.
     pub fn get(self: *DiskReads, index: u64) ?[]const u8 {
         std.debug.assert(self.isOwner());
-        self.mutex.lock();
-        defer self.mutex.unlock();
         const c = self.cache.getPtr(index) orelse return null;
         c.pinned_until_ms = 0;
         return c.payload;
     }
 
-    /// For another shard's thread: a copy of the cached payload at `index`,
-    /// the caller's to free, or null.
-    pub fn copyFor(self: *DiskReads, index: u64, allocator: std.mem.Allocator) ?[]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const c = self.cache.get(index) orelse return null;
-        return allocator.dupe(u8, c.payload) catch null;
-    }
-
-    /// For another shard's thread: whether `index` won't be read (not in
-    /// the durable log, or damaged), so the job skips it.
-    pub fn isGone(self: *DiskReads, index: u64) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.gone.contains(index);
-    }
-
     fn markGone(self: *DiskReads, index: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         if (self.gone.count() >= MAX_GONE) self.gone.clearRetainingCapacity();
         self.gone.put(self.allocator, index, {}) catch {};
-    }
-
-    /// For another shard's thread: ask the owner to fetch window `w` on its
-    /// next tick.
-    pub fn askFor(self: *DiskReads, w: Window) void {
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            for (self.asked[0..self.n_asked]) |have| if (std.mem.eql(u8, &have.stream, &w.stream) and have.from == w.from) return;
-            if (self.n_asked == MAX_WANTS) return;
-            self.asked[self.n_asked] = w;
-            self.n_asked += 1;
-        }
-        if (self.notify) |n| n.done(n.ctx);
     }
 
     /// Ask for the entry at `index`, for a reader of window `w`. Never lands
@@ -301,7 +258,6 @@ pub const DiskReads = struct {
             self.want_block = .io;
             return .blocked;
         }
-        // Only the owner writes `gone`, so it reads it unlocked.
         if (self.gone.contains(index)) return .absent;
         const now = self.now_fn();
         if (now < self.blocked_until_ms) {
@@ -386,6 +342,8 @@ pub const DiskReads = struct {
         self.onTruncate(after_index);
     }
 
+    /// On the thread that cuts the log: the owner's, or boot's before it
+    /// starts.
     pub fn onTruncate(self: *DiskReads, after_index: u64) void {
         // In-place reads queued above the cut would read nothing there, and
         // nothing is no damage: the readers ask again.
@@ -395,8 +353,6 @@ pub const DiskReads = struct {
             kept += 1;
         };
         self.local.n_wants = kept;
-        self.mutex.lock();
-        defer self.mutex.unlock();
         var drop: std.ArrayListUnmanaged(u64) = .empty;
         defer drop.deinit(self.allocator);
         var it = self.cache.iterator();
@@ -421,18 +377,6 @@ pub const DiskReads = struct {
     /// requests: it may evict.
     pub fn drain(self: *DiskReads) bool {
         std.debug.assert(self.isOwner());
-        // What other threads asked for is fetched as the owner's own want;
-        // only an index the log doesn't hold is marked gone for them.
-        var asked: [MAX_WANTS]Window = undefined;
-        const n_asked = blk: {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            const n = self.n_asked;
-            @memcpy(asked[0..n], self.asked[0..n]);
-            self.n_asked = 0;
-            break :blk n;
-        };
-        for (asked[0..n_asked]) |w| if (self.want(w.from, w) == .absent) self.markGone(w.from);
         var any = false;
         for (&self.slots) |*s| {
             if (s.read.state.load(.acquire) != .done) continue;
@@ -509,8 +453,6 @@ pub const DiskReads = struct {
             self.damage(start, .corrupt);
             return;
         }
-        self.mutex.lock();
-        defer self.mutex.unlock();
         // Room first, then once more after: never a walk per entry.
         self.evict(now);
         var taken: [MAX_WANTS]u32 = @splat(0);
@@ -825,7 +767,7 @@ test "stream disk reads: a corrupt segment is damage, reported once, never read 
     // Never read again, nor held.
     try testing.expectEqual(Want.absent, d.want(1, a));
     try testing.expect(!d.drain());
-    try testing.expect(d.isGone(1));
+    try testing.expect(d.gone.contains(1));
 }
 
 test "stream disk reads: an entry as large as the log takes lands, not taken as damaged" {
