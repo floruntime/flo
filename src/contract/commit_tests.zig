@@ -257,6 +257,64 @@ test "contract: random entries, a third of them refused, leave the same state an
     }
 }
 
+test "contract: a range delete rolled back hides nothing, and isn't unlinked at commit" {
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    try seed(&store, &scratch);
+    var ks = view_mod.KeySet.init(scratch.allocator());
+    try ks.addRange(Fam.ID, NS, "");
+    var view = View.init(&store, scratch.allocator(), &ks);
+    var kb: [32]u8 = undefined;
+    try view.put(Fam, k(&kb, "a"), .{ .b = "A2" });
+    // A refused message's writes: everything goes, then it is undone.
+    const mark = view.mark();
+    try view.deleteRange(Fam, k(&kb, ""), null);
+    try view.rollback(mark);
+    try testing.expectEqualStrings("b", (try view.get(Fam, k(&kb, "b"))).?.b);
+    try view.put(Fam, k(&kb, "e"), .{ .b = "E" });
+    try view.commit();
+    var rv = view_mod.ReadView{ .store = &store };
+    try testing.expectEqualStrings("A2", (try rv.get(Fam, k(&kb, "a"))).?.b);
+    for ([_][]const u8{ "b", "c", "d" }) |n| try testing.expectEqualStrings(n, (try rv.get(Fam, k(&kb, n))).?.b);
+    try testing.expectEqual(@as(u64, 5), store.family(Fam.ID).count);
+}
+
+test "contract: past the scan limit, a rollback keeps the range deletes before its mark, and its index of last writes leaves out their prefixes" {
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    try seed(&store, &scratch);
+    var ks = view_mod.KeySet.init(scratch.allocator());
+    try ks.addRange(Fam.ID, NS, "");
+    var view = View.init(&store, scratch.allocator(), &ks);
+    var kb: [32]u8 = undefined;
+    var bb: [32]u8 = undefined;
+    for (0..140) |i| {
+        var nb: [8]u8 = undefined;
+        try view.put(Fam, k(&kb, try std.fmt.bufPrint(&nb, "p{d:0>3}", .{i})), .{ .b = "P" });
+    }
+    // Keys starting "b" and below "b": none, so "b" itself stays.
+    try view.deleteRange(Fam, k(&kb, "b"), k(&bb, "b"));
+    // Every key starting "c": "c" goes, and stays gone past the rollback.
+    try view.deleteRange(Fam, k(&kb, "c"), null);
+    const mark = view.mark();
+    try view.put(Fam, k(&kb, "q"), .{ .b = "Q" });
+    try view.put(Fam, k(&kb, "c"), .{ .b = "C2" });
+    try view.rollback(mark);
+    try testing.expectEqualStrings("b", (try view.get(Fam, k(&kb, "b"))).?.b);
+    try testing.expect((try view.get(Fam, k(&kb, "c"))) == null);
+    try testing.expect((try view.get(Fam, k(&kb, "q"))) == null);
+    try view.commit();
+    var rv = view_mod.ReadView{ .store = &store };
+    try testing.expectEqualStrings("b", (try rv.get(Fam, k(&kb, "b"))).?.b);
+    try testing.expect((try rv.get(Fam, k(&kb, "c"))) == null);
+    // a, b, d and the 140 puts.
+    try testing.expectEqual(@as(u64, 143), store.family(Fam.ID).count);
+}
+
 test "contract: out of memory at every allocation of a commit with range deletes leaves bytes and shape as they were" {
     var fail_at: usize = 0;
     while (true) : (fail_at += 1) {
