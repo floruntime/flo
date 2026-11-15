@@ -224,11 +224,13 @@ fn asEntry(e: *const Entry, m: ce.Message.Value) Entry {
 }
 
 /// A message type applied after its inbound commits (`ChannelsWith`), and
-/// the check that its payload will apply: every reason its applier could
-/// halt but running out of memory.
+/// the check of its payload made before that commit: why it won't apply, or
+/// null. It covers every reason its applier could halt but running out of
+/// memory, and whatever its client path would refuse, so a sender's bad
+/// message is refused alone, in the inbound, and never reaches its applier.
 pub const AfterCommit = struct {
     entry_type: EntryType,
-    valid: *const fn (payload: []const u8) bool,
+    refusal: *const fn (payload: []const u8) ?[]const u8,
 };
 
 /// The channels machine over `targets`, the machines a message may be for.
@@ -314,6 +316,9 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
             }) {
                 if (seq <= applied) continue;
                 if (seq != applied + 1) return error.Halt;
+                // Only a leader's own frames make these: a flag no message
+                // may carry is a Flo bug in the sender.
+                if (m.flags & ~view_mod.MESSAGE_FLAGS != 0) return error.Halt;
                 const t = std.enums.fromInt(EntryType, m.entry_type) orelse return error.Halt;
                 const owner = machine_mod.ownerOf(targets, t);
                 const after = if (owner == null) afterCommitOf(t) else null;
@@ -329,9 +334,9 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                 if (m.slot >= node_router.SLOTS or ownerOf(place, m.slot) != place.group) {
                     r.refuse(.bad_request, .malformed, "bad request: a message for a slot this group doesn't own");
                 } else if (after) |a| {
-                    // Checked now, while a halt still undoes the inbound:
-                    // past its commit, its applier may only run out of memory.
-                    if (!a.valid(m.payload)) return error.Halt;
+                    // Checked now: past the commit its applier may only run
+                    // out of memory.
+                    if (a.refusal(m.payload)) |why| r.refuse(.bad_request, .malformed, why);
                 } else if (owner) |o| {
                     try o.apply(view, &as, &r);
                     // Its sends are held to an apply's limits on their own,
@@ -619,14 +624,26 @@ test "channels: a message applies with the flags its send gave it, not its inbou
 }
 
 /// The probe machine, with stream appends applied after the commit.
-const Later = ChannelsWith(&.{probe.machine}, &.{.{ .entry_type = .stream_append, .valid = @import("../projection/stream.zig").appendApplies }});
+const Later = ChannelsWith(&.{probe.machine}, &.{.{ .entry_type = .stream_append, .refusal = @import("../projection/stream.zig").appendRefusal }});
 
-/// A stream append's command payload, as an append logs it.
+/// A stream append's command payload, as an append logs it: one record.
 fn appendCommand(buf: []u8) []const u8 {
-    return (entry_mod.buildCommandEntry(.stream_append, 0, 1, 1, 0, .default, "s", "\x00\x00\x00\x00", buf) orelse unreachable).payload;
+    return appendCommandOf(buf, 1);
 }
 
-test "channels: an after-commit message its applier would halt on halts the inbound before it commits" {
+/// A stream append's command payload whose batch claims `count` records,
+/// holding one: `[partition][count]([len]["x"][header_count])`.
+fn appendCommandOf(buf: []u8, count: u32) []const u8 {
+    var value: [4 + 4 + 4 + 1 + 2]u8 = undefined;
+    std.mem.writeInt(u32, value[0..4], 0, .little);
+    std.mem.writeInt(u32, value[4..8], count, .little);
+    std.mem.writeInt(u32, value[8..12], 1, .little);
+    value[12] = 'x';
+    std.mem.writeInt(u16, value[13..15], 0, .little);
+    return (entry_mod.buildCommandEntry(.stream_append, 0, 1, 1, 0, .default, "s", &value, buf) orelse unreachable).payload;
+}
+
+test "channels: an after-commit message its applier would halt on, or its client path refuse, is refused alone before the commit" {
     var a = Group.init(0, 2);
     defer a.deinit();
     var b = Group.init(1, 2);
@@ -638,12 +655,19 @@ test "channels: an after-commit message its applier would halt on halts the inbo
     try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = 0, .flags = 0, .payload = o.payload });
     // Not a command payload: past the commit, the stream applier would halt.
     try ce.Message.encode(&mw, .{ .slot = 1, .entry_type = @backingInt(EntryType.stream_append), .layout_epoch = 0, .flags = 0, .payload = "x" });
+    // A command, but its batch claims more records than an append may carry.
+    var over: [64]u8 = undefined;
+    try ce.Message.encode(&mw, .{ .slot = 1, .entry_type = @backingInt(EntryType.stream_append), .layout_epoch = 0, .flags = 0, .payload = appendCommandOf(&over, @import("../projection/stream.zig").MAX_BATCH_RECORDS + 1) });
     var buf: [2048]u8 = undefined;
-    const inbound = try ce.Inbound.encodeInto(&buf, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 2 } });
-    try testing.expectError(error.Halt, b.run(&Later.machine, .channel_inbound, inbound));
-    // Nothing of it committed: not the probe before it, not its seqs.
-    try testing.expect(b.got("message-one-0001") == null);
-    try testing.expect(inOf(b.read(), 0) == null);
+    const inbound = try ce.Inbound.encodeInto(&buf, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 3 } });
+    _ = try b.run(&Later.machine, .channel_inbound, inbound);
+    // Each refused alone, before the commit, and never handed to its
+    // applier; the probe before them applied, and all three took their seq.
+    try testing.expect(b.got("message-one-0001") != null);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
+    const reported = b.store.messages.items;
+    try testing.expect(reported[1].result.refused() != null and !reported[1].after_commit);
+    try testing.expect(reported[2].result.refused() != null and !reported[2].after_commit);
 }
 
 test "channels: a message whose applier runs after the commit takes its seq and is reported for it, unless refused" {
@@ -667,6 +691,24 @@ test "channels: a message whose applier runs after the commit takes its seq and 
     }
     // A type with no applier at all is still a Flo bug.
     try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, try ce.Inbound.encodeInto(&buf, .{ .from = 2, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 3 } })));
+}
+
+test "channels: a message carrying a flag no message may carry halts its inbound, which commits nothing" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    var b = Group.init(1, 2);
+    defer b.deinit();
+    try a.probeTo(1, "message-one-0001");
+    const o = a.outRecord(1, 1).?;
+    var mw: schema.Writer = .{ .buf = try testing.allocator.alloc(u8, 1024) };
+    defer testing.allocator.free(mw.buf);
+    try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .payload = o.payload });
+    try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = 0, .flags = entry_mod.Flags.FORCE, .payload = o.payload });
+    var buf: [2048]u8 = undefined;
+    const inbound = try ce.Inbound.encodeInto(&buf, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 2 } });
+    try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, inbound));
+    try testing.expect(b.got("message-one-0001") == null);
+    try testing.expect(inOf(b.read(), 0) == null);
 }
 
 test "channels: a durable ack names what was applied as of a durable index" {

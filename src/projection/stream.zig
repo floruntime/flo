@@ -180,11 +180,17 @@ pub fn appendAt(payload: []const u8, part: u8) ?AppendValue {
     return decodeAppendValue(cmd.value);
 }
 
-/// Whether a `stream_append` payload applies: its applier halts on nothing
-/// else (`stream/handler.zig`, `replayEntry`). A channel checks a message's
-/// before its inbound commits.
-pub fn appendApplies(payload: []const u8) bool {
-    return entry_mod.CommandPayload.deserialize(payload) != null;
+/// Why a `stream_append` payload a channel message carries won't apply, or
+/// null: one that isn't a command (its applier would halt,
+/// `stream/handler.zig` `replayEntry`), or whose batch a client's append
+/// would have been refused for. Checked before its inbound commits.
+pub fn appendRefusal(payload: []const u8) ?[]const u8 {
+    const cmd = entry_mod.CommandPayload.deserialize(payload) orelse return "bad request: a stream append that isn't one";
+    _ = BatchIterator.init(decodeAppendValue(cmd.value).payload) catch |err| return switch (err) {
+        error.TooManyRecords => "stream append: a batch over the record limit",
+        error.Malformed => "stream append: malformed batch",
+    };
+    return null;
 }
 
 /// A record's `part` for message `ordinal` of an inbound.
