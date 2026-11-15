@@ -27,10 +27,14 @@ pub const Simulator = simulator.Simulator;
 pub const Summary = simulator.Summary;
 pub const Invariant = simulator.Invariant;
 
+pub const groups = @import("groups.zig");
+pub const Groups = groups.Groups;
+
 test {
     _ = scenario;
     _ = workload;
     _ = network;
     _ = families;
     _ = simulator;
+    _ = groups;
 }
