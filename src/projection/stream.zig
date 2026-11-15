@@ -186,6 +186,11 @@ pub fn appendAt(payload: []const u8, part: u8) ?AppendValue {
 /// would have been refused for. Checked before its inbound commits.
 pub fn appendRefusal(payload: []const u8) ?[]const u8 {
     const cmd = entry_mod.CommandPayload.deserialize(payload) orelse return "bad request: a stream append that isn't one";
+    // As a client's append is refused for its name: none, one with NUL, or
+    // one longer than a stream list can name.
+    if (cmd.key.len == 0) return "stream append: stream name is required";
+    if (std.mem.indexOfScalar(u8, cmd.key, 0) != null) return "stream append: stream name must not contain NUL";
+    if (cmd.key.len > MAX_QUALIFIED_KEY) return "stream append: stream name too long";
     _ = BatchIterator.init(decodeAppendValue(cmd.value).payload) catch |err| return switch (err) {
         error.TooManyRecords => "stream append: a batch over the record limit",
         error.Malformed => "stream append: malformed batch",

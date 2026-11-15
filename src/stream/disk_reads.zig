@@ -590,6 +590,9 @@ const Appends = struct {
             self.single = null;
             return s;
         }
+        // Every stream append a message carries counts toward a want's
+        // limit, even one its receiver refused, which no record locates:
+        // at worst a read lands a little short and reads again.
         const it = &(self.messages orelse return null);
         while (it.next() catch return null) |m| {
             if (m.entry_type != @backingInt(entry_mod.EntryType.stream_append)) continue;

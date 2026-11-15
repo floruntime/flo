@@ -4823,6 +4823,12 @@ pub const Shard = struct {
             sm.ts_points.store(self.ts_handler.ts.pointCount(), .monotonic);
             sm.ts_point_bytes.store(self.ts_handler.ts.pointBytes(), .monotonic);
             sm.sink_retry_overflow.store(self.sink_retry_overflow, .monotonic);
+            // Summed over senders: the log names each sender.
+            for (&sm.channel_sender_bugs, 0..) |*total, reason| {
+                var n: u64 = 0;
+                for (self.channel.sender_bugs) |by_reason| n += by_reason[reason];
+                total.store(n, .monotonic);
+            }
             sm.bar_last.store(self.defaultPartition().last_bar, .monotonic);
             sm.bar_bytes.store(self.defaultPartition().bar_bytes, .monotonic);
             // A duration, not the monotonic start: a raw clock reading means
@@ -8252,7 +8258,9 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
         if (applied.route == .skipped_already_applied) return .applied;
         contract_machine.applyEntryWith(m, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, entry, out) catch |err| return .{ .applier_failed = err };
         if (etype == .channel_inbound) for (partition.store.messages.items) |*msg| {
-            noteNamespace(partition, &msg.entry);
+            // A refused message took no effect: its bytes, maybe a sender's
+            // garbage, name no namespace this shard holds.
+            if (msg.result.refused() == null) noteNamespace(partition, &msg.entry);
             if (!msg.after_commit) continue;
             // A stream append a message carries: its record lives in this
             // inbound, at the message's part (`StreamRecord.part`). It
@@ -25977,4 +25985,36 @@ test "Shard: a channel message refused as its sender's bug is counted by sender 
     try std.testing.expectEqual(@as(u64, 1), b.channel.sender_bugs[0][@backingInt(contract_store.SenderBug.wrong_slot)]);
     try std.testing.expectEqual(@as(u64, 0), b.channel.sender_bugs[0][@backingInt(contract_store.SenderBug.bad_payload)]);
     try std.testing.expectEqual(@as(u64, 1), channels_mod.inOf(.{ .store = &b.defaultPartition().store }, 0).?.applied);
+}
+
+test "Shard: a carried stream append its client path would refuse is refused as its sender's bug, creates no stream, and is counted and shown" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const ce = @import("../protocol/channel_entries.zig");
+    var mb: [1024]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &mb };
+    // Slot 1 is shard 1's: not a command, then a command naming no stream.
+    try ce.Message.encode(&w, .{ .slot = 1, .entry_type = @backingInt(entry_mod.EntryType.stream_append), .layout_epoch = 0, .flags = 0, .payload = "\x28\x00\x00\x00garbage" });
+    var cb: [128]u8 = undefined;
+    const unnamed = entry_mod.buildCommandEntry(.stream_append, 0, 1, 1, 0, .default, "", "\x00\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00x\x00\x00", &cb).?.payload;
+    try ce.Message.encode(&w, .{ .slot = 1, .entry_type = @backingInt(entry_mod.EntryType.stream_append), .layout_epoch = 0, .flags = 0, .payload = unnamed });
+    var ib: [2048]u8 = undefined;
+    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
+    const highest = b.defaultPartition().highest_namespace;
+    const e = entry_mod.buildEntry(.channel_inbound, 0, b.raft_node.current_term, b.raft_node.last_applied + 1, 1, inbound);
+    var out = persistence_mod.Result.start(&e);
+    try std.testing.expect(b.applyEntry(&e, &out));
+    try std.testing.expectEqual(@as(u64, 2), channels_mod.inOf(.{ .store = &b.defaultPartition().store }, 0).?.applied);
+    try std.testing.expectEqual(@as(u64, 2), b.channel.sender_bugs[0][@backingInt(contract_store.SenderBug.bad_payload)]);
+    try std.testing.expectEqual(@as(usize, 0), b.stream_handler.stream.streamCount());
+    try std.testing.expectEqual(highest, b.defaultPartition().highest_namespace);
+    var sm: @import("../metrics/registry.zig").ShardMetrics = .{ .shard_id = 1 };
+    b.shard_metrics = &sm;
+    defer b.shard_metrics = null;
+    b.publishHealth();
+    try std.testing.expectEqual(@as(u64, 2), sm.channel_sender_bugs[@backingInt(contract_store.SenderBug.bad_payload)].load(.monotonic));
 }

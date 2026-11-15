@@ -740,6 +740,9 @@ pub const ShardMetrics = struct {
     ts_points: Atomic(u64) = Atomic(u64).init(0),
     ts_point_bytes: Atomic(u64) = Atomic(u64).init(0),
     sink_retry_overflow: Atomic(u64) = Atomic(u64).init(0),
+    /// Channel messages refused here as their sender's bug, by reason
+    /// (`contract.store.SenderBug`): wrong slot, bad payload.
+    channel_sender_bugs: [2]Atomic(u64) = @splat(Atomic(u64).init(0)),
     /// The last snapshot bar's index, and the logical bytes applied since.
     bar_last: Atomic(u64) = Atomic(u64).init(0),
     bar_bytes: Atomic(u64) = Atomic(u64).init(0),
@@ -944,6 +947,7 @@ pub const ShardMetrics = struct {
         ts_points: u64,
         ts_point_bytes: u64,
         sink_retry_overflow: u64,
+        channel_sender_bugs: [2]u64,
         bar_last: u64,
         bar_bytes: u64,
         hardstate_failures: u64,
@@ -1000,6 +1004,7 @@ pub const ShardMetrics = struct {
             .ts_points = self.ts_points.load(.monotonic),
             .ts_point_bytes = self.ts_point_bytes.load(.monotonic),
             .sink_retry_overflow = self.sink_retry_overflow.load(.monotonic),
+            .channel_sender_bugs = .{ self.channel_sender_bugs[0].load(.monotonic), self.channel_sender_bugs[1].load(.monotonic) },
             .bar_last = self.bar_last.load(.monotonic),
             .bar_bytes = self.bar_bytes.load(.monotonic),
             .hardstate_failures = self.hardstate_failures.load(.monotonic),
@@ -1838,6 +1843,8 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_ts_points{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.ts_points });
     try writer.print("flo_shard_ts_point_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.ts_point_bytes });
     try writer.print("flo_shard_sink_retry_overflow_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.sink_retry_overflow });
+    try writer.print("flo_shard_channel_sender_bugs_total{{shard_id=\"{d}\",reason=\"wrong_slot\"}} {d}\n", .{ snap.shard_id, snap.channel_sender_bugs[0] });
+    try writer.print("flo_shard_channel_sender_bugs_total{{shard_id=\"{d}\",reason=\"bad_payload\"}} {d}\n", .{ snap.shard_id, snap.channel_sender_bugs[1] });
     try writer.print("flo_shard_snapshot_bar_last{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bar_last });
     try writer.print("flo_shard_snapshot_bar_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bar_bytes });
     try writer.print("flo_shard_hardstate_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.hardstate_failures });
