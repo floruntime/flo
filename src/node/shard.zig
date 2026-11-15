@@ -248,6 +248,10 @@ const ShardIo = struct {
             of(r).strangerFrame(frame);
         }
 
+        pub fn refuseReplicaForward(r: *Replica, frame: RaftFrame) void {
+            of(r).refuseReplicaForward(frame);
+        }
+
         pub fn handleJoinRequest(r: *Replica, from: u32) void {
             of(r).handleJoinRequest(from);
         }
@@ -2290,16 +2294,17 @@ pub const Shard = struct {
                 self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(if (oom) OUT_OF_MEMORY_MESSAGE else DIVERGED_MESSAGE));
                 return;
             }
-            // A replica serves reads and sends writers to the leader rather
-            // than carrying their writes. It has no voter link to the leader,
-            // so it can't forward a membership or repair change there either —
-            // the leader never answers a forward from a non-voter, and the
-            // caller would hang until timeout. So a replica points the caller
-            // at the leader for both: a write to the leader's client port, an
-            // admin change to a voter's admin socket. A non-leader voter still
-            // forwards, below, which does reach the leader.
+            // A replica serves reads but can't carry a write or a cluster admin
+            // change to the leader: the leader's replica guard (the Replica's
+            // `replicaFrame` / `dropStranger`) refuses a non-voter's forwarded
+            // write. So this points the caller straight at the leader instead of
+            // forwarding into that guard — a write to the leader's client port,
+            // an admin command to a voter's admin socket. It's the fast path;
+            // the leader-side refusal still answers the cases this can't see (a
+            // sender no config names, or one that wrongly believes it's a
+            // voter). A non-leader voter forwards, below, which the guard admits.
             if (!self.raft_node.timer_enabled and self.raft_node.self_named)
-                return if (membership_op or repair_op) self.redirectAdminToLeader(conn, req) else self.redirectToLeader(conn, req);
+                return self.redirectToLeader(conn, req, if (membership_op or repair_op) .admin else .write);
             if (conn.replyTo() == .remote) {
                 // Already forwarded once; a second hop during an election
                 // could bounce between nodes. The client retries instead.
@@ -3454,38 +3459,37 @@ pub const Shard = struct {
 
     // ─── Writes on a node that does not lead ─────────────────────────────
 
-    fn redirectToLeader(self: *Shard, conn: *Connection, req: proto.Request) void {
+    const RedirectKind = enum { write, admin };
+
+    /// A replica serves reads but can't carry a write or a cluster admin change
+    /// to the leader (the leader's replica guard refuses a non-voter's forward),
+    /// so it points the caller straight at the leader: a write to the leader's
+    /// client port, a cluster admin command to a voter's admin socket. The two
+    /// share the stem; only the tail and the destination port differ.
+    fn redirectToLeader(self: *Shard, conn: *Connection, req: proto.Request, kind: RedirectKind) void {
         const leader = self.raft_node.leader_id;
-        var buf: [160]u8 = undefined;
         const addr = if (leader != 0) if (self.raft_network) |rn| rn.clientAddress(leader) else null else null;
-        const msg = if (addr) |a|
-            std.fmt.bufPrint(&buf, "unavailable: this node is a replica; send writes to the leader, node {d} at {d}.{d}.{d}.{d}:{d}", .{ leader, a.ip4[0], a.ip4[1], a.ip4[2], a.ip4[3], a.port }) catch REPLICA_MESSAGE
-        else if (leader != 0)
-            std.fmt.bufPrint(&buf, "unavailable: this node is a replica; send writes to the leader, node {d}", .{leader}) catch REPLICA_MESSAGE
-        else
-            REPLICA_MESSAGE;
+        const stem = "unavailable: this node is a replica; ";
+        var buf: [224]u8 = undefined;
+        const msg = switch (kind) {
+            .write => if (addr) |a|
+                std.fmt.bufPrint(&buf, stem ++ "send writes to the leader, node {d} at {d}.{d}.{d}.{d}:{d}", .{ leader, a.ip4[0], a.ip4[1], a.ip4[2], a.ip4[3], a.port }) catch REPLICA_WRITE_NONE
+            else if (leader != 0)
+                std.fmt.bufPrint(&buf, stem ++ "send writes to the leader, node {d}", .{leader}) catch REPLICA_WRITE_NONE
+            else
+                REPLICA_WRITE_NONE,
+            .admin => if (addr) |a|
+                std.fmt.bufPrint(&buf, stem ++ "a cluster admin command must go to a voter's admin socket — the leader is node {d} at {d}.{d}.{d}.{d}:{d}", .{ leader, a.ip4[0], a.ip4[1], a.ip4[2], a.ip4[3], a.port }) catch REPLICA_ADMIN_NONE
+            else if (leader != 0)
+                std.fmt.bufPrint(&buf, stem ++ "a cluster admin command must go to a voter's admin socket — the leader is node {d}", .{leader}) catch REPLICA_ADMIN_NONE
+            else
+                REPLICA_ADMIN_NONE,
+        };
         self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(msg));
     }
 
-    const REPLICA_MESSAGE = "unavailable: this node is a replica and knows no leader yet; send writes to a voter — retry";
-
-    /// A replica can't carry a membership or repair change to the leader, so
-    /// it names the leader (a voter) for the operator to send the admin
-    /// command to instead of forwarding it where the leader won't answer.
-    fn redirectAdminToLeader(self: *Shard, conn: *Connection, req: proto.Request) void {
-        const leader = self.raft_node.leader_id;
-        var buf: [200]u8 = undefined;
-        const addr = if (leader != 0) if (self.raft_network) |rn| rn.clientAddress(leader) else null else null;
-        const msg = if (addr) |a|
-            std.fmt.bufPrint(&buf, "unavailable: this node is a replica; a cluster admin command must go to a voter — send it to the leader, node {d} at {d}.{d}.{d}.{d}:{d}", .{ leader, a.ip4[0], a.ip4[1], a.ip4[2], a.ip4[3], a.port }) catch REPLICA_ADMIN_MESSAGE
-        else if (leader != 0)
-            std.fmt.bufPrint(&buf, "unavailable: this node is a replica; a cluster admin command must go to a voter — send it to the leader, node {d}", .{leader}) catch REPLICA_ADMIN_MESSAGE
-        else
-            REPLICA_ADMIN_MESSAGE;
-        self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(msg));
-    }
-
-    const REPLICA_ADMIN_MESSAGE = "unavailable: this node is a replica and knows no leader yet; send cluster admin commands to a voter — retry";
+    const REPLICA_WRITE_NONE = "unavailable: this node is a replica and knows no leader yet; send writes to a voter — retry";
+    const REPLICA_ADMIN_NONE = "unavailable: this node is a replica and knows no leader yet; a cluster admin command must go to a voter — retry";
 
     /// Send a client's write to the leader, and
     /// hold the client until the leader answers. With no leader known the
@@ -4138,6 +4142,13 @@ pub const Shard = struct {
     }
 
     fn strangerFrame(self: *Shard, frame: RaftFrame) void {
+        // A forwarded write from a node no config here names can't run, but its
+        // forwarder is holding a client: answer it not-run so the client
+        // retries on a voter, instead of leaving it to the forward backstop.
+        // Other frame types from a stranger are still only ignored, and the
+        // drop is already counted (`dropStranger`).
+        if (frame.msg_type == .forward_write)
+            self.refuseForwardedWrite(frame, "unavailable: the leader does not see this node as a member; send the request to a voter");
         // Only a committed removal is told: an uncommitted one may yet be
         // cut from the log.
         if (self.raft_node.committed_config.removedAt(frame.source_node)) |when| return self.sendRemovedNotice(frame.source_node, when);
@@ -4145,6 +4156,29 @@ pub const Shard = struct {
         if (now -| self.stranger_warn_ms < WARN_INTERVAL_MS) return;
         self.stranger_warn_ms = now;
         log.warn("shard {d}: node {d} sent a {s} frame but is not a member; ignored (a node with the secret is a member only once the leader adds it)", .{ self.id, frame.source_node, @tagName(frame.msg_type) });
+    }
+
+    /// A replica's forwarded write, refused not-run by the leader so its
+    /// forwarder answers the client (retry on a voter) instead of dropping it
+    /// to the backstop. Called from the Replica's `replicaFrame`, which only
+    /// forward_write reaches.
+    fn refuseReplicaForward(self: *Shard, frame: RaftFrame) void {
+        self.refuseForwardedWrite(frame, "unavailable: the leader sees this node as a replica, not a voter; send the request to a voter");
+    }
+
+    /// Answer a forwarded write this node will not run, not-run, so the
+    /// forwarder's held client is told (and retries on a voter) rather than
+    /// waiting out the forward backstop. Replies only to a forward_write, once,
+    /// using the forward id and request id the forwarder matches; never
+    /// proposes anything, so a retry can't double-apply.
+    fn refuseForwardedWrite(self: *Shard, frame: RaftFrame, message: []const u8) void {
+        if (frame.payload.len < FORWARD_PREFIX) return; // no id to route a reply to
+        const id = std.mem.readInt(u32, frame.payload[0..4], .little);
+        const body = frame.payload[@min(frame.payload.len, FORWARD_PREFIX + FORWARD_FIELDS)..];
+        const request_id: u64 = if (body.len >= 16) std.mem.readInt(u64, body[8..16], .little) else 0;
+        var err_buf: [256]u8 = undefined;
+        const serialized = proto.Response.serializeRefusal(.unavailable, request_id, proto.notRun(message), &err_buf);
+        self.sendForwardReply(frame.source_node, id, serialized);
     }
 
     /// Tell a removed node so, at most once a second: it stops, rather than
@@ -9063,6 +9097,104 @@ test "Shard: a node with a stale config takes a promoted voter's append and vote
     try std.testing.expectEqual(@as(u64, 0), shard.replica.replica_frame_warn_ms);
     shard.replica.handleRaftFrame(.{ .source_node = 2, .group_id = 0, .msg_type = .forward_write, .payload = &.{} });
     try std.testing.expect(shard.replica.replica_frame_warn_ms != 0);
+}
+
+/// A forward_write frame's payload: the forward id and fields the leader reads,
+/// then the forwarded request's bytes (its request id lets the forwarder match
+/// the reply).
+fn forwardWritePayload(allocator: std.mem.Allocator, forward_id: u32, req: proto.Request) ![]u8 {
+    const body = try Shard.serializeRequest(allocator, req);
+    defer allocator.free(body);
+    const buf = try allocator.alloc(u8, FORWARD_PREFIX + FORWARD_FIELDS + body.len);
+    std.mem.writeInt(u32, buf[0..4], forward_id, .little);
+    std.mem.writeInt(u16, buf[4..6], FORWARD_FIELDS, .little);
+    std.mem.writeInt(u32, buf[FORWARD_PREFIX..][0..4], 0, .little); // namespace id (unresolved)
+    std.mem.writeInt(u64, buf[FORWARD_PREFIX + 4 ..][0..8], 0, .little); // published index
+    @memcpy(buf[FORWARD_PREFIX + FORWARD_FIELDS ..], body);
+    return buf;
+}
+
+/// The reply the leader queued to `forward_id`'s forwarder, parsed from the
+/// network outbound (as the forwarder's `takeForwardReply` would read it), or
+/// null when none went out. Frees nothing: the caller drains `rn.outbound`.
+fn forwardReplyFor(rn: *RaftNetwork, forward_id: u32) !?proto.Response {
+    var i = rn.outbound.items.len;
+    while (i > 0) {
+        i -= 1;
+        const o = rn.outbound.items[i];
+        if (!o.forward) continue;
+        const body = o.frame[transport.HEADER_SIZE..];
+        if (std.mem.readInt(u32, body[0..4], .little) != forward_id) continue;
+        return try proto.Response.parse(body[12..]);
+    }
+    return null;
+}
+
+fn drainOutbound(rn: *RaftNetwork) void {
+    for (rn.outbound.items) |o| std.testing.allocator.free(o.frame);
+    rn.outbound.clearRetainingCapacity();
+}
+
+test "Shard: the leader answers a replica's forwarded write with a not-run refusal its forwarder can deliver" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 4, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    defer drainOutbound(&rn);
+    try std.testing.expect(shard.applyCommitted());
+    const raft = shard.raft_node;
+    shard.handleJoinRequest(2);
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expect(!raft.latest_config.isVoter(2)); // node 2 is a replica here
+
+    const before_log = raft.log.lastIndex();
+    const before = shard.replica.replica_forwards_refused;
+    const payload = try forwardWritePayload(std.testing.allocator, 7, testReq(.kv_put, 907, "", "k", "v", ""));
+    defer std.testing.allocator.free(payload);
+    // Node 2, which the leader's config calls a replica, forwards a write (it
+    // may believe it was promoted after a leader change, case b).
+    shard.replica.handleRaftFrame(.{ .source_node = 2, .group_id = 0, .msg_type = .forward_write, .payload = payload });
+
+    // Nothing was proposed, so a retry can't double-apply; and the leader
+    // queued node 2 a not-run refusal carrying the request id, which node 2's
+    // takeForwardReply delivers to the waiting client — not a silent drop that
+    // hangs to the backstop.
+    try std.testing.expectEqual(before + 1, shard.replica.replica_forwards_refused);
+    try std.testing.expectEqual(before_log, raft.log.lastIndex());
+    const answer = (try forwardReplyFor(&rn, 7)) orelse return error.TestNoReplySent;
+    try expectAnswer(answer, .unavailable, "not a voter");
+    try std.testing.expectEqual(@as(u64, 907), answer.header.request_id);
+    try std.testing.expectEqual(proto.Ran.no, (try answer.refused()).ran);
+}
+
+test "Shard: the leader answers a stranger's forwarded write with a not-run refusal, proposing nothing" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 4, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    defer drainOutbound(&rn);
+    try std.testing.expect(shard.applyCommitted());
+    const raft = shard.raft_node;
+
+    const before_log = raft.log.lastIndex();
+    const payload = try forwardWritePayload(std.testing.allocator, 7, testReq(.kv_put, 907, "", "k", "v", ""));
+    defer std.testing.allocator.free(payload);
+    // Node 9 is named by no config here (unnamed joiner, or removed-not-told):
+    // its forward is answered not-run, not left to the backstop.
+    shard.replica.handleRaftFrame(.{ .source_node = 9, .group_id = 0, .msg_type = .forward_write, .payload = payload });
+
+    try std.testing.expectEqual(before_log, raft.log.lastIndex()); // nothing proposed
+    const answer = (try forwardReplyFor(&rn, 7)) orelse return error.TestNoReplySent;
+    try expectAnswer(answer, .unavailable, "does not see this node as a member");
+    try std.testing.expectEqual(@as(u64, 907), answer.header.request_id);
 }
 
 test "Shard: a frame from a node the membership does not name is dropped, a join request is not, and the ids inside must be the sender's" {
@@ -23340,8 +23472,10 @@ test "Shard: a replica refuses a repair from its admin socket up front, naming t
     // refuses it up front, naming the leader, rather than holding a forward
     // the leader won't answer.
     const answer = (try t.repairSkip(.admin, 5, false, &buf)) orelse return error.TestExpectedRefusal;
-    try expectAnswer(answer, .unavailable, "this node is a replica");
-    try std.testing.expectEqual(held, t.shard.forward_count);
+    try expectAnswer(answer, .unavailable, "cluster admin command must go to a voter");
+    try std.testing.expect(std.mem.indexOf(u8, answer.data, "node 1") != null); // names the leader
+    try std.testing.expectEqual(held, t.shard.forward_count); // not forwarded
+    try std.testing.expect(!t.conn.response_deferred); // answered here, not held
 }
 
 test "checkAppliers: a type a contract machine owns may have no other applier, and needs none" {

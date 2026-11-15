@@ -123,7 +123,7 @@ test "e2e/membership: a fourth node stays a replica until promoted; removal is r
         var refused = try cluster.clis[replica].?.run(&.{ "cluster", "promote", fourth_s, "--config", cfg });
         defer refused.deinit();
         try stdx.testing.assertFailed(refused);
-        try testing.expect(refused.contains("this node is a replica"));
+        try testing.expect(refused.contains("cluster admin command must go to a voter"));
     }
 
     try cluster.execAdminOn(via, &.{ "cluster", "promote", fourth_s });
