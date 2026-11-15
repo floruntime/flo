@@ -17,6 +17,7 @@ pub const protocol = struct {
     pub const ops = @import("protocol/ops.zig");
     pub const kv_entries = @import("protocol/kv_entries.zig");
     pub const action_entries = @import("protocol/action_entries.zig");
+    pub const channel_entries = @import("protocol/channel_entries.zig");
     pub const schema = @import("protocol/schema.zig");
     pub const limits = @import("protocol/limits.zig");
     pub const request_builder = @import("protocol/request_builder.zig");
@@ -51,6 +52,9 @@ pub const contract = struct {
     pub const store = @import("contract/store.zig");
     pub const view = @import("contract/view.zig");
     pub const machine = @import("contract/machine.zig");
+    pub const channels = @import("contract/channels.zig");
+    pub const channel_driver = @import("contract/channel_driver.zig");
+    pub const channel_probe = @import("contract/channel_probe.zig");
 };
 
 // =============================================================================
