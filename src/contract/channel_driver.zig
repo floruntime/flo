@@ -304,7 +304,7 @@ pub const Driver = struct {
             const o = (read.get(channels.OutFam, channels.outKey(&k, b, seq)) catch null) orelse break;
             if (o.v.sent_at > ready) break;
             if (n > 0 and bytes + o.v.payload.len > MAX_BATCH_BYTES) break;
-            ce.Message.encode(&list, .{ .slot = o.v.slot, .entry_type = o.v.entry_type, .layout_epoch = o.v.layout_epoch, .payload = o.v.payload }) catch break;
+            ce.Message.encode(&list, .{ .slot = o.v.slot, .entry_type = o.v.entry_type, .layout_epoch = o.v.layout_epoch, .flags = o.v.flags, .payload = o.v.payload }) catch break;
             bytes += o.v.payload.len;
             n += 1;
         }

@@ -184,7 +184,7 @@ const Op = struct {
 /// view is partial (a write staged but not indexed) and must not be read
 /// or committed: the machine drops the entry and its view.
 /// One send an entry makes: its target's slot, entry type and payload.
-pub const Send = struct { slot: u16, entry_type: u8, payload: []const u8 };
+pub const Send = struct { slot: u16, entry_type: u8, flags: u16 = 0, payload: []const u8 };
 
 /// This group among the groups on the node: a slot's owner is the group
 /// `slot % count`. Fixed for a data directory, so every replica derives
@@ -241,9 +241,15 @@ pub const View = struct {
     /// `slot`, which applies it through that type's machine. It leaves with
     /// this entry's writes, or not at all.
     pub fn send(self: *View, slot: u16, etype: u8, payload: []const u8) ApplyError!void {
+        return self.sendFlagged(slot, etype, 0, payload);
+    }
+
+    /// `send`, with the entry flags the message applies with at its
+    /// receiver (a sink's write is `Flags.SINK`).
+    pub fn sendFlagged(self: *View, slot: u16, etype: u8, flags: u16, payload: []const u8) ApplyError!void {
         // A send from an apply that isn't wired for one is a Flo bug.
         if (self.place == null) return error.Halt;
-        try self.sends.append(self.arena, .{ .slot = slot, .entry_type = etype, .payload = try self.arena.dupe(u8, payload) });
+        try self.sends.append(self.arena, .{ .slot = slot, .entry_type = etype, .flags = flags, .payload = try self.arena.dupe(u8, payload) });
     }
 
     /// A point `rollback` returns the staged writes and sends to.
