@@ -71,8 +71,8 @@ pub fn read(
         builder.addI64(.ts_to_ms, opts.to_ms) catch return error.OptionsBufferTooSmall;
     }
 
-    if (opts.limit != 10000) {
-        builder.addU32(.limit, @intCast(opts.limit)) catch return error.OptionsBufferTooSmall;
+    if (opts.limit != 0) {
+        builder.addU32(.limit, opts.limit) catch return error.OptionsBufferTooSmall;
     }
 
     return client.sendRequestWithOptions(.ts_read, namespace, measurement, "", builder.getOptions());
@@ -83,7 +83,9 @@ pub const ReadOptions = struct {
     field: []const u8 = "",
     from_ms: i64 = 0,
     to_ms: i64 = 0,
-    limit: u32 = 10000,
+    /// The earliest this many points in range; 0 asks for every one, which
+    /// the server refuses past the most a read answers.
+    limit: u32 = 0,
 };
 
 /// Query with aggregation

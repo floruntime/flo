@@ -131,9 +131,13 @@ pub fn getMeasurementDetail(allocator: Allocator, measurement: []const u8, query
 }
 
 /// GET /timeseries/:measurement/data — One field's raw points (`ts_read`,
-/// answered by the measurement's shard). `?tags=k=v,k=v` selects matching
-/// tag-series; `?from=` / `?to=` bound it in ms. `window` and `aggregation`
-/// are echoed back, not applied.
+/// answered by the measurement's shard), the earliest `?limit=` of them
+/// (at most, and by default, what one read answers). `?tags=k=v,k=v`
+/// selects matching tag-series; `?from=` / `?to=` bound it in ms. With no
+/// `from`, the range starts late enough to hold about `limit` of the
+/// measurement's points, from its spread in `ts.info`, so a chart shows
+/// recent points rather than its oldest. `window` and `aggregation` are
+/// echoed back, not applied.
 pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     const field = h.parseQueryParam([]const u8, query_string, "field") orelse "value";
@@ -142,17 +146,30 @@ pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string
     const to_str = h.parseQueryParam([]const u8, query_string, "to");
     const window = h.parseQueryParam(u64, query_string, "window") orelse 0;
     const aggregation = h.parseQueryParam([]const u8, query_string, "aggregation") orelse "none";
-    const from_val: i64 = if (from_str) |s| std.fmt.parseInt(i64, s, 10) catch 0 else 0;
+    // 0 asks for the default, as no limit does.
+    const asked = h.parseQueryParam(u32, query_string, "limit") orelse 0;
+    const limit: u32 = if (asked == 0) MAX_READ_POINTS else @min(asked, MAX_READ_POINTS);
+    var from_val: i64 = if (from_str) |s| std.fmt.parseInt(i64, s, 10) catch 0 else 0;
     const to_val: i64 = if (to_str) |s| std.fmt.parseInt(i64, s, 10) catch 0 else 0;
 
     var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "time-series read", err);
     defer reader.deinit();
+    if (from_str == null) {
+        const Info = ts_ops.op("ts.info");
+        var got = reader.call(Info, ns, measurement, .{}) catch |err| return try loopback.readFailed(allocator, "time-series info", err);
+        defer got.deinit();
+        var diag: schema.Diagnostic = .{};
+        if (!got.isError()) if (Info.response.decodeAll(got.data, &diag)) |info| {
+            from_val = recentFromMs(info.points, info.oldest_ms orelse 0, info.newest_ms orelse 0, to_val, limit);
+        } else |_| {};
+    }
     const client = reader.next() catch |err| return try loopback.readFailed(allocator, "time-series read", err);
     var got = client_mod.ts.read(client, ns, measurement, .{
         .tags = tags,
         .field = field,
         .from_ms = @max(from_val, 0),
         .to_ms = @max(to_val, 0),
+        .limit = limit,
     }) catch |err| return try loopback.readFailed(allocator, "time-series read", err);
     defer got.deinit();
     if (got.isError() and !got.isNotFound()) return try h.jsonError(allocator, got.errorMessage());
@@ -191,6 +208,34 @@ pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string
     }
     try obj.end();
     return try json_aw.toOwnedSlice();
+}
+
+const MAX_READ_POINTS = @import("../../../ts/handler.zig").MAX_READ_POINTS;
+
+/// Where a range that holds about `limit` of `points`, spread evenly from
+/// `oldest_ms` to `newest_ms`, starts; 0 when they all fit. A range that
+/// ends at `to_ms` (when above 0) counts back from it, never past it.
+/// An estimate: a measurement's points written in bursts, or a field or
+/// tags that stopped writing, chart fewer than `limit`, or none.
+fn recentFromMs(points: u64, oldest_ms: i64, newest_ms: i64, to_ms: i64, limit: u32) i64 {
+    const end = if (to_ms > 0) @min(newest_ms, to_ms) else newest_ms;
+    if (points <= limit or end <= oldest_ms) return 0;
+    const spread: u128 = @intCast(newest_ms - oldest_ms);
+    const span: i64 = @intCast(spread * limit / points);
+    return @max(end - span, 1);
+}
+
+test "dashboard ts: a chart's default range holds about a read's worth of points, the newest" {
+    try std.testing.expectEqual(@as(i64, 0), recentFromMs(4096, 1000, 9000, 0, 4096));
+    try std.testing.expectEqual(@as(i64, 0), recentFromMs(10_000, 5000, 5000, 0, 4096));
+    try std.testing.expectEqual(@as(i64, 9000 - 4000), recentFromMs(8192, 1000, 9000, 0, 4096));
+    // With an end, back from it, and never past it.
+    try std.testing.expectEqual(@as(i64, 7000 - 4000), recentFromMs(8192, 1000, 9000, 7000, 4096));
+    try std.testing.expectEqual(@as(i64, 9000 - 4000), recentFromMs(8192, 1000, 9000, 20_000, 4096));
+    try std.testing.expectEqual(@as(i64, 0), recentFromMs(8192, 1000, 9000, 500, 4096));
+    for ([_]i64{ 1, 1500, 3000, 8999, 9000, 9001 }) |to| try std.testing.expect(recentFromMs(8192, 1000, 9000, to, 4096) <= to);
+    // No overflow at the extremes.
+    try std.testing.expect(recentFromMs(std.math.maxInt(u64), 1, std.math.maxInt(i64), 0, 4096) > std.math.maxInt(i64) - 4096);
 }
 
 /// POST /timeseries/floql — Execute a FloQL query (`ts_floql`), on the

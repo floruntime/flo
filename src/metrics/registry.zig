@@ -736,6 +736,9 @@ pub const ShardMetrics = struct {
     /// (gauge), and those dropped because that list was full (cumulative).
     sink_retry_pending: Atomic(u64) = Atomic(u64).init(0),
     sink_retry_bytes: Atomic(u64) = Atomic(u64).init(0),
+    /// Time-series points the shard holds, and the store bytes they take.
+    ts_points: Atomic(u64) = Atomic(u64).init(0),
+    ts_point_bytes: Atomic(u64) = Atomic(u64).init(0),
     sink_retry_overflow: Atomic(u64) = Atomic(u64).init(0),
     /// The last snapshot bar's index, and the logical bytes applied since.
     bar_last: Atomic(u64) = Atomic(u64).init(0),
@@ -938,6 +941,8 @@ pub const ShardMetrics = struct {
         snapshot_skipped_leader_not_ready: u64,
         sink_retry_pending: u64,
         sink_retry_bytes: u64,
+        ts_points: u64,
+        ts_point_bytes: u64,
         sink_retry_overflow: u64,
         bar_last: u64,
         bar_bytes: u64,
@@ -992,6 +997,8 @@ pub const ShardMetrics = struct {
             .snapshot_skipped_leader_not_ready = self.snapshot_skipped_leader_not_ready.load(.monotonic),
             .sink_retry_pending = self.sink_retry_pending.load(.monotonic),
             .sink_retry_bytes = self.sink_retry_bytes.load(.monotonic),
+            .ts_points = self.ts_points.load(.monotonic),
+            .ts_point_bytes = self.ts_point_bytes.load(.monotonic),
             .sink_retry_overflow = self.sink_retry_overflow.load(.monotonic),
             .bar_last = self.bar_last.load(.monotonic),
             .bar_bytes = self.bar_bytes.load(.monotonic),
@@ -1828,6 +1835,8 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_snapshot_skipped_total{{shard_id=\"{d}\",reason=\"leader_not_ready\"}} {d}\n", .{ snap.shard_id, snap.snapshot_skipped_leader_not_ready });
     try writer.print("flo_shard_sink_retry_pending{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.sink_retry_pending });
     try writer.print("flo_shard_sink_retry_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.sink_retry_bytes });
+    try writer.print("flo_shard_ts_points{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.ts_points });
+    try writer.print("flo_shard_ts_point_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.ts_point_bytes });
     try writer.print("flo_shard_sink_retry_overflow_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.sink_retry_overflow });
     try writer.print("flo_shard_snapshot_bar_last{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bar_last });
     try writer.print("flo_shard_snapshot_bar_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bar_bytes });

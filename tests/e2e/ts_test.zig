@@ -1773,3 +1773,83 @@ test "e2e/ts: a floql query runs on its measurement's shard, wherever that is" {
         try testing.expect(std.mem.indexOf(u8, result.stdout, value) != null);
     }
 }
+
+test "e2e/ts: every point of a series past what a buffer used to hold reads back, before and after a restart" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const n = 5000;
+    const base: u64 = 1_708_700_000_000;
+    // Beside this run's data dir, which the harness makes and removes.
+    const tmp_path = try std.fmt.allocPrint(testing.allocator, "{s}/../many.txt", .{ctx.getDataDir()});
+    defer testing.allocator.free(tmp_path);
+    {
+        var w: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer w.deinit();
+        for (0..n) |i| try w.writer.print("many,host=a v={d} {d}\n", .{ i, base + i });
+        const file = try @import("stdx").fs.createFile(tmp_path, .{});
+        defer @import("stdx").fs.closeFile(file);
+        try @import("stdx").fs.writeAll(file, w.written());
+    }
+    defer @import("stdx").fs.deleteFile(tmp_path) catch {};
+    var wr = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", tmp_path, "--precision", "ms" });
+    defer wr.deinit();
+    try testing.expectEqual(@as(u8, 0), wr.exit_code);
+    try testing.expect(wr.stdoutContains("Wrote 5000 points\n"));
+
+    for (0..2) |round| {
+        // An exact count over every point, and the very first one written.
+        var q = try ctx.cli.run(&.{ "ts", "query", "many", "--field", "v", "--from", "1", "--to", "99999999999999", "--window", "1000000h", "--agg", "count", "-o", "raw" });
+        defer q.deinit();
+        try testing.expectEqual(@as(u8, 0), q.exit_code);
+        try testing.expectEqualStrings("0 5000.000000", std.mem.trim(u8, q.stdout, " \n"));
+        var first = try ctx.cli.run(&.{ "ts", "read", "many", "--field", "v", "--from", "1", "--limit", "1", "-o", "raw" });
+        defer first.deinit();
+        try testing.expectEqual(@as(u8, 0), first.exit_code);
+        var want: [64]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{d} 0.000000\n", .{base}), first.stdout);
+        // By default, the earliest 4096 in range.
+        var dflt = try ctx.cli.run(&.{ "ts", "read", "many", "--field", "v", "--from", "1", "-o", "raw" });
+        defer dflt.deinit();
+        try testing.expectEqual(@as(u8, 0), dflt.exit_code);
+        try testing.expectEqual(@as(usize, 4096), std.mem.count(u8, dflt.stdout, "\n"));
+        try testing.expect(std.mem.endsWith(u8, dflt.stdout, try std.fmt.bufPrint(&want, "{d} 4095.000000\n", .{base + 4095})));
+        // More than a read returns is refused, not cut short.
+        var all = try ctx.cli.run(&.{ "ts", "read", "many", "--field", "v", "--from", "1", "--limit", "5000", "-o", "raw" });
+        defer all.deinit();
+        try testing.expectEqual(@as(u8, 3), all.exit_code);
+        try testing.expectEqualStrings("Error: bad request: more than 4096 points match; pass --limit (at most 4096) or narrow the range [bad_request]\n", all.stderr);
+        if (round == 0) try ctx.restartServer();
+    }
+}
+
+test "e2e/ts: the dashboard charts a series past what one read returns, from its newest points" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .dashboard_enabled = true } });
+    defer ctx.deinit();
+    const n = 5000;
+    const base: u64 = 1_708_700_000_000;
+    const tmp_path = try std.fmt.allocPrint(testing.allocator, "{s}/../chart.txt", .{ctx.getDataDir()});
+    defer testing.allocator.free(tmp_path);
+    {
+        var w: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer w.deinit();
+        for (0..n) |i| try w.writer.print("chart,host=a v={d} {d}\n", .{ i, base + i });
+        const file = try @import("stdx").fs.createFile(tmp_path, .{});
+        defer @import("stdx").fs.closeFile(file);
+        try @import("stdx").fs.writeAll(file, w.written());
+    }
+    var wr = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", tmp_path, "--precision", "ms" });
+    defer wr.deinit();
+    try testing.expectEqual(@as(u8, 0), wr.exit_code);
+
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    var resp = try http.get("/api/v1/timeseries/chart/data?field=v");
+    defer resp.deinit();
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    const parsed = try std.json.parseFromSlice(struct { series: []const struct { timestamp: i64, value: f64 } }, testing.allocator, resp.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const pts = parsed.value.series;
+    if (pts.len == 0 or pts.len > 4096) std.debug.print("{s}\n", .{resp.body[0..@min(resp.body.len, 400)]});
+    try testing.expect(pts.len > 3000 and pts.len <= 4096);
+    try testing.expectEqual(@as(i64, @intCast(base + n - 1)), pts[pts.len - 1].timestamp);
+}

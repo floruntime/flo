@@ -39,6 +39,19 @@ const ss_mod = @import("floql/series_set.zig");
 
 const CommandResult = result_mod.CommandResult;
 const TSProjection = ts_mod.TSProjection;
+
+/// Most points a read, or a FloQL answer, returns.
+pub const MAX_READ_POINTS = 4096;
+pub const TOO_MANY_POINTS = std.fmt.comptimePrint("bad request: more than {d} points match; pass --limit (at most {d}) or narrow the range", .{ MAX_READ_POINTS, MAX_READ_POINTS });
+pub const TOO_MANY_FLOQL_POINTS = std.fmt.comptimePrint("bad request: the answer holds more than {d} points; aggregate them or narrow the query", .{MAX_READ_POINTS});
+/// Most points a FloQL query reads to run its stages over: it holds them
+/// all at once, 16 bytes each, on the shard thread.
+pub const MAX_FLOQL_POINTS = 1 << 17;
+/// Most points `ts query` reads into its buckets, so one query's time on
+/// the shard thread has a bound.
+pub const MAX_QUERY_SCANNED = 1 << 20;
+pub const TOO_MANY_FLOQL_SCANNED = std.fmt.comptimePrint("bad request: more than {d} points match a FloQL query; narrow its range or its tags", .{MAX_FLOQL_POINTS});
+pub const TOO_MANY_QUERY_POINTS = std.fmt.comptimePrint("bad request: more than {d} points match a query; narrow its range or its tags", .{MAX_QUERY_SCANNED});
 const StoredPoint = ts_mod.StoredPoint;
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
@@ -70,6 +83,10 @@ pub const TSHandler = struct {
     why_buf: [512]u8 = undefined,
     /// An info answer's field names, encoded; written before it is sent.
     info_buf: [ts_ops.MAX_INFO_FIELD_BYTES]u8 = undefined,
+    /// How many points a query and a FloQL query may read; lowered only
+    /// by tests.
+    query_scanned_max: usize = MAX_QUERY_SCANNED,
+    floql_points_max: usize = MAX_FLOQL_POINTS,
 
     pub fn init(allocator: Allocator, ts: *TSProjection) TSHandler {
         return .{
@@ -160,7 +177,7 @@ pub const TSHandler = struct {
         _: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
         const ts: *TSProjection = @ptrCast(@alignCast(ctx));
-        const name_buf = dispatcher_mod.scanScratch(ts.buffers.count());
+        const name_buf = dispatcher_mod.scanScratch(ts.seriesCount());
         const count = ts.scanMeasurementNames(ns.id, name_buf);
         return .{ .items = name_buf[0..count], .next_cursor = null };
     }
@@ -398,18 +415,23 @@ pub const TSHandler = struct {
             break :blk if (ms > 0) time_units.msToNsSat(@intCast(ms)) else std.math.maxInt(u64);
         } else std.math.maxInt(u64);
 
-        // Query raw points
-        var point_buf: [4096]StoredPoint = undefined;
+        // The earliest `limit` points, at most `MAX_READ_POINTS`; with no
+        // limit, every point, when they fit. A read that would return more
+        // is refused rather than cut short: an answer has no way yet to say
+        // there's more.
+        const limit = req.getLimit() orelse 0;
+        const capped = limit > 0 and limit <= MAX_READ_POINTS;
+        const point_buf = self.allocator.alloc(StoredPoint, if (capped) limit else MAX_READ_POINTS + 1) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "ts read: out of memory" } };
+        };
+        defer self.allocator.free(point_buf);
         var pred_buf: [32]ts_mod.TagPredicate = undefined;
         const preds = requestTagPredicates(req, &pred_buf);
-        const result = self.ts.queryRangeFiltered(req.ns_id, measurement, field_name, preds, from_ns, to_ns, &point_buf) catch {
+        const result = self.ts.queryRangeFiltered(req.ns_id, measurement, field_name, preds, from_ns, to_ns, point_buf) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts read failed" } };
         };
-
-        // The earliest `limit` points; absent or 0 is every point read.
-        const limit = req.getLimit() orelse 0;
-        const count_pts = if (limit > 0) @min(result.points_in_buffer, limit) else result.points_in_buffer;
-        const data = serializeDataPoints(self.allocator, point_buf[0..count_pts]) catch {
+        if (result.points_in_buffer > MAX_READ_POINTS) return .{ .err = .{ .code = .invalid_request, .message = TOO_MANY_POINTS } };
+        const data = serializeDataPoints(self.allocator, point_buf[0..result.points_in_buffer]) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts read serialization failed" } };
         };
 
@@ -458,30 +480,43 @@ pub const TSHandler = struct {
         var pred_buf: [32]ts_mod.TagPredicate = undefined;
         const preds = requestTagPredicates(req, &pred_buf);
 
-        var point_buf: [4096]StoredPoint = undefined;
-        const qr = self.ts.queryRangeFiltered(ns_id, measurement, field_name, preds, from_ns, to_ns, &point_buf) catch {
+        // Every point in the range, up to `MAX_QUERY_SCANNED`, past which
+        // the query is refused: points arrive time-ordered, so buckets are
+        // produced in order and a point can only ever extend the most
+        // recent bucket.
+        const Buckets = struct {
+            window_ms: i64,
+            starts: [MAX_QUERY_BUCKETS]i64 = undefined,
+            accs: [MAX_QUERY_BUCKETS]BucketAcc = undefined,
+            nb: usize = 0,
+            scanned: usize = 0,
+            max: usize,
+
+            fn add(acc: *@This(), pt: StoredPoint) bool {
+                acc.scanned += 1;
+                if (acc.scanned > acc.max) return false;
+                const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
+                const start = @divFloor(ts_ms, acc.window_ms) * acc.window_ms;
+                if (acc.nb > 0 and acc.starts[acc.nb - 1] == start) {
+                    acc.accs[acc.nb - 1].add(pt.field_value);
+                    return true;
+                }
+                if (acc.nb >= MAX_QUERY_BUCKETS) return false;
+                acc.starts[acc.nb] = start;
+                acc.accs[acc.nb] = .{};
+                acc.accs[acc.nb].add(pt.field_value);
+                acc.nb += 1;
+                return true;
+            }
+        };
+        var b: Buckets = .{ .window_ms = window_ms, .max = self.query_scanned_max };
+        self.ts.scanFiltered(ns_id, measurement, field_name, preds, from_ns, to_ns, &b, Buckets.add) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts query failed" } };
         };
-        const pts = point_buf[0..qr.points_in_buffer];
-
-        // Points arrive time-ordered, so buckets are produced in order and a
-        // point can only ever extend the most recent bucket.
-        var starts: [MAX_QUERY_BUCKETS]i64 = undefined;
-        var accs: [MAX_QUERY_BUCKETS]BucketAcc = undefined;
-        var nb: usize = 0;
-        for (pts) |pt| {
-            const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
-            const start = @divFloor(ts_ms, window_ms) * window_ms;
-            if (nb > 0 and starts[nb - 1] == start) {
-                accs[nb - 1].add(pt.field_value);
-            } else {
-                if (nb >= MAX_QUERY_BUCKETS) break;
-                starts[nb] = start;
-                accs[nb] = .{};
-                accs[nb].add(pt.field_value);
-                nb += 1;
-            }
-        }
+        if (b.scanned > b.max) return .{ .err = .{ .code = .invalid_request, .message = TOO_MANY_QUERY_POINTS } };
+        const starts = b.starts[0..b.nb];
+        const accs = b.accs[0..b.nb];
+        const nb = b.nb;
 
         var buckets: [MAX_QUERY_BUCKETS]QueryBucket = undefined;
         var out_n: usize = 0;
@@ -546,25 +581,44 @@ pub const TSHandler = struct {
             }
         }
 
-        // 3. Query the TSProjection for raw points
-        var point_buf: [4096]StoredPoint = undefined;
+        // 3. Every matching point, so a stage sees them all: up to
+        // `MAX_FLOQL_POINTS`, past which the query is refused, not cut short.
         var pred_buf: [32]ts_mod.TagPredicate = undefined;
         const src_preds = floqlTagPredicates(query.source.filters, &pred_buf);
-        const qr = self.ts.queryRangeFiltered(req.ns_id, measurement, field_name, src_preds, from_ns, to_ns, &point_buf) catch {
+        const Collect = struct {
+            list: std.ArrayListUnmanaged(ss_mod.DataPoint) = .empty,
+            allocator: Allocator,
+            failed: bool = false,
+            max: usize,
+
+            fn take(c: *@This(), sp: StoredPoint) bool {
+                if (c.list.items.len > c.max) return false;
+                c.list.append(c.allocator, .{ .timestamp_ms = @intCast(sp.timestamp_ns / 1_000_000), .value = sp.field_value }) catch {
+                    c.failed = true;
+                    return false;
+                };
+                return true;
+            }
+        };
+        var collect: Collect = .{ .allocator = self.allocator, .max = self.floql_points_max };
+        self.ts.scanFiltered(req.ns_id, measurement, field_name, src_preds, from_ns, to_ns, &collect, Collect.take) catch {
+            collect.list.deinit(self.allocator);
             return .{ .err = .{ .code = .internal_error, .message = "floql: ts query failed" } };
         };
+        if (collect.failed) {
+            collect.list.deinit(self.allocator);
+            return .{ .err = .{ .code = .internal_error, .message = "floql: out of memory" } };
+        }
+        if (collect.list.items.len > collect.max) {
+            collect.list.deinit(self.allocator);
+            return .{ .err = .{ .code = .invalid_request, .message = TOO_MANY_FLOQL_SCANNED } };
+        }
 
-        // 4. Convert StoredPoint[] → SeriesSet (initial pipeline input)
-        const count_pts = qr.points_in_buffer;
-        var dp_slice = self.allocator.alloc(ss_mod.DataPoint, count_pts) catch {
+        // 4. Convert the points → SeriesSet (initial pipeline input)
+        const dp_slice = collect.list.toOwnedSlice(self.allocator) catch {
+            collect.list.deinit(self.allocator);
             return .{ .err = .{ .code = .internal_error, .message = "floql: out of memory" } };
         };
-        for (point_buf[0..count_pts], 0..) |sp, i| {
-            dp_slice[i] = .{
-                .timestamp_ms = @intCast(sp.timestamp_ns / 1_000_000),
-                .value = sp.field_value,
-            };
-        }
 
         var series_slice = self.allocator.alloc(ss_mod.Series, 1) catch {
             self.allocator.free(dp_slice);
@@ -592,6 +646,12 @@ pub const TSHandler = struct {
         if (query.stages.len > 0) {
             initial.deinit();
         }
+
+        // An answer of more raw points than a read returns is refused, as a
+        // read's is: aggregate them, or narrow the query.
+        var answer_points: usize = 0;
+        for (result_set.series) |sr| answer_points += sr.points.len;
+        if (answer_points > MAX_READ_POINTS) return .{ .err = .{ .code = .invalid_request, .message = TOO_MANY_FLOQL_POINTS } };
 
         // 6. Encode SeriesSet → wire bytes
         const encoded = result_set.encode(self.allocator) catch {
@@ -939,7 +999,7 @@ test "ts handler: dispatcher registration" {
 
 test "ts handler: write with string value" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -959,7 +1019,7 @@ test "ts handler: write with string value" {
 
 test "ts handler: write with binary f64 value" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -980,7 +1040,7 @@ test "ts handler: write with binary f64 value" {
 
 test "ts handler: write with field name option" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -999,7 +1059,7 @@ test "ts handler: write with field name option" {
 
 test "ts handler: a client timestamp past what nanoseconds hold is refused, not wrapped" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
     var handler = TSHandler.init(allocator, &ts);
 
@@ -1016,7 +1076,7 @@ test "ts handler: a client timestamp past what nanoseconds hold is refused, not 
 
 test "ts handler: write empty measurement" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1030,7 +1090,7 @@ test "ts handler: write empty measurement" {
 
 test "ts handler: read" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1054,7 +1114,7 @@ test "ts handler: read" {
 
 test "ts handler: read returns at most limit points" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
     var handler = TSHandler.init(allocator, &ts);
     for ([_]f64{ 10.0, 20.0, 30.0 }) |v| _ = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(v), ""));
@@ -1074,7 +1134,7 @@ test "ts handler: read returns at most limit points" {
 
 test "ts handler: read empty measurement" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1088,7 +1148,7 @@ test "ts handler: read empty measurement" {
 
 test "ts handler: read non-existent series" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1106,7 +1166,7 @@ test "ts handler: read non-existent series" {
 
 test "ts handler: query avg" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1136,7 +1196,7 @@ test "ts handler: query avg" {
 
 test "ts handler: query count" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1163,7 +1223,7 @@ test "ts handler: query count" {
 
 test "ts handler: query non-existent series" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1181,7 +1241,7 @@ test "ts handler: query non-existent series" {
 
 test "ts handler: list" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1220,7 +1280,7 @@ test "ts handler: pre-route by measurement" {
 
 test "ts handler: write refuses a value that is not one finite f64" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1237,7 +1297,7 @@ test "ts handler: write refuses a value that is not one finite f64" {
 
 test "ts handler: write accepts negative zero and subnormals" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1252,7 +1312,7 @@ test "ts handler: write accepts negative zero and subnormals" {
 
 test "ts handler: multiple writes same measurement" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1271,7 +1331,7 @@ test "ts handler: multiple writes same measurement" {
 
 test "ts handler: freeResult non-heap-allocated is no-op" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1283,7 +1343,7 @@ test "ts handler: freeResult non-heap-allocated is no-op" {
 
 test "ts handler: floql basic pipeline" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1312,7 +1372,7 @@ test "ts handler: floql basic pipeline" {
 
 test "ts handler: floql empty query" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1326,7 +1386,7 @@ test "ts handler: floql empty query" {
 
 test "ts handler: floql invalid syntax" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1340,7 +1400,7 @@ test "ts handler: floql invalid syntax" {
 
 test "ts handler: floql with pipeline stages" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1368,7 +1428,7 @@ test "ts handler: floql with pipeline stages" {
 
 test "ts handler: delete measurement" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1411,7 +1471,7 @@ test "ts handler: delete measurement" {
 
 test "ts handler: delete empty measurement" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1425,7 +1485,7 @@ test "ts handler: delete empty measurement" {
 
 test "ts handler: retention empty duration" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1439,7 +1499,7 @@ test "ts handler: retention empty duration" {
 
 test "ts handler: a retention duration past 100 years is refused" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
     var handler = TSHandler.init(allocator, &ts);
 
@@ -1452,7 +1512,7 @@ test "ts handler: a retention duration past 100 years is refused" {
 
 test "ts handler: retention invalid duration" {
     const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator, .{});
+    var ts = TSProjection.init(allocator);
     defer ts.deinit();
 
     var handler = TSHandler.init(allocator, &ts);
@@ -1462,4 +1522,102 @@ test "ts handler: retention invalid duration" {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "ts handler: a read past 4096 points is refused rather than cut short; 4096 are served, and a limit takes the earliest" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator);
+    defer ts.deinit();
+    var handler = TSHandler.init(allocator, &ts);
+    for (0..MAX_READ_POINTS) |i| try ts.insert(.default, "cpu", "value", @floatFromInt(i), 1000 + i, 0, "");
+    const read = struct {
+        fn count(h: *TSHandler, options: []const u8) !?u32 {
+            const result = h.handleCommand(makeRequest(.ts_read, "cpu", "", options));
+            switch (result) {
+                .ts_read_result => |r| {
+                    defer h.freeResult(result);
+                    return std.mem.readInt(u32, r.data[0..4], .little);
+                },
+                .err => |e| {
+                    try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code);
+                    try testing.expectEqualStrings(TOO_MANY_POINTS, e.message);
+                    return null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    };
+    try testing.expectEqual(@as(?u32, MAX_READ_POINTS), try read.count(&handler, ""));
+    try ts.insert(.default, "cpu", "value", 0, 1000 + MAX_READ_POINTS, 0, "");
+    try testing.expectEqual(@as(?u32, null), try read.count(&handler, ""));
+    var opts_buf: [16]u8 = undefined;
+    var builder = OptionsBuilder.init(&opts_buf);
+    try builder.addU32(.limit, 10);
+    try testing.expectEqual(@as(?u32, 10), try read.count(&handler, builder.getOptions()));
+    var big_buf: [16]u8 = undefined;
+    var big = OptionsBuilder.init(&big_buf);
+    try big.addU32(.limit, MAX_READ_POINTS + 1);
+    try testing.expectEqual(@as(?u32, null), try read.count(&handler, big.getOptions()));
+}
+
+test "ts handler: FloQL aggregates every matching point, and refuses an answer of more raw points than a read returns" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator);
+    defer ts.deinit();
+    var handler = TSHandler.init(allocator, &ts);
+    const now_ns: u64 = @intCast(@import("stdx").time.milliTimestamp() * std.time.ns_per_ms);
+    const n = MAX_READ_POINTS + 904;
+    for (0..n) |i| try ts.insert(.default, "cpu", "value", 1, now_ns - i * std.time.ns_per_ms, 0, "");
+    {
+        const result = handler.handleCommand(makeRequest(.ts_floql, "", "cpu[24h] | count()", ""));
+        switch (result) {
+            .ts_floql_result => |r| {
+                defer handler.freeResult(result);
+                // One series, "cpu"/"value", one point: its count.
+                const at = 4 + 4 + 3 + 4 + 5 + 4 + 8;
+                try testing.expectEqual(@as(f64, n), @as(f64, @bitCast(std.mem.readInt(u64, r.data[at..][0..8], .little))));
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    const raw = handler.handleCommand(makeRequest(.ts_floql, "", "cpu[24h]", ""));
+    switch (raw) {
+        .err => |e| try testing.expectEqualStrings(TOO_MANY_FLOQL_POINTS, e.message),
+        else => {
+            handler.freeResult(raw);
+            return error.TestUnexpectedResult;
+        },
+    }
+}
+
+test "ts handler: a query or FloQL query reading past its budget is refused, not cut short" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator);
+    defer ts.deinit();
+    var handler = TSHandler.init(allocator, &ts);
+    const now_ns: u64 = @intCast(@import("stdx").time.milliTimestamp() * std.time.ns_per_ms);
+    for (0..11) |i| try ts.insert(.default, "cpu", "value", 1, now_ns - i * std.time.ns_per_ms, 0, "");
+    const refusedWith = struct {
+        fn f(h: *TSHandler, req: Request) ![]const u8 {
+            const result = h.handleCommand(req);
+            switch (result) {
+                .err => |e| {
+                    try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code);
+                    return e.message;
+                },
+                else => {
+                    h.freeResult(result);
+                    return "";
+                },
+            }
+        }
+    }.f;
+    handler.query_scanned_max = 11;
+    handler.floql_points_max = 11;
+    try testing.expectEqualStrings("", try refusedWith(&handler, makeRequest(.ts_query, "cpu", "", "")));
+    try testing.expectEqualStrings("", try refusedWith(&handler, makeRequest(.ts_floql, "", "cpu[24h] | count()", "")));
+    handler.query_scanned_max = 10;
+    handler.floql_points_max = 10;
+    try testing.expectEqualStrings(TOO_MANY_QUERY_POINTS, try refusedWith(&handler, makeRequest(.ts_query, "cpu", "", "")));
+    try testing.expectEqualStrings(TOO_MANY_FLOQL_SCANNED, try refusedWith(&handler, makeRequest(.ts_floql, "", "cpu[24h] | count()", "")));
 }

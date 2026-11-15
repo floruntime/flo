@@ -256,3 +256,148 @@ test "contract: random entries, a third of them refused, leave the same state an
         try testing.expectEqual(@as(u64, bx.len - 10), x.family(Fam.ID).encoded_bytes);
     }
 }
+
+test "contract: out of memory at every allocation of a commit with range deletes leaves bytes and shape as they were" {
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+        var store = Store.init(failing.allocator());
+        defer store.deinit();
+        var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+        defer scratch.deinit();
+        try seed(&store, &scratch);
+        _ = scratch.reset(.retain_capacity);
+        const before = try bytesOf(&store);
+        defer testing.allocator.free(before);
+        const shape_before = shapeHash(&store);
+
+        var ks = view_mod.KeySet.init(scratch.allocator());
+        try ks.addRange(Fam.ID, NS, "");
+        var view = View.init(&store, scratch.allocator(), &ks);
+        var kb: [32]u8 = undefined;
+        var bb: [32]u8 = undefined;
+        // Everything from "b" up to "d" goes, then "c" comes back.
+        try view.put(Fam, k(&kb, "a"), .{ .b = "A2" });
+        try view.deleteRange(Fam, k(&kb, ""), k(&bb, "d"));
+        try view.put(Fam, k(&kb, "c"), .{ .b = "C2" });
+        try view.put(Fam, k(&kb, "e"), .{ .b = "E" });
+        failing.fail_index = failing.alloc_index + fail_at;
+        const r = view.commit();
+        failing.fail_index = std.math.maxInt(usize);
+        const after = try bytesOf(&store);
+        defer testing.allocator.free(after);
+        if (r) |_| {
+            var rv = view_mod.ReadView{ .store = &store };
+            try testing.expect((try rv.get(Fam, k(&kb, "a"))) == null);
+            try testing.expect((try rv.get(Fam, k(&kb, "b"))) == null);
+            try testing.expectEqualStrings("C2", (try rv.get(Fam, k(&kb, "c"))).?.b);
+            try testing.expectEqualStrings("d", (try rv.get(Fam, k(&kb, "d"))).?.b);
+            try testing.expectEqualStrings("E", (try rv.get(Fam, k(&kb, "e"))).?.b);
+            try testing.expectEqual(@as(u64, 3), store.family(Fam.ID).count);
+            try testing.expectEqual(@as(u64, after.len - 10), store.family(Fam.ID).encoded_bytes);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqualSlices(u8, before, after);
+            try testing.expectEqual(shape_before, shapeHash(&store));
+        }
+    }
+    try testing.expect(fail_at >= 3);
+}
+
+test "contract: random puts, deletes and range deletes read and commit as a plain map does, however many an entry stages" {
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    const rand = prng.random();
+    const Map = std.StringArrayHashMapUnmanaged([]const u8);
+    var model: Map = .empty;
+    defer model.deinit(testing.allocator);
+    var keep = std.heap.ArenaAllocator.init(testing.allocator);
+    defer keep.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    const C = struct {
+        keys: [][]const u8,
+        pub fn lessThan(c: @This(), a: usize, b: usize) bool {
+            return std.mem.order(u8, c.keys[a], c.keys[b]) == .lt;
+        }
+    };
+
+    for (0..300) |round| {
+        _ = scratch.reset(.retain_capacity);
+        const sa = scratch.allocator();
+        var ks = view_mod.KeySet.init(sa);
+        try ks.addRange(Fam.ID, NS, "");
+        var view = View.init(&store, sa, &ks);
+        var expect: Map = .empty;
+        for (model.keys(), model.values()) |kk, vv| try expect.put(sa, kk, vv);
+        // Past the view's scan limit every few entries.
+        const nops = if (round % 5 == 0) rand.uintLessThan(usize, 300) + 130 else rand.uintLessThan(usize, 10) + 1;
+        for (0..nops) |_| {
+            var nb: [2]u8 = .{ 'a' + rand.uintLessThan(u8, 6), 'a' + rand.uintLessThan(u8, 3) };
+            const name = nb[0 .. rand.uintLessThan(usize, 2) + 1];
+            var kb: [16]u8 = undefined;
+            const kk = try sa.dupe(u8, k(&kb, name));
+            switch (rand.uintLessThan(u8, 10)) {
+                0...4 => {
+                    const v = try std.fmt.allocPrint(sa, "v{d}", .{rand.int(u16)});
+                    try view.put(Fam, kk, .{ .b = v });
+                    try expect.put(sa, kk, v);
+                },
+                5...7 => {
+                    try view.delete(Fam, kk);
+                    _ = expect.orderedRemove(kk);
+                },
+                else => {
+                    var pb: [16]u8 = undefined;
+                    const prefix = try sa.dupe(u8, k(&pb, name[0..rand.uintLessThan(usize, 2)]));
+                    const below: ?[]const u8 = if (rand.boolean()) kk else null;
+                    try view.deleteRange(Fam, prefix, below);
+                    var i: usize = 0;
+                    while (i < expect.count()) {
+                        const ek = expect.keys()[i];
+                        if (std.mem.startsWith(u8, ek, prefix) and (below == null or std.mem.order(u8, ek, below.?) == .lt)) {
+                            expect.orderedRemoveAt(i);
+                        } else i += 1;
+                    }
+                },
+            }
+            // A read after any write sees it.
+            var gb: [16]u8 = undefined;
+            var gn: [2]u8 = .{ 'a' + rand.uintLessThan(u8, 6), 'a' + rand.uintLessThan(u8, 3) };
+            const gk = k(&gb, gn[0 .. rand.uintLessThan(usize, 2) + 1]);
+            const got = try view.get(Fam, gk);
+            if (expect.get(gk)) |want| try testing.expectEqualStrings(want, got.?.b) else try testing.expect(got == null);
+        }
+        expect.sort(C{ .keys = expect.keys() });
+        {
+            var pb: [4]u8 = undefined;
+            var r = try view.range(Fam, k(&pb, ""));
+            for (expect.keys(), expect.values()) |kk, vv| {
+                const it = (try r.next()).?;
+                try testing.expectEqualStrings(kk, it.key);
+                try testing.expectEqualStrings(vv, it.value.b);
+            }
+            try testing.expect((try r.next()) == null);
+        }
+        if (rand.uintLessThan(u8, 4) == 0) continue;
+        try view.commit();
+        model.clearRetainingCapacity();
+        const ka = keep.allocator();
+        for (expect.keys(), expect.values()) |kk, vv| try model.put(testing.allocator, try ka.dupe(u8, kk), try ka.dupe(u8, vv));
+        var rv = view_mod.ReadView{ .store = &store };
+        var pb: [4]u8 = undefined;
+        var r = rv.range(Fam, k(&pb, ""));
+        for (model.keys(), model.values()) |kk, vv| {
+            const it = (try r.next()).?;
+            try testing.expectEqualStrings(kk, it.key);
+            try testing.expectEqualStrings(vv, it.value.b);
+        }
+        try testing.expect((try r.next()) == null);
+        const bx = try bytesOf(&store);
+        defer testing.allocator.free(bx);
+        try testing.expectEqual(@as(u64, model.count()), store.family(Fam.ID).count);
+        try testing.expectEqual(@as(u64, bx.len - 10), store.family(Fam.ID).encoded_bytes);
+    }
+}
