@@ -61,6 +61,7 @@ pub const Out = Record(&.{
     .{ .name = "slot", .T = Int(u16) },
     .{ .name = "entry_type", .T = Int(u8) },
     .{ .name = "layout_epoch", .T = Int(u32) },
+    .{ .name = "flags", .T = Int(u16) },
     // The sending entry's index: delivered only once that is durable.
     .{ .name = "sent_at", .T = Int(u64) },
     .{ .name = "payload", .T = schema.Bytes(ce.MAX_MESSAGE_PAYLOAD) },
@@ -170,6 +171,7 @@ pub fn writeSends(view: *View, index: u64) ApplyError!void {
             .slot = s.slot,
             .entry_type = s.entry_type,
             .layout_epoch = 0,
+            .flags = s.flags,
             .sent_at = index,
             .payload = s.payload,
         } });
@@ -212,17 +214,46 @@ fn typeOf(e: *const Entry) ?EntryType {
 }
 
 /// A message as the entry its target applies: the inbound's header, with
-/// the message's type and payload.
+/// the message's type, flags and payload.
 fn asEntry(e: *const Entry, m: ce.Message.Value) Entry {
     var h = e.header;
     h.entry_type = m.entry_type;
+    h.flags = m.flags;
     h.payload_len = @intCast(m.payload.len);
     return .{ .header = h, .payload = m.payload };
 }
 
+/// A message type applied after its inbound commits (`ChannelsWith`), and
+/// the check that its payload will apply: every reason its applier could
+/// halt but running out of memory.
+pub const AfterCommit = struct {
+    entry_type: EntryType,
+    valid: *const fn (payload: []const u8) bool,
+};
+
 /// The channels machine over `targets`, the machines a message may be for.
 pub fn Channels(comptime targets: []const machine_mod.Machine) type {
+    return ChannelsWith(targets, &.{});
+}
+
+/// `Channels`, with `after_commit` the entry types a message may also be
+/// whose applier works outside the view (a stream's append, kept in its
+/// projection and read back from the log): the inbound takes their seq and
+/// reports them, and the shard applies each once the inbound has committed,
+/// in order, live and in replay alike. So within one inbound such a
+/// message's state lands after every view message's, whatever their seqs: a
+/// view message never sees an earlier one's (a deliver after an append in
+/// the same batch doesn't hand out that record; the next deliver does).
+/// The shard's after-apply steps then run per message in seq order, over
+/// the whole inbound's state.
+pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime after_commit: []const AfterCommit) type {
+    comptime for (after_commit) |a| std.debug.assert(machine_mod.ownerOf(targets, a.entry_type) == null);
     return struct {
+        fn afterCommitOf(t: EntryType) ?AfterCommit {
+            inline for (after_commit) |a| if (a.entry_type == t) return a;
+            return null;
+        }
+
         fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             var diag: schema.Diagnostic = .{};
             switch (typeOf(e) orelse return) {
@@ -284,7 +315,10 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 if (seq <= applied) continue;
                 if (seq != applied + 1) return error.Halt;
                 const t = std.enums.fromInt(EntryType, m.entry_type) orelse return error.Halt;
-                const owner = machine_mod.ownerOf(targets, t) orelse return error.Halt;
+                const owner = machine_mod.ownerOf(targets, t);
+                const after = if (owner == null) afterCommitOf(t) else null;
+                const later = after != null;
+                if (owner == null and !later) return error.Halt;
                 const as = asEntry(e, m);
                 const mark = view.mark();
                 view.message = .{ .from = p.from, .seq = seq, .ordinal = ordinal };
@@ -294,14 +328,18 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 // the wrong group: refused, never applied over another's state.
                 if (m.slot >= node_router.SLOTS or ownerOf(place, m.slot) != place.group) {
                     r.refuse(.bad_request, .malformed, "bad request: a message for a slot this group doesn't own");
-                } else {
-                    try owner.apply(view, &as, &r);
+                } else if (after) |a| {
+                    // Checked now, while a halt still undoes the inbound:
+                    // past its commit, its applier may only run out of memory.
+                    if (!a.valid(m.payload)) return error.Halt;
+                } else if (owner) |o| {
+                    try o.apply(view, &as, &r);
                     // Its sends are held to an apply's limits on their own,
                     // and leave with it.
                     if (r.refused() == null) if (tooMuchSent(view.sends.items[mark.sends..])) |why| r.refuse(.bad_request, .malformed, why);
                 }
                 if (r.refused() != null) try view.rollback(mark) else try writeSends(view, e.header.index);
-                try store.messages.append(store.allocator, .{ .entry = as, .result = r });
+                try store.messages.append(store.allocator, .{ .entry = as, .result = r, .ordinal = ordinal, .after_commit = later and r.refused() == null });
                 applied = seq;
             }
             if (before != null and applied == before.?.applied) return;
@@ -445,7 +483,7 @@ fn inboundFrom(sender: *Group, from: u16, to: u16, first: u64, n: u64, buf: []u8
     var seq = first;
     while (seq < first + n) : (seq += 1) {
         const o = sender.outRecord(to, seq).?;
-        try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = o.layout_epoch, .payload = o.payload });
+        try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = o.layout_epoch, .flags = o.flags, .payload = o.payload });
     }
     return ce.Inbound.encodeInto(buf, .{ .from = from, .first_seq = first, .messages = .{ .bytes = mw.written(), .count = @intCast(n) } }) catch unreachable;
 }
@@ -555,6 +593,80 @@ test "channels: a message for a slot its receiver doesn't own is refused, and ta
     try testing.expect(b.got("message-one-0001") != null);
     try testing.expect(b.got("message-two-0002") == null);
     try testing.expect(b.store.messages.items[1].result.refused() != null);
+}
+
+test "channels: a message applies with the flags its send gave it, not its inbound's" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    var b = Group.init(1, 2);
+    defer b.deinit();
+    const sink = entry_mod.Flags.SINK;
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var keys = KeySet.init(arena.allocator());
+        var view = View.init(&a.store, arena.allocator(), &keys);
+        var pb: [64]u8 = undefined;
+        try view.sendFlagged(1, @backingInt(EntryType.channel_probe), sink, try ce.Probe.encodeInto(&pb, .{ .slot = 1, .body = "message-snk-0001" }));
+        try writeSends(&view, 1);
+        try view.commit();
+    }
+    try testing.expectEqual(sink, a.outRecord(1, 1).?.flags);
+    var buf: [8192]u8 = undefined;
+    _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 1, &buf));
+    try testing.expect(b.got("message-snk-0001") != null);
+    try testing.expectEqual(sink, b.store.messages.items[0].entry.header.flags);
+}
+
+/// The probe machine, with stream appends applied after the commit.
+const Later = ChannelsWith(&.{probe.machine}, &.{.{ .entry_type = .stream_append, .valid = @import("../projection/stream.zig").appendApplies }});
+
+/// A stream append's command payload, as an append logs it.
+fn appendCommand(buf: []u8) []const u8 {
+    return (entry_mod.buildCommandEntry(.stream_append, 0, 1, 1, 0, .default, "s", "\x00\x00\x00\x00", buf) orelse unreachable).payload;
+}
+
+test "channels: an after-commit message its applier would halt on halts the inbound before it commits" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    var b = Group.init(1, 2);
+    defer b.deinit();
+    try a.probeTo(1, "message-one-0001");
+    var mw: schema.Writer = .{ .buf = try testing.allocator.alloc(u8, 1024) };
+    defer testing.allocator.free(mw.buf);
+    const o = a.outRecord(1, 1).?;
+    try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = 0, .flags = 0, .payload = o.payload });
+    // Not a command payload: past the commit, the stream applier would halt.
+    try ce.Message.encode(&mw, .{ .slot = 1, .entry_type = @backingInt(EntryType.stream_append), .layout_epoch = 0, .flags = 0, .payload = "x" });
+    var buf: [2048]u8 = undefined;
+    const inbound = try ce.Inbound.encodeInto(&buf, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 2 } });
+    try testing.expectError(error.Halt, b.run(&Later.machine, .channel_inbound, inbound));
+    // Nothing of it committed: not the probe before it, not its seqs.
+    try testing.expect(b.got("message-one-0001") == null);
+    try testing.expect(inOf(b.read(), 0) == null);
+}
+
+test "channels: a message whose applier runs after the commit takes its seq and is reported for it, unless refused" {
+    var b = Group.init(1, 3);
+    defer b.deinit();
+    var mw: schema.Writer = .{ .buf = try testing.allocator.alloc(u8, 1024) };
+    defer testing.allocator.free(mw.buf);
+    var cb: [64]u8 = undefined;
+    const append = appendCommand(&cb);
+    // Slot 1 is b's; slot 3 is group 0's.
+    for ([_]u16{ 1, 3, 1 }) |slot| try ce.Message.encode(&mw, .{ .slot = slot, .entry_type = @backingInt(EntryType.stream_append), .layout_epoch = 0, .flags = 0, .payload = append });
+    var buf: [2048]u8 = undefined;
+    const inbound = try ce.Inbound.encodeInto(&buf, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 3 } });
+    _ = try b.run(&Later.machine, .channel_inbound, inbound);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
+    const reported = b.store.messages.items;
+    try testing.expectEqual(@as(usize, 3), reported.len);
+    for (reported, [_]bool{ true, false, true }, 0..) |m, later, i| {
+        try testing.expectEqual(later, m.after_commit);
+        try testing.expectEqual(@as(u8, @intCast(i)), m.ordinal);
+    }
+    // A type with no applier at all is still a Flo bug.
+    try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, try ce.Inbound.encodeInto(&buf, .{ .from = 2, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 3 } })));
 }
 
 test "channels: a durable ack names what was applied as of a durable index" {

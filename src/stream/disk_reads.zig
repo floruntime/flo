@@ -28,6 +28,8 @@ const DurableLog = @import("../storage/durable_log.zig").DurableLog;
 const bulk_io = @import("../storage/bulk_io.zig");
 const RaftLog = @import("../raft/log.zig").RaftLog;
 const router = @import("../node/router.zig");
+const ce = @import("../protocol/channel_entries.zig");
+const schema = @import("../protocol/schema.zig");
 
 const Entry = entry_mod.Entry;
 const log = std.log.scoped(.stream_disk);
@@ -119,9 +121,11 @@ const Slot = struct {
     fn add(self: *Slot, w: Window) void {
         for (self.wants[0..self.n_wants]) |*have| {
             if (std.mem.eql(u8, &have.stream, &w.stream) and have.from <= w.from) {
-                // Its appends past `have.from`, through the end of `w`. An
-                // upper bound: the stream's appends between the two may be
-                // fewer than the indices between them.
+                // Its appends past `have.from`, through the end of `w`,
+                // counted as one per index between them. A channel inbound
+                // holds up to 64 of a stream's appends at one index, so this
+                // can fall short; the cost is an extra read for the rest,
+                // never a record missed.
                 const reach = w.from - have.from + w.limit;
                 have.limit = @intCast(@min(@max(@as(u64, have.limit), reach), std.math.maxInt(u32)));
                 return;
@@ -457,14 +461,22 @@ pub const DiskReads = struct {
         self.evict(now);
         var taken: [MAX_WANTS]u32 = @splat(0);
         for (entries) |*e| {
-            if (e.header.entry_type != @backingInt(entry_mod.EntryType.stream_append)) continue;
-            const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse continue;
-            const stream = router.nsNameKey(cmd.namespace_id, cmd.key);
+            // A stream's appends: its own entries, and the messages a
+            // channel inbound carries to it, each counted as one.
+            // One that doesn't decode is damage to what the log holds: a
+            // reader that asks for it again finds it gone and skips it,
+            // counted, rather than reading it back forever.
+            var appends = (Appends.of(e) catch {
+                self.markGone(e.header.index);
+                continue;
+            }) orelse continue;
             var wanted = false;
-            for (wants, 0..) |w, k| {
-                if (!std.mem.eql(u8, &w.stream, &stream) or e.header.index < w.from or taken[k] >= w.limit) continue;
-                taken[k] += 1;
-                wanted = true;
+            while (appends.next()) |stream| {
+                for (wants, 0..) |w, k| {
+                    if (!std.mem.eql(u8, &w.stream, &stream) or e.header.index < w.from or taken[k] >= w.limit) continue;
+                    taken[k] += 1;
+                    wanted = true;
+                }
             }
             if (!wanted) continue;
             // Above commit a cut may still replace it.
@@ -541,6 +553,43 @@ pub const DiskReads = struct {
             self.arenas[i] = self.allocator.alloc(u8, READ_BYTES) catch return false;
         }
         return true;
+    }
+};
+
+/// The streams an entry appends to, one per append it holds: a
+/// `stream_append` holds one, a `channel_inbound` one per `stream_append`
+/// message it carries.
+const Appends = struct {
+    single: ?[12]u8,
+    messages: ?MessageIterator,
+
+    const MessageIterator = @TypeOf(@as(ce.Messages.Value, undefined).iterator());
+
+    /// Null for an entry that holds no appends; `Damaged` for one of the two
+    /// kinds that do whose payload doesn't decode.
+    fn of(e: *const Entry) error{Damaged}!?Appends {
+        if (e.header.entry_type == @backingInt(entry_mod.EntryType.stream_append)) {
+            const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return error.Damaged;
+            return .{ .single = router.nsNameKey(cmd.namespace_id, cmd.key), .messages = null };
+        }
+        if (e.header.entry_type != @backingInt(entry_mod.EntryType.channel_inbound)) return null;
+        var diag: schema.Diagnostic = .{};
+        const inbound = ce.Inbound.decodeAll(e.payload, &diag) catch return error.Damaged;
+        return .{ .single = null, .messages = inbound.messages.iterator() };
+    }
+
+    fn next(self: *Appends) ?[12]u8 {
+        if (self.single) |s| {
+            self.single = null;
+            return s;
+        }
+        const it = &(self.messages orelse return null);
+        while (it.next() catch return null) |m| {
+            if (m.entry_type != @backingInt(entry_mod.EntryType.stream_append)) continue;
+            const cmd = entry_mod.CommandPayload.deserialize(m.payload) orelse continue;
+            return router.nsNameKey(cmd.namespace_id, cmd.key);
+        }
+        return null;
     }
 };
 
@@ -1000,4 +1049,65 @@ test "stream disk reads: a window across a sealed segment and the active one rea
     try testing.expect(d.drain());
     try testing.expect(d.get(5) != null);
     try testing.expectEqual(@as(u64, 1), d.reads_made);
+}
+
+/// An inbound at `index` carrying a stream append to each of `streams`, and
+/// one message that isn't an append.
+fn inboundEntry(buf: []u8, index: u64, streams: []const []const u8) !Entry {
+    var mb: [2048]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &mb };
+    for (streams) |name| {
+        var cb: [128]u8 = undefined;
+        const cmd = entry_mod.buildCommandEntry(.stream_append, 0, 1, 1, 0, .default, name, "value", &cb).?;
+        try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.stream_append), .layout_epoch = 0, .flags = 0, .payload = cmd.payload });
+    }
+    try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.kv_put), .layout_epoch = 0, .flags = 0, .payload = "not an append" });
+    const payload = try ce.Inbound.encodeInto(buf[512..], .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = @intCast(streams.len + 1) } });
+    var e = entry_mod.buildEntry(.channel_inbound, 0, 1, index, index * 1000, payload);
+    e.header.crc32c = e.computeCrc();
+    return e;
+}
+
+test "stream disk reads: an inbound names each stream it appends to, one per append; one that doesn't decode is damaged" {
+    var buf: [4096]u8 = undefined;
+    const e = try inboundEntry(&buf, 1, &.{ "a", "b", "a" });
+    var appends = (try Appends.of(&e)).?;
+    try testing.expectEqualSlices(u8, &keyOf("a"), &appends.next().?);
+    try testing.expectEqualSlices(u8, &keyOf("b"), &appends.next().?);
+    try testing.expectEqualSlices(u8, &keyOf("a"), &appends.next().?);
+    try testing.expect(appends.next() == null);
+    // Not an append or an inbound: nothing to read.
+    var kb: [64]u8 = undefined;
+    const kv = entry_mod.buildEntry(.kv_put, 0, 1, 2, 0, kb[0..4]);
+    try testing.expect((try Appends.of(&kv)) == null);
+    // An inbound cut short.
+    var cut = e;
+    cut.payload = e.payload[0 .. e.payload.len - 3];
+    try testing.expectError(error.Damaged, Appends.of(&cut));
+}
+
+test "stream disk reads: a landing counts each append in an inbound toward a want, and marks one that doesn't decode gone" {
+    var f: Fixture = undefined;
+    try f.init(1, true);
+    defer f.deinit();
+    var d = DiskReads.init(testing.allocator, &f.dl, &f.raft_log);
+    defer d.deinit();
+    d.setOwner();
+    var b1: [4096]u8 = undefined;
+    var b2: [4096]u8 = undefined;
+    var b3: [4096]u8 = undefined;
+    var entries = [_]Entry{
+        try inboundEntry(&b1, 1, &.{ "a", "b", "a" }),
+        try inboundEntry(&b2, 2, &.{"a"}),
+        try inboundEntry(&b3, 3, &.{"a"}),
+    };
+    // Index 3 cut short: damaged.
+    entries[2].payload = entries[2].payload[0 .. entries[2].payload.len - 3];
+    // Two of "a"'s appends: both in the first inbound, so the second isn't taken.
+    const a: Window = .{ .stream = keyOf("a"), .from = 1, .limit = 2 };
+    d.land(1, &entries, false, false, false, &.{a});
+    try testing.expect(d.get(1) != null);
+    try testing.expect(d.get(2) == null);
+    try testing.expect(d.get(3) == null);
+    try testing.expectEqual(Want.absent, d.want(3, a));
 }

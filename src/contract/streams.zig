@@ -63,8 +63,8 @@ test "streams: ids after a cursor are one per record, a cursor inside an append 
     defer proj.deinit();
     const h = stream_mod.streamKey(.default, "s");
     // Two appends in one millisecond: three records, then two.
-    _ = try proj.appendToStreamAt(h, 1, 0, 100, 3, 30);
-    _ = try proj.appendToStreamAt(h, 2, 0, 100, 2, 20);
+    _ = try proj.appendToStreamAt(h, 1, 0, 0, 100, 3, 30);
+    _ = try proj.appendToStreamAt(h, 2, 0, 0, 100, 2, 20);
     const s: Streams = .{ .proj = &proj };
     var out: [8]StreamID = undefined;
 
@@ -88,8 +88,8 @@ test "streams: each record names its append, until a trim cuts it" {
     var proj = StreamProjection.init(testing.allocator);
     defer proj.deinit();
     const h = stream_mod.streamKey(.default, "s");
-    _ = try proj.appendToStreamAt(h, 1, 0, 100, 3, 30);
-    _ = try proj.appendToStreamAt(h, 2, 0, 100, 2, 20);
+    _ = try proj.appendToStreamAt(h, 1, 0, 0, 100, 3, 30);
+    _ = try proj.appendToStreamAt(h, 2, 0, 0, 100, 2, 20);
     const s: Streams = .{ .proj = &proj };
     try testing.expect(s.appendOf(h, id(100, 1)).?.first.eql(id(100, 0)));
     try testing.expect(s.appendOf(h, id(100, 3)).?.first.eql(id(100, 3)));
@@ -103,8 +103,8 @@ test "streams: a trim's removed-through is its last cut append's last record, an
     var proj = StreamProjection.init(testing.allocator);
     defer proj.deinit();
     const h = stream_mod.streamKey(.default, "s");
-    _ = try proj.appendToStreamAt(h, 1, 0, 100, 3, 30);
-    _ = try proj.appendToStreamAt(h, 2, 0, 200, 1, 10);
+    _ = try proj.appendToStreamAt(h, 1, 0, 0, 100, 3, 30);
+    _ = try proj.appendToStreamAt(h, 2, 0, 0, 200, 1, 10);
     const s: Streams = .{ .proj = &proj };
     try testing.expect(s.removedThrough(h).eql(StreamID.MIN));
 

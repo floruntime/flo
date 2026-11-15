@@ -973,7 +973,7 @@ pub const TestGroups = struct {
     pub fn append(self: *TestGroups, stream: []const u8, at_ms: u64, records: u32) !StreamID {
         try self.log.append(self.store.allocator, .{ .op = .{ .append = .{ .stream = stream, .at_ms = at_ms, .records = records } } });
         self.index += 1;
-        return self.stream.appendToStreamAt(streamOf(.default, stream), self.index, 0, at_ms, records, 10 * records);
+        return self.stream.appendToStreamAt(streamOf(.default, stream), self.index, 0, 0, at_ms, records, 10 * records);
     }
 
     pub fn apply(self: *TestGroups, comptime etype: EntryType, body: anytype, stamp_ns: u64) !Result {

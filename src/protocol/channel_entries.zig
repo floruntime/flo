@@ -38,6 +38,9 @@ pub const Message = Record(&.{
     .{ .name = "entry_type", .T = Int(u8) },
     // Reserved for the slot-move fence: the slot layout the sender saw.
     .{ .name = "layout_epoch", .T = Int(u32) },
+    // The entry flags it applies with (a sink's write is `Flags.SINK`), as
+    // the sending apply set them: never the inbound's.
+    .{ .name = "flags", .T = Int(u16) },
     .{ .name = "payload", .T = Bytes(MAX_MESSAGE_PAYLOAD) },
 });
 

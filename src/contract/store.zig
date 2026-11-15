@@ -12,6 +12,11 @@ const Allocator = std.mem.Allocator;
 pub const AppliedMessage = struct {
     entry: @import("../storage/ual/entry.zig").Entry,
     result: @import("../storage/persistence.zig").Result,
+    /// Its place in the inbound.
+    ordinal: u8,
+    /// Its type's applier runs once the inbound has committed: the
+    /// channels machine only took its seq.
+    after_commit: bool = false,
 };
 
 /// Family ids are below this; a family's state is a slot of its own.
