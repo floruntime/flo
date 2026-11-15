@@ -85,7 +85,7 @@ pub fn createTsCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("field", 0, "", "Field name (default: value)")
                 .stringFlag("from", 0, "-1h", "Start time: -Nh, -Nd, -Nm, or epoch ms")
                 .stringFlag("to", 0, "", "End time (default: now)")
-                .uintFlag("limit", 'l', 10000, "Maximum points to return")
+                .uintFlag("limit", 'l', 4096, "The earliest this many points in range (at most 4096); pass --from for recent ones")
                 .action(wrapHandler(runRead)),
         )
         .subcommand(
@@ -458,7 +458,7 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
     const field = ctx.getString("field") orelse "";
     const from_str = ctx.getString("from") orelse "-1h";
     const to_str = ctx.getString("to") orelse "";
-    const limit = ctx.getUint("limit") orelse 10000;
+    const limit = ctx.getUint("limit") orelse 4096;
 
     const from_ms = parseTimeArg(from_str) orelse 0;
     const to_ms = parseTimeArg(to_str) orelse 0;
@@ -477,7 +477,8 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
         .field = field,
         .from_ms = from_ms,
         .to_ms = to_ms,
-        .limit = @intCast(limit),
+        // Past what a u32 holds is past 4096 too: the server refuses it alike.
+        .limit = @intCast(@min(limit, std.math.maxInt(u32))),
     }) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 

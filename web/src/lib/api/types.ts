@@ -232,7 +232,7 @@ export interface QueueDLQResponse {
 // NB: the TS projection keys write buffers by `measurement\0field\0tag_hash`,
 // so tags ARE a series dimension — `series_count` counts distinct
 // measurement+field+tag-set series (no longer just fields), and `points` counts
-// every point across them, flushed and buffered.
+// every point across them.
 export interface TsMeasurement {
   name: string
   series_count: number

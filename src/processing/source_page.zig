@@ -6,6 +6,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ts_mod = @import("../projection/ts.zig");
+const ts_machine = @import("../ts/machine.zig");
 const NamespaceId = @import("../node/router.zig").NamespaceId;
 
 pub const Kind = enum(u8) { stream, ts };
@@ -34,7 +35,7 @@ pub const Read = struct {
     field: []const u8 = "",
     /// TS only: the series' tag set, or 0 for every one.
     tag_hash: u64 = 0,
-    /// The cursor: a stream id (ms, seq), or a TS point's (time, log index).
+    /// The cursor: a stream id (ms, seq), or a TS point's (time, position).
     from_a: u64,
     from_b: u64,
     limit: u32,
@@ -216,15 +217,15 @@ pub const Page = struct {
     }
 };
 
-/// Up to `limit` of a series' points after `after`, in (time, log index)
+/// Up to `limit` of a series' points after `after`, in (time, position)
 /// order, into `out`. A page may end among points sharing a time: the
-/// next goes on from its last point's (time, log index). The tag strings
+/// next goes on from its last point's (time, position). The tag strings
 /// are the projection's, good until it next changes.
 pub fn readTsPage(ts: *ts_mod.TSProjection, ns: NamespaceId, measurement: []const u8, field: []const u8, tag_hash: u64, after: ts_mod.TSProjection.ReadAt, limit: usize, out: *[TS_PAGE_POINTS]TsPoint) usize {
     var buf: [TS_PAGE_POINTS]ts_mod.StoredPoint = undefined;
     const want = @min(limit, buf.len);
     const n = ts.readAfter(ns, measurement, field, if (tag_hash != 0) tag_hash else null, after, buf[0..want]) catch return 0;
-    for (buf[0..n], out[0..n]) |p, *o| o.* = .{ .timestamp_ns = p.timestamp_ns, .ual = p.ual_index, .value = p.field_value, .tags = ts.tagsForHash(ns, p.tag_hash) };
+    for (buf[0..n], out[0..n]) |p, *o| o.* = .{ .timestamp_ns = p.timestamp_ns, .ual = p.ual_index, .value = p.field_value, .tags = p.tags };
     return n;
 }
 
@@ -293,7 +294,7 @@ test "source read and page: fields come back as sent; a cut one doesn't decode" 
 }
 
 test "readTsPage: pages may end among points sharing a time, and together read each point once" {
-    var ts = ts_mod.TSProjection.init(std.testing.allocator, .{ .buffer_capacity = 4096 });
+    var ts = ts_mod.TSProjection.init(std.testing.allocator);
     defer ts.deinit();
     // Three points at each of times 10..14, from three tag series.
     var ual: u64 = 1;
@@ -309,8 +310,8 @@ test "readTsPage: pages may end among points sharing a time, and together read e
         const n = readTsPage(&ts, .default, "m", "v", 0, after, 4, &out);
         if (n == 0) break;
         for (out[0..n]) |p| {
-            try std.testing.expect(!seen[p.ual]);
-            seen[p.ual] = true;
+            try std.testing.expect(!seen[p.ual >> ts_machine.ORDINAL_BITS]);
+            seen[p.ual >> ts_machine.ORDINAL_BITS] = true;
         }
         after = .{ .ns = out[n - 1].timestamp_ns, .ual = out[n - 1].ual };
     }
@@ -319,7 +320,7 @@ test "readTsPage: pages may end among points sharing a time, and together read e
 }
 
 test "readTsPage: one time with more points than a page is read across pages, none skipped" {
-    var ts = ts_mod.TSProjection.init(std.testing.allocator, .{ .buffer_capacity = 4096 });
+    var ts = ts_mod.TSProjection.init(std.testing.allocator);
     defer ts.deinit();
     var tbuf: [16]u8 = undefined;
     const n_points = TS_PAGE_POINTS * 2 + 7;
@@ -337,7 +338,7 @@ test "readTsPage: one time with more points than a page is read across pages, no
 }
 
 test "readTsPage: an earlier point in a series past the first is read first, however many points the others hold at one time" {
-    var ts = ts_mod.TSProjection.init(std.testing.allocator, .{ .buffer_capacity = 4096 });
+    var ts = ts_mod.TSProjection.init(std.testing.allocator);
     defer ts.deinit();
     var tbuf: [16]u8 = undefined;
     for (0..1200) |i| try ts.insert(.default, "m", "v", 1, 1000, i + 1, try std.fmt.bufPrint(&tbuf, "h={d}", .{i}));

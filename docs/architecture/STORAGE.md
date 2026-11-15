@@ -113,16 +113,9 @@ The sparse index lets you binary-search into the segment by UAL index without sc
 
 ## Projections
 
-A projection is a specialized data structure that consumes UAL entries and maintains queryable state. Each projection implements a common interface:
+A projection is the state a shard builds from its committed UAL entries. Most of it now lives in the shard's contract store: each primitive's machine owns its entry types and applies each entry through a `View`, which stages the entry's writes and makes them state only when the entry applies, so a refused entry changes nothing. A few entry types are still applied by the handler that owns them.
 
-```zig
-const ProjectionVTable = struct {
-    applyFn: *const fn (ctx: *anyopaque, entry: *const Entry) !void,
-    memoryUsageFn: *const fn (ctx: *anyopaque) usize,
-};
-```
-
-Every committed entry goes through the **Projection Router**, which dispatches by entry type to the appropriate projection. The router tracks an `applied_index` for idempotency — replaying an entry the router has already seen is a silent no-op. This is critical for crash recovery, where you might replay entries that were already applied before the crash.
+Every committed entry passes through the **Projection Router** first. It tracks an `applied_index` for idempotency, so an entry the shard has already applied is not applied again, which matters when a restart replays entries applied before the crash.
 
 ### KV Projection
 
@@ -162,35 +155,24 @@ The stream "projection" object exists in code, but it's mostly a bookkeeping wra
 
 Serialization captures the high water mark and consumer group state. That's it — there's no message data to snapshot because the messages are the UAL entries themselves.
 
-### Time-Series Projection
+### Time Series
 
-Time-series data has different access patterns from everything else: writes are append-only (timestamped points), and reads are range scans that need to be fast over millions of points. Storing individual points as UAL entries would make range scans unbearably slow.
+Time series are contract state, like KV: the time-series machine (`src/ts/machine.zig`) applies each write, delete and retention entry to two families of the shard's store.
 
-The TS projection maintains:
+- **`ts.series`** — one record per series (namespace, measurement, field, tag hash): its tags, its point count, and its oldest and newest times.
+- **`ts.point`** — one record per point, keyed by its series, its time and its position (the log index of the entry it came from, then its place in that entry), so a series' points sort by time.
 
-- **Write buffers** — per-series, per-field in-memory buffers that accumulate incoming points. When a buffer fills up (1024 points or 10 seconds, whichever comes first), it's flushed to a columnar block file.
-- **Block index** — maps `(series_hash, field_hash, time_range)` → `(file_id, offset, size)`. This is how range queries find the right blocks without scanning every file.
-
-On `ts_write`, the projection routes the point to the appropriate write buffer by series and field hash. When a buffer is flushed, the data is written column-wise (all timestamps together, then all values together) to a `.floc` file, and a block index entry is added. This columnar layout enables compression and vectorized aggregation.
-
-Series metadata (measurement names, tag sets, field names) lives in the KV projection under `_ts:meta:*` keys. The TS query path typically resolves series metadata from KV, then scans the block index and write buffers to answer aggregation queries.
-
-Serialization captures the block index and any unflushed write buffers. The `.floc` files on disk are not part of the snapshot — they're derived artifacts that can be rebuilt.
+A read merges the matching series' points in time order. Because the points are family state, a snapshot carries every one, and every replica holds the same points.
 
 ### Projection Router
 
-The router is the single fan-out point between the UAL and the projections. When a Partition calls `router.apply(entry)`, the router checks:
+When a Partition calls `router.apply(entry)`, the router:
 
-1. Is `entry.index <= applied_index`? If yes, skip (idempotent replay guard).
-2. What's the entry type? Route to the appropriate projection:
-   - `kv_put`, `kv_delete`, `kv_batch`, `kv_incr`, `kv_expire` → KV Projection
-   - `queue_*` → Nothing (the queue machine applies them)
-   - `ts_write`, `ts_write_batch` → TS Projection
-   - `stream_append` → Nothing (data stays in UAL)
-   - `raft_noop`, `raft_config` → Nothing (consensus layer)
-3. Update `applied_index`.
+1. Skips an entry at or below `applied_index` (the idempotent replay guard).
+2. Notes a `raft_snapshot` entry, which installs a snapshot. Every other entry type is applied by its contract machine or its owning handler, not by the router.
+3. Advances `applied_index` and the latest stamp applied.
 
-The router doesn't implement any business logic. It's a switch statement with accounting.
+The router holds no state of its own beyond those two marks.
 
 ---
 

@@ -1,40 +1,31 @@
-//! TimeSeries Projection — columnar write buffers + block index.
+//! Time series reads, and the shapes and rules the time-series machine
+//! (`ts/machine.zig`) and its callers share.
 //!
-//! Stores time-series data in a columnar layout for efficient range queries
-//! and aggregation. Points are buffered in a write buffer, then flushed to
-//! immutable blocks when the buffer is full.
-//!
-//! Data model:
-//!   - Measurement: top-level namespace (e.g., "cpu", "memory")
+//! A point is a record of the contract's `ts.point` family, a series one of
+//! `ts.series`: the machine changes them in apply, and `TSProjection`
+//! reads them. Data model:
+//!   - Measurement: top-level name (e.g., "cpu", "memory")
 //!   - Tags: key-value pairs for filtering (e.g., host=web-01)
 //!   - Fields: numeric values (e.g., usage=82.5, idle=17.5)
 //!   - Timestamp: nanosecond precision
-//!
-//! Storage layout:
-//!   WriteBuffer (mutable, per-measurement):
-//!     - timestamps[]   — sorted column
-//!     - field_values[]  — parallel columns per field name
-//!     - tag_values[]    — for filtering
-//!   Block (immutable, flushed from WriteBuffer):
-//!     - min/max timestamp
-//!     - point count
-//!     - UAL index range
-//!
-//! Applied via ProjectionRouter from committed UAL entries:
-//!   ts_write       → insert single point
-//!   ts_write_batch → insert batch of points
 
 const std = @import("std");
 const NamespaceId = @import("../namespace/table.zig").Id;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.ts_projection);
 const entry_mod = @import("../storage/ual/entry.zig");
-const router_mod = @import("router.zig");
+const persistence = @import("../storage/persistence.zig");
 const time_units = @import("../util/time_units.zig");
+const store_mod = @import("../contract/store.zig");
+const view_mod = @import("../contract/view.zig");
+const machine_mod = @import("../contract/machine.zig");
+const ts_machine = @import("../ts/machine.zig");
 
-const Entry = entry_mod.Entry;
-const Result = router_mod.Result;
+const Result = persistence.Result;
 const EntryType = entry_mod.EntryType;
+const Store = store_mod.Store;
+const ReadView = view_mod.ReadView;
+const ReadRange = view_mod.ReadRange;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Data Point
@@ -60,79 +51,20 @@ pub const DataPoint = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Stored Point — what we keep in the write buffer
+// Stored Point — a point as a read returns it
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub const StoredPoint = struct {
     timestamp_ns: u64,
     field_value: f64, // normalized to f64
+    /// Its position: the log index of the entry it was applied from, then
+    /// its place in that entry (`ts_machine.positionOf`).
     ual_index: u64,
-    /// Packed tag string for filtering (e.g., "host=web-01,region=us")
+    /// Its series' tag hash (0 = untagged).
     tag_hash: u64,
-};
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Block — immutable, flushed from write buffer
-// ═══════════════════════════════════════════════════════════════════════════════
-
-pub const Block = struct {
-    min_timestamp_ns: u64,
-    max_timestamp_ns: u64,
-    point_count: u32,
-    ual_index_start: u64,
-    ual_index_end: u64,
-};
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Write Buffer — per measurement+field
-// ═══════════════════════════════════════════════════════════════════════════════
-
-pub const WriteBuffer = struct {
-    points: std.ArrayList(StoredPoint),
-    allocator: Allocator,
-    capacity: usize,
-
-    pub fn init(allocator: Allocator, capacity: usize) WriteBuffer {
-        return .{
-            .points = .empty,
-            .allocator = allocator,
-            .capacity = capacity,
-        };
-    }
-
-    pub fn deinit(self: *WriteBuffer) void {
-        self.points.deinit(self.allocator);
-    }
-
-    pub fn append(self: *WriteBuffer, point: StoredPoint) !void {
-        try self.points.append(self.allocator, point);
-    }
-
-    pub fn isFull(self: *const WriteBuffer) bool {
-        return self.points.items.len >= self.capacity;
-    }
-
-    pub fn len(self: *const WriteBuffer) usize {
-        return self.points.items.len;
-    }
-
-    pub fn clear(self: *WriteBuffer) void {
-        self.points.clearRetainingCapacity();
-    }
-
-    /// Query points within a timestamp range [min_ts, max_ts] inclusive.
-    pub fn queryRange(self: *const WriteBuffer, min_ts: u64, max_ts: u64, buf: []StoredPoint) usize {
-        var count: usize = 0;
-        for (self.points.items) |point| {
-            if (point.timestamp_ns >= min_ts and point.timestamp_ns <= max_ts) {
-                if (count < buf.len) {
-                    buf[count] = point;
-                    count += 1;
-                } else break;
-            }
-        }
-        return count;
-    }
+    /// Its series' canonical tags, borrowed from the store a read took it
+    /// from: good until that store next changes.
+    tags: []const u8 = "",
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -204,25 +136,6 @@ pub const TsWriteValue = struct {
         };
     }
 };
-
-/// Series keys are namespace-scoped AND tag-scoped:
-///
-///   [ns_id: u32 BE (4B)][measurement]\x00[field_name]\x00[tag_hash: u64 LE (8B)]
-///
-/// The prefix is `Id.bytes()`, as on every key below the edge, so the
-/// first four bytes of a key name its namespace the same way everywhere.
-///
-/// `tag_hash` is a real series dimension (issue #24): points sharing a
-/// measurement+field but carrying different tags live in different series
-/// instead of collapsing into one write buffer. The hash resolves back to its
-/// canonical tag string through the projection's tag dictionary, which is what
-/// makes partial/glob tag matching and `group_by(tag)` possible.
-///
-/// Both the 4-byte prefix and the trailing 8-byte hash may contain 0x00, so
-/// measurement/field parsing always starts at offset NS_PREFIX and is bounded
-/// by the \x00 separators.
-const NS_PREFIX = 4;
-const TAG_SUFFIX = 8;
 
 /// Maximum `key=value` pairs considered when canonicalizing a tag set.
 pub const MAX_TAGS = 32;
@@ -398,583 +311,348 @@ pub fn canonicalTagHashPairs(pairs: []const TagPair, scratch: []u8) u64 {
     return canonicalTagHash(scratch[0..pos]);
 }
 
-const SeriesKey = struct {
-    ns_id: NamespaceId,
-    measurement: []const u8,
-    field_name: []const u8,
-    tag_hash: u64,
-};
-
-fn seriesKeyToString(allocator: Allocator, key: SeriesKey) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    try appendSeriesPrefix(allocator, &buf, key.ns_id, key.measurement, key.field_name);
-    var tag_bytes: [TAG_SUFFIX]u8 = undefined;
-    std.mem.writeInt(u64, &tag_bytes, key.tag_hash, .little);
-    try buf.appendSlice(allocator, &tag_bytes);
-    return try buf.toOwnedSlice(allocator);
-}
-
-fn appendSeriesPrefix(allocator: Allocator, buf: *std.ArrayList(u8), ns_id: NamespaceId, measurement: []const u8, field_name: []const u8) !void {
-    try buf.appendSlice(allocator, &ns_id.bytes());
-    try buf.appendSlice(allocator, measurement);
-    try buf.append(allocator, 0);
-    try buf.appendSlice(allocator, field_name);
-    try buf.append(allocator, 0);
-}
-
-/// The measurement+field portion of a series key — everything but the trailing
-/// tag hash. Two keys share this prefix exactly when they are the same series in
-/// every dimension except tags. Because the prefix ends with the field's \x00
-/// terminator, a longer field name can never false-positive against a shorter one.
-fn seriesKeyPrefix(allocator: Allocator, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    try appendSeriesPrefix(allocator, &buf, ns_id, measurement, field_name);
-    return try buf.toOwnedSlice(allocator);
-}
-
-fn inMeasurement(key: []const u8, ns_id: NamespaceId, measurement: []const u8) bool {
-    return keyNsId(key) == ns_id and std.mem.eql(u8, keyMeasurement(key), measurement);
-}
-
-/// Namespace id from a series key's 4-byte prefix.
-fn keyNsId(key: []const u8) NamespaceId {
-    if (key.len < NS_PREFIX) return .invalid;
-    return .of(std.mem.readInt(u32, key[0..NS_PREFIX], .big));
-}
-
-/// Measurement name from a series key (the bytes after the prefix, up to \x00).
-fn keyMeasurement(key: []const u8) []const u8 {
-    if (key.len < NS_PREFIX) return key;
-    const rest = key[NS_PREFIX..];
-    const sep = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
-    return rest[0..sep];
-}
-
-/// Field name from a series key — the bytes between the first and second \x00.
-/// Slicing to the end of the key instead would drag in the trailing tag hash.
-pub fn keyFieldName(key: []const u8) []const u8 {
-    if (key.len < NS_PREFIX) return "";
-    const rest = key[NS_PREFIX..];
-    const m_end = std.mem.indexOfScalar(u8, rest, 0) orelse return "";
-    const after = rest[m_end + 1 ..];
-    const f_end = std.mem.indexOfScalar(u8, after, 0) orelse return after;
-    return after[0..f_end];
-}
-
-/// Tag hash from a series key's trailing 8 bytes (0 = the untagged series).
-pub fn keyTagHash(key: []const u8) u64 {
-    if (key.len < TAG_SUFFIX) return 0;
-    return std.mem.readInt(u64, key[key.len - TAG_SUFFIX ..][0..TAG_SUFFIX], .little);
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // TimeSeries Projection
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub const TSProjection = struct {
     allocator: Allocator,
+    /// The shard's store, which the time-series machine changes in apply
+    /// (`ts/machine.zig`); or, standing alone, one of its own (`init`).
+    store: *Store,
+    /// A standalone projection's own store, and the log index its next
+    /// write takes.
+    own: ?*Own = null,
+    stats: Stats = .{},
 
-    /// Write buffers keyed by series key: namespace id, measurement, field
-    /// and tag hash (`seriesKeyToString`).
-    buffers: std.StringHashMap(WriteBuffer),
-
-    /// Flushed blocks (per series key).
-    blocks: std.StringHashMap(std.ArrayList(Block)),
-
-    /// Tag dictionary: a namespace's `tag_hash` → its canonical tag string
-    /// (owned). Keyed by namespace too, so one namespace's entry is never
-    /// another's.
-    ///
-    /// The series key stores only a hash, which can answer exact-set equality
-    /// and nothing else. Keeping the string alongside it is what makes partial
-    /// matching (`{host=web-01}` against `host=web-01,env=prod`), `!=`, glob
-    /// filters, listing a series' tags and `group_by(tag)` possible.
-    tag_dict: std.AutoHashMap(TagKey, []const u8),
-
-    /// Buffer capacity (points in write buffer before flush).
-    buffer_capacity: usize,
-
-    /// Last applied UAL index.
-    applied_index: u64,
-
-    /// Stats.
-    stats: Stats,
-
-    const TagKey = struct { ns_id: NamespaceId, tag_hash: u64 };
+    const Own = struct {
+        store: Store,
+        scratch: std.heap.ArenaAllocator,
+        next_index: u64 = 1,
+    };
 
     pub const Stats = struct {
         points_inserted: u64 = 0,
-        blocks_flushed: u64 = 0,
         queries: u64 = 0,
     };
 
-    pub const Config = struct {
-        buffer_capacity: usize = 1024,
-    };
+    /// A projection over a store of its own, for tests and a handler with
+    /// no shard: its writes go through the same machine a shard applies.
+    pub fn init(allocator: Allocator) TSProjection {
+        const own = allocator.create(Own) catch @panic("out of memory");
+        own.* = .{ .store = Store.init(allocator), .scratch = std.heap.ArenaAllocator.init(allocator) };
+        return .{ .allocator = allocator, .store = &own.store, .own = own };
+    }
 
-    pub fn init(allocator: Allocator, config: Config) TSProjection {
-        return .{
-            .allocator = allocator,
-            .buffers = std.StringHashMap(WriteBuffer).init(allocator),
-            .blocks = std.StringHashMap(std.ArrayList(Block)).init(allocator),
-            .tag_dict = std.AutoHashMap(TagKey, []const u8).init(allocator),
-            .buffer_capacity = config.buffer_capacity,
-            .applied_index = 0,
-            .stats = .{},
-        };
+    /// A projection reading `store`, which a shard's apply changes.
+    pub fn initOn(allocator: Allocator, store: *Store) TSProjection {
+        return .{ .allocator = allocator, .store = store };
     }
 
     pub fn deinit(self: *TSProjection) void {
-        // Free write buffers
-        var bit = self.buffers.iterator();
-        while (bit.next()) |kv| {
-            kv.value_ptr.deinit();
-            self.allocator.free(@constCast(kv.key_ptr.*));
-        }
-        self.buffers.deinit();
-
-        // Free blocks
-        var blit = self.blocks.iterator();
-        while (blit.next()) |kv| {
-            kv.value_ptr.deinit(self.allocator);
-            self.allocator.free(@constCast(kv.key_ptr.*));
-        }
-        self.blocks.deinit();
-
-        // Free the tag dictionary
-        var tit = self.tag_dict.iterator();
-        while (tit.next()) |kv| self.allocator.free(@constCast(kv.value_ptr.*));
-        self.tag_dict.deinit();
+        const own = self.own orelse return;
+        own.store.deinit();
+        own.scratch.deinit();
+        self.allocator.destroy(own);
+        self.own = null;
     }
 
-    // ─── Core operations ───────────────────────────────────────────────────
+    fn read(self: *const TSProjection) ReadView {
+        return .{ .store = self.store };
+    }
 
-    /// Insert a single data point.
-    /// Insert a point. `tags` is the raw `k=v,k=v` tag set (empty for untagged);
-    /// the projection canonicalizes it, derives the series' tag hash and records
-    /// the spelling in the tag dictionary. Taking the string rather than a
-    /// pre-computed hash keeps hashing in ONE place — callers previously each
-    /// rolled their own, and one of them (the processing TS sink) hashed
-    /// non-canonically, producing series no query could ever find.
-    pub fn insert(
-        self: *TSProjection,
-        ns_id: NamespaceId,
-        measurement: []const u8,
-        field_name: []const u8,
-        value: f64,
-        timestamp_ns: u64,
-        ual_index: u64,
-        tags: []const u8,
-    ) !void {
-        var canon_buf: [MAX_TAG_STRING]u8 = undefined;
-        const canonical = canonicalTagString(tags, &canon_buf);
-        const tag_hash: u64 = if (canonical.len == 0) 0 else std.hash.Wyhash.hash(0, canonical);
-        try self.registerTagSet(ns_id, tag_hash, canonical);
+    // ─── Standalone writes ────────────────────────────────────────────────
 
-        const series_str = try seriesKeyToString(self.allocator, .{
-            .ns_id = ns_id,
-            .measurement = measurement,
-            .field_name = field_name,
-            .tag_hash = tag_hash,
-        });
+    /// Apply `etype` as the shard would, on a standalone projection's store.
+    fn applyOwn(self: *TSProjection, comptime etype: EntryType, ns_id: NamespaceId, key: []const u8, value: []const u8, stamp_ns: u64, out: *Result) !void {
+        const own = self.own orelse @panic("a shard's time series are written only by applying entries");
+        var pbuf: [MAX_STANDALONE_PAYLOAD]u8 = undefined;
+        const e = entry_mod.buildCommandEntry(etype, entry_mod.Flags.NONE, 1, own.next_index, stamp_ns, ns_id, key, value, &pbuf) orelse return error.OutOfMemory;
+        own.next_index += 1;
+        out.* = Result.start(&e);
+        try machine_mod.applyEntry(&ts_machine.machine, &own.store, &own.scratch, &e, out);
+    }
 
-        const gop = try self.buffers.getOrPut(series_str);
+    const MAX_STANDALONE_PAYLOAD = 16 * 1024;
 
-        if (gop.found_existing) {
-            // Don't need the new key
-            self.allocator.free(series_str);
-        } else {
-            // Store the key and init a new write buffer
-            gop.key_ptr.* = series_str;
-            gop.value_ptr.* = WriteBuffer.init(self.allocator, self.buffer_capacity);
-        }
+    /// Apply an entry to a standalone projection, through the machine a
+    /// shard applies it with.
+    pub fn applyEntry(self: *TSProjection, e: *const entry_mod.Entry, out: *Result) !void {
+        const own = self.own orelse @panic("a shard's time series are written only by applying entries");
+        own.next_index = @max(own.next_index, e.header.index + 1);
+        try machine_mod.applyEntry(&ts_machine.machine, &own.store, &own.scratch, e, out);
+    }
 
-        const buf = gop.value_ptr;
-        try buf.append(.{
-            .timestamp_ns = timestamp_ns,
-            .field_value = value,
-            .ual_index = ual_index,
-            .tag_hash = tag_hash,
-        });
-
+    /// Insert a point into a standalone projection. `tags` is the raw
+    /// `k=v,k=v` tag set; the machine canonicalizes it. `ual_index` is
+    /// ignored: the point takes the next log index of the projection.
+    pub fn insert(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, value: f64, timestamp_ns: u64, ual_index: u64, tags: []const u8) !void {
+        _ = ual_index;
+        var vbuf: [MAX_TAG_STRING + 1024]u8 = undefined;
+        const v = TsWriteValue.encode(&vbuf, .{ .value = value, .timestamp_ns = timestamp_ns, .field_name = field_name, .tags = tags }) orelse return error.OutOfMemory;
+        var out: Result = undefined;
+        try self.applyOwn(.ts_write, ns_id, measurement, v, if (timestamp_ns == 0) 1 else timestamp_ns, &out);
+        if (out.refused() != null) return error.Refused;
         self.stats.points_inserted += 1;
-
-        // Check if buffer needs flushing
-        if (buf.isFull()) {
-            try self.flushBuffer(gop.key_ptr.*, gop.value_ptr);
-        }
     }
 
-    fn flushBuffer(self: *TSProjection, series_key: []const u8, buf: *WriteBuffer) !void {
-        if (buf.len() == 0) return;
-
-        var min_ts: u64 = std.math.maxInt(u64);
-        var max_ts: u64 = 0;
-        var min_ual: u64 = std.math.maxInt(u64);
-        var max_ual: u64 = 0;
-
-        for (buf.points.items) |p| {
-            min_ts = @min(min_ts, p.timestamp_ns);
-            max_ts = @max(max_ts, p.timestamp_ns);
-            min_ual = @min(min_ual, p.ual_index);
-            max_ual = @max(max_ual, p.ual_index);
+    /// Delete a standalone projection's series of `measurement` whose tags
+    /// equal every predicate; returns how many went.
+    pub fn deleteSeries(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, preds: []const TagPredicate) usize {
+        var fbuf: [MAX_TAG_STRING]u8 = undefined;
+        var pos: usize = 0;
+        for (preds, 0..) |p, i| {
+            const part = std.fmt.bufPrint(fbuf[pos..], "{s}{s}={s}", .{ if (i > 0) "," else "", p.key, p.value }) catch return 0;
+            pos += part.len;
         }
-
-        const block = Block{
-            .min_timestamp_ns = min_ts,
-            .max_timestamp_ns = max_ts,
-            .point_count = @intCast(buf.len()),
-            .ual_index_start = min_ual,
-            .ual_index_end = max_ual,
-        };
-
-        const gop = try self.blocks.getOrPut(series_key);
-        if (!gop.found_existing) {
-            // Need to own the key for the blocks map
-            const owned_key = try self.allocator.dupe(u8, series_key);
-            gop.key_ptr.* = owned_key;
-            gop.value_ptr.* = .empty;
-        }
-
-        try gop.value_ptr.append(self.allocator, block);
-
-        buf.clear();
-        self.stats.blocks_flushed += 1;
+        const before = self.read().store.family(ts_machine.Series.ID).count;
+        var out: Result = undefined;
+        self.applyOwn(.ts_delete, ns_id, measurement, fbuf[0..pos], 1, &out) catch return 0;
+        return before - self.store.family(ts_machine.Series.ID).count;
     }
 
-    /// Query points in a timestamp range for a given measurement and field.
-    /// Returns points from both the write buffer and flushed blocks.
-    /// Query one series, or every tag-series for a measurement+field.
-    ///
-    /// `tag_hash` names an exact tag set (`canonicalTagHash` of the tag string);
-    /// pass `null` to mean "any tags", which fans out across every tag-series
-    /// sharing this measurement+field. That fan-out is what keeps an untagged
-    /// read able to see tagged writes now that tags are part of the series key.
-    pub fn queryRange(
-        self: *TSProjection,
-        ns_id: NamespaceId,
-        measurement: []const u8,
-        field_name: []const u8,
-        tag_hash: ?u64,
-        min_ts: u64,
-        max_ts: u64,
-        point_buf: []StoredPoint,
-    ) !QueryResult {
-        var result = QueryResult{
-            .points_in_buffer = 0,
-            .blocks_matched = 0,
-        };
-
-        if (tag_hash) |th| {
-            // Exact tag set — a single hash lookup.
-            const series_str = try seriesKeyToString(self.allocator, .{
-                .ns_id = ns_id,
-                .measurement = measurement,
-                .field_name = field_name,
-                .tag_hash = th,
-            });
-            defer self.allocator.free(series_str);
-
-            if (self.buffers.get(series_str)) |buf| {
-                result.points_in_buffer = buf.queryRange(min_ts, max_ts, point_buf);
-            }
-            if (self.blocks.get(series_str)) |block_list| {
-                for (block_list.items) |block| {
-                    if (block.max_timestamp_ns >= min_ts and block.min_timestamp_ns <= max_ts) {
-                        result.blocks_matched += 1;
-                    }
-                }
-            }
-        } else {
-            // Any tags — merge every tag-series under this measurement+field.
-            const prefix = try seriesKeyPrefix(self.allocator, ns_id, measurement, field_name);
-            defer self.allocator.free(prefix);
-
-            var it = self.buffers.iterator();
-            while (it.next()) |kv| {
-                if (!std.mem.startsWith(u8, kv.key_ptr.*, prefix)) continue;
-                if (result.points_in_buffer >= point_buf.len) break;
-                result.points_in_buffer += kv.value_ptr.queryRange(min_ts, max_ts, point_buf[result.points_in_buffer..]);
-            }
-
-            var bit = self.blocks.iterator();
-            while (bit.next()) |kv| {
-                if (!std.mem.startsWith(u8, kv.key_ptr.*, prefix)) continue;
-                for (kv.value_ptr.items) |block| {
-                    if (block.max_timestamp_ns >= min_ts and block.min_timestamp_ns <= max_ts) {
-                        result.blocks_matched += 1;
-                    }
-                }
-            }
-
-            // Points from separate tag-series interleave; callers (and the FloQL
-            // window/rate/delta stages) expect time-ordered output.
-            std.mem.sort(StoredPoint, point_buf[0..result.points_in_buffer], {}, struct {
-                fn lt(_: void, a: StoredPoint, b: StoredPoint) bool {
-                    return a.timestamp_ns < b.timestamp_ns;
-                }
-            }.lt);
-        }
-
-        self.stats.queries += 1;
-        return result;
+    pub fn deleteMeasurement(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8) usize {
+        return self.deleteSeries(ns_id, measurement, &.{});
     }
 
-    /// A point's place in a series' read order: its time, then the log
-    /// index it was applied from, which no two of a measurement's points
-    /// share.
-    pub const ReadAt = struct {
-        ns: u64,
-        ual: u64,
+    /// Remove a standalone projection's points of `measurement` older than
+    /// `cutoff_ns`; returns how many went.
+    pub fn applyRetention(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, cutoff_ns: u64) usize {
+        // The entry carries an age from its stamp: a stamp of the cutoff
+        // and an age of 0 trims exactly below the cutoff.
+        var age: [8]u8 = undefined;
+        std.mem.writeInt(u64, &age, 0, .little);
+        const before = self.store.family(ts_machine.Points.ID).count;
+        var out: Result = undefined;
+        self.applyOwn(.ts_retention, ns_id, measurement, &age, cutoff_ns, &out) catch return 0;
+        return before - self.store.family(ts_machine.Points.ID).count;
+    }
 
-        pub fn before(a: ReadAt, b: ReadAt) bool {
-            return a.ns < b.ns or (a.ns == b.ns and a.ual < b.ual);
-        }
+    // ─── Reads ────────────────────────────────────────────────────────────
 
-        fn of(p: StoredPoint) ReadAt {
-            return .{ .ns = p.timestamp_ns, .ual = p.ual_index };
+    pub const QueryResult = struct {
+        points_in_buffer: usize,
+    };
+
+    /// A point's place in read order: its time, then its position
+    /// (`ts_machine.positionOf`), which no two of a series' points share.
+    pub const ReadAt = ts_machine.At;
+
+    /// Which of a field's series a read takes.
+    const Pick = union(enum) {
+        /// The one with this tag hash.
+        exact: u64,
+        /// Those whose tags satisfy every predicate (all, when none).
+        matching: []const TagPredicate,
+    };
+
+    /// One series' points from where a read starts, as the merge holds it.
+    const Cursor = struct {
+        it: ReadRange(ts_machine.Points),
+        head: StoredPoint,
+        tag_hash: u64,
+        tags: []const u8,
+
+        fn advance(self: *Cursor, max_ns: u64) error{Malformed}!bool {
+            const p = (try self.it.next()) orelse return false;
+            const at = ts_machine.pointAt(p.key);
+            if (at.ns > max_ns) return false;
+            self.head = .{ .timestamp_ns = at.ns, .field_value = p.value.value, .ual_index = at.ual, .tag_hash = self.tag_hash, .tags = self.tags };
+            return true;
         }
     };
 
-    /// The earliest points after `after`, in (time, log index) order, of
-    /// one series or (`tag_hash` null) every tag-series of a measurement's
-    /// field: up to `out.len`, however the series hold them. A reader that
-    /// goes on from its last point neither skips nor repeats one, even
-    /// among points sharing a time.
+    fn cursorLess(_: void, a: *Cursor, b: *Cursor) std.math.Order {
+        if (a.head.timestamp_ns != b.head.timestamp_ns) return std.math.order(a.head.timestamp_ns, b.head.timestamp_ns);
+        return std.math.order(a.head.ual_index, b.head.ual_index);
+    }
+
+    /// Where a read starts: at a time, or past a point.
+    const From = union(enum) { at_ns: u64, after: ts_machine.At };
+
+    /// Every point of the picked series from `from` through `max_ns`, in
+    /// (time, position) order across them, to `visit` until it says stop.
+    /// One seek per series, then a merge: a read of one series costs only
+    /// that series' points.
+    fn scan(self: *const TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, pick: Pick, from: From, max_ns: u64, ctx: anytype, comptime visit: fn (@TypeOf(ctx), StoredPoint) bool) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const rv = self.read();
+        var cursors: std.ArrayListUnmanaged(*Cursor) = .empty;
+        const field_prefix = try ts_machine.fieldPrefix(a, ns_id, measurement, field_name);
+        var series_it = rv.range(ts_machine.Series, field_prefix);
+        while (try series_it.next()) |s| {
+            const name = ts_machine.seriesName(s.key);
+            switch (pick) {
+                .exact => |h| if (name.tag_hash != h) continue,
+                .matching => |preds| if (!tagsMatch(s.value.tags, preds)) continue,
+            }
+            const c = try a.create(Cursor);
+            c.* = .{ .it = undefined, .head = undefined, .tag_hash = name.tag_hash, .tags = s.value.tags };
+            c.it = switch (from) {
+                .at_ns => |t| if (t == 0) rv.range(ts_machine.Points, s.key) else rv.rangeAfter(ts_machine.Points, s.key, try ts_machine.pointKey(a, s.key, t - 1, std.math.maxInt(u64))),
+                .after => |at| rv.rangeAfter(ts_machine.Points, s.key, try ts_machine.pointKey(a, s.key, at.ns, at.ual)),
+            };
+            if (try c.advance(max_ns)) try cursors.append(a, c);
+        }
+        var heap: std.PriorityQueue(*Cursor, void, cursorLess) = .empty;
+        try heap.pushSlice(a, cursors.items);
+        while (heap.pop()) |c| {
+            if (!visit(ctx, c.head)) break;
+            if (try c.advance(max_ns)) try heap.push(a, c);
+        }
+    }
+
+    /// Every point of a measurement field's tag-series whose tags satisfy
+    /// `preds`, in `[min_ts, max_ts]`, time-ordered, to `visit` until it
+    /// says stop: however many there are.
+    pub fn scanFiltered(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64, ctx: anytype, comptime visit: fn (@TypeOf(ctx), StoredPoint) bool) !void {
+        self.stats.queries += 1;
+        try self.scan(ns_id, measurement, field_name, .{ .matching = preds }, .{ .at_ns = min_ts }, max_ts, ctx, visit);
+    }
+
+    const Fill = struct {
+        buf: []StoredPoint,
+        n: usize = 0,
+
+        fn take(self: *Fill, p: StoredPoint) bool {
+            if (self.n == self.buf.len) return false;
+            self.buf[self.n] = p;
+            self.n += 1;
+            return self.n < self.buf.len;
+        }
+    };
+
+    fn fill(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, pick: Pick, from: From, max_ts: u64, point_buf: []StoredPoint) !QueryResult {
+        self.stats.queries += 1;
+        if (point_buf.len == 0) return .{ .points_in_buffer = 0 };
+        var f: Fill = .{ .buf = point_buf };
+        try self.scan(ns_id, measurement, field_name, pick, from, max_ts, &f, Fill.take);
+        return .{ .points_in_buffer = f.n };
+    }
+
+    /// The earliest points of one series (`tag_hash`), or of every
+    /// tag-series of a measurement's field (null), in `[min_ts, max_ts]`,
+    /// time-ordered, up to `point_buf.len`. A point's tags are borrowed from
+    /// the store, good until it next changes.
+    pub fn queryRange(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, tag_hash: ?u64, min_ts: u64, max_ts: u64, point_buf: []StoredPoint) !QueryResult {
+        const pick: Pick = if (tag_hash) |h| .{ .exact = h } else .{ .matching = &.{} };
+        return self.fill(ns_id, measurement, field_name, pick, .{ .at_ns = min_ts }, max_ts, point_buf);
+    }
+
+    /// `queryRange` over every tag-series whose tags satisfy `preds`.
+    /// Predicates constrain only the tags they name, so a partial filter
+    /// matches a superset tag set. An empty list means every tag-series.
+    pub fn queryRangeFiltered(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64, point_buf: []StoredPoint) !QueryResult {
+        return self.fill(ns_id, measurement, field_name, .{ .matching = preds }, .{ .at_ns = min_ts }, max_ts, point_buf);
+    }
+
+    /// The earliest points after `after`, in (time, position) order, of
+    /// one series (`tag_hash`) or every tag-series of a measurement's field
+    /// (null): a reader going on from its last point neither skips nor
+    /// repeats one, even among points sharing a time.
     pub fn readAfter(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, tag_hash: ?u64, after: ReadAt, out: []StoredPoint) !usize {
-        if (out.len == 0) return 0;
-        var n: usize = 0;
-        if (tag_hash) |th| {
-            const series_str = try seriesKeyToString(self.allocator, .{ .ns_id = ns_id, .measurement = measurement, .field_name = field_name, .tag_hash = th });
-            defer self.allocator.free(series_str);
-            if (self.buffers.get(series_str)) |buf| for (buf.points.items) |p| keepEarliest(out, &n, after, p);
-        } else {
-            const prefix = try seriesKeyPrefix(self.allocator, ns_id, measurement, field_name);
-            defer self.allocator.free(prefix);
-            var it = self.buffers.iterator();
-            while (it.next()) |kv| {
-                if (!std.mem.startsWith(u8, kv.key_ptr.*, prefix)) continue;
-                for (kv.value_ptr.points.items) |p| keepEarliest(out, &n, after, p);
-            }
-        }
-        std.mem.sort(StoredPoint, out[0..n], {}, struct {
-            fn lt(_: void, a: StoredPoint, b: StoredPoint) bool {
-                return ReadAt.of(a).before(ReadAt.of(b));
-            }
-        }.lt);
-        self.stats.queries += 1;
-        return n;
-    }
-
-    /// Keeps `out[0..n]` the earliest points after `after` seen so far, as
-    /// a heap with the latest at the root.
-    fn keepEarliest(out: []StoredPoint, n: *usize, after: ReadAt, p: StoredPoint) void {
-        const at = ReadAt.of(p);
-        if (!after.before(at)) return;
-        if (n.* < out.len) {
-            var i = n.*;
-            out[i] = p;
-            n.* += 1;
-            while (i > 0) {
-                const parent = (i - 1) / 2;
-                if (!ReadAt.of(out[parent]).before(ReadAt.of(out[i]))) break;
-                std.mem.swap(StoredPoint, &out[parent], &out[i]);
-                i = parent;
-            }
-            return;
-        }
-        if (!at.before(ReadAt.of(out[0]))) return;
-        out[0] = p;
-        var i: usize = 0;
-        while (true) {
-            const l = 2 * i + 1;
-            if (l >= out.len) break;
-            var big = l;
-            if (l + 1 < out.len and ReadAt.of(out[l]).before(ReadAt.of(out[l + 1]))) big = l + 1;
-            if (!ReadAt.of(out[i]).before(ReadAt.of(out[big]))) break;
-            std.mem.swap(StoredPoint, &out[i], &out[big]);
-            i = big;
-        }
-    }
-
-    /// Query every tag-series whose tags satisfy `preds`, merged and
-    /// time-ordered.
-    ///
-    /// This is the general form: predicates constrain only the tags they name,
-    /// so a partial filter matches a superset tag set — which an exact tag-hash
-    /// lookup (`queryRange`) fundamentally cannot do. An empty predicate list
-    /// means "every tag-series".
-    pub fn queryRangeFiltered(
-        self: *TSProjection,
-        ns_id: NamespaceId,
-        measurement: []const u8,
-        field_name: []const u8,
-        preds: []const TagPredicate,
-        min_ts: u64,
-        max_ts: u64,
-        point_buf: []StoredPoint,
-    ) !QueryResult {
-        var result = QueryResult{ .points_in_buffer = 0, .blocks_matched = 0 };
-
-        const prefix = try seriesKeyPrefix(self.allocator, ns_id, measurement, field_name);
-        defer self.allocator.free(prefix);
-
-        var it = self.buffers.iterator();
-        while (it.next()) |kv| {
-            const key = kv.key_ptr.*;
-            if (!std.mem.startsWith(u8, key, prefix)) continue;
-            if (!tagsMatch(self.tagsForHash(ns_id, keyTagHash(key)), preds)) continue;
-            if (result.points_in_buffer >= point_buf.len) break;
-            result.points_in_buffer += kv.value_ptr.queryRange(min_ts, max_ts, point_buf[result.points_in_buffer..]);
-        }
-
-        var bit = self.blocks.iterator();
-        while (bit.next()) |kv| {
-            const key = kv.key_ptr.*;
-            if (!std.mem.startsWith(u8, key, prefix)) continue;
-            if (!tagsMatch(self.tagsForHash(ns_id, keyTagHash(key)), preds)) continue;
-            for (kv.value_ptr.items) |block| {
-                if (block.max_timestamp_ns >= min_ts and block.min_timestamp_ns <= max_ts) {
-                    result.blocks_matched += 1;
-                }
-            }
-        }
-
-        std.mem.sort(StoredPoint, point_buf[0..result.points_in_buffer], {}, struct {
-            fn lt(_: void, a: StoredPoint, b: StoredPoint) bool {
-                return a.timestamp_ns < b.timestamp_ns;
-            }
-        }.lt);
-
-        self.stats.queries += 1;
-        return result;
+        const pick: Pick = if (tag_hash) |h| .{ .exact = h } else .{ .matching = &.{} };
+        return (try self.fill(ns_id, measurement, field_name, pick, .{ .after = after }, std.math.maxInt(u64), out)).points_in_buffer;
     }
 
     /// Distinct tag-series under one measurement+field, as canonical tag
-    /// strings. Backs per-series rollups and `group_by`.
-    pub fn seriesTagsFor(
-        self: *TSProjection,
-        ns_id: NamespaceId,
-        measurement: []const u8,
-        field_name: []const u8,
-        out: [][]const u8,
-    ) !usize {
-        const prefix = try seriesKeyPrefix(self.allocator, ns_id, measurement, field_name);
-        defer self.allocator.free(prefix);
+    /// strings borrowed from the store. Backs per-series rollups and `group_by`.
+    pub fn seriesTagsFor(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, out: [][]const u8) !usize {
+        var kbuf: [4096]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&kbuf);
+        var it = self.read().range(ts_machine.Series, try ts_machine.fieldPrefix(fba.allocator(), ns_id, measurement, field_name));
         var n: usize = 0;
-        var it = self.buffers.iterator();
-        while (it.next()) |kv| {
+        while (try it.next()) |s| {
             if (n >= out.len) break;
-            const key = kv.key_ptr.*;
-            if (!std.mem.startsWith(u8, key, prefix)) continue;
-            out[n] = self.tagsForHash(ns_id, keyTagHash(key));
+            out[n] = s.value.tags;
             n += 1;
         }
         return n;
     }
 
-    pub const QueryResult = struct {
-        points_in_buffer: usize,
-        blocks_matched: usize,
-    };
-
     // ─── Aggregations ──────────────────────────────────────────────────────
 
-    /// Compute the average of points in a range from the write buffer.
+    const Acc = struct {
+        n: u64 = 0,
+        sum: f64 = 0,
+        lo: f64 = std.math.floatMax(f64),
+        hi: f64 = -std.math.floatMax(f64),
+
+        fn add(self: *Acc, p: StoredPoint) bool {
+            self.n += 1;
+            self.sum += p.field_value;
+            self.lo = @min(self.lo, p.field_value);
+            self.hi = @max(self.hi, p.field_value);
+            return true;
+        }
+    };
+
+    /// Every matching point in the range, however many.
+    fn aggregate(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !Acc {
+        self.stats.queries += 1;
+        var acc: Acc = .{};
+        try self.scan(ns_id, measurement, field_name, .{ .matching = preds }, .{ .at_ns = min_ts }, max_ts, &acc, Acc.add);
+        return acc;
+    }
+
     pub fn avg(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
-        var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRangeFiltered(ns_id, measurement, field_name, preds, min_ts, max_ts, &buf);
-        if (result.points_in_buffer == 0) return null;
-
-        var acc: f64 = 0;
-        for (buf[0..result.points_in_buffer]) |p| {
-            acc += p.field_value;
-        }
-        return acc / @as(f64, @floatFromInt(result.points_in_buffer));
+        const acc = try self.aggregate(ns_id, measurement, field_name, preds, min_ts, max_ts);
+        return if (acc.n == 0) null else acc.sum / @as(f64, @floatFromInt(acc.n));
     }
 
-    /// Compute the min of points in a range from the write buffer.
     pub fn min(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
-        var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRangeFiltered(ns_id, measurement, field_name, preds, min_ts, max_ts, &buf);
-        if (result.points_in_buffer == 0) return null;
-
-        var min_val: f64 = std.math.floatMax(f64);
-        for (buf[0..result.points_in_buffer]) |p| {
-            min_val = @min(min_val, p.field_value);
-        }
-        return min_val;
+        const acc = try self.aggregate(ns_id, measurement, field_name, preds, min_ts, max_ts);
+        return if (acc.n == 0) null else acc.lo;
     }
 
-    /// Compute the max of points in a range from the write buffer.
     pub fn max(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
-        var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRangeFiltered(ns_id, measurement, field_name, preds, min_ts, max_ts, &buf);
-        if (result.points_in_buffer == 0) return null;
-
-        var max_val: f64 = -std.math.floatMax(f64);
-        for (buf[0..result.points_in_buffer]) |p| {
-            max_val = @max(max_val, p.field_value);
-        }
-        return max_val;
+        const acc = try self.aggregate(ns_id, measurement, field_name, preds, min_ts, max_ts);
+        return if (acc.n == 0) null else acc.hi;
     }
 
-    /// Compute the sum of points in a range from the write buffer.
     pub fn sum(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
-        var point_buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRangeFiltered(ns_id, measurement, field_name, preds, min_ts, max_ts, &point_buf);
-        if (result.points_in_buffer == 0) return null;
-
-        var total: f64 = 0;
-        for (point_buf[0..result.points_in_buffer]) |p| {
-            total += p.field_value;
-        }
-        return total;
+        const acc = try self.aggregate(ns_id, measurement, field_name, preds, min_ts, max_ts);
+        return if (acc.n == 0) null else acc.sum;
     }
 
-    /// Count points in a range from the write buffer.
     pub fn count(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !usize {
-        var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRangeFiltered(ns_id, measurement, field_name, preds, min_ts, max_ts, &buf);
-        return result.points_in_buffer;
+        return @intCast((try self.aggregate(ns_id, measurement, field_name, preds, min_ts, max_ts)).n);
     }
 
     // ─── Info ──────────────────────────────────────────────────────────────
 
-    /// Number of active series (measurement+field combos with data).
+    /// Series this shard holds, every namespace's.
     pub fn seriesCount(self: *const TSProjection) usize {
-        return self.buffers.count();
+        return self.store.family(ts_machine.Series.ID).count;
     }
 
-    /// Scan unique measurement names into a caller-provided buffer.
-    ///
-    /// Returns the count of unique names written. Names are borrowed
-    /// references into the internal HashMap key storage — valid only
-    /// while the projection is not mutated.
+    /// Points this shard holds, and what the store keeps for them: the
+    /// growth retention bounds.
+    pub fn pointCount(self: *const TSProjection) u64 {
+        return self.store.family(ts_machine.Points.ID).count;
+    }
+
+    pub fn pointBytes(self: *const TSProjection) u64 {
+        return self.store.family(ts_machine.Points.ID).encoded_bytes;
+    }
+
+    /// Unique measurement names of a namespace, into `buf`, borrowed from
+    /// the store: valid while it isn't changed.
     pub fn scanMeasurementNames(self: *const TSProjection, ns_id: NamespaceId, buf: [][]const u8) usize {
-        var result_count: usize = 0;
-        var it = self.buffers.iterator();
-        while (it.next()) |kv| {
-            if (result_count >= buf.len) break;
-            const key = kv.key_ptr.*;
-            if (keyNsId(key) != ns_id) continue;
-            const meas = keyMeasurement(key);
-            // Dedup via linear scan (measurement count is typically small)
-            var dup = false;
-            for (buf[0..result_count]) |existing| {
-                if (std.mem.eql(u8, existing, meas)) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (!dup) {
-                buf[result_count] = meas;
-                result_count += 1;
-            }
+        var n: usize = 0;
+        const id = ns_id.bytes();
+        var it = self.read().range(ts_machine.Series, &id);
+        while (it.next() catch null) |s| {
+            if (n >= buf.len) break;
+            const m = ts_machine.seriesName(s.key).measurement;
+            // Series keys sort by measurement, so its series are together.
+            if (n > 0 and std.mem.eql(u8, buf[n - 1], m)) continue;
+            buf[n] = m;
+            n += 1;
         }
-        return result_count;
+        return n;
     }
 
     /// The most field names a summary lists; past it, `fields` stops
@@ -995,320 +673,74 @@ pub const TSProjection = struct {
     /// A listed measurement's series, distinct fields and points.
     pub const ListCounts = struct { series: u32 = 0, fields: u32 = 0, points: u64 = 0 };
 
-    /// `names`' counts into `out`, one per name, in one pass over the
-    /// shard's series keys and block headers, so a list page costs one pass
-    /// however many names it holds.
+    /// `names`' counts into `out`, one per name, each from its own series
+    /// records: no point is read.
     pub fn listCounts(self: *const TSProjection, ns_id: NamespaceId, names: []const []const u8, allocator: Allocator, out: []ListCounts) error{OutOfMemory}!void {
         std.debug.assert(out.len == names.len);
-        @memset(out, .{});
-        var index = std.StringHashMap(u32).init(allocator);
-        defer index.deinit();
-        try index.ensureTotalCapacity(@intCast(names.len));
-        for (names, 0..) |n, i| index.putAssumeCapacity(n, @intCast(i));
-        // A series key up to its field names one measurement's field.
-        var fields_seen = std.StringHashMap(void).init(allocator);
-        defer fields_seen.deinit();
-        var it = self.buffers.iterator();
-        while (it.next()) |kv| {
-            const key = kv.key_ptr.*;
-            if (keyNsId(key) != ns_id) continue;
-            const meas = keyMeasurement(key);
-            const i = index.get(meas) orelse continue;
-            const c = &out[i];
-            c.series += 1;
-            const field_end = NS_PREFIX + meas.len + 1 + keyFieldName(key).len;
-            if (!(try fields_seen.getOrPut(key[0..@min(field_end, key.len)])).found_existing) c.fields += 1;
-            c.points += kv.value_ptr.len();
-            if (self.blocks.get(key)) |blocks| for (blocks.items) |b| {
-                c.points += b.point_count;
+        for (names, out) |name, *c| {
+            var field_buf: [MAX_SUMMARY_FIELDS][]const u8 = undefined;
+            const s = self.summarizeWith(ns_id, name, &field_buf, allocator) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => Summary{},
             };
+            c.* = .{ .series = s.series, .fields = s.fields, .points = s.points };
         }
     }
 
-    /// One measurement's series, fields and points, from its series keys,
-    /// block headers and buffered points: no block's points are read. Field
-    /// names go into `field_buf`, at most `MAX_SUMMARY_FIELDS` of them, and
-    /// are borrowed from the keys, valid until the projection changes.
-    /// A pass over the shard's series keys, as listing them is.
+    /// One measurement's series, fields and points, from its series
+    /// records: no point is read. Field names go into `field_buf`, at most
+    /// `MAX_SUMMARY_FIELDS`, borrowed from the store.
     pub fn summarize(self: *const TSProjection, ns_id: NamespaceId, measurement: []const u8, field_buf: *[MAX_SUMMARY_FIELDS][]const u8) Summary {
+        return self.summarizeWith(ns_id, measurement, field_buf, self.allocator) catch .{};
+    }
+
+    fn summarizeWith(self: *const TSProjection, ns_id: NamespaceId, measurement: []const u8, field_buf: *[MAX_SUMMARY_FIELDS][]const u8, allocator: Allocator) !Summary {
         var total: Summary = .{};
-        var it = self.buffers.iterator();
-        while (it.next()) |kv| {
-            const key = kv.key_ptr.*;
-            if (keyNsId(key) != ns_id or !std.mem.eql(u8, keyMeasurement(key), measurement)) continue;
+        const prefix = try ts_machine.measurementPrefix(allocator, ns_id, measurement);
+        defer allocator.free(prefix);
+        var it = self.read().range(ts_machine.Series, prefix);
+        while (try it.next()) |s| {
             total.series += 1;
-            const field = keyFieldName(key);
-            for (field_buf[0..total.fields]) |seen| {
-                if (std.mem.eql(u8, seen, field)) break;
-            } else if (total.fields < MAX_SUMMARY_FIELDS) {
+            const field = ts_machine.seriesName(s.key).field;
+            // A field's series sort together.
+            if (total.fields > 0 and std.mem.eql(u8, field_buf[total.fields - 1], field)) {} else if (total.fields < MAX_SUMMARY_FIELDS) {
                 field_buf[total.fields] = field;
                 total.fields += 1;
             } else total.fields_capped = true;
-            for (kv.value_ptr.points.items) |p| {
-                total.oldest_ns = @min(total.oldest_ns, p.timestamp_ns);
-                total.newest_ns = @max(total.newest_ns, p.timestamp_ns);
+            total.points += s.value.points;
+            if (s.value.points > 0) {
+                total.oldest_ns = @min(total.oldest_ns, s.value.oldest_ns);
+                total.newest_ns = @max(total.newest_ns, s.value.newest_ns);
             }
-            total.points += kv.value_ptr.len();
-            if (self.blocks.get(key)) |blocks| for (blocks.items) |b| {
-                total.points += b.point_count;
-                total.oldest_ns = @min(total.oldest_ns, b.min_timestamp_ns);
-                total.newest_ns = @max(total.newest_ns, b.max_timestamp_ns);
-            };
         }
         return total;
     }
 
-    /// Return unique measurement names from the write buffers.
-    /// Caller owns the returned slices and must free them.
+    /// Unique measurement names of a namespace; the caller owns them.
     pub fn listMeasurements(self: *const TSProjection, ns_id: NamespaceId, allocator: Allocator) ![][]const u8 {
-        // Collect unique measurement names from this namespace's buffer keys.
-        var seen = std.StringHashMap(void).init(allocator);
-        defer seen.deinit();
-
-        var it = self.buffers.iterator();
-        while (it.next()) |kv| {
-            const key = kv.key_ptr.*;
-            if (keyNsId(key) != ns_id) continue;
-            _ = try seen.getOrPut(keyMeasurement(key));
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (names.items) |n| allocator.free(n);
+            names.deinit(allocator);
         }
-
-        const names = try allocator.alloc([]const u8, seen.count());
-        var idx: usize = 0;
-        var sit = seen.iterator();
-        while (sit.next()) |entry| {
-            names[idx] = try allocator.dupe(u8, entry.key_ptr.*);
-            idx += 1;
+        const id = ns_id.bytes();
+        var it = self.read().range(ts_machine.Series, &id);
+        while (try it.next()) |s| {
+            const m = ts_machine.seriesName(s.key).measurement;
+            if (names.items.len > 0 and std.mem.eql(u8, names.items[names.items.len - 1], m)) continue;
+            try names.append(allocator, try allocator.dupe(u8, m));
         }
-        return names;
-    }
-
-    /// Total flushed blocks across all series.
-    pub fn totalBlocks(self: *const TSProjection) usize {
-        var total: usize = 0;
-        var it = self.blocks.iterator();
-        while (it.next()) |kv| {
-            total += kv.value_ptr.items.len;
-        }
-        return total;
-    }
-
-    // ─── Delete / Retention ────────────────────────────────────────────────
-
-    /// Delete all data for a measurement (all fields).
-    /// Returns the number of series removed.
-    pub fn deleteMeasurement(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8) usize {
-        return self.deleteSeries(ns_id, measurement, &.{});
-    }
-
-    /// Whether `key` is a series of `measurement` in the namespace whose
-    /// tags satisfy every predicate.
-    fn seriesMatches(self: *const TSProjection, key: []const u8, ns_id: NamespaceId, measurement: []const u8, preds: []const TagPredicate) bool {
-        return inMeasurement(key, ns_id, measurement) and tagsMatch(self.tagsForHash(ns_id, keyTagHash(key)), preds);
+        return names.toOwnedSlice(allocator);
     }
 
     /// Whether any series of `measurement` in the namespace matches.
     pub fn hasSeries(self: *const TSProjection, ns_id: NamespaceId, measurement: []const u8, preds: []const TagPredicate) bool {
-        var bit = self.buffers.keyIterator();
-        while (bit.next()) |k| if (self.seriesMatches(k.*, ns_id, measurement, preds)) return true;
-        var blit = self.blocks.keyIterator();
-        while (blit.next()) |k| if (self.seriesMatches(k.*, ns_id, measurement, preds)) return true;
+        var kbuf: [4096]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&kbuf);
+        const prefix = ts_machine.measurementPrefix(fba.allocator(), ns_id, measurement) catch return false;
+        var it = self.read().range(ts_machine.Series, prefix);
+        while (it.next() catch null) |s| if (tagsMatch(s.value.tags, preds)) return true;
         return false;
-    }
-
-    /// Delete the series of `measurement`, in one namespace, whose tags
-    /// satisfy every predicate (all of them, when there are none).
-    /// Returns the number of series removed.
-    pub fn deleteSeries(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, preds: []const TagPredicate) usize {
-        var removed: usize = 0;
-
-        // Delete matching write buffers (this namespace + measurement only).
-        // Every series has one: a flush empties it but keeps it.
-        var bit = self.buffers.iterator();
-        while (bit.next()) |kv| {
-            const key = kv.key_ptr.*;
-            if (self.seriesMatches(key, ns_id, measurement, preds)) {
-                kv.value_ptr.deinit();
-                self.allocator.free(@constCast(key));
-                self.buffers.removeByPtr(kv.key_ptr);
-                removed += 1;
-            }
-        }
-
-        // Delete matching blocks
-        var blit = self.blocks.iterator();
-        while (blit.next()) |kv| {
-            const key = kv.key_ptr.*;
-            if (self.seriesMatches(key, ns_id, measurement, preds)) {
-                kv.value_ptr.deinit(self.allocator);
-                self.allocator.free(@constCast(key));
-                self.blocks.removeByPtr(kv.key_ptr);
-            }
-        }
-
-        return removed;
-    }
-
-    /// Remove one measurement's points older than `cutoff_ns`, in one
-    /// namespace. Returns the number of points evicted.
-    pub fn applyRetention(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, cutoff_ns: u64) usize {
-        var evicted: usize = 0;
-
-        // Evict from write buffers
-        var bit = self.buffers.iterator();
-        while (bit.next()) |kv| {
-            if (!inMeasurement(kv.key_ptr.*, ns_id, measurement)) continue;
-            const buf = kv.value_ptr;
-            var write_idx: usize = 0;
-            for (buf.points.items) |pt| {
-                if (pt.timestamp_ns >= cutoff_ns) {
-                    buf.points.items[write_idx] = pt;
-                    write_idx += 1;
-                } else {
-                    evicted += 1;
-                }
-            }
-            buf.points.shrinkRetainingCapacity(write_idx);
-        }
-
-        // Evict old blocks (entire blocks where max_timestamp < cutoff)
-        var blit = self.blocks.iterator();
-        while (blit.next()) |kv| {
-            if (!inMeasurement(kv.key_ptr.*, ns_id, measurement)) continue;
-            const block_list = kv.value_ptr;
-            var write_idx: usize = 0;
-            for (block_list.items) |block| {
-                if (block.max_timestamp_ns >= cutoff_ns) {
-                    block_list.items[write_idx] = block;
-                    write_idx += 1;
-                } else {
-                    evicted += block.point_count;
-                }
-            }
-            block_list.shrinkRetainingCapacity(write_idx);
-        }
-
-        return evicted;
-    }
-
-    // ─── UAL Entry application ─────────────────────────────────────────────
-
-    /// Apply a committed entry. A write is answered with its measurement
-    /// and the point's timestamp (the client's, or the entry's stamp), a
-    /// delete or retention with nothing. A payload that doesn't decode
-    /// halts.
-    pub fn applyEntry(self: *TSProjection, ual_entry: *const Entry, out: *Result) router_mod.ApplyError!void {
-        const entry_type: EntryType = @fromBackingInt(@intCast(ual_entry.header.entry_type));
-
-        switch (entry_type) {
-            .ts_write, .ts_write_batch => {
-                // The measurement is the command key; the value carries the
-                // reading plus the field name, client timestamp and tag hash
-                // (see TsWriteValue). Replaying all four is what makes a
-                // restored series identical to the written one.
-                const cmd = entry_mod.CommandPayload.deserialize(ual_entry.payload) orelse return error.Halt;
-                const rec = TsWriteValue.decode(cmd.value, ual_entry.header.timestamp_ns) orelse return error.Halt;
-                try self.insert(
-                    cmd.namespace_id,
-                    cmd.key,
-                    rec.field_name,
-                    rec.value,
-                    rec.timestamp_ns,
-                    ual_entry.header.index,
-                    rec.tags,
-                );
-                out.putBytes(cmd.key);
-                out.putInt(u64, rec.timestamp_ns);
-            },
-            // The value is the canonical tag filter; empty deletes the
-            // whole measurement. A filter that matches no series is refused
-            // here, not when proposed: a write committed ahead of it may
-            // add the series it names.
-            .ts_delete => {
-                const cmd = entry_mod.CommandPayload.deserialize(ual_entry.payload) orelse return error.Halt;
-                var canon_buf: [MAX_TAG_STRING]u8 = undefined;
-                var preds_buf: [MAX_TAGS]TagPredicate = undefined;
-                const f = switch (parseTagFilter(cmd.value, &canon_buf, &preds_buf)) {
-                    .ok => |f| f,
-                    else => return error.Halt,
-                };
-                const removed = self.deleteSeries(cmd.namespace_id, cmd.key, f.preds);
-                if (removed == 0 and f.preds.len > 0) {
-                    out.refuseFmt(.not_found, .not_found, "no series of '{s}' has tags {s}; nothing deleted", .{ cmd.key, f.canonical });
-                }
-            },
-            // The entry carries the duration; the cutoff is its stamp less
-            // that, so every replica trims the same points.
-            .ts_retention => {
-                const cmd = entry_mod.CommandPayload.deserialize(ual_entry.payload) orelse return error.Halt;
-                if (cmd.value.len != 8) return error.Halt;
-                const age_ms = std.mem.readInt(u64, cmd.value[0..8], .little);
-                _ = self.applyRetention(cmd.namespace_id, cmd.key, retentionCutoffNs(ual_entry.header.timestamp_ns, age_ms));
-            },
-            else => return error.Halt,
-        }
-
-        self.applied_index = ual_entry.header.index;
-    }
-
-    /// ProjectionVTable implementation.
-    pub fn projectionHandle(self: *TSProjection) router_mod.ProjectionHandle {
-        return .{
-            .ctx = @ptrCast(self),
-            .vtable = .{
-                .applyFn = vtableApply,
-            },
-        };
-    }
-
-    fn vtableApply(ctx: *anyopaque, ual_entry: *const Entry, out: *Result) router_mod.ApplyError!void {
-        const self: *TSProjection = @ptrCast(@alignCast(ctx));
-        return self.applyEntry(ual_entry, out);
-    }
-
-    /// Clear all state, freeing owned memory.
-    pub fn reset(self: *TSProjection) void {
-        var bit = self.buffers.iterator();
-        while (bit.next()) |kv| {
-            kv.value_ptr.deinit();
-            self.allocator.free(@constCast(kv.key_ptr.*));
-        }
-        self.buffers.clearAndFree();
-
-        var blit = self.blocks.iterator();
-        while (blit.next()) |kv| {
-            kv.value_ptr.deinit(self.allocator);
-            self.allocator.free(@constCast(kv.key_ptr.*));
-        }
-        self.blocks.clearAndFree();
-
-        var tit = self.tag_dict.iterator();
-        while (tit.next()) |kv| self.allocator.free(@constCast(kv.value_ptr.*));
-        self.tag_dict.clearAndFree();
-
-        self.applied_index = 0;
-        self.stats = .{};
-    }
-
-    /// Record a tag set in the dictionary. Idempotent — the first canonical
-    /// string wins, so a hash always resolves to one spelling.
-    pub fn registerTagSet(self: *TSProjection, ns_id: NamespaceId, tag_hash: u64, canonical: []const u8) !void {
-        if (tag_hash == 0 or canonical.len == 0) return;
-        const key: TagKey = .{ .ns_id = ns_id, .tag_hash = tag_hash };
-        const gop = try self.tag_dict.getOrPut(key);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = self.allocator.dupe(u8, canonical) catch |e| {
-                _ = self.tag_dict.remove(key);
-                return e;
-            };
-        }
-    }
-
-    /// Canonical tag string for a namespace's tag hash. The untagged series
-    /// (hash 0) resolves to "" so predicate matching treats it as "no tags
-    /// present".
-    pub fn tagsForHash(self: *const TSProjection, ns_id: NamespaceId, tag_hash: u64) []const u8 {
-        if (tag_hash == 0) return "";
-        return self.tag_dict.get(.{ .ns_id = ns_id, .tag_hash = tag_hash }) orelse "";
     }
 };
 
@@ -1318,13 +750,13 @@ pub const TSProjection = struct {
 
 const testing = std.testing;
 
-fn applyTest(ts: *TSProjection, e: *const Entry) router_mod.ApplyError!void {
+fn applyTest(ts: *TSProjection, e: *const entry_mod.Entry) !void {
     var out = Result.start(e);
     return ts.applyEntry(e, &out);
 }
 
 test "ts: basic insert and query" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
 
     try ts.insert(.of(16), "cpu", "usage", 82.5, 1000, 1, "");
@@ -1341,7 +773,7 @@ test "ts: basic insert and query" {
 }
 
 test "ts: range query filters by timestamp" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
 
     try ts.insert(.of(16), "mem", "used", 100.0, 1000, 1, "");
@@ -1357,7 +789,7 @@ test "ts: range query filters by timestamp" {
 }
 
 test "ts: aggregation — avg" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
 
     try ts.insert(.of(16), "cpu", "usage", 80.0, 1000, 1, "");
@@ -1369,7 +801,7 @@ test "ts: aggregation — avg" {
 }
 
 test "ts: aggregation — min/max/sum" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
 
     try ts.insert(.of(16), "disk", "iops", 10.0, 1000, 1, "");
@@ -1387,7 +819,7 @@ test "ts: aggregation — min/max/sum" {
 }
 
 test "ts: aggregation — count" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
 
     try ts.insert(.of(16), "net", "rx", 1.0, 1000, 1, "");
@@ -1398,28 +830,22 @@ test "ts: aggregation — count" {
     try testing.expectEqual(@as(usize, 1), c); // only ts=2000 in range
 }
 
-test "ts: buffer flush creates block" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 3 });
+test "ts: every point a series holds reads back, in order, however many" {
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
-
-    try ts.insert(.of(16), "cpu", "usage", 1.0, 1000, 1, "");
-    try ts.insert(.of(16), "cpu", "usage", 2.0, 2000, 2, "");
-    try testing.expectEqual(@as(u64, 0), ts.stats.blocks_flushed);
-
-    // Third insert triggers flush
-    try ts.insert(.of(16), "cpu", "usage", 3.0, 3000, 3, "");
-    try testing.expectEqual(@as(u64, 1), ts.stats.blocks_flushed);
-    try testing.expectEqual(@as(usize, 1), ts.totalBlocks());
-
-    // Buffer should be cleared after flush
-    var buf: [10]StoredPoint = undefined;
-    const result = try ts.queryRange(.of(16), "cpu", "usage", null, 1000, 3000, &buf);
-    try testing.expectEqual(@as(usize, 0), result.points_in_buffer);
-    try testing.expectEqual(@as(usize, 1), result.blocks_matched);
+    const n = 5000;
+    // Written newest first: a read still gives them oldest first.
+    for (0..n) |i| try ts.insert(.of(16), "cpu", "usage", @floatFromInt(i), 1000 * (n - i), 0, "");
+    const buf = try testing.allocator.alloc(StoredPoint, n + 1);
+    defer testing.allocator.free(buf);
+    const result = try ts.queryRange(.of(16), "cpu", "usage", null, 0, std.math.maxInt(u64), buf);
+    try testing.expectEqual(@as(usize, n), result.points_in_buffer);
+    for (buf[1..n], buf[0 .. n - 1]) |p, prev| try testing.expect(p.timestamp_ns > prev.timestamp_ns);
+    try testing.expectEqual(@as(usize, n), try ts.count(.of(16), "cpu", "usage", &.{}, 0, std.math.maxInt(u64)));
 }
 
 test "ts: multiple series" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
 
     try ts.insert(.of(16), "cpu", "usage", 80.0, 1000, 1, "");
@@ -1430,17 +856,16 @@ test "ts: multiple series" {
 }
 
 test "ts: query nonexistent series" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
 
     var buf: [10]StoredPoint = undefined;
     const result = try ts.queryRange(.of(16), "nonexistent", "field", null, 0, 9999, &buf);
     try testing.expectEqual(@as(usize, 0), result.points_in_buffer);
-    try testing.expectEqual(@as(usize, 0), result.blocks_matched);
 }
 
 test "ts: a write's answer carries the longest measurement name an entry can hold, whole" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
     const name = @as([@import("../storage/persistence.zig").MAX_ENTRY_KEY]u8, @splat('m'));
     const val_bytes: [8]u8 = @bitCast(@as(u64, @bitCast(@as(f64, 1.5))));
@@ -1455,7 +880,7 @@ test "ts: a write's answer carries the longest measurement name an entry can hol
 }
 
 test "ts: apply entry for ts_write" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
 
     // Build a ts_write UAL entry with key="cpu" and value=f64 bytes
@@ -1465,13 +890,18 @@ test "ts: apply entry for ts_write" {
     const ual_entry = entry_mod.buildCommandEntry(.ts_write, 0, 1, 1, 1000, .of(16), "cpu", &val_bytes, &payload_buf) orelse unreachable;
     try applyTest(&ts, &ual_entry);
 
-    try testing.expectEqual(@as(u64, 1), ts.stats.points_inserted);
+    // A bare value: the field "value", at the entry's stamp.
+    var buf: [2]StoredPoint = undefined;
+    const r = try ts.queryRange(.of(16), "cpu", "value", null, 0, std.math.maxInt(u64), &buf);
+    try testing.expectEqual(@as(usize, 1), r.points_in_buffer);
+    try testing.expectEqual(val, buf[0].field_value);
+    try testing.expectEqual(@as(u64, 1000), buf[0].timestamp_ns);
 }
 
 // ─── Tags as a series dimension (issue #24) ────────────────────────────────
 
 test "ts: tags are a series dimension, not collapsed into one buffer" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
 
     const web1 = canonicalTagHash("host=web-01");
@@ -1502,7 +932,7 @@ test "ts: tags are a series dimension, not collapsed into one buffer" {
 }
 
 test "ts: untagged query still sees tagged writes (no silent regression)" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
 
     try ts.insert(.of(17), "cpu", "value", 10.0, 3000, 1, "host=a");
@@ -1539,40 +969,28 @@ test "ts: tag hash is canonical — order does not fragment a series" {
     const pairs = [_]TagPair{ .{ .key = "host", .value = "a" }, .{ .key = "env", .value = "b" } };
     try testing.expectEqual(canonicalTagHash("env=b,host=a"), canonicalTagHashPairs(&pairs, &scratch));
 
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
     try ts.insert(.of(17), "cpu", "value", 1.0, 1000, 1, "host=a,env=b");
     try ts.insert(.of(17), "cpu", "value", 2.0, 2000, 2, "env=b,host=a");
     try testing.expectEqual(@as(usize, 1), ts.seriesCount());
 }
 
-test "ts: series key parsing isolates field from the trailing tag hash" {
-    const key = try seriesKeyToString(testing.allocator, .{
-        .ns_id = .of(0xAABBCCDD),
-        .measurement = "cpu",
-        .field_name = "user",
-        .tag_hash = 0x1122334455667788,
-    });
-    defer testing.allocator.free(key);
-
-    try testing.expectEqual(NamespaceId.of(0xAABBCCDD), keyNsId(key));
+test "ts: a series key gives back its parts, and a field's prefix takes no longer field's series" {
+    const a = testing.allocator;
+    const key = try ts_machine.seriesKey(a, .of(0xAABBCCDD), "cpu", "user", 0x1122334455667788);
+    defer a.free(key);
     // The prefix is the id big-endian, as every key below the edge leads.
-    try testing.expectEqualSlices(u8, &.{ 0xAA, 0xBB, 0xCC, 0xDD }, key[0..NS_PREFIX]);
-    try testing.expectEqualStrings("cpu", keyMeasurement(key));
-    // Slicing to the end of the key would drag in \x00 + 8 hash bytes.
-    try testing.expectEqualStrings("user", keyFieldName(key));
-    try testing.expectEqual(@as(u64, 0x1122334455667788), keyTagHash(key));
-
-    // A longer field must not prefix-match a shorter one.
-    const prefix = try seriesKeyPrefix(testing.allocator, .of(0xAABBCCDD), "cpu", "user");
-    defer testing.allocator.free(prefix);
-    const other = try seriesKeyToString(testing.allocator, .{
-        .ns_id = .of(0xAABBCCDD),
-        .measurement = "cpu",
-        .field_name = "username",
-        .tag_hash = 0,
-    });
-    defer testing.allocator.free(other);
+    try testing.expectEqualSlices(u8, &.{ 0xAA, 0xBB, 0xCC, 0xDD }, key[0..4]);
+    const name = ts_machine.seriesName(key);
+    try testing.expectEqualStrings("cpu", name.measurement);
+    try testing.expectEqualStrings("user", name.field);
+    try testing.expectEqual(@as(u64, 0x1122334455667788), name.tag_hash);
+    const prefix = try ts_machine.fieldPrefix(a, .of(0xAABBCCDD), "cpu", "user");
+    defer a.free(prefix);
+    const other = try ts_machine.seriesKey(a, .of(0xAABBCCDD), "cpu", "username", 0);
+    defer a.free(other);
+    try testing.expect(std.mem.startsWith(u8, key, prefix));
     try testing.expect(!std.mem.startsWith(u8, other, prefix));
 }
 
@@ -1605,7 +1023,7 @@ test "ts: TsWriteValue round-trips field, timestamp and tags" {
 // ─── Tag dictionary: partial / negated / glob matching (issue #24 part 2b) ──
 
 test "ts: partial tag filter matches a superset tag set" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
 
     try ts.insert(.of(17), "cpu", "value", 10.0, 1000, 1, "host=web-01,env=prod");
@@ -1637,7 +1055,7 @@ test "ts: partial tag filter matches a superset tag set" {
 }
 
 test "ts: negated and glob tag predicates" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
 
     try ts.insert(.of(17), "m", "value", 1.0, 1000, 1, "region=us-east");
@@ -1677,16 +1095,14 @@ test "ts: glob matcher" {
 }
 
 test "ts: tag dictionary resolves a series' tags, and a tag filter matches by them" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
 
-    // Written unsorted — the dictionary stores the canonical (sorted) spelling.
+    // Written unsorted — the series keeps the canonical (sorted) spelling.
     try ts.insert(.of(17), "cpu", "value", 10.0, 1000, 1, "host=web-01,env=prod");
-    const h = canonicalTagHash("env=prod,host=web-01");
-    try testing.expectEqualStrings("env=prod,host=web-01", ts.tagsForHash(.of(17), h));
-    try testing.expectEqualStrings("", ts.tagsForHash(.of(17), 0));
-    // Another namespace's dictionary has no entry for it.
-    try testing.expectEqualStrings("", ts.tagsForHash(.of(18), h));
+    // Another namespace has no such series.
+    var none: [8][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try ts.seriesTagsFor(.of(18), "cpu", "value", &none));
 
     var names: [8][]const u8 = undefined;
     const n = try ts.seriesTagsFor(.of(17), "cpu", "value", &names);
@@ -1697,13 +1113,14 @@ test "ts: tag dictionary resolves a series' tags, and a tag filter matches by th
     const preds = [_]TagPredicate{.{ .key = "host", .op = .eq, .value = "web-01" }};
     const r = try ts.queryRangeFiltered(.of(17), "cpu", "value", &preds, 0, std.math.maxInt(u64), &buf);
     try testing.expectEqual(@as(usize, 1), r.points_in_buffer);
+    try testing.expectEqualStrings("env=prod,host=web-01", buf[0].tags);
 }
 
 test "ts: replay reconstructs the tagged series exactly" {
     // The write path persists TsWriteValue; applyEntry must rebuild the same
     // series, tags included. 2a added the codec but never wired the encode
     // side, so replay still lost field/timestamp/tags.
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
 
     var val_buf: [256]u8 = undefined;
@@ -1718,8 +1135,8 @@ test "ts: replay reconstructs the tagged series exactly" {
     const entry = entry_mod.buildCommandEntry(.ts_write, 0, 1, 1, 123, .of(17), "cpu", encoded, &payload_buf).?;
     try applyTest(&ts, &entry);
 
-    // Field, timestamp and tags all survive — and the point is addressable by a
-    // partial tag filter, which requires the dictionary to be repopulated.
+    // Field, timestamp and tags all survive, and the point is addressable by
+    // a partial tag filter.
     var buf: [8]StoredPoint = undefined;
     const preds = [_]TagPredicate{.{ .key = "env", .op = .eq, .value = "prod" }};
     const r = try ts.queryRangeFiltered(.of(17), "cpu", "user", &preds, 0, std.math.maxInt(u64), &buf);
@@ -1729,7 +1146,7 @@ test "ts: replay reconstructs the tagged series exactly" {
 }
 
 test "ts: retention evicts only its own measurement in its own namespace" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
 
     try ts.insert(.of(17), "a", "value", 1.0, 1000, 1, "");
@@ -1752,7 +1169,7 @@ test "ts: a retention entry cuts at its stamp less its duration, not at the host
     // One stamp far behind the host's clock and one a day ahead: a cut by
     // the host's clock removes all three points or none.
     for ([_]u64{ 1_000 * s_ns, host_ns + std.time.ns_per_day }) |stamp| {
-        var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+        var ts = TSProjection.init(testing.allocator);
         defer ts.deinit();
         for ([_]u64{ 10, 5, 1 }, 1..) |age_s, i| try ts.insert(.of(17), "m", "value", 1.0, stamp - age_s * s_ns, i, "");
 
@@ -1771,23 +1188,26 @@ test "ts: a retention entry cuts at its stamp less its duration, not at the host
     }
 }
 
-test "ts: retention spares other measurements' flushed blocks" {
-    // A one-point buffer flushes each point to a block.
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1 });
+test "ts: retention trims only its own measurement, and a series it empties goes" {
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
-
     try ts.insert(.of(17), "a", "value", 1.0, 1000, 1, "");
     try ts.insert(.of(17), "a", "value", 2.0, 1500, 2, "");
     try ts.insert(.of(17), "b", "value", 3.0, 1000, 3, "");
     try ts.insert(.of(17), "b", "value", 4.0, 1500, 4, "");
-    try testing.expect(ts.blocks.count() > 0);
-
     var buf: [10]StoredPoint = undefined;
-    // Flushed points are counted as matching blocks, not buffered points.
-    try testing.expectEqual(@as(usize, 2), (try ts.queryRange(.of(17), "b", "value", null, 0, 10000, &buf)).blocks_matched);
-    _ = ts.applyRetention(.of(17), "a", 2000);
-    try testing.expectEqual(@as(usize, 2), (try ts.queryRange(.of(17), "b", "value", null, 0, 10000, &buf)).blocks_matched);
-    try testing.expectEqual(@as(usize, 0), (try ts.queryRange(.of(17), "a", "value", null, 0, 10000, &buf)).blocks_matched);
+    try testing.expectEqual(@as(usize, 2), ts.applyRetention(.of(17), "a", 2000));
+    try testing.expectEqual(@as(usize, 0), (try ts.queryRange(.of(17), "a", "value", null, 0, 10000, &buf)).points_in_buffer);
+    try testing.expectEqual(@as(usize, 2), (try ts.queryRange(.of(17), "b", "value", null, 0, 10000, &buf)).points_in_buffer);
+    try testing.expectEqual(@as(usize, 1), ts.seriesCount());
+    var fields: [TSProjection.MAX_SUMMARY_FIELDS][]const u8 = undefined;
+    try testing.expectEqual(@as(u32, 0), ts.summarize(.of(17), "a", &fields).series);
+    // One it only trims stays, from its oldest kept point.
+    try testing.expectEqual(@as(usize, 1), ts.applyRetention(.of(17), "b", 1200));
+    const b = ts.summarize(.of(17), "b", &fields);
+    try testing.expectEqual(@as(u32, 1), b.series);
+    try testing.expectEqual(@as(u64, 1), b.points);
+    try testing.expectEqual(@as(u64, 1500), b.oldest_ns);
 }
 
 test "ts: a tag filter is parsed strictly and canonically" {
@@ -1814,9 +1234,8 @@ test "ts: a tag filter is parsed strictly and canonically" {
 }
 
 test "ts: a delete with a tag filter removes only the series whose tags include it" {
-    // Buffered and flushed series alike.
-    for ([_]usize{ 100, 1 }) |capacity| {
-        var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = capacity });
+    {
+        var ts = TSProjection.init(testing.allocator);
         defer ts.deinit();
         try ts.insert(.of(17), "temp", "value", 1.0, 1000, 1, "sensor=A1,site=x");
         try ts.insert(.of(17), "temp", "value", 2.0, 1000, 2, "sensor=B2,site=x");
@@ -1837,7 +1256,7 @@ test "ts: a delete with a tag filter removes only the series whose tags include 
         try testing.expect(ts.hasSeries(.of(18), "temp", a1));
         var buf: [10]StoredPoint = undefined;
         const untagged = try ts.queryRange(.of(17), "temp", "value", 0, 0, 10000, &buf);
-        try testing.expectEqual(@as(usize, 1), untagged.points_in_buffer + untagged.blocks_matched);
+        try testing.expectEqual(@as(usize, 1), untagged.points_in_buffer);
     }
 }
 
@@ -1848,7 +1267,7 @@ test "ts: a tag-filtered delete is refused at apply when no series matches, and 
     const write = entry_mod.buildCommandEntry(.ts_write, 0, 1, 2, 200, .of(17), "temp", TsWriteValue.encode(&vals[0], .{ .value = 1.0, .timestamp_ns = 1000, .field_name = "value", .tags = "sensor=A1" }).?, &payloads[1]).?;
     const del_again = entry_mod.buildCommandEntry(.ts_delete, 0, 1, 3, 300, .of(17), "temp", "sensor=A1", &payloads[2]).?;
 
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
     var out = Result.start(&del);
     try ts.applyEntry(&del, &out);
@@ -1867,13 +1286,12 @@ test "ts: the same tags and measurement in two namespaces stay apart, live and r
     const tags = "sensor=A1,site=x";
     var vals: [2][256]u8 = undefined;
     var payloads: [3][512]u8 = undefined;
-    const entries = [_]Entry{
+    const entries = [_]entry_mod.Entry{
         entry_mod.buildCommandEntry(.ts_write, 0, 1, 1, 100, .of(17), "temp", TsWriteValue.encode(&vals[0], .{ .value = 1.0, .timestamp_ns = 1000, .field_name = "value", .tags = tags }).?, &payloads[0]).?,
         entry_mod.buildCommandEntry(.ts_write, 0, 1, 2, 200, .of(18), "temp", TsWriteValue.encode(&vals[1], .{ .value = 2.0, .timestamp_ns = 1000, .field_name = "value", .tags = tags }).?, &payloads[1]).?,
         entry_mod.buildCommandEntry(.ts_delete, 0, 1, 3, 300, .of(17), "temp", "sensor=A1", &payloads[2]).?,
     };
     const a1 = [_]TagPredicate{.{ .key = "sensor", .op = .eq, .value = "A1" }};
-    const h = canonicalTagHash(tags);
 
     const check = struct {
         /// The namespace's one point, or none, as a tag-filtered query sees it.
@@ -1883,19 +1301,17 @@ test "ts: the same tags and measurement in two namespaces stay apart, live and r
             if (want) |v| {
                 try testing.expectEqual(@as(usize, 1), r.points_in_buffer);
                 try testing.expectEqual(v, buf[0].field_value);
+                try testing.expectEqualStrings(tags, buf[0].tags);
             } else try testing.expectEqual(@as(usize, 0), r.points_in_buffer);
         }
     };
 
     // Live: each entry applied in turn.
-    var live = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    var live = TSProjection.init(testing.allocator);
     defer live.deinit();
     try applyTest(&live, &entries[0]);
     try applyTest(&live, &entries[1]);
     try testing.expectEqual(@as(usize, 2), live.seriesCount());
-    try testing.expectEqual(@as(u32, 2), live.tag_dict.count());
-    try testing.expectEqualStrings(tags, live.tagsForHash(.of(17), h));
-    try testing.expectEqualStrings(tags, live.tagsForHash(.of(18), h));
     try check.point(&live, .of(17), 1.0);
     try check.point(&live, .of(18), 2.0);
     try applyTest(&live, &entries[2]);
@@ -1904,17 +1320,16 @@ test "ts: the same tags and measurement in two namespaces stay apart, live and r
     try testing.expect(!live.hasSeries(.of(17), "temp", &.{}));
 
     // Replayed: the whole log into a fresh projection ends the same.
-    var replayed = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    var replayed = TSProjection.init(testing.allocator);
     defer replayed.deinit();
     for (&entries) |*e| try applyTest(&replayed, e);
     try check.point(&replayed, .of(17), null);
     try check.point(&replayed, .of(18), 2.0);
-    try testing.expectEqualStrings(tags, replayed.tagsForHash(.of(18), h));
     try testing.expectEqual(@as(usize, 1), replayed.seriesCount());
 }
 
 test "ts: a list page's counts come from one pass, each name's its own" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 2 });
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
     for ([_]u64{ 1000, 2000, 3000 }) |t| try ts.insert(.of(16), "cpu", "usage", 1, t, t, "host=a");
     try ts.insert(.of(16), "cpu", "usage", 1, 500, 4, "host=b");
@@ -1926,17 +1341,16 @@ test "ts: a list page's counts come from one pass, each name's its own" {
     var out: [names.len]TSProjection.ListCounts = undefined;
     try ts.listCounts(.of(16), &names, testing.allocator, &out);
     try testing.expectEqual(TSProjection.ListCounts{ .series = 1, .fields = 1, .points = 1 }, out[0]);
-    // Its series agree with the summary's, flushed block and all.
+    // Its series agree with the summary's.
     var fields: [TSProjection.MAX_SUMMARY_FIELDS][]const u8 = undefined;
     const sum = ts.summarize(.of(16), "cpu", &fields);
     try testing.expectEqual(TSProjection.ListCounts{ .series = sum.series, .fields = sum.fields, .points = sum.points }, out[1]);
     try testing.expectEqual(TSProjection.ListCounts{}, out[2]);
 }
 
-test "ts: a measurement's summary counts its series, fields and points, flushed or buffered" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 2 });
+test "ts: a measurement's summary counts its series, fields and points" {
+    var ts = TSProjection.init(testing.allocator);
     defer ts.deinit();
-    // Three points of one series: a block of two, one buffered.
     for ([_]u64{ 1000, 2000, 3000 }) |t| try ts.insert(.of(16), "cpu", "usage", 1, t, t, "host=a");
     try ts.insert(.of(16), "cpu", "usage", 1, 500, 4, "host=b");
     try ts.insert(.of(16), "cpu", "idle", 1, 4000, 5, "host=a");
@@ -1955,4 +1369,36 @@ test "ts: a measurement's summary counts its series, fields and points, flushed 
     const none = ts.summarize(.of(16), "disk", &fields);
     try testing.expectEqual(@as(u64, 0), none.points);
     try testing.expectEqual(@as(u32, 0), none.series);
+}
+
+test "ts: a delete or retention over thousands of series applies in one linear pass" {
+    // Ranging between staged deletes rescans them all: 5000 series of 20
+    // points took over 30 s in Debug that way. Timed on the allocator a
+    // server runs with: the leak-checking one spends most of it on frees.
+    const series = 5000;
+    const per = 20;
+    const stdx_time = @import("stdx").time;
+    var fields: [TSProjection.MAX_SUMMARY_FIELDS][]const u8 = undefined;
+    inline for (.{ "delete", "retention" }) |how| {
+        var ts = TSProjection.init(std.heap.smp_allocator);
+        defer ts.deinit();
+        var tags: [32]u8 = undefined;
+        for (0..series) |s| for (0..per) |p|
+            try ts.insert(.of(17), "m", "value", 1, 1000 + p, 0, try std.fmt.bufPrint(&tags, "host=h{d}", .{s}));
+        try testing.expectEqual(@as(usize, series), ts.seriesCount());
+        const started = stdx_time.milliTimestamp();
+        if (comptime std.mem.eql(u8, how, "delete")) {
+            try testing.expectEqual(@as(usize, series), ts.deleteMeasurement(.of(17), "m"));
+        } else {
+            try testing.expectEqual(@as(usize, series * per), ts.applyRetention(.of(17), "m", 1000 + per));
+        }
+        const took = stdx_time.milliTimestamp() - started;
+        try testing.expectEqual(@as(usize, 0), ts.seriesCount());
+        try testing.expectEqual(@as(u32, 0), ts.summarize(.of(17), "m", &fields).series);
+        try testing.expectEqual(@as(usize, 0), ts.store.family(ts_machine.Points.ID).count);
+        if (took > 5000) {
+            std.debug.print("ts {s} of {d} points took {d} ms\n", .{ how, series * per, took });
+            return error.TooSlow;
+        }
+    }
 }

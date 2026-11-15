@@ -196,7 +196,7 @@ pub const ProcessingHandler = struct {
         sinks: []SinkConfig = &.{},
 
         // Read cursors — track what's been processed
-        /// TS source: the last point read, by (time, log index).
+        /// TS source: the last point read, by (time, position).
         ts_cursor: ReadAt,
         stream_cursor_ts: u64, // Stream source: last StreamID timestamp_ms read
         stream_cursor_seq: u64, // Stream source: last StreamID sequence read
@@ -1193,7 +1193,7 @@ pub const ProcessingHandler = struct {
     /// Move a pipeline's read cursor to `(a, b)`, forward only: this is also
     /// the live applier, and a leader may have read further by the time its
     /// checkpoint commits. `(a, b)` is a stream source's (timestamp,
-    /// sequence), or a TS source's last point's (time, log index).
+    /// sequence), or a TS source's last point's (time, position).
     fn applyCursor(pipe: *PipelineState, a: u64, b: u64) void {
         switch (pipe.source_kind) {
             .stream => if (a > pipe.stream_cursor_ts or (a == pipe.stream_cursor_ts and b > pipe.stream_cursor_seq)) {
@@ -1570,6 +1570,8 @@ pub const ProcessingHandler = struct {
     }
 
     /// Tick a TS source pipeline: read points, apply operators, write to sinks.
+    /// It reads in time order, so a point written with a time behind its
+    /// cursor (late, or from a writer whose clock lags) is never read.
     fn tickTsSource(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
         const room = sinkRoom(shard, pipe);
         // Room for none: the source waits, its cursor where it is. So it
@@ -1584,7 +1586,7 @@ pub const ProcessingHandler = struct {
     }
 
     /// A page of a TS source, read here or sent by the shard that owns it,
-    /// in (time, log index) order after the cursor.
+    /// in (time, position) order after the cursor.
     fn processTsPage(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord, points: []const TsPoint) void {
         if (points.len == 0) return maybePersistCheckpoint(pipeline_key, pipe, shard, job.ns_id);
         const cursor = pipe.ts_cursor;

@@ -95,7 +95,6 @@ pub const Partition = struct {
         errdefer ual.deinit();
 
         const stream = stream_mod.StreamProjection.init(allocator);
-        const ts = ts_mod.TSProjection.init(allocator, .{});
 
         var part = Partition{
             .id = partition_id,
@@ -105,7 +104,8 @@ pub const Partition = struct {
             // Pointed at `store` once the partition is where it stays.
             .kv = .{ .store = undefined },
             .stream = stream,
-            .ts = ts,
+            // Pointed at `store` once the partition is where it stays.
+            .ts = ts_mod.TSProjection.initOn(allocator, undefined),
             .store = contract_store.Store.init(allocator),
             .apply_scratch = std.heap.ArenaAllocator.init(allocator),
             .current_term = 0,
@@ -128,7 +128,7 @@ pub const Partition = struct {
     /// MUST be called after init(), once the Partition is at its final address.
     pub fn wireProjections(self: *Partition) void {
         self.kv.store = &self.store;
-        self.router.registerTS(self.ts.projectionHandle());
+        self.ts.store = &self.store;
     }
 
     /// Set the warm store budget (max bytes before eviction).
@@ -158,19 +158,16 @@ pub const Partition = struct {
     /// `applyRouted`, for a caller that needs only the index: tests and
     /// the handlers' no-shard paths.
     pub fn apply(self: *Partition, e: *const Entry) !u64 {
-        var out = router_mod.Result.start(e);
-        return (try self.applyRouted(e, &out)).index;
+        return (try self.applyRouted(e)).index;
     }
 
-    /// `failed`: why the projection the router owns could not apply it.
-    pub const Applied = struct { index: u64, route: router_mod.ApplyResult, failed: ?router_mod.ApplyError = null };
+    pub const Applied = struct { index: u64, route: router_mod.ApplyResult };
 
     /// Apply a committed entry: route it to its projection and, for every
     /// type but KV, append it to the hot ring and warm store. Returns the
-    /// entry's index and what the router made of it, which the shard counts
-    /// when a projection failed.
-    pub fn applyRouted(self: *Partition, e: *const Entry, out: *router_mod.Result) !Applied {
-        return self.take(e, out, .apply);
+    /// entry's index and what the router made of it.
+    pub fn applyRouted(self: *Partition, e: *const Entry) !Applied {
+        return self.take(e, .apply);
     }
 
     /// Take an entry a repair skips as a halt on it left the partition: in
@@ -178,15 +175,14 @@ pub const Partition = struct {
     /// halted on it live and one that boots past it then hold the same. The
     /// router isn't told: the next entry it applies moves it past.
     pub fn passOverSkipped(self: *Partition, e: *const Entry) error{OutOfMemory}!void {
-        var out: router_mod.Result = .{};
-        _ = self.take(e, &out, .pass_over) catch |err| switch (err) {
+        _ = self.take(e, .pass_over) catch |err| switch (err) {
             // Refused before anything was taken, as the halt on it was.
             error.EntryTooLarge, error.IndexNotIncreasing => return,
             else => |e2| return e2,
         };
     }
 
-    fn take(self: *Partition, e: *const Entry, out: *router_mod.Result, how: enum { apply, pass_over }) !Applied {
+    fn take(self: *Partition, e: *const Entry, how: enum { apply, pass_over }) !Applied {
         // The hot ring and the warm store exist for the stream read path,
         // which fetches record payloads by index. KV's families hold its
         // values and nothing reads a KV payload back from the partition
@@ -195,12 +191,8 @@ pub const Partition = struct {
         const index = if (is_kv) e.header.index else try self.ual.append(e);
 
         // Route to projections via the real router (idempotent)
-        var failed: ?router_mod.ApplyError = null;
-        const route = switch (how) {
-            .apply => self.router.apply(e, out) catch |err| blk: {
-                failed = err;
-                break :blk .skipped_no_projection;
-            },
+        const route: router_mod.ApplyResult = switch (how) {
+            .apply => self.router.apply(e),
             .pass_over => .skipped_no_projection,
         };
 
@@ -215,11 +207,11 @@ pub const Partition = struct {
         // Save payload to warm store (survives UAL hot ring eviction).
         // Uses the entry's own index as key.
         if (e.payload.len > 0 and !is_kv) {
-            const copy = self.allocator.dupe(u8, e.payload) catch return .{ .index = index, .route = route, .failed = failed };
+            const copy = self.allocator.dupe(u8, e.payload) catch return .{ .index = index, .route = route };
             // Room in the order first, so every index stored is in it.
             self.warm_order.ensureUnusedCapacity(self.allocator, 1) catch {
                 self.allocator.free(copy);
-                return .{ .index = index, .route = route, .failed = failed };
+                return .{ .index = index, .route = route };
             };
 
             // Free old copy if this index was already in warm store (idempotent apply)
@@ -231,7 +223,7 @@ pub const Partition = struct {
 
             self.warm_store.put(self.allocator, e.header.index, copy) catch {
                 self.allocator.free(copy);
-                return .{ .index = index, .route = route, .failed = failed };
+                return .{ .index = index, .route = route };
             };
             self.warm_bytes_used += copy.len;
             self.noteWarmIndex(e.header.index);
@@ -240,7 +232,7 @@ pub const Partition = struct {
             self.evictWarmIfNeeded();
         }
 
-        return .{ .index = index, .route = route, .failed = failed };
+        return .{ .index = index, .route = route };
     }
 
     /// Bars fall at least this many logical bytes apart.

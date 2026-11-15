@@ -163,8 +163,22 @@ pub fn Family(comptime id: u16, comptime name: []const u8, comptime V: type) typ
     };
 }
 
-/// A staged write: a value's bytes, or null for a delete.
-const Op = struct { fam: u16, key: []const u8, value: ?[]const u8 };
+/// A staged write: a value's bytes, or null for a delete. A range delete
+/// (`range`) deletes every key starting with `key`, and before `below`
+/// when there is one.
+const Op = struct {
+    fam: u16,
+    key: []const u8,
+    value: ?[]const u8,
+    range: bool = false,
+    below: ?[]const u8 = null,
+
+    fn covers(op: Op, fam: u16, k: []const u8) bool {
+        if (op.fam != fam or !std.mem.startsWith(u8, k, op.key)) return false;
+        const below = op.below orelse return true;
+        return std.mem.order(u8, k, below) == .lt;
+    }
+};
 
 /// One entry's staged reads and writes. After any of its calls fails, the
 /// view is partial (a write staged but not indexed) and must not be read
@@ -179,7 +193,10 @@ pub const View = struct {
     ops: std.ArrayListUnmanaged(Op) = .empty,
     /// Each key's last write in `ops`, once there are more than
     /// `SCAN_LIMIT`, so a read or the commit finds it without a scan.
+    /// Range deletes aren't in it.
     last: FamKey.Map(usize) = .empty,
+    /// Where the range deletes are in `ops`, in order: an entry makes few.
+    ranges: std.ArrayListUnmanaged(usize) = .empty,
     /// Fail on an undeclared key rather than count it (`Store.strict_keys`).
     strict: bool,
     /// The shard's streams, read-only, when the apply was handed them.
@@ -215,12 +232,38 @@ pub const View = struct {
         try self.stage(.{ .fam = F.ID, .key = try self.arena.dupe(u8, k), .value = null });
     }
 
+    /// Deletes every key of the family starting with `prefix`, and before
+    /// `below` when one is given, however many: staged as one write, and
+    /// unlinked in place at commit. Reads later in this entry see them
+    /// gone, as they see a single delete; a write after it puts a key
+    /// back. The prefix must lie in a declared range, as `range`'s does.
+    pub fn deleteRange(self: *View, comptime F: type, prefix: []const u8, below: ?[]const u8) ApplyError!void {
+        if (!self.declared.coversRange(F.ID, prefix)) self.undeclared();
+        try self.ranges.ensureUnusedCapacity(self.arena, 1);
+        const b: ?[]const u8 = if (below) |x| try self.arena.dupe(u8, x) else null;
+        try self.stage(.{ .fam = F.ID, .key = try self.arena.dupe(u8, prefix), .value = null, .range = true, .below = b });
+        self.ranges.appendAssumeCapacity(self.ops.items.len - 1);
+    }
+
+    /// Whether a range delete after `after` in `ops` (after none: any)
+    /// covers `k`.
+    fn rangedAfter(self: *const View, fam: u16, k: []const u8, after: ?usize) bool {
+        var n = self.ranges.items.len;
+        while (n > 0) {
+            n -= 1;
+            const at = self.ranges.items[n];
+            if (after) |a| if (at < a) return false;
+            if (self.ops.items[at].covers(fam, k)) return true;
+        }
+        return false;
+    }
+
     fn stage(self: *View, op: Op) Allocator.Error!void {
         try self.ops.append(self.arena, op);
         const n = self.ops.items.len;
         if (n == SCAN_LIMIT + 1) {
-            for (self.ops.items, 0..) |o, i| try self.last.put(self.arena, .{ .fam = o.fam, .key = o.key }, i);
-        } else if (n > SCAN_LIMIT + 1) {
+            for (self.ops.items, 0..) |o, i| if (!o.range) try self.last.put(self.arena, .{ .fam = o.fam, .key = o.key }, i);
+        } else if (n > SCAN_LIMIT + 1 and !op.range) {
             try self.last.put(self.arena, .{ .fam = op.fam, .key = op.key }, n - 1);
         }
     }
@@ -232,7 +275,7 @@ pub const View = struct {
         while (i > 0) {
             i -= 1;
             const op = self.ops.items[i];
-            if (op.fam == fam and std.mem.eql(u8, op.key, k)) return i;
+            if (!op.range and op.fam == fam and std.mem.eql(u8, op.key, k)) return i;
         }
         return null;
     }
@@ -243,18 +286,22 @@ pub const View = struct {
     /// (namespace first); one that doesn't is undeclared.
     pub fn range(self: *View, comptime F: type, prefix: []const u8) ApplyError!ViewRange(F) {
         if (!self.declared.coversRange(F.ID, prefix)) self.undeclared();
-        // This entry's writes under the prefix, the last per key, in order.
+        // This entry's writes under the prefix, the last per key, in order;
+        // one a later range delete covers is gone with the rest it covers.
         var staged: std.ArrayListUnmanaged(Op) = .empty;
         var i = self.ops.items.len;
         while (i > 0) {
             i -= 1;
             const op = self.ops.items[i];
-            if (op.fam != F.ID or !std.mem.startsWith(u8, op.key, prefix)) continue;
+            if (op.range or op.fam != F.ID or !std.mem.startsWith(u8, op.key, prefix)) continue;
             if (indexOfKey(staged.items, op.key) != null) continue;
+            if (self.rangedAfter(F.ID, op.key, i)) continue;
             try staged.append(self.arena, op);
         }
         std.mem.sort(Op, staged.items, {}, opLess);
-        return .{ .base = self.store.range(F.ID, prefix), .staged = staged.items };
+        var hides: std.ArrayListUnmanaged(Op) = .empty;
+        for (self.ranges.items) |at| if (self.ops.items[at].fam == F.ID) try hides.append(self.arena, self.ops.items[at]);
+        return .{ .base = self.store.range(F.ID, prefix), .staged = staged.items, .hides = hides.items };
     }
 
     /// `range`, from the first key past `after`.
@@ -268,7 +315,9 @@ pub const View = struct {
     }
 
     fn bytesOf(self: *View, fam: u16, k: []const u8) ?[]const u8 {
-        if (self.lastWrite(fam, k)) |i| return self.ops.items[i].value;
+        const last = self.lastWrite(fam, k);
+        if (self.ranges.items.len > 0 and self.rangedAfter(fam, k, last)) return null;
+        if (last) |i| return self.ops.items[i].value;
         return self.store.get(fam, k);
     }
 
@@ -290,10 +339,12 @@ pub const View = struct {
         // The last write per key. Each key is written once, so the order
         // doesn't change the state; it does shape the store's tree, and every
         // replica of a build commits in the same order.
+        // A write a later range delete covers is gone with the range.
         var plan: std.ArrayListUnmanaged(Step) = .empty;
         if (self.ops.items.len > SCAN_LIMIT) {
             for (self.ops.items, 0..) |op, i| {
-                if (self.last.get(.{ .fam = op.fam, .key = op.key }).? != i) continue;
+                if (op.range or self.last.get(.{ .fam = op.fam, .key = op.key }).? != i) continue;
+                if (self.ranges.items.len > 0 and self.rangedAfter(op.fam, op.key, i)) continue;
                 try plan.append(self.arena, .{ .op = op });
             }
         } else {
@@ -301,15 +352,34 @@ pub const View = struct {
             while (i > 0) {
                 i -= 1;
                 const op = self.ops.items[i];
+                if (op.range) continue;
                 if (indexOfStep(plan.items, op)) |_| continue;
+                if (self.ranges.items.len > 0 and self.rangedAfter(op.fam, op.key, i)) continue;
                 try plan.append(self.arena, .{ .op = op });
             }
         }
+        // The keys a range covers that a later write keeps: the range
+        // passes over them, and their step writes them.
+        var kept: FamKey.Map(void) = .empty;
+        if (self.ranges.items.len > 0) for (plan.items) |s| {
+            if (self.rangedAfter(s.op.fam, s.op.key, null)) try kept.put(self.arena, .{ .fam = s.op.fam, .key = s.op.key }, {});
+        };
         var reserved: usize = 0;
         errdefer for (plan.items[0..reserved]) |*s| self.release(s);
         for (plan.items) |*s| {
             try self.reserve(s);
             reserved += 1;
+        }
+        // Nothing past here can fail: a range unlinks what it covers in
+        // place, then each step writes its key.
+        for (self.ranges.items) |at| {
+            const op = self.ops.items[at];
+            var it = self.store.range(op.fam, op.key);
+            while (it.next()) |rec| {
+                if (op.below) |b| if (std.mem.order(u8, rec.key(), b) != .lt) break;
+                if (kept.contains(.{ .fam = op.fam, .key = rec.key() })) continue;
+                self.store.unlink(op.fam, &rec.node);
+            }
         }
         for (plan.items) |*s| self.apply(s);
     }
@@ -360,6 +430,11 @@ fn indexOfKey(ops: []const Op, k: []const u8) ?usize {
     return null;
 }
 
+fn hidden(hides: []const Op, fam: u16, k: []const u8) bool {
+    for (hides) |op| if (op.covers(fam, k)) return true;
+    return false;
+}
+
 fn opLess(_: void, a: Op, b: Op) bool {
     return std.mem.order(u8, a.key, b.key) == .lt;
 }
@@ -370,6 +445,9 @@ pub fn ViewRange(comptime F: type) type {
     return struct {
         base: store_mod.Range,
         staged: []const Op,
+        /// The entry's range deletes of this family: a committed record
+        /// one covers is gone.
+        hides: []const Op = &.{},
         pending: ?*store_mod.Record = null,
         started: bool = false,
 
@@ -394,6 +472,7 @@ pub fn ViewRange(comptime F: type) type {
                 }
                 const rec = committed.?;
                 self.pending = self.base.next();
+                if (hidden(self.hides, F.ID, rec.key())) continue;
                 return .{ .key = rec.key(), .value = F.Value.decode(rec.value) catch return error.Halt };
             }
         }
