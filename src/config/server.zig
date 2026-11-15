@@ -45,6 +45,12 @@ pub const MAX_SHARDS: u16 = 256;
 /// value or type.
 pub const PARTITIONS_GONE = "partition_count is no longer a setting: every cluster has 4096 key partitions; remove it from the config";
 
+/// Upper bounds for the async-flush write bound (the value itself, not a
+/// default): an hour of failing flushes, and 64 GiB unflushed, are already
+/// far past any healthy run — a larger setting is a typo, not an intent.
+pub const ASYNC_FLUSH_BOUND_SECONDS_MAX: i64 = 3600;
+pub const ASYNC_FLUSH_BOUND_MB_MAX: i64 = 65536;
+
 /// How long a worker may go without a heartbeat.
 pub const WorkersConfig = struct {
     /// Silent this long, a worker is unhealthy and takes no work.
@@ -90,6 +96,17 @@ pub const ServerConfig = struct {
     data_dir_set: bool = false,
     shards: u16 = 0, // 0 = auto-detect CPU count; defines data topology (permanent!)
     max_connections: u32 = 0, // 0 = auto from the open-file limit; client connections held at once
+    // With async_flush, a write is acked before it reaches disk. If the disk
+    // stops keeping up, refuse new writes rather than acknowledge more that
+    // aren't durable: once flushing has been failing this long, or this many
+    // MiB sit unflushed, writes are refused (unavailable, not run) until a
+    // flush lands. 0 on either disables that bound. No effect under sync.
+    // The time bound counts from the first flush that failed, and flushes run
+    // on an interval (~1 s), so the real refusal window is this plus up to one
+    // interval. The size bound measures only the writer's in-memory buffer —
+    // bytes staged for the next flush, not bytes already on disk.
+    async_flush_bound_seconds: u32 = 3, // 0 = no time bound
+    async_flush_bound_mb: u32 = 64, // 0 = no size bound
 
     // [storage] section — unified tier configuration
     // NOTE: memtable_size_mb removed - no SpilloverEngine in "Log is Data" architecture
@@ -171,6 +188,8 @@ pub const ServerConfig = struct {
         return RuntimeConfig{
             .num_shards = self.shards,
             .max_connections = self.max_connections,
+            .async_flush_bound_seconds = self.async_flush_bound_seconds,
+            .async_flush_bound_mb = self.async_flush_bound_mb,
             .data_dir = self.data_dir,
             .listen_port = self.port,
             .listen_addr = self.bind,
@@ -233,6 +252,8 @@ const sections = [_]Section{
             // Range-checked by load, which names the automatic value.
             .{ .name = "shards", .kind = .integer, .min = std.math.minInt(i64) },
             .{ .name = "max_connections", .kind = .integer, .min = 0, .max = std.math.maxInt(u32) },
+            .{ .name = "async_flush_bound_seconds", .kind = .integer, .min = 0, .max = ASYNC_FLUSH_BOUND_SECONDS_MAX },
+            .{ .name = "async_flush_bound_mb", .kind = .integer, .min = 0, .max = ASYNC_FLUSH_BOUND_MB_MAX },
         },
     },
     .{ .name = "storage", .keys = &.{
@@ -447,6 +468,20 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
                 return error.InvalidSetting;
             }
             config.max_connections = @intCast(mc);
+        }
+        if (server.getInt("async_flush_bound_seconds")) |s| {
+            if (s < 0 or s > ASYNC_FLUSH_BOUND_SECONDS_MAX) {
+                log.err("[server] async_flush_bound_seconds = {d}: must be 0 (no bound) to {d}", .{ s, ASYNC_FLUSH_BOUND_SECONDS_MAX });
+                return error.InvalidSetting;
+            }
+            config.async_flush_bound_seconds = @intCast(s);
+        }
+        if (server.getInt("async_flush_bound_mb")) |m| {
+            if (m < 0 or m > ASYNC_FLUSH_BOUND_MB_MAX) {
+                log.err("[server] async_flush_bound_mb = {d}: must be 0 (no bound) to {d}", .{ m, ASYNC_FLUSH_BOUND_MB_MAX });
+                return error.InvalidSetting;
+            }
+            config.async_flush_bound_mb = @intCast(m);
         }
     }
 
@@ -668,6 +703,13 @@ pub fn generateDefaultConfig() []const u8 {
     \\# Client connections held at once (0 = auto from the open-file limit).
     \\# Over this, a new connection is accepted and closed at once.
     \\# max_connections = 0
+    \\
+    \\# With async_flush, refuse writes once the disk has fallen too far behind,
+    \\# rather than acknowledge more that aren't on disk yet. After this long
+    \\# with flushes failing, or this many MiB unflushed, writes are refused
+    \\# (unavailable, not run) until a flush lands. 0 disables that bound.
+    \\# async_flush_bound_seconds = 3
+    \\# async_flush_bound_mb = 64
     \\
     \\[storage]
     \\# --- WAL Durability ---
@@ -1027,6 +1069,49 @@ test "config: [server] max_connections reaches the runtime config, and defaults 
     var defaults = ServerConfig.init(allocator);
     defer defaults.deinit();
     try std.testing.expectEqual(@as(u32, 0), defaults.toRuntimeConfig().max_connections);
+}
+
+test "config: [server] async_flush bound keys reach the runtime config, default to 3 s / 64 MiB, and refuse out-of-range" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try @import("stdx").fs.dirRealpathAlloc(tmp.dir, allocator, ".");
+    defer allocator.free(dir);
+    const path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{dir});
+    defer allocator.free(path);
+
+    const write = struct {
+        fn toml(p: []const u8, body: []const u8) !void {
+            const f = try @import("stdx").fs.createFileAbsolute(p, .{ .truncate = true });
+            try @import("stdx").fs.writeAll(f, body);
+            @import("stdx").fs.closeFile(f);
+        }
+    }.toml;
+
+    // Set values reach the runtime config, including 0 to disable a bound.
+    try write(path, "[server]\nasync_flush_bound_seconds = 10\nasync_flush_bound_mb = 128\n");
+    var set = try load(allocator, path);
+    defer set.deinit();
+    try std.testing.expectEqual(@as(u32, 10), set.toRuntimeConfig().async_flush_bound_seconds);
+    try std.testing.expectEqual(@as(u32, 128), set.toRuntimeConfig().async_flush_bound_mb);
+
+    try write(path, "[server]\nasync_flush_bound_seconds = 0\nasync_flush_bound_mb = 0\n");
+    var off = try load(allocator, path);
+    defer off.deinit();
+    try std.testing.expectEqual(@as(u32, 0), off.toRuntimeConfig().async_flush_bound_seconds);
+    try std.testing.expectEqual(@as(u32, 0), off.toRuntimeConfig().async_flush_bound_mb);
+
+    // Defaults when absent.
+    var defaults = ServerConfig.init(allocator);
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(u32, 3), defaults.toRuntimeConfig().async_flush_bound_seconds);
+    try std.testing.expectEqual(@as(u32, 64), defaults.toRuntimeConfig().async_flush_bound_mb);
+
+    // Out of range is refused, not clamped — a bad bound shouldn't run.
+    try write(path, "[server]\nasync_flush_bound_seconds = 99999\n");
+    try std.testing.expectError(error.InvalidSetting, load(allocator, path));
+    try write(path, "[server]\nasync_flush_bound_mb = 99999999\n");
+    try std.testing.expectError(error.InvalidSetting, load(allocator, path));
 }
 
 test "config: [workers] timeouts reach the runtime config, and default when absent" {

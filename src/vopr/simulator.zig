@@ -477,6 +477,15 @@ const SimIo = struct {
         return true;
     }
 
+    /// The simulator's disk never stalls its flushes, so the async-flush write
+    /// bound is never crossed here: the follower-ack-withhold path stays inert,
+    /// and the safety phase still proves the surrounding refactor is sound.
+    /// Exercising the withhold needs a sim disk-stall fault (would reshuffle the
+    /// PRNG stream and the pins), tracked separately.
+    pub fn asyncAckBlocked(_: *Replica) bool {
+        return false;
+    }
+
     /// The network takes any member's frames; the replica's own guard
     /// decides whom it hears.
     pub fn setVoters(_: *Replica, _: []const u32) void {}
@@ -512,6 +521,11 @@ const SimIo = struct {
         /// The simulator applies through its own disk model and does not yet
         /// model a blocked read.
         pub fn readBlocked(_: *Replica) bool {
+            return false;
+        }
+
+        /// The simulator does not yet model an async_flush disk-staging gap.
+        pub fn gapHolding(_: *Replica) bool {
             return false;
         }
 
