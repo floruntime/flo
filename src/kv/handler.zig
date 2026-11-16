@@ -324,10 +324,6 @@ pub const KVHandler = struct {
         return .init(buf, req.ns_id, req.key);
     }
 
-    /// Why `raw` can't be a key a client reads or writes, if it can't. A
-    /// key with a NUL byte is refused though the stored key, which leads
-    /// with a fixed-width namespace id, could hold one: the CLI and SDKs
-    /// have always refused it, so no client has one to read back.
     /// Why a sink can't write `raw`, as a client's write of it would be
     /// refused, or null.
     pub fn keyRefusal(raw: []const u8) ?[]const u8 {
@@ -335,6 +331,10 @@ pub const KVHandler = struct {
         return null;
     }
 
+    /// Why `raw` can't be a key a client reads or writes, if it can't. A
+    /// key with a NUL byte is refused though the stored key, which leads
+    /// with a fixed-width namespace id, could hold one: the CLI and SDKs
+    /// have always refused it, so no client has one to read back.
     fn checkKey(raw: []const u8) Error!void {
         if (raw.len == 0) return error.KeyEmpty;
         if (isReservedKey(raw)) return error.ReservedKey;

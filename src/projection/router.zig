@@ -10,7 +10,7 @@
 //!   group_*                         → None (the group machine)
 //!   raft_config, raft_noop          → None (consensus layer)
 //!   raft_snapshot                    → Snapshot installation
-//!   checkpoint                      → None (processing runtime)
+//!   processing_sink_batch           → None (the sinks machine)
 //!
 //! The router maintains `applied_index` for idempotency — entries at or below
 //! this index are silently skipped.

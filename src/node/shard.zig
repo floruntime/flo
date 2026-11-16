@@ -515,7 +515,7 @@ pub const Shard = struct {
     /// replay: left above the watermark, a later build that can apply the
     /// skipped entry would apply it on boot, then meet the skip.
     seal_skip: bool = false,
-    /// The shard's own writes (checkpoints, acks, run steps) refused since
+    /// The shard's own writes (sink batches, acks, run steps) refused since
     /// the last line saying so, and when the next line may go out.
     halted_refusals: u64 = 0,
     halted_line_ms: u64 = 0,
@@ -564,8 +564,9 @@ pub const Shard = struct {
     channel: channel_driver.Driver,
     /// When `noteSenderBug` last logged.
     sender_bug_warn_ms: u64 = 0,
-    /// When `noteSinkRefusal` last logged.
+    /// When `noteSinkRefusal` last logged, and how many it has counted.
     sink_refusal_warn_ms: u64 = 0,
+    sink_refusals_total: u64 = 0,
     /// The unpark this leader last proposed, and when it last looked.
     unpark_index: u64 = 0,
     unpark_term: u64 = 0,
@@ -1414,15 +1415,39 @@ pub const Shard = struct {
         log.err("shard {d}: a channel message from shard {d} was refused as that shard's bug ({s}): {s}; this is a bug in this build, not in the data", .{ self.id, m.from, @tagName(bug), why });
     }
 
+    /// Messages this shard has sent and its receivers haven't acked, over
+    /// every channel.
+    fn channelUnacked(self: *Shard) u64 {
+        const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
+        var n: u64 = 0;
+        for (0..self.channel.count) |to| {
+            const meta = channels_mod.metaOf(read, @intCast(to));
+            n += meta.next_seq - 1 - meta.acked;
+        }
+        return n;
+    }
+
     /// A sink's write its target refused for good: its record is lost to
     /// that sink. Counted by sender and reason, and logged at most once a
     /// minute naming both.
     fn noteSinkRefusal(self: *Shard, m: *const contract_store.AppliedMessage, r: persistence_mod.Refused) void {
         if (m.from < self.channel.sink_refusals.len) self.channel.sink_refusals[m.from].getPtr(r.refusal.reason).* += 1;
+        self.sink_refusals_total += 1;
         const now = nowMs();
         if (self.sink_refusal_warn_ms != 0 and now -| self.sink_refusal_warn_ms < 60_000) return;
         self.sink_refusal_warn_ms = now;
-        log.err("shard {d}: a processing sink's write from shard {d} was refused by its target ({s}): {s}; that record is lost to that sink", .{ self.id, m.from, @tagName(r.refusal.reason), r.refusal.message });
+        var lb: [96]u8 = undefined;
+        const target = targetLabel(&m.entry, &lb);
+        log.err("shard {d}: {s} refused a processing sink's write sent by shard {d} ({s}): {s}; that record is lost to that sink ({d} refused here so far)", .{ self.id, target, m.from, @tagName(r.refusal.reason), r.refusal.message, self.sink_refusals_total });
+    }
+
+    /// The target an entry writes, as its machine names it ("queue
+    /// orders"), or its entry type.
+    fn targetLabel(e: *const entry_mod.Entry, buf: []u8) []const u8 {
+        const t = std.enums.fromInt(entry_mod.EntryType, e.header.entry_type) orelse return "its target";
+        const owner = contract_machine.ownerOf(&contract_machines.list, t) orelse return @tagName(t);
+        const label = owner.label orelse return @tagName(t);
+        return label(e, buf);
     }
 
     /// The channel driver's memory is a term's: a new one starts over.
@@ -4485,7 +4510,7 @@ pub const Shard = struct {
         const now = nowMs();
         if (now >= self.halted_line_ms) {
             self.halted_line_ms = now + 30_000;
-            log.warn("shard {d} is halted: {d} of its own writes (checkpoints, acks, run steps) refused since the last line", .{ self.id, self.halted_refusals });
+            log.warn("shard {d} is halted: {d} of its own writes (sink batches, acks, run steps) refused since the last line", .{ self.id, self.halted_refusals });
             self.halted_refusals = 0;
         }
         return true;
@@ -4819,6 +4844,7 @@ pub const Shard = struct {
                 for (self.channel.sender_bugs) |by_reason| n += by_reason[reason];
                 total.store(n, .monotonic);
             }
+            sm.channel_unacked_messages.store(self.channelUnacked(), .monotonic);
             for (std.enums.values(proto.Reason)) |k| {
                 var n: u64 = 0;
                 for (self.channel.sink_refusals) |by_reason| n += by_reason.get(k);
@@ -10859,11 +10885,22 @@ test "Shard: a processing sink in a namespace not yet published writes nothing u
     try std.testing.expectEqual(@as(u32, 1), a.processing_handler.jobs.count());
 
     const from_a = a.raft_node.log.lastIndex() + 1;
+    var metrics = MetricsRegistry.init(std.testing.allocator);
+    defer metrics.deinit();
+    a.setMetricsRegistry(&metrics);
     _ = a.processing_handler.tickPipelines(a);
-    // Not published: the pipeline waits, and says why.
+    // Not published: the pipeline waits, and says why, and the node counts it.
     var it = a.processing_handler.pipelines.valueIterator();
     try std.testing.expectEqualStrings("pns", it.next().?.wait.namespace);
     try std.testing.expectEqual(@as(usize, 0), entriesOf(a, .processing_sink_batch, from_a));
+    try std.testing.expectEqual(@as(u64, 1), metrics.processing.pipelines_waiting_namespace.load(.monotonic));
+    // A node that stops leading says nothing of it: its next leader will.
+    a.raft_node.role = .follower;
+    _ = a.processing_handler.tickPipelines(a);
+    it = a.processing_handler.pipelines.valueIterator();
+    try std.testing.expect(it.next().?.wait == .none);
+    try std.testing.expectEqual(@as(u64, 0), metrics.processing.pipelines_waiting_namespace.load(.monotonic));
+    a.raft_node.role = .leader;
     two.settle();
     try std.testing.expectEqual(id, two.namespaces.lookup("pns").?);
     // Published: the stream is on shard 1, which applies the record its
@@ -11095,6 +11132,68 @@ test "Shard: a pipeline's writes to another shard's queue that fills park there,
     for (b.channel.sink_refusals) |r| for (std.enums.values(proto.Reason)) |k| try std.testing.expectEqual(@as(u64, 0), r.get(k));
 }
 
+/// A job reading `source` on shard 0 into stream "bs-out" on shard 0,
+/// `batch_size` records a poll; its pipeline.
+fn batchJob(two: *TwoShards, c: TestClient, source: []const u8, batch_size: u32) !*ProcessingHandler.PipelineState {
+    const a = &two.shards[0];
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: bs
+        \\batch_size: {d}
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: bs-out }}
+    , .{ batch_size, source });
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    return pit.next().?;
+}
+
+test "Shard: a poll reads its batch_size, a page after another as each batch applies, and no more until the next poll" {
+    for ([_]u32{ 200, 50 }) |batch_size| {
+        var two: TwoShards = undefined;
+        try two.init();
+        defer two.deinit();
+        const a = &two.shards[0];
+        for (&two.shards) |*s| s.wireHandlerShardPtrs();
+        var sbuf: [16]u8 = undefined;
+        const source = try keyOn(a, .default, 0, &sbuf);
+        for (0..200) |i| {
+            var rb: [8]u8 = undefined;
+            _ = try a.stream_handler.appendPayloadToStream(source, "default", try std.fmt.bufPrint(&rb, "r{d}", .{i}));
+            if (i % 50 == 49) two.settle();
+        }
+        two.settle();
+        const c = try TestClient.open(a);
+        defer _ = std.c.close(c.pair[1]);
+        const pipe = try batchJob(&two, c, source, batch_size);
+        // One poll: its pages follow one another without waiting for the
+        // poll interval, each once the last batch applies.
+        pipe.last_poll_ms = 0;
+        for (0..20) |_| {
+            _ = a.processing_handler.tickPipelines(a);
+            two.settle();
+        }
+        try std.testing.expectEqual(@as(u64, @min(batch_size, 200)), pipe.records_in);
+        // The next poll reads the next batch_size.
+        if (batch_size < 200) {
+            pipe.last_poll_ms = 0;
+            for (0..20) |_| {
+                _ = a.processing_handler.tickPipelines(a);
+                two.settle();
+            }
+            try std.testing.expectEqual(@as(u64, 2 * batch_size), pipe.records_in);
+        }
+        pumpChannels(&two);
+        try std.testing.expectEqual(@as(usize, pipe.records_in), streamRecords(a, "bs-out", "default") + streamRecords(&two.shards[1], "bs-out", "default"));
+    }
+}
+
 test "Shard: records whose operators emit nothing aren't read again while their cursor waits to be logged" {
     var two: TwoShards = undefined;
     try two.init();
@@ -11180,9 +11279,10 @@ test "Shard: a batch proposed again in a new term before the first applied lands
     // Proposed, and not applied before the term moves on.
     tickNow(a, pipe);
     try std.testing.expectEqual(@as(usize, 1), entriesOf(a, .processing_sink_batch, from));
-    // A leader that proposes before its predecessor's batch applies (one
-    // waits for that, so this is the applier's guard, not the usual path)
-    // reads again from the applied cursor, and proposes the same batch.
+    // A new term's leader that proposes before its predecessor's batch
+    // applies reads again from the applied cursor and proposes the same
+    // batch. A real leader waits for that batch to apply first, so this
+    // tests the applier's guard, not the usual path.
     raft.current_term += 1;
     raft.ready_index = raft.last_applied;
     tickNow(a, pipe);
@@ -11222,6 +11322,9 @@ test "Shard: a record whose writes don't fit one entry is skipped, counted, and 
     const c = try TestClient.open(a);
     defer _ = std.c.close(c.pair[1]);
     const pipe = try sinkJob(&two, c, source, yw.buffered());
+    var metrics = MetricsRegistry.init(std.testing.allocator);
+    defer metrics.deinit();
+    a.setMetricsRegistry(&metrics);
     for (0..4) |_| {
         tickNow(a, pipe);
         two.settle();
@@ -11236,9 +11339,12 @@ test "Shard: a record whose writes don't fit one entry is skipped, counted, and 
     const job = jobs.next().?;
     try std.testing.expectEqual(@as(u64, 1), job.drops);
     try std.testing.expectEqual(@as(u64, 1), a.processing_handler.too_large);
+    // Counted once as dropped, and once as too large.
+    try std.testing.expectEqual(@as(u64, 1), metrics.processing.records_dropped_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), metrics.processing.records_too_large_total.load(.monotonic));
     var lb: [512]u8 = undefined;
     const note = a.processing_handler.liveNote(job, &lb).?;
-    try std.testing.expect(std.mem.indexOf(u8, note, "1 records dropped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, note, "1 record skipped") != null);
     try std.testing.expect(std.mem.indexOf(u8, note, "don't fit one entry") != null);
 }
 

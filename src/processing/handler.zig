@@ -101,12 +101,11 @@ pub const ProcessingHandler = struct {
     /// In-memory job store: job_id → JobRecord.
     jobs: std.StringHashMap(JobRecord),
     sink_drops: u64 = 0,
-    sink_warn_ms: i64 = 0,
     chain_errors: u64 = 0,
     chain_warn_ms: i64 = 0,
     /// The job whose pipeline is ticking, so a drop or chain error names it.
     ticking_job: []const u8 = "",
-    /// When a held pipeline was last said to be waiting (`noteHeld`).
+    /// When a waiting pipeline was last logged (`noteWait`).
     held_warn_ms: i64 = 0,
 
     /// Per-job pipeline execution state (keyed by same job_id as jobs map).
@@ -235,7 +234,13 @@ pub const ProcessingHandler = struct {
         carry_bytes: usize = 0,
         batch_index: u64 = 0,
         batch_term: u64 = 0,
-        last_batch_ms: i64 = 0,
+        last_batch_ms: u64 = 0,
+        /// Records this poll may still read, and whether the last page
+        /// filled its batch with more to read: then the next page is read
+        /// once that batch applies. `page_limit` is the last page's size.
+        poll_left: u32 = 0,
+        more: bool = false,
+        page_limit: usize = 0,
         /// A read of a source another shard owns, in flight: its number
         /// (0 for none), the term it was asked in, and when.
         read_seq: u64 = 0,
@@ -324,6 +329,10 @@ pub const ProcessingHandler = struct {
         drops: u64 = 0,
         last_drop: [160]u8 = undefined,
         last_drop_len: usize = 0,
+        /// Single sink writes this leader dropped, and when one was last
+        /// logged.
+        write_drops: u64 = 0,
+        drop_warn_ms: i64 = 0,
     };
 
     /// The most of a failure reason a job keeps.
@@ -723,18 +732,17 @@ pub const ProcessingHandler = struct {
             // [job_id_len:u16][job_id][name_len:u16][name][status:u8]
             // [batch_size:u32][records_processed:u64][created_at:i64]
             // [reason_len:u16][reason] — a failed job's reason, "held here:
-            // <why>" for a running one this node holds, or empty —
+            // <why>" for a running one this node holds, what a running
+            // one's pipelines wait for and skipped (`liveNote`), or empty —
             // then this node's runtime of the job, `Runtime`, and
             // [yaml_len:u32][yaml], the submitted definition.
             // Sized to the job. The id is 32 bytes and the name came from a
             // submit entry under 64 KiB, so both lengths fit u16.
             var live_buf: [LIVE_NOTE_MAX]u8 = undefined;
-            const note: Note = switch (noteOf(job)) {
-                .none => if (self.liveNote(job, &live_buf)) |t| .{ .live = t } else .none,
-                else => |n| n,
-            };
+            const note = noteOf(job);
+            const live: []const u8 = if (note == .none) self.liveNote(job, &live_buf) orelse "" else "";
             const runtime = self.runtimeOf(job.job_id_owned, @import("stdx").time.milliTimestamp());
-            const size = 2 + job.job_id_owned.len + 2 + job.name_owned.len + 1 + 4 + 8 + 8 + 2 + note.reasonLen() + Runtime.SIZE + 4 + job.yaml_owned.len;
+            const size = 2 + job.job_id_owned.len + 2 + job.name_owned.len + 1 + 4 + 8 + 8 + 2 + note.reasonLen() + live.len + Runtime.SIZE + 4 + job.yaml_owned.len;
             const buf = self.allocator.alloc(u8, size) catch {
                 shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "out of memory");
                 return;
@@ -750,8 +758,9 @@ pub const ProcessingHandler = struct {
             w.writeInt(u32, job.batch_size, .little) catch unreachable;
             w.writeInt(u64, job.records_processed, .little) catch unreachable;
             w.writeInt(i64, job.created_at_ms, .little) catch unreachable;
-            w.writeInt(u16, @intCast(note.reasonLen()), .little) catch unreachable;
+            w.writeInt(u16, @intCast(note.reasonLen() + live.len), .little) catch unreachable;
             note.writeReason(w);
+            w.writeAll(live) catch unreachable;
             runtime.write(w) catch unreachable;
             w.writeInt(u32, @intCast(job.yaml_owned.len), .little) catch unreachable;
             w.writeAll(job.yaml_owned) catch unreachable;
@@ -900,7 +909,7 @@ pub const ProcessingHandler = struct {
 
     /// What a running job's pipelines here are waiting for, and the last
     /// record skipped for good, if any: "waiting for namespace X",
-    /// "waiting for room on shard N (queue Q)"; "N records dropped, the
+    /// "waiting for room on shard N (target)"; "N records skipped, the
     /// last <where>: <why>".
     pub fn liveNote(self: *const ProcessingHandler, job: *const JobRecord, buf: []u8) ?[]const u8 {
         if (job.status != .running) return null;
@@ -916,7 +925,7 @@ pub const ProcessingHandler = struct {
         }
         if (job.drops > 0) {
             if (w.end > 0) w.writeAll("; ") catch {};
-            w.print("{d} records dropped, the last {s}", .{ job.drops, job.last_drop[0..job.last_drop_len] }) catch {};
+            w.print("{d} record{s} skipped, the last {s}", .{ job.drops, if (job.drops == 1) "" else "s", job.last_drop[0..job.last_drop_len] }) catch {};
         }
         return if (w.end == 0) null else w.buffered();
     }
@@ -925,21 +934,19 @@ pub const ProcessingHandler = struct {
         none,
         failed: []const u8,
         held: []const u8,
-        /// A running job's pipelines here, as `liveNote` says them.
-        live: []const u8,
 
         /// The status answer's reason: as it is, or "held here: <why>".
         fn reasonLen(n: Note) usize {
             return switch (n) {
                 .none => 0,
-                .failed, .live => |r| r.len,
+                .failed => |r| r.len,
                 .held => |r| HELD.len + r.len,
             };
         }
         fn writeReason(n: Note, w: *std.Io.Writer) void {
             switch (n) {
                 .none => {},
-                .failed, .live => |r| w.writeAll(r) catch unreachable,
+                .failed => |r| w.writeAll(r) catch unreachable,
                 .held => |r| {
                     w.writeAll(HELD) catch unreachable;
                     w.writeAll(r) catch unreachable;
@@ -955,7 +962,7 @@ pub const ProcessingHandler = struct {
         const note = noteOf(job);
         return job.status.toString().len + switch (note) {
             .none => 0,
-            .failed, .live => |r| 2 + r.len,
+            .failed => |r| 2 + r.len,
             .held => 2 + note.reasonLen() + 1,
         };
     }
@@ -965,7 +972,7 @@ pub const ProcessingHandler = struct {
         const note = noteOf(job);
         switch (note) {
             .none => {},
-            .failed, .live => |r| {
+            .failed => |r| {
                 w.writeAll(": ") catch unreachable;
                 w.writeAll(r) catch unreachable;
             },
@@ -1487,13 +1494,12 @@ pub const ProcessingHandler = struct {
     /// pipeline reads nothing, so its cursor stays at the first record
     /// not written. Writes already sent wait in its outbox until the
     /// halted shard is repaired.
-    fn sinksHeld(self: *const ProcessingHandler, shard: *const Shard, pipe: *const PipelineState) bool {
-        for (pipe.sinks) |snk| {
-            if (self.sinkShard(snk)) |to| {
-                if (to != shard.id and shard.shardHalted(to)) return true;
-            } else if (shard.peerHalted()) return true;
+    fn haltedSinkShard(self: *const ProcessingHandler, shard: *const Shard, pipe: *const PipelineState) ?u16 {
+        var to: u16 = 0;
+        while (to < @max(self.peer_shard_count, 1)) : (to += 1) {
+            if (to != shard.id and self.sendsTo(pipe, to) and shard.shardHalted(to)) return to;
         }
-        return false;
+        return null;
     }
 
     /// Why a pipeline reads nothing now, as its job's status says it.
@@ -1502,13 +1508,15 @@ pub const ProcessingHandler = struct {
         /// A sink's namespace isn't in the node's table: no shard can tell
         /// where its targets are. Sinks don't create namespaces.
         namespace: []const u8,
-        /// A sink's shard is halted.
-        halted,
+        /// This sink shard is halted.
+        halted: u16,
         /// A sink's shard answers `busy` (a target there is over its
-        /// parked cap), or a whole window of this shard's writes to it is
-        /// unacked. `target` is the sink whose write waits, when the first
-        /// unacked message is one of this pipeline's; "" otherwise.
-        room: struct { shard: u16, target: []const u8, since_ms: u64 },
+        /// parked cap). `target` is the sink whose write waits, when the
+        /// first unacked message is one of this pipeline's; "" otherwise.
+        busy: struct { shard: u16, target: []const u8 },
+        /// A whole window of this shard's writes to a sink's shard is
+        /// unacked, with no `busy` answer: it is slow or can't be reached.
+        unacked: struct { shard: u16, count: u64 },
         /// This shard's log has no room for another entry now.
         log,
     };
@@ -1520,7 +1528,7 @@ pub const ProcessingHandler = struct {
     /// take, so this waits only past it.
     fn waitOf(self: *const ProcessingHandler, shard: *Shard, pipe: *const PipelineState) Wait {
         for (pipe.sinks) |snk| if (self.namespaceIdOf(snk.namespace) == .invalid) return .{ .namespace = snk.namespace };
-        if (self.sinksHeld(shard, pipe)) return .halted;
+        if (self.haltedSinkShard(shard, pipe)) |to| return .{ .halted = to };
         const read: view_mod.ReadView = .{ .store = &shard.defaultPartition().store };
         var to: u16 = 0;
         const shards: u16 = @max(self.peer_shard_count, 1);
@@ -1530,11 +1538,11 @@ pub const ProcessingHandler = struct {
             const unacked = meta.next_seq - 1 - meta.acked;
             // A `busy` answer holds only while something to it is unacked:
             // one with nothing outstanding has nothing to clear it.
-            const busy = if (unacked > 0) shard.channel.busySince(to) else null;
-            // The outbox has no cap of its own yet: a pipeline stops adding
-            // to a channel a whole window behind.
-            if (busy == null and unacked < channel_driver.WINDOW) continue;
-            return .{ .room = .{ .shard = to, .target = self.waitingSink(read, pipe, to, meta.acked + 1), .since_ms = busy orelse 0 } };
+            if (unacked > 0 and shard.channel.busySince(to) != null)
+                return .{ .busy = .{ .shard = to, .target = self.waitingSink(read, pipe, to, meta.acked + 1) } };
+            // The outbox has no cap of its own: a pipeline stops adding to
+            // a channel a whole window behind.
+            if (unacked >= channel_driver.WINDOW) return .{ .unacked = .{ .shard = to, .count = unacked } };
         }
         const raft = shard.raft_node;
         if (raft.log.lastIndex() -| raft.last_applied >= raft_node_mod.MAX_OUTSTANDING) return .log;
@@ -1592,32 +1600,43 @@ pub const ProcessingHandler = struct {
             // Only run for RUNNING jobs
             const job = self.jobs.getPtr(base_job_id) orelse continue;
             if (job.status != .running or job.held) continue;
-            if (!leads) continue;
+            // What a pipeline waits for is its leader's to say: a node
+            // that doesn't lead says nothing, and one led again starts over.
+            if (!leads) {
+                pipe.wait = .none;
+                pipe.held_since_ms = 0;
+                pipe.more = false;
+                continue;
+            }
+            defer switch (pipe.wait) {
+                .namespace => waiting_ns += 1,
+                .halted => held = true,
+                else => {},
+            };
 
-            // Enforce poll interval
+            // A poll reads up to `batch_size` records, a page at a time:
+            // while a page fills its batch, the next is read as soon as
+            // that batch applies, not at the next poll.
             const poll_ms: i64 = @intCast(pipe.src_poll_ms);
-            if (now_ms - pipe.last_poll_ms < poll_ms) continue;
+            const due = now_ms - pipe.last_poll_ms >= poll_ms;
+            if (!due and !pipe.more) continue;
             // Its batch in the log: nothing more until it applies.
             if (pipe.batch_term == raft.current_term and pipe.batch_index > raft.last_applied) continue;
             self.loadCursor(shard, job.ns_id, pipeline_key, pipe);
             pipe.wait = self.waitOf(shard, pipe);
-            switch (pipe.wait) {
-                .none => {},
-                .namespace => {
-                    waiting_ns += 1;
-                    continue;
-                },
-                .halted => {
-                    held = true;
-                    continue;
-                },
-                else => {
-                    self.noteHeld(shard, pipe);
-                    continue;
-                },
+            if (pipe.wait != .none) {
+                // Looked at again at the next poll.
+                pipe.last_poll_ms = now_ms;
+                pipe.more = false;
+                self.noteWait(shard, pipe);
+                continue;
             }
             pipe.held_since_ms = 0;
-            pipe.last_poll_ms = now_ms;
+            if (!pipe.more) {
+                pipe.last_poll_ms = now_ms;
+                pipe.poll_left = pipe.batch_size;
+            }
+            pipe.more = false;
 
             // Time the tick, but only record latency/throughput for *productive*
             // ticks (those that actually read records) so idle polls don't skew
@@ -1651,9 +1670,9 @@ pub const ProcessingHandler = struct {
         self.waiting_ns = now;
     }
 
-    /// The pipeline's cursor as its last applied batch left it: where it
-    /// reads from, and the `from` its next batch names. A batch a leader
-    /// change lost, or one that applied, is behind it either way.
+    /// Its logged cursor, as its last applied batch left it: the `from` its
+    /// next batch names, and where it reads from unless it read past it
+    /// in this term. A batch a leader change lost is behind it.
     fn loadCursor(self: *ProcessingHandler, shard: *Shard, ns: NamespaceId, pipeline_key: []const u8, pipe: *PipelineState) void {
         const at = sinks_machine.cursorOf(.{ .store = &shard.defaultPartition().store }, ns, pipeline_key);
         pipe.from = at;
@@ -1685,7 +1704,8 @@ pub const ProcessingHandler = struct {
     /// It reads in time order, so a point written with a time behind its
     /// cursor (late, or from a writer whose clock lags) is never read.
     fn tickTsSource(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
-        const limit = @min(pipe.batch_size, source_page.TS_PAGE_POINTS);
+        const limit = @min(pipe.poll_left, source_page.TS_PAGE_POINTS);
+        pipe.page_limit = limit;
         const owner = self.sinkOwner(shard, pipe.src_namespace, pipe.src_measurement);
         if (owner != shard.id) return self.askSource(pipeline_key, pipe, shard, owner, limit);
         var points: [source_page.TS_PAGE_POINTS]TsPoint = undefined;
@@ -1705,6 +1725,7 @@ pub const ProcessingHandler = struct {
         // Where the batch moves the cursor, when it ends before a record
         // its operators ran on; else where the read reached.
         var to: ?sinks_machine.At = null;
+        var taken: u32 = 0;
         // One point at a time: its JSON and what its chain allocates are
         // freed once its outputs are written.
         var arena = std.heap.ArenaAllocator.init(shard.allocator);
@@ -1738,14 +1759,17 @@ pub const ProcessingHandler = struct {
             if (ts_ms > pipe.watermark_ms) pipe.watermark_ms = ts_ms;
             job.records_processed += 1;
             pipe.records_in += 1;
+            taken += 1;
             if (ended == .carried) break;
         }
+        self.notePage(pipe, batch, taken, points.len);
         self.proposeBatch(shard, job.ns_id, pipeline_key, pipe, batch, to orelse readAt(pipe));
     }
 
     /// Tick a stream source pipeline: read payloads from stream, apply operators, write to sink.
     fn tickStreamSource(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
-        const limit = @min(pipe.batch_size, channels_mod.MAX_SENDS);
+        const limit = @min(pipe.poll_left, channels_mod.MAX_SENDS);
+        pipe.page_limit = limit;
         const owner = self.sinkOwner(shard, pipe.src_namespace, pipe.src_stream);
         if (owner != shard.id) return self.askSource(pipeline_key, pipe, shard, owner, limit);
         const cursor = StreamID{ .timestamp_ms = pipe.stream_cursor_ts, .sequence = pipe.stream_cursor_seq };
@@ -1760,6 +1784,7 @@ pub const ProcessingHandler = struct {
     fn processStreamPage(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord, payloads: []const []const u8, ids: []const StreamID, last_id: StreamID) void {
         const batch = self.beginBatch(pipe) orelse return;
         var to: ?sinks_machine.At = null;
+        var taken: u32 = 0;
         // One payload's chain at a time: what it allocates is freed once its
         // outputs are written.
         var arena = std.heap.ArenaAllocator.init(shard.allocator);
@@ -1789,6 +1814,7 @@ pub const ProcessingHandler = struct {
             pipe.stream_cursor_seq = id.sequence;
             job.records_processed += 1;
             pipe.records_in += 1;
+            taken += 1;
             if (ended == .carried) {
                 all = false;
                 break;
@@ -1801,7 +1827,17 @@ pub const ProcessingHandler = struct {
             pipe.stream_cursor_ts = last_id.timestamp_ms;
             pipe.stream_cursor_seq = last_id.sequence;
         }
+        self.notePage(pipe, batch, taken, payloads.len);
         self.proposeBatch(shard, job.ns_id, pipeline_key, pipe, batch, to orelse readAt(pipe));
+    }
+
+    /// A page taken: `taken` records of the `got` it held count against
+    /// the poll's `batch_size`; while the page filled its batch, or was as
+    /// long as asked for, and the poll has records left, the next page is
+    /// read once this batch applies.
+    fn notePage(_: *ProcessingHandler, pipe: *PipelineState, batch: *const Batch, taken: u32, got: usize) void {
+        pipe.poll_left -|= taken;
+        pipe.more = pipe.poll_left > 0 and (batch.full or (got > 0 and got >= pipe.page_limit));
     }
 
     /// Most a read of another shard's source waits for its page before it
@@ -1949,9 +1985,10 @@ pub const ProcessingHandler = struct {
         if (processed > 0) if (shard.metrics_registry) |m| m.processing.recordProcessed(processed);
     }
 
-    /// Most often a pipeline whose cursor moved with no writes (past
-    /// appends that couldn't be read) logs that move alone.
-    const IDLE_BATCH_MS: i64 = 1000;
+    /// Most often a pipeline logs a cursor move with no writes: records
+    /// its operators emitted nothing for, or appends that couldn't be
+    /// read. Until then it reads on, ahead of its logged cursor.
+    const IDLE_BATCH_MS: u64 = 1000;
 
     /// The sink batch a page builds: its writes as channel messages. Each
     /// record's writes are built apart first (`r`), then go in whole, wait
@@ -2052,7 +2089,7 @@ pub const ProcessingHandler = struct {
         /// Not kept, and out of memory to carry it: the batch ends before
         /// it, and it is read again.
         cut,
-        /// Its writes don't fit an entry even alone: skipped, counted.
+        /// Too large even alone: skipped.
         skipped,
     };
 
@@ -2095,8 +2132,8 @@ pub const ProcessingHandler = struct {
         const read = readAt(pipe);
         const moved = to.a != pipe.from.a or to.b != pipe.from.b;
         if (batch.n == 0 and !moved) return;
-        const now = @import("stdx").time.milliTimestamp();
-        if (batch.n == 0 and now - pipe.last_batch_ms < IDLE_BATCH_MS) {
+        const now = self.mono_ms();
+        if (batch.n == 0 and now -| pipe.last_batch_ms < IDLE_BATCH_MS) {
             pipe.ahead = true;
             pipe.ahead_term = term;
             return;
@@ -2169,18 +2206,25 @@ pub const ProcessingHandler = struct {
         return collector.records.items;
     }
 
-    /// A pipeline that can't read for room (a busy sink shard, a whole
-    /// window unacked, a full log). One held this long is said so, once
-    /// per interval, as a stuck one would be.
-    fn noteHeld(self: *ProcessingHandler, shard: *Shard, pipe: *PipelineState) void {
+    /// A pipeline that can't read, at a poll: counted, and logged once a
+    /// pipeline has waited 30 s, at most every 30 s. One waiting for a
+    /// namespace is logged at once, with what to do, since only an
+    /// operator ends that wait.
+    fn noteWait(self: *ProcessingHandler, shard: *Shard, pipe: *PipelineState) void {
         if (shard.metrics_registry) |m| m.processing.recordHeldTick();
         const now = @import("stdx").time.milliTimestamp();
         if (pipe.held_since_ms == 0) pipe.held_since_ms = now;
         const held_for = now - pipe.held_since_ms;
-        if (held_for < HELD_WARN_MS or now - self.held_warn_ms < 30_000) return;
+        const prompt = pipe.wait == .namespace and held_for == 0;
+        if (!prompt and held_for < HELD_WARN_MS) return;
+        if (now - self.held_warn_ms < 30_000) return;
         self.held_warn_ms = now;
         var wb: [160]u8 = undefined;
-        log.warn("job '{s}': a pipeline has waited {d} s: {s}", .{ self.ticking_job, @divTrunc(held_for, 1000), waitText(pipe.wait, &wb) });
+        const what = waitText(pipe.wait, &wb);
+        switch (pipe.wait) {
+            .namespace => |ns| log.warn("job '{s}': {s}: sinks don't create namespaces; create it (flo namespace create {s})", .{ self.ticking_job, what, ns }),
+            else => log.warn("job '{s}': a pipeline has waited {d} s: {s}", .{ self.ticking_job, @divTrunc(held_for, 1000), what }),
+        }
     }
 
     const HELD_WARN_MS: i64 = 30_000;
@@ -2190,11 +2234,12 @@ pub const ProcessingHandler = struct {
         return switch (w) {
             .none => "",
             .namespace => |ns| std.fmt.bufPrint(buf, "waiting for namespace {s}", .{ns}) catch "waiting for a namespace",
-            .halted => "waiting: a sink's shard is halted",
-            .room => |r| if (r.target.len > 0)
+            .halted => |to| std.fmt.bufPrint(buf, "waiting: sink shard {d} is halted", .{to}) catch "waiting: a sink's shard is halted",
+            .busy => |r| if (r.target.len > 0)
                 std.fmt.bufPrint(buf, "waiting for room on shard {d} ({s})", .{ r.shard, r.target }) catch "waiting for room on a sink's shard"
             else
                 std.fmt.bufPrint(buf, "waiting for room on shard {d}", .{r.shard}) catch "waiting for room on a sink's shard",
+            .unacked => |u| std.fmt.bufPrint(buf, "waiting: {d} writes to shard {d} unacked", .{ u.count, u.shard }) catch "waiting: writes to a sink's shard unacked",
             .log => "waiting for room in this shard's log",
         };
     }
@@ -2205,21 +2250,28 @@ pub const ProcessingHandler = struct {
     pub fn noteSinkDrop(self: *ProcessingHandler, metrics: ?*MetricsRegistry, kind: []const u8, target: []const u8, why: []const u8) void {
         self.sink_drops += 1;
         if (metrics) |m| m.processing.recordDropped();
+        const job = self.jobs.getPtr(self.ticking_job) orelse return;
+        job.write_drops += 1;
         const now = @import("stdx").time.milliTimestamp();
-        if (now - self.sink_warn_ms < 30_000) return;
-        self.sink_warn_ms = now;
-        log.err("job '{s}': {s} sink '{s}': record dropped: {s} ({d} sink records dropped so far)", .{ self.ticking_job, kind, target, why, self.sink_drops });
+        if (now - job.drop_warn_ms < 30_000) return;
+        job.drop_warn_ms = now;
+        log.err("job '{s}': {s} sink '{s}': record dropped: {s} ({d} dropped by this job so far)", .{ self.ticking_job, kind, target, why, job.write_drops });
     }
 
-    /// A whole record skipped: counted as dropped, said in the job's
-    /// status with where and why, and logged once per interval.
+    /// A whole record skipped by every sink: counted as dropped, said in
+    /// the job's status with where and why, and logged at most once every
+    /// 30 s per job.
     fn noteDrop(self: *ProcessingHandler, shard: *Shard, at: []const u8, why: []const u8) void {
-        if (self.jobs.getPtr(self.ticking_job)) |job| {
-            job.drops += 1;
-            const text = std.fmt.bufPrint(&job.last_drop, "{s}: {s}", .{ at, why }) catch null;
-            job.last_drop_len = if (text) |t| t.len else job.last_drop.len;
-        }
-        self.noteSinkDrop(shard.metrics_registry, "every", at, why);
+        self.sink_drops += 1;
+        if (shard.metrics_registry) |m| m.processing.recordDropped();
+        const job = self.jobs.getPtr(self.ticking_job) orelse return;
+        job.drops += 1;
+        const text = std.fmt.bufPrint(&job.last_drop, "{s}: {s}", .{ at, why }) catch null;
+        job.last_drop_len = if (text) |t| t.len else job.last_drop.len;
+        const now = @import("stdx").time.milliTimestamp();
+        if (now - job.drop_warn_ms < 30_000) return;
+        job.drop_warn_ms = now;
+        log.err("job '{s}': {s} skipped: {s} ({d} skipped by this job so far)", .{ self.ticking_job, at, why, job.drops });
     }
 
     /// A record the operator chain failed on is skipped; said once per
@@ -2712,6 +2764,20 @@ test "ProcessingHandler: a TS source record writes a non-finite value as null" {
         defer std.testing.allocator.free(json);
         try std.testing.expectEqualStrings("{\"measurement\":\"m\",\"value\":null,\"timestamp_ms\":7}", json);
     }
+}
+
+test "processing: what a pipeline waits for, in words" {
+    var buf: [160]u8 = undefined;
+    const W = ProcessingHandler.Wait;
+    const cases = [_]struct { w: W, says: []const u8 }{
+        .{ .w = .{ .namespace = "orders" }, .says = "waiting for namespace orders" },
+        .{ .w = .{ .halted = 2 }, .says = "waiting: sink shard 2 is halted" },
+        .{ .w = .{ .busy = .{ .shard = 3, .target = "jobs" } }, .says = "waiting for room on shard 3 (jobs)" },
+        .{ .w = .{ .busy = .{ .shard = 3, .target = "" } }, .says = "waiting for room on shard 3" },
+        .{ .w = .{ .unacked = .{ .shard = 1, .count = 1024 } }, .says = "waiting: 1024 writes to shard 1 unacked" },
+        .{ .w = .log, .says = "waiting for room in this shard's log" },
+    };
+    for (cases) |c| try std.testing.expectEqualStrings(c.says, ProcessingHandler.waitText(c.w, &buf));
 }
 
 var test_why_buf: [256]u8 = undefined;

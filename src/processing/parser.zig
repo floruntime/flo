@@ -1992,8 +1992,8 @@ test "parser: an unknown key is refused by name and place" {
     try expectRefused(job("\"paralelism\": 2,", "", ""), ParseError.UnknownKey, "unknown key \"paralelism\" at the top level");
     try expectRefused(job("", ", \"batchSize\": 5", ""), ParseError.UnknownKey, "unknown key \"batchSize\" at sources[0].stream");
     try expectRefused(job("", "", ", \"matches\": \"x\""), ParseError.UnknownKey, "unknown key \"matches\" at sinks[0]");
-    // Neither did anything: one job runs on one shard, and only the source
-    // cursor is checkpointed, at its own pace.
+    // Neither did anything: one job runs on one shard, and its source
+    // cursor moves with each batch of its sink writes.
     try expectRefused(job("\"parallelism\": 2,", "", ""), ParseError.UnknownKey, "unknown key \"parallelism\" at the top level");
     try expectRefused(job("\"checkpointing\": { \"interval_ms\": 5 },", "", ""), ParseError.UnknownKey, "unknown key \"checkpointing\" at the top level");
     try expectRefused(

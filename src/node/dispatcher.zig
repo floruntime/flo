@@ -91,6 +91,9 @@ pub fn opReadsAtLeader(op: proto.OpCode) bool {
         // As its leader has applied them, so a failed message is listed
         // as soon as its fail is answered.
         .queue_dlq_list => true,
+        // What a job's pipelines wait for, and the records they skipped,
+        // only the leader running them knows.
+        .processing_status => true,
         else => false,
     };
 }
@@ -385,6 +388,11 @@ fn makeRequest(opcode: proto.OpCode) proto.Request {
         .key = "",
         .value = "",
     };
+}
+
+test "Dispatcher: a job's status is read at its leader, which alone knows what its pipelines wait for" {
+    try std.testing.expect(opReadsAtLeader(.processing_status));
+    try std.testing.expect(!opWrites(.processing_status));
 }
 
 test "Dispatcher: init empty" {

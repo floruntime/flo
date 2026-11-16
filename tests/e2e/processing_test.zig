@@ -3525,8 +3525,8 @@ test "e2e/processing: on 4 shards, jobs write queues, streams and a measurement 
             }
             stdx.time.sleep(250 * std.time.ns_per_ms);
         }
-        // Idle past the checkpoint interval, every pipeline's cursor is on
-        // disk, so the restart reads nothing again.
+        // Idle past a second, every pipeline's cursor is logged where its
+        // reads reached, so the restart reads nothing again.
         if (round == 0) {
             stdx.time.sleep(3000 * std.time.ns_per_ms);
             try ctx.restartServer();

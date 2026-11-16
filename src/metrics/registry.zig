@@ -298,8 +298,8 @@ pub const ProcessingMetrics = struct {
     records_too_large_total: Atomic(u64) = Atomic(u64).init(0),
     /// Total processing errors
     errors_total: Atomic(u64) = Atomic(u64).init(0),
-    /// Pipeline ticks that waited for room: a busy sink shard, a whole
-    /// window of writes unacked, or a full log.
+    /// Pipeline polls that couldn't read: a sink's namespace missing, its
+    /// shard halted or busy, a window of its writes unacked, a full log.
     ticks_held_total: Atomic(u64) = Atomic(u64).init(0),
     /// Pipelines waiting for a sink's namespace to be created, on every shard.
     pipelines_waiting_namespace: Atomic(u64) = Atomic(u64).init(0),
@@ -343,9 +343,9 @@ pub const ProcessingMetrics = struct {
         _ = self.sink_batches_total.fetchAdd(1, .monotonic);
     }
 
+    /// Counted dropped too, by the caller.
     pub fn recordTooLarge(self: *ProcessingMetrics) void {
         _ = self.records_too_large_total.fetchAdd(1, .monotonic);
-        _ = self.records_dropped_total.fetchAdd(1, .monotonic);
     }
 
     pub fn recordError(self: *ProcessingMetrics) void {
@@ -750,6 +750,9 @@ pub const ShardMetrics = struct {
     /// A sink's channel messages refused here for good by their target,
     /// by reason, summed over the shards that sent them.
     channel_sink_refusals: std.EnumArray(Reason, Atomic(u64)) = .initFill(Atomic(u64).init(0)),
+    /// Channel messages this shard sent that their receivers haven't
+    /// acked, over every channel (gauge).
+    channel_unacked_messages: Atomic(u64) = Atomic(u64).init(0),
     /// Channel messages parked here for a full target (gauges), the targets
     /// they wait on, and how long the longest-waiting target has waited.
     channel_parked_messages: Atomic(u64) = Atomic(u64).init(0),
@@ -960,6 +963,7 @@ pub const ShardMetrics = struct {
         ts_late: [TS_LATE_EDGES.len]u64,
         channel_sender_bugs: [2]u64,
         channel_sink_refusals: std.EnumArray(Reason, u64),
+        channel_unacked_messages: u64,
         channel_parked_messages: u64,
         channel_parked_bytes: u64,
         channel_parked_targets: u64,
@@ -1023,6 +1027,7 @@ pub const ShardMetrics = struct {
                 break :blk v;
             },
             .channel_sender_bugs = .{ self.channel_sender_bugs[0].load(.monotonic), self.channel_sender_bugs[1].load(.monotonic) },
+            .channel_unacked_messages = self.channel_unacked_messages.load(.monotonic),
             .channel_sink_refusals = blk: {
                 var r: std.EnumArray(Reason, u64) = .initFill(0);
                 for (std.enums.values(Reason)) |k| r.set(k, self.channel_sink_refusals.getPtrConst(k).load(.monotonic));
@@ -1870,7 +1875,9 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     for (TS_LATE_EDGES, snap.ts_late) |edge, n| try writer.print("flo_ts_late_points_total{{shard_id=\"{d}\",behind=\"{s}\"}} {d}\n", .{ snap.shard_id, edge, n });
     try writer.print("flo_shard_channel_sender_bugs_total{{shard_id=\"{d}\",reason=\"wrong_slot\"}} {d}\n", .{ snap.shard_id, snap.channel_sender_bugs[0] });
     try writer.print("flo_shard_channel_sender_bugs_total{{shard_id=\"{d}\",reason=\"bad_payload\"}} {d}\n", .{ snap.shard_id, snap.channel_sender_bugs[1] });
-    // Only reasons seen: most targets refuse a sink's write for few.
+    try writer.print("flo_shard_channel_unacked_messages{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.channel_unacked_messages });
+    // Only reasons seen: most targets refuse a sink's write for few
+    // reasons.
     for (std.enums.values(Reason)) |k| {
         const n = snap.channel_sink_refusals.get(k);
         if (n > 0) try writer.print("flo_shard_channel_sink_refusals_total{{shard_id=\"{d}\",reason=\"{s}\"}} {d}\n", .{ snap.shard_id, @tagName(k), n });

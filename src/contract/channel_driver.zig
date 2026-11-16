@@ -106,8 +106,9 @@ const Peer = struct {
     trim_through: u64 = 0,
     trim_at_ms: ?u64 = null,
     last_trim_ms: u64 = 0,
-    /// When it last answered `busy` or `halted` with nothing new applied;
-    /// 0 once it applies more or answers `ok`.
+    /// Since when it has answered `busy` or `halted` with nothing new
+    /// applied: the first such answer; 0 once it applies more or answers
+    /// `ok`.
     busy_ms: u64 = 0,
     // Receiving from it.
     /// The highest seq proposed or applied from it; null until rebuilt.
