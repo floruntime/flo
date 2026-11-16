@@ -51,6 +51,7 @@ pub const MAX_FLOQL_POINTS = 1 << 17;
 pub const MAX_QUERY_SCANNED = 1 << 20;
 pub const TOO_MANY_FLOQL_SCANNED = std.fmt.comptimePrint("bad request: more than {d} points match a FloQL query; narrow its range or its tags", .{MAX_FLOQL_POINTS});
 pub const TOO_MANY_QUERY_POINTS = std.fmt.comptimePrint("bad request: more than {d} points match a query; narrow its range or its tags", .{MAX_QUERY_SCANNED});
+pub const UNKNOWN_AGGREGATION = "bad request: unknown aggregation; use avg, sum, count, min or max";
 pub const TOO_MANY_QUERY_BUCKETS = std.fmt.comptimePrint("bad request: the matching points span more than {d} windows of this width; widen the window (it is in nanoseconds) or narrow the range", .{MAX_QUERY_BUCKETS});
 const StoredPoint = ts_mod.StoredPoint;
 const Dispatcher = dispatcher_mod.Dispatcher;
@@ -478,6 +479,10 @@ pub const TSHandler = struct {
             opt.asString()
         else
             "avg";
+        // Checked before the scan: an unknown name would leave every bucket
+        // without a value, so an answer of none.
+        const agg = floql_ast.AggFunction.fromString(agg_name) orelse
+            return .{ .err = .{ .code = .invalid_request, .message = UNKNOWN_AGGREGATION } };
 
         // Buckets are aligned to the epoch (ts / window * window) so a bucket's
         // identity does not depend on the query's `from`. Absent, the window
@@ -537,7 +542,7 @@ pub const TSHandler = struct {
         var buckets: [MAX_QUERY_BUCKETS]QueryBucket = undefined;
         var out_n: usize = 0;
         for (starts[0..nb], accs[0..nb]) |start, acc| {
-            if (acc.value(agg_name)) |v| {
+            if (acc.value(agg)) |v| {
                 buckets[out_n] = .{ .start_ns = @intCast(start), .value = v };
                 out_n += 1;
             }
@@ -897,15 +902,16 @@ const BucketAcc = struct {
         if (v > self.max_v) self.max_v = v;
     }
 
-    /// Null for an empty bucket or an unrecognised aggregation name.
-    fn value(self: BucketAcc, agg: []const u8) ?f64 {
+    /// Null for an empty bucket.
+    fn value(self: BucketAcc, agg: floql_ast.AggFunction) ?f64 {
         if (self.n == 0) return null;
-        if (std.mem.eql(u8, agg, "avg")) return self.sum / @as(f64, @floatFromInt(self.n));
-        if (std.mem.eql(u8, agg, "sum")) return self.sum;
-        if (std.mem.eql(u8, agg, "min")) return self.min_v;
-        if (std.mem.eql(u8, agg, "max")) return self.max_v;
-        if (std.mem.eql(u8, agg, "count")) return @floatFromInt(self.n);
-        return null;
+        return switch (agg) {
+            .avg => self.sum / @as(f64, @floatFromInt(self.n)),
+            .sum => self.sum,
+            .min => self.min_v,
+            .max => self.max_v,
+            .count => @floatFromInt(self.n),
+        };
     }
 };
 
@@ -1356,6 +1362,11 @@ test "ts handler: a query takes its range and window in ns, and answers bucket s
     var zb = OptionsBuilder.init(&zb_buf);
     try zb.addI64(.ts_window_ns, 0);
     try testing.expectEqualStrings("ts query: a window must be more than 0 ns", try refusedWith(&handler, makeRequest(.ts_query, "disk", "", zb.getOptions())));
+    // An unknown aggregation is refused, not answered with no buckets.
+    var ab_buf: [64]u8 = undefined;
+    var ab = OptionsBuilder.init(&ab_buf);
+    try ab.addString(.ts_aggregation, "mean");
+    try testing.expectEqualStrings(UNKNOWN_AGGREGATION, try refusedWith(&handler, makeRequest(.ts_query, "disk", "", ab.getOptions())));
     for (0..MAX_QUERY_BUCKETS + 1) |i| try ts.insert(.default, "many", "value", 1, base + i * 1000, 0, "");
     var nb_buf: [64]u8 = undefined;
     var nb = OptionsBuilder.init(&nb_buf);

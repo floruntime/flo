@@ -297,6 +297,11 @@ test "e2e/ts: info, query and floql answer times in ns, to the nanosecond" {
     defer no_window.deinit();
     try testing.expectEqual(@as(u8, 2), no_window.exit_code);
     try testing.expect(no_window.stderrContains("--window must be more than 0"));
+    // An unknown aggregation is refused by the server, not answered empty.
+    var bad_agg = try ctx.cli.run(&.{ "ts", "query", "wire", "--field", "v", "--from", "1708700000000", "--agg", "mean" });
+    defer bad_agg.deinit();
+    try testing.expectEqual(@as(u8, 3), bad_agg.exit_code);
+    try testing.expect(bad_agg.stderrContains("unknown aggregation; use avg, sum, count, min or max"));
 
     // FloQL: a bare range is epoch ms; one in ns is refused, saying so.
     var floql = try ctx.cli.run(&.{ "ts", "floql", "wire[1708700400000..1708700401000] | field(v)" });

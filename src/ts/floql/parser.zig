@@ -757,3 +757,7 @@ test "parser: a query's measurement is read without parsing the rest" {
     try std.testing.expect(Parser.sourceMeasurement("|||bad") == null);
     try std.testing.expect(Parser.sourceMeasurement("") == null);
 }
+
+test "parser: an unknown aggregation stage is refused, not skipped" {
+    try std.testing.expectError(error.UnknownFunction, Parser.parse("cpu[1h] | window(5m) | mean()", std.testing.allocator));
+}
