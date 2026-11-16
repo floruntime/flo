@@ -17,7 +17,7 @@ const Response = base.Response;
 const proto = @import("../../protocol/proto.zig");
 
 /// Write one value of one field. `field` null means the server's default
-/// field ("value"); a null `timestamp_ms` lets the server stamp the point.
+/// field ("value"); a null `timestamp_ns` lets the server stamp the point.
 pub fn write(
     client: *Client,
     namespace: []const u8,
@@ -25,7 +25,7 @@ pub fn write(
     field: ?[]const u8,
     value: f64,
     tags: []const u8,
-    timestamp_ms: ?i64,
+    timestamp_ns: ?i64,
 ) !Response {
     var options_buf: [1024]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
@@ -36,8 +36,8 @@ pub fn write(
     if (field) |f| {
         builder.addString(.ts_field, f) catch return error.OptionsBufferTooSmall;
     }
-    if (timestamp_ms) |ts| {
-        builder.addI64(.ts_timestamp, ts) catch return error.OptionsBufferTooSmall;
+    if (timestamp_ns) |ts| {
+        builder.addI64(.ts_timestamp_ns, ts) catch return error.OptionsBufferTooSmall;
     }
 
     var value_buf: [8]u8 = undefined;

@@ -317,7 +317,7 @@ pub const CommandResult = union(enum) {
     /// Write succeeded
     ts_write_ok: struct {
         series_hash: u64,
-        timestamp_ms: i64,
+        timestamp_ns: i64,
         sequence: u64,
     },
 

@@ -17,22 +17,22 @@
 //! - Only f64 field values are supported (integer "i" suffix is parsed and converted)
 //! - String fields are rejected (not supported in Flo-TS v1)
 //! - Boolean fields are converted to 0.0/1.0
-//! - Timestamps are converted to milliseconds using the caller-specified Precision
+//! - Timestamps are converted to nanoseconds, exactly, using the caller-specified Precision
 //!
 //! ## Precision
 //!
 //! Matches InfluxDB's `?precision=` query parameter. Callers specify the unit of
 //! the integer timestamps in the payload:
 //!
-//!   | Precision | Wire value | Conversion |
-//!   |-----------|-------------------------------------|----------------------------|
-//!   | ns        | nanoseconds  (InfluxDB default)     | ÷ 1,000,000                |
-//!   | us / µs   | microseconds                        | ÷ 1,000                    |
-//!   | ms        | milliseconds (Flo native, **default**)| identity                   |
-//!   | s         | seconds                             | × 1,000                    |
+//!   | Precision | Wire value                         | Conversion      |
+//!   |-----------|------------------------------------|-----------------|
+//!   | ns        | nanoseconds (InfluxDB default)     | identity        |
+//!   | us / µs   | microseconds                       | × 1,000         |
+//!   | ms        | milliseconds (**default**)         | × 1,000,000     |
+//!   | s         | seconds                            | × 1,000,000,000 |
 //!
-//! Default is `.ms` (Flo-native). Use `.ns` when accepting InfluxDB wire protocol
-//! payloads where timestamps are in nanoseconds.
+//! Default is `.ms`. Use `.ns` when accepting InfluxDB wire protocol payloads,
+//! whose timestamps are in nanoseconds.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -40,26 +40,27 @@ const Allocator = std.mem.Allocator;
 /// Timestamp precision — determines how the integer timestamp in the wire
 /// format is interpreted. Matches InfluxDB's `?precision=` parameter.
 ///
-/// Flo internally stores all timestamps as milliseconds.
-/// The parser converts incoming integers to milliseconds using this precision.
+/// Flo stores a point's time in nanoseconds; the parser converts to them.
 pub const Precision = enum(u8) {
-    /// Nanoseconds (InfluxDB default). 1 ms = 1,000,000 ns.
+    /// Nanoseconds (InfluxDB default).
     ns = 0,
-    /// Microseconds. 1 ms = 1,000 µs.
+    /// Microseconds.
     us = 1,
-    /// Milliseconds — Flo's native resolution. No conversion needed.
+    /// Milliseconds.
     ms = 2,
-    /// Seconds. 1 s = 1,000 ms.
+    /// Seconds.
     s = 3,
 
-    /// Convert a raw timestamp integer to milliseconds.
-    pub fn toMillis(self: Precision, raw: i64) i64 {
-        return switch (self) {
-            .ns => @divFloor(raw, 1_000_000),
-            .us => @divFloor(raw, 1_000),
-            .ms => raw,
-            .s => raw *| 1_000, // saturating multiply to avoid overflow
+    /// A raw timestamp in nanoseconds, exactly; null past what an i64 of
+    /// nanoseconds holds.
+    pub fn toNanos(self: Precision, raw: i64) ?i64 {
+        const per: i64 = switch (self) {
+            .ns => 1,
+            .us => std.time.ns_per_us,
+            .ms => std.time.ns_per_ms,
+            .s => std.time.ns_per_s,
         };
+        return std.math.mul(i64, raw, per) catch null;
     }
 
     /// Parse a precision string (e.g. from HTTP query param or CLI flag).
@@ -91,8 +92,8 @@ pub const ParsedLine = struct {
     measurement: []const u8,
     tags: []ParsedTag,
     fields: []ParsedField,
-    /// Timestamp in milliseconds (0 = use server time)
-    timestamp_ms: i64,
+    /// Timestamp in nanoseconds (0 = use server time)
+    timestamp_ns: i64,
 };
 
 /// Result of parsing multiple lines
@@ -120,7 +121,7 @@ pub const ParseError = struct {
 /// Caller must NOT free or modify `line` while using the ParsedLine.
 ///
 /// `precision` controls how the trailing integer timestamp is interpreted.
-/// Default is `.ms` (Flo-native milliseconds). Pass `.ns` when accepting
+/// This takes milliseconds. Pass `.ns` to `parseLineWithPrecision` for
 /// InfluxDB wire protocol payloads.
 pub fn parseLine(line: []const u8, allocator: Allocator) !ParsedLine {
     return parseLineWithPrecision(line, .ms, allocator);
@@ -233,7 +234,7 @@ pub fn parseLineDiagnosed(line: []const u8, precision: Precision, allocator: All
     }
 
     // Parse timestamp (optional — units determined by precision parameter)
-    var timestamp_ms: i64 = 0;
+    var timestamp_ns: i64 = 0;
     if (input.len > 0 and input[0] == ' ') {
         input = input[1..]; // skip space
         // Skip extra spaces
@@ -242,7 +243,7 @@ pub fn parseLineDiagnosed(line: []const u8, precision: Precision, allocator: All
         }
         if (input.len > 0) {
             const token = tokenAt(input);
-            timestamp_ms = parseTimestamp(token, precision) catch |err| {
+            timestamp_ns = parseTimestamp(token, precision) catch |err| {
                 fields.deinit(allocator);
                 tags.deinit(allocator);
                 diag.token = token;
@@ -264,11 +265,11 @@ pub fn parseLineDiagnosed(line: []const u8, precision: Precision, allocator: All
         .measurement = measurement,
         .tags = try tags.toOwnedSlice(allocator),
         .fields = try fields.toOwnedSlice(allocator),
-        .timestamp_ms = timestamp_ms,
+        .timestamp_ns = timestamp_ns,
     };
 }
 
-/// Parse multiple lines of line protocol (millisecond precision, Flo-native).
+/// Parse multiple lines of line protocol, timestamps in milliseconds.
 pub fn parseLines(input: []const u8, allocator: Allocator) !ParseResult {
     return parseLinesWithPrecision(input, .ms, allocator);
 }
@@ -460,14 +461,15 @@ fn tokenAt(input: []const u8) []const u8 {
     return input[0..end];
 }
 
-/// A whole token of digits, converted to ms; it must come out above zero.
+/// A whole token of digits, converted to ns; it must be above zero and
+/// fit an i64 of nanoseconds.
 fn parseTimestamp(token: []const u8, precision: Precision) !i64 {
     if (token.len == 0) return error.InvalidTimestamp;
     for (token) |c| if (!std.ascii.isDigit(c)) return error.InvalidTimestamp;
-    const raw = std.fmt.parseInt(i64, token, 10) catch return error.InvalidTimestamp;
-    const ms = precision.toMillis(raw);
-    if (ms <= 0) return error.InvalidTimestamp;
-    return ms;
+    const raw = std.fmt.parseInt(i64, token, 10) catch return error.TimestampTooLate;
+    const ns = precision.toNanos(raw) orelse return error.TimestampTooLate;
+    if (ns <= 0) return error.InvalidTimestamp;
+    return ns;
 }
 
 // ============================================================================
@@ -492,8 +494,8 @@ test "parseLine - basic with tags and fields (ms default)" {
     try std.testing.expectEqual(@as(f64, 98.5), result.fields[0].value);
     try std.testing.expectEqualStrings("usage_user", result.fields[1].name);
     try std.testing.expectEqual(@as(f64, 1.5), result.fields[1].value);
-    // Timestamp in ms (Flo-native default)
-    try std.testing.expectEqual(@as(i64, 1465839830100), result.timestamp_ms);
+    // A ms timestamp (the default), in ns
+    try std.testing.expectEqual(@as(i64, 1465839830100_000_000), result.timestamp_ns);
 }
 
 test "parseLine - InfluxDB ns compat via parseLineWithPrecision" {
@@ -503,8 +505,8 @@ test "parseLine - InfluxDB ns compat via parseLineWithPrecision" {
     const result = try parseLineWithPrecision(line, .ns, allocator);
     defer freeParsedLine(result, allocator);
 
-    // 1465839830100400200 ns → 1465839830100 ms
-    try std.testing.expectEqual(@as(i64, 1465839830100), result.timestamp_ms);
+    // Nanoseconds kept to the nanosecond
+    try std.testing.expectEqual(@as(i64, 1465839830100400200), result.timestamp_ns);
 }
 
 test "parseLine - no tags" {
@@ -519,7 +521,7 @@ test "parseLine - no tags" {
     try std.testing.expectEqual(@as(usize, 1), result.fields.len);
     try std.testing.expectEqualStrings("value", result.fields[0].name);
     try std.testing.expectEqual(@as(f64, 72.3), result.fields[0].value);
-    try std.testing.expectEqual(@as(i64, 0), result.timestamp_ms);
+    try std.testing.expectEqual(@as(i64, 0), result.timestamp_ns);
 }
 
 test "parseLine - integer field" {
@@ -563,9 +565,9 @@ test "parseLines - multi-line (ms default)" {
     try std.testing.expectEqual(@as(usize, 0), result.errors.len);
     try std.testing.expectEqualStrings("a", result.lines[0].tags[0].value);
     try std.testing.expectEqualStrings("b", result.lines[1].tags[0].value);
-    // With .ms default, values are used as-is
-    try std.testing.expectEqual(@as(i64, 1000), result.lines[0].timestamp_ms);
-    try std.testing.expectEqual(@as(i64, 2000), result.lines[1].timestamp_ms);
+    // Milliseconds by default, in ns
+    try std.testing.expectEqual(@as(i64, 1000_000_000), result.lines[0].timestamp_ns);
+    try std.testing.expectEqual(@as(i64, 2000_000_000), result.lines[1].timestamp_ns);
 }
 
 test "parseLine - string field rejected" {
@@ -580,29 +582,15 @@ test "parseLine - string field rejected" {
 // Precision Tests
 // ============================================================================
 
-test "Precision.toMillis - nanoseconds" {
-    const p = Precision.ns;
-    try std.testing.expectEqual(@as(i64, 1465839830100), p.toMillis(1465839830100400200));
-    try std.testing.expectEqual(@as(i64, 0), p.toMillis(0));
-    try std.testing.expectEqual(@as(i64, 1), p.toMillis(1_500_000)); // 1.5 ms → 1 (floor)
-}
-
-test "Precision.toMillis - microseconds" {
-    const p = Precision.us;
-    try std.testing.expectEqual(@as(i64, 1465839830100), p.toMillis(1465839830100400));
-    try std.testing.expectEqual(@as(i64, 1000), p.toMillis(1_000_000));
-}
-
-test "Precision.toMillis - milliseconds (identity)" {
-    const p = Precision.ms;
-    try std.testing.expectEqual(@as(i64, 1465839830100), p.toMillis(1465839830100));
-    try std.testing.expectEqual(@as(i64, 42), p.toMillis(42));
-}
-
-test "Precision.toMillis - seconds" {
-    const p = Precision.s;
-    try std.testing.expectEqual(@as(i64, 1465839830000), p.toMillis(1465839830));
-    try std.testing.expectEqual(@as(i64, 1000), p.toMillis(1));
+test "Precision.toNanos: each unit exactly, and none past an i64 of nanoseconds" {
+    try std.testing.expectEqual(@as(?i64, 1465839830100400200), Precision.ns.toNanos(1465839830100400200));
+    try std.testing.expectEqual(@as(?i64, 1465839830100400000), Precision.us.toNanos(1465839830100400));
+    try std.testing.expectEqual(@as(?i64, 1465839830100000000), Precision.ms.toNanos(1465839830100));
+    try std.testing.expectEqual(@as(?i64, 1465839830000000000), Precision.s.toNanos(1465839830));
+    const max = std.math.maxInt(i64);
+    try std.testing.expectEqual(@as(?i64, max), Precision.ns.toNanos(max));
+    try std.testing.expectEqual(@as(?i64, null), Precision.ms.toNanos(max / std.time.ns_per_ms + 1));
+    try std.testing.expectEqual(@as(?i64, null), Precision.s.toNanos(max / std.time.ns_per_s + 1));
 }
 
 test "Precision.fromString" {
@@ -615,14 +603,14 @@ test "Precision.fromString" {
     try std.testing.expect(Precision.fromString("invalid") == null);
 }
 
-test "parseLineWithPrecision - millisecond precision (no conversion)" {
+test "parseLineWithPrecision - millisecond precision" {
     const allocator = std.testing.allocator;
     const line = "cpu,host=a idle=99.0 1465839830100";
 
     const result = try parseLineWithPrecision(line, .ms, allocator);
     defer freeParsedLine(result, allocator);
 
-    try std.testing.expectEqual(@as(i64, 1465839830100), result.timestamp_ms);
+    try std.testing.expectEqual(@as(i64, 1465839830100_000_000), result.timestamp_ns);
 }
 
 test "parseLineWithPrecision - second precision" {
@@ -632,7 +620,7 @@ test "parseLineWithPrecision - second precision" {
     const result = try parseLineWithPrecision(line, .s, allocator);
     defer freeParsedLine(result, allocator);
 
-    try std.testing.expectEqual(@as(i64, 1465839830000), result.timestamp_ms);
+    try std.testing.expectEqual(@as(i64, 1465839830_000_000_000), result.timestamp_ns);
 }
 
 test "parseLineWithPrecision - microsecond precision" {
@@ -642,7 +630,7 @@ test "parseLineWithPrecision - microsecond precision" {
     const result = try parseLineWithPrecision(line, .us, allocator);
     defer freeParsedLine(result, allocator);
 
-    try std.testing.expectEqual(@as(i64, 1465839830100), result.timestamp_ms);
+    try std.testing.expectEqual(@as(i64, 1465839830100400_000), result.timestamp_ns);
 }
 
 test "parseLinesWithPrecision - millisecond batch" {
@@ -662,9 +650,9 @@ test "parseLinesWithPrecision - millisecond batch" {
     }
 
     try std.testing.expectEqual(@as(usize, 2), result.lines.len);
-    // With .ms precision, values are used as-is
-    try std.testing.expectEqual(@as(i64, 1000), result.lines[0].timestamp_ms);
-    try std.testing.expectEqual(@as(i64, 2000), result.lines[1].timestamp_ms);
+    // Milliseconds, in ns
+    try std.testing.expectEqual(@as(i64, 1000_000_000), result.lines[0].timestamp_ns);
+    try std.testing.expectEqual(@as(i64, 2000_000_000), result.lines[1].timestamp_ns);
 }
 
 test "parseLineDiagnosed refuses what it used to read loosely, naming the token" {
@@ -694,5 +682,15 @@ test "parseLineDiagnosed refuses what it used to read loosely, naming the token"
     const ok = try parseLineDiagnosed("cpu x=9007199254740992i 1708700407000  ", .ms, allocator, &diag);
     defer freeParsedLine(ok, allocator);
     try std.testing.expectEqual(@as(f64, 9007199254740992), ok.fields[0].value);
-    try std.testing.expectEqual(@as(i64, 1708700407000), ok.timestamp_ms);
+    try std.testing.expectEqual(@as(i64, 1708700407000_000_000), ok.timestamp_ns);
+}
+
+test "parseLineDiagnosed refuses a timestamp later than an i64 of nanoseconds holds" {
+    const allocator = std.testing.allocator;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.TimestampTooLate, parseLineDiagnosed("cpu x=1 9300000000000", .ms, allocator, &diag));
+    try std.testing.expectEqualStrings("9300000000000", diag.token);
+    const ok = try parseLineDiagnosed("cpu x=1 9223372036854775807", .ns, allocator, &diag);
+    defer freeParsedLine(ok, allocator);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), ok.timestamp_ns);
 }

@@ -84,14 +84,15 @@ test "e2e/exit: a batch line the server refuses makes the batch exit 3" {
     {
         const file = try stdx.fs.createFile(path, .{});
         defer stdx.fs.closeFile(file);
-        // The second line parses here but its timestamp is past what the server stores.
-        try stdx.fs.writeAll(file, "m v=1 1708700400000\nm v=2 99999999999999999\n");
+        // The second line parses here, but the server refuses a name
+        // holding NUL.
+        try stdx.fs.writeAll(file, "m v=1 1708700400000\nm\x00x v=2 1708700400000\n");
     }
     defer stdx.fs.deleteFile(path) catch {};
 
     var r = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", path, "--precision", "ms" });
     defer r.deinit();
     try testing.expectEqual(@as(u8, 3), r.exit_code);
-    try testing.expect(r.stderrContains("line 2: field v (0 of 1 fields written): ts write: timestamp out of range [bad_request]"));
+    try testing.expect(r.stderrContains("line 2: field v (0 of 1 fields written): bad request: a measurement or field name must not contain NUL [bad_request]"));
     try testing.expect(r.stderrContains("1 of 2 lines failed"));
 }
