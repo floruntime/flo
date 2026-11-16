@@ -324,6 +324,13 @@ pub const KVHandler = struct {
         return .init(buf, req.ns_id, req.key);
     }
 
+    /// Why a sink can't write `raw`, as a client's write of it would be
+    /// refused, or null.
+    pub fn keyRefusal(raw: []const u8) ?[]const u8 {
+        checkKey(raw) catch |err| return refusal(err).refusal.message;
+        return null;
+    }
+
     /// Why `raw` can't be a key a client reads or writes, if it can't. A
     /// key with a NUL byte is refused though the stored key, which leads
     /// with a fixed-width namespace id, could hold one: the CLI and SDKs
@@ -926,41 +933,6 @@ pub const KVHandler = struct {
         if (t.ns_id != ns_id) return null;
         t.last_active_ms = @import("stdx").time.monotonicMs();
         return t;
-    }
-
-    /// What became of a processing KV sink's write.
-    pub const SinkResult = union(enum) {
-        /// In the log, not yet applied.
-        proposed: @import("../raft/node.zig").ProposeResult,
-        /// The shard can take no more writes for now: the sink holds its
-        /// source, or its message, and tries again.
-        held,
-        /// Refused for good, for this reason; the caller counts it dropped.
-        dropped: []const u8,
-    };
-
-    /// The processing KV sink's write of `raw_key` in `namespace`, which
-    /// this shard owns: proposed as any put is, unanswered.
-    pub fn sinkPropose(shard: *Shard, namespace: []const u8, raw_key: []const u8, value: []const u8, ttl_ms: ?u64) SinkResult {
-        checkKey(raw_key) catch |err| return .{ .dropped = refusal(err).refusal.message };
-        shard.namespace_handler.proposeImplicitCreate(namespace, shard);
-        const ns_id = shard.namespaceId(namespace);
-        if (ns_id == .invalid) {
-            // Its create was refused for room: held like the write would be.
-            const raft = shard.raft_node;
-            if (raft.log.lastIndex() -| raft.last_applied >= raft_node_mod.MAX_OUTSTANDING) return .held;
-            return .{ .dropped = "the namespace isn't created on this shard yet" };
-        }
-        var kbuf: [MAX_KV_KEY]u8 = undefined;
-        const proposed = proposeKVFlagged(shard, .kv_put, entry_mod.Flags.SINK, .{ .key = Key.init(&kbuf, ns_id, raw_key).stored, .value = value, .ttl_ms = ttl_ms, .condition = .always, .cas_version = null }) catch |err| return switch (err) {
-            error.Overloaded => .held,
-            error.NotLeader => .{ .dropped = "this node doesn't lead its group" },
-            error.WritesStopped => .{ .dropped = "the shard stopped taking writes" },
-            error.Halted => .{ .dropped = "the shard is halted" },
-            else => .{ .dropped = @errorName(err) },
-        };
-        shard.namespace_handler.markNamespaceHasData(namespace, shard);
-        return .{ .proposed = proposed };
     }
 
     // ── Blocking GET Waiter Management ──────────────────────────────────

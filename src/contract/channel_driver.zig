@@ -91,6 +91,8 @@ fn encodeFrame(buf: []u8, comptime kind: Kind, v: anytype) ?[]const u8 {
 
 // ─── The driver ────────────────────────────────────────────────────────────
 
+pub const SinkRefusals = std.EnumArray(@import("../protocol/reason.zig").Reason, u64);
+
 const Peer = struct {
     // Sending to it.
     gen_counter: u32 = 0,
@@ -104,6 +106,10 @@ const Peer = struct {
     trim_through: u64 = 0,
     trim_at_ms: ?u64 = null,
     last_trim_ms: u64 = 0,
+    /// Since when it has answered `busy` or `halted` with nothing new
+    /// applied: the first such answer; 0 once it applies more or answers
+    /// `ok`.
+    busy_ms: u64 = 0,
     // Receiving from it.
     /// The highest seq proposed or applied from it; null until rebuilt.
     accepted: ?u64 = null,
@@ -168,6 +174,10 @@ pub const Driver = struct {
     /// by reason (`store.SenderBug`). Counted where they apply, on every
     /// replica, and kept across terms, unlike `peers`.
     sender_bugs: [][2]u64,
+    /// A sink's messages each group sent this one that their target refused
+    /// for good, by reason: the sink's records lost to that target. Counted
+    /// where they apply, on every replica, and kept across terms.
+    sink_refusals: []SinkRefusals,
     /// The last scan left nothing outstanding: no message unsent or
     /// unacked, no trim due or in flight, no answer untold. Until a channel
     /// record or a frame changes that, a tick has nothing to do. The commit
@@ -189,15 +199,27 @@ pub const Driver = struct {
         errdefer allocator.free(peers);
         @memset(peers, .{});
         const bugs = try allocator.alloc([2]u64, count);
+        errdefer allocator.free(bugs);
         @memset(bugs, .{ 0, 0 });
-        return .{ .allocator = allocator, .group = group, .count = count, .peers = peers, .sender_bugs = bugs };
+        const refusals = try allocator.alloc(SinkRefusals, count);
+        @memset(refusals, .initFill(0));
+        return .{ .allocator = allocator, .group = group, .count = count, .peers = peers, .sender_bugs = bugs, .sink_refusals = refusals };
     }
 
     pub fn deinit(self: *Driver) void {
         self.allocator.free(self.peers);
         self.allocator.free(self.sender_bugs);
+        self.allocator.free(self.sink_refusals);
         self.allocator.free(self.buf);
         self.allocator.free(self.msgs);
+    }
+
+    /// Since when group `to` has answered this leader `busy` or `halted`
+    /// without applying more, or null: what holds a pipeline sending to it.
+    pub fn busySince(self: *const Driver, to: u16) ?u64 {
+        if (to >= self.peers.len) return null;
+        const ms = self.peers[to].busy_ms;
+        return if (ms == 0) null else ms;
     }
 
     /// The batch buffers, allocated once; false when there's no memory for
@@ -445,6 +467,7 @@ pub const Driver = struct {
             p.applied_ack = a.applied;
             p.progress_ms = now_ms;
             p.backoff_ms = RESEND_MIN_MS;
+            p.busy_ms = 0;
         }
         p.durable_ack = @max(p.durable_ack, if (self.mutant == .trim_on_applied) a.applied else a.durable);
         const current = self.mutant == .no_gen_filter or (a.gen_term == self.term and a.gen_counter == p.gen_counter);
@@ -454,8 +477,11 @@ pub const Driver = struct {
             p.gen_counter += 1;
             p.progress_ms = now_ms;
         }
-        if (std.enums.fromInt(Status, a.status)) |s| if (s != .ok) {
-            p.backoff_ms = @min(p.backoff_ms * 2, RESEND_MAX_MS);
-        };
+        if (std.enums.fromInt(Status, a.status)) |s| {
+            if (s != .ok) {
+                p.backoff_ms = @min(p.backoff_ms * 2, RESEND_MAX_MS);
+                if (p.busy_ms == 0) p.busy_ms = @max(now_ms, 1);
+            } else p.busy_ms = 0;
+        }
     }
 };

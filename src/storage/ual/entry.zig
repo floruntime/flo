@@ -141,8 +141,8 @@ pub const EntryType = enum(u8) {
     processing_submit = 0x80,
     processing_stop = 0x81,
     processing_cancel = 0x82,
-    processing_checkpoint = 0x85,
     processing_remove = 0x86,
+    processing_sink_batch = 0x87,
 
     // ── Cluster settings (the memory-budget policy and per-node RAM) ──
     settings_pool_share = 0x90,
@@ -168,7 +168,9 @@ pub const EntryType = enum(u8) {
             .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,
             .cg_create => true,
             .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step_started => true,
-            .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint, .processing_remove => true,
+            .processing_submit, .processing_stop, .processing_cancel, .processing_remove => true,
+            // A sink batch's payload is a schema (`protocol/processing_entries.zig`).
+            .processing_sink_batch => false,
             // Cluster-settings entries touch no namespace projection; they are node-level state on shard 0.
             .settings_pool_share, .settings_node_mem, .settings_node_del => false,
             // A message's own target says what it touches, at its apply.
@@ -190,11 +192,9 @@ pub const Flags = struct {
     pub const TOMBSTONE: u16 = 1 << 3;
     /// A stream delete given `--force`: it drops the stream whatever it holds.
     pub const FORCE: u16 = 1 << 4;
-    /// Written by a processing pipeline's sink. Refused at apply, it is a
-    /// record lost to that sink: the leader applying it counts it dropped
-    /// unless the pipeline that proposed it, on this shard, reads it again.
-    /// Best effort around leader changes: one applied after the term has
-    /// moved on is not counted.
+    /// A processing pipeline's sink write, sent as a channel message. One
+    /// its target is full for is parked, not lost; one its target refuses
+    /// for good is counted by its receiver.
     pub const SINK: u16 = 1 << 5;
     /// A workflow create whose trigger names its workflow's own namespace,
     /// as the leader that proposed it read the request: every replica reads

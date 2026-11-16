@@ -354,6 +354,19 @@ pub const NodeHealth = struct {
                 const bad_payload = m.channel_sender_bugs[1].load(.monotonic);
                 if (wrong_slot + bad_payload > 0) try w.print(",\"channel_sender_bugs\":{{\"wrong_slot\":{d},\"bad_payload\":{d}}}", .{ wrong_slot, bad_payload });
             }
+            // Shown once a sink's write sent here was refused for good by
+            // its target, by reason: records lost to that sink.
+            if (sm) |m| {
+                var any = false;
+                for (std.enums.values(@import("../protocol/reason.zig").Reason)) |k| {
+                    const n = m.channel_sink_refusals.getPtrConst(k).load(.monotonic);
+                    if (n == 0) continue;
+                    try w.writeAll(if (any) "," else ",\"channel_sink_refusals\":{");
+                    any = true;
+                    try w.print("\"{s}\":{d}", .{ @tagName(k), n });
+                }
+                if (any) try w.writeByte('}');
+            }
             // Shown while any channel message waits here for a full target.
             if (sm) |m| {
                 const parked = m.channel_parked_messages.load(.monotonic);

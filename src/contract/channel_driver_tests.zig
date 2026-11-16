@@ -409,6 +409,7 @@ test "channel driver: past a target's parked cap its messages wait at their send
     try testing.expect(hasGot(b, "before-0000-0002"));
     try testing.expect(!hasGot(b, "behind-0000-0004"));
     try testing.expect(b.driver.counts.busy > 0);
+    try testing.expect(a.driver.busySince(1) != null);
     try testing.expectEqual(@as(u64, 2), channels.inOf(.{ .store = &b.store }, 0).?.applied);
     // b drains slot 1 by its own channel; the unpark empties it, and the
     // rest go, in order.
@@ -419,6 +420,8 @@ test "channel driver: past a target's parked cap its messages wait at their send
     for (0..12_000) |_| try sim.step();
     try testing.expect(hasGot(b, "parked-0000-0001") and hasGot(b, "capped-0000-0003") and hasGot(b, "behind-0000-0004"));
     try testing.expectEqual(@as(u64, 4), channels.inOf(.{ .store = &b.store }, 0).?.applied);
+    // Taken: what holds a pipeline sending to b is gone.
+    try testing.expect(a.driver.busySince(1) == null);
 }
 
 fn channelsTarget(slot: u16) [ce.TARGET_LEN]u8 {

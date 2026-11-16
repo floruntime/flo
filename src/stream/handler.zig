@@ -1357,8 +1357,8 @@ pub const StreamHandler = struct {
         return shardFromPtr(sptr).namespace_handler.table.nameOf(id);
     }
 
-    /// Append payload to a named stream (used by processing pipelines).
-    /// Wraps the payload in batch format for consistency with all other appends.
+    /// Append one record of `payload` to a named stream, as a client's
+    /// append would; tests write their sources with it.
     pub fn appendPayloadToStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, payload: []const u8) !persistence_mod.ProposeResult {
         // Wrap raw payload in batch format: [count:u32][payload_len:u32][payload][header_count:u16]
         const batch_size = 4 + 4 + payload.len + 2;

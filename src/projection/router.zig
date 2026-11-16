@@ -10,7 +10,7 @@
 //!   group_*                         → None (the group machine)
 //!   raft_config, raft_noop          → None (consensus layer)
 //!   raft_snapshot                    → Snapshot installation
-//!   checkpoint                      → None (processing runtime)
+//!   processing_sink_batch           → None (the sinks machine)
 //!
 //! The router maintains `applied_index` for idempotency — entries at or below
 //! this index are silently skipped.
@@ -108,7 +108,9 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .namespace_create => .none,
         // Actions: their contract machine (actions/machine.zig).
         .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => .none,
-        .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint, .processing_remove => .none,
+        .processing_submit, .processing_stop, .processing_cancel, .processing_remove => .none,
+        // Its contract machine (processing/sinks_machine.zig).
+        .processing_sink_batch => .none,
         // Cluster settings: their contract machine (settings/machine.zig).
         .settings_pool_share, .settings_node_mem, .settings_node_del => .none,
         .channel_inbound, .channel_trim, .channel_probe, .channel_unpark => .none,

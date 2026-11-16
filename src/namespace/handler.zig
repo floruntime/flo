@@ -130,7 +130,7 @@ pub const NamespaceHandler = struct {
     /// deadline this is, so a create and a held write are told at once,
     /// and both under the SDKs' 5 s request timeout.
     pub const PUBLISH_WAIT_MS: u64 = @import("../node/reply_pool.zig").DEADLINE_MS;
-    /// A sink's write to a namespace this shard can't create, and the node
+    /// A write to a namespace this shard can't create, and the node
     /// doesn't know yet.
     pub const UNKNOWN_HERE_MESSAGE = "unavailable: the namespace isn't created yet; create it first (flo namespace create)";
     /// Every id is taken: ids aren't reused, and a create refused or lost
@@ -233,9 +233,8 @@ pub const NamespaceHandler = struct {
     }
 
     /// A namespace a handler is about to write to, created if this is shard
-    /// 0. Elsewhere a name the node's table lacks, from a path that can't
-    /// wait for shard 0 to create it (a pipeline's sink), stays unknown,
-    /// and the caller's `admission` check drops the write.
+    /// 0. Elsewhere a name the node's table lacks stays unknown, and the
+    /// caller's `admission` check refuses the write.
     pub fn proposeImplicitCreate(self: *NamespaceHandler, name: []const u8, s: *Shard) void {
         switch (self.prepareWrite(s, name)) {
             .go, .ensure => {},

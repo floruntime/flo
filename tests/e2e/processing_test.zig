@@ -3318,7 +3318,7 @@ fn drainUntilAll(ctx: *stdx.testing.TestContext, queue: []const u8) ![CAPPED_REC
     return seen;
 }
 
-test "e2e/processing: on 4 shards, queue sinks at their cap lose nothing: on the job's shard the source waits, on another the writes wait there" {
+test "e2e/processing: on 4 shards, queue sinks at their cap lose nothing: their writes park at each queue and land once as it drains" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{
         .shards = 4,
         .metrics_enabled = true,
@@ -3344,7 +3344,7 @@ test "e2e/processing: on 4 shards, queue sinks at their cap lose nothing: on the
         const q = try std.fmt.bufPrint(&rbuf, "far{d}", .{i});
         if (shardOf(router, q) != home) break q;
     };
-    // The near sink first: held there, a record isn't sent to the far one.
+    // Each queue parks what it has no room for; the other goes on.
     var ybuf: [512]u8 = undefined;
     const job = try std.fmt.bufPrint(&ybuf,
         \\kind: Processing
@@ -3365,8 +3365,8 @@ test "e2e/processing: on 4 shards, queue sinks at their cap lose nothing: on the
 
     const seen = try drainUntilAll(ctx, local);
     for (seen) |n| try testing.expectEqual(@as(usize, 1), n);
-    // The far queue holds the first two; the other four wait on its shard,
-    // nothing dropped, and come as it drains, once each.
+    // The far queue holds the first two; the other four are parked on its
+    // shard, nothing dropped, and come as it drains, once each.
     var http = try ctx.createMetricsHttp();
     defer http.deinit();
     var resp = try http.get("/metrics");
@@ -3374,6 +3374,51 @@ test "e2e/processing: on 4 shards, queue sinks at their cap lose nothing: on the
     try testing.expectEqual(@as(?u64, 0), metricValue(resp.body, "flo_processing_records_dropped_total"));
     const far = try drainUntilAll(ctx, remote);
     for (far) |n| try testing.expectEqual(@as(usize, 1), n);
+}
+
+test "e2e/processing: on 4 shards, a sink on another shard writes each record once across a restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4, .durability = .sync } });
+    defer ctx.deinit();
+    var ibuf: [16]u8 = undefined;
+    var obuf: [16]u8 = undefined;
+    // The job runs on shard 0; its sink stream is on another.
+    const input = try nameOn(&ibuf, "rst-in", 0);
+    const output = try nameOn(&obuf, "rst-out", 2);
+    var ybuf: [256]u8 = undefined;
+    const job = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: restart-sink
+        \\sources.[0].stream.name: {s}
+        \\sinks.[0].stream.name: {s}
+    , .{ input, output });
+    const path = try writeDottedToTempYaml(testing.allocator, job, "restart-sink.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    var submit = try ctx.cli.run(&.{ "processing", "submit", path });
+    defer submit.deinit();
+    try testing.expectEqual(@as(u8, 0), submit.exit_code);
+
+    const markers = [_][]const u8{ "rst-rec-00", "rst-rec-01", "rst-rec-02", "rst-rec-03", "rst-rec-04", "rst-rec-05", "rst-rec-06", "rst-rec-07" };
+    for (markers[0..4]) |m| try ctx.exec(&.{ "stream", "append", input, m });
+    try waitForEach(ctx, output, markers[0..4]);
+    try ctx.restartServer();
+    // The cursor came back with the log: the first four aren't written
+    // again, and the next four are, once each.
+    for (markers[4..]) |m| try ctx.exec(&.{ "stream", "append", input, m });
+    try waitForEach(ctx, output, &markers);
+    var read = try ctx.cli.run(&.{ "stream", "read", output, "--start", "0-0", "--limit", "100" });
+    defer read.deinit();
+    try expectEachOnce(read.stdout, &markers, "after the restart");
+}
+
+/// Waits until stream `name` holds every marker.
+fn waitForEach(ctx: *stdx.testing.TestContext, name: []const u8, markers: []const []const u8) !void {
+    for (0..100) |_| {
+        var read = try ctx.cli.run(&.{ "stream", "read", name, "--start", "0-0", "--limit", "100" });
+        defer read.deinit();
+        if (allSeen(read.stdout, markers)) return;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    return error.RecordsNotWritten;
 }
 
 /// An unlabeled `name <value>` series from a Prometheus body.
@@ -3502,8 +3547,8 @@ test "e2e/processing: on 4 shards, jobs write queues, streams and a measurement 
             }
             stdx.time.sleep(250 * std.time.ns_per_ms);
         }
-        // Idle past the checkpoint interval, every pipeline's cursor is on
-        // disk, so the restart reads nothing again.
+        // Idle past a second, every pipeline's cursor is logged where its
+        // reads reached, so the restart reads nothing again.
         if (round == 0) {
             stdx.time.sleep(3000 * std.time.ns_per_ms);
             try ctx.restartServer();
