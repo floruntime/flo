@@ -361,6 +361,7 @@ fn runGroups(allocator: std.mem.Allocator, args: Args, scenario: Scenario) !bool
     defer groups.deinit();
     for (groups.chans) |*c| c.driver.mutant = args.channel_mutant;
     vopr.groups.channels.mutant_no_park_behind = args.channel_mutant == .no_park_behind;
+    vopr.groups.channels.test_parked_target_max = vopr.groups.GroupChannel.PARKED_TARGET_CAP;
     if (args.flush_stalls) groups.stall_permille = 2;
     const s = try groups.run();
     defer allocator.free(s.groups);

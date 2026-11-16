@@ -460,6 +460,7 @@ test "channel driver: a group whose outbox to another is full says so in its ans
     var pb: [16]u8 = undefined;
     for (0..3) |i| try sim.probeBody(a, 1, try std.fmt.bufPrint(&pb, "outbox-0000-{d:0>4}", .{i}));
     const bytes = channels.metaOf(.{ .store = &a.store }, 1).bytes;
+    a.driver.quiet = false;
     a.driver.caps.channel = bytes;
     a.driver.tick(sim.now, .{ .store = &a.store }, 0, Sim.Io{ .sim = &sim, .me = 0 });
     // Group 2 probes a: a's answer names group 1.
@@ -471,11 +472,13 @@ test "channel driver: a group whose outbox to another is full says so in its ans
     try testing.expectEqual(@as(u16, 1), said[0].shard);
     try testing.expectEqual(@as(u8, @backingInt(driver_mod.Cause.outbox_full)), said[0].cause);
     // Still above three quarters of a cap raised a little: still said.
+    a.driver.quiet = false;
     a.driver.caps.channel = bytes + bytes / 8;
     a.driver.tick(sim.now, .{ .store = &a.store }, 0, Sim.Io{ .sim = &sim, .me = 0 });
     a.driver.onFrame(2, emptyBatch(&fb, 1), sim.now, .{ .store = &a.store }, 0, false, Sim.Io{ .sim = &sim, .me = 0 });
     try testing.expectEqual(@as(usize, 1), lastPressure(&sim, 2, &out).len);
     // Under three quarters: no longer.
+    a.driver.quiet = false;
     a.driver.caps.channel = bytes * 2;
     a.driver.tick(sim.now, .{ .store = &a.store }, 0, Sim.Io{ .sim = &sim, .me = 0 });
     a.driver.onFrame(2, emptyBatch(&fb, 1), sim.now, .{ .store = &a.store }, 0, false, Sim.Io{ .sim = &sim, .me = 0 });

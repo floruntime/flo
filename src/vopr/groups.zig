@@ -433,6 +433,9 @@ pub const GroupChannel = struct {
         c.store.place = .{ .group = g, .count = count };
         c.store.strict_keys = true;
         c.driver.admits = Probed.admits;
+        // Small enough that probes reach it, so a full outbox's pressure
+        // is reported and read back.
+        c.driver.caps = .{ .shard = 4 * OUTBOX_CAP, .channel = OUTBOX_CAP };
         return c;
     }
 
@@ -553,6 +556,11 @@ pub const GroupChannel = struct {
         c.unparks += 1;
     }
 
+    /// What one channel's outbox may hold before its leader reports it full.
+    pub const OUTBOX_CAP = 64 << 10;
+    /// What a target may park before more to it is refused.
+    pub const PARKED_TARGET_CAP = 8 << 10;
+
     /// Slots most probes go to, so a target is written again while it is
     /// full, and parks.
     const POOL = [_]u16{ 7, 101, 202, 303, 404, 505, 606, 707, 808, 909, 1111, 1212, 1313, 1414, 1515, 1616 };
@@ -573,19 +581,20 @@ pub const GroupChannel = struct {
     }
 
     /// The test machine's send to a random slot: a 16-byte name unique to
-    /// the group, and some bytes more.
+    /// the group, and up to 512 bytes in all, so the outbox and parked
+    /// caps `Groups` sets are reached.
     fn proposeProbe(c: *GroupChannel, r: std.Random) void {
         if (!c.leads()) return;
-        var body: [16 + 48]u8 = undefined;
+        var body: [512]u8 = undefined;
         _ = std.fmt.bufPrint(body[0..16], "g{d:0>2}-{d:0>12}", .{ c.g, c.probes_proposed }) catch return;
-        const extra = r.uintAtMost(usize, 48);
+        const extra = r.uintAtMost(usize, body.len - 16);
         r.bytes(body[16..][0..extra]);
         // Now and then a pool slot fills, and more often drains.
         const roll = r.uintLessThan(u8, 100);
         if (roll < 3) return c.proposeMark("fill", POOL[r.uintLessThan(usize, POOL.len)]);
         if (roll < 8) return c.proposeMark("drai", POOL[r.uintLessThan(usize, POOL.len)]);
         const slot = if (r.uintLessThan(u8, 4) == 0) r.uintLessThan(u16, 4096) else POOL[r.uintLessThan(usize, POOL.len)];
-        var buf: [128]u8 = undefined;
+        var buf: [body.len + 64]u8 = undefined;
         const payload = ce.Probe.encodeInto(&buf, .{ .slot = slot, .body = body[0 .. 16 + extra] }) catch return;
         if (c.groups.sims[c.g].proposeOn(NODE, .channel_probe, payload)) c.probes_proposed += 1;
     }

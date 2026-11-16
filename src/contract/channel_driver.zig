@@ -368,14 +368,15 @@ pub const Driver = struct {
     /// record changes or a frame arrives.
     pub fn tick(self: *Driver, now_ms: u64, read: ReadView, durable: u64, io: anytype) void {
         self.now_ms = now_ms;
+        const seen = seenOf(read);
+        if (self.quiet and std.meta.eql(seen, self.seen)) return;
         // Which outboxes are full, for the pressure this leader reports:
-        // set at the cap, cleared below three quarters of it.
+        // set at the cap, cleared below three quarters of it. Their bytes
+        // move only with a channel record, so a quiet tick skips this.
         for (self.peers, 0..) |*p, c| {
             const bytes = channels.metaOf(read, @intCast(c)).bytes;
             if (bytes >= self.caps.channel) p.outbox_full = true else if (bytes < self.caps.channel / 4 * 3) p.outbox_full = false;
         }
-        const seen = seenOf(read);
-        if (self.quiet and std.meta.eql(seen, self.seen)) return;
         self.counts.scans += 1;
         var quiet = true;
         for (0..self.count) |b_| {
