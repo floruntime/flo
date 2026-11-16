@@ -11895,21 +11895,27 @@ test "Shard: pressure that arrived as a send-only shard's outbox emptied still e
     const fams = &a.defaultPartition().store.families;
     try std.testing.expectEqual(@as(usize, 0), fams[channels_mod.OutFam.ID].count + fams[channels_mod.InFam.ID].count + fams[channels_mod.ParkFam.ID].count);
     // The last answer before the trim said shard 1 is halted.
+    // Time is set, not waited for: each phase stamps the pressure as of
+    // the clock it is read against.
+    if (Shard.nowMs() <= 2 * channel_driver.PRESSURE_EXPIRY_MS) return error.SkipZigTest;
     const p = &a.channel.peers[1];
     p.pressure[0] = .{ .shard = 1, .cause = @backingInt(channel_driver.Cause.halted) };
     p.pressure_len = 1;
-    p.pressure_ms = Shard.nowMs();
     p.probe_ms = 0;
     _ = try a.stream_handler.appendPayloadToStream(source, "default", "r1");
     two.settle();
+    p.pressure_ms = Shard.nowMs();
     tickNow(a, pipe);
     try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
     try std.testing.expect(pipe.wait == .pressure);
     // Its channels keep ticking while the pressure is live: it probes.
+    p.pressure_ms = Shard.nowMs();
     a.tickChannels();
     try std.testing.expect(p.probe_ms > 0);
-    // A second on, with no answer carrying it, it is gone: reads on.
-    @import("stdx").time.sleep((channel_driver.PRESSURE_EXPIRY_MS + 50) * std.time.ns_per_ms);
+    // The last answer carrying it was long ago, and the driver's own clock
+    // stopped then: it is gone by the time now, and the pipeline reads on.
+    p.pressure_ms = 1;
+    a.channel.now_ms = 1;
     a.tickChannels();
     tickNow(a, pipe);
     two.settle();

@@ -94,13 +94,14 @@ pub const Pressure = schema.BoundedList(Stall, MAX_PRESSURE, MAX_PRESSURE * 3);
 pub const PRESSURE_EXPIRY_MS = 1_000;
 pub const PRESSURE_PROBE_MS = 500;
 /// A peer silent this long, with writes waiting for it, is taken to have
-/// no leader.
-pub const NO_LEADER_MS = 5_000;
+/// no leader: twice the longest resend backoff, so a sender backed off in
+/// full still hears from a live peer first.
+pub const NO_LEADER_MS = 2 * RESEND_MAX_MS;
 
 pub fn causeWords(cause: Cause) []const u8 {
     return switch (cause) {
         .halted => "is halted",
-        .no_leader => "hasn't answered for 5 s",
+        .no_leader => std.fmt.comptimePrint("hasn't answered for {d} s", .{NO_LEADER_MS / std.time.ms_per_s}),
         .cannot_flush => "cannot flush to disk",
         .target_full => "has a full target",
     };
@@ -775,7 +776,7 @@ test "channel driver: byte counts read in the largest unit that keeps them whole
     try std.testing.expectEqualStrings("64 MiB", bytesText(&buf, 64 << 20));
 }
 
-test "channel driver: a peer silent for five seconds reads as having no leader, and a halted one that goes quiet stops reading halted" {
+test "channel driver: a peer silent for twice the longest resend backoff reads as having no leader, and a halted one that goes quiet stops reading halted" {
     var d = try Driver.init(std.testing.allocator, 0, 2);
     defer d.deinit();
     var store = @import("store.zig").Store.init(std.testing.allocator);
@@ -796,9 +797,10 @@ test "channel driver: a peer silent for five seconds reads as having no leader, 
     d.peers[1].pressure_len = 1;
     d.peers[1].pressure_ms = 11_000;
     try std.testing.expectEqual(@as(?Cause, .halted), d.causeOf(1, 11_500));
-    // Then nothing: a second on, its pressure is gone; five, it is silent.
+    // Then nothing: a second on, its pressure is gone; ten, it is silent.
     try std.testing.expectEqual(@as(?Cause, null), d.causeOf(1, 12_000));
-    try std.testing.expectEqual(@as(?Cause, .no_leader), d.causeOf(1, 16_000));
+    try std.testing.expectEqual(@as(?Cause, null), d.causeOf(1, 11_000 + NO_LEADER_MS - 1));
+    try std.testing.expectEqual(@as(?Cause, .no_leader), d.causeOf(1, 11_000 + NO_LEADER_MS));
 }
 
 test "channel driver: what a leader proposed and hasn't applied is released when it applies, and all of it with the term" {

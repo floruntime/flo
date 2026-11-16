@@ -1683,18 +1683,17 @@ pub const ProcessingHandler = struct {
     }
 
     /// The sink of `pipe` the message at `seq` to `to` is for, by its
-    /// slot; else, when the message is another job's, `pipe`'s own queue
-    /// sink on `to`, which is what can fill; else "": a KV sink's keys are
-    /// many.
+    /// slot, or "": a KV sink's keys are many, and the message may be
+    /// another job's, whose full target this one can't name.
     fn waitingSink(self: *const ProcessingHandler, read: view_mod.ReadView, pipe: *const PipelineState, to: u16, seq: u64) []const u8 {
         var kb: [channels_mod.OUT_KEY]u8 = undefined;
-        if (read.get(channels_mod.OutFam, channels_mod.outKey(&kb, to, seq)) catch null) |out| for (pipe.sinks) |snk| {
+        const out = (read.get(channels_mod.OutFam, channels_mod.outKey(&kb, to, seq)) catch null) orelse return "";
+        for (pipe.sinks) |snk| {
             const name = if (snk.kind == .ts) snk.measurement else snk.target;
             if (snk.kind == .kv) continue;
             const slot = router.slot(router.routeNsKey(self.namespaceIdOf(snk.namespace), name));
             if (slot == out.v.slot) return name;
-        };
-        for (pipe.sinks) |snk| if (snk.kind == .queue and self.sinkShard(snk) == to) return snk.target;
+        }
         return "";
     }
 
@@ -2971,7 +2970,7 @@ test "processing: what a pipeline waits for, in words" {
         .{ .w = .{ .pressure = .{ .shard = 3, .stall = .{ .shard = 3, .cause = 1 }, .target = "jobs" } }, .says = "waiting: writes to shard 3 are queued: it is halted" },
         .{ .w = .{ .pressure = .{ .shard = 3, .stall = .{ .shard = 3, .cause = 3 }, .target = "" } }, .says = "waiting: writes to shard 3 are queued: it cannot flush to disk" },
         .{ .w = .{ .outbox = .{ .to = 1, .bytes = 130 << 20, .cap = 128 << 20 } }, .says = "waiting: the outbox to shard 1 is full (130 MiB of 128 MiB)" },
-        .{ .w = .{ .outbox = .{ .to = 1, .bytes = 70 << 10, .cap = 64 << 10, .cause = .no_leader } }, .says = "waiting: the outbox to shard 1 is full (70 KiB of 64 KiB): it hasn't answered for 5 s" },
+        .{ .w = .{ .outbox = .{ .to = 1, .bytes = 70 << 10, .cap = 64 << 10, .cause = .no_leader } }, .says = "waiting: the outbox to shard 1 is full (70 KiB of 64 KiB): it hasn't answered for 10 s" },
         .{ .w = .{ .outbox = .{ .to = 2, .bytes = 9 << 20, .cap = 8 << 20, .cause = .target_full } }, .says = "waiting: the outbox to shard 2 is full (9 MiB of 8 MiB): it has a full target" },
         .{ .w = .{ .outbox = .{ .to = null, .bytes = 1 << 30, .cap = 1 << 30 } }, .says = "waiting: this shard's outboxes are full (1024 MiB of 1024 MiB)" },
         .{ .w = .log, .says = "waiting for room in this shard's log" },
