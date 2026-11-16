@@ -422,6 +422,18 @@ pub const ServerProcess = struct {
             try stdx.fs.writeAll(config_file, fbs.buffered());
         }
 
+        // Keep the previous run's log across a restart: rotate it to
+        // `server.log.prev` before this run truncates `server.log`. Without it
+        // a restart test's log dump shows only the new boot, losing the old
+        // run's shutdown and final flush — so it can't tell "never flushed"
+        // from "flushed but not replayed". A missing file (the first start) is
+        // fine; only the immediately previous run is kept.
+        {
+            var prev_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const prev = std.fmt.bufPrint(&prev_buf, "{s}.prev", .{self.log_file_path}) catch "";
+            if (prev.len > 0) stdx.fs.rename(self.log_file_path, prev) catch {};
+        }
+
         // Open log file for output redirection
         var log_file = try stdx.fs.createFileAbsolute(self.log_file_path, .{
             .truncate = true,
@@ -765,7 +777,11 @@ pub const ServerProcess = struct {
 
     /// Read server logs (returns owned slice - caller must free)
     pub fn readLogs(self: *Self) ![]const u8 {
-        const file = stdx.fs.openFileAbsolute(self.log_file_path, .{}) catch |err| {
+        return self.readLogAt(self.log_file_path);
+    }
+
+    fn readLogAt(self: *Self, path: []const u8) ![]const u8 {
+        const file = stdx.fs.openFileAbsolute(path, .{}) catch |err| {
             if (err == error.FileNotFound) return try self.allocator.dupe(u8, "");
             return err;
         };
@@ -810,8 +826,19 @@ pub const ServerProcess = struct {
         return matches.toOwnedSlice(self.allocator);
     }
 
-    /// Print server logs to stderr (useful for debugging failed tests)
+    /// Print server logs to stderr (useful for debugging failed tests). After a
+    /// restart, the previous run's log (its shutdown and final flush) is printed
+    /// first, from the rotated `server.log.prev`, then this run's.
     pub fn dumpLogs(self: *Self) void {
+        var prev_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const prev = std.fmt.bufPrint(&prev_buf, "{s}.prev", .{self.log_file_path}) catch "";
+        if (prev.len > 0) {
+            if (self.readLogAt(prev)) |plogs| {
+                defer self.allocator.free(plogs);
+                if (plogs.len > 0) std.debug.print("\n=== PREVIOUS RUN LOGS ({s}) ===\n{s}\n=== END PREVIOUS RUN LOGS ===\n", .{ prev, plogs });
+            } else |_| {}
+        }
+
         const logs = self.readLogs() catch |err| {
             std.debug.print("\n=== SERVER LOGS (error: {}) ===\n", .{err});
             return;
