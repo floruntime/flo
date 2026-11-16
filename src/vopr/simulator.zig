@@ -2161,6 +2161,46 @@ pub const Simulator = struct {
         }
     }
 
+    /// A committed entry's effect on this node's model: the checker's view,
+    /// the committed config, and the families' state. Shared by live apply
+    /// and the restart-prefix replay (through `replayOneEntry`) so an entry
+    /// reaches the checker the same way whichever path applied it. The stamp
+    /// bookkeeping (applied_stamp, noteApplied, last_applied) stays with each
+    /// caller, since live and replay carry the stamp differently.
+    fn applyEntryModel(self: *Simulator, node: *SimNode, e: *const entry_mod.Entry, idx: u64, is_op: bool) void {
+        while (node.applied_ticks.items.len < idx) node.applied_ticks.append(self.allocator, 0) catch @panic("sim OOM");
+        node.applied_ticks.items[idx - 1] = self.now;
+        const learned_at = if (comptime plant.active == .erasure_from_apply) self.now else if (idx <= node.learned.ticks.items.len) @min(self.now, node.learned.ticks.items[idx - 1]) else self.now;
+        self.checker.onApply(&self.workload, node.id, idx, e.header.term, e.header.entry_type, e.payload, is_op, self.now, learned_at, self.latest_crash_at);
+        // A config applied is committed, as production's applier records it.
+        if (e.header.entry_type == @backingInt(entry_mod.EntryType.raft_config)) {
+            if (membership.decode(e.payload)) |cfg| {
+                // Each committed config follows from the one before: what one
+                // change at a time, after an own-term commit, is there to
+                // guarantee.
+                if (node.applied_config.member_count > 0) {
+                    // Who proposed is not in the entry: a lone voter's own
+                    // two-at-once step passes here, and `proposeConfig` checks
+                    // the proposer.
+                    var lone: [membership.MAX_MEMBERS]u32 = undefined;
+                    const prev_voters = node.applied_config.voterIds(&lone);
+                    const proposer: u32 = if (prev_voters.len == 1) prev_voters[0] else 0;
+                    if (membership.checkChange(&node.applied_config, &cfg, proposer)) |why| self.checker.fail(.{
+                        .invariant = .config_safety,
+                        .node = node.id,
+                        .index = idx,
+                        .tick = self.now,
+                        .detail = why.message(),
+                    });
+                }
+                node.applied_config = cfg;
+                node.raft.commitMembership(&cfg, idx);
+                node.raft.recordConfig(idx, e.header.term, &cfg);
+            }
+        }
+        self.applyFamilies(node, e, idx, is_op);
+    }
+
     /// The host's apply: with sync durability the log is flushed and the
     /// node told so first, as the shard does before every apply — a
     /// leader's own copy counts toward commit only once on disk.
@@ -2211,39 +2251,8 @@ pub const Simulator = struct {
                 });
                 node.applied_stamp = e.header.timestamp_ns;
                 node.applied_stamp_index = idx;
-                while (node.applied_ticks.items.len < idx) node.applied_ticks.append(self.allocator, 0) catch @panic("sim OOM");
-                node.applied_ticks.items[idx - 1] = self.now;
+                self.applyEntryModel(node, &e, idx, is_op);
                 node.raft.noteApplied(e.header.timestamp_ns);
-                const learned_at = if (comptime plant.active == .erasure_from_apply) self.now else if (idx <= node.learned.ticks.items.len) @min(self.now, node.learned.ticks.items[idx - 1]) else self.now;
-                self.checker.onApply(&self.workload, node.id, idx, e.header.term, e.header.entry_type, e.payload, is_op, self.now, learned_at, self.latest_crash_at);
-                // A config applied is committed, as production's applier
-                // records it.
-                if (e.header.entry_type == @backingInt(entry_mod.EntryType.raft_config)) {
-                    if (membership.decode(e.payload)) |cfg| {
-                        // Each committed config follows from the one before:
-                        // what one change at a time, after an own-term
-                        // commit, is there to guarantee.
-                        if (node.applied_config.member_count > 0) {
-                            // Who proposed is not in the entry: a lone voter's
-                            // own two-at-once step passes here, and
-                            // `proposeConfig` checks the proposer.
-                            var lone: [membership.MAX_MEMBERS]u32 = undefined;
-                            const prev_voters = node.applied_config.voterIds(&lone);
-                            const proposer: u32 = if (prev_voters.len == 1) prev_voters[0] else 0;
-                            if (membership.checkChange(&node.applied_config, &cfg, proposer)) |why| self.checker.fail(.{
-                                .invariant = .config_safety,
-                                .node = node.id,
-                                .index = idx,
-                                .tick = self.now,
-                                .detail = why.message(),
-                            });
-                        }
-                        node.applied_config = cfg;
-                        node.raft.commitMembership(&cfg, idx);
-                        node.raft.recordConfig(idx, e.header.term, &cfg);
-                    }
-                }
-                self.applyFamilies(node, &e, idx, is_op);
                 node.raft.last_applied = idx;
             }
         }
