@@ -8895,7 +8895,14 @@ fn replaySegmentFile(
             break :v verdictOf(losses, shard_id, Shard.nowMs(), &seg_entry, applyEntryCore(partition, replay_registry, &seg_entry, &replay_result));
         };
         switch (verdict) {
-            .applied, .duplicate => {},
+            .applied => {},
+            // At boot, segments replay in index order, so every entry should
+            // apply exactly once; a duplicate means overlapping segments or a
+            // wrong watermark.
+            .duplicate => {
+                const type_name = std.enums.tagName(entry_mod.EntryType, @fromBackingInt(@intCast(seg_entry.header.entry_type))) orelse "unknown";
+                log.warn("shard {d}: replayed entry {d} ({s}) was skipped at apply (the partition rejected it as not increasing); its effect is absent after this boot", .{ shard_id, seg_entry.header.index, type_name });
+            },
             .halt => |why| {
                 const type_name = std.enums.tagName(entry_mod.EntryType, @fromBackingInt(@intCast(seg_entry.header.entry_type))) orelse "unknown";
                 out.halt = Halt.init(&seg_entry, "entry {d} ({s}): {s} (a Flo bug)", .{ seg_entry.header.index, type_name, why });
