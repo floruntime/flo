@@ -325,7 +325,7 @@ jobs:
         run: |
           mode=check
           if [ "${{ github.event_name }}" = pull_request ] && changed=$(git diff --name-only HEAD^1 HEAD) && [ -n "$changed" ]; then
-            if ! grep -qE '^(src/(vopr|raft|replica|storage/ual|stdx|kv|contract|actions|queue|namespace|protocol)/|src/node/repair\.zig|src/storage/persistence\.zig|src/plant\.zig|build\.zig|scripts/vopr-seed-undos\.sh)' <<< "$changed"; then
+            if ! grep -qE '^(src/(vopr|raft|replica|storage/ual|stdx|kv|contract|actions|queue|namespace|protocol)/|src/node/repair\.zig|src/node/replay\.zig|src/storage/persistence\.zig|src/plant\.zig|build\.zig|scripts/vopr-seed-undos\.sh)' <<< "$changed"; then
               mode=compile
             fi
           fi

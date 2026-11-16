@@ -8,14 +8,15 @@
 //! LEAF MODULE, shared with src/vopr/simulator.zig: it must NOT import shard.zig
 //! or anything that pulls in the server stack (networking, protocol handlers,
 //! sinks, channels, processing). Its imports stay leaves (raft/log, ual/entry,
-//! repair, silent_loss, stdx) so the vopr binary, which never links shard.zig,
-//! can compile it.
+//! repair, silent_loss, plant, stdx) so the vopr binary, which never links
+//! shard.zig, can compile it.
 
 const std = @import("std");
 const log = @import("stdx").log;
 const entry_mod = @import("../storage/ual/entry.zig");
 const silent_loss = @import("silent_loss.zig");
 const repair = @import("repair.zig");
+const plant = @import("../plant.zig");
 const RaftLog = @import("../raft/log.zig").RaftLog;
 
 /// An entry every replica fails the same way, and why. A shard halted at
@@ -140,7 +141,8 @@ pub fn replayOneEntry(ctx: ReplayCtx, entry: *const entry_mod.Entry, out: *Repla
     }
     // Above the watermark: in the log, not yet in the projections. Past a halt:
     // in the log, and nothing of it applies until a repair.
-    if (entry.header.index > ctx.watermark or out.halt != null) return;
+    const mark = if (comptime plant.active == .replay_watermark_off_by_one) ctx.watermark + 1 else ctx.watermark;
+    if (entry.header.index > mark or out.halt != null) return;
     // A repair skips it: taken as a halt on it left a replica that halted live,
     // and its applier never runs.
     if (skippedHere(ctx.skips, entry)) {

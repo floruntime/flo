@@ -25,6 +25,9 @@ pub const Plant = enum {
     async_boot_applies,
     /// The simulator's repair waits on every core node, members or not.
     repair_waits_on_removed,
+    /// Boot replay applies one entry past the commit watermark, so it can apply
+    /// an entry a leader has not committed.
+    replay_watermark_off_by_one,
 };
 
 pub const active: Plant = std.meta.stringToEnum(Plant, @import("build_options").vopr_plant) orelse
