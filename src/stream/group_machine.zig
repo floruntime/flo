@@ -499,6 +499,10 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         },
         .group_release => {
             const p = ge.Release.decodeAll(e.payload, &diag) catch return error.Halt;
+            // The handler refuses this at propose; a log entry from any other
+            // proposer is refused here, not half applied.
+            if (p.ended != .failed and (p.dead or p.delay_ms > 0 or p.@"error".len > 0))
+                return out.refuse(.bad_request, .unclassified, ABANDON_ALONE);
             try report(view, out, p, .{ .release = .{ .delay_ms = p.delay_ms, .dead = p.dead, .@"error" = p.@"error", .ended = p.ended } }, stamp);
         },
         .group_extend => {
@@ -718,48 +722,52 @@ const Report = union(enum) {
 };
 
 /// A report's records, each applied to on its own: one it holds changes,
-/// and one it doesn't is answered by what became of it. A resent release
-/// whose first applied counts as applied; a resent settle finds its record
-/// gone, as the settle removed it, and is answered gone.
+/// and one it doesn't is answered by what became of it. The same release
+/// resent (a nack, or an abandon) counts as applied once the first has; a
+/// resent settle finds its record gone, as the settle removed it, and is
+/// answered gone.
 fn report(view: *View, out: *Result, p: anytype, kind: Report, stamp: u64) ApplyError!void {
     const ns: NamespaceId = .of(p.ns);
     const scope = scopeOf(ns, p.stream, p.group);
     const mk = try M.inNs(view, ns, &scope);
     const found = try view.get(Metas, mk);
     const rec = try streamRec(view, streamOf(ns, p.stream));
-    var meta = if (found) |m| (if (live(m.v, rec) and std.mem.eql(u8, m.v.stream, p.stream) and std.mem.eql(u8, m.v.group, p.group)) m else null) else null;
+    const named = if (found) |m| (if (live(m.v, rec) and std.mem.eql(u8, m.v.stream, p.stream) and std.mem.eql(u8, m.v.group, p.group)) m else null) else null;
     // No such group: the whole report is refused, not each record gone.
-    if (meta == null) return out.refuse(.not_found, .not_found, NO_GROUP);
+    var meta = named orelse return out.refuse(.not_found, .not_found, NO_GROUP);
     var applied: u32 = 0;
     var to: u64 = 0;
     // Refused items are said after the count: room for each, then filled.
     var refused: [ge.MAX_BATCH]struct { record: StreamID, why: Why } = undefined;
     var nr: usize = 0;
     var it = p.items.iterator();
-    while (it.next() catch return error.Halt) |named| {
-        const record: StreamID = .{ .timestamp_ms = named.ms, .sequence = named.seq };
+    while (it.next() catch return error.Halt) |one| {
+        const record: StreamID = .{ .timestamp_ms = one.ms, .sequence = one.seq };
         const id = idOf(scope, record);
         const key = try M.inNs(view, ns, &id);
-        var item = (if (meta != null) try view.get(Items, key) else null) orelse {
+        var item = (try view.get(Items, key)) orelse {
             refused[nr] = .{ .record = record, .why = .gone };
             nr += 1;
             continue;
         };
-        if (!delivery.holds(item.v, p.holder, named.deliveries, p.token)) {
-            const same = delivery.sameDelivery(item.v, p.holder, named.deliveries, p.token);
+        if (!delivery.holds(item.v, p.holder, one.deliveries, p.token)) {
+            const same = delivery.sameDelivery(item.v, p.holder, one.deliveries, p.token);
+            // Only the same hand-back resent counts as applied: a nack after
+            // an abandon of the delivery, or the reverse, is answered by what
+            // the first made of it.
             const repeat = same and switch (kind) {
                 .settle, .extend => false,
-                .release => item.v.ended == .released or item.v.ended == .abandoned,
+                .release => |r| item.v.ended == if (r.ended == .failed) Ended.released else Ended.abandoned,
             };
             if (repeat) {
                 applied += 1;
                 continue;
             }
-            refused[nr] = .{ .record = record, .why = why(item.v, p.holder, named.deliveries, p.token) };
+            refused[nr] = .{ .record = record, .why = why(item.v, p.holder, one.deliveries, p.token) };
             nr += 1;
             continue;
         }
-        const m = &meta.?.v;
+        const m = &meta.v;
         switch (kind) {
             .settle => {
                 try M.endLease(view, ns, &id, item.v, p.holder, null, p.expiry_ns);
@@ -811,7 +819,7 @@ fn report(view: *View, out: *Result, p: anytype, kind: Report, stamp: u64) Apply
         }
         applied += 1;
     }
-    if (meta) |m| if (applied > 0) try view.put(Metas, mk, m);
+    if (applied > 0) try view.put(Metas, mk, meta);
     out.putInt(u32, applied);
     if (kind == .extend) out.putInt(u64, to);
     for (refused[0..nr]) |r| {
@@ -832,6 +840,8 @@ fn die(view: *View, ns: NamespaceId, scope: *const Scope, record: StreamID, item
 }
 
 const EXPIRED = "lease expired";
+
+pub const ABANDON_ALONE = "bad request: abandon hands records back unstarted, so it takes no dead, delay_ms or error";
 
 /// One expire item, past due by the log's clock: its key goes, and if it
 /// is the record's live deadline, the lease ends as a failure.
@@ -1260,12 +1270,70 @@ test "group machine: a report to a group that isn't there is refused not_found, 
     }
 }
 
-fn abandon(t: *TestGroups, d: Delivered, records: []const StreamID, stamp: u64) !Answer {
+const HandBackOpts = struct { ended: ge.HandBack, dead: bool = false, delay_ms: u64 = 0, @"error": []const u8 = "" };
+
+fn handBackRaw(t: *TestGroups, d: Delivered, records: []const StreamID, stamp: u64, o: HandBackOpts) !Result {
     var buf: [512]u8 = undefined;
     const items = try itemsOf(&buf, t, records);
     const exp = if (t.item("s", "g", records[0])) |i| i.expiry_ns else 0;
-    const r = try t.apply(.group_release, ge.Release.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = d.token, .expiry_ns = exp, .items = items, .delay_ms = 0, .dead = false, .@"error" = "", .ended = .abandoned }, stamp);
-    return Answer.of(r, false);
+    return t.apply(.group_release, ge.Release.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = d.token, .expiry_ns = exp, .items = items, .delay_ms = o.delay_ms, .dead = o.dead, .@"error" = o.@"error", .ended = o.ended }, stamp);
+}
+
+fn handBack(t: *TestGroups, d: Delivered, records: []const StreamID, stamp: u64, o: HandBackOpts) !Answer {
+    return Answer.of(try handBackRaw(t, d, records, stamp, o), false);
+}
+
+fn abandon(t: *TestGroups, d: Delivered, records: []const StreamID, stamp: u64) !Answer {
+    return handBack(t, d, records, stamp, .{ .ended = .abandoned });
+}
+
+test "group machine: a nack after an abandon of the same delivery, or the reverse, is answered released, not applied; an abandon counts no release" {
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 2);
+    const d = try deliver(&t, 2, 1 << 20, "c1", 10 * ms);
+    const a = sid(100, 0);
+    const b = sid(100, 1);
+
+    try testing.expectEqual(@as(u32, 1), (try abandon(&t, d, &.{a}, 11 * ms)).applied);
+    try testing.expectEqual(@as(u64, 0), t.meta("s", "g").?.released);
+    var sums = t.sums();
+    const nack = try handBack(&t, d, &.{a}, 12 * ms, .{ .ended = .failed, .@"error" = "boom" });
+    try testing.expectEqual(@as(u32, 0), nack.applied);
+    try testing.expectEqual(Why.released, nack.refused[0].why);
+    try testing.expectEqual(@as(u32, 0), t.item("s", "g", a).?.failures);
+    try testing.expectEqual(sums, t.sums());
+
+    try testing.expectEqual(@as(u32, 1), (try handBack(&t, d, &.{b}, 13 * ms, .{ .ended = .failed })).applied);
+    try testing.expectEqual(@as(u64, 1), t.meta("s", "g").?.released);
+    sums = t.sums();
+    const late = try abandon(&t, d, &.{b}, 14 * ms);
+    try testing.expectEqual(@as(u32, 0), late.applied);
+    try testing.expectEqual(Why.released, late.refused[0].why);
+    try testing.expectEqual(@as(u32, 1), t.item("s", "g", b).?.failures);
+    try testing.expectEqual(sums, t.sums());
+}
+
+test "group machine: apply refuses an abandon that carries dead, a delay or an error, changing nothing" {
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 1);
+    const d = try deliver(&t, 1, 1 << 20, "c1", 10 * ms);
+    const rec = sid(100, 0);
+    const sums = t.sums();
+    for ([_]HandBackOpts{
+        .{ .ended = .abandoned, .dead = true },
+        .{ .ended = .abandoned, .delay_ms = 1000 },
+        .{ .ended = .abandoned, .@"error" = "boom" },
+        .{ .ended = .unread, .dead = true },
+    }) |o| {
+        const r = try handBackRaw(&t, d, &.{rec}, 11 * ms, o);
+        const why_not = r.refused().?;
+        try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.bad_request, why_not.status);
+        try testing.expectEqualStrings(ABANDON_ALONE, why_not.refusal.message);
+        try testing.expectEqual(sums, t.sums());
+        try testing.expectEqual(Status.leased, t.item("s", "g", rec).?.status);
+    }
 }
 
 test "group machine: an abandoned record is ready at once, its delivery kept and no failure counted; a resend applies, a stale one doesn't" {

@@ -418,7 +418,7 @@ test "e2e/group: a removed group op is refused, naming what replaces it" {
     };
 }
 
-test "e2e/group: an ack or nack to a group that isn't there is refused not found, and a nack's error up to 1024 bytes is kept" {
+test "e2e/group: an ack, nack or touch to a group that isn't there is refused not found, and a nack's error past an option's 255 bytes is kept whole" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
     try ctx.exec(&.{ "stream", "append", "s", "a" });
@@ -426,10 +426,12 @@ test "e2e/group: an ack or nack to a group that isn't there is refused not found
     defer r.deinit();
     var db: [256]u8 = undefined;
     const ds = try deliveries(&db, r.stdout);
-    var none = try ctx.cli.run(&.{ "stream", "group", "ack", "s", "--group", "nope", "--consumer", "w", "--ids", ds });
-    defer none.deinit();
-    try testing.expect(none.exit_code != 0);
-    try testing.expect(none.stderrContains("consumer group not found"));
+    for ([_][]const u8{ "ack", "nack", "touch" }) |verb| {
+        var none = try ctx.cli.run(&.{ "stream", "group", verb, "s", "--group", "nope", "--consumer", "w", "--ids", ds });
+        defer none.deinit();
+        try testing.expectEqual(@as(u8, 1), none.exit_code);
+        try testing.expect(none.stderrContains("consumer group not found"));
+    }
     // An error past an option's 255 bytes rides in the body whole.
     const long: [1000]u8 = @splat('e');
     var nack = try ctx.cli.run(&.{ "stream", "group", "nack", "s", "--group", "g", "--consumer", "w", "--ids", ds, "--error", &long });
@@ -456,7 +458,7 @@ test "e2e/group: an abandoned record goes again at once and spends no attempt; a
         const ds = try deliveries(&db, r.stdout);
         if (n == 1) {
             // Abandon is the hand-back alone.
-            for ([_][]const u8{ "--dlq", "--error=boom" }) |extra| {
+            for ([_][]const u8{ "--dlq", "--error=boom", "--delay=1000" }) |extra| {
                 var bad = try ctx.cli.run(&.{ "stream", "group", "nack", "s", "--group", "g", "--consumer", "w", "--ids", ds, "--abandon", extra });
                 defer bad.deinit();
                 try testing.expect(bad.exit_code != 0);

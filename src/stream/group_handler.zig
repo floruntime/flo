@@ -641,7 +641,7 @@ fn report(shard: *Shard, conn: *Connection, req: Request, kind: Report) void {
             // Handed back unstarted: no failure, so nothing a failure takes.
             const abandon = req.findOption(.abandon) != null;
             if (abandon and (dead or delay > 0 or text.len > 0))
-                return refuse(shard, conn, req.header.request_id, .bad_request, "bad request: abandon hands records back unstarted, so it takes no dead, delay_ms or error");
+                return refuse(shard, conn, req.header.request_id, .bad_request, machine.ABANDON_ALONE);
             break :blk propose(shard, .group_release, ge.Release.Value{ .ns = req.ns_id.int(), .stream = req.key, .group = n.group, .holder = consumer, .token = token, .expiry_ns = expiry, .items = parsed.items, .delay_ms = delay, .dead = dead, .@"error" = text, .ended = if (abandon) .abandoned else .failed });
         },
         .touch => blk: {
