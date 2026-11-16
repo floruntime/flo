@@ -22,6 +22,8 @@ const raft_node = @import("../raft/node.zig");
 const raft_log_mod = @import("../raft/log.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const repair = @import("../node/repair.zig");
+const replay = @import("../node/replay.zig");
+const silent_loss = @import("../node/silent_loss.zig");
 const plant = @import("../plant.zig");
 const scenario_mod = @import("scenario.zig");
 const workload_mod = @import("workload.zig");
@@ -391,10 +393,8 @@ const SimNode = struct {
     /// set each tick.
     wall_offset_ms: i64 = 0,
     wall_ns: u64 = 0,
-    /// The stamp of the last entry it applied, and that entry's index, for
-    /// `stamp_order`.
+    /// The stamp of the last entry it applied, for `stamp_order`.
     applied_stamp: u64 = 0,
-    applied_stamp_index: u64 = 0,
     /// The last config this node applied, for `config_safety`.
     applied_config: membership.Config = .{},
     /// The entry it halted at, 0 for none: it applies nothing from it on.
@@ -1343,6 +1343,52 @@ pub const Simulator = struct {
         } else self.halt = at;
     }
 
+    /// The simulator's `replay.ReplayApply`: it drives the real boot-replay
+    /// decisions (restore, watermark gate, skip pass-over, stamp halt) over the
+    /// durable log and applies each prefix entry through the sim's own checker
+    /// and family model, so the checker's view is built the same whether an
+    /// entry arrives by replay or live. The sim models repairs through
+    /// `self.halt`, not a `repair.Skips` set, so a node that comes up at the
+    /// entry the group halted at stops replay there, as production's crash
+    /// marker does.
+    const SimReplay = struct {
+        sim: *Simulator,
+        node: *SimNode,
+
+        fn applier(self: *SimReplay) replay.ReplayApply {
+            return .{ .ctx = self, .apply = apply, .pass_over = passOver };
+        }
+
+        fn apply(ctx: *anyopaque, entry: *const entry_mod.Entry) replay.Verdict {
+            const self: *SimReplay = @ptrCast(@alignCast(ctx));
+            const sim = self.sim;
+            const node = self.node;
+            const idx = entry.header.index;
+            // Comes up halted at the entry the group halted at: replay applies
+            // up to it and no further, as production's crash marker stops it.
+            if (sim.halt) |h| {
+                if (h.index == idx and h.term == entry.header.term and
+                    std.hash.Wyhash.hash(HASH_SEED, entry.payload) == h.hash)
+                    return .{ .halt = "halted here before the restart" };
+            }
+            const is_op = entry.header.entry_type != @backingInt(entry_mod.EntryType.raft_noop) and
+                entry.header.entry_type != @backingInt(entry_mod.EntryType.raft_config) and
+                entry.header.entry_type != @backingInt(entry_mod.EntryType.repair_skip);
+            if (is_op and sim.scenario.halt_op != 0 and
+                sim.workload.opIdAt(entry.header.term, idx, entry.header.entry_type, entry.payload) == sim.scenario.halt_op - 1)
+                return .{ .halt = "halt_op injection" };
+            sim.applyEntryModel(node, entry, idx, is_op);
+            return .applied;
+        }
+
+        fn passOver(ctx: *anyopaque, entry: *const entry_mod.Entry) ?silent_loss.Damage {
+            _ = ctx;
+            _ = entry;
+            // The sim carries no repair.Skips into replay, so this never runs.
+            return null;
+        }
+    };
+
     fn restartNode(self: *Simulator, node: *SimNode) !void {
         const prev_term = node.max_term_seen;
         node.raft.deinit();
@@ -1355,16 +1401,48 @@ pub const Simulator = struct {
         );
         attachHost(node);
         node.applied_stamp = 0;
-        node.applied_stamp_index = 0;
         // Its apply starts again from the log, and halts where it did.
         node.halted_at = 0;
         for (self.nodes, 0..) |_, j| {
             if (j + 1 != node.id) node.raft.addPeer(@intCast(j + 1));
         }
         self.commitAllMembers(node);
+        // Replay re-applies from the start, so reset the models it rebuilds
+        // before any entry applies.
+        node.applied_config = .{};
+        node.replay_through = node.applied_ticks.items.len;
+        node.counter.reset(self.allocator, @intCast(@min(node.disk.durable_len, std.math.maxInt(u32))));
+        node.kv.reset();
+        node.actions.reset();
+        node.queues.reset();
+        node.ns.reset();
+        if (self.extension) |x| x.reset(x.ctx, node.id);
+        node.apply_paused_until = 0;
+        node.families_index = 0;
+        node.families_stale = false;
+        node.history = 0;
+        // What was flushed under a commit index is committed, as production's
+        // boot takes the segments' watermark; the rest waits for a leader.
+        // Under async flush a crashed quorum can lose what this node kept, and
+        // a leader then rewrites it: an entry applied can't be taken back, so
+        // the data waits for a leader, as production's async boot does.
+        const mark = @min(node.disk.watermark(), node.disk.durable_len);
+        const cold = self.scenario.durability == .async_flush and comptime plant.active != .async_boot_applies;
         // Replay the durable log before attaching the hook, exactly as
-        // production wires persistence after segment replay — a hook
-        // active during replay would re-feed the disk.
+        // production wires persistence after segment replay — a hook active
+        // during replay would re-feed the disk. Drive the real boot-replay
+        // decisions (restore, watermark gate, skip pass-over, stamp halt)
+        // through replayOneEntry; the sim's model is the applier below the mark.
+        var sim_replay: SimReplay = .{ .sim = self, .node = node };
+        const empty_skips: repair.Skips = .{};
+        const ctx: replay.ReplayCtx = .{
+            .raft_log = &node.raft.log,
+            .watermark = if (cold) 0 else mark,
+            .skips = &empty_skips,
+            .shard_id = @intCast(node.id),
+            .apply = sim_replay.applier(),
+        };
+        var out: replay.ReplayOutcome = .{};
         for (node.disk.entries.items[0..node.disk.durable_len], 1..) |e, idx| {
             var entry = entry_mod.buildEntry(
                 @fromBackingInt(@intCast(e.entry_type)),
@@ -1375,32 +1453,32 @@ pub const Simulator = struct {
                 e.payload,
             );
             entry.header.crc32c = entry.computeCrc();
-            _ = node.raft.log.append(&entry) catch @panic("sim replay append");
-            // The configs the log holds, as production's boot records them.
+            replay.replayOneEntry(ctx, &entry, &out);
+            if (out.damage != null) break;
+            // The configs the log holds set the membership for routing, as
+            // production's boot reads the latest config from the restored log.
             if (e.entry_type == @backingInt(entry_mod.EntryType.raft_config)) {
                 if (membership.decode(e.payload)) |cfg| {
                     node.raft.recordConfig(@intCast(idx), e.term, &cfg);
-                    // The latest config in the log is the membership, as
-                    // production's boot reads it.
                     node.raft.setMembership(&cfg, @intCast(idx));
                     node.raft.membership_term = e.term;
                 }
             }
         }
+        // Replay left the applied stamp and index here; live apply continues
+        // from them, as production's boot feeds replay's last stamp to
+        // noteApplied (shard.zig:1166). A boot that halted comes up halted
+        // there, having applied only what precedes it.
+        node.raft.last_applied = out.applied_through;
+        node.applied_stamp = out.last_stamp;
+        node.raft.noteApplied(out.last_stamp);
+        if (out.halt) |h| if (node.raft.log.getEntryCopy(h.index, self.apply_buf)) |he| self.haltNode(node, &he);
         // What the sink persisted is what comes back — nothing in volatile
         // mode, so such a node restarts at term 0.
         // The log is evidence of the term too, as in production's boot.
         // Volatile mode keeps the demonstrator of a node with no hard state
         // at all: it restarts at term 0.
         node.raft.current_term = if (self.options.volatile_hard_state) node.disk.term else @max(node.disk.term, node.raft.log.lastTerm());
-        // What was flushed under a commit index is committed, as
-        // production's boot takes the segments' watermark; the rest waits
-        // for a leader. Under async flush a crashed quorum can lose what
-        // this node kept, and a leader then rewrites it: an entry applied
-        // can't be taken back, so the data waits for a leader, as
-        // production's async boot does.
-        const mark = @min(node.disk.watermark(), node.disk.durable_len);
-        const cold = self.scenario.durability == .async_flush and comptime plant.active != .async_boot_applies;
         node.raft.commit_index = if (cold) 0 else mark;
         if (node.raft.commit_index > 0) self.warm_restarts += 1;
         node.raft.voted_for = node.disk.voted_for;
@@ -1418,30 +1496,10 @@ pub const Simulator = struct {
         resetReplica(node);
         node.up = true;
         self.restarts += 1;
-        // Replay applies from the start again.
-        node.applied_config = .{};
-        node.replay_through = node.applied_ticks.items.len;
-        node.counter.reset(self.allocator, @intCast(@min(node.disk.durable_len, std.math.maxInt(u32))));
-        node.kv.reset();
-        node.actions.reset();
-        node.queues.reset();
-        node.ns.reset();
-        if (self.extension) |x| x.reset(x.ctx, node.id);
-        node.apply_paused_until = 0;
-        node.families_index = 0;
-        node.families_stale = false;
-        node.history = 0;
-        // A node whose log holds the entry the group halted at comes up
-        // halted there, as production's boot replay stops at it.
-        if (self.halt) |h| if (node.raft.log.getEntryCopy(h.index, self.apply_buf)) |e| {
-            if (e.header.term == h.term and std.hash.Wyhash.hash(HASH_SEED, e.payload) == h.hash) {
-                node.halted_at = h.index;
-                node.raft.halt_at = .{ .index = e.header.index, .term = e.header.term, .crc = e.header.crc32c };
-            }
-        };
-        // Applied through it before any leader speaks, as production's boot
-        // replays it, committing each config it applies. A boot that halts
-        // short of it commits only what it applied, as production's does.
+        // The replay above applied the prefix; this notes what the node has
+        // learned, flushes a sync disk, and resumes past a skip if there is
+        // one. Commit sits at what was applied, so a boot that halted commits
+        // only that, as production's does.
         self.applyCommitted(node);
         node.raft.commit_index = node.raft.last_applied;
         // A cold boot still commits the configs under the mark, as a warm
@@ -2218,14 +2276,6 @@ pub const Simulator = struct {
         {
             while (node.raft.last_applied < node.raft.commit_index) {
                 const idx = node.raft.last_applied + 1;
-                // Apply rewound (async flush lost committed history and the
-                // log took the leader's): the entry before is the log's now.
-                const stamp_before: ?u64 = if (idx == node.applied_stamp_index + 1)
-                    node.applied_stamp
-                else if (node.raft.log.getEntryCopy(idx - 1, self.apply_buf)) |prev|
-                    prev.header.timestamp_ns
-                else
-                    null;
                 // Never bare getEntry (the wrap-null trap). A restarted
                 // node's durable log can exceed its ring; the log reads the
                 // rest from the disk itself.
@@ -2242,7 +2292,12 @@ pub const Simulator = struct {
                     self.haltNode(node, &e);
                     break;
                 }
-                if (stamp_before != null and e.header.timestamp_ns <= stamp_before.?) self.checker.fail(.{
+                // The same rule production halts a live apply on (shard.zig:5657,
+                // applyThrough): a committed entry's stamp never falls at or
+                // before the last applied one's, a skip excepted. Production
+                // halts as a defence against a Flo bug; the sim's job is to find
+                // it, so it fails the checker on the condition instead.
+                if (node.applied_stamp != 0 and e.header.timestamp_ns <= node.applied_stamp and !replay.isSkip(&e)) self.checker.fail(.{
                     .invariant = .stamp_order,
                     .node = node.id,
                     .index = idx,
@@ -2250,7 +2305,6 @@ pub const Simulator = struct {
                     .detail = "committed entry stamped no later than the one before it",
                 });
                 node.applied_stamp = e.header.timestamp_ns;
-                node.applied_stamp_index = idx;
                 self.applyEntryModel(node, &e, idx, is_op);
                 node.raft.noteApplied(e.header.timestamp_ns);
                 node.raft.last_applied = idx;
