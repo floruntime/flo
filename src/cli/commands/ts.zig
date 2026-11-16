@@ -182,21 +182,11 @@ fn parseTimeArg(s: []const u8) ?i64 {
         return std.fmt.parseInt(i64, s, 10) catch null;
     }
 
-    // Relative: -Nh, -Nm, -Nd, -Ns
+    // Relative: -Nh, -Nm, -Nd, -Ns. One too far back for an i64 of ms
+    // isn't a time, rather than an overflow.
     if (s.len < 3) return null; // need at least "-1h"
-    const num_str = s[1 .. s.len - 1];
-    const unit = s[s.len - 1];
-    const num = std.fmt.parseInt(i64, num_str, 10) catch return null;
-
-    const now_ms = @import("stdx").time.milliTimestamp();
-
-    return switch (unit) {
-        's' => now_ms - num * 1000,
-        'm' => now_ms - num * 60 * 1000,
-        'h' => now_ms - num * 3600 * 1000,
-        'd' => now_ms - num * 86400 * 1000,
-        else => null,
-    };
+    const back_ms = parseDuration(s[1..]) orelse return null;
+    return std.math.sub(i64, @import("stdx").time.milliTimestamp(), back_ms) catch null;
 }
 
 /// Parse a duration string like "1m", "5m", "1h", "1d" to milliseconds.
@@ -953,6 +943,10 @@ test "parseTimeArg relative" {
 
     const result_d = parseTimeArg("-7d");
     try std.testing.expect(result_d != null);
+
+    // Too far back for an i64 of ms: not a time, not an overflow.
+    try std.testing.expectEqual(@as(?i64, null), parseTimeArg("-999999999999999d"));
+    try std.testing.expectEqual(@as(?i64, null), parseTimeArg("--999999999999999d"));
 }
 
 test "parseTimeArg absolute" {
