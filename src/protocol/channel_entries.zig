@@ -65,9 +65,12 @@ pub const Trim = Record(&.{
     .{ .name = "through", .T = Int(u64) },
 });
 
-/// A parked message's target, as its machine names it: fixed width, so a
-/// target's parked records sort together under it.
-pub const TARGET_LEN = 12;
+/// A parked message's target: its machine's tag, then the target as that
+/// machine names it (`MACHINE_TARGET_LEN`). Fixed width, so a target's
+/// parked records sort together under it; tagged, so two machines' names
+/// never collide.
+pub const MACHINE_TARGET_LEN = 12;
+pub const TARGET_LEN = 1 + MACHINE_TARGET_LEN;
 
 /// One parked message an unpark applies: as it arrived, with its sender and
 /// seq, which it is parked under.

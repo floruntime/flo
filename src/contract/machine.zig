@@ -55,7 +55,8 @@ pub const Machine = struct {
     label: ?*const fn (e: *const Entry, buf: []u8) []const u8 = null,
 };
 
-pub const TARGET_LEN = @import("../protocol/channel_entries.zig").TARGET_LEN;
+/// A target as its machine names it; channels tag it with the machine.
+pub const TARGET_LEN = @import("../protocol/channel_entries.zig").MACHINE_TARGET_LEN;
 
 /// What's wrong with a list of machines, or null: one owner per entry type,
 /// one family per id and per name.

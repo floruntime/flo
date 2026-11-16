@@ -121,13 +121,27 @@ pub const PARK_NS = "~park";
 /// receiver answers `busy` for that target's messages (`admits`).
 pub const PARKED_TARGET_MAX: u64 = 16 << 20;
 pub const PARKED_SHARD_MAX: u64 = 128 << 20;
-/// Tests lower the target cap rather than park 16 MiB.
+/// Tests lower the caps rather than park megabytes.
 pub var test_parked_target_max: ?u64 = null;
+pub var test_parked_shard_max: ?u64 = null;
 /// VOPR's planted bug `no_park_behind`: a message for a target with room is
 /// applied even while earlier ones to it are parked. Never set in a server.
 pub var mutant_no_park_behind = false;
 
+pub const TARGET_LEN = ce.TARGET_LEN;
 const Target = [ce.TARGET_LEN]u8;
+
+/// The target entry `e` writes as parking keys it, or null for none: its
+/// machine's tag (the machine's first entry type, which no other machine
+/// owns), then the machine's own name for it.
+fn targetOf(owner: *const machine_mod.Machine, e: *const Entry) ?Target {
+    const tf = owner.target orelse return null;
+    const own = tf(e) orelse return null;
+    var t: Target = undefined;
+    t[0] = @backingInt(owner.entry_types[0]);
+    t[1..].* = own;
+    return t;
+}
 
 fn parkedRaw(buf: *[1 + ce.TARGET_LEN + 2 + 8]u8, target: Target, from: u16, seq: u64) []const u8 {
     buf[0] = 'p';
@@ -397,8 +411,8 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                         const owner = machine_mod.ownerOf(targets, t) orelse continue;
                         const as = asEntry(e, m);
                         try owner.keys(&as, out);
-                        // One it may park.
-                        if (owner.target) |tf| if (tf(&as)) |target| try parkKeys(out, target, p.from, seq);
+                        // A sink's, which may park.
+                        if (m.flags & entry_mod.Flags.SINK != 0) if (targetOf(owner, &as)) |target| try parkKeys(out, target, p.from, seq);
                     }
                 },
                 .channel_unpark => {
@@ -496,10 +510,11 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                         bug = .bad_payload;
                     }
                 } else if (owner) |o| {
-                    const target = if (o.target) |tf| tf(&as) else null;
-                    // A target with messages parked takes this one after
-                    // them: it parks behind, even if it has room now.
-                    if (target != null and !mutant_no_park_behind and try targetParkedIn(view, target.?) > 0) {
+                    const sink = m.flags & entry_mod.Flags.SINK != 0;
+                    const target = targetOf(o, &as);
+                    // A sink's write to a target with messages parked takes
+                    // it after them: it parks behind, even if it has room now.
+                    if (sink and target != null and !mutant_no_park_behind and try targetParkedIn(view, target.?) > 0) {
                         try park(view, target.?, p.from, seq, m, e.header.timestamp_ns);
                         applied = seq;
                         continue;
@@ -507,7 +522,7 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                     try o.apply(view, &as, &r);
                     // A sink's write its target is full for: parked, not
                     // lost; it takes its seq, and the channel goes on.
-                    if (target != null and m.flags & entry_mod.Flags.SINK != 0) if (r.refused()) |rf| if (rf.status == .overloaded) {
+                    if (sink and target != null) if (r.refused()) |rf| if (rf.status == .overloaded) {
                         try view.rollback(mark);
                         try park(view, target.?, p.from, seq, m, e.header.timestamp_ns);
                         applied = seq;
@@ -578,19 +593,26 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
             return .{ .header = h, .payload = payload };
         }
 
-        /// Whether this group's leader takes message `m` in now. One whose
-        /// target has messages parked would park too, so past the target's
-        /// or the shard's parked cap it waits at its sender (`busy`); every
-        /// other message is taken, so only that target pushes back.
+        /// Whether this group's leader takes message `m` in now. Only a
+        /// sink's message to a target may park. Past the shard's parked
+        /// cap none is taken; past its target's, none for that target.
+        /// The driver proposes a batch's messages before the first not
+        /// taken, and that one and those after wait at their sender
+        /// (`busy`), so only a sink to a full target pushes back.
+        ///
+        /// This reads committed state: inbounds proposed and not yet
+        /// applied aren't counted, so either cap may be passed by what
+        /// they park, at most a sender's window of messages each
+        /// (`channel_driver.WINDOW`).
         pub fn admits(read: ReadView, m: ce.Message.Value) bool {
+            if (m.flags & entry_mod.Flags.SINK == 0) return true;
             const t = std.enums.fromInt(EntryType, m.entry_type) orelse return true;
             const owner = machine_mod.ownerOf(targets, t) orelse return true;
-            const tf = owner.target orelse return true;
             const as = bare(m.entry_type, m.flags, m.payload);
-            const target = tf(&as) orelse return true;
+            const target = targetOf(owner, &as) orelse return true;
+            if (shardParked(read).bytes >= (test_parked_shard_max orelse PARKED_SHARD_MAX)) return false;
             const parked = targetParked(read, target);
-            if (parked.count == 0) return true;
-            return parked.bytes < (test_parked_target_max orelse PARKED_TARGET_MAX) and shardParked(read).bytes < PARKED_SHARD_MAX;
+            return parked.count == 0 or parked.bytes < (test_parked_target_max orelse PARKED_TARGET_MAX);
         }
 
         /// What this group has parked: messages, bytes, targets, and the
@@ -630,46 +652,75 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
             return s;
         }
 
+        /// An unpark to propose: its entry, the target it is for, and
+        /// whether it took as many messages as one entry holds, so more of
+        /// that target's may be waiting behind it.
+        pub const NextUnpark = struct { entry: []const u8, target: Target, full: bool };
+
         /// The unpark this group's leader should propose next, encoded in
         /// `buf` (over a message list built in `msgs`), or null: the first
-        /// target with parked messages whose first one has room now, with
-        /// its parked messages in order, as many as one entry takes. Apply
-        /// decides how many of them fit.
-        pub fn nextUnpark(read: ReadView, buf: []u8, msgs: []u8) ?[]const u8 {
+        /// target after `after`, in key order and round again, with parked
+        /// messages whose first one has room now, with its parked messages
+        /// in order, as many as one entry takes. Starting past the last one
+        /// unparked, a target that always has room can't starve those after
+        /// it. Apply decides how many of them fit.
+        pub fn nextUnpark(read: ReadView, buf: []u8, msgs: []u8, after: ?Target) ?NextUnpark {
             var mk: [PARK_KEY_MAX]u8 = undefined;
-            var targets_it = read.range(ParkFam, parkKey(&mk, "m"));
-            while (targets_it.next() catch return null) |rec| {
-                const raw = rec.key[1 + PARK_NS.len ..];
-                if (raw.len != 1 + ce.TARGET_LEN) continue;
-                const target: Target = raw[1..][0..ce.TARGET_LEN].*;
-                var pb: [1 + ce.TARGET_LEN]u8 = undefined;
-                pb[0] = 'p';
-                pb[1..].* = target;
-                var kb: [PARK_KEY_MAX]u8 = undefined;
-                var it = read.range(ParkFam, parkKey(&kb, &pb));
-                var w: schema.Writer = .{ .buf = msgs };
-                var n: u32 = 0;
-                var bytes: usize = 0;
-                while (it.next() catch return null) |p| {
-                    const praw = p.key[1 + PARK_NS.len ..];
-                    const from = std.mem.readInt(u16, praw[1 + ce.TARGET_LEN ..][0..2], .big);
-                    const seq = std.mem.readInt(u64, praw[1 + ce.TARGET_LEN + 2 ..][0..8], .big);
-                    if (n == 0) {
-                        const t = std.enums.fromInt(EntryType, p.value.v.entry_type) orelse break;
-                        const owner = machine_mod.ownerOf(targets, t) orelse break;
-                        const room = owner.room orelse break;
-                        const as = bare(p.value.v.entry_type, p.value.v.flags, p.value.v.payload);
-                        if (!room(read, &as)) break;
-                    }
-                    if (n == ce.MAX_BATCH or (n > 0 and bytes + p.value.v.payload.len > MAX_SEND_BYTES)) break;
-                    ce.Unparked.encode(&w, .{ .from = from, .seq = seq, .entry_type = p.value.v.entry_type, .flags = p.value.v.flags, .payload = p.value.v.payload }) catch break;
-                    n += 1;
-                    bytes += p.value.v.payload.len;
+            const prefix = parkKey(&mk, "m");
+            var ab: [1 + ce.TARGET_LEN]u8 = undefined;
+            var akb: [PARK_KEY_MAX]u8 = undefined;
+            const after_key: ?[]const u8 = if (after) |t| parkKey(&akb, targetRaw(&ab, t)) else null;
+            // Those after `after`, then from the first up to it.
+            for (0..2) |pass| {
+                if (pass == 1 and after_key == null) break;
+                var targets_it = if (pass == 0 and after_key != null) read.rangeAfter(ParkFam, prefix, after_key.?) else read.range(ParkFam, prefix);
+                while (targets_it.next() catch return null) |rec| {
+                    if (pass == 1 and std.mem.order(u8, rec.key, after_key.?) == .gt) break;
+                    const raw = rec.key[1 + PARK_NS.len ..];
+                    if (raw.len != 1 + ce.TARGET_LEN) continue;
+                    const target: Target = raw[1..][0..ce.TARGET_LEN].*;
+                    if (unparkOf(read, target, buf, msgs)) |u| return u;
                 }
-                if (n == 0) continue;
-                return ce.Unpark.encodeInto(buf, .{ .target = &target, .messages = .{ .bytes = w.written(), .count = n } }) catch null;
             }
             return null;
+        }
+
+        /// `target`'s unpark, if its first parked message has room now.
+        fn unparkOf(read: ReadView, target: Target, buf: []u8, msgs: []u8) ?NextUnpark {
+            var pb: [1 + ce.TARGET_LEN]u8 = undefined;
+            pb[0] = 'p';
+            pb[1..].* = target;
+            var kb: [PARK_KEY_MAX]u8 = undefined;
+            var it = read.range(ParkFam, parkKey(&kb, &pb));
+            var w: schema.Writer = .{ .buf = msgs };
+            var n: u32 = 0;
+            var bytes: usize = 0;
+            var full = false;
+            while (it.next() catch return null) |p| {
+                const praw = p.key[1 + PARK_NS.len ..];
+                const from = std.mem.readInt(u16, praw[1 + ce.TARGET_LEN ..][0..2], .big);
+                const seq = std.mem.readInt(u64, praw[1 + ce.TARGET_LEN + 2 ..][0..8], .big);
+                if (n == 0) {
+                    const t = std.enums.fromInt(EntryType, p.value.v.entry_type) orelse return null;
+                    const owner = machine_mod.ownerOf(targets, t) orelse return null;
+                    const room = owner.room orelse return null;
+                    const as = bare(p.value.v.entry_type, p.value.v.flags, p.value.v.payload);
+                    if (!room(read, &as)) return null;
+                }
+                if (n == ce.MAX_BATCH or (n > 0 and bytes + p.value.v.payload.len > MAX_SEND_BYTES)) {
+                    full = true;
+                    break;
+                }
+                ce.Unparked.encode(&w, .{ .from = from, .seq = seq, .entry_type = p.value.v.entry_type, .flags = p.value.v.flags, .payload = p.value.v.payload }) catch {
+                    full = true;
+                    break;
+                };
+                n += 1;
+                bytes += p.value.v.payload.len;
+            }
+            if (n == 0) return null;
+            const entry = ce.Unpark.encodeInto(buf, .{ .target = &target, .messages = .{ .bytes = w.written(), .count = n } }) catch return null;
+            return .{ .entry = entry, .target = target, .full = full };
         }
 
         /// Whether `raw` is the first parked key of its sender under its
@@ -1061,15 +1112,16 @@ fn deliver(a: *Group, b: *Group, first: u64, last: u64) !void {
 fn unparkNext(b: *Group) !bool {
     var buf: [8192]u8 = undefined;
     var msgs: [8192]u8 = undefined;
-    const entry = Probed.nextUnpark(b.read(), &buf, &msgs) orelse return false;
-    _ = try b.run(&Probed.machine, .channel_unpark, entry);
+    const next = Probed.nextUnpark(b.read(), &buf, &msgs, null) orelse return false;
+    _ = try b.run(&Probed.machine, .channel_unpark, next.entry);
     return true;
 }
 
 fn probeTarget(slot: u16) Target {
     var t: Target = @splat(0);
-    t[0..5].* = "probe".*;
-    std.mem.writeInt(u16, t[5..7], slot, .big);
+    t[0] = @backingInt(probe.machine.entry_types[0]);
+    t[1..6].* = "probe".*;
+    std.mem.writeInt(u16, t[6..8], slot, .big);
     return t;
 }
 
@@ -1181,6 +1233,80 @@ test "channels: past a target's parked cap, only that target's messages wait at 
     try a.probeTo(3, "message-thr-0003");
     const other = a.outRecord(1, 3).?;
     try testing.expect(Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = other.flags, .payload = other.payload }));
+}
+
+test "channels: past the shard's parked cap, a sink's message to any target waits at its sender, even one with nothing parked" {
+    test_parked_shard_max = 16;
+    defer test_parked_shard_max = null;
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    var b = Group.init(1, 2);
+    defer b.deinit();
+    try a.probeTo(1, "fill-slot1-00001");
+    try a.probeTo(1, "message-two-0002");
+    try deliver(&a, &b, 1, 2);
+    try testing.expect(shardParked(b.read()).bytes >= 16);
+    try a.probeTo(3, "message-thr-0003");
+    const other = a.outRecord(1, 3).?;
+    try testing.expectEqual(@as(u64, 0), targetParked(b.read(), probeTarget(3)).count);
+    try testing.expect(!Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = other.flags, .payload = other.payload }));
+    // Not a sink's: it never parks, so it is taken.
+    try testing.expect(Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = 0, .payload = other.payload }));
+}
+
+test "channels: only a sink's message parks behind; another for the same target goes to it" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    var b = Group.init(1, 2);
+    defer b.deinit();
+    try a.probeTo(1, "fill-slot1-00001");
+    try a.probeTo(1, "message-two-0002");
+    try a.probeTo(1, "drain-slot1-0003");
+    try a.probeTo(1, "message-fou-0004");
+    // Seq 4 again, sent without the sink flag.
+    var mb: [1024]u8 = undefined;
+    var mw: schema.Writer = .{ .buf = &mb };
+    for (1..5) |seq| {
+        const o = a.outRecord(1, seq).?;
+        try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = o.layout_epoch, .flags = if (seq == 4) 0 else o.flags, .payload = o.payload });
+    }
+    var buf: [4096]u8 = undefined;
+    _ = try b.run(&Probed.machine, .channel_inbound, try ce.Inbound.encodeInto(&buf, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 4 } }));
+    try testing.expectEqual(@as(u64, 1), targetParked(b.read(), probeTarget(1)).count);
+    try testing.expectEqual(Got{ .from = 0, .seq = 4 }, b.got("message-fou-0004").?);
+    try testing.expect(b.got("message-two-0002") == null);
+}
+
+test "channels: unparks take turns among targets with room, each starting past the last one's target" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    var b = Group.init(1, 2);
+    defer b.deinit();
+    try a.probeTo(1, "fill-slot1-00001");
+    try a.probeTo(3, "fill-slot3-00002");
+    try a.probeTo(1, "message-one-0003");
+    try a.probeTo(3, "message-thr-0004");
+    try a.probeTo(1, "drain-slot1-0005");
+    try a.probeTo(3, "drain-slot3-0006");
+    try deliver(&a, &b, 1, 6);
+    try testing.expectEqual(@as(u64, 1), targetParked(b.read(), probeTarget(1)).count);
+    try testing.expectEqual(@as(u64, 1), targetParked(b.read(), probeTarget(3)).count);
+    var buf: [8192]u8 = undefined;
+    var msgs: [8192]u8 = undefined;
+    // From the start, the first in key order; past it, the next; past the
+    // last, round to the first again.
+    try testing.expectEqualSlices(u8, &probeTarget(1), &Probed.nextUnpark(b.read(), &buf, &msgs, null).?.target);
+    try testing.expectEqualSlices(u8, &probeTarget(3), &Probed.nextUnpark(b.read(), &buf, &msgs, probeTarget(1)).?.target);
+    try testing.expectEqualSlices(u8, &probeTarget(1), &Probed.nextUnpark(b.read(), &buf, &msgs, probeTarget(3)).?.target);
+    // Taking turns, both drain.
+    var after: ?Target = probeTarget(1);
+    while (Probed.nextUnpark(b.read(), &buf, &msgs, after)) |next| {
+        after = next.target;
+        try testing.expect(!next.full);
+        _ = try b.run(&Probed.machine, .channel_unpark, next.entry);
+    }
+    try testing.expectEqual(@as(u64, 0), shardParked(b.read()).count);
+    try testing.expect(b.got("message-one-0003") != null and b.got("message-thr-0004") != null);
 }
 
 test "channels: a durable ack names what was applied as of a durable index" {

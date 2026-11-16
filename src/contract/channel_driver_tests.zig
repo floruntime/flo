@@ -138,8 +138,8 @@ const Sim = struct {
     /// The group's next unpark, proposed and applied as its leader would.
     fn unpark(self: *Sim, g: *Group) !bool {
         if (!g.driver.buffers()) return false;
-        const entry = Probed.nextUnpark(.{ .store = &g.store }, g.driver.buf, g.driver.msgs) orelse return false;
-        const owned = try self.allocator.dupe(u8, entry);
+        const next = Probed.nextUnpark(.{ .store = &g.store }, g.driver.buf, g.driver.msgs, null) orelse return false;
+        const owned = try self.allocator.dupe(u8, next.entry);
         defer self.allocator.free(owned);
         try self.apply(g, .channel_unpark, owned);
         return true;
@@ -423,8 +423,9 @@ test "channel driver: past a target's parked cap its messages wait at their send
 
 fn channelsTarget(slot: u16) [ce.TARGET_LEN]u8 {
     var t: [ce.TARGET_LEN]u8 = @splat(0);
-    t[0..5].* = "probe".*;
-    std.mem.writeInt(u16, t[5..7], slot, .big);
+    t[0] = @backingInt(probe.machine.entry_types[0]);
+    t[1..6].* = "probe".*;
+    std.mem.writeInt(u16, t[6..8], slot, .big);
     return t;
 }
 

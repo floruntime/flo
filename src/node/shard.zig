@@ -569,6 +569,10 @@ pub const Shard = struct {
     unpark_index: u64 = 0,
     unpark_term: u64 = 0,
     unpark_ms: u64 = 0,
+    /// The target that unpark was for, where the next looks from; and
+    /// whether it took a whole entry's worth, so the next goes at once.
+    unpark_after: ?[channels_mod.TARGET_LEN]u8 = null,
+    unpark_full: bool = false,
     /// When `publishParked` last logged.
     parked_warn_ms: u64 = 0,
 
@@ -1463,19 +1467,26 @@ pub const Shard = struct {
     const UNPARK_EVERY_MS = 100;
 
     /// Proposes the next unpark (`Channels.nextUnpark`): one at a time, so
-    /// one in the log isn't proposed again before it applies.
+    /// one in the log isn't proposed again before it applies. Once one that
+    /// took a whole entry's worth applies, the next goes at once, so a
+    /// target written faster than one entry per wait still drains; each
+    /// starts past the target the last was for, so none starves another.
     fn tickUnpark(self: *Shard, st: *contract_store.Store) void {
         if (st.families[channels_mod.ParkFam.ID].count == 0 or self.halted != null) return;
         const raft = self.raft_node;
         if (self.unpark_term == raft.current_term and self.unpark_index > raft.last_applied) return;
         const now = nowMs();
-        if (now -| self.unpark_ms < UNPARK_EVERY_MS) return;
+        const again = self.unpark_full and self.unpark_term == raft.current_term;
+        if (!again and now -| self.unpark_ms < UNPARK_EVERY_MS) return;
         self.unpark_ms = now;
+        self.unpark_full = false;
         if (!self.channel.buffers()) return;
-        const entry = contract_machines.Channels.nextUnpark(.{ .store = st }, self.channel.buf, self.channel.msgs) orelse return;
-        const r = raft.propose(.channel_unpark, entry_mod.Flags.NONE, entry) catch return;
+        const next = contract_machines.Channels.nextUnpark(.{ .store = st }, self.channel.buf, self.channel.msgs, self.unpark_after) orelse return;
+        const r = raft.propose(.channel_unpark, entry_mod.Flags.NONE, next.entry) catch return;
         self.unpark_index = r.index;
         self.unpark_term = r.term;
+        self.unpark_after = next.target;
+        self.unpark_full = next.full;
     }
 
     /// A channel frame from another shard, or this one. Its sender is the
@@ -5596,9 +5607,12 @@ pub const Shard = struct {
             if (leads and @import("test_faults.zig").of(entry) == .panic_leader_step) @panic("test fault: panic in the leader's step after apply");
         }
         self.workflow_handler.startApplied(self, entry, result);
-        // Each message an inbound applied is, to these steps, an entry of
-        // its own: a blocking read waits on its key, a dequeue on its queue.
-        if (entry.header.entry_type == @backingInt(entry_mod.EntryType.channel_inbound)) {
+        // Each message an inbound or unpark applied is, to these steps, an
+        // entry of its own: a blocking read waits on its key, a dequeue on
+        // its queue.
+        if (entry.header.entry_type == @backingInt(entry_mod.EntryType.channel_inbound) or
+            entry.header.entry_type == @backingInt(entry_mod.EntryType.channel_unpark))
+        {
             for (self.defaultPartition().store.messages.items) |*m| {
                 if (m.sender_bug) |bug| self.noteSenderBug(m, bug);
                 self.afterApply(&m.entry, &m.result);
@@ -8370,7 +8384,7 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
         // was applied already, and must not be twice.
         if (applied.route == .skipped_already_applied) return .applied;
         contract_machine.applyEntryWith(m, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, entry, out) catch |err| return .{ .applier_failed = err };
-        if (etype == .channel_inbound) for (partition.store.messages.items) |*msg| {
+        if (etype == .channel_inbound or etype == .channel_unpark) for (partition.store.messages.items) |*msg| {
             // A refused message took no effect: its bytes, maybe a sender's
             // garbage, name no namespace this shard holds.
             if (msg.result.refused() == null) noteNamespace(partition, &msg.entry);
@@ -18839,6 +18853,43 @@ test "queues: a dequeue with block_ms 0 answers at once with none; one that wait
     try std.testing.expectEqualStrings("woken", v.payloadOf(0));
 }
 
+test "queues: a dequeue waiting on a queue is answered when a sink's enqueue parked under it is unparked" {
+    var t: QueuesTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const s = &t.a.shard;
+    try t.enqueue("a");
+    // A sink's enqueue to "q", which holds one at most: full, so it parks.
+    const ce = @import("../protocol/channel_entries.zig");
+    var eb: [256]u8 = undefined;
+    var mb: [512]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &mb };
+    try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, "q"))), .entry_type = @backingInt(entry_mod.EntryType.queue_enqueue), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .payload = try oneSlotEnqueue(&eb, "q", "parked") });
+    var ib: [1024]u8 = undefined;
+    _ = try s.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } }));
+    try std.testing.expect(s.applyCommitted());
+    const st = &s.defaultPartition().store;
+    try std.testing.expectEqual(@as(u64, 1), channels_mod.shardParked(.{ .store = st }).count);
+    // Emptied, and a dequeue waits on it.
+    try std.testing.expectEqual(@as(u32, 1), (try t.dequeue("c1", 1, null, true)).count);
+    var b: [QueuesTest.Dequeue.request.max_size]u8 = undefined;
+    try t.a.feed(.queue_dequeue, "q", try QueuesTest.Dequeue.request.encodeInto(&b, .{ .consumer = "c2", .count = 1, .lease_ms = null, .block_ms = 30_000, .ack = false }));
+    const waiting = t.a.next_id;
+    s.flushToClient(t.a.c.conn.fd);
+    try std.testing.expectEqual(@as(c_int, 0), unreadBytes(t.a.c.pair[1]));
+    // The unpark applies the enqueue, and wakes it.
+    s.unpark_ms = 0;
+    s.tickUnpark(st);
+    _ = s.applyCommitted();
+    try std.testing.expectEqual(@as(u64, 0), channels_mod.shardParked(.{ .store = st }).count);
+    var rs: [1]proto.Response = undefined;
+    var buf: [4096]u8 = undefined;
+    try ParkTest.responses(s, t.a.c.conn, t.a.c.pair[1], &buf, &rs);
+    const got = rs[0];
+    try std.testing.expectEqual(waiting, got.header.request_id);
+    try std.testing.expectEqualStrings("parked", (try QueuesTest.gotOf(got.data)).payloadOf(0));
+}
+
 test "queues: a report or purge on a queue the leader doesn't hold logs nothing, answering each message gone, or unavailable for a namespace not known here" {
     var t: QueuesTest = undefined;
     try t.init();
@@ -26504,6 +26555,86 @@ test "Shard: a sink's enqueues to a full queue on another shard park, a KV write
     try std.testing.expectEqual(@as(usize, 1), queueBodies(b, q.name, &bodies));
     try std.testing.expectEqualStrings("third", bodies[0]);
     try std.testing.expectEqual(@as(u64, 0), channels_mod.shardParked(read).count);
+}
+
+/// A sink's enqueue of `body` to `queue`, which holds `max` messages at most.
+fn sinkEnqueue(buf: []u8, queue: []const u8, body: []const u8, max: u32) ![]const u8 {
+    return qe_caps.Enqueue.encodeInto(buf, .{ .ns = ns_table.DEFAULT.int(), .queue = queue, .priority = 0, .delay_ms = 0, .payload = body, .max_messages = max, .max_bytes = 1 << 20, .shard_held_bytes = 1 << 30 });
+}
+
+test "Shard: an unpark that took a whole entry's worth is followed at once, not after the wait, so a fast sink's target drains" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    var qb: [16]u8 = undefined;
+    const q = try queueOwnedBy(&two, 1, &qb);
+    // One fills the queue; the next, capped at one, parks; the rest, which
+    // fit, park behind it.
+    const n = 3 * @import("../protocol/channel_entries.zig").MAX_BATCH;
+    var eb: [256]u8 = undefined;
+    var nb: [16]u8 = undefined;
+    try sendFromApplyFlagged(a, q.slot, .queue_enqueue, entry_mod.Flags.SINK, try sinkEnqueue(&eb, q.name, "fill", 1));
+    try sendFromApplyFlagged(a, q.slot, .queue_enqueue, entry_mod.Flags.SINK, try sinkEnqueue(&eb, q.name, "capped", 1));
+    for (0..n) |i| try sendFromApplyFlagged(a, q.slot, .queue_enqueue, entry_mod.Flags.SINK, try sinkEnqueue(&eb, q.name, try std.fmt.bufPrint(&nb, "m{d}", .{i}), 1 << 20));
+    pumpChannels(&two);
+    const read: contract_view.ReadView = .{ .store = &b.defaultPartition().store };
+    try std.testing.expectEqual(@as(u64, n + 1), channels_mod.shardParked(read).count);
+    try purgeQueue(b, q.name);
+    // Ticks with the wait never over: only a full unpark's follow-up runs.
+    const st = &b.defaultPartition().store;
+    b.unpark_ms = 0;
+    var ticks: usize = 0;
+    while (channels_mod.shardParked(read).count > 0 and ticks < 8) : (ticks += 1) {
+        b.tickUnpark(st);
+        b.unpark_ms = std.math.maxInt(u64);
+        two.settle();
+    }
+    try std.testing.expectEqual(@as(u64, 0), channels_mod.shardParked(read).count);
+    try std.testing.expectEqual(@as(usize, 4), ticks);
+}
+
+test "Shard: a leader in a new term unparks again past an unpark its last term left unapplied, and each message lands once, in order" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    var qb: [16]u8 = undefined;
+    const q = try queueOwnedBy(&two, 1, &qb);
+    var eb: [3][256]u8 = undefined;
+    for ([_][]const u8{ "first", "second", "third" }, 0..) |body, i| {
+        try sendFromApplyFlagged(a, q.slot, .queue_enqueue, entry_mod.Flags.SINK, try sinkEnqueue(&eb[i], q.name, body, if (i < 2) 1 else 8));
+    }
+    pumpChannels(&two);
+    const read: contract_view.ReadView = .{ .store = &b.defaultPartition().store };
+    try std.testing.expectEqual(@as(u64, 2), channels_mod.shardParked(read).count);
+    try purgeQueue(b, q.name);
+    const st = &b.defaultPartition().store;
+    const raft = b.raft_node;
+    // Proposed, and not applied before the term moves on.
+    b.unpark_ms = 0;
+    b.tickUnpark(st);
+    const first = raft.log.lastIndex();
+    try std.testing.expect(first > raft.last_applied);
+    raft.current_term += 1;
+    raft.ready_index = raft.log.lastIndex();
+    // The new term's leader doesn't wait on it: it proposes its own.
+    b.unpark_ms = 0;
+    b.tickUnpark(st);
+    try std.testing.expectEqual(first + 1, raft.log.lastIndex());
+    // Both apply; the second finds them unparked already and changes nothing.
+    try std.testing.expect(b.applyCommitted());
+    try std.testing.expectEqual(@as(u64, 0), channels_mod.shardParked(read).count);
+    var bodies: [8][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), queueBodies(b, q.name, &bodies));
+    try std.testing.expectEqualStrings("second", bodies[0]);
+    try std.testing.expectEqualStrings("third", bodies[1]);
 }
 
 test "Shard: parked messages are the same on a replica that applies the same log" {

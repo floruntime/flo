@@ -101,7 +101,7 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     .{ .format = 29, .segment_version = 19, .entries = 0x336fb98011d1835f },
     // A channel message whose target is full is parked under it, and a
     // `channel_unpark` applies a target's parked messages once it has room.
-    .{ .format = 30, .segment_version = 20, .entries = 0x9fcefb3a170607f5 },
+    .{ .format = 30, .segment_version = 20, .entries = 0xc4e3a23975b2cf62 },
 };
 
 comptime {

@@ -419,6 +419,8 @@ pub const GroupChannel = struct {
     /// The unpark this group's leader last proposed: one at a time.
     unpark_index: u64 = 0,
     unpark_term: u64 = 0,
+    /// Where its next unpark looks from: past the last one's target.
+    unpark_after: ?[channels_mod.TARGET_LEN]u8 = null,
 
     fn init(allocator: Allocator, g: GroupId, count: u16) !GroupChannel {
         const driver = try driver_mod.Driver.init(allocator, g, count);
@@ -543,8 +545,9 @@ pub const GroupChannel = struct {
         if (sim.isHalted(NODE)) return;
         if (c.unpark_term == sim.termOf(NODE) and c.unpark_index > sim.appliedIndex(NODE)) return;
         if (!c.driver.buffers()) return;
-        const entry = Probed.nextUnpark(c.read(), c.driver.buf, c.driver.msgs) orelse return;
-        if (!sim.proposeOn(NODE, .channel_unpark, entry)) return;
+        const next = Probed.nextUnpark(c.read(), c.driver.buf, c.driver.msgs, c.unpark_after) orelse return;
+        if (!sim.proposeOn(NODE, .channel_unpark, next.entry)) return;
+        c.unpark_after = next.target;
         c.unpark_term = sim.termOf(NODE);
         c.unpark_index = sim.lastIndex(NODE);
         c.unparks += 1;
