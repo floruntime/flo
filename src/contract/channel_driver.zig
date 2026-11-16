@@ -63,6 +63,58 @@ pub const TRIM_LOST_MS = 1_000;
 pub const Kind = enum(u8) { batch = 1, answer = 2 };
 pub const Status = enum(u8) { ok = 0, busy = 1, halted = 2 };
 
+/// Why writes through a shard are queued: what an answer's pressure names.
+pub const Cause = enum(u8) {
+    /// The named shard is halted.
+    halted = 1,
+    /// The named shard hasn't answered in a while: no leader, or none it
+    /// can reach.
+    no_leader = 2,
+    /// The named shard can't flush its log to disk.
+    cannot_flush = 3,
+    /// A target on the named shard is full, past what it parks.
+    target_full = 4,
+    /// The named shard takes what it is sent slower than it comes.
+    outbox_full = 5,
+};
+
+/// One shard writes are queued behind, and why.
+pub const Stall = Record(&.{
+    .{ .name = "shard", .T = Int(u16) },
+    .{ .name = "cause", .T = Int(u8) },
+});
+
+/// Most stalls an answer carries.
+pub const MAX_PRESSURE = 4;
+pub const Pressure = schema.BoundedList(Stall, MAX_PRESSURE, MAX_PRESSURE * 3);
+
+/// A pressure entry is kept this long after the last answer carrying it,
+/// and its sender probes this often while it is, so an idle channel can't
+/// keep a stale one.
+pub const PRESSURE_EXPIRY_MS = 1_000;
+pub const PRESSURE_PROBE_MS = 500;
+/// A peer silent this long is taken to have no leader.
+pub const NO_LEADER_MS = 5_000;
+
+/// What `cause` says of the shard it names, in words.
+pub fn causeWords(cause: Cause) []const u8 {
+    return switch (cause) {
+        .halted => "is halted",
+        .no_leader => "has no leader",
+        .cannot_flush => "cannot flush to disk",
+        .target_full => "has a full target",
+        .outbox_full => "is busy",
+    };
+}
+
+/// The refusal a write bound through shard `to` gets while its pressure
+/// names `stall`: "overloaded: writes to shard 7 are queued because shard
+/// 9 is halted; this request was not run — retry later".
+pub fn pressureRefusal(buf: []u8, to: u16, stall: Stall.Value) []const u8 {
+    const cause = std.enums.fromInt(Cause, stall.cause) orelse .outbox_full;
+    return std.fmt.bufPrint(buf, "overloaded: writes to shard {d} are queued because shard {d} {s}; this request was not run — retry later", .{ to, stall.shard, causeWords(cause) }) catch "overloaded: writes are queued; this request was not run — retry later";
+}
+
 pub const Batch = Record(&.{
     .{ .name = "gen_term", .T = Int(u64) },
     .{ .name = "gen_counter", .T = Int(u32) },
@@ -79,6 +131,8 @@ pub const Answer = Record(&.{
     // it; 0 for none.
     .{ .name = "gap", .T = Int(u64) },
     .{ .name = "status", .T = Int(u8) },
+    // What writes through the receiver are queued behind, if anything.
+    .{ .name = "pressure", .T = Pressure },
 });
 
 pub const Frame = union(Kind) {
@@ -123,10 +177,20 @@ const Peer = struct {
     trim_through: u64 = 0,
     trim_at_ms: ?u64 = null,
     last_trim_ms: u64 = 0,
-    /// Since when it has answered `busy` or `halted` with nothing new
-    /// applied: the first such answer; 0 once it applies more or answers
-    /// `ok`.
-    busy_ms: u64 = 0,
+    /// The pressure its last answer carried, and when: kept until
+    /// `PRESSURE_EXPIRY_MS` after that, probed for every
+    /// `PRESSURE_PROBE_MS` meanwhile.
+    pressure: [MAX_PRESSURE]Stall.Value = undefined,
+    pressure_len: u8 = 0,
+    pressure_ms: u64 = 0,
+    probe_ms: u64 = 0,
+    /// When it last answered, and its status then: what this leader names
+    /// as the cause when its outbox to it is full.
+    answered_ms: u64 = 0,
+    last_status: Status = .ok,
+    /// The outbox to it holds `OutboxCaps.channel` or more; cleared below
+    /// three quarters of it.
+    outbox_full: bool = false,
     // Receiving from it.
     /// The highest seq proposed or applied from it; null until rebuilt.
     accepted: ?u64 = null,
@@ -187,6 +251,19 @@ pub const Driver = struct {
     /// takes every one.
     admits: ?*const fn (read: ReadView, m: ce.Message.Value) bool = null,
     counts: Counts = .{},
+    /// What this leader's outboxes may hold, for the pressure it reports.
+    caps: OutboxCaps = .{},
+    /// Rewrites a message before this leader logs it, or null to log it as
+    /// it came: a sink's enqueue takes this node's queue caps, as its own
+    /// clients' do. Writes into `buf`; `stamp_ctx` is its own.
+    stamp: ?*const fn (ctx: ?*const anyopaque, m: ce.Message.Value, buf: []u8) ?[]const u8 = null,
+    stamp_ctx: ?*const anyopaque = null,
+    stamp_buf: []u8 = &.{},
+    /// Why writes through this group are queued by its own state, if they
+    /// are: halted, or flushes failing. Set by its shard each tick.
+    own_cause: ?Cause = null,
+    /// The clock as of the last tick or frame.
+    now_ms: u64 = 0,
     /// Messages each group sent this one that were refused as its own bug,
     /// by reason (`store.SenderBug`). Counted where they apply, on every
     /// replica, and kept across terms, unlike `peers`.
@@ -229,26 +306,47 @@ pub const Driver = struct {
         self.allocator.free(self.sink_refusals);
         self.allocator.free(self.buf);
         self.allocator.free(self.msgs);
+        self.allocator.free(self.stamp_buf);
     }
 
-    /// Since when group `to` has answered this leader `busy` or `halted`
-    /// without applying more, or null: what holds a pipeline sending to it.
-    pub fn busySince(self: *const Driver, to: u16) ?u64 {
+    /// What writes to group `to` are queued behind, as its last answers
+    /// said, or null: what holds a pipeline sending to it.
+    pub fn pressureOf(self: *const Driver, to: u16, now_ms: u64) ?Stall.Value {
         if (to >= self.peers.len) return null;
-        const ms = self.peers[to].busy_ms;
-        return if (ms == 0) null else ms;
+        const p = &self.peers[to];
+        if (!pressureLive(p, now_ms)) return null;
+        return p.pressure[0];
+    }
+
+    fn pressureLive(p: *const Peer, now_ms: u64) bool {
+        return p.pressure_len > 0 and now_ms -| p.pressure_ms < PRESSURE_EXPIRY_MS;
+    }
+
+    /// Why this leader names `c` when its outbox to `c` is full: what `c`
+    /// last said, or that it has gone quiet.
+    fn causeOf(self: *const Driver, c: u16) Cause {
+        const p = &self.peers[c];
+        return switch (p.last_status) {
+            .halted => .halted,
+            .busy => .target_full,
+            .ok => if (self.now_ms -| p.answered_ms >= NO_LEADER_MS) .no_leader else .outbox_full,
+        };
     }
 
     /// The batch buffers, allocated once; false when there's no memory for
     /// them, and the batch waits.
     pub fn buffers(self: *Driver) bool {
-        if (self.buf.len > 0) return true;
-        self.buf = self.allocator.alloc(u8, 1 + ce.Inbound.max_size) catch return false;
-        self.msgs = self.allocator.alloc(u8, ce.Messages.max_size) catch {
-            self.allocator.free(self.buf);
-            self.buf = &.{};
-            return false;
-        };
+        if (self.buf.len == 0) {
+            self.buf = self.allocator.alloc(u8, 1 + ce.Inbound.max_size) catch return false;
+            self.msgs = self.allocator.alloc(u8, ce.Messages.max_size) catch {
+                self.allocator.free(self.buf);
+                self.buf = &.{};
+                return false;
+            };
+        }
+        if (self.stamp != null and self.stamp_buf.len == 0) {
+            self.stamp_buf = self.allocator.alloc(u8, ce.MAX_MESSAGE_PAYLOAD) catch return false;
+        }
         return true;
     }
 
@@ -266,6 +364,13 @@ pub const Driver = struct {
     /// told, it reads three commit counts and stops there, until a channel
     /// record changes or a frame arrives.
     pub fn tick(self: *Driver, now_ms: u64, read: ReadView, durable: u64, io: anytype) void {
+        self.now_ms = now_ms;
+        // Which outboxes are full, for the pressure this leader reports:
+        // set at the cap, cleared below three quarters of it.
+        for (self.peers, 0..) |*p, c| {
+            const bytes = channels.metaOf(read, @intCast(c)).bytes;
+            if (bytes >= self.caps.channel) p.outbox_full = true else if (bytes < self.caps.channel / 4 * 3) p.outbox_full = false;
+        }
         const seen = seenOf(read);
         if (self.quiet and std.meta.eql(seen, self.seen)) return;
         self.counts.scans += 1;
@@ -286,6 +391,7 @@ pub const Driver = struct {
     /// settled channel needn't watch the durable index.
     fn settled(self: *const Driver, b: u16, read: ReadView, durable: u64) bool {
         const p = &self.peers[b];
+        if (pressureLive(p, self.now_ms)) return false;
         const meta = channels.metaOf(read, b);
         const last = meta.next_seq - 1;
         if (meta.acked != last or p.trim_at_ms != null or p.durable_ack > meta.acked or p.applied_ack > meta.acked) return false;
@@ -311,6 +417,10 @@ pub const Driver = struct {
                 p.last_trim_ms = now_ms;
                 self.counts.trims_proposed += 1;
             }
+        }
+        // Pressure is kept only while answers carry it: ask again.
+        if (pressureLive(p, now_ms) and now_ms -| p.probe_ms >= PRESSURE_PROBE_MS) {
+            if (self.sendEmpty(b, p, io)) p.probe_ms = now_ms;
         }
         if (last == 0 and p.applied_ack == 0) return;
         const floor = @max(meta.acked, p.applied_ack);
@@ -388,14 +498,38 @@ pub const Driver = struct {
         self.answer(a, p, in.applied, dur, 0, .ok, io);
     }
 
+    /// What writes through this group are queued behind, written to `w`,
+    /// and how many: its own state, the target an answer of `busy` is for,
+    /// and each group its outbox to is full, up to `MAX_PRESSURE`.
+    fn pressure(self: *const Driver, status: Status, w: *schema.Writer) u32 {
+        var n: u32 = 0;
+        const own: ?Cause = if (status == .halted) .halted else self.own_cause;
+        if (own) |c| n += @intFromBool(addStall(w, self.group, c));
+        if (status == .busy) n += @intFromBool(addStall(w, self.group, .target_full));
+        for (self.peers, 0..) |*p, c| {
+            if (n == MAX_PRESSURE) break;
+            if (c == self.group or !p.outbox_full) continue;
+            n += @intFromBool(addStall(w, @intCast(c), self.causeOf(@intCast(c))));
+        }
+        return n;
+    }
+
+    fn addStall(w: *schema.Writer, shard: u16, cause: Cause) bool {
+        Stall.encode(w, .{ .shard = shard, .cause = @backingInt(cause) }) catch return false;
+        return true;
+    }
+
     fn durableAck(self: *const Driver, a: u16, in: channels.In.Value, durable: u64) u64 {
         // A self-channel's applied is durable: its inbound entry is later in
         // the same log than the sends it carries.
         return if (a == self.group) in.applied else channels.appliedAsOf(in, durable);
     }
 
-    fn answer(_: *Driver, a: u16, p: *Peer, applied: u64, dur: u64, gap: u64, status: Status, io: anytype) void {
-        var buf: [64]u8 = undefined;
+    fn answer(self: *Driver, a: u16, p: *Peer, applied: u64, dur: u64, gap: u64, status: Status, io: anytype) void {
+        var pb: [Pressure.max_size]u8 = undefined;
+        var pw: schema.Writer = .{ .buf = &pb };
+        const n = self.pressure(status, &pw);
+        var buf: [128]u8 = undefined;
         const f = encodeFrame(&buf, .answer, Answer.Value{
             .gen_term = p.recv_gen.term,
             .gen_counter = p.recv_gen.counter,
@@ -403,6 +537,7 @@ pub const Driver = struct {
             .durable = dur,
             .gap = gap,
             .status = @backingInt(status),
+            .pressure = .{ .bytes = pw.written(), .count = n },
         }) orelse return;
         if (io.sendFrame(a, f)) {
             p.told_applied = @max(p.told_applied, applied);
@@ -415,6 +550,7 @@ pub const Driver = struct {
     pub fn onFrame(self: *Driver, from: u16, bytes: []const u8, now_ms: u64, read: ReadView, durable: u64, halted: bool, io: anytype) void {
         if (from >= self.count) return;
         const f = Frame.decode(bytes) orelse return;
+        self.now_ms = now_ms;
         // An answer can move an ack, and a batch be owed one: look again.
         self.quiet = false;
         switch (f) {
@@ -453,7 +589,11 @@ pub const Driver = struct {
             // A message whose target is over its parked cap waits at its
             // sender, and so do those after it: the batch's prefix goes.
             if (self.admits) |admits| if (!admits(read, m)) break;
-            ce.Message.encode(&w, m) catch return;
+            var logged = m;
+            if (self.stamp) |f| if (f(self.stamp_ctx, m, self.stamp_buf)) |payload| {
+                logged.payload = payload;
+            };
+            ce.Message.encode(&w, logged) catch return;
             n += 1;
         }
         if (n == 0) {
@@ -484,7 +624,6 @@ pub const Driver = struct {
             p.applied_ack = a.applied;
             p.progress_ms = now_ms;
             p.backoff_ms = RESEND_MIN_MS;
-            p.busy_ms = 0;
         }
         p.durable_ack = @max(p.durable_ack, if (self.mutant == .trim_on_applied) a.applied else a.durable);
         const current = self.mutant == .no_gen_filter or (a.gen_term == self.term and a.gen_counter == p.gen_counter);
@@ -494,11 +633,21 @@ pub const Driver = struct {
             p.gen_counter += 1;
             p.progress_ms = now_ms;
         }
-        if (std.enums.fromInt(Status, a.status)) |s| {
-            if (s != .ok) {
-                p.backoff_ms = @min(p.backoff_ms * 2, RESEND_MAX_MS);
-                if (p.busy_ms == 0) p.busy_ms = @max(now_ms, 1);
-            } else p.busy_ms = 0;
+        if (std.enums.fromInt(Status, a.status)) |st| {
+            if (st != .ok) p.backoff_ms = @min(p.backoff_ms * 2, RESEND_MAX_MS);
+            p.last_status = st;
         }
+        p.answered_ms = now_ms;
+        // The pressure it reports now, if any, replaces what it reported.
+        var it = a.pressure.iterator();
+        var n: u8 = 0;
+        while (it.next() catch null) |st| {
+            if (n == MAX_PRESSURE) break;
+            if (std.enums.fromInt(Cause, st.cause) == null) continue;
+            p.pressure[n] = st;
+            n += 1;
+        }
+        p.pressure_len = n;
+        if (n > 0) p.pressure_ms = now_ms;
     }
 };

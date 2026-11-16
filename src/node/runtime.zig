@@ -1118,6 +1118,7 @@ pub const Runtime = struct {
             shards[i].peer_mailboxes = mailboxes;
             shards[i].stopping = &self.stopping;
             shards[i].outbox_caps = caps;
+            shards[i].channel.caps = caps;
         }
     }
 

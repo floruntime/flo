@@ -1621,10 +1621,11 @@ pub const ProcessingHandler = struct {
         namespace: []const u8,
         /// This sink shard is halted.
         halted: u16,
-        /// A sink's shard answers `busy` (a target there is over its
-        /// parked cap). `target` is the sink whose write waits, when the
+        /// Writes to a sink's shard are queued behind `stall`, as its
+        /// answers say: a target there over its parked cap, a halted shard
+        /// beyond it. `target` is the sink whose write waits, when the
         /// first unacked message is one of this pipeline's; "" otherwise.
-        busy: struct { shard: u16, target: []const u8 },
+        pressure: struct { shard: u16, stall: channel_driver.Stall.Value, target: []const u8 },
         /// This shard's outbox to a sink's shard (`to`), or all its
         /// outboxes together (`to` null), hold their cap: what it sent
         /// isn't taken as fast as it is made.
@@ -1656,11 +1657,8 @@ pub const ProcessingHandler = struct {
         while (to < shards) : (to += 1) {
             if (!self.sendsTo(pipe, to)) continue;
             const meta = channels_mod.metaOf(read, to);
-            const unacked = meta.next_seq - 1 - meta.acked;
-            // A `busy` answer holds only while something to it is unacked:
-            // one with nothing outstanding has nothing to clear it.
-            if (unacked > 0 and shard.channel.busySince(to) != null)
-                return .{ .busy = .{ .shard = to, .target = self.waitingSink(read, pipe, to, meta.acked + 1) } };
+            if (shard.channel.pressureOf(to, shard.channel.now_ms)) |stall|
+                return .{ .pressure = .{ .shard = to, .stall = stall, .target = self.waitingSink(read, pipe, to, meta.acked + 1) } };
             if (meta.bytes >= caps.channel) return .{ .outbox = .{ .to = to, .bytes = meta.bytes, .cap = caps.channel } };
         }
         const raft = shard.raft_node;
@@ -2406,10 +2404,15 @@ pub const ProcessingHandler = struct {
             .none => "",
             .namespace => |ns| std.fmt.bufPrint(buf, "waiting for namespace {s}", .{ns}) catch "waiting for a namespace",
             .halted => |to| std.fmt.bufPrint(buf, "waiting: sink shard {d} is halted", .{to}) catch "waiting: a sink's shard is halted",
-            .busy => |r| if (r.target.len > 0)
-                std.fmt.bufPrint(buf, "waiting for room on shard {d} ({s})", .{ r.shard, r.target }) catch "waiting for room on a sink's shard"
-            else
-                std.fmt.bufPrint(buf, "waiting for room on shard {d}", .{r.shard}) catch "waiting for room on a sink's shard",
+            .pressure => |r| blk: {
+                // A full target on the shard it writes to: say which sink.
+                if (r.stall.shard == r.shard and r.stall.cause == @backingInt(channel_driver.Cause.target_full)) break :blk (if (r.target.len > 0)
+                    std.fmt.bufPrint(buf, "waiting for room on shard {d} ({s})", .{ r.shard, r.target })
+                else
+                    std.fmt.bufPrint(buf, "waiting for room on shard {d}", .{r.shard})) catch "waiting for room on a sink's shard";
+                const cause = std.enums.fromInt(channel_driver.Cause, r.stall.cause) orelse .outbox_full;
+                break :blk std.fmt.bufPrint(buf, "waiting: writes to shard {d} are queued because shard {d} {s}", .{ r.shard, r.stall.shard, channel_driver.causeWords(cause) }) catch "waiting: writes to a sink's shard are queued";
+            },
             .outbox => |o| (if (o.to) |to|
                 std.fmt.bufPrint(buf, "waiting: the outbox to shard {d} is full ({d} of {d} MiB)", .{ to, o.bytes >> 20, o.cap >> 20 })
             else
@@ -2949,8 +2952,9 @@ test "processing: what a pipeline waits for, in words" {
     const cases = [_]struct { w: W, says: []const u8 }{
         .{ .w = .{ .namespace = "orders" }, .says = "waiting for namespace orders" },
         .{ .w = .{ .halted = 2 }, .says = "waiting: sink shard 2 is halted" },
-        .{ .w = .{ .busy = .{ .shard = 3, .target = "jobs" } }, .says = "waiting for room on shard 3 (jobs)" },
-        .{ .w = .{ .busy = .{ .shard = 3, .target = "" } }, .says = "waiting for room on shard 3" },
+        .{ .w = .{ .pressure = .{ .shard = 3, .stall = .{ .shard = 3, .cause = 4 }, .target = "jobs" } }, .says = "waiting for room on shard 3 (jobs)" },
+        .{ .w = .{ .pressure = .{ .shard = 3, .stall = .{ .shard = 3, .cause = 4 }, .target = "" } }, .says = "waiting for room on shard 3" },
+        .{ .w = .{ .pressure = .{ .shard = 3, .stall = .{ .shard = 9, .cause = 1 }, .target = "jobs" } }, .says = "waiting: writes to shard 3 are queued because shard 9 is halted" },
         .{ .w = .{ .outbox = .{ .to = 1, .bytes = 130 << 20, .cap = 128 << 20 } }, .says = "waiting: the outbox to shard 1 is full (130 of 128 MiB)" },
         .{ .w = .{ .outbox = .{ .to = null, .bytes = 1 << 30, .cap = 1 << 30 } }, .says = "waiting: this shard's outboxes are full (1024 of 1024 MiB)" },
         .{ .w = .log, .says = "waiting for room in this shard's log" },

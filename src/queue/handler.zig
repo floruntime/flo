@@ -37,6 +37,7 @@ const table_run = @import("../node/table_run.zig");
 const ops = @import("../protocol/ops.zig");
 const queue_ops = @import("../protocol/queue_ops.zig");
 const qe = @import("../protocol/queue_entries.zig");
+const ce = @import("../protocol/channel_entries.zig");
 const ae = @import("../protocol/action_entries.zig");
 const machine = @import("machine.zig");
 const waiter_pool_mod = @import("../node/waiter_pool.zig");
@@ -192,6 +193,23 @@ pub const Caps = struct {
 };
 
 /// An enqueue under `caps`.
+/// A sink's enqueue another shard sent, rewritten to the caps at `ctx`
+/// (this node's `[queues]` caps) before its receiver logs it, as its own
+/// clients' enqueues carry them; null when it is no sink's enqueue, or
+/// already carries them. Apply reads the caps from the entry, so every
+/// replica agrees.
+pub fn stampSinkCaps(ctx: ?*const anyopaque, m: ce.Message.Value, buf: []u8) ?[]const u8 {
+    if (m.flags & entry_mod.Flags.SINK == 0 or m.entry_type != @backingInt(entry_mod.EntryType.queue_enqueue)) return null;
+    const caps: *const Caps = @ptrCast(@alignCast(ctx orelse return null));
+    var diag: schema.Diagnostic = .{};
+    var p = qe.Enqueue.decodeAll(m.payload, &diag) catch return null;
+    if (p.max_messages == caps.max_messages and p.max_bytes == caps.max_bytes and p.shard_held_bytes == caps.shard_held_bytes) return null;
+    p.max_messages = caps.max_messages;
+    p.max_bytes = caps.max_bytes;
+    p.shard_held_bytes = caps.shard_held_bytes;
+    return qe.Enqueue.encodeInto(buf, p) catch null;
+}
+
 pub fn enqueueValue(caps: Caps, ns: NamespaceId, name: []const u8, priority: u32, delay_ms: u64, payload: []const u8) qe.Enqueue.Value {
     return .{ .ns = ns.int(), .queue = name, .priority = priority, .delay_ms = delay_ms, .payload = payload, .max_messages = caps.max_messages, .max_bytes = caps.max_bytes, .shard_held_bytes = caps.shard_held_bytes };
 }

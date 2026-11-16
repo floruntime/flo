@@ -1385,6 +1385,9 @@ pub const Shard = struct {
     /// Wire shard back-pointers into handlers that need Raft access.
     /// Must be called after shards are at their final heap addresses.
     pub fn wireHandlerShardPtrs(self: *Shard) void {
+        // A sink's enqueue another shard sends takes this node's queue caps.
+        self.channel.stamp = queue_handler_mod.stampSinkCaps;
+        self.channel.stamp_ctx = @ptrCast(&self.queue_handler.caps);
         self.raft_node.log_flush_sink = .{ .ctx = @ptrCast(self), .flush = flushForConfig };
         self.raft_node.repaired = .{ .ctx = @ptrCast(self), .check = repairedOpaque };
         self.stream_handler.shard_ptr = @ptrCast(self);
@@ -1498,6 +1501,14 @@ pub const Shard = struct {
         return label(e, buf);
     }
 
+    /// Why writes through this shard are queued by its own state, for the
+    /// pressure its answers carry.
+    fn channelCause(self: *const Shard) ?channel_driver.Cause {
+        if (self.halted != null) return .halted;
+        if (self.flushes_failing_since_ms != 0) return .cannot_flush;
+        return null;
+    }
+
     /// The channel driver's memory is a term's: a new one starts over.
     fn channelTerm(self: *Shard) void {
         if (self.channel.term != self.raft_node.current_term) self.channel.reset(self.raft_node.current_term);
@@ -1511,6 +1522,7 @@ pub const Shard = struct {
         const fams = &st.families;
         if (fams[channels_mod.OutFam.ID].count == 0 and fams[channels_mod.InFam.ID].count == 0 and fams[channels_mod.ParkFam.ID].count == 0) return;
         self.channelTerm();
+        self.channel.own_cause = self.channelCause();
         self.channel.tick(nowMs(), .{ .store = st }, self.channelDurable(), ChannelIo{ .shard = self });
         self.tickUnpark(st);
     }
@@ -1570,6 +1582,7 @@ pub const Shard = struct {
         const leads = self.raft_node.role == .leader and self.offline == null and (self.raft_node.leaderReady() or self.halted != null);
         if (!leads) return;
         self.channelTerm();
+        self.channel.own_cause = self.channelCause();
         self.channel.onFrame(msg.src_shard, bytes, nowMs(), .{ .store = &self.defaultPartition().store }, self.channelDurable(), self.halted != null, ChannelIo{ .shard = self });
     }
 
