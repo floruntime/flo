@@ -90,6 +90,18 @@ fn claimCheckout() !void {
     }
     claim = .held;
 
+    // Sweep leftover servers of both binaries: a killed faults run leaves
+    // flo-faults servers the normal path would miss.
+    pkillServers(binary);
+    if (findFloFaultsBinary(std.heap.page_allocator)) |faults_binary| {
+        defer std.heap.page_allocator.free(faults_binary);
+        pkillServers(faults_binary);
+    } else |_| {}
+}
+
+/// `pkill -9` every `<binary> server …` process left over from a prior run,
+/// then pause for freed ports if any matched. Best effort: errors are ignored.
+fn pkillServers(binary: []const u8) void {
     // pkill -f takes an extended regex: escape the path so it matches only itself.
     var pattern: std.ArrayListUnmanaged(u8) = .empty;
     defer pattern.deinit(std.heap.page_allocator);
@@ -220,6 +232,10 @@ pub const ServerProcess = struct {
         log_level: []const u8 = "info",
         /// Durability mode (sync = guaranteed persistence, async_flush = fast)
         durability: Durability = .async_flush,
+        /// Spawn the `flo-faults` binary (zig-out/test/flo-faults) instead of the
+        /// shipped `flo`. The fault e2e files set this; it carries the faults
+        /// drive the shipped binary never has. See build.zig.
+        faults: bool = false,
         /// Serve from this data dir rather than the node's own, e.g. another
         /// node's. Config and log stay in the node's own.
         data_dir_of: ?[]const u8 = null,
@@ -295,8 +311,7 @@ pub const ServerProcess = struct {
         errdefer allocator.free(log_path);
         self.log_file_path = log_path;
 
-        // Find flo binary
-        self.flo_binary = try findFloBinary(allocator);
+        self.flo_binary = if (config.faults) try findFloFaultsBinary(allocator) else try findFloBinary(allocator);
 
         self.allocator = allocator;
         self.process = null;
@@ -940,15 +955,22 @@ fn portAfter(line: []const u8, key: []const u8) ?u16 {
 
 /// Find the flo binary path
 pub fn findFloBinary(allocator: Allocator) ![]const u8 {
-    // Try relative path from workspace root
-    const paths_to_try = [_][]const u8{
-        "zig-out/bin/flo",
-        "./zig-out/bin/flo",
-        "../zig-out/bin/flo",
-        "../../zig-out/bin/flo",
-    };
+    return findBinary(allocator, "bin", "flo");
+}
 
-    for (paths_to_try) |rel_path| {
+/// The faults e2e binary (zig-out/test/flo-faults), spawned by the fault e2e
+/// files via `ServerConfig.faults`. It carries the faults drive the shipped
+/// `flo` never has; build.zig keeps it out of zig-out/bin.
+pub fn findFloFaultsBinary(allocator: Allocator) ![]const u8 {
+    return findBinary(allocator, "test", "flo-faults");
+}
+
+fn findBinary(allocator: Allocator, sub: []const u8, name: []const u8) ![]const u8 {
+    // Try relative path from workspace root
+    const prefixes = [_][]const u8{ "zig-out", "./zig-out", "../zig-out", "../../zig-out" };
+    for (prefixes) |prefix| {
+        const rel_path = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ prefix, sub, name });
+        defer allocator.free(rel_path);
         const abs_path = stdx.fs.realpathAlloc(allocator, rel_path) catch continue;
         // Verify it exists (access check for existence)
         stdx.fs.access(rel_path, .{}) catch {
@@ -975,7 +997,7 @@ pub fn findFloBinary(allocator: Allocator) ![]const u8 {
     };
 
     const dir = std.fs.path.dirname(self_exe) orelse return error.FloBinaryNotFound;
-    const flo_path = try std.fs.path.join(allocator, &.{ dir, "flo" });
+    const flo_path = try std.fs.path.join(allocator, &.{ dir, name });
 
     stdx.fs.access(flo_path, .{}) catch {
         allocator.free(flo_path);

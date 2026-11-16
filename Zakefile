@@ -49,7 +49,7 @@ clean:
 # Testing
 # ============================================================================
 
-## Run all tests (unit + integration)
+## Run every test (unit, stdx, integration, e2e) — minutes; loads the machine
 test:
     flag: --filter|-f [string?] "Test name pattern to match"
     flag: --summary|-s [string="none"] "Summary level (all, none)"
@@ -322,7 +322,8 @@ dev:
         zig build
         echo ""
         echo "Step 2: Testing..."
-        zig build test --summary all
+        zig build test-unit --summary all
+        zig build test-integration --summary all
         echo ""
         echo "Step 3: Quick benchmark..."
         zig build bench-state -Drelease -- -n 5000
@@ -342,7 +343,8 @@ release:
         bash scripts/build-dashboard.sh
         echo ""
         echo "Step 3: Running tests..."
-        zig build test --summary all
+        zig build test-unit --summary all
+        zig build test-integration --summary all
         echo ""
         echo "Step 4: Building release..."
         let build_target = {{target}}
@@ -360,8 +362,10 @@ ci:
     script:
         echo "Running CI workflow..."
         echo ""
-        echo "Step 1: Testing..."
-        zig build test --summary all
+        echo "Step 1: Testing (CI's explicit steps)..."
+        zig build test-unit --summary all
+        zig build test-integration --summary all
+        zig build test-e2e --summary all
         echo ""
         echo "Step 2: Building dashboard (embeds Console v2)..."
         bash scripts/build-dashboard.sh

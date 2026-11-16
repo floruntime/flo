@@ -107,11 +107,12 @@ jobs:
           fi
 
       - name: The binary carries no test faults
-        # A -Dtest-faults build halts a shard, or crashes it in apply, on a
-        # kv set of a key with this prefix.
+        # A build with the fault hooks (only flo-faults) halts or crashes a
+        # shard on a kv set of a key with this prefix; the shipped flo must not
+        # carry them. Kept as insurance against a build.zig miswiring.
         run: |
           if grep -qa 'flo-test-fault-' zig-out/bin/flo; then
-            echo "::error::the release binary carries the test faults"; exit 1
+            echo "::error::the release binary carries the test faults (they belong only in flo-faults)"; exit 1
           fi
           if zig-out/bin/flo version --verbose | grep -qF 'test-faults'; then
             echo "::error::the release binary says it carries the test faults"; exit 1

@@ -2,8 +2,8 @@
 //! there: its writes are refused saying where and why, a write committed
 //! past it is told its outcome is pending, its reads are still served, and
 //! a restart comes up halted at the same entry. The halting entry comes
-//! from a fault only a `-Dtest-faults` build carries; without one these
-//! skip.
+//! from a test fault, so these run on the flo-faults e2e binary
+//! (`.faults = true`).
 
 const std = @import("std");
 const testing = std.testing;
@@ -28,9 +28,8 @@ fn haltIndex(parsed: std.json.Parsed(std.json.Value), shard: usize) ?i64 {
 }
 
 test "e2e/halt: a lone node's shard halts at the entry, refuses writes saying why, serves reads, and stays halted across a restart" {
-    if (!test_faults.enabled) return error.SkipZigTest;
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true },
+        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     try ctx.exec(&.{ "kv", "set", "before", "kept" });
@@ -126,8 +125,7 @@ fn repairSkip(cluster: anytype, node: usize, at: i64, yes: bool) !stdx.testing.C
 }
 
 test "e2e/halt: every node of a three-node group halts at the same entry" {
-    if (!test_faults.enabled) return error.SkipZigTest;
-    var cluster = try stdx.testing.ClusterContext.init(testing.allocator, .{ .node_count = 3, .metrics_enabled = true });
+    var cluster = try stdx.testing.ClusterContext.init(testing.allocator, .{ .node_count = 3, .metrics_enabled = true, .faults = true });
     defer cluster.deinit();
     try cluster.execOnWithRetry(0, &.{ "kv", "set", "before", "kept" }, 20, 250);
 
@@ -177,8 +175,7 @@ test "e2e/halt: every node of a three-node group halts at the same entry" {
 }
 
 test "e2e/halt: a repair from any member's admin socket skips the entry the group halted at; every node goes on past it, across a restart" {
-    if (!test_faults.enabled) return error.SkipZigTest;
-    var cluster = try stdx.testing.ClusterContext.init(testing.allocator, .{ .node_count = 3, .metrics_enabled = true });
+    var cluster = try stdx.testing.ClusterContext.init(testing.allocator, .{ .node_count = 3, .metrics_enabled = true, .faults = true });
     defer cluster.deinit();
     try cluster.execOnWithRetry(0, &.{ "kv", "set", "before", "kept" }, 20, 250);
     {
@@ -278,13 +275,12 @@ test "e2e/halt: a repair from any member's admin socket skips the entry the grou
 }
 
 test "e2e/halt: a follower that halts where its leader applied halted alone and is diverged (a build with no version says it can't tell); the group goes on" {
-    if (!test_faults.enabled) return error.SkipZigTest;
     const off: []const [2][]const u8 = &.{.{ test_faults.OFF_ENV, "1" }};
     var env: @FieldType(stdx.testing.ClusterConfig, "node_env") = @splat(&.{});
     // Node 2 alone halts at the fault; the seed, which leads, applies it.
     env[0] = off;
     env[1] = off;
-    var cluster = try stdx.testing.ClusterContext.init(testing.allocator, .{ .node_count = 3, .metrics_enabled = true, .node_env = env });
+    var cluster = try stdx.testing.ClusterContext.init(testing.allocator, .{ .node_count = 3, .metrics_enabled = true, .node_env = env, .faults = true });
     defer cluster.deinit();
     testing.allocator.free(try cluster.pollUntilContains(0, &.{ "cluster", "status", "-o", "json" }, "\"role\":\"leader\"", 40, 250));
     try cluster.execOnWithRetry(0, &.{ "kv", "set", HALT_KEY, "x" }, 20, 250);
@@ -370,9 +366,8 @@ fn shardOf(shards: u16, key: []const u8) u16 {
 }
 
 test "e2e/halt: a halted shard's schedule stops starting runs, and shows as a held duty" {
-    if (!test_faults.enabled) return error.SkipZigTest;
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true },
+        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     const path = try stdx.testing.writeTempYaml(testing.allocator,
@@ -412,9 +407,8 @@ test "e2e/halt: a halted shard's schedule stops starting runs, and shows as a he
 }
 
 test "e2e/halt: a halted shard's own processing job reads nothing, and shows as a held duty" {
-    if (!test_faults.enabled) return error.SkipZigTest;
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true },
+        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     try ctx.exec(&.{ "stream", "append", "job-in", "a" });
@@ -440,9 +434,8 @@ test "e2e/halt: a halted shard's own processing job reads nothing, and shows as 
 }
 
 test "e2e/halt: a pipeline whose KV sink can reach a halted shard reads nothing until it serves, even for keys a serving shard owns" {
-    if (!test_faults.enabled) return error.SkipZigTest;
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true },
+        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     // Every submit runs its job on shard 0, so the halt goes to the other

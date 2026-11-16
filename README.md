@@ -543,9 +543,10 @@ zig build -Drelease                    # Release build (ReleaseSafe)
 ./zig-out/bin/flo server start
 
 # Test
-zig build test --summary all               # Unit tests
+zig build test-unit --summary all          # Unit tests
 zig build test-integration --summary all   # Integration tests
 zig build test-e2e --summary all           # E2E acceptance tests
+zig build test --summary all               # Everything (minutes; loads the machine)
 
 # Only tests whose name contains a substring; repeat to run several.
 # A filter that matches no test in the step fails it; `|` is refused.
@@ -603,8 +604,8 @@ Flo is in **active development**. The core runtime has been rewritten from the g
 Contributions are welcome! Please see the [architecture docs](docs/architecture/) to understand the codebase structure before diving in.
 
 ```bash
-# Run tests
-zig build test --summary all
+# Run tests (unit; `zig build test` runs the whole suite and takes minutes)
+zig build test-unit --summary all
 
 # Run benchmarks
 zig build bench && ./zig-out/bin/bench-ual
