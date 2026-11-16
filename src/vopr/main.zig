@@ -301,6 +301,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
             s.kv.batch_conditions_held,
         },
     );
+    if (sim.leader_not_ready_refused > 0) std.debug.print("[vopr] client writes refused for a leader still applying earlier terms: {d}\n", .{sim.leader_not_ready_refused});
     if (scenario.action_percent > 0) printActionCounts(s.actions);
     if (scenario.queue_percent > 0) printQueueCounts(s.queues);
     if (scenario.hasTxnLimits()) printTxnCounts(s.txn);
