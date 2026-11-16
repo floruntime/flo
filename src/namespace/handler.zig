@@ -519,6 +519,14 @@ pub const NamespaceHandler = struct {
         return .wait;
     }
 
+    /// Shard 0: the log index of a create of `name` applied here that the
+    /// table doesn't show yet, or null.
+    pub fn unpublishedIndex(self: *const NamespaceHandler, name: []const u8) ?u64 {
+        if (!self.owner or self.table.lookup(name) != null) return null;
+        const meta = self.namespaces.get(name) orelse return null;
+        return meta.created_index;
+    }
+
     /// Whether this shard has a create of `name` applied or under way that
     /// the table doesn't show yet: shard 0 only.
     pub fn creating(self: *const NamespaceHandler, name: []const u8) bool {
