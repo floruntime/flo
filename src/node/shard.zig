@@ -11789,6 +11789,85 @@ test "Shard: operators that can't be rebuilt for a new term make the pipeline wa
     try std.testing.expectEqual(raft.current_term, pipe.ops_term);
 }
 
+test "Shard: a pipeline waits while its outbox to a sink's shard, or all its outboxes, hold their cap, and reads on once they're taken" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    var qb: [16]u8 = undefined;
+    const q = try queueOwnedBy(&two, 1, &qb);
+    var rb: [8]u8 = undefined;
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "r0");
+    two.settle();
+    // One byte a channel: the first batch fills it.
+    a.outbox_caps = .{ .shard = 1 << 30, .channel = 1 };
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var yb: [128]u8 = undefined;
+    const pipe = try sinkJob(&two, c, source, try std.fmt.bufPrint(&yb, "  - name: out\n    queue: {{ name: {s} }}", .{q.name}));
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
+    const read: contract_view.ReadView = .{ .store = &a.defaultPartition().store };
+    const held = channels_mod.metaOf(read, 1).bytes;
+    try std.testing.expect(held > 0);
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", try std.fmt.bufPrint(&rb, "r{d}", .{1}));
+    two.settle();
+    tickNow(a, pipe);
+    try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
+    try std.testing.expectEqual(@as(?u16, 1), pipe.wait.outbox.to);
+    try std.testing.expectEqual(held, pipe.wait.outbox.bytes);
+    {
+        // A replica of shard 0, as a restart or a new leader holds it: the
+        // same log, applied, holds the same outbox bytes.
+        const pipe_fds = try @import("stdx").io.pipe();
+        defer _ = std.c.close(pipe_fds[0]);
+        defer _ = std.c.close(pipe_fds[1]);
+        var r = try Shard.init(std.testing.allocator, 0, 2, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{ .namespaces = two.namespaces });
+        defer r.deinit();
+        r.wireHandlerShardPtrs();
+        var i: u64 = r.raft_node.last_applied + 1;
+        while (i <= a.raft_node.last_applied) : (i += 1) {
+            const e = a.raft_node.log.getEntry(i).?;
+            var out = persistence_mod.Result.start(&e);
+            try std.testing.expect(r.applyEntry(&e, &out));
+        }
+        try std.testing.expectEqual(held, channels_mod.metaOf(.{ .store = &r.defaultPartition().store }, 1).bytes);
+        try std.testing.expectEqual(held, r.outboxBytes());
+    }
+    var jobs = a.processing_handler.jobs.valueIterator();
+    var lb: [512]u8 = undefined;
+    try std.testing.expectEqualStrings("waiting: the outbox to shard 1 is full (0 of 0 MiB)", a.processing_handler.liveNote(jobs.next().?, &lb).?);
+    // Delivered, acked and trimmed: room again, and the next record goes.
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 0), channels_mod.metaOf(read, 1).bytes);
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expect(pipe.wait == .none);
+    try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
+    // The shard's cap, over all its outboxes, holds it the same way.
+    a.outbox_caps = .{ .shard = 1, .channel = 1 << 30 };
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", try std.fmt.bufPrint(&rb, "r{d}", .{2}));
+    two.settle();
+    tickNow(a, pipe);
+    try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
+    try std.testing.expectEqual(@as(?u16, null), pipe.wait.outbox.to);
+    // Trims are spaced 100 ms apart; this one is due now.
+    a.channel.peers[1].last_trim_ms = 0;
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 0), a.outboxBytes());
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+    pumpChannels(&two);
+    var bodies: [8][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), queueBodies(b, q.name, &bodies));
+}
+
 test "Shard: records whose operators emit nothing aren't read again while their cursor waits to be logged" {
     var two: TwoShards = undefined;
     try two.init();

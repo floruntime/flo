@@ -756,8 +756,8 @@ pub const ShardMetrics = struct {
     /// A sink's channel messages refused here for good by their target,
     /// by reason, summed over the shards that sent them.
     channel_sink_refusals: std.EnumArray(Reason, Atomic(u64)) = .initFill(Atomic(u64).init(0)),
-    /// Channel messages this shard sent that their receivers haven't
-    /// acked, over every channel (gauge).
+    /// Payload bytes of the channel messages this shard sent and hasn't
+    /// trimmed yet, over every channel (gauge).
     channel_outbox_bytes: Atomic(u64) = Atomic(u64).init(0),
     /// Channel messages parked here for a full target (gauges), the targets
     /// they wait on, and how long the longest-waiting target has waited.
