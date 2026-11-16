@@ -1266,6 +1266,7 @@ pub const Shard = struct {
         var channel = try channel_driver.Driver.init(allocator, shard_id, shard_count);
         errdefer channel.deinit();
         channel.admits = contract_machines.Channels.admits;
+        channel.sink_target = contract_machines.Channels.sinkTarget;
 
         return .{
             .id = shard_id,

@@ -1663,6 +1663,9 @@ pub const ProcessingHandler = struct {
         }
         const raft = shard.raft_node;
         if (raft.log.lastIndex() -| raft.last_applied >= raft_node_mod.MAX_OUTSTANDING) return .log;
+        // Room for a whole batch within what the log takes of this shard's
+        // own writes, so one isn't built only to be refused.
+        if (raft.pendingBytes() + limits.MAX_LOG_ENTRY_PAYLOAD > raft_node_mod.PROPOSAL_BYTES - raft_node_mod.PROPOSAL_RESERVE) return .log;
         return .none;
     }
 

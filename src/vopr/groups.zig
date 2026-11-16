@@ -437,6 +437,7 @@ pub const GroupChannel = struct {
         c.store.place = .{ .group = g, .count = count };
         c.store.strict_keys = true;
         c.driver.admits = Probed.admits;
+        c.driver.sink_target = Probed.sinkTarget;
         // Small enough that probes reach it, so a full outbox's pressure
         // is reported and read back.
         c.driver.caps = .{ .shard = 4 * OUTBOX_CAP, .channel = OUTBOX_CAP };
