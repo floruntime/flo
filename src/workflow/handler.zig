@@ -4827,6 +4827,9 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.entry_buf = try std.testing.allocator.alloc(u8, persistence_mod.MAX_PERSIST_PAYLOAD);
     shard.scratch = try @import("../node/scratch.zig").Scratch.init(std.testing.allocator, shard_mod.SCRATCH_SIZE);
     shard.durability = .async_flush;
+    // No disk in this harness: the apply loop's async-flush gap check reads
+    // durable_log, so it must be null, not the `undefined` garbage above.
+    shard.durable_log = null;
     shard.pending = try std.testing.allocator.alloc(shard_mod.Pending, shard_mod.PENDING_SLOTS);
     @memset(shard.pending, .{});
     shard.pending_count = 0;

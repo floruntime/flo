@@ -771,6 +771,10 @@ pub const ShardMetrics = struct {
     /// resync.
     buffer_failures: Atomic(u64) = Atomic(u64).init(0),
     buffer_failing_for_ms: Atomic(u64) = Atomic(u64).init(0),
+    /// How long a disk-staging gap has been open under async_flush (0 when
+    /// none): writes at or past it are held, not acked, until it fills. A
+    /// duration, computed at publish, like `flushes_failing_for_ms`.
+    gap_open_for_ms: Atomic(u64) = Atomic(u64).init(0),
     /// 1 while the shard is offline on this node.
     offline: Atomic(u8) = Atomic(u8).init(0),
     /// 1 while a committed entry cannot be read to apply it. Alert on this:
@@ -971,6 +975,7 @@ pub const ShardMetrics = struct {
         hardstate_failing_for_ms: u64,
         buffer_failures: u64,
         buffer_failing_for_ms: u64,
+        gap_open_for_ms: u64,
         offline: u8,
         read_blocked: u8,
         read_blocks_total: u64,
@@ -1037,6 +1042,7 @@ pub const ShardMetrics = struct {
             .hardstate_failing_for_ms = self.hardstate_failing_for_ms.load(.monotonic),
             .buffer_failures = self.buffer_failures.load(.monotonic),
             .buffer_failing_for_ms = self.buffer_failing_for_ms.load(.monotonic),
+            .gap_open_for_ms = self.gap_open_for_ms.load(.monotonic),
             .offline = self.offline.load(.monotonic),
             .read_blocked = self.read_blocked.load(.monotonic),
             .read_blocks_total = self.read_blocks_total.load(.monotonic),
@@ -1882,6 +1888,7 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_hardstate_failing_for_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.hardstate_failing_for_ms / 1000, snap.hardstate_failing_for_ms % 1000 });
     try writer.print("flo_shard_buffer_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.buffer_failures });
     try writer.print("flo_shard_buffer_failing_for_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.buffer_failing_for_ms / 1000, snap.buffer_failing_for_ms % 1000 });
+    try writer.print("flo_shard_gap_open_for_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.gap_open_for_ms / 1000, snap.gap_open_for_ms % 1000 });
     try writer.print("flo_shard_offline{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.offline });
     try writer.print("flo_shard_read_blocked{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.read_blocked });
     try writer.print("flo_shard_read_blocks_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.read_blocks_total });

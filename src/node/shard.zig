@@ -204,6 +204,18 @@ const ShardIo = struct {
         return Host.of(r).flushForAck();
     }
 
+    /// Under async_flush, whether this node's disk has fallen far enough behind
+    /// that it should stop acking appends: a follower withholds its ack so it
+    /// no longer counts toward commit until a flush lands. Always false under
+    /// sync (which goes through `flushForAck` instead) and when no bound is set.
+    pub fn asyncAckBlocked(r: *Replica) bool {
+        const s = Host.of(r);
+        // An open gap withholds the ack even once it is permanent (writes_stopped
+        // makes asyncBoundCrossed return .none): entries at or past the gap must
+        // never count toward commit, since they cannot reach this node's disk.
+        return s.gapHeld() or s.asyncBoundCrossed() != .none;
+    }
+
     /// The voters the network lets dial in and votes among.
     pub fn setVoters(r: *Replica, ids: []const u32) void {
         if (Host.of(r).raft_network) |rn| rn.setVoters(ids);
@@ -239,6 +251,14 @@ const ShardIo = struct {
         /// not report the same block again.
         pub fn readBlocked(r: *Replica) bool {
             return of(r).read_blocked;
+        }
+
+        /// Apply is held at an open disk-staging gap under async_flush: a
+        /// committed entry at or past it is deliberately not applied until the
+        /// gap fills, so `applyCommitted` returning false is expected, not an
+        /// error — callers stay quiet, as they do for a blocked read.
+        pub fn gapHolding(r: *Replica) bool {
+            return of(r).gapHeld();
         }
 
         pub fn clearRemovalNotices(r: *Replica) void {
@@ -575,6 +595,14 @@ pub const Shard = struct {
     unpark_full: bool = false,
     /// When `publishParked` last logged.
     parked_warn_ms: u64 = 0,
+    /// Async-flush write bound. Under async_flush, refuse new writes once
+    /// flushing has been failing for `async_flush_bound_ms`, or once
+    /// `async_flush_bound_bytes` sit unflushed in the writer's buffer, so the
+    /// node stops acking writes it can't promise are on disk. 0 on either
+    /// disables that half. Both 0 under sync and ephemeral, which never ack an
+    /// unflushed write anyway.
+    async_flush_bound_ms: u64,
+    async_flush_bound_bytes: u64,
 
     /// Where the Raft node persists its term and vote (null if ephemeral).
     hard_state_store: ?*HardStateStore,
@@ -796,6 +824,12 @@ pub const Shard = struct {
         /// The node's namespace table, shared by its shards; a shard built
         /// without one makes its own.
         namespaces: ?*@import("../namespace/table.zig").Table = null,
+        /// Async-flush write bound: refuse new writes once flushing has been
+        /// failing this long, or this many bytes sit unflushed. 0 disables
+        /// that half of the bound. Both default off, so a shard built for a
+        /// test carries no bound unless it asks for one.
+        async_flush_bound_ms: u64 = 0,
+        async_flush_bound_bytes: u64 = 0,
 
         fn cancelled(self: Boot) bool {
             const cancel = self.cancel orelse return false;
@@ -1150,7 +1184,6 @@ pub const Shard = struct {
         // whose entries are already covered by the Raft log's persistence.
         raft_node.log.ual.on_append_ctx = @ptrCast(seg_writer);
         raft_node.log.ual.on_append = segmentBufferCallback;
-        seg_writer.stop_at_gap = durability == .sync;
         var catch_up: ?*CatchUp = null;
         errdefer if (catch_up) |cu| {
             cu.deinit();
@@ -1290,6 +1323,10 @@ pub const Shard = struct {
             .losses = losses,
             .health = boot.health,
             .node_health = boot.node_health,
+            // The bound only governs async_flush: sync and ephemeral never ack
+            // an unflushed write, so there is nothing to hold back.
+            .async_flush_bound_ms = if (durability == .async_flush) boot.async_flush_bound_ms else 0,
+            .async_flush_bound_bytes = if (durability == .async_flush) boot.async_flush_bound_bytes else 0,
             .join_first_asked_ms = 0,
             .join_warned_ms = 0,
             .join_refused_warn_ms = 0,
@@ -1509,6 +1546,84 @@ pub const Shard = struct {
         if (self.flushes_failing_since_ms == 0) self.flushes_failing_since_ms = nowMs();
     }
 
+    /// Which half of the async-flush write bound is crossed right now, if any.
+    /// Both inputs are local and recover on their own: the failing clock resets
+    /// when a flush lands (`flushSegmentToDisk`), and the buffer drains with it.
+    pub const AsyncBound = union(enum) {
+        none,
+        /// An entry could not be staged for disk and the gap is still open
+        /// (its index); nothing at or past it is acked until it is re-staged.
+        gap: u64,
+        /// Flushing has been failing this many ms (>= async_flush_bound_ms).
+        time: u64,
+        /// This many bytes sit unflushed (>= async_flush_bound_bytes).
+        size: u64,
+    };
+
+    fn asyncBoundCrossed(self: *const Shard) AsyncBound {
+        // Only under async_flush: sync acks a write only once it is on disk, so
+        // it never acks past a gap or an unflushed backlog, and its own path
+        // handles a staging failure.
+        if (self.durability != .async_flush) return .none;
+        // Once an entry has left memory the gap is permanent and writes_stopped
+        // is set. Admission then defers to the proposal's writes_stopped refusal
+        // (restart needed) rather than any transient bound ("retry"), whether the
+        // bound that would otherwise fire is the gap, the time or the size. The
+        // follower ack-withhold does NOT key off this — it uses gapHeld(), so it
+        // keeps withholding acks for the entries at or past the permanent gap.
+        if (self.raft_node.writes_stopped) return .none;
+        // A recorded gap is the most urgent: an entry already missed the disk
+        // buffer, so nothing at or past it may be acked until it is re-staged.
+        if (self.durable_log) |dl| {
+            if (dl.writer.first_unbuffered) |from| return .{ .gap = from };
+        }
+        // Flushing failing for too long is the primary bound signal that the
+        // disk has stopped keeping up; the size bound also catches a burst that
+        // outruns the once-a-second flush before a failure is even recorded.
+        if (self.async_flush_bound_ms != 0 and self.flushes_failing_since_ms != 0) {
+            const failing_for = nowMs() -| self.flushes_failing_since_ms;
+            if (failing_for >= self.async_flush_bound_ms) return .{ .time = failing_for };
+        }
+        if (self.async_flush_bound_bytes != 0) {
+            if (self.durable_log) |dl| {
+                const unflushed = dl.writer.dataSize();
+                if (unflushed >= self.async_flush_bound_bytes) return .{ .size = unflushed };
+            }
+        }
+        return .none;
+    }
+
+    /// The refusal text for a crossed bound, naming the measured value and the
+    /// configured limit, into `buf`.
+    fn asyncBoundMessage(self: *const Shard, buf: []u8, bound: AsyncBound) []const u8 {
+        return switch (bound) {
+            .none => "",
+            .gap => |idx| std.fmt.bufPrint(buf, "unavailable: a write to this shard (entry {d}) has not reached disk; later writes are held until it does, and this one was not run — retry", .{idx}) catch "unavailable: a write to this shard has not reached disk; later writes are held, and this one was not run — retry",
+            .time => |ms| std.fmt.bufPrint(buf, "unavailable: writes to this shard haven't reached disk for {d:.1} s (limit {d} s); the write was not run — retry", .{
+                @as(f64, @floatFromInt(ms)) / 1000.0,
+                self.async_flush_bound_ms / 1000,
+            }) catch "unavailable: writes to this shard aren't reaching disk; the write was not run — retry",
+            .size => |bytes| std.fmt.bufPrint(buf, "unavailable: {d:.1} MiB written to this shard hasn't reached disk (limit {d} MiB); the write was not run — retry", .{
+                @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0),
+                self.async_flush_bound_bytes / (1024 * 1024),
+            }) catch "unavailable: this shard's writes aren't reaching disk; the write was not run — retry",
+        };
+    }
+
+    /// A gap is open under async_flush: the append hook could not buffer an
+    /// entry, so nothing at or past it has reached disk and apply holds there.
+    /// Derived from the writer, which opens and clears the gap (and its start
+    /// stamp) in lockstep, so this reads true from the moment the gap opens —
+    /// before the entry commits — until a flush heals it or a truncation cuts it.
+    /// Limited to async_flush: only async acks before disk, so only async holds
+    /// apply, marks reads stale and quiets the follower apply-log at a gap; sync
+    /// re-stages its own gap through flushForAck without any of that.
+    fn gapHeld(self: *const Shard) bool {
+        if (self.durability != .async_flush) return false;
+        const dl = self.durable_log orelse return false;
+        return dl.writer.first_unbuffered != null;
+    }
+
     /// Buffer again what the append hook could not, from the log, so the
     /// flush writes a run without a gap. The log evicts by size, so the
     /// entry may be gone; then nothing after it can reach disk, and the
@@ -1521,6 +1636,7 @@ pub const Shard = struct {
                 raft.writes_stopped = false;
                 log.info("shard {d}: the entry that never reached disk was cut from the log; taking writes again", .{self.id});
             }
+            writer.gap_open_since_ms = 0;
             return;
         };
         var idx = from;
@@ -1529,6 +1645,15 @@ pub const Shard = struct {
                 if (!raft.writes_stopped) {
                     raft.writes_stopped = true;
                     log.err("shard {d}: entry index={d} left memory before it reached disk, so nothing after it can be flushed; this shard takes no more writes until it restarts", .{ self.id, idx });
+                    // The held writes at or past the gap can't reach THIS node's
+                    // disk, so answer their clients now rather than leave them
+                    // waiting (ran=unknown). Alone, the entry is truly gone and a
+                    // resend after restart is safe (LOST_AT_RESTART). In a cluster
+                    // the followers may hold and commit it, so a blind resend would
+                    // apply it twice: tell the client it may still apply and to
+                    // check before resending (NOT_ON_DISK), as the sync path does.
+                    const alone = raft.role == .leader and raft.voterPeers() == 0;
+                    self.failPendingAbove(from -| 1, if (alone) LOST_AT_RESTART else NOT_ON_DISK);
                 }
                 return error.EntryUnavailable;
             };
@@ -1538,10 +1663,11 @@ pub const Shard = struct {
             };
         }
         writer.first_unbuffered = null;
-        // Buffering has caught up: end any failing run. Behind a sync gap the
-        // append hook returns early, so this is the only place a sync-mode run
-        // ends; the cumulative count stays.
+        // Buffering has caught up: end any failing run. Behind a gap the append
+        // hook returns early, so this is the only place a run ends; the
+        // cumulative count stays.
         writer.buffer_failing_since_ms = 0;
+        writer.gap_open_since_ms = 0;
     }
 
     /// Start applying what replay loaded into the log above the commit
@@ -2357,9 +2483,10 @@ pub const Shard = struct {
         if (!writes and !at_leader and !exempt and !internal_from_client and auth.origin != .peer and self.refusedRead(conn, req)) return;
         const was_stale = proto.answering_stale;
         // A read is stale when this node can't apply what the group committed:
-        // halted, diverged, or blocked reading a committed entry — the
-        // projections sit behind the commit either way.
-        proto.answering_stale = was_stale or ((self.halted != null or self.replica.diverged or self.read_blocked) and !writes);
+        // halted, diverged, blocked reading a committed entry, or holding apply
+        // at a disk-staging gap under async_flush — the projections sit behind
+        // the commit either way.
+        proto.answering_stale = was_stale or ((self.halted != null or self.replica.diverged or self.read_blocked or self.gapHeld()) and !writes);
         defer proto.answering_stale = was_stale;
         if (self.raft_network != null and (writes or at_leader) and (self.replica.diverged or self.raft_node.role != .leader)) {
             if (self.replica.diverged) {
@@ -2401,10 +2528,33 @@ pub const Shard = struct {
         const in_txn_read = table_run.readsInTxn(req);
         const worker_op = req.header.op_code == @backingInt(proto.OpCode.worker_register) or req.header.op_code == @backingInt(proto.OpCode.worker_heartbeat) or
             req.header.op_code == @backingInt(proto.OpCode.worker_deregister) or req.header.op_code == @backingInt(proto.OpCode.worker_drain);
-        const refuses_write = writes and !in_txn_read and !membership_op and !repair_op and !worker_op and !table_run.runsOnApplyingLeader(req);
+        // A real data write from a client or forwarded from a peer. The async
+        // bound applies to every one of these, including the ops that run on an
+        // applying leader (kv.*, namespace.create/ensure, action.await): they
+        // also ack before the entry reaches disk. runsOnApplyingLeader exempts
+        // that set from the leaderApplying refusal only, so the bound keeps its
+        // own gate rather than inheriting that exemption and skipping kv writes.
+        const bound_eligible = writes and !in_txn_read and !membership_op and !repair_op and !worker_op;
+        const refuses_write = bound_eligible and !table_run.runsOnApplyingLeader(req);
         if ((at_leader or in_txn_read or refuses_write) and self.leaderApplying()) {
             self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = LEADER_NOT_READY_REFUSAL });
             return;
+        }
+        // Under async_flush this node acks a write before it reaches disk. When
+        // the disk has fallen too far behind — flushing failing past the time
+        // bound, or too many bytes unflushed — refuse the write here, before it
+        // is proposed, rather than acknowledge one more that may be lost. ran=no
+        // is exact: nothing was proposed. It clears on its own once a flush
+        // lands. Only client and forwarded writes are held; duties propose
+        // directly and are small and bounded. A write already in flight is
+        // unaffected, so the buffer can overshoot by what that holds.
+        if (bound_eligible) {
+            const bound = self.asyncBoundCrossed();
+            if (bound != .none) {
+                var buf: [256]u8 = undefined;
+                self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .unclassified, .ran = .no, .message = self.asyncBoundMessage(&buf, bound) });
+                return;
+            }
         }
         // A write that brings data into a namespace this shard has not seen
         // creates it. Checked after forwarding because only the leader knows
@@ -3433,7 +3583,7 @@ pub const Shard = struct {
             // Reached its entry, or the pass drained fully (not stopped by the
             // budget, and not held by a blocked read): otherwise it parks and
             // is answered when the rest applies.
-            break :here self.raft_node.last_applied >= proposed.index or (!self.apply_behind and !self.read_blocked and self.snapshot_window == null);
+            break :here self.raft_node.last_applied >= proposed.index or (!self.apply_behind and !self.read_blocked and self.snapshot_window == null and !self.gapHeld());
         };
         if (answered_here) {
             defer if (release) |r| r(self, ctx);
@@ -4846,6 +4996,14 @@ pub const Shard = struct {
         if (self.halted != null) return .halted;
         const raft = self.raft_node;
         if (raft.writes_stopped) return .cannot_flush;
+        // A disk-staging gap is open under async_flush: writes at or past it are
+        // held and not acked until it fills — the same not-on-disk condition
+        // sync reports, so it reads the same way.
+        if (self.gapHeld()) return .cannot_flush;
+        // The async-flush time or size bound is crossed: new writes are being
+        // refused because flushing has fallen behind, so the node is not healthy
+        // and should not read ready while it is turning writes away.
+        if (self.asyncBoundCrossed() != .none) return .cannot_flush;
         // A node no config names is joining. It is guarded too, since an
         // empty log could be a lost one, but it holds nothing a group
         // counts on yet, and joining says what it waits for.
@@ -4965,6 +5123,7 @@ pub const Shard = struct {
             if (self.durable_log) |dl| {
                 sm.buffer_failures.store(dl.writer.buffer_failures, .monotonic);
                 sm.buffer_failing_for_ms.store(if (dl.writer.buffer_failing_since_ms == 0) 0 else nowMs() -| dl.writer.buffer_failing_since_ms, .monotonic);
+                sm.gap_open_for_ms.store(if (dl.writer.gap_open_since_ms == 0) 0 else nowMs() -| dl.writer.gap_open_since_ms, .monotonic);
             }
         }
         const slot = self.health orelse return;
@@ -5027,6 +5186,7 @@ pub const Shard = struct {
         if (self.durable_log) |dl| {
             slot.buffer_failures.store(dl.writer.buffer_failures, .monotonic);
             slot.buffer_failing_for_ms.store(if (dl.writer.buffer_failing_since_ms == 0) 0 else nowMs() -| dl.writer.buffer_failing_since_ms, .monotonic);
+            slot.gap_open_for_ms.store(if (dl.writer.gap_open_since_ms == 0) 0 else nowMs() -| dl.writer.gap_open_since_ms, .monotonic);
         }
         slot.publish(self.healthState(), raft.role, raft.last_applied, raft.commit_index);
     }
@@ -5441,6 +5601,21 @@ pub const Shard = struct {
                 // Advanced before the apply: whatever a notification does, this
                 // entry is never taken twice, and the loop cannot stall.
                 raft.last_applied = next_idx;
+                // An entry the append hook could not stage for disk under
+                // async_flush opens a gap. Hold apply at it, as a blocked read
+                // does: nothing at or past it applies or is acked until the
+                // flush re-stages it (clearing the gap), or stops writes if it
+                // has left memory. Without this, async would ack an entry that
+                // may never reach disk.
+                if (self.durability == .async_flush) {
+                    if (self.durable_log) |dl| if (dl.writer.first_unbuffered) |from| if (next_idx >= from) {
+                        // The gap's start was stamped in the append hook when it
+                        // opened; apply only has to hold here, not re-stamp.
+                        raft.last_applied = next_idx - 1;
+                        all_applied = false;
+                        break :drain;
+                    };
+                }
                 switch (raft.log.readForApply(next_idx, self.apply_buf)) {
                     .blocked => |b| {
                         // The entry's segment could not be read right now (a
@@ -7778,16 +7953,19 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
 fn segmentBufferCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
     const writer: *SegmentWriter = @ptrCast(@alignCast(ctx));
     // Behind a gap nothing is buffered: the flush re-buffers from the gap.
-    if (writer.stop_at_gap and writer.first_unbuffered != null) return;
+    if (writer.first_unbuffered != null) return;
     writer.addEntry(entry) catch |err| {
+        // A hole on disk would break the on-disk ack promise (sync acks only on
+        // disk; async acks before it), so a staging failure always opens a gap
+        // rather than drop the entry and buffer past it. The early return above
+        // means no gap is open yet, so this entry opens it. Stamp the start now,
+        // at append time — before the entry commits — so health and metrics
+        // report the gap even on a follower withholding acks on it.
         writer.buffer_failures += 1;
         if (writer.buffer_failing_since_ms == 0) writer.buffer_failing_since_ms = Shard.nowMs();
-        if (writer.stop_at_gap) {
-            writer.first_unbuffered = entry.header.index;
-            log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; buffering resumes from it at the next flush (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
-        } else {
-            log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; it will be missing from disk after a restart (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
-        }
+        writer.first_unbuffered = entry.header.index;
+        writer.gap_open_since_ms = Shard.nowMs();
+        log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; buffering resumes from it at the next flush (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
         return;
     };
     // Buffered again: end any failing run. The cumulative count stays.
@@ -14664,7 +14842,7 @@ test "shard: a real HARDSTATE persist failure shows in the field, the metric sna
     try std.testing.expectEqual(@as(u64, 0), shard.shard_metrics.?.snapshot().hardstate_failing_for_ms);
 }
 
-test "shard: a real buffer failure shows in the field, the metric snapshot and text, /status, and a later entry that buffers ends the run" {
+test "shard: a real buffer failure shows in the field, the metric snapshot and text, /status, and a flush that re-stages the gap ends the run" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const data_dir = try testDataDir(&tmp);
@@ -14721,12 +14899,198 @@ test "shard: a real buffer failure shows in the field, the metric snapshot and t
     try std.testing.expectEqual(@as(i64, 1), s0.get("buffer_failures").?.integer);
     try std.testing.expect(s0.get("buffer_failing_for_ms").?.integer >= 1000);
 
-    // A later entry that buffers ends the run; the cumulative count stays.
-    _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "k2", "v");
+    // A flush re-stages the gapped entry from the log and ends the run; the
+    // cumulative count stays. Both durabilities now stop at the gap (the entry
+    // is held, not dropped past), so the run ends when buffering catches up at
+    // a flush, not when a later append slips in behind the hole.
+    try shard.flushSegmentToDisk();
     try std.testing.expectEqual(@as(u64, 0), writer.buffer_failing_since_ms);
     try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures);
     shard.publishHealth();
     try std.testing.expectEqual(@as(u64, 0), shard.shard_metrics.?.snapshot().buffer_failing_for_ms);
+}
+
+test "shard: the async-flush time bound trips after flushes fail long enough and clears on a flush" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    // The server converts [server] async_flush_bound_seconds/mb to ms/bytes.
+    var shard = try Shard.init(std.testing.allocator, 0, 4, pipe_fds[0], data_dir, 8 * 1024 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{ .async_flush_bound_ms = 3000, .async_flush_bound_bytes = 64 * 1024 * 1024 });
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+
+    // Healthy: nothing failing, buffer under 64 MiB.
+    try std.testing.expect(shard.asyncBoundCrossed() == .none);
+
+    // Make a real flush fail, then age the failing clock past the 3 s bound.
+    const raft = shard.raft_node;
+    _ = try raft.propose(.raft_noop, entry_mod.Flags.NONE, "x");
+    const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
+    defer std.testing.allocator.free(segs);
+    var zbuf: [600:0]u8 = undefined;
+    const z = try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{segs}, 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(z, 0o500));
+    defer _ = std.c.chmod(z, 0o700);
+    try std.testing.expect(!shard.flushForAck());
+    try std.testing.expect(shard.flushes_failing_since_ms != 0);
+
+    // Just under the bound: not yet crossed. Past it: the time bound, named.
+    shard.flushes_failing_since_ms = Shard.nowMs() -| 2_900;
+    try std.testing.expect(shard.asyncBoundCrossed() == .none);
+    shard.flushes_failing_since_ms = Shard.nowMs() -| 3_200;
+    switch (shard.asyncBoundCrossed()) {
+        .time => |ms| try std.testing.expect(ms >= 3_000),
+        else => return error.ExpectedTimeBound,
+    }
+    var buf: [256]u8 = undefined;
+    const msg = shard.asyncBoundMessage(&buf, shard.asyncBoundCrossed());
+    try std.testing.expect(std.mem.indexOf(u8, msg, "haven't reached disk for 3.2 s (limit 3 s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "was not run") != null);
+    // While it refuses writes, health reads cannot_flush (not ok), so the node
+    // does not read ready while turning writes away.
+    try std.testing.expectEqual(health_mod.ShardState.cannot_flush, shard.healthState());
+
+    // A flush that reaches disk clears the run and the bound with it.
+    _ = std.c.chmod(z, 0o700);
+    try std.testing.expect(shard.flushForAck());
+    try std.testing.expect(shard.asyncBoundCrossed() == .none);
+    try std.testing.expectEqual(health_mod.ShardState.ok, shard.healthState());
+}
+
+test "shard: the async-flush size bound trips on unflushed bytes and clears on a flush" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    // Only the size bound is armed (1 byte), so any buffered entry crosses it.
+    var shard = try Shard.init(std.testing.allocator, 0, 4, pipe_fds[0], data_dir, 8 * 1024 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{ .async_flush_bound_ms = 0, .async_flush_bound_bytes = 1 });
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+
+    // Drain the bootstrap noop the single-node start buffered, so the test
+    // begins with an empty buffer.
+    const raft = shard.raft_node;
+    try std.testing.expect(shard.flushForAck());
+    try std.testing.expect(shard.asyncBoundCrossed() == .none);
+
+    // One buffered entry is already over a 1-byte bound.
+    _ = try raft.propose(.raft_noop, entry_mod.Flags.NONE, "x");
+    switch (shard.asyncBoundCrossed()) {
+        .size => |bytes| try std.testing.expect(bytes >= 1),
+        else => return error.ExpectedSizeBound,
+    }
+    // Flushing it to disk drains the buffer, so the bound clears.
+    try std.testing.expect(shard.flushForAck());
+    try std.testing.expect(shard.asyncBoundCrossed() == .none);
+}
+
+test "shard: the async-flush bound refusal names the measured value and the configured limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, pipe_fds[0], data_dir, 8 * 1024 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{ .async_flush_bound_ms = 3000, .async_flush_bound_bytes = 64 * 1024 * 1024 });
+    defer shard.deinit();
+
+    var tbuf: [256]u8 = undefined;
+    const t = shard.asyncBoundMessage(&tbuf, .{ .time = 3_200 });
+    try std.testing.expect(std.mem.indexOf(u8, t, "haven't reached disk for 3.2 s (limit 3 s)") != null);
+
+    var sbuf: [256]u8 = undefined;
+    // ~64.1 MiB unflushed.
+    const s = shard.asyncBoundMessage(&sbuf, .{ .size = 64 * 1024 * 1024 + 110_000 });
+    try std.testing.expect(std.mem.indexOf(u8, s, "hasn't reached disk (limit 64 MiB)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "64.1 MiB") != null);
+}
+
+test "shard: a client write is refused with the bound text once the async-flush bound is crossed, and admitted again after a flush" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], data_dir, 8 * 1024 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{ .async_flush_bound_ms = 3000, .async_flush_bound_bytes = 64 * 1024 * 1024 });
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    // Fail a real flush and age the failing clock past the 3 s time bound.
+    const raft = shard.raft_node;
+    _ = try raft.propose(.raft_noop, entry_mod.Flags.NONE, "x");
+    const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
+    defer std.testing.allocator.free(segs);
+    var zbuf: [600:0]u8 = undefined;
+    const z = try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{segs}, 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(z, 0o500));
+    defer _ = std.c.chmod(z, 0o700);
+    try std.testing.expect(!shard.flushForAck());
+    shard.flushes_failing_since_ms = Shard.nowMs() -| 3_200;
+
+    // A client write is refused before it is proposed: unavailable, naming the
+    // bound. Assert the answer itself — the CLI exits 0 even on a refusal.
+    var out: [512]u8 = undefined;
+    shard.runRequest(conn, testReq(.kv_put, 5, "", "k", "v", ""), .client);
+    const resp = try readOne(&shard, conn, pair[1], &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 5), resp.header.request_id);
+    try std.testing.expect(std.mem.indexOf(u8, resp.data, "haven't reached disk for 3.2 s (limit 3 s)") != null);
+
+    // The bound covers every data write, not only the ops the leaderApplying
+    // refusal would catch. kv.* runs on an applying leader (so it's exempt from
+    // that refusal) but is still acked before disk — the kv_put above proves it
+    // is held. A queue write, which the leaderApplying refusal does catch, is
+    // held here too: the refusal is at admission, so either op reaches it.
+    shard.runRequest(conn, testReq(.queue_complete, 7, "", "q", "v", ""), .client);
+    const respq = try readOne(&shard, conn, pair[1], &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), respq.header.status);
+    try std.testing.expectEqual(@as(u64, 7), respq.header.request_id);
+    try std.testing.expect(std.mem.indexOf(u8, respq.data, "haven't reached disk") != null);
+
+    // A flush that reaches disk clears the bound; the next write is admitted and
+    // applies here, so its ok answer is delivered (a refusal answers at once; an
+    // admitted write is answered once it applies).
+    _ = std.c.chmod(z, 0o700);
+    try std.testing.expect(shard.flushForAck());
+    try std.testing.expect(shard.asyncBoundCrossed() == .none);
+    shard.runRequest(conn, testReq(.kv_put, 6, "", "k", "v", ""), .client);
+    _ = shard.applyCommitted();
+    const resp2 = try readOne(&shard, conn, pair[1], &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp2.header.status);
+    try std.testing.expectEqual(@as(u64, 6), resp2.header.request_id);
+}
+
+/// Flush the shard's buffered answers to the connection and read exactly one
+/// response, without blocking — the shard buffers answers per connection, so a
+/// test must flush before it can read one from the socket.
+fn readOne(sh: *Shard, conn: *Connection, fd: std.posix.fd_t, buf: []u8) !proto.Response {
+    sh.flushToClient(conn.fd);
+    var total: usize = 0;
+    while (total < buf.len) {
+        const r = std.c.recv(fd, buf[total..].ptr, buf.len - total, std.c.MSG.DONTWAIT);
+        if (r <= 0) break;
+        total += @intCast(r);
+    }
+    try std.testing.expect(total > 0);
+    return proto.Response.parse(buf[0..total]);
 }
 
 test "Shard: a data directory that belonged to a group refuses to run alone, and rejoins as a member" {
@@ -18219,8 +18583,8 @@ test "Shard: in sync mode a buffer-failure run holds behind the gap and ends onc
     _ = try kv_handler_mod.KVHandler.testProposePut(&s.shard, "k1", "v");
     writer.allocator = real;
     try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures);
-    // The run started. Behind the sync gap the append hook returns early, so
-    // the next entry does not clear it — it holds until rebuffering catches up.
+    // The run started. Behind the gap the append hook returns early, so the
+    // next entry does not clear it — it holds until rebuffering catches up.
     try std.testing.expect(writer.buffer_failing_since_ms != 0);
     _ = try kv_handler_mod.KVHandler.testProposePut(&s.shard, "k2", "v");
     try std.testing.expect(writer.buffer_failing_since_ms != 0);
@@ -18259,6 +18623,213 @@ test "Shard: with sync durability, an entry that left memory before reaching dis
     try std.testing.expectEqual(proto.StatusCode.unavailable, refused.getStatus());
     try std.testing.expect(std.mem.indexOf(u8, refused.data, "stopped taking writes") != null);
     try std.testing.expectEqual(last, s.shard.raft_node.log.lastIndex());
+}
+
+const GapAlone = struct {
+    data_dir: []const u8,
+    pipe_fds: [2]i32,
+    pair: [2]std.posix.fd_t,
+    shard: Shard,
+    conn: *Connection,
+
+    fn init(self: *GapAlone, tmp: *std.testing.TmpDir) !void {
+        self.data_dir = try testDataDir(tmp);
+        self.pipe_fds = try @import("stdx").io.pipe();
+        // Bounds off (0/0): only the staging-gap path is under test here.
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, self.pipe_fds[0], self.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+        self.shard.wireHandlerShardPtrs();
+        try std.testing.expect(self.shard.applyCommitted());
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &self.pair));
+        self.conn = try self.shard.addConnection(self.pair[0]);
+    }
+
+    fn deinit(self: *GapAlone) void {
+        self.shard.deinit();
+        _ = std.c.close(self.pair[1]);
+        _ = std.c.close(self.pipe_fds[0]);
+        _ = std.c.close(self.pipe_fds[1]);
+        std.testing.allocator.free(self.data_dir);
+    }
+
+    /// Flush what is buffered to disk and drop the writer's spare capacity, so
+    /// the very next append must allocate — and the next `openGap` can fail it.
+    fn settleEmpty(self: *GapAlone) !void {
+        try self.shard.flushSegmentToDisk();
+        const writer = self.shard.durable_log.?.writer;
+        writer.data.clearAndFree(writer.allocator);
+        writer.sparse_index.clearAndFree(writer.allocator);
+    }
+
+    /// Send a put whose append cannot be staged for disk (its allocation
+    /// fails), opening a gap. Caller has already `settleEmpty`.
+    fn openGap(self: *GapAlone, id: u64, key: []const u8) !void {
+        const writer = self.shard.durable_log.?.writer;
+        const real = writer.allocator;
+        var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
+        writer.allocator = failing.allocator();
+        try ParkTest.send(&self.shard, self.conn, .kv_put, id, key, "v");
+        writer.allocator = real;
+        _ = self.shard.applyCommitted();
+    }
+
+    fn put(self: *GapAlone, id: u64, key: []const u8, buf: []u8) !proto.Response {
+        try ParkTest.send(&self.shard, self.conn, .kv_put, id, key, "v");
+        _ = self.shard.applyCommitted();
+        var r: [1]proto.Response = undefined;
+        try ParkTest.responses(&self.shard, self.conn, self.pair[1], buf, &r);
+        return r[0];
+    }
+
+    fn reply(self: *GapAlone, buf: []u8) !proto.Response {
+        _ = self.shard.applyCommitted();
+        var r: [1]proto.Response = undefined;
+        try ParkTest.responses(&self.shard, self.conn, self.pair[1], buf, &r);
+        return r[0];
+    }
+};
+
+test "Shard: alone with async_flush, a write that can't be staged for disk is held, not acked, then acked once it is re-staged" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: GapAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+    var buf: [1024]u8 = undefined;
+
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.put(1, "k0", &buf)).getStatus());
+    try s.settleEmpty();
+    try s.openGap(2, "k1");
+
+    // The entry is a gap: its write is held (not answered), it is not applied,
+    // and the shard reports the stall like a failed flush would.
+    const writer = s.shard.durable_log.?.writer;
+    try std.testing.expect(writer.first_unbuffered != null);
+    try std.testing.expect(s.conn.response_deferred);
+    try std.testing.expect(s.shard.kv_handler.kv.getIn(.default, "k1") == null);
+    try std.testing.expect(s.shard.asyncBoundCrossed() == .gap);
+    try std.testing.expectEqual(health_mod.ShardState.cannot_flush, s.shard.healthState());
+    try std.testing.expect(writer.gap_open_since_ms != 0);
+
+    // The flush re-stages the entry from the log, clearing the gap; the held
+    // write is then answered, once, and the value is present.
+    try s.shard.flushSegmentToDisk();
+    try std.testing.expect(writer.first_unbuffered == null);
+    try std.testing.expectEqual(@as(u64, 0), writer.gap_open_since_ms);
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.reply(&buf)).getStatus());
+    try std.testing.expect(s.shard.kv_handler.kv.getIn(.default, "k1") != null);
+    try std.testing.expectEqual(health_mod.ShardState.ok, s.shard.healthState());
+
+    // A later write lands once, as normal.
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.put(3, "k2", &buf)).getStatus());
+    try std.testing.expect(s.shard.kv_handler.kv.getIn(.default, "k2") != null);
+}
+
+test "Shard: alone with async_flush, a held write whose entry leaves memory before disk is told it is lost, and writes stop" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: GapAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+    var buf: [1024]u8 = undefined;
+
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.put(1, "k0", &buf)).getStatus());
+    try s.settleEmpty();
+    try s.openGap(2, "k1");
+    try std.testing.expect(s.conn.response_deferred);
+
+    // The gap entry is evicted from the log before it could be re-staged: it is
+    // nowhere, so the shard stops writes and the held write is told it is lost.
+    _ = s.shard.raft_node.log.ual.evictOlderThan(std.math.maxInt(u64));
+    s.shard.flushSegmentToDisk() catch {};
+    try std.testing.expect(s.shard.raft_node.writes_stopped);
+    const lost = try s.reply(&buf);
+    try std.testing.expectEqual(proto.StatusCode.unavailable, lost.getStatus());
+    try std.testing.expect(std.mem.indexOf(u8, lost.data, "lost when the node restarts") != null);
+
+    // A new write is refused before it reaches the log.
+    const last = s.shard.raft_node.log.lastIndex();
+    const refused = try s.put(3, "k3", &buf);
+    try std.testing.expectEqual(proto.StatusCode.unavailable, refused.getStatus());
+    try std.testing.expect(std.mem.indexOf(u8, refused.data, "stopped taking writes") != null);
+    try std.testing.expectEqual(last, s.shard.raft_node.log.lastIndex());
+
+    // writes_stopped is permanent, so admission keeps deferring to it even once
+    // flushing has been failing past the time bound — it never flips back to a
+    // transient "retry". And a follower still withholds its ack (gapHeld stays
+    // true), since the gap entry must never count toward commit on a node whose
+    // disk it can't reach.
+    s.shard.async_flush_bound_ms = 3000;
+    s.shard.flushes_failing_since_ms = Shard.nowMs() -| 5000; // well past the bound
+    try std.testing.expect(s.shard.asyncBoundCrossed() == .none);
+    try std.testing.expect(s.shard.gapHeld());
+}
+
+test "Shard: in a cluster with async_flush, a held write whose entry is evicted may still apply, so it is not told it is lost" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: GapAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+    var buf: [1024]u8 = undefined;
+
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.put(1, "k0", &buf)).getStatus());
+    try s.settleEmpty();
+    try s.openGap(2, "k1");
+    try std.testing.expect(s.conn.response_deferred);
+
+    // A voter peer: this node is no longer alone. The evicted entry may still
+    // hold and commit on that peer, so a blind resend would apply it twice — the
+    // held write is told it may still apply and to check before resending, not
+    // that it is lost (which the alone case says).
+    s.shard.raft_node.addPeer(2);
+    try std.testing.expect(s.shard.raft_node.voterPeers() > 0);
+    _ = s.shard.raft_node.log.ual.evictOlderThan(std.math.maxInt(u64));
+    s.shard.flushSegmentToDisk() catch {};
+    try std.testing.expect(s.shard.raft_node.writes_stopped);
+    const held = try s.reply(&buf);
+    try std.testing.expectEqual(proto.StatusCode.unavailable, held.getStatus());
+    try std.testing.expect(std.mem.indexOf(u8, held.data, "check before resending") != null);
+    try std.testing.expect(std.mem.indexOf(u8, held.data, "lost when the node restarts") == null);
+}
+
+test "Shard: alone with async_flush, a gap held open never lets channelDurable pass the flushed tip" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: GapAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+    var buf: [1024]u8 = undefined;
+
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.put(1, "k0", &buf)).getStatus());
+    try s.settleEmpty(); // k0 on disk; the flushed tip is at k0.
+    const durable_before = s.shard.channelDurable();
+
+    try s.openGap(2, "k1");
+    const gap_at = s.shard.durable_log.?.writer.first_unbuffered.?;
+    // The flushed tip a channel delivers against must sit before the gap.
+    try std.testing.expect(s.shard.channelDurable() < gap_at);
+    try std.testing.expectEqual(durable_before, s.shard.channelDurable());
+
+    // Writes commit behind the gap (held by the apply-hold, never staged).
+    _ = try kv_handler_mod.KVHandler.testProposePut(&s.shard, "k2", "v");
+    _ = try kv_handler_mod.KVHandler.testProposePut(&s.shard, "k3", "v");
+    _ = s.shard.applyCommitted();
+
+    // A flush that can't re-stage the gap must not advance the flushed tip:
+    // channelDurable stays put, so a channel trims no further than disk holds.
+    const writer = s.shard.durable_log.?.writer;
+    const real = writer.allocator;
+    var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
+    writer.allocator = failing.allocator();
+    s.shard.flushSegmentToDisk() catch {};
+    writer.allocator = real;
+    try std.testing.expect(s.shard.channelDurable() < gap_at);
+    try std.testing.expectEqual(durable_before, s.shard.channelDurable());
+
+    // Healed: the flush re-stages from the gap and the tip advances past it.
+    try s.shard.flushSegmentToDisk();
+    try std.testing.expect(writer.first_unbuffered == null);
+    try std.testing.expect(s.shard.channelDurable() >= gap_at);
 }
 
 test "Shard: a namespace create is published, and answered, only once its segment and directory are on disk" {
@@ -18355,7 +18926,7 @@ test "Shard: a second create of a name being created waits for the first, and is
     try std.testing.expectEqual(@backingInt(proto.StatusCode.conflict), by_id[1].header.status);
 }
 
-test "Shard: with async durability, an entry the writer could not buffer is a hole, and buffering goes on" {
+test "Shard: with async durability, an entry the writer could not buffer opens a gap and holds; a flush re-stages it and what follows" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const data_dir = try testDataDir(&tmp);
@@ -18368,20 +18939,36 @@ test "Shard: with async durability, an entry the writer could not buffer is a ho
     shard.wireHandlerShardPtrs();
     try shard.flushSegmentToDisk();
 
+    // Async acks before disk, so a hole would be acked-but-lost. Async now holds
+    // at the gap exactly as sync does: the entry that failed to stage is kept,
+    // and nothing after it buffers until a flush re-stages from the gap.
     const writer = shard.durable_log.?.writer;
     writer.data.clearAndFree(writer.allocator);
     writer.sparse_index.clearAndFree(writer.allocator);
     const real = writer.allocator;
     var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
     writer.allocator = failing.allocator();
-    _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "k1", "v");
+    const first = try kv_handler_mod.KVHandler.testProposePut(&shard, "k1", "v");
     writer.allocator = real;
-    const second = try kv_handler_mod.KVHandler.testProposePut(&shard, "k2", "v");
+    _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "k2", "v");
     try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures);
-    try std.testing.expect(writer.first_unbuffered == null);
-    try std.testing.expectEqual(@as(u32, 1), writer.entry_count);
-    try std.testing.expectEqual(second.index, writer.first_index);
+    try std.testing.expectEqual(first.index, writer.first_unbuffered);
+    try std.testing.expect(writer.gap_open_since_ms != 0);
+    try std.testing.expectEqual(@as(u32, 0), writer.entry_count); // nothing buffered past the gap
+    try std.testing.expectEqual(health_mod.ShardState.cannot_flush, shard.healthState());
+
+    // The flush re-stages from the gap: the held entry and the one after it both
+    // reach disk once each, in order; the gap clears and health recovers.
     try shard.flushSegmentToDisk();
+    try std.testing.expect(writer.first_unbuffered == null);
+    try std.testing.expectEqual(@as(u64, 0), writer.gap_open_since_ms);
+    try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures); // the count stays
+    try std.testing.expectEqual(health_mod.ShardState.ok, shard.healthState());
+    var got: [4]entry_mod.Entry = undefined;
+    var arena: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), shard.durable_log.?.readRange(first.index, &got, &arena).count);
+    try std.testing.expectEqual(first.index, got[0].header.index);
+    try std.testing.expectEqual(first.index + 1, got[1].header.index);
 }
 
 test "shard: a forwarded request parsed without its options trailer re-serializes whole" {

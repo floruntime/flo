@@ -50,17 +50,21 @@ pub const SegmentWriter = struct {
     /// A raw monotonic reading when the current run of buffer failures began, or
     /// 0 while buffering succeeds. Kept internal — set on the first failure of a
     /// run and cleared when buffering catches up (in the append hook, or in
-    /// rebufferGap behind a sync gap); `/status` and metrics publish the elapsed
+    /// rebufferGap behind a gap); `/status` and metrics publish the elapsed
     /// duration computed from it, not this raw reading.
     buffer_failing_since_ms: u64 = 0,
-    /// The first index that could not be buffered, when `stop_at_gap`.
-    /// Nothing after it is buffered either, so a flush never writes past a
-    /// gap; the owner re-buffers from here before flushing.
+    /// The first index the append hook could not buffer. Nothing after it is
+    /// buffered either, so a flush never writes past a gap; the owner re-buffers
+    /// from here before flushing. A hole on disk would break the on-disk promise
+    /// (sync acks only on disk; async acks before it), so a gap always holds —
+    /// the entry is never dropped and buffered past.
     first_unbuffered: ?u64 = null,
-    /// Set when a write is acked only once on disk: a hole in a flush would
-    /// break that promise. Otherwise an entry that can't be buffered is a
-    /// counted hole and buffering goes on.
-    stop_at_gap: bool = false,
+    /// A raw monotonic reading taken when the gap opened (when `first_unbuffered`
+    /// was set), or 0 while there is no gap. Set in the append hook — before the
+    /// entry commits — so a follower holding an uncommitted gap still reports it;
+    /// cleared in lockstep with `first_unbuffered`. `/status` and metrics publish
+    /// the elapsed duration computed from it, not this raw reading.
+    gap_open_since_ms: u64 = 0,
 
     allocator: std.mem.Allocator,
 
@@ -138,9 +142,14 @@ pub const SegmentWriter = struct {
     /// self-delimiting in `data`, so the kept prefix ends at the first
     /// dropped header; the sparse index and metadata follow it.
     pub fn truncateAfter(self: *SegmentWriter, after_index: u64) void {
-        // Missing entries the cut discards are no longer owed to disk.
+        // Missing entries the cut discards are no longer owed to disk: clear the
+        // gap and its start stamp together, so health recovers and the published
+        // gap duration stops growing at the cut, not at the next flush.
         if (self.first_unbuffered) |f| {
-            if (f > after_index) self.first_unbuffered = null;
+            if (f > after_index) {
+                self.first_unbuffered = null;
+                self.gap_open_since_ms = 0;
+            }
         }
         if (self.entry_count == 0 or self.last_index <= after_index) return;
         if (self.first_index > after_index) {
