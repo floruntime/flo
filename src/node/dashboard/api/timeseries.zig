@@ -167,8 +167,11 @@ pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string
         .cursor = "",
     }) catch |err| return try loopback.readFailed(allocator, "time-series read", err);
     defer got.deinit();
+    // Not found charts empty: a namespace never created holds no points,
+    // and the read answers the same not found for a field or tags no series
+    // of the measurement has (a typo too), which the console's pickers only
+    // offer from what exists.
     if (got.isError() and !got.isNotFound()) return try h.jsonError(allocator, got.errorMessage());
-    // A namespace never created holds no points.
     const Point = struct { ms: i64, value: f64 };
     var points: std.ArrayListUnmanaged(Point) = .empty;
     defer points.deinit(allocator);

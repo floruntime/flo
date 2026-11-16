@@ -282,7 +282,7 @@ pub const StreamHandler = struct {
         const self = shard.stream_handler;
         if (req.key.len > group_entries.StreamName.max_size or group.len > group_entries.MAX_GROUP_NAME) return error.NameTooLong;
         _ = group_handler.metaOf(shard, req.ns_id, req.key, group) orelse
-            return .{ .refused = .{ .status = .not_found, .refusal = proto.notRun("not found: no such consumer group") } };
+            return .{ .refused = .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = "not found: no such consumer group" } } };
         const read: @import("../contract/view.zig").ReadView = .{ .store = &self.partition.store };
         var holders: [stream_ops.MAX_MEMBERS]Holder = undefined;
         const n = holdersOf(read, req.ns_id, group_machine.scopeOf(req.ns_id, req.key, group), &holders);
@@ -423,6 +423,13 @@ pub const StreamHandler = struct {
                     // No data — register a blocking waiter
                     shard.stream_handler.freeResult(cmd_result);
                 },
+                // A stream not there yet: a blocking read waits for its
+                // first append, as it waits for any record.
+                .err => |e| if (e.code == .not_found) shard.stream_handler.freeResult(cmd_result) else {
+                    defer shard.stream_handler.freeResult(cmd_result);
+                    sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
+                    return;
+                },
                 else => {
                     // Error or other result — send immediately
                     defer shard.stream_handler.freeResult(cmd_result);
@@ -449,6 +456,13 @@ pub const StreamHandler = struct {
         const cmd_result = shard.stream_handler.handleCommand(req);
         if (cmd_result == .pending) return holdForDisk(shard, conn, req, DISK_READ_WAIT_MS);
         defer shard.stream_handler.freeResult(cmd_result);
+        // No such stream here, on a follower: the leader answers whether
+        // there is one, or this answers stale.
+        const missing = cmd_result == .err and cmd_result.err.code == .not_found;
+        if (missing and shard.missToLeader(conn, req)) return;
+        const was_stale = proto.answering_stale;
+        defer proto.answering_stale = was_stale;
+        if (missing and shard.staleMiss(req.header.op_code)) proto.answering_stale = true;
         sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
@@ -604,6 +618,12 @@ pub const StreamHandler = struct {
         if (req.key.len == 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "stream name is required" } };
         }
+        // A stream that was never created (by create or a first append), or
+        // was deleted. One that exists with nothing in the window answers
+        // empty.
+        var name_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const name = nameKey(&name_buf, req) orelse return NAME_TOO_LONG;
+        if (!self.stream.stream_names.contains(name)) return .{ .err = .{ .code = .not_found, .message = NO_STREAM } };
 
         var window = self.readWindow(req);
         var buf: [MAX_READ_BATCH]StreamRecord = undefined;
@@ -2031,6 +2051,53 @@ test "stream handler: read" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "stream handler: a read of a stream that doesn't exist is not found; one that exists with nothing to read is empty" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    const Read = struct {
+        fn count(h: *StreamHandler, name: []const u8) !?u32 {
+            const result = h.handleCommand(makeRequest(.stream_read, name, "", ""));
+            defer h.freeResult(result);
+            switch (result) {
+                .stream_messages => |m| return std.mem.readInt(u32, m.data[0..4], .little),
+                .err => |e| {
+                    try testing.expectEqual(CommandResult.ErrorCode.not_found, e.code);
+                    try testing.expectEqualStrings("stream not found", e.message);
+                    // Its reason too, by which a client tells it from a refusal.
+                    try testing.expectEqual(proto.Reason.not_found, e.refusal().reason);
+                    return null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    };
+    try testing.expectEqual(@as(?u32, null), try Read.count(&handler, "never"));
+    // Created, nothing appended: empty.
+    _ = handler.handleCommand(makeRequest(.stream_create, "empty", "", ""));
+    try testing.expectEqual(@as(?u32, 0), try Read.count(&handler, "empty"));
+    // Appended, then read past its last record: empty.
+    var vb: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "one", makeBatchValue(&vb, "a"), ""));
+    try testing.expectEqual(@as(?u32, 1), try Read.count(&handler, "one"));
+    var ob: [32]u8 = undefined;
+    var tail = OptionsBuilder.init(&ob);
+    try tail.addFlag(.stream_tail);
+    const past = handler.handleCommand(makeRequest(.stream_read, "one", "", tail.getOptions()));
+    defer handler.freeResult(past);
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, past.stream_messages.data[0..4], .little));
+    // Deleted: not found again.
+    var fb: [8]u8 = undefined;
+    var force = OptionsBuilder.init(&fb);
+    try force.addFlag(.force);
+    _ = handler.handleCommand(makeRequest(.stream_delete, "one", "", force.getOptions()));
+    try testing.expectEqual(@as(?u32, null), try Read.count(&handler, "one"));
 }
 
 fn makeNRecordBatch(buf: []u8, n: u32, tag: u8) []const u8 {

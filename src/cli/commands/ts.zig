@@ -527,6 +527,12 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
             .cursor = cursor,
         }) catch |err| return outcome.requestFailed(ctx, err);
         defer result.deinit();
+        // A later page refused: close what was printed, its cursor the page
+        // that failed, so the read can go on from there.
+        if (format == .json and pages > 0 and result.isError()) {
+            const at = std.fmt.bytesToHex(cursor[0..ts_ops.CURSOR_LEN].*, .lower);
+            ctx.print("{s}], \"cursor\": \"{s}\"}}\n", .{ if (printed > 0) "\n" else "", &at });
+        }
         try outcome.check(ctx, result);
         if (format == .json and pages == 0) ctx.print("{{\"points\": [", .{});
         pages += 1;

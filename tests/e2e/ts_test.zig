@@ -1830,17 +1830,20 @@ test "e2e/ts: a delete with tags removes only the matching series, and stays don
     }
 }
 
-test "e2e/ts: a read or query with no data is still JSON under -o json" {
+test "e2e/ts: a read or query with no data is still JSON under -o json; a read of no such series is not found" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     // A measurement that doesn't exist, then one with no points in range.
     try ctx.exec(&.{ "ts", "write", "json_empty", "--value", "1", "--timestamp", "1708700000000" });
+    var missing = try ctx.cli.run(&.{ "ts", "read", "json_nosuch", "--from", "1", "--to", "2", "-o", "json" });
+    defer missing.deinit();
+    try testing.expectEqual(@as(u8, 1), missing.exit_code);
+    try testing.expect(missing.stderrContains("not found: 'json_nosuch' has no series of field 'value' [not_found"));
+    var empty = try ctx.cli.run(&.{ "ts", "read", "json_empty", "--from", "1", "--to", "2", "-o", "json" });
+    defer empty.deinit();
+    try testing.expectEqualStrings("{\"points\": [], \"cursor\": null}", std.mem.trim(u8, empty.stdout, &std.ascii.whitespace));
     for ([_][]const u8{ "json_nosuch", "json_empty" }) |m| {
-        var read = try ctx.cli.run(&.{ "ts", "read", m, "--from", "1", "--to", "2", "-o", "json" });
-        defer read.deinit();
-        try testing.expectEqualStrings("{\"points\": [], \"cursor\": null}", std.mem.trim(u8, read.stdout, &std.ascii.whitespace));
-
         var query = try ctx.cli.run(&.{ "ts", "query", m, "--from", "1", "--to", "2", "--window", "1m", "--agg", "avg", "-o", "json" });
         defer query.deinit();
         try testing.expectEqualStrings("{\"series\":[]}", std.mem.trim(u8, query.stdout, &std.ascii.whitespace));

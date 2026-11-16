@@ -228,7 +228,9 @@ test "e2e/bounds: a stream append of more than 1000 records, or not a batch, is 
         try testing.expectEqualStrings(c.why, r.data);
     }
 
+    // Refused, they made no stream: a read finds none.
     var read = try ctx.cli.run(&.{ "stream", "read", "s", "--limit", "10", "-o", "json" });
     defer read.deinit();
-    try testing.expectEqualStrings("[]\n", read.stdout);
+    try testing.expectEqual(@as(u8, 1), read.exit_code);
+    try testing.expect(read.stderrContains("stream not found"));
 }
