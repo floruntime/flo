@@ -188,6 +188,16 @@ pub const TSHandler = struct {
         defer self.allocator.free(buf);
         const n = if (min > max) 0 else self.ts.readPage(ns, measurement, field, filter.preds, min, max, @fromBackingInt(@intCast(@backingInt(order))), after, buf) catch
             return .{ .refused = .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "ts read failed" } } };
+        // No points: a read of a series that doesn't exist is not_found; one
+        // that exists, with none in range or past the cursor, is an empty page.
+        if (n == 0) {
+            const exists = self.ts.hasFieldSeries(ns, measurement, field, filter.preds) catch
+                return .{ .refused = .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "ts read failed" } } };
+            if (!exists) return .{ .refused = .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = if (filter.canonical.len == 0)
+                std.fmt.bufPrint(&self.why_buf, "not found: '{s}' has no series of field '{s}'", .{ measurement, field }) catch "not found: no such series"
+            else
+                std.fmt.bufPrint(&self.why_buf, "not found: '{s}' has no series of field '{s}' with tags {s}", .{ measurement, field, filter.canonical }) catch "not found: no such series" } } };
+        }
         const page = buf[0..@min(n, limit)];
         var w: schema.Writer = .{ .buf = &self.read_buf };
         for (page) |p| ts_ops.Point.encode(&w, .{ .time_ns = @intCast(p.timestamp_ns), .value = p.field_value }) catch unreachable; // sized for MAX_READ
@@ -1174,9 +1184,13 @@ fn testRead(h: *TSHandler, measurement: []const u8, args: ReadArgs) !TestPage {
 }
 
 fn refusalOf(h: *TSHandler, measurement: []const u8, args: ReadArgs) ![]const u8 {
+    return refusedAs(.bad_request, h, measurement, args);
+}
+
+fn refusedAs(status: proto.StatusCode, h: *TSHandler, measurement: []const u8, args: ReadArgs) ![]const u8 {
     switch (h.readPage(.default, measurement, args.field, args.tags, args.from_ns, args.to_ns, args.limit, args.order, args.cursor)) {
         .refused => |r| {
-            try testing.expectEqual(proto.StatusCode.bad_request, r.status);
+            try testing.expectEqual(status, r.status);
             return r.refusal.message;
         },
         else => return error.TestUnexpectedResult,
@@ -1199,8 +1213,8 @@ test "ts handler: read" {
     try testing.expectEqual(@as(u32, 1), rest.n);
     try testing.expectEqual(@as(f64, 30.0), rest.values[0]);
     try testing.expect(rest.cursor == null);
-    // A measurement with none: an empty page.
-    try testing.expectEqual(@as(u32, 0), (try testRead(&handler, "nonexistent", .{})).n);
+    // A measurement with no such series: not found.
+    try testing.expectEqualStrings("not found: 'nonexistent' has no series of field 'value'", try refusedAs(.not_found, &handler, "nonexistent", .{}));
 }
 
 test "ts handler: a read takes one field, the series a tag filter names, and its time range, ends included" {
@@ -1214,7 +1228,10 @@ test "ts handler: a read takes one field, the series a tag filter names, and its
     try ts.insert(.default, "cpu", "idle", 9, 200, 0, "host=a,dc=x");
     try testing.expectEqual(@as(u32, 3), (try testRead(&handler, "cpu", .{ .field = "user" })).n);
     try testing.expectEqual(@as(u32, 1), (try testRead(&handler, "cpu", .{ .field = "idle" })).n);
-    try testing.expectEqual(@as(u32, 0), (try testRead(&handler, "cpu", .{})).n);
+    // No series of the field, or none with the filter's tags: not found.
+    // A series with no points in range or past the cursor: an empty page.
+    try testing.expectEqualStrings("not found: 'cpu' has no series of field 'value'", try refusedAs(.not_found, &handler, "cpu", .{}));
+    try testing.expectEqualStrings("not found: 'cpu' has no series of field 'idle' with tags host=b", try refusedAs(.not_found, &handler, "cpu", .{ .field = "idle", .tags = "host=b" }));
     const a = try testRead(&handler, "cpu", .{ .field = "user", .tags = "host=a" });
     try testing.expectEqual(@as(u32, 2), a.n);
     try testing.expectEqual(@as(u32, 1), (try testRead(&handler, "cpu", .{ .field = "user", .tags = "dc=x,host=b" })).n);
@@ -1687,7 +1704,7 @@ test "ts handler: delete measurement" {
         else => return error.TestUnexpectedResult,
     }
 
-    try testing.expectEqual(@as(u32, 0), (try testRead(&handler, "cpu", .{})).n);
+    try testing.expectEqualStrings("not found: 'cpu' has no series of field 'value'", try refusedAs(.not_found, &handler, "cpu", .{}));
     try testing.expectEqual(@as(u32, 1), (try testRead(&handler, "memory", .{})).n);
 }
 
