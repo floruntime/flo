@@ -140,6 +140,11 @@ pub const ServerProcess = struct {
     dashboard_port: u16,
     metrics_port: u16,
     raft_port: u16,
+    /// Set once the node has started on `raft_port`, so a restart rebinds the
+    /// same peer port — the address its peers know — instead of picking a new
+    /// one. Clear during the first start's attempts, so a bind collision there
+    /// re-picks.
+    raft_port_pinned: bool = false,
     data_dir: []const u8,
     config_file: []const u8,
     log_file_path: []const u8,
@@ -323,6 +328,7 @@ pub const ServerProcess = struct {
         self.dashboard_port = 0;
         self.metrics_port = 0;
         self.raft_port = 0;
+        self.raft_port_pinned = false;
         self.started = false;
         // `allocator.create` leaves the struct uninitialised, so the field
         // defaults declared above do NOT apply — every field must be assigned
@@ -467,6 +473,14 @@ pub const ServerProcess = struct {
         // 0 for the server to pick on a first start.
         if (self.config.raft_port > 0) self.raft_port = self.config.raft_port;
         const cluster_node = self.config.join_addresses != null or self.config.cluster_enabled;
+        // At first start, bind a peer port below the OS ephemeral range rather
+        // than letting the OS pick one it may later hand to a transient
+        // connection (see pickRaftPort). Re-picked each unpinned attempt, so a
+        // bind collision is retried; pinned once the node is up, so a restart
+        // rebinds the same address. An explicit `[cluster] raft_port` wins.
+        if (cluster_node and self.config.raft_port == 0 and !self.raft_port_pinned) {
+            self.raft_port = pickRaftPort();
+        }
         if (cluster_node and self.config.node_id == 0 and !self.config.derive_node_id) self.config.node_id = nextNodeId();
 
         // Build argv dynamically
@@ -611,6 +625,9 @@ pub const ServerProcess = struct {
         };
 
         self.started = true;
+        // It is up on this peer port now; pin it so a restart rebinds the same
+        // address instead of picking a new one.
+        if (self.raft_port > 0 and self.config.raft_port == 0) self.raft_port_pinned = true;
     }
 
     /// Stop the server gracefully, then fail the test (see `checkExit`) if
@@ -990,6 +1007,24 @@ fn nextNodeId() u32 {
         _ = next_node_id.cmpxchgStrong(0, base, .monotonic, .monotonic);
     }
     return next_node_id.fetchAdd(1, .monotonic);
+}
+
+/// A peer (Raft) port for a cluster node's first start: below the OS ephemeral
+/// range (Linux 32768+, macOS 49152+) and above the privileged ports. The OS
+/// never hands a port in this range to a transient connection, so a restart can
+/// rebind the same port — the address its peers know — without another
+/// process's transient connection having taken it. Seeded by the pid so
+/// concurrent test processes start at different ports, and advanced per pick so
+/// a bind collision retried at first start tries a new one.
+var raft_port_seq: std.atomic.Value(u32) = .init(0);
+
+fn pickRaftPort() u16 {
+    if (raft_port_seq.load(.monotonic) == 0) {
+        const base: u32 = @intCast(@mod(std.c.getpid(), 20_000));
+        _ = raft_port_seq.cmpxchgStrong(0, base, .monotonic, .monotonic);
+    }
+    const span: u32 = 20_000; // 10000..30000, below every common ephemeral floor
+    return @intCast(10_000 + raft_port_seq.fetchAdd(1, .monotonic) % span);
 }
 
 const PORTS_LINE = "Flo server ports: ";
