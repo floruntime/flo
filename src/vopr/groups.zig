@@ -433,6 +433,7 @@ pub const GroupChannel = struct {
         c.store.place = .{ .group = g, .count = count };
         c.store.strict_keys = true;
         c.driver.admits = Probed.admits;
+        c.driver.sink_target = Probed.sinkTarget;
         return c;
     }
 

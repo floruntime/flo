@@ -356,6 +356,26 @@ pub const MAX_PEERS: usize = 7;
 /// proposals.
 pub const MAX_OUTSTANDING: u64 = 1024;
 
+/// Most payload bytes a leader proposes in its term beyond its applied
+/// index. A quarter is kept for the channel entries (`inbound`, `trim`,
+/// `unpark`), so a shard its clients fill still takes what other shards
+/// send it.
+pub const PROPOSAL_BYTES: u64 = 16 << 20;
+pub const PROPOSAL_RESERVE: u64 = PROPOSAL_BYTES / 4;
+
+/// Whether `t` may use the reserve.
+fn channelEntry(t: EntryType) bool {
+    return switch (t) {
+        .channel_inbound, .channel_trim, .channel_unpark => true,
+        else => false,
+    };
+}
+
+const Proposed = struct { index: u64, bytes: u64 };
+/// Room for every proposal the entry cap lets be outstanding, and the
+/// repairs it exempts.
+const PROPOSED_RING = MAX_OUTSTANDING + 64;
+
 /// A timer seed from OS entropy, for nodes no simulation is replaying.
 fn entropySeed() u64 {
     var buf: [8]u8 = undefined;
@@ -564,6 +584,14 @@ pub const RaftNode = struct {
     // ── Config ─────────────────────────────────────────────────────────
     config: Config,
     allocator: Allocator,
+    /// What this leader proposed in `proposed_term` and hasn't applied, by
+    /// index, oldest first, and its payload bytes in all: admission state,
+    /// this leader's alone, never read by apply (`pendingBytes`).
+    proposed: [PROPOSED_RING]Proposed = undefined,
+    proposed_head: usize = 0,
+    proposed_len: usize = 0,
+    proposed_bytes: u64 = 0,
+    proposed_term: u64 = 0,
 
     // ── Stats ──────────────────────────────────────────────────────────
     elections_started: u64,
@@ -1607,6 +1635,38 @@ pub const RaftNode = struct {
 
     // ── Propose (Leader) ────────────────────────────────────────────────
 
+    /// Payload bytes this leader proposed in its term and hasn't applied.
+    /// Zero on a node that doesn't lead, and once the log has applied all
+    /// it proposed: what was proposed in an earlier term is the log's to
+    /// apply or drop, no longer this leader's to count.
+    pub fn pendingBytes(self: *RaftNode) u64 {
+        if (self.role != .leader or self.proposed_term != self.current_term) {
+            self.proposed_len = 0;
+            self.proposed_bytes = 0;
+            self.proposed_term = self.current_term;
+            return 0;
+        }
+        while (self.proposed_len > 0 and self.proposed[self.proposed_head].index <= self.last_applied) {
+            self.proposed_bytes -= self.proposed[self.proposed_head].bytes;
+            self.proposed_head = (self.proposed_head + 1) % PROPOSED_RING;
+            self.proposed_len -= 1;
+        }
+        return self.proposed_bytes;
+    }
+
+    fn noteProposed(self: *RaftNode, index: u64, bytes: u64) void {
+        _ = self.pendingBytes();
+        // Full only past the entry cap's room: the oldest goes uncounted.
+        if (self.proposed_len == PROPOSED_RING) {
+            self.proposed_bytes -= self.proposed[self.proposed_head].bytes;
+            self.proposed_head = (self.proposed_head + 1) % PROPOSED_RING;
+            self.proposed_len -= 1;
+        }
+        self.proposed[(self.proposed_head + self.proposed_len) % PROPOSED_RING] = .{ .index = index, .bytes = bytes };
+        self.proposed_len += 1;
+        self.proposed_bytes += bytes;
+    }
+
     /// Propose an entry (leader only), with `flags` in its header (e.g.
     /// HAS_TTL, TOMBSTONE), stamped here (`nextStamp`): no caller chooses
     /// an entry's time.
@@ -1633,6 +1693,14 @@ pub const RaftNode = struct {
         // applied past on some replicas and not others. A new term's no-op
         // and configs don't come through here.
         if (entry_type != .repair_skip and self.log.lastIndex() - self.last_applied >= MAX_OUTSTANDING) return error.Overloaded;
+        // And by bytes: past a quarter short of the cap, only the channel
+        // entries go on. One alone always goes, so no entry is too large
+        // for an empty log.
+        if (entry_type != .repair_skip and entry_type != .raft_config) {
+            const limit = if (channelEntry(entry_type)) PROPOSAL_BYTES else PROPOSAL_BYTES - PROPOSAL_RESERVE;
+            const pending = self.pendingBytes();
+            if (pending > 0 and pending + payload.len > limit) return error.Overloaded;
+        }
 
         var e = entry_mod.buildEntry(
             entry_type,
@@ -1653,6 +1721,7 @@ pub const RaftNode = struct {
             }
         }
         self.noteAppended(&e);
+        self.noteProposed(idx, payload.len);
         // Counted only once it is the membership: a config commits by a
         // majority of the voters it names, never by the ones before it
         // (a lone voter would otherwise commit a second voter's promotion
@@ -5242,6 +5311,40 @@ test "raft node: a leader counts a voter halted at an entry only on this leaders
     node.handleAppendResponse(.{ .term = node.current_term, .success = true, .match_index = 0, .from = 2, .halt = h });
     node.handleAppendResponse(.{ .term = node.current_term, .success = true, .match_index = 0, .from = 3, .halt = h });
     try testing.expectEqualSlices(NodeId, &.{ 1, 2, 3 }, node.votersHaltedAt(h, &ids));
+}
+
+test "raft node: proposals are capped by payload bytes, a quarter kept for channel entries; the count is 0 once the log applies and when the node stops leading" {
+    var node = try RaftNode.init(testing.allocator, 1, 1000, 64 << 20, .{});
+    defer node.deinit();
+    node.addPeer(2);
+    _ = candidacy(&node).?;
+    _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
+    try testing.expectEqual(Role.leader, node.role);
+    const big = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    // Clients take three quarters of it.
+    const quarters = (PROPOSAL_BYTES - PROPOSAL_RESERVE) / big.len;
+    for (0..quarters) |_| _ = try node.propose(.kv_put, 0, big);
+    try testing.expectError(error.Overloaded, node.propose(.kv_put, 0, big));
+    try testing.expectEqual(PROPOSAL_BYTES - PROPOSAL_RESERVE, node.pendingBytes());
+    // What other shards send takes the rest.
+    for (0..PROPOSAL_RESERVE / big.len) |_| _ = try node.propose(.channel_inbound, 0, big);
+    try testing.expectError(error.Overloaded, node.propose(.channel_inbound, 0, big));
+    try testing.expectEqual(PROPOSAL_BYTES, node.pendingBytes());
+    // Applied, it is all released.
+    node.last_applied = node.log.lastIndex();
+    try testing.expectEqual(@as(u64, 0), node.pendingBytes());
+    // Proposed again, and the node stops leading before it applies: none of
+    // it is this node's to count, and a later term starts from 0.
+    _ = try node.propose(.kv_put, 0, big);
+    try testing.expectEqual(@as(u64, big.len), node.pendingBytes());
+    node.stepDown(2);
+    try testing.expectEqual(@as(u64, 0), node.pendingBytes());
+    _ = candidacy(&node).?;
+    _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
+    try testing.expectEqual(Role.leader, node.role);
+    try testing.expectEqual(@as(u64, 0), node.pendingBytes());
 }
 
 test "raft node: a repair skip is proposed past the outstanding cap and while halted, but not once writes have stopped" {

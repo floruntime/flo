@@ -390,7 +390,10 @@ test "channel driver: past a target's parked cap its messages wait at their send
     defer channels.test_parked_target_max = null;
     var sim = try Sim.init(testing.allocator, 2, 31, .{});
     defer sim.deinit();
-    for (sim.groups) |*g| g.driver.admits = Probed.admits;
+    for (sim.groups) |*g| {
+        g.driver.admits = Probed.admits;
+        g.driver.sink_target = Probed.sinkTarget;
+    }
     const a = &sim.groups[0];
     const b = &sim.groups[1];
     // b's slot 1 is full, by b's own channel, and one message to it parks.
@@ -422,6 +425,38 @@ test "channel driver: past a target's parked cap its messages wait at their send
     try testing.expectEqual(@as(u64, 4), channels.inOf(.{ .store = &b.store }, 0).?.applied);
     // Taken: what holds a pipeline sending to b is gone.
     try testing.expect(a.driver.busySince(1) == null);
+}
+
+test "channel driver: what a receiver proposed to a target and hasn't applied counts against its cap, so one batch can't pass it" {
+    var sim = try Sim.init(testing.allocator, 2, 31, .{});
+    defer sim.deinit();
+    for (sim.groups) |*g| {
+        g.driver.admits = Probed.admits;
+        g.driver.sink_target = Probed.sinkTarget;
+    }
+    const a = &sim.groups[0];
+    const b = &sim.groups[1];
+    // b's slot 1 is full, by b's own channel.
+    try sim.probeBody(b, 1, "fill-slot1-00001");
+    for (0..40) |_| try sim.step();
+    // Five to it in one batch, each one size.
+    const bodies = [_][]const u8{ "inflight-0000-01", "inflight-0000-02", "inflight-0000-03", "inflight-0000-04", "inflight-0000-05" };
+    for (bodies) |body| try sim.probeBody(a, 1, body);
+    // In a's outbox; its frame reaches b a step or more later.
+    try sim.step();
+    var ok: [channels.OUT_KEY]u8 = undefined;
+    const read_a: @import("view.zig").ReadView = .{ .store = &a.store };
+    const one = (try read_a.get(channels.OutFam, channels.outKey(&ok, 1, 1))).?.v.payload.len;
+    // Room for two whole ones and part of a third: the third is the one
+    // admitted below the cap.
+    channels.test_parked_target_max = 2 * one + 1;
+    defer channels.test_parked_target_max = null;
+    for (0..1000) |_| try sim.step();
+    try testing.expectEqual(@as(u64, 3), channels.targetParked(.{ .store = &b.store }, channelsTarget(1)).count);
+    try testing.expect(!hasGot(b, "inflight-0000-04"));
+    // Applied, none is still counted in flight.
+    try testing.expectEqual(@as(u64, 0), b.driver.inFlight(channelsTarget(1)).target);
+    try testing.expectEqual(@as(u64, 0), b.driver.in_flight_bytes);
 }
 
 fn channelsTarget(slot: u16) [ce.TARGET_LEN]u8 {
