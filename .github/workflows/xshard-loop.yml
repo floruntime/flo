@@ -37,7 +37,7 @@ jobs:
       # The server embeds the console; an empty dir keeps the build from
       # failing on a missing dist (the console isn't exercised by this test).
       - name: Placeholder console dist
-        run: mkdir -p src/node/dashboard/dist && : > src/node/dashboard/dist/.keep
+        run: mkdir -p src/node/dashboard/dist && touch src/node/dashboard/dist/.keep
 
       # Build flo, the faults binary and the single-test e2e binary (this run
       # executes the test once); then find that binary.
