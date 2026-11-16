@@ -476,23 +476,39 @@ test "e2e/kv: a TTL in milliseconds expires the key; --ttl-ms refuses a unit it 
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Read as seconds, either TTL would outlive the test.
-    try ctx.exec(&.{ "kv", "set", "ms_key", "ms_value", "--ttl-ms", "800ms" });
+    // `--ttl-ms` parses a millisecond unit: check it against the STORED deadline,
+    // not presence-before-expiry. ms_key lives a minute, so the read never races
+    // its TTL; expires_at_ms must land ~60 s out. Read as seconds "60000ms" would
+    // be ~16 h out; read as anything smaller it would already be gone.
+    const Timed = struct { version: u64, value: []const u8, expires_at_ms: ?i64 = null };
+    const before = stdx.time.milliTimestamp();
+    try ctx.exec(&.{ "kv", "set", "ms_key", "ms_value", "--ttl-ms", "60000ms" });
+    const timed = try ctx.execCapture(&.{ "kv", "get", "ms_key", "-o", "json" });
+    const after = stdx.time.milliTimestamp();
+    const parsed = try std.json.parseFromSlice(Timed, testing.allocator, timed, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ms_value", parsed.value.value);
+    const at = parsed.value.expires_at_ms orelse return error.NoExpiry;
+    try testing.expect(at >= before + 60_000 and at <= after + 60_000 + 1_000);
+
+    // An ms TTL expires a key, on `expire --ttl-ms` and `set --ttl-ms`. The
+    // present-reads never race the short TTL: touched_key is read while it still
+    // has no TTL, then given an 800 ms TTL; short_key is set with an 800 ms TTL
+    // directly (ms_key above proved that write path). Both are read back only
+    // after they are gone, so no read competes with the 800 ms window.
     try ctx.exec(&.{ "kv", "set", "touched_key", "touched_value" });
-    try ctx.exec(&.{ "kv", "expire", "touched_key", "--ttl-ms", "800ms" });
-    var early = try ctx.cli.run(&.{ "kv", "get", "ms_key", "--output", "table" });
-    defer early.deinit();
-    try testing.expect(early.stdoutContains("ms_value"));
     var early_touched = try ctx.cli.run(&.{ "kv", "get", "touched_key", "--output", "table" });
     defer early_touched.deinit();
     try testing.expect(early_touched.stdoutContains("touched_value"));
+    try ctx.exec(&.{ "kv", "expire", "touched_key", "--ttl-ms", "800ms" });
+    try ctx.exec(&.{ "kv", "set", "short_key", "short_value", "--ttl-ms", "800ms" });
     @import("stdx").time.sleep(2000 * std.time.ns_per_ms);
-    var late = try ctx.cli.run(&.{ "kv", "get", "ms_key", "--output", "table" });
-    defer late.deinit();
-    try expectNotFound(late);
     var late_touched = try ctx.cli.run(&.{ "kv", "get", "touched_key", "--output", "table" });
     defer late_touched.deinit();
     try expectNotFound(late_touched);
+    var late_short = try ctx.cli.run(&.{ "kv", "get", "short_key", "--output", "table" });
+    defer late_short.deinit();
+    try expectNotFound(late_short);
 
     // A unit the flag doesn't know is refused, and nothing set.
     var bare = try ctx.cli.run(&.{ "kv", "set", "bare_key", "v", "--ttl-ms", "1x" });
