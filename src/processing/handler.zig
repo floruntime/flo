@@ -333,6 +333,9 @@ pub const ProcessingHandler = struct {
         status: JobStatus,
         batch_size: u32,
         yaml_owned: []const u8,
+        /// The namespace its submit was parsed in, as the entry stores it:
+        /// what its definition is parsed in again.
+        home_owned: []const u8,
         created_at_ms: i64,
         records_processed: u64,
         /// Why a stored job couldn't be rebuilt; empty unless it failed.
@@ -408,6 +411,7 @@ pub const ProcessingHandler = struct {
         self.allocator.free(job.job_id_owned);
         self.allocator.free(job.name_owned);
         self.allocator.free(job.yaml_owned);
+        self.allocator.free(job.home_owned);
         if (job.failure_owned.len > 0) self.allocator.free(job.failure_owned);
         self.freeHeldReason(job);
     }
@@ -1190,6 +1194,12 @@ pub const ProcessingHandler = struct {
             self.allocator.free(name);
             return error.OutOfMemory;
         };
+        const owned_home = self.allocator.dupe(u8, ns_raw) catch {
+            self.allocator.free(owned_id);
+            self.allocator.free(name);
+            self.allocator.free(owned_yaml);
+            return error.OutOfMemory;
+        };
 
         // Replace an existing record (idempotent replay).
         if (self.jobs.fetchRemove(owned_id)) |old| {
@@ -1206,12 +1216,14 @@ pub const ProcessingHandler = struct {
             .status = status,
             .batch_size = batch_size,
             .yaml_owned = owned_yaml,
+            .home_owned = owned_home,
             .created_at_ms = created_at_ms,
             .records_processed = 0,
         }) catch {
             self.allocator.free(owned_id);
             self.allocator.free(name);
             self.allocator.free(owned_yaml);
+            self.allocator.free(owned_home);
             return error.OutOfMemory;
         };
         if (status == .failed) self.failed_jobs += 1;
@@ -1435,7 +1447,7 @@ pub const ProcessingHandler = struct {
             return false;
         };
 
-        const count = self.fillOperators(job_id, op_specs, tags, ops, backings) orelse {
+        const count = self.fillOperators(job_id, op_specs, tags, ops, backings, true) orelse {
             self.allocator.free(backings);
             self.allocator.free(ops);
             return false;
@@ -1467,11 +1479,11 @@ pub const ProcessingHandler = struct {
 
     /// Builds `specs` into `ops` and `backings`, each as long; how many, or
     /// null with none left built when one can't be.
-    fn fillOperators(self: *ProcessingHandler, job_id: []const u8, specs: []const definition.OperatorSpec, tags: *const definition.TagRegistry, ops: []Operator, backings: []native_registry.CreateResult) ?usize {
+    fn fillOperators(self: *ProcessingHandler, job_id: []const u8, specs: []const definition.OperatorSpec, tags: *const definition.TagRegistry, ops: []Operator, backings: []native_registry.CreateResult, loud: bool) ?usize {
         var count: usize = 0;
         for (specs) |*spec| {
             const result = native_registry.create(self.allocator, spec, tags) catch |err| {
-                log.err("processing job {s}: pipeline not started: operator '{s}' (type {s}) can't be built: {}", .{ job_id, spec.name, spec.type_name, err });
+                if (loud) log.err("processing job {s}: pipeline not started: operator '{s}' (type {s}) can't be built: {}", .{ job_id, spec.name, spec.type_name, err });
                 for (backings[0..count]) |*b| b.deinit(self.allocator);
                 return null;
             };
@@ -1487,32 +1499,32 @@ pub const ProcessingHandler = struct {
 
     /// The pipeline's operators built again from its job's definition,
     /// their state empty: what a new leader term starts from, as it reads
-    /// again from the logged cursor. False, the old ones kept, if they
-    /// can't be (out of memory); the caller tries again.
-    fn resetOperators(self: *ProcessingHandler, job: *const JobRecord, pipe: *PipelineState) bool {
-        const ns_name = if (job.ns_id == .default) "default" else if (self.ns_table) |t| t.nameOf(job.ns_id) orelse return false else return false;
+    /// again from the logged cursor. Why not, the old ones kept, if they
+    /// can't be; the caller waits a poll and tries again.
+    fn resetOperators(self: *ProcessingHandler, job: *const JobRecord, pipe: *PipelineState) ?[]const u8 {
         var diag: parser.Diagnostic = .{};
-        var def = parser.parseJobDefinitionWithNamespace(self.allocator, job.yaml_owned, ns_name, &diag) catch return false;
+        var def = parser.parseJobDefinitionWithNamespace(self.allocator, job.yaml_owned, job.home_owned, &diag) catch |err|
+            return if (err == error.OutOfMemory) "out of memory" else "its definition no longer parses";
         defer def.deinit(self.allocator);
-        if (def.operators.items.len != pipe.operators.len) return false;
+        if (def.operators.items.len != pipe.operators.len) return "its definition no longer has the operators it ran";
         var tags = definition.TagRegistry{};
         fillTagRegistry(&tags, &def);
-        const ops = self.allocator.alloc(Operator, pipe.operators.len) catch return false;
+        const ops = self.allocator.alloc(Operator, pipe.operators.len) catch return "out of memory";
         const backings = self.allocator.alloc(native_registry.CreateResult, pipe.operators.len) catch {
             self.allocator.free(ops);
-            return false;
+            return "out of memory";
         };
-        _ = self.fillOperators(job.job_id_owned, def.operators.items, &tags, ops, backings) orelse {
+        _ = self.fillOperators(job.job_id_owned, def.operators.items, &tags, ops, backings, false) orelse {
             self.allocator.free(ops);
             self.allocator.free(backings);
-            return false;
+            return "an operator can't be built";
         };
         for (pipe.operator_backings) |*b| b.deinit(self.allocator);
         self.allocator.free(pipe.operator_backings);
         self.allocator.free(pipe.operators);
         pipe.operators = ops;
         pipe.operator_backings = backings;
-        return true;
+        return null;
     }
 
     /// KV lookup callback passed to KvLookupOperator. It reads this shard's
@@ -1618,6 +1630,9 @@ pub const ProcessingHandler = struct {
         unacked: struct { shard: u16, count: u64 },
         /// This shard's log has no room for another entry now.
         log,
+        /// Its operators couldn't be built anew for this leader term, and
+        /// why: tried again each poll.
+        operators: []const u8,
     };
 
     /// Why `pipe` can't read now, or `.none`. A sink batch commits all its
@@ -1720,13 +1735,20 @@ pub const ProcessingHandler = struct {
             const due = now_ms - pipe.last_poll_ms >= poll_ms;
             // A waiting one looks again each tick, so its wait ends as soon
             // as it can.
-            if (!due and !pipe.more and pipe.wait == .none) continue;
+            if (!due and !pipe.more and (pipe.wait == .none or pipe.wait == .operators)) continue;
             // Its batch in the log: nothing more until it applies.
             if (pipe.batch_term == raft.current_term and pipe.batch_index > raft.last_applied) continue;
             // Operator state is a leader term's: a new term reads again
             // from the logged cursor, so its operators start empty.
             if (pipe.ops_term != raft.current_term) {
-                if (pipe.ops_term != 0 and pipe.operators.len > 0 and !self.resetOperators(job, pipe)) continue;
+                if (pipe.ops_term != 0 and pipe.operators.len > 0) if (self.resetOperators(job, pipe)) |why| {
+                    // Tried again at the next poll, not every tick.
+                    pipe.wait = .{ .operators = why };
+                    pipe.last_poll_ms = now_ms;
+                    self.reported = true;
+                    self.noteWait(shard, pipe, true);
+                    continue;
+                };
                 pipe.ops_term = raft.current_term;
             }
             self.loadCursor(shard, job.ns_id, pipeline_key, pipe);
@@ -2348,8 +2370,8 @@ pub const ProcessingHandler = struct {
 
     /// A pipeline that can't read, at a poll: counted, and logged once a
     /// pipeline has waited 30 s, at most every 30 s. One waiting for a
-    /// namespace is logged at once, with what to do, since only an
-    /// operator ends that wait.
+    /// namespace, or for its operators to be rebuilt, is logged when the
+    /// wait begins.
     fn noteWait(self: *ProcessingHandler, shard: *Shard, pipe: *PipelineState, count: bool) void {
         const now = @import("stdx").time.milliTimestamp();
         if (count) {
@@ -2358,7 +2380,8 @@ pub const ProcessingHandler = struct {
         }
         if (pipe.held_since_ms == 0) pipe.held_since_ms = now;
         const held_for = now - pipe.held_since_ms;
-        const prompt = pipe.wait == .namespace and held_for == 0;
+        // Only an operator, or memory, ends these: said at once.
+        const prompt = (pipe.wait == .namespace or pipe.wait == .operators) and held_for == 0;
         if (!prompt and held_for < HELD_WARN_MS) return;
         if (now - self.held_warn_ms < 30_000) return;
         self.held_warn_ms = now;
@@ -2384,6 +2407,7 @@ pub const ProcessingHandler = struct {
                 std.fmt.bufPrint(buf, "waiting for room on shard {d}", .{r.shard}) catch "waiting for room on a sink's shard",
             .unacked => |u| std.fmt.bufPrint(buf, "waiting: {d} writes to shard {d} unacked", .{ u.count, u.shard }) catch "waiting: writes to a sink's shard unacked",
             .log => "waiting for room in this shard's log",
+            .operators => |why| std.fmt.bufPrint(buf, "waiting: its operators couldn't be rebuilt: {s}", .{why}) catch "waiting: its operators couldn't be rebuilt",
         };
     }
 
@@ -2921,6 +2945,7 @@ test "processing: what a pipeline waits for, in words" {
         .{ .w = .{ .busy = .{ .shard = 3, .target = "" } }, .says = "waiting for room on shard 3" },
         .{ .w = .{ .unacked = .{ .shard = 1, .count = 1024 } }, .says = "waiting: 1024 writes to shard 1 unacked" },
         .{ .w = .log, .says = "waiting for room in this shard's log" },
+        .{ .w = .{ .operators = "out of memory" }, .says = "waiting: its operators couldn't be rebuilt: out of memory" },
     };
     for (cases) |c| try std.testing.expectEqualStrings(c.says, ProcessingHandler.waitText(c.w, &buf));
 }

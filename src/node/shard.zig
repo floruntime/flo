@@ -11578,6 +11578,67 @@ test "Shard: a stateful operator starts empty in a new term, as its records are 
     _ = b;
 }
 
+test "Shard: operators that can't be rebuilt for a new term make the pipeline wait, said in its status, tried again each poll, not each tick" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    for ([_][]const u8{ "r0", "r1" }) |r| _ = try a.stream_handler.appendPayloadToStream(source, "default", r);
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: rebuild
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\operators:
+        \\  - name: n
+        \\    type: aggregate
+        \\    function: count
+        \\    window: count
+        \\    window_count: 5
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: rb-out }}
+    , .{source});
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    const pipe = pit.next().?;
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
+    // A later term, with no memory to build its operators in.
+    const raft = a.raft_node;
+    raft.current_term += 1;
+    raft.ready_index = raft.last_applied;
+    const real = a.processing_handler.allocator;
+    var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
+    a.processing_handler.allocator = failing.allocator();
+    tickNow(a, pipe);
+    try std.testing.expectEqualStrings("out of memory", pipe.wait.operators);
+    var jobs = a.processing_handler.jobs.valueIterator();
+    var lb: [512]u8 = undefined;
+    try std.testing.expectEqualStrings("waiting: its operators couldn't be rebuilt: out of memory", a.processing_handler.liveNote(jobs.next().?, &lb).?);
+    // Ticks before the next poll don't try again.
+    const tried = failing.alloc_index;
+    for (0..5) |_| _ = a.processing_handler.tickPipelines(a);
+    try std.testing.expectEqual(tried, failing.alloc_index);
+    try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
+    // Memory back, at the next poll: rebuilt for this term, and reading.
+    a.processing_handler.allocator = real;
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expect(pipe.wait == .none);
+    try std.testing.expectEqual(raft.current_term, pipe.ops_term);
+}
+
 test "Shard: records whose operators emit nothing aren't read again while their cursor waits to be logged" {
     var two: TwoShards = undefined;
     try two.init();
