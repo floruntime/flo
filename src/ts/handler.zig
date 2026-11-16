@@ -178,7 +178,8 @@ pub const TSHandler = struct {
             else => return badRead(std.fmt.comptimePrint("bad request: a cursor is the {d} bytes a page answered", .{ts_ops.CURSOR_LEN})),
         };
         const min: u64 = if (from_ns) |t| @intCast(t) else 0;
-        const max: u64 = if (to_ns) |t| @intCast(t) else std.math.maxInt(u64);
+        // Apply refuses a point past maxInt(i64) ns: the answer's time is i64.
+        const max: u64 = if (to_ns) |t| @intCast(t) else std.math.maxInt(i64);
         // One past the page, to know whether more follow.
         const buf = self.allocator.alloc(StoredPoint, limit + 1) catch
             return .{ .refused = .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "ts read: out of memory" } } };
@@ -1160,6 +1161,29 @@ test "ts handler: a read refuses an empty measurement, a bad tag filter and a cu
     try testing.expectEqualStrings("bad request: measurement name is required", try refusalOf(&handler, "", .{}));
     try testing.expectEqualStrings("bad request: tag filter part 'host' is not key=value", try refusalOf(&handler, "cpu", .{ .tags = "host" }));
     try testing.expectEqualStrings("bad request: a cursor is the 16 bytes a page answered", try refusalOf(&handler, "cpu", .{ .cursor = "short" }));
+}
+
+test "ts handler: a read reaches the latest time a point can have, and a cursor past it reads no further" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator);
+    defer ts.deinit();
+    var handler = TSHandler.init(allocator, &ts);
+    const latest: u64 = std.math.maxInt(i64);
+    try ts.insert(.default, "cpu", "value", 1, 100, 0, "");
+    try ts.insert(.default, "cpu", "value", 2, latest, 0, "");
+    try testing.expectError(error.Refused, ts.insert(.default, "cpu", "value", 3, latest + 1, 0, ""));
+    for ([_]ts_ops.Order{ .oldest_first, .newest_first }) |order| {
+        const page = try testRead(&handler, "cpu", .{ .order = order });
+        try testing.expectEqual(@as(u32, 2), page.n);
+        try testing.expectEqual(@as(i64, std.math.maxInt(i64)), page.times[if (order == .oldest_first) 1 else 0]);
+    }
+    // A cursor no page answered, past every time: nothing after it, and
+    // everything before it.
+    var past: [ts_ops.CURSOR_LEN]u8 = undefined;
+    std.mem.writeInt(u64, past[0..8], std.math.maxInt(u64), .big);
+    std.mem.writeInt(u64, past[8..16], 0, .big);
+    try testing.expectEqual(@as(u32, 0), (try testRead(&handler, "cpu", .{ .cursor = &past })).n);
+    try testing.expectEqual(@as(u32, 2), (try testRead(&handler, "cpu", .{ .order = .newest_first, .cursor = &past })).n);
 }
 
 test "ts handler: query avg" {

@@ -468,11 +468,15 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
     const to_str = ctx.getString("to") orelse "";
     const limit = ctx.getUint("limit") orelse ts_ops.MAX_READ;
     if (limit == 0 or limit > ts_ops.MAX_READ) return outcome.usage(ctx, "--limit {d} must be 1 to {d}", .{ limit, ts_ops.MAX_READ });
+    // A table aligns its rows, so it holds them all until the end.
+    if (all and format == .table) return outcome.usage(ctx, "--all prints every page as it comes: use -o raw or -o json", .{});
 
     // A newest-first read reaches back as far as it pages; an oldest-first
     // one starts an hour ago unless told.
     const from_ms: ?i64 = if (from_str.len > 0) parseTimeArg(from_str) orelse return outcome.usage(ctx, "--from '{s}' isn't a time", .{from_str}) else if (newest) null else parseTimeArg("-1h");
-    const to_ms: ?i64 = if (to_str.len > 0) parseTimeArg(to_str) orelse return outcome.usage(ctx, "--to '{s}' isn't a time", .{to_str}) else null;
+    // `--to 0` is no bound.
+    const to_given: ?i64 = if (to_str.len > 0) parseTimeArg(to_str) orelse return outcome.usage(ctx, "--to '{s}' isn't a time", .{to_str}) else null;
+    const to_ms: ?i64 = if (to_given) |t| (if (t > 0) t else null) else null;
     var cursor_buf: [ts_ops.CURSOR_LEN]u8 = undefined;
     var cursor: []const u8 = "";
     if (ctx.getString("cursor")) |hex| if (hex.len > 0) {
@@ -496,9 +500,9 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
         try t.addColumn("TIMESTAMP", .left);
         try t.addColumn("VALUE", .right);
     }
-    if (format == .json) ctx.print("{{\"points\": [", .{});
     var next_buf: [ts_ops.CURSOR_LEN]u8 = undefined;
     var next: ?[]const u8 = null;
+    var pages: usize = 0;
     while (true) {
         var result = client.call(ReadOp, namespace, measurement, .{
             .field = if (field.len > 0) field else "value",
@@ -511,6 +515,8 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
         }) catch |err| return outcome.requestFailed(ctx, err);
         defer result.deinit();
         try outcome.check(ctx, result);
+        if (format == .json and pages == 0) ctx.print("{{\"points\": [", .{});
+        pages += 1;
         var diag: schema.Diagnostic = .{};
         const page = ReadOp.response.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "read response");
         var it = page.points.iterator();
@@ -532,7 +538,8 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
             @memcpy(&next_buf, c[0..ts_ops.CURSOR_LEN]);
             next = &next_buf;
         }
-        if (!all or next == null) break;
+        // A cursor that doesn't move would page forever.
+        if (!all or next == null or std.mem.eql(u8, next.?, cursor)) break;
         cursor = next.?;
     }
     const hex = if (next) |c| std.fmt.bytesToHex(c[0..ts_ops.CURSOR_LEN].*, .lower) else undefined;

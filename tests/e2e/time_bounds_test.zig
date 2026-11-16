@@ -52,7 +52,6 @@ fn kvValue(ctx: *stdx.testing.TestContext, key: []const u8, out: []u8) ![]const 
     return (try kv_ops.op("kv.get").response.decodeAll(r.data, &diag)).value;
 }
 
-/// The point or series count leading a ts read or query answer.
 /// How many points a `ts.read` of "m" from `from_ns` answers.
 fn tsReadCount(ctx: *stdx.testing.TestContext, from_ns: i64, out: []u8) !u32 {
     const Read = ts_ops.op("ts.read");
@@ -64,6 +63,7 @@ fn tsReadCount(ctx: *stdx.testing.TestContext, from_ns: i64, out: []u8) !u32 {
     return (try Read.response.decodeAll(r.data, &diag)).points.count;
 }
 
+/// The series count leading a ts query answer.
 fn leadingCount(r: Reply) !u32 {
     try testing.expectEqual(@backingInt(proto.StatusCode.ok), r.status);
     return std.mem.readInt(u32, r.data[0..4], .little);
