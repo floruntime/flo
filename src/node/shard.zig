@@ -2127,6 +2127,23 @@ pub const Shard = struct {
             return self.route(conn, routed, auth);
         }
 
+        // Any other request routed by key still without an id (a write that
+        // creates nothing: a delete, an expire, an ack) goes by the id the
+        // table has now, as a read does past the edge: shard 0 may have
+        // published the name since it was resolved. Routed by none it would
+        // go to the wrong shard: a delete there finds no key, and the key
+        // survives. Before the publish, a shard other than 0 asks shard 0,
+        // and looks again once shard 0 has published any create it holds.
+        if (self.shardCount() > 1 and req.ns_id == .invalid and req.key.len > 0 and namespaced(op)) {
+            const name = if (req.namespace.len == 0) "default" else req.namespace;
+            if (self.namespace_handler.table.lookup(name)) |id| {
+                var routed = req;
+                routed.ns_id = id;
+                return self.route(conn, routed, auth);
+            }
+            if (self.id != 0) return self.askShard0(conn, req, name, auth.origin);
+        }
+
         // A start that chooses its run id is decided on its workflow's
         // shard, found by the namespace's id: only past the wait above.
         if (self.startChoosesRunId(req)) |rid| {
@@ -3900,9 +3917,12 @@ pub const Shard = struct {
     /// A read in a namespace this node's table doesn't have. The table
     /// shows a create once shard 0 has published it, which is after a write
     /// that created it implicitly may have been answered; so:
-    /// - another shard, or shard 0 holding a create of the name, asks shard 0
-    ///   (`namespace.published`, a gather), which answers once that create
-    ///   is published, and then looks again (`EdgeAsk`);
+    /// - another shard asks shard 0 (`namespace.published`, a gather), which
+    ///   answers once a create of the name it holds is published, and then
+    ///   looks again (`EdgeAsk`);
+    /// - shard 0 on a node of several shards holds a read of a create it
+    ///   applied until it publishes it; one still under way, or any on a
+    ///   lone shard, reads by the id shard 0 holds;
     /// - on one node, or the leader, shard 0 has every create there is, so a
     ///   name it doesn't hold is none;
     /// - a follower's shard 0 may be behind: it holds the read and asks the
@@ -3914,10 +3934,10 @@ pub const Shard = struct {
     /// A shard other than 0 never asks the leader: a cluster member runs one
     /// shard, so it has none, and on one node shard 0 holds every create.
     ///
-    /// A read it lets through routes by the id its own lookup found: shard 0
-    /// publishes from another thread, so an id resolved before could be
-    /// none, and a read routed by none goes to the wrong shard, which
-    /// resolves the name and answers not found for a key it doesn't hold.
+    /// A read the table resolves here routes by that id: shard 0 publishes
+    /// on its own thread, so an id resolved before could be none, and a read
+    /// routed by none goes to the wrong shard, which resolves the name and
+    /// answers not found for a key it doesn't hold.
     fn edgeMiss(self: *Shard, conn: *Connection, req_in: *proto.Request, origin: run_mod.Origin) bool {
         const req = req_in.*;
         if (!namespaced(req.header.op_code) or requestWrites(req)) return false;
@@ -4018,7 +4038,7 @@ pub const Shard = struct {
         };
         const index = at orelse self.edge.knownIndex(name);
         const asked = index != null or self.askingAbout(name);
-        w.* = .{ .active = true, .reply_to = conn.replyTo(), .origin = origin, .request_id = req.header.request_id, .bytes = bytes, .name = owned, .index = index, .deadline_ms = now + edge_mod.WAIT_MS };
+        w.* = .{ .active = true, .reply_to = conn.replyTo(), .origin = origin, .request_id = req.header.request_id, .bytes = bytes, .name = owned, .index = index, .local = at != null, .deadline_ms = now + edge_mod.WAIT_MS };
         self.edge.count += 1;
         // One of the connection's requests waiting elsewhere, as a gather's.
         conn.forwards_in_flight += 1;
@@ -4084,7 +4104,10 @@ pub const Shard = struct {
                 continue;
             };
             if (now >= w.deadline_ms) {
-                self.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, proto.notRun("unavailable: this node hasn't caught up with the leader's namespaces yet; the request was not run — retry"));
+                self.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, proto.notRun(if (w.local)
+                    "unavailable: the namespace is created but not yet on disk; the request was not run — retry"
+                else
+                    "unavailable: this node hasn't caught up with the leader's namespaces yet; the request was not run — retry"));
                 self.endEdgeWait(w);
             }
         }
@@ -4621,7 +4644,6 @@ pub const Shard = struct {
         if (self.raft_node.role == .leader) self.adjustMembership(now);
         if (self.joinWanted(now)) self.askToJoin(now);
         if (self.forward_count > 0) self.sweepForwards(now);
-        if (self.edge.count > 0) self.sweepEdge(now);
     }
 
     /// Stop at entry `e`, which no replica can apply: its `last_applied`
@@ -6177,8 +6199,10 @@ pub const Shard = struct {
         // node's table, and what waited for them is answered.
         self.namespace_handler.settle(self);
         // After shard 0 publishes, so a forward held there for this tick's
-        // creates runs now.
+        // creates runs now, and so does a read held for them: on a node
+        // with no peers too, whose ticks take no membership steps.
         if (self.edge.held_count > 0) self.sweepHeldForwards(nowMs());
+        if (self.edge.count > 0) self.sweepEdge(nowMs());
 
         if (leads or holds) self.runStepping();
 
@@ -9881,6 +9905,7 @@ fn testReq(op: proto.OpCode, id: u64, ns: []const u8, key: []const u8, value: []
 fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8) []const u8 {
     switch (op) {
         .kv_put => return table_run.op("kv.set").request.encodeInto(buf, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null }) catch unreachable,
+        .kv_delete => return table_run.op("kv.delete").request.encodeInto(buf, .{ .cas_version = null, .txn = null }) catch unreachable,
         .kv_get => {
             const opts: proto.Request = .{ .header = undefined, .namespace = "", .key = "", .value = "", .options = options };
             var w: schema.Writer = .{ .buf = buf };
@@ -24611,61 +24636,134 @@ test "Shard: a read resolved before shard 0 published its namespace routes by th
     try std.testing.expectEqual(id, req.ns_id);
 }
 
+/// A first life of two shards under `data_dir`: namespace "xs" created,
+/// and key "v" written under a key shard 1 owns by the namespace's id but
+/// shard 0 would own by none, so a request routed by no id goes astray.
+fn twoShardsWithXsKey(data_dir: []const u8, key_buf: *[8]u8) ![]const u8 {
+    var out: [512]u8 = undefined;
+    var two: TwoShards = undefined;
+    try two.initAt(data_dir);
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const a = &two.shards[0];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    a.runRequest(c.conn, try ParkTest.request(.namespace_create, 1, "", "xs", "", ""), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, a, &out)).header.status);
+    const id = two.namespaces.lookup("xs").?;
+    var key: []const u8 = "";
+    var i: u8 = 0;
+    while (key.len == 0) : (i += 1) {
+        const k = try std.fmt.bufPrint(key_buf, "k{d}", .{i});
+        if (a.router.hashToShard(node_router.routeNsKey(id, k)) == 1 and a.router.hashToShard(node_router.routeNsKey(.invalid, k)) == 0) key = k;
+    }
+    a.runRequest(c.conn, testReq(.kv_put, 2, "xs", key, "v", ""), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, a, &out)).header.status);
+    for (&two.shards) |*s| try s.flushSegmentToDisk();
+    return key;
+}
+
+/// The second life: both shards booted from `data_dir`, everything applied,
+/// "xs" held by shard 0 and not yet in the node's table.
+fn restartedBeforePublish(two: *TwoShards, data_dir: []const u8) !void {
+    try two.initAt(data_dir);
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    for (&two.shards) |*s| _ = s.applyCommitted();
+    try std.testing.expect(two.namespaces.lookup("xs") == null);
+}
+
+fn drainBoth(two: *TwoShards) void {
+    for (0..4) |_| for (&two.shards) |*s| {
+        _ = s.drainInbox();
+    };
+}
+
 test "Shard: after a restart, a read through shard 0 of a key another shard owns waits for shard 0 to publish its namespace, then finds it" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const data_dir = try testDataDir(&tmp);
     defer std.testing.allocator.free(data_dir);
     var key_buf: [8]u8 = undefined;
-    var key: []const u8 = "";
-    var body: [64]u8 = undefined;
-    var out: [512]u8 = undefined;
-    {
-        var two: TwoShards = undefined;
-        try two.initAt(data_dir);
-        defer two.deinit();
-        for (&two.shards) |*s| s.wireHandlerShardPtrs();
-        two.settle();
-        const a = &two.shards[0];
-        const c = try TestClient.open(a);
-        defer _ = std.c.close(c.pair[1]);
-        a.runRequest(c.conn, try ParkTest.request(.namespace_create, 1, "", "xs", "", ""), .client);
-        two.settle();
-        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, a, &out)).header.status);
-        // A key shard 1 owns.
-        const id = two.namespaces.lookup("xs").?;
-        var i: u8 = 0;
-        while (key.len == 0) : (i += 1) {
-            const k = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
-            if (a.router.hashToShard(node_router.routeNsKey(id, k)) == 1) key = k;
-        }
-        a.runRequest(c.conn, testReq(.kv_put, 2, "xs", key, "v", ""), .client);
-        two.settle();
-        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, a, &out)).header.status);
-        for (&two.shards) |*s| try s.flushSegmentToDisk();
-    }
+    const key = try twoShardsWithXsKey(data_dir, &key_buf);
     var two: TwoShards = undefined;
-    try two.initAt(data_dir);
+    try restartedBeforePublish(&two, data_dir);
     defer two.deinit();
-    for (&two.shards) |*s| s.wireHandlerShardPtrs();
-    // Replayed and applied, the create not yet published: shard 0 holds
-    // the name, the table doesn't, and shard 1 resolves names by the table.
-    for (&two.shards) |*s| _ = s.applyCommitted();
-    try std.testing.expect(two.namespaces.lookup("xs") == null);
     const a = &two.shards[0];
     const c = try TestClient.open(a);
     defer _ = std.c.close(c.pair[1]);
+    var body: [64]u8 = undefined;
+    var out: [512]u8 = undefined;
     a.runRequest(c.conn, edgeGet(&body, 3, "xs", key), .client);
-    for (0..4) |_| for (&two.shards) |*s| {
-        _ = s.drainInbox();
-    };
-    // Held, not answered as missing; answered once shard 0 publishes.
+    drainBoth(&two);
+    // Held, not answered as missing; answered once shard 0's tick publishes.
     try expectNoAnswer(c, a);
-    two.settle();
-    a.sweepEdge(Shard.nowMs());
+    _ = try a.tick(0);
     two.settle();
     const got = try nextAnswer(c, a, &out);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), got.header.status);
+    var diag: schema.Diagnostic = .{};
+    try std.testing.expectEqualStrings("v", (try table_run.op("kv.get").response.decodeAll(got.data, &diag)).value);
+}
+
+test "Shard: after a restart, a delete through another shard before shard 0 publishes its namespace deletes the key where it is" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    var key_buf: [8]u8 = undefined;
+    const key = try twoShardsWithXsKey(data_dir, &key_buf);
+    var two: TwoShards = undefined;
+    try restartedBeforePublish(&two, data_dir);
+    defer two.deinit();
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var body: [64]u8 = undefined;
+    var out: [512]u8 = undefined;
+    // By no id the key is shard 0's, where there is none: the delete waits
+    // for the name, then goes where the key is.
+    b.runRequest(c.conn, testReq(.kv_delete, 4, "xs", key, "", ""), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, b, &out)).header.status);
+    b.runRequest(c.conn, edgeGet(&body, 5, "xs", key), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), (try nextAnswer(c, b, &out)).header.status);
+}
+
+test "Shard: on a lone node of several shards, a read pipelined behind the write that creates its namespace is answered once shard 0's tick publishes it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const a = &two.shards[0];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var body: [64]u8 = undefined;
+    var out: [512]u8 = undefined;
+    a.runRequest(c.conn, testReq(.kv_put, 1, "fresh", "k", "v", ""), .client);
+    // The write applied the create here; it isn't published yet.
+    try std.testing.expect(two.namespaces.lookup("fresh") == null);
+    a.runRequest(c.conn, edgeGet(&body, 2, "fresh", "k"), .client);
+    try std.testing.expectEqual(@as(u32, 1), a.edge.count);
+    // No peers, so no membership steps: the tick alone releases the read.
+    for (0..4) |_| {
+        for (&two.shards) |*s| _ = try s.tick(0);
+        two.settle();
+    }
+    var answers: [2]proto.Response = undefined;
+    try ParkTest.responses(a, c.conn, c.pair[1], &out, &answers);
+    for (answers) |r| {
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
+        if (r.header.request_id == 2) {
+            var diag: schema.Diagnostic = .{};
+            try std.testing.expectEqualStrings("v", (try table_run.op("kv.get").response.decodeAll(r.data, &diag)).value);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), a.edge.count);
 }
 
 test "Shard: a lone node's read of a namespace never created is answered missing at once, and a write creates it" {

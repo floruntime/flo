@@ -55,8 +55,10 @@ pub const Wait = struct {
     /// The request, serialized, run once its namespace is resolved.
     bytes: []u8 = &.{},
     name: []u8 = &.{},
-    /// The leader's published index, once it has answered.
+    /// The leader's published index, once it has answered; or the index of
+    /// a create this node's shard 0 holds and hasn't published (`local`).
     index: ?u64 = null,
+    local: bool = false,
     deadline_ms: u64 = 0,
 };
 
