@@ -27434,6 +27434,8 @@ fn queueOwnedBy(two: *TwoShards, owner: u16, buf: []u8) !struct { name: []const 
 }
 
 /// A sink's enqueue of `body` to `queue`, which holds one message at most.
+/// A receiver stamps its own caps over these, so a test across shards sets
+/// them there too.
 fn oneSlotEnqueue(buf: []u8, queue: []const u8, body: []const u8) ![]const u8 {
     return qe_caps.Enqueue.encodeInto(buf, .{ .ns = ns_table.DEFAULT.int(), .queue = queue, .priority = 0, .delay_ms = 0, .payload = body, .max_messages = 1, .max_bytes = 1 << 20, .shard_held_bytes = 1 << 30 });
 }
@@ -27479,6 +27481,9 @@ test "Shard: a sink's enqueues to a full queue on another shard park, a KV write
     const b = &two.shards[1];
     for (&two.shards) |*s| s.wireHandlerShardPtrs();
     two.settle();
+    // The receiver's caps are what a sink's enqueue applies under: one
+    // message at most.
+    b.queue_handler.caps.max_messages = 1;
     var qb: [16]u8 = undefined;
     const q = try queueOwnedBy(&two, 1, &qb);
     var eb: [3][256]u8 = undefined;
@@ -27542,6 +27547,9 @@ test "Shard: an unpark that took a whole entry's worth is followed at once, not 
     const b = &two.shards[1];
     for (&two.shards) |*s| s.wireHandlerShardPtrs();
     two.settle();
+    // Each enqueue keeps the caps it was sent with: no receiver's caps
+    // stamped over them.
+    b.channel.stamp = null;
     var qb: [16]u8 = undefined;
     const q = try queueOwnedBy(&two, 1, &qb);
     // One fills the queue; the next, capped at one, parks; the rest, which
@@ -27577,6 +27585,9 @@ test "Shard: a leader in a new term unparks again past an unpark its last term l
     const b = &two.shards[1];
     for (&two.shards) |*s| s.wireHandlerShardPtrs();
     two.settle();
+    // Each enqueue keeps the caps it was sent with, to fill the queue
+    // for the first two only: no receiver's caps stamped over them.
+    b.channel.stamp = null;
     var qb: [16]u8 = undefined;
     const q = try queueOwnedBy(&two, 1, &qb);
     var eb: [3][256]u8 = undefined;
@@ -27617,6 +27628,9 @@ test "Shard: parked messages are the same on a replica that applies the same log
     const b = &two.shards[1];
     for (&two.shards) |*s| s.wireHandlerShardPtrs();
     two.settle();
+    // The receiver's caps are what a sink's enqueue applies under: one
+    // message at most.
+    b.queue_handler.caps.max_messages = 1;
     var qb: [16]u8 = undefined;
     const q = try queueOwnedBy(&two, 1, &qb);
     var eb: [3][256]u8 = undefined;
