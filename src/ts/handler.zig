@@ -158,6 +158,8 @@ pub const TSHandler = struct {
         // there is one, or this answers stale.
         if (page == .refused and page.refused.status == .not_found) {
             if (shard.missToLeader(conn, req)) return .wait;
+            // Answered after this returns, still inside dispatchLocal, which
+            // restores the flag once the answer is sent.
             if (shard.staleMiss(req.header.op_code)) proto.answering_stale = true;
         }
         return page;
