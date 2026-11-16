@@ -1,0 +1,54 @@
+# THROWAWAY — do not merge. Reruns the 50x xshard sink-restart loop on the
+# revised fix-ns-read-route head (42e3c40e) to confirm the k0 read-route fix.
+name: xshard-loop
+
+on:
+  push:
+    branches:
+      - 'loop/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.17.0"
+  FILTER: "kv sink routes to the owning shard"
+  ITERATIONS: "50"
+
+jobs:
+  loop:
+    name: xshard sink restart loop
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Placeholder console dist
+        run: mkdir -p src/node/dashboard/dist && touch src/node/dashboard/dist/.keep
+      - name: Build and locate the test binary
+        run: |
+          set -euo pipefail
+          zig build
+          zig build test-e2e -Dtest-filter="$FILTER" --verbose 2>&1 | tee verbose.log
+          BIN=$(grep -oE '\.zig-cache/o/[a-f0-9]+/test' verbose.log | tail -1)
+          test -x "$BIN"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+      - name: Run the test in a loop
+        run: |
+          set -uo pipefail
+          fails=0
+          for i in $(seq 1 "$ITERATIONS"); do
+            if "./$BIN" > "iter-$i.log" 2>&1; then
+              echo "iter $i: ok"
+            else
+              fails=$((fails + 1))
+              echo "===== ITERATION $i FAILED ====="
+              cat "iter-$i.log"
+              echo "===== end iteration $i ====="
+            fi
+          done
+          echo "---- $fails / $ITERATIONS iterations failed ----"
+          test "$fails" -eq 0
