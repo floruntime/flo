@@ -35,7 +35,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Placeholder console dist
-        run: mkdir -p src/node/dashboard/dist && : > src/node/dashboard/dist/.keep
+        run: mkdir -p src/node/dashboard/dist && touch src/node/dashboard/dist/.keep
 
       - name: Build and locate the test binary
         run: |
