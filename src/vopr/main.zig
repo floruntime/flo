@@ -366,8 +366,8 @@ fn runGroups(allocator: std.mem.Allocator, args: Args, scenario: Scenario) !bool
     const s = try groups.run();
     defer allocator.free(s.groups);
     std.debug.print(
-        "[vopr] seed={d} {s}: groups={d} crashes={d} probes={d} frames_sent={d} frames_delivered={d} frames_refused={d} flush_stalls={d} frames_lost_in_crash={d} channel_applies={d} channel_violations={d} held_by_halts={d} left_in_mailbox={d} unparks={d}\n",
-        .{ scenario.seed, if (s.ok) "OK" else "FAILED", s.groups.len, s.crashes, s.probes_proposed, s.frames_sent, s.frames_delivered, s.frames_refused, s.flush_stalls, s.frames_lost_in_crash, s.channel_applies, s.channel_violations, s.held_by_halts, s.left_in_mailbox, s.unparks },
+        "[vopr] seed={d} {s}: groups={d} crashes={d} probes={d} frames_sent={d} frames_delivered={d} frames_refused={d} flush_stalls={d} frames_lost_in_crash={d} channel_applies={d} channel_violations={d} held_by_halts={d} left_in_mailbox={d} unparks={d} busy={d} pressured={d}\n",
+        .{ scenario.seed, if (s.ok) "OK" else "FAILED", s.groups.len, s.crashes, s.probes_proposed, s.frames_sent, s.frames_delivered, s.frames_refused, s.flush_stalls, s.frames_lost_in_crash, s.channel_applies, s.channel_violations, s.held_by_halts, s.left_in_mailbox, s.unparks, s.busy, s.pressured },
     );
     for (s.groups, 0..) |g, i| std.debug.print("[vopr]   group {d} {s}: ticks={d} acked={d} lost={d} committed={d} state_checks={d}\n", .{ i, if (g.ok) "OK" else "FAILED", g.ticks, g.ops_acked, g.ops_lost, g.max_committed, g.state_checks });
     if (!s.ok) {

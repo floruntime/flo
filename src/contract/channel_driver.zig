@@ -209,6 +209,8 @@ pub const Counts = struct {
     gaps: u64 = 0,
     inbound_proposed: u64 = 0,
     busy: u64 = 0,
+    /// Answers that said what writes through this group are queued behind.
+    pressured: u64 = 0,
     trims_proposed: u64 = 0,
     acks_refused: u64 = 0,
     /// Ticks that read every peer's records; the rest found nothing changed.
@@ -534,6 +536,7 @@ pub const Driver = struct {
         var pb: [Pressure.max_size]u8 = undefined;
         var pw: schema.Writer = .{ .buf = &pb };
         const n = self.pressure(status, p, &pw);
+        if (n > 0) self.counts.pressured += 1;
         var buf: [128]u8 = undefined;
         const f = encodeFrame(&buf, .answer, Answer.Value{
             .gen_term = p.recv_gen.term,

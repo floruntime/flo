@@ -382,6 +382,10 @@ pub const Summary = struct {
     probes_proposed: u64,
     /// Unparks the groups' leaders proposed: each a full target with room again.
     unparks: u64,
+    /// Batches refused for a full target, and answers that named a stall:
+    /// above 0, the caps were reached.
+    busy: u64,
+    pressured: u64,
     frames_refused: u64,
     flush_stalls: u64,
     held_by_halts: u64,
@@ -749,10 +753,7 @@ pub const Groups = struct {
         if (up and self.probe_every > 0 and self.converging and self.now() % 1_000 == 0) for (GroupChannel.POOL) |slot| {
             const owner = &self.chans[slot % self.chans.len];
             if (!probe.slotFull(owner.read(), slot)) continue;
-            for (self.chans) |*c| if (c.leads()) {
-                c.proposeMark("drai", slot);
-                break;
-            };
+            if (owner.leads()) owner.proposeMark("drai", slot);
         };
         self.delivery.clearRetainingCapacity();
         try self.mailbox.deliverDue(self.now(), &self.delivery);
@@ -826,6 +827,16 @@ pub const Groups = struct {
             .flush_stalls = self.flush_stalls,
             .held_by_halts = self.oracle.held_by_halts,
             .left_in_mailbox = self.mailbox.queue.items.len,
+            .busy = busy: {
+                var n: u64 = 0;
+                for (self.chans) |*c| n += c.driver.counts.busy;
+                break :busy n;
+            },
+            .pressured = pressured: {
+                var n: u64 = 0;
+                for (self.chans) |*c| n += c.driver.counts.pressured;
+                break :pressured n;
+            },
             .unparks = unparks: {
                 var n: u64 = 0;
                 for (self.chans) |*c| n += c.unparks;

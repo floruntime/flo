@@ -11,7 +11,8 @@
 //! A probe is a sink's write (`Flags.SINK`), and its target is its slot,
 //! which can be full: one starting "fill" makes its slot full at its
 //! receiver, one starting "drai" (drain) makes it take probes again, and neither
-//! has a target, so neither parks. While its slot is full, a probe is
+//! has a target, so neither parks. A drain proposed at the slot's owner applies
+//! there, unsent. While its slot is full, a probe is
 //! refused `overloaded`, so a channel parks it.
 
 const std = @import("std");
@@ -104,9 +105,15 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     var diag: schema.Diagnostic = .{};
     const p = ce.Probe.decodeAll(e.payload, &diag) catch return out.refuse(.bad_request, .malformed, "bad request: malformed probe");
     if (p.body.len < NAME_LEN) return out.refuse(.bad_request, .malformed, "bad request: a probe body names itself in 16 bytes");
-    const m = view.message orelse return view.sendFlagged(p.slot, @backingInt(entry_mod.EntryType.channel_probe), entry_mod.Flags.SINK, e.payload);
     var fb: [6]u8 = undefined;
     const full_key = fullKey(&fb, p.slot);
+    // A drain of a slot this group owns applies here, as a consumer's
+    // dequeue would: sent, it could wait behind messages to that same slot
+    // its owner refuses until it drains.
+    if (view.message == null and std.mem.startsWith(u8, p.body, "drai")) if (view.place) |pl| if (p.slot % pl.count == pl.group) {
+        return view.delete(GotFam, full_key);
+    };
+    const m = view.message orelse return view.sendFlagged(p.slot, @backingInt(entry_mod.EntryType.channel_probe), entry_mod.Flags.SINK, e.payload);
     if (std.mem.startsWith(u8, p.body, "fill")) {
         try view.put(GotFam, full_key, .{ .v = .{ .from = 0, .seq = 0, .hash = 0 } });
     } else if (std.mem.startsWith(u8, p.body, "drai")) {
