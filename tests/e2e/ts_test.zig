@@ -257,8 +257,9 @@ test "e2e/ts: write batch keeps each precision's timestamp to the nanosecond" {
     }
     var late = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", tmp_path, "--precision", "ms" });
     defer late.deinit();
-    try testing.expect(late.exit_code != 0);
-    try testing.expect(late.stderrContains("timestamp '9300000000000' is not a positive whole number"));
+    try testing.expectEqual(@as(u8, 2), late.exit_code);
+    try testing.expect(late.stdoutContains("Wrote 0 points"));
+    try testing.expect(late.stderrContains("line 1: timestamp '9300000000000' is past 2262-04-11T23:47:16Z, the latest time a point can have"));
 }
 
 test "e2e/ts: write batch reports a bad line and stores the rest" {

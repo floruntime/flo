@@ -249,7 +249,7 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
     const fields_flag = ctx.getString("fields") orelse "";
 
     const ts_str = ctx.getString("timestamp") orelse "";
-    // Milliseconds here; the server takes nanoseconds.
+    // --timestamp is ms; the server takes ns.
     var timestamp_ns: ?i64 = null;
     if (ts_str.len > 0) {
         const ms = std.fmt.parseInt(i64, ts_str, 10) catch {
@@ -331,9 +331,10 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
     ctx.print("OK ({d} fields at {d})\n", .{ n, @divFloor(ts, std.time.ns_per_ms) });
 }
 
-/// Now, in ns, for a point the CLI stamps itself.
+/// Now, in ns, for a point the CLI stamps itself: a whole millisecond,
+/// so the ms it prints, given back as --timestamp, names the same time.
 fn nowNs() i64 {
-    return @intCast(@import("stdx").time.nanoTimestamp());
+    return @import("stdx").time.milliTimestamp() * std.time.ns_per_ms;
 }
 
 /// A value the server will store: a finite number.
@@ -356,7 +357,8 @@ fn parseValue(ctx: *commander.Context, what: []const u8, text: []const u8) ?f64 
 /// A batch line's parse error as a sentence naming the token at fault.
 fn lineError(buf: []u8, err: anyerror, token: []const u8) []const u8 {
     return switch (err) {
-        error.InvalidTimestamp => std.fmt.bufPrint(buf, "timestamp '{s}' is not a positive whole number, or is past the latest time a point can have", .{token}),
+        error.InvalidTimestamp => std.fmt.bufPrint(buf, "timestamp '{s}' is not a positive whole number", .{token}),
+        error.TimestampTooLate => std.fmt.bufPrint(buf, "timestamp '{s}' is past 2262-04-11T23:47:16Z, the latest time a point can have", .{token}),
         error.TrailingInput => std.fmt.bufPrint(buf, "unexpected '{s}' after the timestamp", .{token}),
         error.EscapesNotSupported => std.fmt.bufPrint(buf, "backslash escapes ('{s}') are not supported", .{token}),
         error.DuplicateTag => std.fmt.bufPrint(buf, "tag key '{s}' is given more than once", .{token}),

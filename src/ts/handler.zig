@@ -291,11 +291,13 @@ pub const TSHandler = struct {
     }
 
     /// The time the client gave its point, in ns; null when it left the
-    /// choice to the server. An i64, so never past what a read answers.
-    fn clientTimestampNs(req: Request) ?u64 {
+    /// choice to the server (no option, or 0). An i64, so never past what a
+    /// read answers; one before 1970, or not 8 bytes, is refused.
+    fn clientTimestampNs(req: Request) error{ BeforeEpoch, NotI64 }!?u64 {
         const opt = req.findOption(.ts_timestamp_ns) orelse return null;
-        const ns = opt.asI64() orelse 0;
-        return if (ns <= 0) null else @intCast(ns);
+        const ns = opt.asI64() orelse return error.NotI64;
+        if (ns < 0) return error.BeforeEpoch;
+        return if (ns == 0) null else @intCast(ns);
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -337,7 +339,10 @@ pub const TSHandler = struct {
         }
 
         // Timestamp: from options, or server-generated
-        const client_ts = clientTimestampNs(req);
+        const client_ts = clientTimestampNs(req) catch |err| return .{ .err = .{ .code = .invalid_request, .message = switch (err) {
+            error.BeforeEpoch => "ts write: a point's time must not be before 1970",
+            error.NotI64 => "ts write: the timestamp option must be an 8-byte i64 of nanoseconds",
+        } } };
 
         // Canonical tag hash — sorted pairs, so tag ordering is not part of
         // the series identity (see ts_mod.canonicalTagHash).
@@ -766,7 +771,7 @@ pub const TSHandler = struct {
     }
 
     fn serverTimestampNs() u64 {
-        return @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
+        return @intCast(@import("stdx").time.nanoTimestamp());
     }
 
     pub fn freeResult(self: *TSHandler, cmd_result: CommandResult) void {
@@ -1032,7 +1037,7 @@ test "ts handler: write with field name option" {
     }
 }
 
-test "ts handler: a write's time is nanoseconds, read back exactly; none or not above 0 is the server's" {
+test "ts handler: a write's time is nanoseconds, read back exactly; 0 is the server's, and one before 1970 is refused" {
     const allocator = testing.allocator;
     var ts = TSProjection.init(allocator);
     defer ts.deinit();
@@ -1050,15 +1055,33 @@ test "ts handler: a write's time is nanoseconds, read back exactly; none or not 
     try testing.expectEqual(@as(u32, 1), page.n);
     try testing.expectEqual(exact, page.times[0]);
 
+    // 0 is the server's time.
     const before: i64 = @intCast(TSHandler.serverTimestampNs());
-    for ([_]i64{ 0, -1 }) |given| {
-        var b = OptionsBuilder.init(&opts_buf);
-        try b.addI64(.ts_timestamp_ns, given);
-        switch (handler.handleCommand(makeRequest(.ts_write, "mem", &f64Bytes(1), b.getOptions()))) {
-            .ts_write_ok => |w| try testing.expect(w.timestamp_ns >= before),
-            else => return error.TestUnexpectedResult,
-        }
+    var zero = OptionsBuilder.init(&opts_buf);
+    try zero.addI64(.ts_timestamp_ns, 0);
+    switch (handler.handleCommand(makeRequest(.ts_write, "mem", &f64Bytes(1), zero.getOptions()))) {
+        .ts_write_ok => |w| try testing.expect(w.timestamp_ns >= before),
+        else => return error.TestUnexpectedResult,
     }
+    // Before 1970, or not an i64: refused, not taken as the server's time.
+    var neg_buf: [64]u8 = undefined;
+    var neg = OptionsBuilder.init(&neg_buf);
+    try neg.addI64(.ts_timestamp_ns, -1);
+    var short_buf: [64]u8 = undefined;
+    var short = OptionsBuilder.init(&short_buf);
+    try short.addString(.ts_timestamp_ns, "1234");
+    const cases = [_]struct { opts: []const u8, why: []const u8 }{
+        .{ .opts = neg.getOptions(), .why = "ts write: a point's time must not be before 1970" },
+        .{ .opts = short.getOptions(), .why = "ts write: the timestamp option must be an 8-byte i64 of nanoseconds" },
+    };
+    for (cases) |c| switch (handler.handleCommand(makeRequest(.ts_write, "mem", &f64Bytes(1), c.opts))) {
+        .err => |e| {
+            try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code);
+            try testing.expectEqualStrings(c.why, e.message);
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(u64, 2), ts.stats.points_inserted);
 }
 
 test "ts handler: write empty measurement" {
