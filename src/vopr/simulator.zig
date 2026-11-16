@@ -3870,10 +3870,12 @@ test "vopr sim: a truncated uncommitted config leaves the node with the members 
 
 /// Catching-up seeds that run long enough to create namespaces under every
 /// fault the swarm has.
-// Re-derived after client writes to a not-ready leader are refused: 15 and 38
-// are the seeds whose stopped run still leaves acked ops unapplied (the
-// secondary durability line); the old 2, 3, 4, 6 no longer do.
-const CATCHING_UP_SEEDS = [_]u64{ 3, 4, 15, 38 };
+// Re-derived after client writes to a not-ready leader are refused. Every seed
+// must still catch ns_stale_id under both the ns_ungated and ns_ready_on_commit
+// mutants and refuse creates until ready with no lost id; 76 is one whose
+// stopped run also leaves acked ops unapplied (the secondary durability line),
+// which the old 2, 3, 4, 6 no longer do.
+const CATCHING_UP_SEEDS = [_]u64{ 3, 4, 6, 76 };
 
 test "vopr sim: in every catching-up run, leaders refuse creates until ready, and no create loses its id" {
     for (CATCHING_UP_SEEDS) |seed| {
