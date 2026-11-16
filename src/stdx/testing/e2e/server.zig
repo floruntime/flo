@@ -172,8 +172,12 @@ pub const ServerProcess = struct {
     pub const READY_POLL_INTERVAL_MS: u64 = 50;
     /// Timeout for graceful shutdown before SIGKILL (ms)
     pub const SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
-    /// Wait time between SIGTERM and SIGKILL (ms)
-    pub const SHUTDOWN_GRACE_PERIOD_MS: u64 = 500;
+    /// How long to wait after SIGTERM for a graceful exit before force-killing.
+    /// A graceful exit runs each shard's final segment flush; a force-kill skips
+    /// it, losing async_flush writes acked but not yet flushed. 5 s so a loaded
+    /// queue runner — exactly where shutdown is slow — still flushes; a healthy
+    /// server exits well before this, so the test pays nothing.
+    pub const SHUTDOWN_GRACE_PERIOD_MS: u64 = 5_000;
     /// Wait time after SIGKILL before proceeding (ms)
     /// Each server binds ports the OS picks, so a short wait suffices
     pub const POST_KILL_WAIT_MS: u64 = 100;
@@ -603,9 +607,15 @@ pub const ServerProcess = struct {
                 }
 
                 if (!self.reaped) {
-                    // Server didn't respond to SIGTERM, force kill its group
+                    // Server didn't respond to SIGTERM in time, force-kill its
+                    // group. Under async_flush a force-kill skips the final flush,
+                    // so writes acked but not yet flushed (segment flush runs at
+                    // most once a second) are lost — the restart then reads them
+                    // not_found. Say so loudly so a later not_found explains
+                    // itself; the test is not failed on the kill itself.
                     forced = true;
                     self.sent_kill = true;
+                    std.debug.print("[server] pid {d} did not exit within {d} ms of SIGTERM; killed (a kill skips the async-flush final flush — unflushed writes are lost)\n", .{ pid, SHUTDOWN_GRACE_PERIOD_MS });
                     if (std.c.kill(-pid, .KILL) != 0) _ = std.c.kill(pid, .KILL);
                     const kill_start = stdx.time.milliTimestamp();
                     while (!self.tryReap(pid) and stdx.time.milliTimestamp() - kill_start < 1000) {
