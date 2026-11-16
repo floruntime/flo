@@ -53,6 +53,10 @@ pub const Machine = struct {
     /// The target's name for an operator, from one entry that writes it
     /// ("queue orders"), into `buf`.
     label: ?*const fn (e: *const Entry, buf: []u8) []const u8 = null,
+    /// The namespace id an entry's payload names, for one whose applier
+    /// can't take an id no namespace could have: a channel message naming
+    /// one is refused before its machine sees it (`channels.zig`).
+    namespace: ?*const fn (e: *const Entry) ?u32 = null,
 };
 
 /// A target as its machine names it; channels tag it with the machine.

@@ -36,6 +36,7 @@ const persistence = @import("../storage/persistence.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const node_router = @import("../node/router.zig");
 const store_mod = @import("store.zig");
+const ns_table = @import("../namespace/table.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -354,6 +355,18 @@ fn unparkedEntry(e: *const Entry, u: ce.Unparked.Value) Entry {
     return .{ .header = h, .payload = u.payload };
 }
 
+/// Why message `e` can't be applied by `owner` for the namespace it names,
+/// or null: an id no namespace could have (`.invalid`, or past the
+/// table's capacity). Read from the payload alone, so every replica agrees.
+/// Whether a namespace is live isn't checked: no shard but shard 0 logs
+/// namespaces, so that can't be decided at apply here.
+fn namespaceRefusal(owner: *const machine_mod.Machine, e: *const Entry) ?[]const u8 {
+    const nf = owner.namespace orelse return null;
+    const id = nf(e) orelse return null;
+    if (id == ns_table.INVALID.int() or id >= ns_table.CAPACITY) return "bad request: a message naming a namespace id none could have";
+    return null;
+}
+
 /// A message as the entry its target applies: the inbound's header, with
 /// the message's type, flags and payload.
 fn asEntry(e: *const Entry, m: ce.Message.Value) Entry {
@@ -509,6 +522,9 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                         r.refuse(.bad_request, .malformed, why);
                         bug = .bad_payload;
                     }
+                } else if (namespaceRefusal(owner.?, &as)) |why| {
+                    r.refuse(.bad_request, .malformed, why);
+                    bug = .bad_payload;
                 } else if (owner) |o| {
                     const sink = m.flags & entry_mod.Flags.SINK != 0;
                     const target = targetOf(o, &as);
@@ -570,7 +586,7 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                 view.message = .{ .from = u.from, .seq = u.seq, .ordinal = ordinal };
                 defer view.message = null;
                 var r = Result.start(&as);
-                try owner.apply(view, &as, &r);
+                if (namespaceRefusal(owner, &as)) |why| r.refuse(.bad_request, .malformed, why) else try owner.apply(view, &as, &r);
                 if (r.refused()) |rf| if (rf.status == .overloaded) {
                     try view.rollback(mark);
                     break;

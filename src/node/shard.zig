@@ -26406,6 +26406,34 @@ test "Shard: a channel message refused as its sender's bug is counted by sender 
     try std.testing.expectEqual(@as(u64, 1), channels_mod.inOf(.{ .store = &b.defaultPartition().store }, 0).?.applied);
 }
 
+test "Shard: a sink's enqueue naming a namespace id none could have is refused as its sender's bug, not halted on" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    var qb: [16]u8 = undefined;
+    const q = try queueOwnedBy(&two, 1, &qb);
+    const ce = @import("../protocol/channel_entries.zig");
+    var mb: [1024]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &mb };
+    for ([_]u32{ ns_table.INVALID.int(), ns_table.CAPACITY }) |ns| {
+        var eb: [256]u8 = undefined;
+        const enq = try qe_caps.Enqueue.encodeInto(&eb, .{ .ns = ns, .queue = q.name, .priority = 0, .delay_ms = 0, .payload = "x", .max_messages = 8, .max_bytes = 1 << 20, .shard_held_bytes = 1 << 30 });
+        try ce.Message.encode(&w, .{ .slot = q.slot, .entry_type = @backingInt(entry_mod.EntryType.queue_enqueue), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .payload = enq });
+    }
+    var ib: [2048]u8 = undefined;
+    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
+    const e = entry_mod.buildEntry(.channel_inbound, 0, b.raft_node.current_term, b.raft_node.last_applied + 1, 1, inbound);
+    var out = persistence_mod.Result.start(&e);
+    try std.testing.expect(b.applyEntry(&e, &out));
+    const read: contract_view.ReadView = .{ .store = &b.defaultPartition().store };
+    try std.testing.expectEqual(@as(u64, 2), channels_mod.inOf(read, 0).?.applied);
+    try std.testing.expectEqual(@as(u64, 2), b.channel.sender_bugs[0][@backingInt(contract_store.SenderBug.bad_payload)]);
+    try std.testing.expectEqual(@as(u64, 0), channels_mod.shardParked(read).count);
+}
+
 test "Shard: a carried stream append its client path would refuse is refused as its sender's bug, creates no stream, and is counted and shown" {
     var two: TwoShards = undefined;
     try two.init();

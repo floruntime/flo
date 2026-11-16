@@ -641,7 +641,16 @@ pub const machine: machine_mod.Machine = .{
     .target = targetOf,
     .room = roomFor,
     .label = labelOf,
+    .namespace = namespaceOf,
 };
+
+/// An enqueue's namespace id: its applier halts on one naming none.
+fn namespaceOf(e: *const Entry) ?u32 {
+    if (typeOf(e) != .queue_enqueue) return null;
+    var diag: schema.Diagnostic = .{};
+    const p = qe.Enqueue.decodeAll(e.payload, &diag) catch return null;
+    return p.ns;
+}
 
 fn labelOf(e: *const Entry, buf: []u8) []const u8 {
     var diag: schema.Diagnostic = .{};
