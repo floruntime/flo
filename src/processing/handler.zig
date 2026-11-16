@@ -240,6 +240,8 @@ pub const ProcessingHandler = struct {
         /// once that batch applies. `page_limit` is the last page's size.
         poll_left: u32 = 0,
         more: bool = false,
+        /// When a poll last found it waiting, and counted it.
+        wait_counted_ms: i64 = 0,
         page_limit: usize = 0,
         /// A read of a source another shard owns, in flight: its number
         /// (0 for none), the term it was asked in, and when.
@@ -1625,10 +1627,10 @@ pub const ProcessingHandler = struct {
             self.loadCursor(shard, job.ns_id, pipeline_key, pipe);
             pipe.wait = self.waitOf(shard, pipe);
             if (pipe.wait != .none) {
-                // Looked at again at the next poll.
-                pipe.last_poll_ms = now_ms;
+                // Looked at again next tick, so the wait ends, and status
+                // stops saying so, as soon as it can; counted once a poll.
                 pipe.more = false;
-                self.noteWait(shard, pipe);
+                self.noteWait(shard, pipe, now_ms - pipe.wait_counted_ms >= poll_ms);
                 continue;
             }
             pipe.held_since_ms = 0;
@@ -2210,9 +2212,12 @@ pub const ProcessingHandler = struct {
     /// pipeline has waited 30 s, at most every 30 s. One waiting for a
     /// namespace is logged at once, with what to do, since only an
     /// operator ends that wait.
-    fn noteWait(self: *ProcessingHandler, shard: *Shard, pipe: *PipelineState) void {
-        if (shard.metrics_registry) |m| m.processing.recordHeldTick();
+    fn noteWait(self: *ProcessingHandler, shard: *Shard, pipe: *PipelineState, count: bool) void {
         const now = @import("stdx").time.milliTimestamp();
+        if (count) {
+            pipe.wait_counted_ms = now;
+            if (shard.metrics_registry) |m| m.processing.recordHeldTick();
+        }
         if (pipe.held_since_ms == 0) pipe.held_since_ms = now;
         const held_for = now - pipe.held_since_ms;
         const prompt = pipe.wait == .namespace and held_for == 0;
