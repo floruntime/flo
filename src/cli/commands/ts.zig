@@ -249,14 +249,18 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
     const fields_flag = ctx.getString("fields") orelse "";
 
     const ts_str = ctx.getString("timestamp") orelse "";
-    var timestamp_ms: ?i64 = null;
+    // Milliseconds here; the server takes nanoseconds.
+    var timestamp_ns: ?i64 = null;
     if (ts_str.len > 0) {
-        timestamp_ms = std.fmt.parseInt(i64, ts_str, 10) catch {
+        const ms = std.fmt.parseInt(i64, ts_str, 10) catch {
             return outcome.usage(ctx, "--timestamp '{s}' is not a whole number of milliseconds", .{ts_str});
         };
-        if (timestamp_ms.? <= 0) {
+        if (ms <= 0) {
             return outcome.usage(ctx, "--timestamp must be > 0 ms, not {s}", .{ts_str});
         }
+        timestamp_ns = std.math.mul(i64, ms, std.time.ns_per_ms) catch {
+            return outcome.usage(ctx, "--timestamp {s} ms is past the latest time a point can have", .{ts_str});
+        };
     }
 
     if (value_flag.len > 0 and fields_flag.len > 0) {
@@ -266,13 +270,14 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
     if (value_flag.len > 0) {
         const value = parseValue(ctx, "--value", value_flag) orelse return error.Usage;
         client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-        var result = client_mod.ts.write(&client, namespace, measurement, null, value, tags, timestamp_ms) catch |err| return outcome.requestFailed(ctx, err);
+        var result = client_mod.ts.write(&client, namespace, measurement, null, value, tags, timestamp_ns) catch |err| return outcome.requestFailed(ctx, err);
         defer result.deinit();
         try outcome.check(ctx, result);
-        // [series_hash:u64][timestamp_ms:i64][sequence:u64]
+        // [series_hash:u64][timestamp_ns:i64][sequence:u64], printed in ms
+        // as --timestamp takes it.
         const data = result.asRawData() orelse return outcome.malformed(ctx, "write response (empty)");
         if (data.len != 24) return outcome.malformed(ctx, "write response");
-        ctx.print("OK ({d}-{d})\n", .{ std.mem.readInt(i64, data[8..16], .little), std.mem.readInt(u64, data[16..24], .little) });
+        ctx.print("OK ({d}-{d})\n", .{ @divFloor(std.mem.readInt(i64, data[8..16], .little), std.time.ns_per_ms), std.mem.readInt(u64, data[16..24], .little) });
         return;
     }
 
@@ -311,7 +316,7 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // One timestamp for every field, so they read back as one point.
-    const ts = timestamp_ms orelse @import("stdx").time.milliTimestamp();
+    const ts = timestamp_ns orelse nowNs();
     for (names[0..n], values[0..n], 0..) |name, value, written| {
         var result = client_mod.ts.write(&client, namespace, measurement, name, value, tags, ts) catch |err| {
             const failed = outcome.requestFailed(ctx, err);
@@ -323,7 +328,12 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
             return outcome.refusal(ctx, result.status, result.reason(), result.errorMessage(), "field {s} ({d} of {d} fields written): ", .{ name, written, n });
         }
     }
-    ctx.print("OK ({d} fields at {d})\n", .{ n, ts });
+    ctx.print("OK ({d} fields at {d})\n", .{ n, @divFloor(ts, std.time.ns_per_ms) });
+}
+
+/// Now, in ns, for a point the CLI stamps itself.
+fn nowNs() i64 {
+    return @intCast(@import("stdx").time.nanoTimestamp());
 }
 
 /// A value the server will store: a finite number.
@@ -346,7 +356,7 @@ fn parseValue(ctx: *commander.Context, what: []const u8, text: []const u8) ?f64 
 /// A batch line's parse error as a sentence naming the token at fault.
 fn lineError(buf: []u8, err: anyerror, token: []const u8) []const u8 {
     return switch (err) {
-        error.InvalidTimestamp => std.fmt.bufPrint(buf, "timestamp '{s}' is not a positive whole number", .{token}),
+        error.InvalidTimestamp => std.fmt.bufPrint(buf, "timestamp '{s}' is not a positive whole number, or is past the latest time a point can have", .{token}),
         error.TrailingInput => std.fmt.bufPrint(buf, "unexpected '{s}' after the timestamp", .{token}),
         error.EscapesNotSupported => std.fmt.bufPrint(buf, "backslash escapes ('{s}') are not supported", .{token}),
         error.DuplicateTag => std.fmt.bufPrint(buf, "tag key '{s}' is given more than once", .{token}),
@@ -429,7 +439,7 @@ fn runWriteBatch(ctx: *commander.Context, client: *Client, namespace: []const u8
             // The parser checked every field, so a line is written whole
             // unless the server refuses part of it. A line without a
             // timestamp is stamped once, so its fields agree.
-            const ts = if (parsed.timestamp_ms != 0) parsed.timestamp_ms else @import("stdx").time.milliTimestamp();
+            const ts = if (parsed.timestamp_ns != 0) parsed.timestamp_ns else nowNs();
             for (parsed.fields, 0..) |field, written| {
                 var result = client_mod.ts.write(client, namespace, parsed.measurement, field.name, field.value, tags_w.buffered(), ts) catch |err| {
                     const failed = outcome.requestFailed(ctx, err);

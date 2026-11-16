@@ -290,13 +290,12 @@ pub const TSHandler = struct {
         sendTSResponse(shard, conn, request_id, writeOk(key, r.int(u64) orelse result.timestamp_ns, result.index));
     }
 
-    /// The timestamp the client gave its point, in ns; null when it left
-    /// the choice to the server. Refused past what nanoseconds can hold.
-    fn clientTimestampNs(req: Request) error{Overflow}!?u64 {
-        const opt = req.findOption(.ts_timestamp) orelse return null;
-        const ts_ms = opt.asI64() orelse 0;
-        if (ts_ms <= 0) return null;
-        return try std.math.mul(u64, @intCast(ts_ms), 1_000_000);
+    /// The time the client gave its point, in ns; null when it left the
+    /// choice to the server. An i64, so never past what a read answers.
+    fn clientTimestampNs(req: Request) ?u64 {
+        const opt = req.findOption(.ts_timestamp_ns) orelse return null;
+        const ns = opt.asI64() orelse 0;
+        return if (ns <= 0) null else @intCast(ns);
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -338,9 +337,7 @@ pub const TSHandler = struct {
         }
 
         // Timestamp: from options, or server-generated
-        const client_ts = clientTimestampNs(req) catch {
-            return .{ .err = .{ .code = .invalid_request, .message = "ts write: timestamp out of range" } };
-        };
+        const client_ts = clientTimestampNs(req);
 
         // Canonical tag hash — sorted pairs, so tag ordering is not part of
         // the series identity (see ts_mod.canonicalTagHash).
@@ -388,7 +385,7 @@ pub const TSHandler = struct {
     fn writeOk(measurement: []const u8, timestamp_ns: u64, sequence: u64) CommandResult {
         return .{ .ts_write_ok = .{
             .series_hash = std.hash.Wyhash.hash(0, measurement),
-            .timestamp_ms = @intCast(timestamp_ns / 1_000_000),
+            .timestamp_ns = @intCast(timestamp_ns),
             .sequence = sequence,
         } };
     }
@@ -808,10 +805,10 @@ fn sendTSResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
             shard.sendRefusal(conn, request_id, e.code.toStatus(), e.refusal());
         },
         .ts_write_ok => |w| {
-            // Send [series_hash:u64][timestamp_ms:i64][sequence:u64] (24 bytes)
+            // [series_hash:u64][timestamp_ns:i64][sequence:u64]
             var buf: [24]u8 = undefined;
             std.mem.writeInt(u64, buf[0..8], w.series_hash, .little);
-            std.mem.writeInt(i64, buf[8..16], w.timestamp_ms, .little);
+            std.mem.writeInt(i64, buf[8..16], w.timestamp_ns, .little);
             std.mem.writeInt(u64, buf[16..24], w.sequence, .little);
             shard.sendOkResponse(conn, request_id, &buf);
         },
@@ -986,7 +983,7 @@ test "ts handler: write with string value" {
     switch (result) {
         .ts_write_ok => |w| {
             try testing.expect(w.series_hash != 0);
-            try testing.expect(w.timestamp_ms > 0);
+            try testing.expect(w.timestamp_ns > 0);
             try testing.expectEqual(@as(u64, 1), w.sequence);
         },
         else => return error.TestUnexpectedResult,
@@ -1035,21 +1032,33 @@ test "ts handler: write with field name option" {
     }
 }
 
-test "ts handler: a client timestamp past what nanoseconds hold is refused, not wrapped" {
+test "ts handler: a write's time is nanoseconds, read back exactly; none or not above 0 is the server's" {
     const allocator = testing.allocator;
     var ts = TSProjection.init(allocator);
     defer ts.deinit();
     var handler = TSHandler.init(allocator, &ts);
 
+    const exact: i64 = 1_700_000_000_123_456_789;
     var opts_buf: [64]u8 = undefined;
     var builder = OptionsBuilder.init(&opts_buf);
-    try builder.addI64(.ts_timestamp, std.math.maxInt(i64) / 1_000);
-    const result = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(82.5), builder.getOptions()));
-    switch (result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
+    try builder.addI64(.ts_timestamp_ns, exact);
+    switch (handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(82.5), builder.getOptions()))) {
+        .ts_write_ok => |w| try testing.expectEqual(exact, w.timestamp_ns),
         else => return error.TestUnexpectedResult,
     }
-    try testing.expectEqual(@as(u64, 0), ts.stats.points_inserted);
+    const page = try testRead(&handler, "cpu", .{});
+    try testing.expectEqual(@as(u32, 1), page.n);
+    try testing.expectEqual(exact, page.times[0]);
+
+    const before: i64 = @intCast(TSHandler.serverTimestampNs());
+    for ([_]i64{ 0, -1 }) |given| {
+        var b = OptionsBuilder.init(&opts_buf);
+        try b.addI64(.ts_timestamp_ns, given);
+        switch (handler.handleCommand(makeRequest(.ts_write, "mem", &f64Bytes(1), b.getOptions()))) {
+            .ts_write_ok => |w| try testing.expect(w.timestamp_ns >= before),
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 test "ts handler: write empty measurement" {

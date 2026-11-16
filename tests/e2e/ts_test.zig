@@ -217,25 +217,48 @@ test "e2e/ts: write batch from file stores every point" {
     }
 }
 
-test "e2e/ts: write batch converts the timestamp precision" {
+test "e2e/ts: write batch keeps each precision's timestamp to the nanosecond" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    const tmp_path = "/tmp/flo-e2e-ts-batch-ns.txt";
+    const cases = [_]struct { precision: []const u8, stamp: []const u8, ns: []const u8 }{
+        .{ .precision = "ns", .stamp = "1708700400123456789", .ns = "1708700400123456789" },
+        .{ .precision = "us", .stamp = "1708700400123456", .ns = "1708700400123456000" },
+        .{ .precision = "ms", .stamp = "1708700400123", .ns = "1708700400123000000" },
+        .{ .precision = "s", .stamp = "1708700400", .ns = "1708700400000000000" },
+    };
+    const tmp_path = "/tmp/flo-e2e-ts-batch-precision.txt";
+    defer @import("stdx").fs.deleteFile(tmp_path) catch {};
+    for (cases) |c| {
+        {
+            var line: [96]u8 = undefined;
+            const file = try @import("stdx").fs.createFile(tmp_path, .{});
+            defer @import("stdx").fs.closeFile(file);
+            try @import("stdx").fs.writeAll(file, try std.fmt.bufPrint(&line, "disk,unit={s} free=12.5 {s}\n", .{ c.precision, c.stamp }));
+        }
+        var w = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", tmp_path, "--precision", c.precision });
+        defer w.deinit();
+        try testing.expectEqual(@as(u8, 0), w.exit_code);
+        try testing.expect(w.stdoutContains("Wrote 1 points"));
+
+        var tags: [16]u8 = undefined;
+        var r = try ctx.cli.run(&.{ "ts", "read", "disk", "--tags", try std.fmt.bufPrint(&tags, "unit={s}", .{c.precision}), "--field", "free", "--from", "1708700000000", "-o", "json" });
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 0), r.exit_code);
+        var want: [48]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, r.stdout, try std.fmt.bufPrint(&want, "\"time_ns\": {s},", .{c.ns})) != null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.stdout, "\"time_ns\""));
+    }
+    // A timestamp later than an i64 of nanoseconds is refused, not wrapped.
     {
         const file = try @import("stdx").fs.createFile(tmp_path, .{});
         defer @import("stdx").fs.closeFile(file);
-        try @import("stdx").fs.writeAll(file, "disk,host=a free=12.5 1708700400123000000\n");
+        try @import("stdx").fs.writeAll(file, "disk,unit=late free=1 9300000000000\n");
     }
-    defer @import("stdx").fs.deleteFile(tmp_path) catch {};
-
-    var w = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", tmp_path, "--precision", "ns" });
-    defer w.deinit();
-    try testing.expectEqual(@as(u8, 0), w.exit_code);
-
-    var r = try ctx.cli.run(&.{ "ts", "read", "disk", "--tags", "host=a", "--field", "free", "--from", "1708700000000", "-o", "raw" });
-    defer r.deinit();
-    try testing.expectEqualStrings("1708700400123 12.500000\n", r.stdout);
+    var late = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", tmp_path, "--precision", "ms" });
+    defer late.deinit();
+    try testing.expect(late.exit_code != 0);
+    try testing.expect(late.stderrContains("timestamp '9300000000000' is not a positive whole number"));
 }
 
 test "e2e/ts: write batch reports a bad line and stores the rest" {

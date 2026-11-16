@@ -16002,8 +16002,7 @@ test "Shard: appends, enqueues and a time-series write parked behind a peer's ac
     try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, rs[4].data[0..8], .little));
     // Server-stamped: the point's timestamp is its entry header's clock,
     // its sequence its entry's index.
-    const hdr_ms = raft.log.getEntry(ts_index).?.header.timestamp_ns / 1_000_000;
-    try std.testing.expectEqual(hdr_ms, std.mem.readInt(u64, rs[2].data[8..16], .little));
+    try std.testing.expectEqual(raft.log.getEntry(ts_index).?.header.timestamp_ns, std.mem.readInt(u64, rs[2].data[8..16], .little));
     try std.testing.expectEqual(ts_index, std.mem.readInt(u64, rs[2].data[16..24], .little));
 }
 

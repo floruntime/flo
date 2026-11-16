@@ -335,7 +335,7 @@ pub const OptionTag = enum(u8) {
     ts_aggregation = 0x63, // string: Aggregation function name (avg, sum, count, min, max)
     ts_field = 0x64, // string: Field name filter (empty = "value")
     ts_tags = 0x65, // string: Comma-separated tag filters "key=val,key2=val2"
-    ts_timestamp = 0x67, // i64: Explicit timestamp for write (0 = server-assigned)
+    ts_timestamp_ns = 0x67, // i64: a write's time in ns (≤ 0 = server-assigned)
     ts_raw_ttl = 0x68, // string: Raw data TTL (e.g., "7d")
     ts_downsample = 0x69, // string: refused — downsampling isn't supported
 
