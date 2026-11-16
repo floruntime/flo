@@ -383,7 +383,7 @@ function JobDetail({ ns, job, onBack }: { ns: string; job: ProcessingJobInfo; on
                   ['Tick avg · max', m ? `${fixed(m.tick_avg_us, 'µs')} · ${fixed(m.tick_max_us, 'µs')}` : DASH],
                   ['Watermark', m?.watermark_ms != null ? tfmt(m.watermark_ms) : DASH],
                   ['Uptime on this node', m ? pDur(m.uptime_ms) : DASH],
-                  ['Late points', m?.late_edge_ms != null ? `≥ ${pfmtN(m.late_points ?? 0)}, over ${edgeDur(m.late_edge_ms)} behind` : DASH],
+                  ['Late points', m?.late_edge_ms != null ? (m.late_points ? `≥ ${pfmtN(m.late_points)}, over ${edgeDur(m.late_edge_ms)} behind` : `none over ${edgeDur(m.late_edge_ms)} behind`) : DASH],
                 ] as [string, string][]
               ).map(([k, v]) => (
                 <div className="kvrow2" key={k}>

@@ -276,8 +276,8 @@ fn printProcessingJobStatus(ctx: *commander.Context, data: []const u8) commander
     ctx.print("Processed:  {d} records\n", .{records});
     ctx.print("Created:    {d}ms\n", .{created_at});
     if (running) ctx.print("On this node: {d} in, {d} out over {d}ms; ticks avg {d}us\n", .{ records_in, records_out, uptime_ms, tick_avg_us });
-    // Edges are whole seconds; none past the last, an hour.
-    if (running and late_edge_ms <= std.time.ms_per_hour) {
+    // Every edge is a whole number of seconds.
+    if (running and late_edge_ms != std.math.maxInt(u64)) {
         var eb: [16]u8 = undefined;
         const edge = if (late_edge_ms >= std.time.ms_per_hour and late_edge_ms % std.time.ms_per_hour == 0)
             std.fmt.bufPrint(&eb, "{d}h", .{late_edge_ms / std.time.ms_per_hour}) catch unreachable
@@ -285,7 +285,10 @@ fn printProcessingJobStatus(ctx: *commander.Context, data: []const u8) commander
             std.fmt.bufPrint(&eb, "{d}m", .{late_edge_ms / std.time.ms_per_min}) catch unreachable
         else
             std.fmt.bufPrint(&eb, "{d}s", .{late_edge_ms / std.time.ms_per_s}) catch unreachable;
-        ctx.print("Late points: at least {d}, more than {s} behind their field's newest\n", .{ late_points, edge });
+        if (late_points == 0)
+            ctx.print("Late points: none more than {s} behind their field's newest\n", .{edge})
+        else
+            ctx.print("Late points: at least {d}, more than {s} behind their field's newest\n", .{ late_points, edge });
     }
 }
 

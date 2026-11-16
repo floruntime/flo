@@ -287,9 +287,9 @@ pub const ProcessingHandler = struct {
             return if (now_ms -| self.seen_at_ms >= self.lateness_ms) writes else 0;
         }
 
-        /// The late-point edge a TS source reports against: the smallest at
-        /// or above its window. None for a stream source, or a window past
-        /// every edge.
+        /// The index of the late-point edge a TS source reports against:
+        /// the smallest at or above its window. None for a stream source, or
+        /// a window past every edge.
         pub fn lateEdge(self: *const PipelineState) ?usize {
             if (self.source_kind != .ts) return null;
             return ts_machine.lateEdgeFor(@as(u64, self.lateness_ms) * std.time.ns_per_ms);
@@ -810,13 +810,9 @@ pub const ProcessingHandler = struct {
         tick_max_us: u64 = 0,
         /// Since the earliest of them started.
         uptime_ms: u64 = 0,
-        /// The job's TS sources' late points: at least `late_points` of
-        /// their fields' points came later than `late_edge_ms` behind each
-        /// field's newest, so past every window that edge is at or above.
-        /// The edge is the largest any of its TS sources reports against;
-        /// a source on a smaller edge isn't counted, since how many of its
-        /// points are past the larger one isn't kept. `NO_LATE_EDGE` with
-        /// no TS source, or a window past every edge.
+        /// At least `late_points` of the source fields' points came more
+        /// than `late_edge_ms` behind their field's newest: the largest edge
+        /// the job's TS sources report against. `NO_LATE_EDGE` for none.
         late_edge_ms: u64 = NO_LATE_EDGE,
         late_points: u64 = 0,
 
@@ -862,18 +858,45 @@ pub const ProcessingHandler = struct {
             tick_sum += p.tick_ns_sum;
             ticks += p.tick_count;
             started = @min(started, p.started_ms);
-            if (p.lateEdge()) |edge| {
-                if (late_edge == null or edge > late_edge.?) {
-                    late_edge = edge;
-                    r.late_points = 0;
+            if (p.lateEdge()) |edge| late_edge = @max(late_edge orelse edge, edge);
+        }
+        // Each field once: its count is the whole field's, however many of
+        // the job's sources read it. A source on a smaller edge isn't
+        // counted, as its count past the larger one isn't carried for it.
+        if (late_edge) |edge| {
+            r.late_edge_ms = ts_machine.LATE_EDGES_NS[edge] / std.time.ns_per_ms;
+            var outer = self.pipelines.iterator();
+            var at: usize = 0;
+            while (outer.next()) |e| : (at += 1) {
+                const p = e.value_ptr;
+                if (!self.lateCounts(e.key_ptr.*, p, job_id, edge)) continue;
+                var inner = self.pipelines.iterator();
+                var seen = false;
+                var i: usize = 0;
+                while (inner.next()) |q| : (i += 1) {
+                    if (i == at) break;
+                    if (self.lateCounts(q.key_ptr.*, q.value_ptr, job_id, edge) and sameField(p, q.value_ptr)) {
+                        seen = true;
+                        break;
+                    }
                 }
-                if (edge == late_edge.?) r.late_points += p.late_points;
+                if (!seen) r.late_points += p.late_points;
             }
         }
-        if (late_edge) |e| r.late_edge_ms = ts_machine.LATE_EDGES_NS[e] / std.time.ns_per_ms;
         if (ticks > 0) r.tick_avg_us = tick_sum / ticks / std.time.ns_per_us;
         if (r.running) r.uptime_ms = @intCast(@max(0, now_ms - started));
         return r;
+    }
+
+    /// Whether pipeline `key` is one of job `job_id`'s, reporting late
+    /// points against `edge`.
+    fn lateCounts(_: *const ProcessingHandler, key: []const u8, p: *const PipelineState, job_id: []const u8, edge: usize) bool {
+        const base = if (std.mem.indexOfScalar(u8, key, 0)) |nul| key[0..nul] else key;
+        return std.mem.eql(u8, base, job_id) and p.lateEdge() == edge;
+    }
+
+    fn sameField(a: *const PipelineState, b: *const PipelineState) bool {
+        return std.mem.eql(u8, a.src_namespace, b.src_namespace) and std.mem.eql(u8, a.src_measurement, b.src_measurement) and std.mem.eql(u8, a.src_field, b.src_field);
     }
 
     // ── List ─────────────────────────────────────────────────────────────
@@ -3545,26 +3568,28 @@ test "ProcessingHandler: jobs that share a name are each listed" {
     try std.testing.expect(handler.listedJob(.of(16), "job-a") == null);
 }
 
-test "processing: a job's status counts its TS sources' late points at the largest edge they report against" {
+test "processing: a job's status counts its TS sources' late points at the largest edge they report against, each field once" {
     const allocator = std.testing.allocator;
     var handler = ProcessingHandler.init(allocator);
     defer handler.deinit();
     const Src = struct {
-        fn ts(lateness_ms: u32) definition.SourceSpec {
-            return .{ .kind = .ts, .name = "t", .stream = "", .namespace = "default", .batch_size = 0, .ts_measurement = "cpu", .ts_field = "value", .ts_lateness_ms = lateness_ms };
+        fn ts(measurement: []const u8, lateness_ms: u32) definition.SourceSpec {
+            return .{ .kind = .ts, .name = "t", .stream = "", .namespace = "default", .batch_size = 0, .ts_measurement = measurement, .ts_field = "value", .ts_lateness_ms = lateness_ms };
         }
     };
     // Windows of 30 s and 20 s both report against the 30 s edge; the
-    // 3 s one reports against 5 s, and how many of its points are past
-    // 30 s isn't kept, so it isn't counted.
-    const sources = [_]struct { key: []const u8, lateness_ms: u32, late: u64 }{
-        .{ .key = "job-a\x000", .lateness_ms = 30_000, .late = 5 },
-        .{ .key = "job-a\x001", .lateness_ms = 3_000, .late = 9 },
-        .{ .key = "job-a\x002", .lateness_ms = 20_000, .late = 2 },
-        .{ .key = "job-h", .lateness_ms = 2 * 3_600_000, .late = 4 },
+    // 3 s one reports against 5 s, and its count past 30 s isn't carried
+    // for it, so it isn't counted. Two sources reading cpu.value (say,
+    // one host each) count its late points once: the count is the field's.
+    const sources = [_]struct { key: []const u8, measurement: []const u8, lateness_ms: u32, late: u64 }{
+        .{ .key = "job-a\x000", .measurement = "cpu", .lateness_ms = 30_000, .late = 5 },
+        .{ .key = "job-a\x001", .measurement = "cpu", .lateness_ms = 3_000, .late = 9 },
+        .{ .key = "job-a\x002", .measurement = "mem", .lateness_ms = 20_000, .late = 2 },
+        .{ .key = "job-a\x003", .measurement = "cpu", .lateness_ms = 30_000, .late = 5 },
+        .{ .key = "job-h", .measurement = "cpu", .lateness_ms = 2 * 3_600_000, .late = 4 },
     };
     for (sources) |s| {
-        const src = Src.ts(s.lateness_ms);
+        const src = Src.ts(s.measurement, s.lateness_ms);
         var pipe = try ProcessingHandler.makePipeState(allocator, &src, &.{}, 0);
         pipe.late_points = s.late;
         try handler.pipelines.put(try allocator.dupe(u8, s.key), pipe);

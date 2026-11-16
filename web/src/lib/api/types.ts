@@ -379,8 +379,8 @@ export interface ProcessingJobMetrics {
   tick_max_us: number
   watermark_ms: number | null
   uptime_ms: number
-  /** A TS job's source points that came more than late_edge_ms behind
-   *  their field's newest: at least late_points. Null without a count. */
+  /** At least late_points of the source fields' points came more than
+   *  late_edge_ms behind their field's newest. Null without a count. */
   late_edge_ms: number | null
   late_points: number | null
 }

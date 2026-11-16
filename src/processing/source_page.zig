@@ -108,9 +108,9 @@ pub const TsPoint = struct { timestamp_ns: u64, ual: u64, value: f64, tags: []co
 /// and the records.
 ///
 /// `[term u64][seq u64][kind u8][pipeline len u16][pipeline][from_a u64]
-/// [from_b u64][last_a u64][last_b u64][late u64][count u32]` then each stream record
-/// `[ms u64][seq u64][len u32][payload]` or TS point `[ns u64][ual u64]
-/// [value u64][tags len u16][tags]`.
+/// [from_b u64][last_a u64][last_b u64][late u64][count u32]` then each
+/// stream record `[ms u64][seq u64][len u32][payload]` or TS point
+/// `[ns u64][ual u64][value u64][tags len u16][tags]`.
 pub const Page = struct {
     term: u64,
     seq: u64,
