@@ -243,9 +243,25 @@ pub const ClusterContext = struct {
         self.seed_endpoint = null;
     }
 
+    /// Fail the test loudly if any node has exited unexpectedly. Called from
+    /// every command path below — including the retry/poll loops, which reach it
+    /// through these base calls each attempt — so a node that died mid-test (a
+    /// peer-bind collision, a crash) is reported as that exit, with the node
+    /// index and reason, instead of masking as a not_found on a surviving node
+    /// that the poll then spins on. An intentional stopNode (the SIGTERM/SIGKILL
+    /// the harness sent) and an awaited crash are not flagged.
+    pub fn assertNodesAlive(self: *Self) void {
+        for (self.servers[0..self.node_count], 0..) |maybe, i| {
+            const server = maybe orelse continue;
+            var buf: [32]u8 = undefined;
+            server.assertAlive(std.fmt.bufPrint(&buf, "cluster node {d}", .{i}) catch "a cluster node");
+        }
+    }
+
     /// Execute command on specific node (fire-and-forget, asserts success)
     pub fn execOn(self: *Self, node: usize, args: []const []const u8) !void {
         if (node >= self.node_count) return error.InvalidNodeIndex;
+        self.assertNodesAlive();
         const cli = self.clis[node] orelse return error.NodeNotRunning;
 
         var result = try cli.run(args);
@@ -287,6 +303,7 @@ pub const ClusterContext = struct {
     /// Caller owns returned memory
     pub fn execCaptureOn(self: *Self, node: usize, args: []const []const u8) ![]const u8 {
         if (node >= self.node_count) return error.InvalidNodeIndex;
+        self.assertNodesAlive();
         const cli = self.clis[node] orelse return error.NodeNotRunning;
 
         var result = try cli.run(args);
@@ -307,6 +324,7 @@ pub const ClusterContext = struct {
     /// Caller owns returned memory
     pub fn execCaptureAnyOn(self: *Self, node: usize, args: []const []const u8) ![]const u8 {
         if (node >= self.node_count) return error.InvalidNodeIndex;
+        self.assertNodesAlive();
         const cli = self.clis[node] orelse return error.NodeNotRunning;
 
         var result = try cli.run(args);
