@@ -45,6 +45,8 @@ const Sim = struct {
     prng: PRNG,
     faults: Faults,
     now: u64 = 0,
+    /// Every proposal refused, as a full log refuses it.
+    refuse_proposals: bool = false,
 
     fn init(allocator: Allocator, count: u16, seed: u64, faults: Faults) !Sim {
         const groups = try allocator.alloc(Group, count);
@@ -94,6 +96,7 @@ const Sim = struct {
         }
 
         pub fn propose(io: Io, etype: entry_mod.EntryType, payload: []const u8) bool {
+            if (io.sim.refuse_proposals) return false;
             const g = &io.sim.groups[io.me];
             const owned = io.sim.allocator.dupe(u8, payload) catch return false;
             g.pending.append(io.sim.allocator, .{ .etype = etype, .bytes = owned }) catch return false;
@@ -456,6 +459,33 @@ test "channel driver: what a receiver proposed to a target and hasn't applied co
     try testing.expect(!hasGot(b, "inflight-0000-04"));
     // Applied, none is still counted in flight.
     try testing.expectEqual(@as(u64, 0), b.driver.inFlight(channelsTarget(1)).target);
+    try testing.expectEqual(@as(u64, 0), b.driver.in_flight_bytes);
+}
+
+test "channel driver: a batch whose inbound the log refuses counts nothing in flight, and goes once it takes it" {
+    var sim = try Sim.init(testing.allocator, 2, 37, .{});
+    defer sim.deinit();
+    for (sim.groups) |*g| {
+        g.driver.admits = Probed.admits;
+        g.driver.sink_target = Probed.sinkTarget;
+    }
+    const a = &sim.groups[0];
+    const b = &sim.groups[1];
+    try sim.probeBody(b, 1, "fill-slot1-00001");
+    for (0..40) |_| try sim.step();
+    try sim.probeBody(a, 1, "refused-0000-001");
+    try sim.probeBody(a, 1, "refused-0000-002");
+    // Every proposal refused: b answers busy, and nothing it tracked stays.
+    sim.refuse_proposals = true;
+    for (0..200) |_| try sim.step();
+    try testing.expect(b.driver.counts.busy > 0);
+    try testing.expectEqual(@as(u64, 0), b.driver.in_flight_bytes);
+    try testing.expectEqual(@as(usize, 0), b.driver.target_bytes.count());
+    try testing.expectEqual(@as(u64, 0), channels.targetParked(.{ .store = &b.store }, channelsTarget(1)).count);
+    // Taken again: both park, in order.
+    sim.refuse_proposals = false;
+    for (0..12_000) |_| try sim.step();
+    try testing.expectEqual(@as(u64, 2), channels.targetParked(.{ .store = &b.store }, channelsTarget(1)).count);
     try testing.expectEqual(@as(u64, 0), b.driver.in_flight_bytes);
 }
 

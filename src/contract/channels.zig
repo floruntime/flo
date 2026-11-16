@@ -618,7 +618,8 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
         /// cap none is taken; past its target's, none for that target.
         /// The driver proposes a batch's messages before the first not
         /// taken, and that one and those after wait at their sender
-        /// (`busy`), so only a sink to a full target pushes back.
+        /// (`busy`), so only a sink to a full target, or one with as much
+        /// on its way as would fill it, pushes back.
         ///
         /// Parked bytes are read from committed state, and the bytes this
         /// leader proposed to the target and hasn't applied (`in_flight`,

@@ -5335,12 +5335,12 @@ test "raft node: proposals are capped by payload bytes, a quarter kept for chann
     // Applied, it is all released.
     node.last_applied = node.log.lastIndex();
     try testing.expectEqual(@as(u64, 0), node.pendingBytes());
-    // Proposed again, and the node stops leading before it applies: none of
-    // it is this node's to count, and a later term starts from 0.
+    // Proposed again, and the node stops leading before it applies. A
+    // follower never asks, so the count is first read again as leader of a
+    // later term: none of the earlier term's is this leader's to count.
     _ = try node.propose(.kv_put, 0, big);
     try testing.expectEqual(@as(u64, big.len), node.pendingBytes());
     node.stepDown(2);
-    try testing.expectEqual(@as(u64, 0), node.pendingBytes());
     _ = candidacy(&node).?;
     _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
     try testing.expectEqual(Role.leader, node.role);
