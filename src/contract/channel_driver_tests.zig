@@ -425,6 +425,12 @@ test "channel driver: past a target's parked cap its messages wait at their send
     try sim.probeBody(b, 1, "drain-slot1-0002");
     for (0..40) |_| try sim.step();
     try testing.expect(try sim.unpark(b));
+    // Room on b, by its parked state: its answers stop naming a full
+    // target at once, before a's batch is resent and taken.
+    var fb: [64]u8 = undefined;
+    b.driver.onFrame(0, emptyBatch(&fb, a.driver.term), sim.now, .{ .store = &b.store }, 0, false, Sim.Io{ .sim = &sim, .me = 1 });
+    var out: [driver_mod.MAX_PRESSURE]driver_mod.Stall.Value = undefined;
+    for (lastPressure(&sim, 0, &out)) |st| try testing.expect(st.cause != @backingInt(driver_mod.Cause.target_full));
     // The sender's backoff grew while it was busy: up to 5 s.
     for (0..12_000) |_| try sim.step();
     try testing.expect(hasGot(b, "parked-0000-0001") and hasGot(b, "capped-0000-0003") and hasGot(b, "behind-0000-0004"));
