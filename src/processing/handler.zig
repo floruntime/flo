@@ -124,8 +124,9 @@ pub const ProcessingHandler = struct {
 
     /// The sink batch a page is building, and the buffers it and its
     /// entry are built in, allocated at the first batch.
-    batch: Batch = .{ .w = .{ .buf = &.{} } },
+    batch: Batch = .{ .w = .{ .buf = &.{} }, .r = .{ .buf = &.{} } },
     batch_buf: []u8 = &.{},
+    rec_buf: []u8 = &.{},
     entry_buf: []u8 = &.{},
     msg_buf: []u8 = &.{},
     /// Records skipped because their writes don't fit one entry.
@@ -222,6 +223,16 @@ pub const ProcessingHandler = struct {
         /// next batch. The batch it proposed and hasn't seen apply, by
         /// index and term (index 0: none), and when it last proposed one.
         from: sinks_machine.At = .{},
+        /// Its read cursor is past `from` in term `ahead_term`, for records
+        /// its operators have run on that no batch has logged yet: an idle
+        /// page, or a record cut from a full batch, whose writes wait in
+        /// `carry` for the next. Read again only if the term moves on, as
+        /// operator state is.
+        ahead: bool = false,
+        ahead_term: u64 = 0,
+        carry: std.ArrayListUnmanaged(u8) = .empty,
+        carry_n: u32 = 0,
+        carry_bytes: usize = 0,
         batch_index: u64 = 0,
         batch_term: u64 = 0,
         last_batch_ms: i64 = 0,
@@ -343,7 +354,7 @@ pub const ProcessingHandler = struct {
             self.freeJobRecord(entry.value_ptr);
         }
         self.jobs.deinit();
-        for ([_][]u8{ self.batch_buf, self.entry_buf, self.msg_buf }) |b| if (b.len > 0) self.allocator.free(b);
+        for ([_][]u8{ self.batch_buf, self.rec_buf, self.entry_buf, self.msg_buf }) |b| if (b.len > 0) self.allocator.free(b);
     }
 
     /// Shard that owns `key` in `namespace`, by the router the dispatchers use
@@ -426,6 +437,7 @@ pub const ProcessingHandler = struct {
     }
 
     fn freePipelineState(self: *ProcessingHandler, pipe: *PipelineState) void {
+        pipe.carry.deinit(self.allocator);
         // Free operator chain
         for (pipe.operator_backings) |*backing| {
             backing.deinit(self.allocator);
@@ -1643,17 +1655,21 @@ pub const ProcessingHandler = struct {
     /// reads from, and the `from` its next batch names. A batch a leader
     /// change lost, or one that applied, is behind it either way.
     fn loadCursor(self: *ProcessingHandler, shard: *Shard, ns: NamespaceId, pipeline_key: []const u8, pipe: *PipelineState) void {
-        _ = self;
         const at = sinks_machine.cursorOf(.{ .store = &shard.defaultPartition().store }, ns, pipeline_key);
         pipe.from = at;
         pipe.batch_index = 0;
-        switch (pipe.source_kind) {
-            .stream => {
-                pipe.stream_cursor_ts = at.a;
-                pipe.stream_cursor_seq = at.b;
-            },
-            .ts => pipe.ts_cursor = .{ .ns = at.a, .ual = at.b },
-        }
+        // Read ahead in this term: it reads on from there, and its next
+        // batch covers what it read.
+        if (pipe.ahead and pipe.ahead_term == shard.raft_node.current_term) return;
+        self.rewindTo(pipe, at);
+    }
+
+    /// Where it reads next.
+    fn readAt(pipe: *const PipelineState) sinks_machine.At {
+        return switch (pipe.source_kind) {
+            .stream => .{ .a = pipe.stream_cursor_ts, .b = pipe.stream_cursor_seq },
+            .ts => .{ .a = pipe.ts_cursor.ns, .b = pipe.ts_cursor.ual },
+        };
     }
 
     /// The latest time a TS source's read reaches, on the shard holding
@@ -1685,7 +1701,10 @@ pub const ProcessingHandler = struct {
     /// in (time, position) order after the cursor. Its points' writes go in
     /// one batch, as many whole points as fit.
     fn processTsPage(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord, points: []const TsPoint) void {
-        const batch = self.beginBatch() orelse return;
+        const batch = self.beginBatch(pipe) orelse return;
+        // Where the batch moves the cursor, when it ends before a record
+        // its operators ran on; else where the read reached.
+        var to: ?sinks_machine.At = null;
         // One point at a time: its JSON and what its chain allocates are
         // freed once its outputs are written.
         var arena = std.heap.ArenaAllocator.init(shard.allocator);
@@ -1710,14 +1729,18 @@ pub const ProcessingHandler = struct {
                 self.writeSinkRecord(batch, pipe, shard, arena.allocator(), json, pt.value, pt.timestamp_ns, pt.tags, 0);
             }
             var pb: [48]u8 = undefined;
-            if (!self.endRecord(batch, shard, std.fmt.bufPrint(&pb, "point {d}/{d}", .{ pt.timestamp_ns, pt.ual }) catch "a point")) break;
+            const before = readAt(pipe);
+            const ended = self.endRecord(batch, pipe, shard, std.fmt.bufPrint(&pb, "point {d}/{d}", .{ pt.timestamp_ns, pt.ual }) catch "a point");
+            if (ended == .cut) break;
+            if (ended == .carried) to = before;
             pipe.ts_cursor = .{ .ns = pt.timestamp_ns, .ual = pt.ual };
             // Event-time watermark = highest source point timestamp seen.
             if (ts_ms > pipe.watermark_ms) pipe.watermark_ms = ts_ms;
             job.records_processed += 1;
             pipe.records_in += 1;
+            if (ended == .carried) break;
         }
-        self.proposeBatch(shard, job.ns_id, pipeline_key, pipe, batch, .{ .a = pipe.ts_cursor.ns, .b = pipe.ts_cursor.ual });
+        self.proposeBatch(shard, job.ns_id, pipeline_key, pipe, batch, to orelse readAt(pipe));
     }
 
     /// Tick a stream source pipeline: read payloads from stream, apply operators, write to sink.
@@ -1735,7 +1758,8 @@ pub const ProcessingHandler = struct {
     /// sent by the shard that owns it: `last_id` is where the read reached.
     /// Its records' writes go in one batch, as many whole records as fit.
     fn processStreamPage(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord, payloads: []const []const u8, ids: []const StreamID, last_id: StreamID) void {
-        const batch = self.beginBatch() orelse return;
+        const batch = self.beginBatch(pipe) orelse return;
+        var to: ?sinks_machine.At = null;
         // One payload's chain at a time: what it allocates is freed once its
         // outputs are written.
         var arena = std.heap.ArenaAllocator.init(shard.allocator);
@@ -1754,14 +1778,21 @@ pub const ProcessingHandler = struct {
                 self.writeSinkRecordFromStream(batch, pipe, shard, arena.allocator(), "", payload, 0);
             }
             var pb: [48]u8 = undefined;
-            if (!self.endRecord(batch, shard, std.fmt.bufPrint(&pb, "record {d}-{d}", .{ id.timestamp_ms, id.sequence }) catch "a record")) {
+            const before = readAt(pipe);
+            const ended = self.endRecord(batch, pipe, shard, std.fmt.bufPrint(&pb, "record {d}-{d}", .{ id.timestamp_ms, id.sequence }) catch "a record");
+            if (ended == .cut) {
                 all = false;
                 break;
             }
+            if (ended == .carried) to = before;
             pipe.stream_cursor_ts = id.timestamp_ms;
             pipe.stream_cursor_seq = id.sequence;
             job.records_processed += 1;
             pipe.records_in += 1;
+            if (ended == .carried) {
+                all = false;
+                break;
+            }
         }
         // Every record taken: the cursor goes where the read reached, past
         // appends that couldn't be read (the stream handler logged them),
@@ -1770,7 +1801,7 @@ pub const ProcessingHandler = struct {
             pipe.stream_cursor_ts = last_id.timestamp_ms;
             pipe.stream_cursor_seq = last_id.sequence;
         }
-        self.proposeBatch(shard, job.ns_id, pipeline_key, pipe, batch, .{ .a = pipe.stream_cursor_ts, .b = pipe.stream_cursor_seq });
+        self.proposeBatch(shard, job.ns_id, pipeline_key, pipe, batch, to orelse readAt(pipe));
     }
 
     /// Most a read of another shard's source waits for its page before it
@@ -1877,10 +1908,11 @@ pub const ProcessingHandler = struct {
         const job = self.jobs.getPtr(base_job_id) orelse return;
         if (job.status != .running or job.held) return;
         if (pipe.batch_term == raft.current_term and pipe.batch_index > raft.last_applied) return;
-        // A batch applied since the read was asked moved the cursor: read
-        // again from there.
+        // A leader change since the read was asked moved the cursor back:
+        // read again from there.
         self.loadCursor(shard, job.ns_id, pipeline_key, pipe);
-        if (pipe.from.a != page.from_a or pipe.from.b != page.from_b) return;
+        const read = readAt(pipe);
+        if (read.a != page.from_a or read.b != page.from_b) return;
         // As a tick checks before it reads. Asked again next tick, from
         // the same cursor.
         pipe.wait = self.waitOf(shard, pipe);
@@ -1921,48 +1953,55 @@ pub const ProcessingHandler = struct {
     /// appends that couldn't be read) logs that move alone.
     const IDLE_BATCH_MS: i64 = 1000;
 
-    /// The sink batch a page builds: its writes as channel messages, and
-    /// the record being added, which goes whole or not at all. Its buffers
-    /// are the handler's, allocated once.
+    /// The sink batch a page builds: its writes as channel messages. Each
+    /// record's writes are built apart first (`r`), then go in whole, wait
+    /// for the next batch, or are skipped whole. Its buffers are the
+    /// handler's, allocated once.
     const Batch = struct {
         w: schema.Writer,
+        /// The record being added: its writes, how many, and their bytes;
+        /// `over` once they pass what one entry carries.
+        r: schema.Writer,
         n: u32 = 0,
         bytes: usize = 0,
-        rec_pos: usize = 0,
         rec_n: u32 = 0,
         rec_bytes: usize = 0,
-        /// A write of the record being added didn't fit.
         over: bool = false,
         /// The batch took no more records: the next one is the next batch's.
         full: bool = false,
 
         fn beginRecord(b: *Batch) void {
-            b.rec_pos = b.w.pos;
-            b.rec_n = b.n;
-            b.rec_bytes = b.bytes;
+            b.r.pos = 0;
+            b.rec_n = 0;
+            b.rec_bytes = 0;
             b.over = false;
         }
 
-        /// Adds one write; past an entry's sends or bytes, or its room,
-        /// marks the record over.
+        /// Adds one of the record's writes.
         fn add(b: *Batch, built: sink_payload.Built) void {
             if (b.over) return;
-            if (b.n + 1 > channels_mod.MAX_SENDS or b.bytes + built.payload.len > channels_mod.MAX_SEND_BYTES) {
+            if (b.rec_n + 1 > channels_mod.MAX_SENDS or b.rec_bytes + built.payload.len > channels_mod.MAX_SEND_BYTES) {
                 b.over = true;
                 return;
             }
-            pe.SinkMessage.encode(&b.w, .{ .slot = built.slot, .entry_type = @backingInt(built.entry_type), .flags = Flags.SINK, .payload = built.payload }) catch {
+            pe.SinkMessage.encode(&b.r, .{ .slot = built.slot, .entry_type = @backingInt(built.entry_type), .flags = Flags.SINK, .payload = built.payload }) catch {
                 b.over = true;
                 return;
             };
-            b.n += 1;
-            b.bytes += built.payload.len;
+            b.rec_n += 1;
+            b.rec_bytes += built.payload.len;
         }
 
-        fn undoRecord(b: *Batch) void {
-            b.w.pos = b.rec_pos;
-            b.n = b.rec_n;
-            b.bytes = b.rec_bytes;
+        /// Whether the record's writes fit beside those in the batch.
+        fn fits(b: *const Batch) bool {
+            return b.n + b.rec_n <= channels_mod.MAX_SENDS and b.bytes + b.rec_bytes <= channels_mod.MAX_SEND_BYTES and b.r.pos <= b.w.buf.len - b.w.pos;
+        }
+
+        fn take(b: *Batch) void {
+            @memcpy(b.w.buf[b.w.pos..][0..b.r.pos], b.r.buf[0..b.r.pos]);
+            b.w.pos += b.r.pos;
+            b.n += b.rec_n;
+            b.bytes += b.rec_bytes;
         }
     };
 
@@ -1971,7 +2010,8 @@ pub const ProcessingHandler = struct {
 
     /// A new batch over the handler's buffers, or null out of memory:
     /// the tick reads nothing, its cursor where it was.
-    fn beginBatch(self: *ProcessingHandler) ?*Batch {
+    fn beginBatch(self: *ProcessingHandler, pipe: *PipelineState) ?*Batch {
+        if (self.rec_buf.len == 0) self.rec_buf = self.allocator.alloc(u8, BATCH_MESSAGES_MAX) catch return null;
         if (self.batch_buf.len == 0) {
             self.batch_buf = self.allocator.alloc(u8, BATCH_MESSAGES_MAX) catch return null;
             self.entry_buf = self.allocator.alloc(u8, limits.MAX_LOG_ENTRY_PAYLOAD) catch {
@@ -1987,37 +2027,80 @@ pub const ProcessingHandler = struct {
                 return null;
             };
         }
-        self.batch = .{ .w = .{ .buf = self.batch_buf } };
+        self.batch = .{ .w = .{ .buf = self.batch_buf }, .r = .{ .buf = self.rec_buf } };
+        // A record cut from the last batch, its operators run: its writes
+        // lead this one. They fit alone.
+        if (pipe.carry_n > 0) {
+            const c = pipe.carry.items;
+            @memcpy(self.batch_buf[0..c.len], c);
+            self.batch.w.pos = c.len;
+            self.batch.n = pipe.carry_n;
+            self.batch.bytes = pipe.carry_bytes;
+            pipe.carry.clearRetainingCapacity();
+            pipe.carry_n = 0;
+            pipe.carry_bytes = 0;
+        }
         return &self.batch;
     }
 
-    /// The record just added: kept if its writes fit; if they don't, and
-    /// others are in the batch, the batch ends before it (false); if they
-    /// don't fit an entry even alone, it is skipped and counted, loudly,
-    /// and the cursor moves past it. `at` names it for that.
-    fn endRecord(self: *ProcessingHandler, batch: *Batch, shard: *Shard, at: []const u8) bool {
-        if (!batch.over) return true;
-        const alone = batch.rec_n == 0;
-        batch.undoRecord();
-        if (!alone) {
-            batch.full = true;
-            return false;
+    /// What became of the record just added.
+    const Ended = enum {
+        /// In the batch.
+        kept,
+        /// Its writes go in the next batch: this one ends before it.
+        carried,
+        /// Not kept, and out of memory to carry it: the batch ends before
+        /// it, and it is read again.
+        cut,
+        /// Its writes don't fit an entry even alone: skipped, counted.
+        skipped,
+    };
+
+    /// The record just added: in the batch if its writes fit beside the
+    /// rest. If they don't, the batch ends before it, and its writes, built
+    /// already, wait in `pipe.carry` to lead the next, so its operators
+    /// don't run on it twice. If they don't fit an entry even alone, it is
+    /// skipped and counted, loudly, and the cursor moves past it. `at`
+    /// names it for that.
+    fn endRecord(self: *ProcessingHandler, batch: *Batch, pipe: *PipelineState, shard: *Shard, at: []const u8) Ended {
+        if (batch.over) return self.skipTooLarge(shard, at);
+        if (batch.fits()) {
+            batch.take();
+            return .kept;
         }
+        batch.full = true;
+        pipe.carry.appendSlice(self.allocator, batch.r.written()) catch return .cut;
+        pipe.carry_n = batch.rec_n;
+        pipe.carry_bytes = batch.rec_bytes;
+        return .carried;
+    }
+
+    fn skipTooLarge(self: *ProcessingHandler, shard: *Shard, at: []const u8) Ended {
         self.too_large += 1;
         if (shard.metrics_registry) |m| m.processing.recordTooLarge();
         self.noteDrop(shard, at, std.fmt.comptimePrint("its writes don't fit one entry (at most {d} writes and {d} bytes a record)", .{ channels_mod.MAX_SENDS, channels_mod.MAX_SEND_BYTES }));
-        return true;
+        return .skipped;
     }
 
     /// Proposes `batch` with the cursor it moves the pipeline to: its
     /// writes and its cursor apply together, once. One with no writes and
     /// the cursor where it was is nothing to log; one with no writes that
-    /// moves it is logged at most once a second.
+    /// moves it is logged at most once a second, and until then the
+    /// pipeline reads on from where it is, ahead of its logged cursor, so
+    /// its operators never run on a record twice in a term. A batch not
+    /// logged (rare: it didn't encode, or the log refused it) is read
+    /// again, its operators run on it again.
     fn proposeBatch(self: *ProcessingHandler, shard: *Shard, ns: NamespaceId, pipeline_key: []const u8, pipe: *PipelineState, batch: *Batch, to: sinks_machine.At) void {
+        const term = shard.raft_node.current_term;
+        const read = readAt(pipe);
         const moved = to.a != pipe.from.a or to.b != pipe.from.b;
         if (batch.n == 0 and !moved) return;
         const now = @import("stdx").time.milliTimestamp();
-        if (batch.n == 0 and now - pipe.last_batch_ms < IDLE_BATCH_MS) return self.rewindTo(pipe, pipe.from);
+        if (batch.n == 0 and now - pipe.last_batch_ms < IDLE_BATCH_MS) {
+            pipe.ahead = true;
+            pipe.ahead_term = term;
+            return;
+        }
         const entry = pe.SinkBatch.encodeInto(self.entry_buf, .{
             .ns = ns.int(),
             .pipeline = pipeline_key,
@@ -2037,12 +2120,19 @@ pub const ProcessingHandler = struct {
         pipe.batch_index = r.index;
         pipe.batch_term = r.term;
         pipe.last_batch_ms = now;
+        // Read past it: the record whose writes wait in `carry`.
+        pipe.ahead = read.a != to.a or read.b != to.b;
+        pipe.ahead_term = r.term;
         if (shard.metrics_registry) |m| m.processing.recordSinkBatch();
     }
 
     /// Back to where the pipeline's last applied batch left it: what it
-    /// read since is read again.
+    /// read since is read again, and its operators run on it again.
     fn rewindTo(_: *ProcessingHandler, pipe: *PipelineState, at: sinks_machine.At) void {
+        pipe.ahead = false;
+        pipe.carry.clearRetainingCapacity();
+        pipe.carry_n = 0;
+        pipe.carry_bytes = 0;
         switch (pipe.source_kind) {
             .stream => {
                 pipe.stream_cursor_ts = at.a;

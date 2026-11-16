@@ -11095,6 +11095,69 @@ test "Shard: a pipeline's writes to another shard's queue that fills park there,
     for (b.channel.sink_refusals) |r| for (std.enums.values(proto.Reason)) |k| try std.testing.expectEqual(@as(u64, 0), r.get(k));
 }
 
+test "Shard: records whose operators emit nothing aren't read again while their cursor waits to be logged" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    for ([_][]const u8{ "r0", "r1", "r2" }) |r| _ = try a.stream_handler.appendPayloadToStream(source, "default", r);
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: quiet
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\operators:
+        \\  - name: none
+        \\    type: filter
+        \\    condition: value_contains:never-in-a-record
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: quiet-out }}
+    , .{source});
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    const pipe = pit.next().?;
+    // The first page logs its cursor; the next, within the second, has
+    // nothing to log and reads on from where it is.
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "r3");
+    two.settle();
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 4), pipe.records_in);
+    try std.testing.expect(pipe.ahead);
+    // Polled again before the second is up: nothing read twice.
+    for (0..3) |_| {
+        tickNow(a, pipe);
+        two.settle();
+    }
+    try std.testing.expectEqual(@as(u64, 4), pipe.records_in);
+    // Past it, the cursor is logged where the read reached.
+    pipe.last_batch_ms = 0;
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "r4");
+    two.settle();
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 5), pipe.records_in);
+    try std.testing.expect(!pipe.ahead);
+    var jobs = a.processing_handler.jobs.iterator();
+    const key = jobs.next().?.key_ptr.*;
+    const at = @import("../processing/sinks_machine.zig").cursorOf(.{ .store = &a.defaultPartition().store }, .default, key);
+    try std.testing.expectEqual(pipe.stream_cursor_seq, at.b);
+    try std.testing.expectEqual(pipe.stream_cursor_ts, at.a);
+}
+
 test "Shard: a batch proposed again in a new term before the first applied lands once" {
     var two: TwoShards = undefined;
     try two.init();
@@ -11368,8 +11431,10 @@ test "Shard: a TS source with more points at one time than a tick has room for g
         tickNow(a, pipe);
         two.settle();
         pumpChannels(&two);
-        if (pipe.records_in == hosts) break;
+        if (streamRecords(a, outs[2], "default") == hosts) break;
     }
+    // Each point read once: one cut from a full batch carries its writes
+    // to the next, its operators not run on it again.
     // 1200 writes: the channel delivers a batch at a time.
     for (0..20) |_| {
         pumpChannels(&two);

@@ -429,12 +429,15 @@ pub const JobDefinition = struct {
     /// writes for a record go in one entry with its cursor, so such a record
     /// could never be written. Each sink writes once per record; a TS sink
     /// with a `fields` map, once per field. A record may match every sink.
+    /// A floor, not a bound: an operator that emits several records for
+    /// one (a flatmap) multiplies it, and a record past it at run time is
+    /// skipped and counted.
     pub fn sinkWritesRefusal(self: *const JobDefinition, buf: []u8) ?[]const u8 {
         const max = @import("../contract/channels.zig").MAX_SENDS;
         var writes: usize = 0;
         for (self.sinks.items) |snk| writes += if (snk.kind == .ts and snk.ts_field_keys.len > 0) snk.ts_field_keys.len / 2 else 1;
         if (writes <= max) return null;
-        return std.fmt.bufPrint(buf, "a record of this job could make {d} sink writes, past the {d} one record may make", .{ writes, max }) catch "a record of this job could make more sink writes than one record may make";
+        return std.fmt.bufPrint(buf, "a record of this job could make at least {d} sink writes, past the {d} one record may make", .{ writes, max }) catch "a record of this job could make more sink writes than one record may make";
     }
 
     /// Free all owned memory.
@@ -591,5 +594,5 @@ test "JobDefinition: a job whose record could make more sink writes than one ent
     try std.testing.expect(fits.sinkWritesRefusal(&why) == null);
     var past = try parser.parseJobDefinition(allocator, try Job.of(&buf, 64), null);
     defer past.deinit(allocator);
-    try std.testing.expectEqualStrings("a record of this job could make 65 sink writes, past the 64 one record may make", past.sinkWritesRefusal(&why).?);
+    try std.testing.expectEqualStrings("a record of this job could make at least 65 sink writes, past the 64 one record may make", past.sinkWritesRefusal(&why).?);
 }
