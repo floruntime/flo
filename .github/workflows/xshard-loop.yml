@@ -1,0 +1,64 @@
+# THROWAWAY — do not merge. Control for the dev-side loop: runs the same
+# cross-shard KV-sink restart test many times on the CI Linux runner, but on
+# 603c9dfa (the commit BEFORE #481) with #493 (5 s grace), the log rotation and
+# the per-key diagnostic cherry-picked on top. If dev fails this loop and this
+# branch stays clean, the regression is #481.
+name: xshard-loop
+
+on:
+  push:
+    branches:
+      - 'loop/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.17.0"
+  # A plain substring matching only the target test. `zig test --test-filter`
+  # applies it at compile time, so the built binary holds only this test;
+  # running the binary directly re-executes it every time (an identical build
+  # run step would otherwise be cached).
+  FILTER: "kv sink routes to the owning shard"
+  ITERATIONS: "50"
+
+jobs:
+  loop:
+    name: xshard sink restart loop (pre-#481)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Placeholder console dist
+        run: mkdir -p src/node/dashboard/dist && : > src/node/dashboard/dist/.keep
+
+      - name: Build and locate the test binary
+        run: |
+          set -euo pipefail
+          zig build
+          zig build test-e2e -Dtest-filter="$FILTER" --verbose 2>&1 | tee verbose.log
+          BIN=$(grep -oE '\.zig-cache/o/[a-f0-9]+/test' verbose.log | tail -1)
+          test -x "$BIN"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+
+      - name: Run the test in a loop
+        run: |
+          set -uo pipefail
+          fails=0
+          for i in $(seq 1 "$ITERATIONS"); do
+            if "./$BIN" > "iter-$i.log" 2>&1; then
+              echo "iter $i: ok"
+            else
+              fails=$((fails + 1))
+              echo "===== ITERATION $i FAILED ====="
+              cat "iter-$i.log"
+              echo "===== end iteration $i ====="
+            fi
+          done
+          echo "---- $fails / $ITERATIONS iterations failed ----"
+          test "$fails" -eq 0
