@@ -418,7 +418,7 @@ test "e2e/group: a removed group op is refused, naming what replaces it" {
     };
 }
 
-test "e2e/group: an ack, nack or touch to a group that isn't there is refused not found, and a nack's error past an option's 255 bytes is kept whole" {
+test "e2e/group: an ack, nack or touch to a group that isn't there is refused not found, and a nack's error past an option's 255 bytes is accepted" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
     try ctx.exec(&.{ "stream", "append", "s", "a" });

@@ -1300,6 +1300,7 @@ test "group machine: a nack after an abandon of the same delivery, or the revers
     var sums = t.sums();
     const nack = try handBack(&t, d, &.{a}, 12 * ms, .{ .ended = .failed, .@"error" = "boom" });
     try testing.expectEqual(@as(u32, 0), nack.applied);
+    try testing.expectEqual(@as(usize, 1), nack.n);
     try testing.expectEqual(Why.released, nack.refused[0].why);
     try testing.expectEqual(@as(u32, 0), t.item("s", "g", a).?.failures);
     try testing.expectEqual(sums, t.sums());
@@ -1309,6 +1310,7 @@ test "group machine: a nack after an abandon of the same delivery, or the revers
     sums = t.sums();
     const late = try abandon(&t, d, &.{b}, 14 * ms);
     try testing.expectEqual(@as(u32, 0), late.applied);
+    try testing.expectEqual(@as(usize, 1), late.n);
     try testing.expectEqual(Why.released, late.refused[0].why);
     try testing.expectEqual(@as(u32, 1), t.item("s", "g", b).?.failures);
     try testing.expectEqual(sums, t.sums());
