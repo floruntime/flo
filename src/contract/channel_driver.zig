@@ -195,6 +195,9 @@ const Peer = struct {
     /// The highest seq proposed or applied from it; null until rebuilt.
     accepted: ?u64 = null,
     recv_gen: struct { term: u64 = 0, counter: u32 = 0 } = .{},
+    /// Its last batch with messages was answered `busy`: until one is
+    /// taken, every answer to it, probes' too, says a target is full.
+    refused_busy: bool = false,
     told_applied: u64 = 0,
     told_durable: u64 = 0,
 };
@@ -499,13 +502,14 @@ pub const Driver = struct {
     }
 
     /// What writes through this group are queued behind, written to `w`,
-    /// and how many: its own state, the target an answer of `busy` is for,
-    /// and each group its outbox to is full, up to `MAX_PRESSURE`.
-    fn pressure(self: *const Driver, status: Status, w: *schema.Writer) u32 {
+    /// and how many: its own state, a full target while `to`'s last batch
+    /// was refused for one, and each group its outbox to is full, up to
+    /// `MAX_PRESSURE`.
+    fn pressure(self: *const Driver, status: Status, to: *const Peer, w: *schema.Writer) u32 {
         var n: u32 = 0;
         const own: ?Cause = if (status == .halted) .halted else self.own_cause;
         if (own) |c| n += @intFromBool(addStall(w, self.group, c));
-        if (status == .busy) n += @intFromBool(addStall(w, self.group, .target_full));
+        if (status == .busy or to.refused_busy) n += @intFromBool(addStall(w, self.group, .target_full));
         for (self.peers, 0..) |*p, c| {
             if (n == MAX_PRESSURE) break;
             if (c == self.group or !p.outbox_full) continue;
@@ -528,7 +532,7 @@ pub const Driver = struct {
     fn answer(self: *Driver, a: u16, p: *Peer, applied: u64, dur: u64, gap: u64, status: Status, io: anytype) void {
         var pb: [Pressure.max_size]u8 = undefined;
         var pw: schema.Writer = .{ .buf = &pb };
-        const n = self.pressure(status, &pw);
+        const n = self.pressure(status, p, &pw);
         var buf: [128]u8 = undefined;
         const f = encodeFrame(&buf, .answer, Answer.Value{
             .gen_term = p.recv_gen.term,
@@ -598,8 +602,10 @@ pub const Driver = struct {
         }
         if (n == 0) {
             self.counts.busy += 1;
+            p.refused_busy = true;
             return self.answer(from, p, applied, dur, 0, .busy, io);
         }
+        p.refused_busy = false;
         const entry = ce.Inbound.encodeInto(self.buf, .{ .from = from, .first_seq = accepted + 1, .messages = .{ .bytes = w.written(), .count = n } }) catch return;
         if (!io.propose(.channel_inbound, entry)) {
             self.counts.busy += 1;
@@ -651,3 +657,21 @@ pub const Driver = struct {
         if (n > 0) p.pressure_ms = now_ms;
     }
 };
+
+test "channel driver: outbox caps are an eighth of the node's memory over its shards, a quarter of that a channel, within their ceilings" {
+    try std.testing.expectEqual(OutboxCaps{ .shard = 256 << 20, .channel = 64 << 20 }, OutboxCaps.of(16 << 30, 8));
+    try std.testing.expectEqual(OutboxCaps{ .shard = 1 << 30, .channel = 128 << 20 }, OutboxCaps.of(256 << 30, 4));
+    try std.testing.expectEqual(OutboxCaps{ .shard = 32 << 20, .channel = 8 << 20 }, OutboxCaps.of(1 << 30, 4));
+}
+
+test "channel driver: the refusal a pressured write gets names the shard it goes to and the one it is queued behind" {
+    var buf: [192]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "overloaded: writes to shard 7 are queued because shard 9 is halted; this request was not run — retry later",
+        pressureRefusal(&buf, 7, .{ .shard = 9, .cause = @backingInt(Cause.halted) }),
+    );
+    try std.testing.expectEqualStrings(
+        "overloaded: writes to shard 2 are queued because shard 2 cannot flush to disk; this request was not run — retry later",
+        pressureRefusal(&buf, 2, .{ .shard = 2, .cause = @backingInt(Cause.cannot_flush) }),
+    );
+}

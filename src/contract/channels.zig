@@ -1372,6 +1372,21 @@ test "channels: a trim drops what was acked; a stale one is a no-op, and one pas
     try testing.expectError(error.Halt, a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 3, .through = 4 })));
 }
 
+test "channels: an outbox counts the payload bytes it holds, from its sends to its trims" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    try a.probeTo(1, "message-one-0001");
+    const one = a.outRecord(1, 1).?.payload.len;
+    try a.probeTo(1, "message-two-0002");
+    try a.probeTo(1, "message-thr-0003");
+    try testing.expectEqual(3 * one, metaOf(a.read(), 1).bytes);
+    var buf: [64]u8 = undefined;
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 1, .through = 2 }));
+    try testing.expectEqual(one, metaOf(a.read(), 1).bytes);
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 3, .through = 3 }));
+    try testing.expectEqual(@as(u64, 0), metaOf(a.read(), 1).bytes);
+}
+
 test "channels: an apply that sends too much is refused, and sends nothing" {
     var a = Group.init(0, 2);
     defer a.deinit();

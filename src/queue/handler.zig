@@ -1191,3 +1191,21 @@ test "queue handler: a dequeue's waiter key keeps what it asked for" {
     try std.testing.expectEqualStrings("c1", back.params.consumer);
     try std.testing.expectEqual(machine.hashOf("q"), back.hash);
 }
+
+test "queues: a sink's enqueue another shard sends takes this node's caps; any other message is left as it came" {
+    const caps: Caps = .{ .max_messages = 7, .max_bytes = 4096, .shard_held_bytes = 1 << 20 };
+    var pb: [256]u8 = undefined;
+    const sent = try qe.Enqueue.encodeInto(&pb, enqueueValue(.{}, .default, "q", 0, 0, "body"));
+    var out: [256]u8 = undefined;
+    const m: ce.Message.Value = .{ .slot = 1, .entry_type = @backingInt(entry_mod.EntryType.queue_enqueue), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .payload = sent };
+    var diag: schema.Diagnostic = .{};
+    const stamped = try qe.Enqueue.decodeAll(stampSinkCaps(&caps, m, &out).?, &diag);
+    try std.testing.expectEqual(@as(u32, 7), stamped.max_messages);
+    try std.testing.expectEqual(@as(u64, 4096), stamped.max_bytes);
+    try std.testing.expectEqualStrings("body", stamped.payload);
+    // Already under these caps, not a sink's, or not an enqueue: as it came.
+    const same = try qe.Enqueue.encodeInto(&pb, enqueueValue(caps, .default, "q", 0, 0, "body"));
+    try std.testing.expect(stampSinkCaps(&caps, .{ .slot = 1, .entry_type = m.entry_type, .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .payload = same }, &out) == null);
+    try std.testing.expect(stampSinkCaps(&caps, .{ .slot = 1, .entry_type = m.entry_type, .layout_epoch = 0, .flags = 0, .payload = sent }, &out) == null);
+    try std.testing.expect(stampSinkCaps(&caps, .{ .slot = 1, .entry_type = @backingInt(entry_mod.EntryType.kv_put), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .payload = sent }, &out) == null);
+}
