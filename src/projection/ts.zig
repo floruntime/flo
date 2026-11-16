@@ -454,9 +454,15 @@ pub const TSProjection = struct {
         tags: []const u8,
 
         fn advance(self: *Cursor, max_ns: u64) error{Malformed}!bool {
+            return self.step(0, max_ns);
+        }
+
+        /// The next point of the series, newest first or oldest, while it
+        /// lies in `[min_ns, max_ns]`.
+        fn step(self: *Cursor, min_ns: u64, max_ns: u64) error{Malformed}!bool {
             const p = (try self.it.next()) orelse return false;
             const at = ts_machine.pointAt(p.key);
-            if (at.ns > max_ns) return false;
+            if (at.ns > max_ns or at.ns < min_ns) return false;
             self.head = .{ .timestamp_ns = at.ns, .field_value = p.value.value, .ual_index = at.ual, .tag_hash = self.tag_hash, .tags = self.tags };
             return true;
         }
@@ -465,6 +471,69 @@ pub const TSProjection = struct {
     fn cursorLess(_: void, a: *Cursor, b: *Cursor) std.math.Order {
         if (a.head.timestamp_ns != b.head.timestamp_ns) return std.math.order(a.head.timestamp_ns, b.head.timestamp_ns);
         return std.math.order(a.head.ual_index, b.head.ual_index);
+    }
+
+    fn cursorMore(_: void, a: *Cursor, b: *Cursor) std.math.Order {
+        return cursorLess({}, b, a);
+    }
+
+    /// Which way a read goes through a field's points.
+    pub const Order = enum(u8) { oldest_first, newest_first };
+
+    /// Every point of the picked series in `[min_ns, max_ns]`, newest
+    /// first and strictly before `before` when given, to `visit` until it
+    /// says stop: `scan`, the other way.
+    fn scanBack(self: *const TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, pick: Pick, before: ?ReadAt, min_ns: u64, max_ns: u64, ctx: anytype, comptime visit: fn (@TypeOf(ctx), StoredPoint) bool) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const rv = self.read();
+        var cursors: std.ArrayListUnmanaged(*Cursor) = .empty;
+        const field_prefix = try ts_machine.fieldPrefix(a, ns_id, measurement, field_name);
+        // No position is maxInt, so (max_ns, maxInt) is past every point at
+        // max_ns.
+        const end: ReadAt = before orelse .{ .ns = max_ns, .ual = std.math.maxInt(u64) };
+        var series_it = rv.range(ts_machine.Series, field_prefix);
+        while (try series_it.next()) |s| {
+            const name = ts_machine.seriesName(s.key);
+            switch (pick) {
+                .exact => |h| if (name.tag_hash != h) continue,
+                .matching => |preds| if (!tagsMatch(s.value.tags, preds)) continue,
+            }
+            const c = try a.create(Cursor);
+            c.* = .{ .it = rv.rangeBefore(ts_machine.Points, s.key, try ts_machine.pointKey(a, s.key, end.ns, end.ual)), .head = undefined, .tag_hash = name.tag_hash, .tags = s.value.tags };
+            if (try c.step(min_ns, max_ns)) try cursors.append(a, c);
+        }
+        var heap: std.PriorityQueue(*Cursor, void, cursorMore) = .empty;
+        try heap.pushSlice(a, cursors.items);
+        while (heap.pop()) |c| {
+            if (!visit(ctx, c.head)) break;
+            if (try c.step(min_ns, max_ns)) try heap.push(a, c);
+        }
+    }
+
+    /// Up to `out.len` points of a measurement field's tag-series whose
+    /// tags satisfy `preds`, in `[min_ns, max_ns]`, in `order`, and past
+    /// `after` in that order when given: one page of a read that goes on
+    /// from its last point. (time, position) orders every point of a field
+    /// across its series, so pages neither repeat nor skip a point that was
+    /// there the whole read.
+    pub fn readPage(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ns: u64, max_ns: u64, order: Order, after: ?ReadAt, out: []StoredPoint) !usize {
+        self.stats.queries += 1;
+        if (out.len == 0) return 0;
+        var f: Fill = .{ .buf = out };
+        const pick: Pick = .{ .matching = preds };
+        switch (order) {
+            .oldest_first => {
+                const from: From = if (after) |at| (if (at.ns < min_ns) .{ .at_ns = min_ns } else .{ .after = at }) else .{ .at_ns = min_ns };
+                try self.scan(ns_id, measurement, field_name, pick, from, max_ns, &f, Fill.take);
+            },
+            .newest_first => {
+                const before: ?ReadAt = if (after) |at| (if (at.ns > max_ns) null else at) else null;
+                try self.scanBack(ns_id, measurement, field_name, pick, before, min_ns, max_ns, &f, Fill.take);
+            },
+        }
+        return f.n;
     }
 
     /// Where a read starts: at a time, or past a point.
@@ -1408,6 +1477,53 @@ test "ts: a delete or retention over thousands of series applies in one linear p
         if (took > 5000) {
             std.debug.print("ts {s} of {d} points took {d} ms\n", .{ how, series * per, took });
             return error.TooSlow;
+        }
+    }
+}
+
+test "ts: a newest-first read is an oldest-first one reversed, and pages of any size walk every point once, either way" {
+    var prng = std.Random.DefaultPrng.init(0x7E57);
+    const rand = prng.random();
+    var ts = TSProjection.init(testing.allocator);
+    defer ts.deinit();
+    const n = 600;
+    var tags: [16]u8 = undefined;
+    // Five hosts over 60 times: many points share a time, across series
+    // and within one.
+    for (0..n) |i| try ts.insert(.of(17), "m", "value", @floatFromInt(i), 1 + rand.uintLessThan(u64, 60), 0, try std.fmt.bufPrint(&tags, "host=h{d}", .{rand.uintLessThan(u8, 5)}));
+    var fwd: [n + 1]StoredPoint = undefined;
+    var back: [n + 1]StoredPoint = undefined;
+    for (0..20) |_| {
+        const lo = rand.uintLessThan(u64, 70);
+        const hi = lo + rand.uintLessThan(u64, 70);
+        const nf = try ts.readPage(.of(17), "m", "value", &.{}, lo, hi, .oldest_first, null, &fwd);
+        const nb = try ts.readPage(.of(17), "m", "value", &.{}, lo, hi, .newest_first, null, &back);
+        try testing.expectEqual(nf, nb);
+        for (fwd[0..nf], 0..) |p, i| {
+            const q = back[nb - 1 - i];
+            try testing.expectEqual(p.timestamp_ns, q.timestamp_ns);
+            try testing.expectEqual(p.ual_index, q.ual_index);
+            try testing.expect(p.timestamp_ns >= lo and p.timestamp_ns <= hi);
+        }
+        // Paged by a random size, each way: the same points in the same
+        // order, each once.
+        inline for (.{ TSProjection.Order.oldest_first, TSProjection.Order.newest_first }) |order| {
+            const whole = if (order == .oldest_first) fwd[0..nf] else back[0..nb];
+            var after: ?TSProjection.ReadAt = null;
+            var got: usize = 0;
+            const size = 1 + rand.uintLessThan(usize, 40);
+            var page: [41]StoredPoint = undefined;
+            while (true) {
+                const k = try ts.readPage(.of(17), "m", "value", &.{}, lo, hi, order, after, page[0..size]);
+                for (page[0..k]) |p| {
+                    try testing.expectEqual(whole[got].timestamp_ns, p.timestamp_ns);
+                    try testing.expectEqual(whole[got].ual_index, p.ual_index);
+                    got += 1;
+                }
+                if (k < size) break;
+                after = .{ .ns = page[k - 1].timestamp_ns, .ual = page[k - 1].ual_index };
+            }
+            try testing.expectEqual(whole.len, got);
         }
     }
 }

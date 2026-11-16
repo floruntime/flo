@@ -261,6 +261,8 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
 }
 
 const NUL_IN_NAME = "bad request: a measurement or field name must not contain NUL";
+/// Reads answer a point's time as i64 nanoseconds.
+const TIME_TOO_LATE = std.fmt.comptimePrint("bad request: a point's time is at most {d} ns", .{std.math.maxInt(i64)});
 
 fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     const a = view.arena;
@@ -273,6 +275,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             if (std.mem.indexOfScalar(u8, w.cmd.key, 0) != null or std.mem.indexOfScalar(u8, w.rec.field_name, 0) != null)
                 return out.refuse(.bad_request, .unclassified, NUL_IN_NAME);
             const ts = w.rec.timestamp_ns;
+            if (ts > std.math.maxInt(i64)) return out.refuse(.bad_request, .unclassified, TIME_TOO_LATE);
             const sk = try seriesKey(a, w.cmd.namespace_id, w.cmd.key, w.rec.field_name, w.tag_hash);
             const existing = try view.get(Series, sk);
             var field: FieldValue = (try view.get(Fields, fieldOf(sk))) orelse .{};
@@ -590,6 +593,25 @@ test "time series: a name holding NUL is refused, and changes nothing" {
     }
     try testing.expectEqual(@as(usize, 1), s.family(Points.ID).count);
     try testing.expectEqual(@as(usize, 1), s.family(Series.ID).count);
+}
+
+test "time series: a point later than an i64 of nanoseconds is refused, and changes nothing" {
+    var log: TestLog = .{};
+    defer log.deinit();
+    try log.write(.of(7), "cpu", "v", 1, std.math.maxInt(i64), "");
+    try log.write(.of(7), "cpu", "v", 2, @as(u64, std.math.maxInt(i64)) + 1, "");
+    try log.write(.of(7), "cpu", "v", 3, 10_000_000_000_000_000_000, "");
+    var s = store_mod.Store.init(testing.allocator);
+    defer s.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    for (log.entries.items, 0..) |*e, i| {
+        var o = Result.start(e);
+        try machine_mod.applyEntry(&machine, &s, &scratch, e, &o);
+        if (i == 0) try testing.expect(o.refused() == null) else try testing.expectEqualStrings(TIME_TOO_LATE, o.refused().?.refusal.message);
+    }
+    try testing.expectEqual(@as(usize, 1), s.family(Points.ID).count);
+    try testing.expectEqual(@as(u64, std.math.maxInt(i64)), (try fieldIn(&s, .of(7), "cpu", "v")).?.newest_ns);
 }
 
 test "time series: two writes at one timestamp in one channel inbound are two points" {

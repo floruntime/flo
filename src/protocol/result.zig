@@ -321,12 +321,6 @@ pub const CommandResult = union(enum) {
         sequence: u64,
     },
 
-    /// Read result with raw data points (pre-serialized)
-    /// Wire format: [count:u32] per point: [timestamp_ms:i64 LE][value:f64 LE]
-    ts_read_result: struct {
-        data: []const u8,
-    },
-
     /// Query result with aggregated buckets (pre-serialized)
     /// Wire format: [series_count:u32] per series:
     ///   [key_len:u32][key][bucket_count:u32] per bucket: [window_start_ms:i64][value:f64]

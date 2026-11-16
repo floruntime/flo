@@ -166,6 +166,13 @@ pub const Store = struct {
         return .{ .node = node, .prefix = prefix };
     }
 
+    /// The family's keys starting with `prefix` and before `before`, last
+    /// first.
+    pub fn rangeBefore(self: *Store, fam: u16, prefix: []const u8, before: []const u8) Range {
+        const node = if (self.lowerBound(fam, before)) |n| n.prev() else self.families[fam].tree.getMax();
+        return .{ .node = node, .prefix = prefix, .back = true };
+    }
+
     /// The first record at or after `key`.
     fn lowerBound(self: *Store, fam: u16, key: []const u8) ?*Tree.Node {
         const entry = self.families[fam].tree.getEntryFor(key);
@@ -230,6 +237,8 @@ pub const Store = struct {
 pub const Range = struct {
     node: ?*Tree.Node,
     prefix: []const u8,
+    /// Last key first (`rangeBefore`).
+    back: bool = false,
 
     pub fn next(self: *Range) ?*Record {
         const node = self.node orelse return null;
@@ -237,7 +246,7 @@ pub const Range = struct {
             self.node = null;
             return null;
         }
-        self.node = node.next();
+        self.node = if (self.back) node.prev() else node.next();
         return Record.of(node);
     }
 };

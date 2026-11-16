@@ -24,6 +24,7 @@ const cli_config = @import("../config.zig");
 const line_protocol = @import("../../ts/line_protocol.zig");
 const gen = @import("../gen.zig");
 const ts_ops = @import("../../protocol/ts_ops.zig");
+const schema = @import("../../protocol/schema.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -73,19 +74,24 @@ pub fn createTsCommand(allocator: Allocator) !*commander.Command {
         .subcommand(
             commander.newBuilder(allocator)
                 .name("read")
-                .about("Read raw time-series data points")
+                .about("Read raw time-series data points, a page at a time")
                 .examples(&.{
                     "flo ts read cpu_usage --from -1h",
+                    "flo ts read cpu_usage --newest --limit 100",
                     "flo ts read temperature --tags sensor=A3,env=prod --from -24h --to -1h",
                     "flo ts read cpu --tags host=web-01 --field user --from -1h",
-                    "flo ts read cpu_usage --tags host=web-01 --from -1h --limit 100",
+                    "flo ts read cpu_usage --from -24h --all",
+                    "flo ts read cpu_usage --from -24h --cursor 00000000000003e80000000000001200",
                 })
                 .arg("measurement", "Measurement name")
                 .stringFlag("tags", 't', "", "Tag filters: key=val,key2=val2")
                 .stringFlag("field", 0, "", "Field name (default: value)")
-                .stringFlag("from", 0, "-1h", "Start time: -Nh, -Nd, -Nm, or epoch ms")
+                .stringFlag("from", 0, "", "Start time: -Nh, -Nd, -Nm, or epoch ms (default: -1h, or none with --newest)")
                 .stringFlag("to", 0, "", "End time (default: now)")
-                .uintFlag("limit", 'l', 4096, "The earliest this many points in range (at most 4096); pass --from for recent ones")
+                .uintFlag("limit", 'l', 4096, "Most points on a page (at most 4096)")
+                .boolFlag("newest", 0, "Newest points first")
+                .stringFlag("cursor", 0, "", "Go on from where a page stopped: the cursor it printed")
+                .boolFlag("all", 0, "Follow the pages to the last")
                 .action(wrapHandler(runRead)),
         )
         .subcommand(
@@ -456,12 +462,27 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
     const format = output.getFormat(ctx);
     const tags = ctx.getString("tags") orelse "";
     const field = ctx.getString("field") orelse "";
-    const from_str = ctx.getString("from") orelse "-1h";
+    const newest = ctx.getBool("newest");
+    const all = ctx.getBool("all");
+    const from_str = ctx.getString("from") orelse "";
     const to_str = ctx.getString("to") orelse "";
-    const limit = ctx.getUint("limit") orelse 4096;
+    const limit = ctx.getUint("limit") orelse ts_ops.MAX_READ;
+    if (limit == 0 or limit > ts_ops.MAX_READ) return outcome.usage(ctx, "--limit {d} must be 1 to {d}", .{ limit, ts_ops.MAX_READ });
+    // A table aligns its rows, so it holds them all until the end.
+    if (all and format == .table) return outcome.usage(ctx, "--all prints every page as it comes: use -o raw or -o json", .{});
 
-    const from_ms = parseTimeArg(from_str) orelse 0;
-    const to_ms = parseTimeArg(to_str) orelse 0;
+    // A newest-first read reaches back as far as it pages; an oldest-first
+    // one starts an hour ago unless told.
+    const from_ms: ?i64 = if (from_str.len > 0) parseTimeArg(from_str) orelse return outcome.usage(ctx, "--from '{s}' isn't a time", .{from_str}) else if (newest) null else parseTimeArg("-1h");
+    // `--to 0` is no bound.
+    const to_given: ?i64 = if (to_str.len > 0) parseTimeArg(to_str) orelse return outcome.usage(ctx, "--to '{s}' isn't a time", .{to_str}) else null;
+    const to_ms: ?i64 = if (to_given) |t| (if (t > 0) t else null) else null;
+    var cursor_buf: [ts_ops.CURSOR_LEN]u8 = undefined;
+    var cursor: []const u8 = "";
+    if (ctx.getString("cursor")) |hex| if (hex.len > 0) {
+        if (hex.len != 2 * ts_ops.CURSOR_LEN) return outcome.usage(ctx, "--cursor must be the {d} hex digits a page printed", .{2 * ts_ops.CURSOR_LEN});
+        cursor = std.fmt.hexToBytes(&cursor_buf, hex) catch return outcome.usage(ctx, "--cursor {s} is not hex", .{hex});
+    };
 
     if (output.isVerbose(ctx)) {
         ctx.printErr("[verbose] READ measurement={s} namespace={s} endpoint={s}\n", .{ measurement, namespace, endpoint });
@@ -469,70 +490,70 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
-
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.ts.read(&client, namespace, measurement, .{
-        .tags = tags,
-        .field = field,
-        .from_ms = from_ms,
-        .to_ms = to_ms,
-        // Past what a u32 holds is past 4096 too: the server refuses it alike.
-        .limit = @intCast(@min(limit, std.math.maxInt(u32))),
-    }) catch |err| return outcome.requestFailed(ctx, err);
-    defer result.deinit();
-
-    // An existing series with no points in range answers ok and empty (0);
-    // not_found means the measurement itself is absent.
-    if (result.isNotFound()) {
-        output.printEmptyList(ctx, "(no data)");
-        return error.NotFound;
+    const ReadOp = ts_ops.op("ts.read");
+    var printed: usize = 0;
+    var table: ?output.Table = if (format == .table) output.Table.init(ctx.allocator) else null;
+    defer if (table) |*t| t.deinit();
+    if (table) |*t| {
+        try t.addColumn("TIMESTAMP", .left);
+        try t.addColumn("VALUE", .right);
     }
-
-    try outcome.check(ctx, result);
-
-    // An empty range still answers with a count of 0.
-    const data = result.asRawData() orelse return outcome.malformed(ctx, "read response (empty)");
-    const points = parsePoints(data) catch return outcome.malformed(ctx, "read response");
-
-    if (points.len() == 0) {
-        output.printEmptyList(ctx, "(no data)");
-        return;
+    var next_buf: [ts_ops.CURSOR_LEN]u8 = undefined;
+    var next: ?[]const u8 = null;
+    var pages: usize = 0;
+    while (true) {
+        var result = client.call(ReadOp, namespace, measurement, .{
+            .field = if (field.len > 0) field else "value",
+            .tags = tags,
+            .from_ns = if (from_ms) |ms| msToNs(ms) else null,
+            .to_ns = if (to_ms) |ms| msToNs(ms) else null,
+            .limit = @intCast(limit),
+            .order = if (newest) .newest_first else .oldest_first,
+            .cursor = cursor,
+        }) catch |err| return outcome.requestFailed(ctx, err);
+        defer result.deinit();
+        try outcome.check(ctx, result);
+        if (format == .json and pages == 0) ctx.print("{{\"points\": [", .{});
+        pages += 1;
+        var diag: schema.Diagnostic = .{};
+        const page = ReadOp.response.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "read response");
+        var it = page.points.iterator();
+        while (it.next() catch return outcome.malformed(ctx, "read response")) |p| {
+            const ms = @divFloor(p.time_ns, std.time.ns_per_ms);
+            switch (format) {
+                .table => {
+                    var ts_buf: [32]u8 = undefined;
+                    var val_buf: [32]u8 = undefined;
+                    table.?.addRow(&.{ std.fmt.bufPrint(&ts_buf, "{d}", .{ms}) catch "", std.fmt.bufPrint(&val_buf, "{d:.4}", .{p.value}) catch "" }) catch return error.OutOfMemory;
+                },
+                .json => ctx.print("{s}\n  {{\"timestamp_ms\": {d}, \"time_ns\": {d}, \"value\": {d:.6}}}", .{ if (printed > 0) "," else "", ms, p.time_ns, p.value }),
+                .raw => ctx.print("{d} {d:.6}\n", .{ ms, p.value }),
+            }
+            printed += 1;
+        }
+        next = null;
+        if (page.cursor) |c| {
+            @memcpy(&next_buf, c[0..ts_ops.CURSOR_LEN]);
+            next = &next_buf;
+        }
+        // A cursor that doesn't move would page forever.
+        if (!all or next == null or std.mem.eql(u8, next.?, cursor)) break;
+        cursor = next.?;
     }
-
+    const hex = if (next) |c| std.fmt.bytesToHex(c[0..ts_ops.CURSOR_LEN].*, .lower) else undefined;
     switch (format) {
-        .table => {
-            var table = output.Table.init(ctx.allocator);
-            defer table.deinit();
-            try table.addColumn("TIMESTAMP", .left);
-            try table.addColumn("VALUE", .right);
-
-            for (0..points.len()) |i| {
-                const p = points.at(i);
-                var ts_buf: [32]u8 = undefined;
-                const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{p.ms}) catch "";
-                var val_buf: [32]u8 = undefined;
-                const val_str = std.fmt.bufPrint(&val_buf, "{d:.4}", .{p.value}) catch "";
-                table.addRow(&.{ ts_str, val_str }) catch return error.OutOfMemory;
-            }
-            table.print(ctx);
-        },
-        .json => {
-            ctx.print("[\n", .{});
-            for (0..points.len()) |i| {
-                const p = points.at(i);
-                if (i > 0) ctx.print(",\n", .{});
-                ctx.print("  {{\"timestamp_ms\": {d}, \"value\": {d:.6}}}", .{ p.ms, p.value });
-            }
-            ctx.print("\n]\n", .{});
-        },
-        .raw => {
-            for (0..points.len()) |i| {
-                const p = points.at(i);
-                ctx.print("{d} {d:.6}\n", .{ p.ms, p.value });
-            }
-        },
+        .table => if (printed == 0) output.printEmptyList(ctx, "(no data)") else table.?.print(ctx),
+        .json => if (next != null) ctx.print("\n], \"cursor\": \"{s}\"}}\n", .{&hex}) else ctx.print("{s}], \"cursor\": null}}\n", .{if (printed > 0) "\n" else ""}),
+        .raw => {},
     }
+    // More follow: say how to go on, apart from the points.
+    if (next != null and format != .json) ctx.printErr("Note: more points follow: --cursor {s}\n", .{&hex});
+}
+
+fn msToNs(ms: i64) i64 {
+    return if (ms <= 0) 0 else std.math.mul(i64, ms, std.time.ns_per_ms) catch std.math.maxInt(i64);
 }
 
 /// A query with no series, in the output format: json keeps the object
@@ -839,12 +860,6 @@ fn readPoints(reader: *WireReader) error{Truncated}!Points {
     return .{ .bytes = reader.readSlice(n) orelse return error.Truncated };
 }
 
-/// A read answer: `[count:u32]([ms:i64][value:f64])*`.
-fn parsePoints(data: []const u8) error{Truncated}!Points {
-    var reader = WireReader.init(data);
-    return readPoints(&reader);
-}
-
 const Series = struct { key: []const u8, field: []const u8, points: Points };
 
 /// `[series_count:u32]` then per series `[key_len:u32][key]`, for floql
@@ -928,17 +943,6 @@ test "parseDuration" {
     try std.testing.expectEqual(@as(i64, 3600000), parseDuration("1h").?);
     try std.testing.expectEqual(@as(i64, 86400000), parseDuration("1d").?);
     try std.testing.expectEqual(@as(i64, 30000), parseDuration("30s").?);
-}
-
-test "ts: a read answer parses, and a cut-short one is Truncated" {
-    const answer = "\x02\x00\x00\x00" ++ "\x05" ++ stdx.repeat("\x00", 7) ++ stdx.repeat("\x00", 6) ++ "\xf0\x3f" ++
-        "\x06" ++ stdx.repeat("\x00", 7) ++ stdx.repeat("\x00", 8);
-    const points = try parsePoints(answer);
-    try std.testing.expectEqual(@as(usize, 2), points.len());
-    try std.testing.expectEqual(@as(i64, 5), points.at(0).ms);
-    try std.testing.expectEqual(@as(f64, 1.0), points.at(0).value);
-    try std.testing.expectEqual(@as(usize, 0), (try parsePoints("\x00\x00\x00\x00")).len());
-    for (0..answer.len) |n| try std.testing.expectError(error.Truncated, parsePoints(answer[0..n]));
 }
 
 test "ts: query and floql answers parse, and cut-short ones are Truncated" {

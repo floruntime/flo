@@ -1,6 +1,6 @@
 //! TimeSeries Handler — registers TS opcodes with Dispatcher and handles time-series operations.
 //!
-//! Read operations (ts_read, ts_query, ts_list) query the TSProjection directly.
+//! Read operations (ts.read, ts_query, ts_list) query the TSProjection directly.
 //! Write operations (ts_write) persist an entry through Raft; the projection
 //! router inserts the point under `Shard.applyCommitted()`.
 //!
@@ -41,9 +41,8 @@ const CommandResult = result_mod.CommandResult;
 const TSProjection = ts_mod.TSProjection;
 
 /// Most points a read, or a FloQL answer, returns.
-pub const MAX_READ_POINTS = 4096;
-pub const TOO_MANY_POINTS = std.fmt.comptimePrint("bad request: more than {d} points match; pass --limit (at most {d}) or narrow the range", .{ MAX_READ_POINTS, MAX_READ_POINTS });
-pub const TOO_MANY_FLOQL_POINTS = std.fmt.comptimePrint("bad request: the answer holds more than {d} points; aggregate them or narrow the query", .{MAX_READ_POINTS});
+pub const MAX_READ_POINTS = ts_ops.MAX_READ;
+pub const TOO_MANY_FLOQL_POINTS = std.fmt.comptimePrint("bad request: the answer holds more than {d} points; aggregate them, narrow the query, or page through them with ts read", .{MAX_READ_POINTS});
 /// Most points a FloQL query reads to run its stages over: it holds them
 /// all at once, 16 bytes each, on the shard thread.
 pub const MAX_FLOQL_POINTS = 1 << 17;
@@ -62,6 +61,8 @@ const table_run = @import("../node/table_run.zig");
 const schema = @import("../protocol/schema.zig");
 const ts_ops = @import("../protocol/ts_ops.zig");
 const InfoResponse = table_run.op("ts.info").response;
+const ReadResponse = table_run.op("ts.read").response;
+pub const ReadOutcome = table_run.Outcome(ReadResponse);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TSHandler
@@ -81,6 +82,9 @@ pub const TSHandler = struct {
     /// request overwrites it, so a refusal from it is sent at once, never
     /// parked.
     why_buf: [512]u8 = undefined,
+    /// A read's page and its cursor, encoded; written before it is sent.
+    read_buf: [ts_ops.MAX_READ * 16]u8 = undefined,
+    cursor_buf: [ts_ops.CURSOR_LEN]u8 = undefined,
     /// An info answer's field names, encoded; written before it is sent.
     info_buf: [ts_ops.MAX_INFO_FIELD_BYTES]u8 = undefined,
     /// How many points a query and a FloQL query may read; lowered only
@@ -101,7 +105,7 @@ pub const TSHandler = struct {
 
     pub fn register(dispatcher: *Dispatcher) void {
         dispatcher.registerWithRoute(.ts_write, dispatchTS, preRouteByMeasurement);
-        dispatcher.registerWithRoute(.ts_read, dispatchTS, preRouteByMeasurement);
+        dispatcher.registerWithRoute(.ts_read, table_run.handler("ts.read", TSHandler, runRead), preRouteByMeasurement);
         dispatcher.registerWithRoute(.ts_query, dispatchTS, preRouteByMeasurement);
         dispatcher.registerWithRoute(.ts_floql, dispatchTS, preRouteByQueryMeasurement);
         dispatcher.registerWalk(.ts_list, dispatchTS, localScanMeasurements);
@@ -144,6 +148,55 @@ pub const TSHandler = struct {
             .oldest_ms = if (has_points) @intCast(sum.oldest_ns / std.time.ns_per_ms) else null,
             .newest_ms = if (has_points) @intCast(sum.newest_ns / std.time.ns_per_ms) else null,
         } };
+    }
+
+    fn runRead(shard: *Shard, _: *Connection, req: Request, field: []const u8, tags: []const u8, from_ns: ?i64, to_ns: ?i64, limit: u32, order: ts_ops.Order, cursor: []const u8) Error!ReadOutcome {
+        return shard.ts_handler.readPage(req.ns_id, req.key, field, tags, from_ns, to_ns, limit, order, cursor);
+    }
+
+    fn badRead(message: []const u8) ReadOutcome {
+        return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .malformed, .ran = .no, .message = message } } };
+    }
+
+    /// One page of a measurement field's points in `[from_ns, to_ns]`, in
+    /// `order`, past `cursor` (the last page's) when it isn't empty. A page
+    /// that stops short of the last matching point answers a cursor to go
+    /// on from; a read never refuses for how many points match.
+    pub fn readPage(self: *TSHandler, ns: router.NamespaceId, measurement: []const u8, field: []const u8, tags: []const u8, from_ns: ?i64, to_ns: ?i64, limit: u32, order: ts_ops.Order, cursor: []const u8) ReadOutcome {
+        if (measurement.len == 0) return badRead("bad request: measurement name is required");
+        var canon_buf: [ts_mod.MAX_TAG_STRING]u8 = undefined;
+        var preds_buf: [ts_mod.MAX_TAGS]ts_mod.TagPredicate = undefined;
+        const filter = switch (ts_mod.parseTagFilter(tags, &canon_buf, &preds_buf)) {
+            .ok => |f| f,
+            .not_pair => |part| return badRead(std.fmt.bufPrint(&self.why_buf, "bad request: tag filter part '{s}' is not key=value", .{part}) catch "bad request: a tag filter part is not key=value"),
+            .too_many => return badRead(std.fmt.comptimePrint("bad request: a tag filter takes at most {d} tags", .{ts_mod.MAX_TAGS})),
+            .too_long => return badRead(std.fmt.comptimePrint("bad request: a tag filter is at most {d} bytes", .{ts_mod.MAX_TAG_STRING})),
+        };
+        const after: ?ts_mod.TSProjection.ReadAt = switch (cursor.len) {
+            0 => null,
+            ts_ops.CURSOR_LEN => .{ .ns = std.mem.readInt(u64, cursor[0..8], .big), .ual = std.mem.readInt(u64, cursor[8..16], .big) },
+            else => return badRead(std.fmt.comptimePrint("bad request: a cursor is the {d} bytes a page answered", .{ts_ops.CURSOR_LEN})),
+        };
+        const min: u64 = if (from_ns) |t| @intCast(t) else 0;
+        // Apply refuses a point past maxInt(i64) ns: the answer's time is i64.
+        const max: u64 = if (to_ns) |t| @intCast(t) else std.math.maxInt(i64);
+        // One past the page, to know whether more follow.
+        const buf = self.allocator.alloc(StoredPoint, limit + 1) catch
+            return .{ .refused = .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "ts read: out of memory" } } };
+        defer self.allocator.free(buf);
+        const n = if (min > max) 0 else self.ts.readPage(ns, measurement, field, filter.preds, min, max, @fromBackingInt(@intCast(@backingInt(order))), after, buf) catch
+            return .{ .refused = .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "ts read failed" } } };
+        const page = buf[0..@min(n, limit)];
+        var w: schema.Writer = .{ .buf = &self.read_buf };
+        for (page) |p| ts_ops.Point.encode(&w, .{ .time_ns = @intCast(p.timestamp_ns), .value = p.field_value }) catch unreachable; // sized for MAX_READ
+        var next: ?[]const u8 = null;
+        if (n > limit) {
+            const last = page[page.len - 1];
+            std.mem.writeInt(u64, self.cursor_buf[0..8], last.timestamp_ns, .big);
+            std.mem.writeInt(u64, self.cursor_buf[8..16], last.ual_index, .big);
+            next = &self.cursor_buf;
+        }
+        return .{ .answer = .{ .points = .{ .bytes = self.read_buf[0..w.pos], .count = @intCast(page.len) }, .cursor = next } };
     }
 
     // ── Pre-Route ───────────────────────────────────────────────────────
@@ -252,7 +305,6 @@ pub const TSHandler = struct {
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         return switch (op) {
             .ts_write => self.handleWrite(req),
-            .ts_read => self.handleRead(req),
             .ts_query => self.handleQuery(req),
             .ts_floql => self.handleFloQL(req),
             .ts_list => self.handleList(req),
@@ -391,51 +443,6 @@ pub const TSHandler = struct {
             n += 1;
         }
         return out[0..n];
-    }
-
-    fn handleRead(self: *TSHandler, req: Request) CommandResult {
-        if (req.key.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "measurement name is required" } };
-        }
-
-        const measurement = req.key;
-
-        const field_name = if (req.findOption(.ts_field)) |opt|
-            opt.asString()
-        else
-            "value";
-
-        const from_ns = if (req.findOption(.ts_from_ms)) |opt| blk: {
-            const ms = opt.asI64() orelse 0;
-            break :blk if (ms > 0) time_units.msToNsSat(@intCast(ms)) else 0;
-        } else 0;
-
-        const to_ns = if (req.findOption(.ts_to_ms)) |opt| blk: {
-            const ms = opt.asI64() orelse 0;
-            break :blk if (ms > 0) time_units.msToNsSat(@intCast(ms)) else std.math.maxInt(u64);
-        } else std.math.maxInt(u64);
-
-        // The earliest `limit` points, at most `MAX_READ_POINTS`; with no
-        // limit, every point, when they fit. A read that would return more
-        // is refused rather than cut short: an answer has no way yet to say
-        // there's more.
-        const limit = req.getLimit() orelse 0;
-        const capped = limit > 0 and limit <= MAX_READ_POINTS;
-        const point_buf = self.allocator.alloc(StoredPoint, if (capped) limit else MAX_READ_POINTS + 1) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "ts read: out of memory" } };
-        };
-        defer self.allocator.free(point_buf);
-        var pred_buf: [32]ts_mod.TagPredicate = undefined;
-        const preds = requestTagPredicates(req, &pred_buf);
-        const result = self.ts.queryRangeFiltered(req.ns_id, measurement, field_name, preds, from_ns, to_ns, point_buf) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "ts read failed" } };
-        };
-        if (result.points_in_buffer > MAX_READ_POINTS) return .{ .err = .{ .code = .invalid_request, .message = TOO_MANY_POINTS } };
-        const data = serializeDataPoints(self.allocator, point_buf[0..result.points_in_buffer]) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "ts read serialization failed" } };
-        };
-
-        return .{ .ts_read_result = .{ .data = data } };
     }
 
     // ── QUERY (aggregation) ─────────────────────────────────────────────
@@ -767,7 +774,6 @@ pub const TSHandler = struct {
 
     pub fn freeResult(self: *TSHandler, cmd_result: CommandResult) void {
         switch (cmd_result) {
-            .ts_read_result => |r| self.allocator.free(r.data),
             .ts_query_result => |r| self.allocator.free(r.data),
             .ts_list_result => |r| self.allocator.free(r.data),
             .ts_floql_result => |r| self.allocator.free(r.data),
@@ -809,9 +815,6 @@ fn sendTSResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
             std.mem.writeInt(u64, buf[16..24], w.sequence, .little);
             shard.sendOkResponse(conn, request_id, &buf);
         },
-        .ts_read_result => |r| {
-            shard.sendOkResponse(conn, request_id, r.data);
-        },
         .ts_query_result => |r| {
             shard.sendOkResponse(conn, request_id, r.data);
         },
@@ -830,31 +833,6 @@ fn sendTSResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
 // ═══════════════════════════════════════════════════════════════════════════════
 // Serialization
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/// Serialize raw data points.
-/// Wire format: [count:u32] per point: [timestamp_ms:i64 LE][value:f64 LE]
-fn serializeDataPoints(allocator: Allocator, points: []const StoredPoint) ![]u8 {
-    const entry_size: usize = 16; // i64 + f64
-    const total = 4 + points.len * entry_size;
-
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-    var offset: usize = 0;
-
-    std.mem.writeInt(u32, buf[offset..][0..4], @intCast(points.len), .little);
-    offset += 4;
-
-    for (points) |pt| {
-        const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
-        std.mem.writeInt(i64, buf[offset..][0..8], ts_ms, .little);
-        offset += 8;
-        const val_bits: u64 = @bitCast(pt.field_value);
-        std.mem.writeInt(u64, buf[offset..][0..8], val_bits, .little);
-        offset += 8;
-    }
-
-    return buf;
-}
 
 /// Default aggregation window when the request does not specify one.
 const DEFAULT_WINDOW_MS: i64 = 60_000;
@@ -1088,80 +1066,124 @@ test "ts handler: write empty measurement" {
     }
 }
 
-test "ts handler: read" {
-    const allocator = testing.allocator;
-    var ts = TSProjection.init(allocator);
-    defer ts.deinit();
+/// A read's page as the handler answers it: its points' times and values,
+/// and its cursor.
+const TestPage = struct {
+    times: [ts_ops.MAX_READ]i64 = undefined,
+    values: [ts_ops.MAX_READ]f64 = undefined,
+    n: u32 = 0,
+    cursor: ?[ts_ops.CURSOR_LEN]u8 = null,
+};
 
-    var handler = TSHandler.init(allocator, &ts);
+const ReadArgs = struct {
+    field: []const u8 = "value",
+    tags: []const u8 = "",
+    from_ns: ?i64 = null,
+    to_ns: ?i64 = null,
+    limit: u32 = ts_ops.MAX_READ,
+    order: ts_ops.Order = .oldest_first,
+    cursor: []const u8 = "",
+};
 
-    // Write some data points
-    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(10.0), ""));
-    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(20.0), ""));
-    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(30.0), ""));
+fn testRead(h: *TSHandler, measurement: []const u8, args: ReadArgs) !TestPage {
+    switch (h.readPage(.default, measurement, args.field, args.tags, args.from_ns, args.to_ns, args.limit, args.order, args.cursor)) {
+        .answer => |v| {
+            var page: TestPage = .{ .n = v.points.count };
+            for (0..v.points.count) |i| {
+                page.times[i] = std.mem.readInt(i64, v.points.bytes[16 * i ..][0..8], .little);
+                page.values[i] = @bitCast(std.mem.readInt(u64, v.points.bytes[16 * i + 8 ..][0..8], .little));
+            }
+            if (v.cursor) |c| page.cursor = c[0..ts_ops.CURSOR_LEN].*;
+            return page;
+        },
+        .refused => return error.Refused,
+        else => return error.TestUnexpectedResult,
+    }
+}
 
-    // Read all
-    const result = handler.handleCommand(makeRequest(.ts_read, "cpu", "", ""));
-    switch (result) {
-        .ts_read_result => |r| {
-            defer handler.freeResult(result);
-            const count_pts = std.mem.readInt(u32, r.data[0..4], .little);
-            try testing.expectEqual(@as(u32, 3), count_pts);
+fn refusalOf(h: *TSHandler, measurement: []const u8, args: ReadArgs) ![]const u8 {
+    switch (h.readPage(.default, measurement, args.field, args.tags, args.from_ns, args.to_ns, args.limit, args.order, args.cursor)) {
+        .refused => |r| {
+            try testing.expectEqual(proto.StatusCode.bad_request, r.status);
+            return r.refusal.message;
         },
         else => return error.TestUnexpectedResult,
     }
 }
 
-test "ts handler: read returns at most limit points" {
+test "ts handler: read" {
     const allocator = testing.allocator;
     var ts = TSProjection.init(allocator);
     defer ts.deinit();
     var handler = TSHandler.init(allocator, &ts);
     for ([_]f64{ 10.0, 20.0, 30.0 }) |v| _ = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(v), ""));
-
-    var opts_buf: [16]u8 = undefined;
-    var builder = OptionsBuilder.init(&opts_buf);
-    try builder.addU32(.limit, 2);
-    const result = handler.handleCommand(makeRequest(.ts_read, "cpu", "", builder.getOptions()));
-    switch (result) {
-        .ts_read_result => |r| {
-            defer handler.freeResult(result);
-            try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, r.data[0..4], .little));
-        },
-        else => return error.TestUnexpectedResult,
-    }
+    const all = try testRead(&handler, "cpu", .{});
+    try testing.expectEqual(@as(u32, 3), all.n);
+    try testing.expect(all.cursor == null);
+    // A limit short of them: a page, and a cursor to go on from.
+    const two = try testRead(&handler, "cpu", .{ .limit = 2 });
+    try testing.expectEqual(@as(u32, 2), two.n);
+    const rest = try testRead(&handler, "cpu", .{ .limit = 2, .cursor = &two.cursor.? });
+    try testing.expectEqual(@as(u32, 1), rest.n);
+    try testing.expectEqual(@as(f64, 30.0), rest.values[0]);
+    try testing.expect(rest.cursor == null);
+    // A measurement with none: an empty page.
+    try testing.expectEqual(@as(u32, 0), (try testRead(&handler, "nonexistent", .{})).n);
 }
 
-test "ts handler: read empty measurement" {
+test "ts handler: a read takes one field, the series a tag filter names, and its time range, ends included" {
     const allocator = testing.allocator;
     var ts = TSProjection.init(allocator);
     defer ts.deinit();
-
     var handler = TSHandler.init(allocator, &ts);
-
-    const result = handler.handleCommand(makeRequest(.ts_read, "", "", ""));
-    switch (result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
-        else => return error.TestUnexpectedResult,
-    }
+    try ts.insert(.default, "cpu", "user", 1, 100, 0, "host=a,dc=x");
+    try ts.insert(.default, "cpu", "user", 2, 200, 0, "host=b,dc=x");
+    try ts.insert(.default, "cpu", "user", 3, 300, 0, "host=a,dc=y");
+    try ts.insert(.default, "cpu", "idle", 9, 200, 0, "host=a,dc=x");
+    try testing.expectEqual(@as(u32, 3), (try testRead(&handler, "cpu", .{ .field = "user" })).n);
+    try testing.expectEqual(@as(u32, 1), (try testRead(&handler, "cpu", .{ .field = "idle" })).n);
+    try testing.expectEqual(@as(u32, 0), (try testRead(&handler, "cpu", .{})).n);
+    const a = try testRead(&handler, "cpu", .{ .field = "user", .tags = "host=a" });
+    try testing.expectEqual(@as(u32, 2), a.n);
+    try testing.expectEqual(@as(u32, 1), (try testRead(&handler, "cpu", .{ .field = "user", .tags = "dc=x,host=b" })).n);
+    const mid = try testRead(&handler, "cpu", .{ .field = "user", .from_ns = 200, .to_ns = 300 });
+    try testing.expectEqual(@as(u32, 2), mid.n);
+    try testing.expectEqual(@as(i64, 200), mid.times[0]);
+    try testing.expectEqual(@as(u32, 0), (try testRead(&handler, "cpu", .{ .field = "user", .from_ns = 301 })).n);
+    try testing.expectEqual(@as(u32, 0), (try testRead(&handler, "cpu", .{ .field = "user", .from_ns = 300, .to_ns = 200 })).n);
 }
 
-test "ts handler: read non-existent series" {
+test "ts handler: a read refuses an empty measurement, a bad tag filter and a cursor it didn't answer" {
     const allocator = testing.allocator;
     var ts = TSProjection.init(allocator);
     defer ts.deinit();
-
     var handler = TSHandler.init(allocator, &ts);
+    try testing.expectEqualStrings("bad request: measurement name is required", try refusalOf(&handler, "", .{}));
+    try testing.expectEqualStrings("bad request: tag filter part 'host' is not key=value", try refusalOf(&handler, "cpu", .{ .tags = "host" }));
+    try testing.expectEqualStrings("bad request: a cursor is the 16 bytes a page answered", try refusalOf(&handler, "cpu", .{ .cursor = "short" }));
+}
 
-    const result = handler.handleCommand(makeRequest(.ts_read, "nonexistent", "", ""));
-    switch (result) {
-        .ts_read_result => |r| {
-            defer handler.freeResult(result);
-            const count_pts = std.mem.readInt(u32, r.data[0..4], .little);
-            try testing.expectEqual(@as(u32, 0), count_pts);
-        },
-        else => return error.TestUnexpectedResult,
+test "ts handler: a read reaches the latest time a point can have, and a cursor past it reads no further" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator);
+    defer ts.deinit();
+    var handler = TSHandler.init(allocator, &ts);
+    const latest: u64 = std.math.maxInt(i64);
+    try ts.insert(.default, "cpu", "value", 1, 100, 0, "");
+    try ts.insert(.default, "cpu", "value", 2, latest, 0, "");
+    try testing.expectError(error.Refused, ts.insert(.default, "cpu", "value", 3, latest + 1, 0, ""));
+    for ([_]ts_ops.Order{ .oldest_first, .newest_first }) |order| {
+        const page = try testRead(&handler, "cpu", .{ .order = order });
+        try testing.expectEqual(@as(u32, 2), page.n);
+        try testing.expectEqual(@as(i64, std.math.maxInt(i64)), page.times[if (order == .oldest_first) 1 else 0]);
     }
+    // A cursor no page answered, past every time: nothing after it, and
+    // everything before it.
+    var past: [ts_ops.CURSOR_LEN]u8 = undefined;
+    std.mem.writeInt(u64, past[0..8], std.math.maxInt(u64), .big);
+    std.mem.writeInt(u64, past[8..16], 0, .big);
+    try testing.expectEqual(@as(u32, 0), (try testRead(&handler, "cpu", .{ .cursor = &past })).n);
+    try testing.expectEqual(@as(u32, 2), (try testRead(&handler, "cpu", .{ .order = .newest_first, .cursor = &past })).n);
 }
 
 test "ts handler: query avg" {
@@ -1446,27 +1468,8 @@ test "ts handler: delete measurement" {
         else => return error.TestUnexpectedResult,
     }
 
-    // cpu should be gone
-    const read_result = handler.handleCommand(makeRequest(.ts_read, "cpu", "", ""));
-    switch (read_result) {
-        .ts_read_result => |r| {
-            defer handler.freeResult(read_result);
-            const count_pts = std.mem.readInt(u32, r.data[0..4], .little);
-            try testing.expectEqual(@as(u32, 0), count_pts);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    // memory should still exist
-    const mem_result = handler.handleCommand(makeRequest(.ts_read, "memory", "", ""));
-    switch (mem_result) {
-        .ts_read_result => |r| {
-            defer handler.freeResult(mem_result);
-            const count_pts = std.mem.readInt(u32, r.data[0..4], .little);
-            try testing.expectEqual(@as(u32, 1), count_pts);
-        },
-        else => return error.TestUnexpectedResult,
-    }
+    try testing.expectEqual(@as(u32, 0), (try testRead(&handler, "cpu", .{})).n);
+    try testing.expectEqual(@as(u32, 1), (try testRead(&handler, "memory", .{})).n);
 }
 
 test "ts handler: delete empty measurement" {
@@ -1524,40 +1527,63 @@ test "ts handler: retention invalid duration" {
     }
 }
 
-test "ts handler: a read past 4096 points is refused rather than cut short; 4096 are served, and a limit takes the earliest" {
+test "ts handler: a read pages through every point, oldest or newest first, each once, across series and points sharing a time" {
     const allocator = testing.allocator;
     var ts = TSProjection.init(allocator);
     defer ts.deinit();
     var handler = TSHandler.init(allocator, &ts);
-    for (0..MAX_READ_POINTS) |i| try ts.insert(.default, "cpu", "value", @floatFromInt(i), 1000 + i, 0, "");
-    const read = struct {
-        fn count(h: *TSHandler, options: []const u8) !?u32 {
-            const result = h.handleCommand(makeRequest(.ts_read, "cpu", "", options));
-            switch (result) {
-                .ts_read_result => |r| {
-                    defer h.freeResult(result);
-                    return std.mem.readInt(u32, r.data[0..4], .little);
-                },
-                .err => |e| {
-                    try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code);
-                    try testing.expectEqualStrings(TOO_MANY_POINTS, e.message);
-                    return null;
-                },
-                else => return error.TestUnexpectedResult,
+    // Three hosts, every point time shared by two of them.
+    const n = MAX_READ_POINTS + 500;
+    for (0..n) |i| {
+        const hosts = [_][]const u8{ "host=a", "host=b", "host=c" };
+        const host = hosts[i % 3];
+        try ts.insert(.default, "cpu", "value", @floatFromInt(i), 1000 + i / 2, 0, host);
+    }
+    // A default page is the most a page holds, and says where to go on.
+    const first = try testRead(&handler, "cpu", .{});
+    try testing.expectEqual(MAX_READ_POINTS, first.n);
+    try testing.expect(first.cursor != null);
+    inline for (.{ ts_ops.Order.oldest_first, ts_ops.Order.newest_first }) |order| {
+        var seen = try allocator.alloc(bool, n);
+        defer allocator.free(seen);
+        @memset(seen, false);
+        var cursor: [ts_ops.CURSOR_LEN]u8 = undefined;
+        var cur: []const u8 = "";
+        var count: usize = 0;
+        var prev: ?i64 = null;
+        while (true) {
+            const page = try testRead(&handler, "cpu", .{ .limit = 777, .order = order, .cursor = cur });
+            for (page.times[0..page.n], page.values[0..page.n]) |t, v| {
+                const i: usize = @intFromFloat(v);
+                try testing.expect(!seen[i]);
+                seen[i] = true;
+                count += 1;
+                if (prev) |p| try testing.expect(if (order == .oldest_first) t >= p else t <= p);
+                prev = t;
             }
+            cursor = page.cursor orelse break;
+            cur = &cursor;
         }
-    };
-    try testing.expectEqual(@as(?u32, MAX_READ_POINTS), try read.count(&handler, ""));
-    try ts.insert(.default, "cpu", "value", 0, 1000 + MAX_READ_POINTS, 0, "");
-    try testing.expectEqual(@as(?u32, null), try read.count(&handler, ""));
-    var opts_buf: [16]u8 = undefined;
-    var builder = OptionsBuilder.init(&opts_buf);
-    try builder.addU32(.limit, 10);
-    try testing.expectEqual(@as(?u32, 10), try read.count(&handler, builder.getOptions()));
-    var big_buf: [16]u8 = undefined;
-    var big = OptionsBuilder.init(&big_buf);
-    try big.addU32(.limit, MAX_READ_POINTS + 1);
-    try testing.expectEqual(@as(?u32, null), try read.count(&handler, big.getOptions()));
+        try testing.expectEqual(n, count);
+    }
+    // Newest first starts at the newest point; a range bounds it both ways.
+    const newest = try testRead(&handler, "cpu", .{ .limit = 1, .order = .newest_first });
+    try testing.expectEqual(@as(i64, 1000 + (n - 1) / 2), newest.times[0]);
+    const window = try testRead(&handler, "cpu", .{ .from_ns = 1100, .to_ns = 1101, .order = .newest_first });
+    try testing.expectEqual(@as(u32, 4), window.n);
+    try testing.expectEqual(@as(i64, 1101), window.times[0]);
+    try testing.expectEqual(@as(i64, 1100), window.times[3]);
+    // Tags select series: a third of them.
+    var tagged: usize = 0;
+    var tcur: [ts_ops.CURSOR_LEN]u8 = undefined;
+    var tc: []const u8 = "";
+    while (true) {
+        const page = try testRead(&handler, "cpu", .{ .tags = "host=b", .cursor = tc });
+        tagged += page.n;
+        tcur = page.cursor orelse break;
+        tc = &tcur;
+    }
+    try testing.expectEqual(@as(usize, n / 3), tagged);
 }
 
 test "ts handler: FloQL aggregates every matching point, and refuses an answer of more raw points than a read returns" {

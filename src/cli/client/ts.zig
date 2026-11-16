@@ -4,7 +4,7 @@
 //! All functions take a *Client and namespace as parameters.
 //!
 //! Wire mapping:
-//!   OpCode: ts_write / ts_read / ts_query / ts_list / ts_delete / ts_retention
+//!   OpCode: ts_write / ts_query / ts_list / ts_delete / ts_retention (ts.read is a table op: `client.call`)
 //!   namespace = req.namespace
 //!   key = measurement name
 //!   value = the payload (for a write, one f64, little-endian)
@@ -44,49 +44,6 @@ pub fn write(
     std.mem.writeInt(u64, &value_buf, @bitCast(value), .little);
     return client.sendRequestWithOptions(.ts_write, namespace, measurement, &value_buf, builder.getOptions());
 }
-
-/// Read raw data points for a measurement
-pub fn read(
-    client: *Client,
-    namespace: []const u8,
-    measurement: []const u8,
-    opts: ReadOptions,
-) !Response {
-    var options_buf: [256]u8 = undefined;
-    var builder = proto.OptionsBuilder.init(&options_buf);
-
-    if (opts.tags.len > 0) {
-        builder.addString(.ts_tags, opts.tags) catch return error.OptionsBufferTooSmall;
-    }
-
-    if (opts.field.len > 0) {
-        builder.addString(.ts_field, opts.field) catch return error.OptionsBufferTooSmall;
-    }
-
-    if (opts.from_ms != 0) {
-        builder.addI64(.ts_from_ms, opts.from_ms) catch return error.OptionsBufferTooSmall;
-    }
-
-    if (opts.to_ms != 0) {
-        builder.addI64(.ts_to_ms, opts.to_ms) catch return error.OptionsBufferTooSmall;
-    }
-
-    if (opts.limit != 0) {
-        builder.addU32(.limit, opts.limit) catch return error.OptionsBufferTooSmall;
-    }
-
-    return client.sendRequestWithOptions(.ts_read, namespace, measurement, "", builder.getOptions());
-}
-
-pub const ReadOptions = struct {
-    tags: []const u8 = "",
-    field: []const u8 = "",
-    from_ms: i64 = 0,
-    to_ms: i64 = 0,
-    /// The earliest this many points in range; 0 asks for every one, which
-    /// the server refuses past the most a read answers.
-    limit: u32 = 0,
-};
 
 /// Query with aggregation
 pub fn query(

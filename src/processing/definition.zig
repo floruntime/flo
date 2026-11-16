@@ -174,8 +174,8 @@ pub const MAX_OPERATORS: usize = 256;
 /// A **stream** source reads every partition of its stream.
 ///
 /// For **ts** sources the spec identifies a measurement + optional tags and
-/// field to read. The handler periodically polls `ts_read` to feed the
-/// pipeline with time-series data points.
+/// field to read. Each tick the handler reads the field's points past its
+/// cursor, in time order, to feed the pipeline.
 pub const SourceSpec = struct {
     /// Source kind: stream (default) or ts
     kind: SourceKind = .stream,
