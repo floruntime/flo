@@ -65,6 +65,34 @@ pub const Trim = Record(&.{
     .{ .name = "through", .T = Int(u64) },
 });
 
+/// A parked message's target: its machine's tag, then the target as that
+/// machine names it (`MACHINE_TARGET_LEN`). Fixed width, so a target's
+/// parked records sort together under it; tagged, so two machines' names
+/// never collide.
+pub const MACHINE_TARGET_LEN = 12;
+pub const TARGET_LEN = 1 + MACHINE_TARGET_LEN;
+
+/// One parked message an unpark applies: as it arrived, with its sender and
+/// seq, which it is parked under.
+pub const Unparked = Record(&.{
+    .{ .name = "from", .T = Int(u16) },
+    .{ .name = "seq", .T = Int(u64) },
+    .{ .name = "entry_type", .T = Int(u8) },
+    .{ .name = "flags", .T = Int(u16) },
+    .{ .name = "payload", .T = Bytes(MAX_MESSAGE_PAYLOAD) },
+});
+
+pub const UnparkedList = schema.BoundedList(Unparked, MAX_BATCH, @intCast(limits.MAX_LOG_ENTRY_PAYLOAD - 32));
+
+/// `channel_unpark`: a target's first parked messages, in their parked
+/// order, which its leader saw room for. Each one names itself, so the
+/// entry declares every key it may touch; apply checks each is still the
+/// target's next from its sender, and applies the longest prefix that fits.
+pub const Unpark = Record(&.{
+    .{ .name = "target", .T = Bytes(TARGET_LEN) },
+    .{ .name = "messages", .T = UnparkedList },
+});
+
 /// The largest probe body.
 pub const MAX_PROBE_BODY = 1024;
 
@@ -79,6 +107,7 @@ pub const table = [_]entries.Entry{
     .{ .name = "channel.inbound", .type_code = 0xA0, .payload = Inbound, .max_payload = limits.MAX_LOG_ENTRY_PAYLOAD, .doc = "Messages from another group, applied in order through their targets' machines." },
     .{ .name = "channel.trim", .type_code = 0xA1, .payload = Trim, .max_payload = Trim.max_size, .doc = "An outbox trimmed through what its receiver durably applied." },
     .{ .name = "channel.probe", .type_code = 0xA2, .payload = Probe, .max_payload = Probe.max_size, .doc = "A test machine's send; no server machine applies it." },
+    .{ .name = "channel.unpark", .type_code = 0xA3, .payload = Unpark, .max_payload = limits.MAX_LOG_ENTRY_PAYLOAD, .doc = "A target's parked messages, applied in order as far as it has room." },
 };
 
 pub fn Payload(comptime code: u8) type {

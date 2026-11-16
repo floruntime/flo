@@ -655,7 +655,7 @@ pub const Workload = struct {
         var diag: schema.Diagnostic = .{};
         // Channel entries are the groups' own, never a workload op.
         switch (entry_type) {
-            @backingInt(EntryType.channel_probe), @backingInt(EntryType.channel_inbound), @backingInt(EntryType.channel_trim) => return null,
+            @backingInt(EntryType.channel_probe), @backingInt(EntryType.channel_inbound), @backingInt(EntryType.channel_trim), @backingInt(EntryType.channel_unpark) => return null,
             else => {},
         }
         if (entry_type == @backingInt(EntryType.kv_put)) {

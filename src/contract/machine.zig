@@ -42,7 +42,25 @@ pub const Machine = struct {
     observes: []const EntryType = &.{},
     observe_keys: ?*const fn (e: *const Entry, out: *view_mod.KeySet) error{OutOfMemory}!void = null,
     observe: ?*const fn (view: *view_mod.View, e: *const Entry) ApplyError!void = null,
+    /// For a target that can be full for a while (a queue at its caps): the
+    /// target an entry writes, so a channel message it refuses `overloaded`
+    /// is parked under it rather than lost, and later messages for it park
+    /// behind (`channels.zig`). Null for an entry of another kind.
+    target: ?*const fn (e: *const Entry) ?[TARGET_LEN]u8 = null,
+    /// Whether the entry's target has room for it now, from state alone, as
+    /// its apply would decide: what a leader checks before unparking.
+    room: ?*const fn (read: view_mod.ReadView, e: *const Entry) bool = null,
+    /// The target's name for an operator, from one entry that writes it
+    /// ("queue orders"), into `buf`.
+    label: ?*const fn (e: *const Entry, buf: []u8) []const u8 = null,
+    /// The namespace id an entry's payload names, for one whose applier
+    /// can't take an id no namespace could have: a channel message naming
+    /// one is refused before its machine sees it (`channels.zig`).
+    namespace: ?*const fn (e: *const Entry) ?u32 = null,
 };
+
+/// A target as its machine names it; channels tag it with the machine.
+pub const TARGET_LEN = @import("../protocol/channel_entries.zig").MACHINE_TARGET_LEN;
 
 /// What's wrong with a list of machines, or null: one owner per entry type,
 /// one family per id and per name.

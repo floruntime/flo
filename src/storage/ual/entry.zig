@@ -153,6 +153,7 @@ pub const EntryType = enum(u8) {
     channel_inbound = 0xA0,
     channel_trim = 0xA1,
     channel_probe = 0xA2,
+    channel_unpark = 0xA3,
 
     /// Returns true if this type carries a key-value command payload. KV
     /// entries don't: their payloads are schemas (`protocol/kv_entries.zig`).
@@ -171,7 +172,7 @@ pub const EntryType = enum(u8) {
             // Cluster-settings entries touch no namespace projection; they are node-level state on shard 0.
             .settings_pool_share, .settings_node_mem, .settings_node_del => false,
             // A message's own target says what it touches, at its apply.
-            .channel_inbound, .channel_trim, .channel_probe => false,
+            .channel_inbound, .channel_trim, .channel_probe, .channel_unpark => false,
             .raft_config, .raft_noop, .raft_snapshot, .repair_skip => false,
         };
     }

@@ -749,6 +749,12 @@ pub const ShardMetrics = struct {
     /// Channel messages refused here as their sender's bug, by reason
     /// (`contract.store.SenderBug`): wrong slot, bad payload.
     channel_sender_bugs: [2]Atomic(u64) = @splat(Atomic(u64).init(0)),
+    /// Channel messages parked here for a full target (gauges), the targets
+    /// they wait on, and how long the longest-waiting target has waited.
+    channel_parked_messages: Atomic(u64) = Atomic(u64).init(0),
+    channel_parked_bytes: Atomic(u64) = Atomic(u64).init(0),
+    channel_parked_targets: Atomic(u64) = Atomic(u64).init(0),
+    channel_parked_oldest_ms: Atomic(u64) = Atomic(u64).init(0),
     /// The last snapshot bar's index, and the logical bytes applied since.
     bar_last: Atomic(u64) = Atomic(u64).init(0),
     bar_bytes: Atomic(u64) = Atomic(u64).init(0),
@@ -955,6 +961,10 @@ pub const ShardMetrics = struct {
         ts_late: [TS_LATE_EDGES.len]u64,
         sink_retry_overflow: u64,
         channel_sender_bugs: [2]u64,
+        channel_parked_messages: u64,
+        channel_parked_bytes: u64,
+        channel_parked_targets: u64,
+        channel_parked_oldest_ms: u64,
         bar_last: u64,
         bar_bytes: u64,
         hardstate_failures: u64,
@@ -1017,6 +1027,10 @@ pub const ShardMetrics = struct {
             },
             .sink_retry_overflow = self.sink_retry_overflow.load(.monotonic),
             .channel_sender_bugs = .{ self.channel_sender_bugs[0].load(.monotonic), self.channel_sender_bugs[1].load(.monotonic) },
+            .channel_parked_messages = self.channel_parked_messages.load(.monotonic),
+            .channel_parked_bytes = self.channel_parked_bytes.load(.monotonic),
+            .channel_parked_targets = self.channel_parked_targets.load(.monotonic),
+            .channel_parked_oldest_ms = self.channel_parked_oldest_ms.load(.monotonic),
             .bar_last = self.bar_last.load(.monotonic),
             .bar_bytes = self.bar_bytes.load(.monotonic),
             .hardstate_failures = self.hardstate_failures.load(.monotonic),
@@ -1858,6 +1872,10 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_sink_retry_overflow_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.sink_retry_overflow });
     try writer.print("flo_shard_channel_sender_bugs_total{{shard_id=\"{d}\",reason=\"wrong_slot\"}} {d}\n", .{ snap.shard_id, snap.channel_sender_bugs[0] });
     try writer.print("flo_shard_channel_sender_bugs_total{{shard_id=\"{d}\",reason=\"bad_payload\"}} {d}\n", .{ snap.shard_id, snap.channel_sender_bugs[1] });
+    try writer.print("flo_shard_channel_parked_messages{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.channel_parked_messages });
+    try writer.print("flo_shard_channel_parked_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.channel_parked_bytes });
+    try writer.print("flo_shard_channel_parked_targets{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.channel_parked_targets });
+    try writer.print("flo_shard_channel_parked_oldest_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.channel_parked_oldest_ms / 1000, snap.channel_parked_oldest_ms % 1000 });
     try writer.print("flo_shard_snapshot_bar_last{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bar_last });
     try writer.print("flo_shard_snapshot_bar_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bar_bytes });
     try writer.print("flo_shard_hardstate_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.hardstate_failures });

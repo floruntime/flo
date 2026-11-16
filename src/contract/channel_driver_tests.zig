@@ -130,6 +130,21 @@ const Sim = struct {
         try self.apply(g, .channel_probe, try ce.Probe.encodeInto(&buf, .{ .slot = slot, .body = &body }));
     }
 
+    fn probeBody(self: *Sim, g: *Group, slot: u16, body: []const u8) !void {
+        var buf: [64]u8 = undefined;
+        try self.apply(g, .channel_probe, try ce.Probe.encodeInto(&buf, .{ .slot = slot, .body = body }));
+    }
+
+    /// The group's next unpark, proposed and applied as its leader would.
+    fn unpark(self: *Sim, g: *Group) !bool {
+        if (!g.driver.buffers()) return false;
+        const next = Probed.nextUnpark(.{ .store = &g.store }, g.driver.buf, g.driver.msgs, null) orelse return false;
+        const owned = try self.allocator.dupe(u8, next.entry);
+        defer self.allocator.free(owned);
+        try self.apply(g, .channel_unpark, owned);
+        return true;
+    }
+
     fn step(self: *Sim) !void {
         self.now += 1;
         // Due frames, in (time, seq) order.
@@ -368,4 +383,53 @@ test "channel driver: an ack past what this group's state says was sent is refus
             else => try testing.expectEqual(@as(u64, 5), g.driver.peers[1].durable_ack),
         }
     }
+}
+
+test "channel driver: past a target's parked cap its messages wait at their sender with those behind them, and go once it drains" {
+    channels.test_parked_target_max = 1;
+    defer channels.test_parked_target_max = null;
+    var sim = try Sim.init(testing.allocator, 2, 31, .{});
+    defer sim.deinit();
+    for (sim.groups) |*g| g.driver.admits = Probed.admits;
+    const a = &sim.groups[0];
+    const b = &sim.groups[1];
+    // b's slot 1 is full, by b's own channel, and one message to it parks.
+    try sim.probeBody(b, 1, "fill-slot1-00001");
+    for (0..40) |_| try sim.step();
+    try sim.probeBody(a, 1, "parked-0000-0001");
+    for (0..40) |_| try sim.step();
+    try testing.expectEqual(@as(u64, 1), channels.targetParked(.{ .store = &b.store }, channelsTarget(1)).count);
+    // Now over its cap: a message to slot 1 waits at a, and so does the one
+    // to slot 3 behind it; the one to slot 3 before it goes.
+    try sim.probeBody(a, 3, "before-0000-0002");
+    try sim.probeBody(a, 1, "capped-0000-0003");
+    try sim.probeBody(a, 3, "behind-0000-0004");
+    // Past a resend or two.
+    for (0..1000) |_| try sim.step();
+    try testing.expect(hasGot(b, "before-0000-0002"));
+    try testing.expect(!hasGot(b, "behind-0000-0004"));
+    try testing.expect(b.driver.counts.busy > 0);
+    try testing.expectEqual(@as(u64, 2), channels.inOf(.{ .store = &b.store }, 0).?.applied);
+    // b drains slot 1 by its own channel; the unpark empties it, and the
+    // rest go, in order.
+    try sim.probeBody(b, 1, "drain-slot1-0002");
+    for (0..40) |_| try sim.step();
+    try testing.expect(try sim.unpark(b));
+    // The sender's backoff grew while it was busy: up to 5 s.
+    for (0..12_000) |_| try sim.step();
+    try testing.expect(hasGot(b, "parked-0000-0001") and hasGot(b, "capped-0000-0003") and hasGot(b, "behind-0000-0004"));
+    try testing.expectEqual(@as(u64, 4), channels.inOf(.{ .store = &b.store }, 0).?.applied);
+}
+
+fn channelsTarget(slot: u16) [ce.TARGET_LEN]u8 {
+    var t: [ce.TARGET_LEN]u8 = @splat(0);
+    t[0] = @backingInt(probe.machine.entry_types[0]);
+    t[1..6].* = "probe".*;
+    std.mem.writeInt(u16, t[6..8], slot, .big);
+    return t;
+}
+
+fn hasGot(g: *Group, name: []const u8) bool {
+    var kb: [1 + probe.NAME_LEN]u8 = undefined;
+    return ((view_mod.ReadView{ .store = &g.store }).get(probe.GotFam, probe.gotKey(&kb, name[0..probe.NAME_LEN])) catch null) != null;
 }
