@@ -90,6 +90,40 @@ test "e2e/queue: multiple enqueue and dequeue" {
 // Priority Ordering
 // =============================================================================
 
+test "e2e/queue: peek shows the next ready messages in dequeue order and takes none of them" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "queue", "enqueue", "pq", "later", "--priority", "5" });
+    try ctx.exec(&.{ "queue", "enqueue", "pq", "sooner", "--priority", "1" });
+
+    var peek = try ctx.cli.run(&.{ "queue", "peek", "pq", "-o", "json" });
+    defer peek.deinit();
+    try testing.expectEqual(@as(u8, 0), peek.exit_code);
+    const sooner = std.mem.indexOf(u8, peek.stdout, "\"payload\":\"sooner\"") orelse return error.TestUnexpectedResult;
+    const later = std.mem.indexOf(u8, peek.stdout, "\"payload\":\"later\"") orelse return error.TestUnexpectedResult;
+    try testing.expect(sooner < later);
+    try testing.expect(peek.stdoutContains("\"deliveries\":0"));
+    try testing.expect(!peek.stdoutContains("\"deliveries\":1"));
+    try testing.expect(peek.stdoutContains("\"more\":false"));
+
+    // A limit stops the page and says more may follow.
+    var one = try ctx.cli.run(&.{ "queue", "peek", "pq", "--limit", "1", "-o", "json" });
+    defer one.deinit();
+    try testing.expect(one.stdoutContains("\"payload\":\"sooner\""));
+    try testing.expect(!one.stdoutContains("\"payload\":\"later\""));
+    try testing.expect(one.stdoutContains("\"more\":true"));
+
+    // Nothing was taken: a dequeue gets the head peek showed, and peek
+    // then shows only the rest.
+    var taken = try ctx.cli.run(&.{ "queue", "dequeue", "pq", "--count", "1" });
+    defer taken.deinit();
+    try testing.expect(taken.stdoutContains("sooner"));
+    var rest = try ctx.cli.run(&.{ "queue", "peek", "pq", "-o", "json" });
+    defer rest.deinit();
+    try testing.expect(!rest.stdoutContains("\"payload\":\"sooner\""));
+    try testing.expect(rest.stdoutContains("\"payload\":\"later\""));
+}
+
 test "e2e/queue: priority ordering (lower value = higher priority)" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
