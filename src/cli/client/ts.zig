@@ -63,16 +63,16 @@ pub fn query(
         builder.addString(.ts_field, opts.field) catch return error.OptionsBufferTooSmall;
     }
 
-    if (opts.from_ms != 0) {
-        builder.addI64(.ts_from_ms, opts.from_ms) catch return error.OptionsBufferTooSmall;
+    if (opts.from_ns != 0) {
+        builder.addI64(.ts_from_ns, opts.from_ns) catch return error.OptionsBufferTooSmall;
     }
 
-    if (opts.to_ms != 0) {
-        builder.addI64(.ts_to_ms, opts.to_ms) catch return error.OptionsBufferTooSmall;
+    if (opts.to_ns != 0) {
+        builder.addI64(.ts_to_ns, opts.to_ns) catch return error.OptionsBufferTooSmall;
     }
 
-    if (opts.window_ms != 60000) {
-        builder.addI64(.ts_window_ms, opts.window_ms) catch return error.OptionsBufferTooSmall;
+    if (opts.window_ns != 0) {
+        builder.addI64(.ts_window_ns, opts.window_ns) catch return error.OptionsBufferTooSmall;
     }
 
     if (!std.mem.eql(u8, opts.aggregation, "avg")) {
@@ -85,9 +85,11 @@ pub fn query(
 pub const QueryOptions = struct {
     tags: []const u8 = "",
     field: []const u8 = "",
-    from_ms: i64 = 0,
-    to_ms: i64 = 0,
-    window_ms: i64 = 60000,
+    /// Times and the window in ns; 0 leaves each to the server (no bound, a
+    /// minute).
+    from_ns: i64 = 0,
+    to_ns: i64 = 0,
+    window_ns: i64 = 0,
     aggregation: []const u8 = "avg",
 };
 

@@ -206,13 +206,14 @@ fn parseDuration(s: []const u8) ?i64 {
     const unit = s[s.len - 1];
     const num = std.fmt.parseInt(i64, num_str, 10) catch return null;
 
-    return switch (unit) {
-        's' => num * 1000,
-        'm' => num * 60 * 1000,
-        'h' => num * 3600 * 1000,
-        'd' => num * 86400 * 1000,
-        else => null,
+    const scale: i64 = switch (unit) {
+        's' => 1000,
+        'm' => 60 * 1000,
+        'h' => 3600 * 1000,
+        'd' => 86400 * 1000,
+        else => return null,
     };
+    return std.math.mul(i64, num, scale) catch null;
 }
 
 // ========================================================================
@@ -590,9 +591,12 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
     const window_str = ctx.getString("window") orelse "1m";
     const agg = ctx.getString("agg") orelse "avg";
 
-    const from_ms = parseTimeArg(from_str) orelse 0;
-    const to_ms = parseTimeArg(to_str) orelse 0;
-    const window_ms = parseDuration(window_str) orelse 60000;
+    // Times are ms here, as --from and --to take them; the server takes ns.
+    const from_ms = if (from_str.len > 0) parseTimeArg(from_str) orelse return outcome.usage(ctx, "--from '{s}' isn't a time", .{from_str}) else 0;
+    const to_ms = if (to_str.len > 0) parseTimeArg(to_str) orelse return outcome.usage(ctx, "--to '{s}' isn't a time", .{to_str}) else 0;
+    const window_ms = parseDuration(window_str) orelse return outcome.usage(ctx, "--window '{s}' isn't a duration (Ns, Nm, Nh or Nd)", .{window_str});
+    // Sent as 0, a window would be read as absent, so a minute.
+    if (window_ms <= 0) return outcome.usage(ctx, "--window must be more than 0", .{});
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -602,9 +606,9 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
     var result = client_mod.ts.query(&client, namespace, measurement, .{
         .tags = tags,
         .field = field,
-        .from_ms = from_ms,
-        .to_ms = to_ms,
-        .window_ms = window_ms,
+        .from_ns = msToNs(from_ms),
+        .to_ns = msToNs(to_ms),
+        .window_ns = msToNs(window_ms),
         .aggregation = agg,
     }) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
@@ -646,7 +650,7 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
                 for (0..sr.points.len()) |b| {
                     const p = sr.points.at(b);
                     var ts_buf: [32]u8 = undefined;
-                    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{p.ms}) catch "";
+                    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{p.ms()}) catch "";
                     var val_buf: [32]u8 = undefined;
                     const val_str = std.fmt.bufPrint(&val_buf, "{d:.4}", .{p.value}) catch "";
                     table.addRow(&.{ ts_str, val_str }) catch return error.OutOfMemory;
@@ -662,7 +666,7 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
                 for (0..sr.points.len()) |b| {
                     const p = sr.points.at(b);
                     if (b > 0) ctx.print(",\n", .{});
-                    ctx.print("      {{\"start_ms\": {d}, \"value\": {d:.6}}}", .{ p.ms, p.value });
+                    ctx.print("      {{\"start_ms\": {d}, \"start_ns\": {d}, \"value\": {d:.6}}}", .{ p.ms(), p.ns, p.value });
                 }
                 ctx.print("\n    ]}}", .{});
             }
@@ -672,7 +676,7 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
             for (series) |sr| {
                 for (0..sr.points.len()) |b| {
                     const p = sr.points.at(b);
-                    ctx.print("{d} {d:.6}\n", .{ p.ms, p.value });
+                    ctx.print("{d} {d:.6}\n", .{ p.ms(), p.value });
                 }
             }
         },
@@ -838,7 +842,7 @@ fn runFloql(ctx: *commander.Context) commander.Error!void {
         ctx.print("--- {s} ({s}) [{d} points] ---\n", .{ sr.key, sr.field, sr.points.len() });
         for (0..sr.points.len()) |i| {
             const p = sr.points.at(i);
-            ctx.print("  {d}: {d:.4}\n", .{ p.ms, p.value });
+            ctx.print("  {d}: {d:.4}\n", .{ p.ms(), p.value });
         }
     }
 }
@@ -847,9 +851,17 @@ fn runFloql(ctx: *commander.Context) commander.Error!void {
 // Response parsing
 // ========================================================================
 
-const Point = struct { ms: i64, value: f64 };
+/// A point or bucket as the server answers it, its time in ns; shown in ms.
+const Point = struct {
+    ns: i64,
+    value: f64,
 
-/// `n` points of `[ms:i64][value:f64]`, read in place.
+    fn ms(p: Point) i64 {
+        return @divFloor(p.ns, std.time.ns_per_ms);
+    }
+};
+
+/// `n` points of `[ns:i64][value:f64]`, read in place.
 const Points = struct {
     bytes: []const u8,
 
@@ -860,7 +872,7 @@ const Points = struct {
     fn at(self: Points, i: usize) Point {
         const p = self.bytes[i * 16 ..][0..16];
         return .{
-            .ms = std.mem.readInt(i64, p[0..8], .little),
+            .ns = std.mem.readInt(i64, p[0..8], .little),
             .value = @bitCast(std.mem.readInt(u64, p[8..16], .little)),
         };
     }
@@ -955,6 +967,8 @@ test "parseDuration" {
     try std.testing.expectEqual(@as(i64, 3600000), parseDuration("1h").?);
     try std.testing.expectEqual(@as(i64, 86400000), parseDuration("1d").?);
     try std.testing.expectEqual(@as(i64, 30000), parseDuration("30s").?);
+    // Too long for an i64 of ms: not a duration, not an overflow.
+    try std.testing.expectEqual(@as(?i64, null), parseDuration("999999999999999d"));
 }
 
 test "ts: query and floql answers parse, and cut-short ones are Truncated" {
@@ -966,7 +980,7 @@ test "ts: query and floql answers parse, and cut-short ones are Truncated" {
     const q = try parseSeriesSet(a, query, .query);
     defer a.free(q);
     try std.testing.expectEqualStrings("cpu", q[0].key);
-    try std.testing.expectEqual(@as(i64, 9), q[0].points.at(0).ms);
+    try std.testing.expectEqual(@as(i64, 9), q[0].points.at(0).ns);
 
     const f = try parseSeriesSet(a, floql, .floql);
     defer a.free(f);

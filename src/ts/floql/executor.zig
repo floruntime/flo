@@ -39,14 +39,15 @@ pub fn execute(
     var current_is_initial = true;
 
     // Track the current window interval for aggregation stages
-    var current_window_ms: i64 = 60000; // Default 1m if no window stage precedes agg
+    // Stages work in ns; a query's durations are ms.
+    var current_window_ns: i64 = std.time.ns_per_min; // Default 1m if no window stage precedes agg
 
     for (pipeline) |stage| {
-        var next = try applyStage(stage, current, current_window_ms, allocator);
+        var next = try applyStage(stage, current, current_window_ns, allocator);
 
         // Update window tracking
         switch (stage) {
-            .window => |w| current_window_ms = w.interval_ms,
+            .window => |w| current_window_ns = try durationNs(w.interval_ms),
             else => {},
         }
 
@@ -62,16 +63,21 @@ pub fn execute(
     return current;
 }
 
+/// A query's duration, ms, in ns: one too long for an i64 of ns is refused.
+fn durationNs(ms: i64) ExecuteError!i64 {
+    return std.math.mul(i64, ms, std.time.ns_per_ms) catch error.InvalidInput;
+}
+
 fn applyStage(
     stage: Stage,
     input: SeriesSet,
-    current_window_ms: i64,
+    current_window_ns: i64,
     allocator: Allocator,
 ) ExecuteError!SeriesSet {
     return switch (stage) {
-        .window => |w| stages.applyWindow(input, w.interval_ms, allocator) catch return error.InvalidInput,
-        .aggregate => |a| stages.applyAggregate(input, a.function, current_window_ms, allocator) catch return error.InvalidInput,
-        .rate => |r| stages.applyRate(input, r.interval_ms, allocator) catch return error.InvalidInput,
+        .window => |w| stages.applyWindow(input, try durationNs(w.interval_ms), allocator) catch return error.InvalidInput,
+        .aggregate => |a| stages.applyAggregate(input, a.function, current_window_ns, allocator) catch return error.InvalidInput,
+        .rate => |r| stages.applyRate(input, try durationNs(r.interval_ms), allocator) catch return error.InvalidInput,
         .delta => stages.applyDelta(input, allocator) catch return error.InvalidInput,
         .where_filter => |w| stages.applyWhere(input, w.predicate, allocator) catch return error.InvalidInput,
         .group_by => |g| stages.applyGroupBy(input, g.tag, allocator) catch return error.InvalidInput,
@@ -81,7 +87,7 @@ fn applyStage(
         .ceil_stage => stages.applyCeil(input, allocator) catch return error.InvalidInput,
         .floor_stage => stages.applyFloor(input, allocator) catch return error.InvalidInput,
         .round_stage => |r| stages.applyRound(input, r.decimals, allocator) catch return error.InvalidInput,
-        .percentile => |p| stages.applyPercentile(input, p.percentile, current_window_ms, allocator) catch return error.InvalidInput,
+        .percentile => |p| stages.applyPercentile(input, p.percentile, current_window_ns, allocator) catch return error.InvalidInput,
         .first => stages.applyFirst(input, allocator) catch return error.InvalidInput,
         .last => stages.applyLast(input, allocator) catch return error.InvalidInput,
 
@@ -119,17 +125,30 @@ fn applyAlias(input: SeriesSet, name: []const u8, allocator: Allocator) ExecuteE
 
 fn makeTestInput(allocator: Allocator) !SeriesSet {
     var points = try allocator.alloc(ss_mod.DataPoint, 6);
-    points[0] = .{ .timestamp_ms = 0, .value = 10.0 };
-    points[1] = .{ .timestamp_ms = 1000, .value = 20.0 };
-    points[2] = .{ .timestamp_ms = 2000, .value = 30.0 };
-    points[3] = .{ .timestamp_ms = 3000, .value = 40.0 };
-    points[4] = .{ .timestamp_ms = 4000, .value = 50.0 };
-    points[5] = .{ .timestamp_ms = 5000, .value = 60.0 };
+    points[0] = .{ .timestamp_ns = 0, .value = 10.0 };
+    points[1] = .{ .timestamp_ns = 1000 * std.time.ns_per_ms, .value = 20.0 };
+    points[2] = .{ .timestamp_ns = 2000 * std.time.ns_per_ms, .value = 30.0 };
+    points[3] = .{ .timestamp_ns = 3000 * std.time.ns_per_ms, .value = 40.0 };
+    points[4] = .{ .timestamp_ns = 4000 * std.time.ns_per_ms, .value = 50.0 };
+    points[5] = .{ .timestamp_ns = 5000 * std.time.ns_per_ms, .value = 60.0 };
 
     var series = try allocator.alloc(ss_mod.Series, 1);
     series[0] = .{ .key = "cpu,host=web-01", .field = "value", .points = points };
 
     return SeriesSet.fromOwned(allocator, series);
+}
+
+test "executor: a window or rate too long for an i64 of nanoseconds is refused, not overflowed" {
+    const allocator = std.testing.allocator;
+    // 106752 days is past what an i64 of ns holds; it still parses as ms.
+    const days: i64 = 106752;
+    const too_long = (@import("ast.zig").parseDuration("106752d")).?;
+    try std.testing.expectEqual(days * 86_400_000, too_long);
+    for ([_]Stage{ .{ .window = .{ .interval_ms = too_long } }, .{ .rate = .{ .interval_ms = too_long } } }) |stage| {
+        var input = try makeTestInput(allocator);
+        defer input.deinit();
+        try std.testing.expectError(error.InvalidInput, execute(&.{stage}, input, allocator));
+    }
 }
 
 test "executor_window_avg_pipeline" {
