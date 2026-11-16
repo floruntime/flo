@@ -393,8 +393,6 @@ const SimNode = struct {
     /// set each tick.
     wall_offset_ms: i64 = 0,
     wall_ns: u64 = 0,
-    /// The stamp of the last entry it applied, for `stamp_order`.
-    applied_stamp: u64 = 0,
     /// The last config this node applied, for `config_safety`.
     applied_config: membership.Config = .{},
     /// The entry it halted at, 0 for none: it applies nothing from it on.
@@ -1344,16 +1342,20 @@ pub const Simulator = struct {
     }
 
     /// The simulator's `replay.ReplayApply`: it drives the real boot-replay
-    /// decisions (restore, watermark gate, skip pass-over, stamp halt) over the
-    /// durable log and applies each prefix entry through the sim's own checker
-    /// and family model, so the checker's view is built the same whether an
-    /// entry arrives by replay or live. The sim models repairs through
-    /// `self.halt`, not a `repair.Skips` set, so a node that comes up at the
-    /// entry the group halted at stops replay there, as production's crash
-    /// marker does.
+    /// decisions (restore, watermark gate, stamp halt) over the durable log and
+    /// applies each prefix entry through the sim's own checker and family model,
+    /// so the checker's view is built the same whether an entry arrives by
+    /// replay or live. The sim models repairs through `self.halt`, not a
+    /// `repair.Skips` set — it passes an empty set, so the pass-over never runs
+    /// — and a node that comes up at the entry the group halted at stops replay
+    /// there, as production's crash marker does.
     const SimReplay = struct {
         sim: *Simulator,
         node: *SimNode,
+        /// Set when apply() itself returns a halt (the node came up halted, or a
+        /// halt_op injection), to tell that apart from replayOneEntry's own
+        /// stamp-regression halt, which is a bug the checker must see.
+        apply_halt: bool = false,
 
         fn applier(self: *SimReplay) replay.ReplayApply {
             return .{ .ctx = self, .apply = apply, .pass_over = passOver };
@@ -1369,14 +1371,20 @@ pub const Simulator = struct {
             if (sim.halt) |h| {
                 if (h.index == idx and h.term == entry.header.term and
                     std.hash.Wyhash.hash(HASH_SEED, entry.payload) == h.hash)
+                {
+                    self.apply_halt = true;
                     return .{ .halt = "halted here before the restart" };
+                }
             }
             const is_op = entry.header.entry_type != @backingInt(entry_mod.EntryType.raft_noop) and
                 entry.header.entry_type != @backingInt(entry_mod.EntryType.raft_config) and
                 entry.header.entry_type != @backingInt(entry_mod.EntryType.repair_skip);
             if (is_op and sim.scenario.halt_op != 0 and
                 sim.workload.opIdAt(entry.header.term, idx, entry.header.entry_type, entry.payload) == sim.scenario.halt_op - 1)
+            {
+                self.apply_halt = true;
                 return .{ .halt = "halt_op injection" };
+            }
             sim.applyEntryModel(node, entry, idx, is_op);
             return .applied;
         }
@@ -1400,7 +1408,6 @@ pub const Simulator = struct {
             self.raftConfig(),
         );
         attachHost(node);
-        node.applied_stamp = 0;
         // Its apply starts again from the log, and halts where it did.
         node.halted_at = 0;
         for (self.nodes, 0..) |_, j| {
@@ -1431,8 +1438,9 @@ pub const Simulator = struct {
         // Replay the durable log before attaching the hook, exactly as
         // production wires persistence after segment replay — a hook active
         // during replay would re-feed the disk. Drive the real boot-replay
-        // decisions (restore, watermark gate, skip pass-over, stamp halt)
-        // through replayOneEntry; the sim's model is the applier below the mark.
+        // decisions (restore, watermark gate, stamp halt) through replayOneEntry;
+        // the sim's model is the applier below the mark. The skip set is empty
+        // (the sim models repairs via self.halt), so the pass-over never runs.
         var sim_replay: SimReplay = .{ .sim = self, .node = node };
         const empty_skips: repair.Skips = .{};
         const ctx: replay.ReplayCtx = .{
@@ -1454,7 +1462,9 @@ pub const Simulator = struct {
             );
             entry.header.crc32c = entry.computeCrc();
             replay.replayOneEntry(ctx, &entry, &out);
-            if (out.damage != null) break;
+            // Damage is a restore failure over a hole; the sim writes its durable
+            // log in index order, so it never leaves one — a gap is a sim bug.
+            if (out.damage != null) @panic("sim boot replay hit a durable-log gap");
             // The configs the log holds set the membership for routing, as
             // production's boot reads the latest config from the restored log.
             if (e.entry_type == @backingInt(entry_mod.EntryType.raft_config)) {
@@ -1466,13 +1476,24 @@ pub const Simulator = struct {
             }
         }
         // Replay left the applied stamp and index here; live apply continues
-        // from them, as production's boot feeds replay's last stamp to
-        // noteApplied (shard.zig:1166). A boot that halted comes up halted
-        // there, having applied only what precedes it.
+        // from them, as production's boot feeds replay's last stamp through
+        // noteApplied. A boot that halted comes up halted there, having applied
+        // only what precedes it.
         node.raft.last_applied = out.applied_through;
-        node.applied_stamp = out.last_stamp;
         node.raft.noteApplied(out.last_stamp);
-        if (out.halt) |h| if (node.raft.log.getEntryCopy(h.index, self.apply_buf)) |he| self.haltNode(node, &he);
+        if (out.halt) |h| {
+            if (node.raft.log.getEntryCopy(h.index, self.apply_buf)) |he| self.haltNode(node, &he);
+            // replayOneEntry's own stamp-regression halt is a Flo bug the oracle
+            // must see; a halt the applier returned (came up halted, or a
+            // halt_op) is a modelled outcome, not a bug.
+            if (!sim_replay.apply_halt) self.checker.fail(.{
+                .invariant = .stamp_order,
+                .node = node.id,
+                .index = h.index,
+                .tick = self.now,
+                .detail = "boot replay found an entry stamped no later than the one before it",
+            });
+        }
         // What the sink persisted is what comes back — nothing in volatile
         // mode, so such a node restarts at term 0.
         // The log is evidence of the term too, as in production's boot.
@@ -2223,8 +2244,8 @@ pub const Simulator = struct {
     /// the committed config, and the families' state. Shared by live apply
     /// and the restart-prefix replay (through `replayOneEntry`) so an entry
     /// reaches the checker the same way whichever path applied it. The stamp
-    /// bookkeeping (applied_stamp, noteApplied, last_applied) stays with each
-    /// caller, since live and replay carry the stamp differently.
+    /// bookkeeping (noteApplied) and last_applied stay with each caller, since
+    /// live and replay carry the stamp differently.
     fn applyEntryModel(self: *Simulator, node: *SimNode, e: *const entry_mod.Entry, idx: u64, is_op: bool) void {
         while (node.applied_ticks.items.len < idx) node.applied_ticks.append(self.allocator, 0) catch @panic("sim OOM");
         node.applied_ticks.items[idx - 1] = self.now;
@@ -2263,6 +2284,12 @@ pub const Simulator = struct {
     /// node told so first, as the shard does before every apply — a
     /// leader's own copy counts toward commit only once on disk.
     fn applyCommitted(self: *Simulator, node: *SimNode) void {
+        // A diverged node's log contradicts history it already applied (an async
+        // rewind took the leader's past its committed tail); it applies nothing
+        // more, as production's applyThrough returns on self.replica.diverged.
+        // Re-applying over the cut is what would stamp an entry before the one
+        // this node lost.
+        if (node.replica.diverged) return;
         if (self.scenario.durability == .sync) {
             node.disk.flush();
             node.raft.markDurable(node.raft.log.lastIndex());
@@ -2292,21 +2319,24 @@ pub const Simulator = struct {
                     self.haltNode(node, &e);
                     break;
                 }
-                // The same rule production halts a live apply on (shard.zig:5657,
-                // applyThrough): a committed entry's stamp never falls at or
-                // before the last applied one's, a skip excepted. Production
-                // halts as a defence against a Flo bug; the sim's job is to find
-                // it, so it fails the checker on the condition instead.
-                if (node.applied_stamp != 0 and e.header.timestamp_ns <= node.applied_stamp and !replay.isSkip(&e)) self.checker.fail(.{
-                    .invariant = .stamp_order,
-                    .node = node.id,
-                    .index = idx,
-                    .tick = self.now,
-                    .detail = "committed entry stamped no later than the one before it",
-                });
-                node.applied_stamp = e.header.timestamp_ns;
+                // The same rule production halts a live apply on (applyThrough):
+                // a committed entry's stamp never falls at or before the last
+                // applied one's, a skip excepted. Production halts as a defence
+                // against a Flo bug; the sim's job is to find it, so it fails the
+                // checker on the condition instead. A passed-over entry neither
+                // checks nor moves the stamp, as applyThrough's skip path
+                // continues past it.
+                if (!passed_over) {
+                    if (node.raft.applied_stamp != 0 and e.header.timestamp_ns <= node.raft.applied_stamp and !replay.isSkip(&e)) self.checker.fail(.{
+                        .invariant = .stamp_order,
+                        .node = node.id,
+                        .index = idx,
+                        .tick = self.now,
+                        .detail = "committed entry stamped no later than the one before it",
+                    });
+                    node.raft.noteApplied(e.header.timestamp_ns);
+                }
                 self.applyEntryModel(node, &e, idx, is_op);
-                node.raft.noteApplied(e.header.timestamp_ns);
                 node.raft.last_applied = idx;
             }
         }

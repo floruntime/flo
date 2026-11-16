@@ -8731,9 +8731,6 @@ fn listDurable(dl: *DurableLog) ![]const durable_log_mod.SegmentFile {
     return dl.segments();
 }
 
-/// Feed a durable entry back into the Raft log at boot: the last index, the
-/// term index and the hot-ring tail all come from this pass. A hole is
-/// damage: an entry this node committed is gone.
 // ═══════════════════════════════════════════════════════════════════════════════
 // Segment Replay — recover state from .flseg files on startup
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -8833,6 +8830,12 @@ const PartitionReplay = struct {
     }
 };
 
+/// Replay the durable segments into the Raft log, and below the watermark into
+/// the projections, driving each entry through `replay.replayOneEntry` on a
+/// `PartitionReplay` applier. Entries above the watermark are restored but not
+/// applied. Replay stops at the first damage — what follows it would apply over
+/// a hole — and the outcome (applied-through, last stamp, any halt) goes back to
+/// the boot caller.
 fn replaySegments(
     allocator: std.mem.Allocator,
     files: []const durable_log_mod.SegmentFile,
