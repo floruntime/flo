@@ -362,6 +362,9 @@ pub const CommandResult = union(enum) {
                 .reason = switch (e.code) {
                     .committed_not_applied => .committed_not_applied,
                     .too_many_actions => .too_many_actions,
+                    // What a client tells apart from a refusal to look:
+                    // the thing named isn't there.
+                    .not_found => .not_found,
                     else => .unclassified,
                 },
                 .ran = if (e.code == .committed_not_applied) .yes else e.ran orelse flo_proto.ranOf(status),
@@ -542,7 +545,9 @@ test "result: an error's refusal says whether it ran: committed is yes, the site
     try std.testing.expectEqual(flo_proto.Ran.no, (E{ .code = .internal_error, .message = "m", .ran = .no }).refusal().ran);
     try std.testing.expectEqual(flo_proto.Ran.unknown, (E{ .code = .internal_error, .message = "m" }).refusal().ran);
     try std.testing.expectEqual(flo_proto.Ran.no, (E{ .code = .invalid_request, .message = "m" }).refusal().ran);
-    try std.testing.expectEqual(flo_proto.Reason.unclassified, (E{ .code = .not_found, .message = "m" }).refusal().reason);
+    // Not found names its reason, which a client tells apart from a refusal by.
+    try std.testing.expectEqual(flo_proto.Reason.not_found, (E{ .code = .not_found, .message = "m" }).refusal().reason);
+    try std.testing.expectEqual(flo_proto.Reason.unclassified, (E{ .code = .invalid_request, .message = "m" }).refusal().reason);
 }
 
 test "a node at its action limit refuses with the limit status, saying which, and never ran" {

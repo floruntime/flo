@@ -2041,10 +2041,14 @@ pub const Shard = struct {
             // A node forwards only writes to its leader.
             .peer => if (!self.dispatcher.serves(req.header.op_code))
                 answerUnknownOp(@ptrCast(self), @ptrCast(conn), req.header.request_id, req.header.op_code)
-            else if (requestToLeader(req) or req.header.op_code == @backingInt(proto.OpCode.namespace_published))
+            else if (missForwarded(req.header.op_code) and self.leaderApplying())
+                // A read a follower found nothing for: a leader still
+                // applying earlier terms can't say there's none either.
+                self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = LEADER_NOT_READY_REFUSAL })
+            else if (requestToLeader(req) or req.header.op_code == @backingInt(proto.OpCode.namespace_published) or missForwarded(req.header.op_code))
                 self.dispatchLocal(conn, req, auth)
             else
-                self.sendRefusal(conn, req.header.request_id, .bad_request, proto.notRun("bad request: only writes, reads the leader answers, and a follower's ask about the namespaces, are forwarded to a leader")),
+                self.sendRefusal(conn, req.header.request_id, .bad_request, proto.notRun("bad request: only writes, reads the leader answers, a follower's ask about the namespaces, and a read a follower found nothing for, are forwarded to a leader")),
         }
     }
 
@@ -3750,6 +3754,44 @@ pub const Shard = struct {
     /// Send a client's write to the leader, and
     /// hold the client until the leader answers. With no leader known the
     /// write waits for one, up to FORWARD_TIMEOUT_MS.
+    /// A read whose stream or series isn't here, on a follower: it may be
+    /// one the leader has and this node hasn't applied yet, so the leader
+    /// answers it, and not found is only ever the leader's. One hop only,
+    /// and never into the slots kept for writes; false when not sent, and
+    /// the caller answers what it found, marked stale.
+    pub fn missToLeader(self: *Shard, conn: *Connection, req: proto.Request) bool {
+        if (self.raft_network == null or self.raft_node.role == .leader or self.raft_node.leader_id == 0) return false;
+        if (conn.replyTo() == .remote) return false;
+        if (self.forward_count >= FORWARD_SLOTS - FORWARD_WRITE_RESERVE) return false;
+        self.forwardToLeader(conn, req);
+        self.noteReadMiss(req.header.op_code, .leader);
+        return true;
+    }
+
+    /// A read missToLeader didn't send: on a follower, answered from its
+    /// state, which may be behind; true when it should be marked stale.
+    pub fn staleMiss(self: *Shard, op: u16) bool {
+        if (!self.followsLeader()) return false;
+        self.noteReadMiss(op, .stale);
+        return true;
+    }
+
+    fn noteReadMiss(self: *Shard, op: u16, how: ShardMetrics.ReadMiss) void {
+        const m = self.shard_metrics orelse return;
+        m.recordReadMiss(if (op == @backingInt(proto.OpCode.ts_read)) .ts_read else .stream_read, how);
+    }
+
+    /// The reads a follower sends its leader when it finds nothing.
+    fn missForwarded(op: u16) bool {
+        return op == @backingInt(proto.OpCode.stream_read) or op == @backingInt(proto.OpCode.ts_read);
+    }
+
+    /// Whether this node answers from a replica's state: a follower in a
+    /// cluster, which may be behind its leader.
+    pub fn followsLeader(self: *const Shard) bool {
+        return self.raft_network != null and self.raft_node.role != .leader;
+    }
+
     fn forwardToLeader(self: *Shard, conn: *Connection, req: proto.Request) void {
         const wait_ms = blockingWait(req) orelse 0;
         if (wait_ms > 0 and self.blocking_forwards >= FORWARD_SLOTS - FORWARD_WRITE_RESERVE) {
@@ -7979,8 +8021,10 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
             return true;
         },
     };
-    // A read held only for its disk payloads is answered as a fresh read
-    // would be now, records or none: its stream may be trimmed or deleted.
+    // A read held only for its disk payloads is answered from its window as
+    // it reads now, records or none: a stream trimmed meanwhile answers what
+    // is left, and one deleted meanwhile answers empty, not not_found (the
+    // name check was made when the read arrived).
     if (records.len == 0 and waiter.kind == .stream_disk_read) {
         switch (result) {
             .stream_messages => |m| shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, m.data),
@@ -15591,7 +15635,7 @@ test "Shard: a node forwards only writes to its leader; a forwarded read is refu
     const reply = rn.outbound.items[0].frame[transport.HEADER_SIZE..];
     const resp = try proto.Response.parse(reply[12..]);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
-    try std.testing.expectEqualStrings("bad request: only writes, reads the leader answers, and a follower's ask about the namespaces, are forwarded to a leader", (try resp.refused()).message);
+    try std.testing.expectEqualStrings("bad request: only writes, reads the leader answers, a follower's ask about the namespaces, and a read a follower found nothing for, are forwarded to a leader", (try resp.refused()).message);
     try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
 }
 
@@ -24418,6 +24462,68 @@ test "Shard: a skip seals its segment as it applies, under a watermark at or pas
     defer shard.deinit();
     // Taken at boot: replay passed over the entry rather than halting at it.
     try std.testing.expect(shard.halted == null);
+}
+
+test "Shard: a follower sends its leader a read it found no stream or series for, and answers stale past the forwards it may hold" {
+    var t: AdminTest = undefined;
+    try t.init(3, .join);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    raft.role = .follower;
+    raft.leader_id = 1;
+    var body: [64]u8 = undefined;
+    const read_ts = table_run.op("ts.read").request.encodeInto(&body, .{ .field = "value", .tags = "", .from_ns = null, .to_ns = null, .limit = 10, .order = .oldest_first, .cursor = "" }) catch unreachable;
+    // Not here: it may be the leader's, not yet applied here.
+    const held = t.shard.forward_count;
+    t.shard.runRequest(t.conn, try ParkTest.request(.stream_read, 1, "", "nosuch", "", ""), .client);
+    try std.testing.expectEqual(held + 1, t.shard.forward_count);
+    try std.testing.expect(t.conn.response_deferred);
+    t.conn.response_deferred = false;
+    t.shard.runRequest(t.conn, .{ .header = proto.RequestHeader.init(.ts_read, 2), .namespace = "", .key = "nosuch", .value = read_ts }, .client);
+    try std.testing.expectEqual(held + 2, t.shard.forward_count);
+
+    // Past the forwards a follower may hold for reads: answered here, as
+    // not found from a replica's state, marked stale.
+    t.shard.forward_count = FORWARD_SLOTS - FORWARD_WRITE_RESERVE;
+    defer t.shard.forward_count = held + 2;
+    var buf: [256]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    t.conn.response_deferred = false;
+    t.shard.runRequest(t.conn, try ParkTest.request(.stream_read, 3, "", "nosuch", "", ""), .client);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), one[0].header.status);
+    try std.testing.expect(one[0].header.flags & proto.RESPONSE_STALE != 0);
+    try std.testing.expectEqual(proto.Reason.not_found, (try one[0].refused()).reason);
+}
+
+test "Shard: a leader still applying earlier terms refuses a read a follower sent it for want of a stream, rather than say there's none" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    try std.testing.expect(raft.leaderReady());
+    // Leading, its term's first entry not yet applied.
+    raft.ready_index = raft.last_applied + 1;
+    defer raft.ready_index = raft.last_applied;
+    var buf: [256]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    t.shard.runRequest(t.conn, try ParkTest.request(.stream_read, 1, "", "nosuch", "", ""), .peer);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try one[0].refused()).ran);
+}
+
+test "Shard: a leader answers a read a follower sent it for want of a stream" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    var buf: [256]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    t.shard.runRequest(t.conn, try ParkTest.request(.stream_read, 1, "", "nosuch", "", ""), .peer);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    // Run, and answered by the leader's own state: no such stream, not stale.
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), one[0].header.status);
+    try std.testing.expect(one[0].header.flags & proto.RESPONSE_STALE == 0);
 }
 
 test "Shard: a replica refuses a repair from its admin socket up front, naming the leader" {

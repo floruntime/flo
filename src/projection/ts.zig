@@ -626,10 +626,8 @@ pub const TSProjection = struct {
         return (try self.fill(ns_id, measurement, field_name, pick, .{ .after = after }, through_ns, out)).points_in_buffer;
     }
 
-    /// A measurement field's record: its newest time and lateness counts;
-    /// null when it has no series.
     /// Whether `measurement` has a series of `field_name` whose tags satisfy
-    /// every predicate: what a read of it names, points in range or not.
+    /// every predicate, whether or not it has points in range.
     pub fn hasFieldSeries(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate) !bool {
         var kbuf: [4096]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&kbuf);
@@ -639,6 +637,8 @@ pub const TSProjection = struct {
         return false;
     }
 
+    /// A measurement field's record: its newest time and lateness counts;
+    /// null when it has no series.
     pub fn fieldRecord(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8) ?ts_machine.FieldValue {
         var kbuf: [4096]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&kbuf);

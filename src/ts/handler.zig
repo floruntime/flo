@@ -152,8 +152,15 @@ pub const TSHandler = struct {
         } };
     }
 
-    fn runRead(shard: *Shard, _: *Connection, req: Request, field: []const u8, tags: []const u8, from_ns: ?i64, to_ns: ?i64, limit: u32, order: ts_ops.Order, cursor: []const u8) Error!ReadOutcome {
-        return shard.ts_handler.readPage(req.ns_id, req.key, field, tags, from_ns, to_ns, limit, order, cursor);
+    fn runRead(shard: *Shard, conn: *Connection, req: Request, field: []const u8, tags: []const u8, from_ns: ?i64, to_ns: ?i64, limit: u32, order: ts_ops.Order, cursor: []const u8) Error!ReadOutcome {
+        const page = shard.ts_handler.readPage(req.ns_id, req.key, field, tags, from_ns, to_ns, limit, order, cursor);
+        // No such series here, on a follower: the leader answers whether
+        // there is one, or this answers stale.
+        if (page == .refused and page.refused.status == .not_found) {
+            if (shard.missToLeader(conn, req)) return .wait;
+            if (shard.staleMiss(req.header.op_code)) proto.answering_stale = true;
+        }
+        return page;
     }
 
     fn badRead(message: []const u8) ReadOutcome {

@@ -320,17 +320,6 @@ test "e2e/stream: read with --start and --end (range query)" {
     try testing.expect(result.stdoutContains("range-msg-4"));
 }
 
-test "e2e/stream: read empty stream returns empty" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    var result = try ctx.cli.run(&.{ "stream", "read", "nonexistent-stream-xyz" });
-    defer result.deinit();
-
-    // Empty stream should return empty or "no messages"
-    try testing.expect(result.contains("no messages") or result.contains("[]") or result.stdout.len == 0 or result.succeeded());
-}
-
 // =============================================================================
 // Stream INFO
 // =============================================================================
@@ -740,6 +729,7 @@ test "e2e/stream: a read of a stream that doesn't exist is not found; an empty o
     var gone = try ctx.cli.run(&.{ "stream", "read", "made-empty" });
     defer gone.deinit();
     try testing.expectEqual(@as(u8, 1), gone.exit_code);
+    try testing.expect(gone.stderrContains("stream not found [not_found"));
 }
 
 test "e2e/stream: the longest blocking read receives data, and --block 0 answers at once" {
@@ -775,19 +765,15 @@ test "e2e/stream: the longest blocking read receives data, and --block 0 answers
     try testing.expect(result.contains("longest-wait-msg"));
 }
 
-test "e2e/stream: blocking read times out with empty result" {
-    // Test: Blocking read with short timeout returns empty when no data appended
+test "e2e/stream: a blocking read of a stream not created yet times out ok and empty" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    const stream_name = "block-read-timeout";
-
-    // Start blocking read with short timeout (1 second)
-    var result = try ctx.cli.run(&.{ "stream", "read", stream_name, "--block", "1000", "--start", "0-0", "--limit", "5" });
+    // It waits for a first append; none comes within a second.
+    var result = try ctx.cli.run(&.{ "stream", "read", "block-read-timeout", "--block", "1000", "--start", "0-0", "--limit", "5" });
     defer result.deinit();
-
-    // Should succeed (exit 0) but no messages
-    try testing.expect(result.succeeded());
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    try testing.expect(result.stdoutContains("No records"));
 }
 
 test "e2e/stream: blocking read returns existing data immediately" {

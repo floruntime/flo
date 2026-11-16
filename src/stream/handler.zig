@@ -282,7 +282,7 @@ pub const StreamHandler = struct {
         const self = shard.stream_handler;
         if (req.key.len > group_entries.StreamName.max_size or group.len > group_entries.MAX_GROUP_NAME) return error.NameTooLong;
         _ = group_handler.metaOf(shard, req.ns_id, req.key, group) orelse
-            return .{ .refused = .{ .status = .not_found, .refusal = proto.notRun("not found: no such consumer group") } };
+            return .{ .refused = .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = "not found: no such consumer group" } } };
         const read: @import("../contract/view.zig").ReadView = .{ .store = &self.partition.store };
         var holders: [stream_ops.MAX_MEMBERS]Holder = undefined;
         const n = holdersOf(read, req.ns_id, group_machine.scopeOf(req.ns_id, req.key, group), &holders);
@@ -456,6 +456,13 @@ pub const StreamHandler = struct {
         const cmd_result = shard.stream_handler.handleCommand(req);
         if (cmd_result == .pending) return holdForDisk(shard, conn, req, DISK_READ_WAIT_MS);
         defer shard.stream_handler.freeResult(cmd_result);
+        // No such stream here, on a follower: the leader answers whether
+        // there is one, or this answers stale.
+        const missing = cmd_result == .err and cmd_result.err.code == .not_found;
+        if (missing and shard.missToLeader(conn, req)) return;
+        const was_stale = proto.answering_stale;
+        defer proto.answering_stale = was_stale;
+        if (missing and shard.staleMiss(req.header.op_code)) proto.answering_stale = true;
         sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
@@ -2063,6 +2070,8 @@ test "stream handler: a read of a stream that doesn't exist is not found; one th
                 .err => |e| {
                     try testing.expectEqual(CommandResult.ErrorCode.not_found, e.code);
                     try testing.expectEqualStrings("stream not found", e.message);
+                    // Its reason too, by which a client tells it from a refusal.
+                    try testing.expectEqual(proto.Reason.not_found, e.refusal().reason);
                     return null;
                 },
                 else => return error.TestUnexpectedResult,
