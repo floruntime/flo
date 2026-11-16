@@ -1300,6 +1300,7 @@ test "group machine: a nack after an abandon of the same delivery, or the revers
     var sums = t.sums();
     const nack = try handBack(&t, d, &.{a}, 12 * ms, .{ .ended = .failed, .@"error" = "boom" });
     try testing.expectEqual(@as(u32, 0), nack.applied);
+    try testing.expectEqual(@as(usize, 1), nack.n);
     try testing.expectEqual(Why.released, nack.refused[0].why);
     try testing.expectEqual(@as(u32, 0), t.item("s", "g", a).?.failures);
     try testing.expectEqual(sums, t.sums());
@@ -1309,6 +1310,7 @@ test "group machine: a nack after an abandon of the same delivery, or the revers
     sums = t.sums();
     const late = try abandon(&t, d, &.{b}, 14 * ms);
     try testing.expectEqual(@as(u32, 0), late.applied);
+    try testing.expectEqual(@as(usize, 1), late.n);
     try testing.expectEqual(Why.released, late.refused[0].why);
     try testing.expectEqual(@as(u32, 1), t.item("s", "g", b).?.failures);
     try testing.expectEqual(sums, t.sums());
@@ -1334,6 +1336,38 @@ test "group machine: apply refuses an abandon that carries dead, a delay or an e
         try testing.expectEqual(sums, t.sums());
         try testing.expectEqual(Status.leased, t.item("s", "g", rec).?.status);
     }
+}
+
+test "group machine: a leader's hand-back proposed again after the expire applied changes nothing, and the record is delivered once more, not twice" {
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 1);
+    const d = try deliver(&t, 1, 1 << 20, "c1", 10 * ms);
+    const rec = sid(100, 0);
+    // The unread hand-back a refused propose kept, as it was first proposed.
+    var buf: [512]u8 = undefined;
+    const items = try itemsOf(&buf, &t, &.{rec});
+    const lease_end = t.item("s", "g", rec).?.expiry_ns;
+    const back: ge.Release.Value = .{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = d.token, .expiry_ns = lease_end, .items = items, .delay_ms = 0, .dead = false, .@"error" = "", .ended = .unread };
+    _ = try t.duty(lease_end + ms);
+    try testing.expectEqual(Status.ready, t.item("s", "g", rec).?.status);
+    const sums = t.sums();
+    const late = Answer.of(try t.apply(.group_release, back, lease_end + 2 * ms), false);
+    try testing.expectEqual(@as(u32, 0), late.applied);
+    try testing.expectEqual(Why.expired, late.refused[0].why);
+    try testing.expectEqual(sums, t.sums());
+    // Unread would have taken the delivery back: it is still counted.
+    try testing.expectEqual(@as(u32, 1), t.item("s", "g", rec).?.deliveries);
+    // Delivered again once; the kept hand-back still applies nothing.
+    const d2 = try deliver(&t, 1, 1 << 20, "c2", lease_end + 3 * ms);
+    try testing.expectEqual(@as(usize, 1), d2.n);
+    const again = t.sums();
+    const later = Answer.of(try t.apply(.group_release, back, lease_end + 4 * ms), false);
+    try testing.expectEqual(@as(u32, 0), later.applied);
+    try testing.expectEqual(Why.delivered_again, later.refused[0].why);
+    try testing.expectEqual(again, t.sums());
+    try testing.expectEqual(@as(u32, 2), t.item("s", "g", rec).?.deliveries);
+    try testing.expectEqual(Status.leased, t.item("s", "g", rec).?.status);
 }
 
 test "group machine: an abandoned record is ready at once, its delivery kept and no failure counted; a resend applies, a stale one doesn't" {
