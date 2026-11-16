@@ -528,8 +528,9 @@ const LOST = "the record's payload can't be read: it is gone from the stream's s
 /// ready again now rather than at their lease's end: those whose payload
 /// was on its way back from disk with no failure counted, those whose
 /// payload is lost as a failure, so their attempts run out and they die
-/// rather than go round forever. Best effort; were a proposal lost, the
-/// lease's expiry still returns them, counting a failure.
+/// rather than go round forever. A release refused for a while is tried
+/// again until the lease would end (`Shard.proposeHandBack`); one given up
+/// is returned by the lease's expiry, counting a failure.
 fn freeUnread(shard: *Shard, p: *const ge.Deliver.Value, e: *const Entry, expiry: u64, records: []const StreamID, deliveries: []const u32, unread: []const StreamHandler.Unread) void {
     for ([_]StreamHandler.Unread{ .fetching, .lost }) |kind| {
         var buf: [ge.Items.max_size]u8 = undefined;
@@ -542,7 +543,13 @@ fn freeUnread(shard: *Shard, p: *const ge.Deliver.Value, e: *const Entry, expiry
         if (count == 0) continue;
         const free = kind == .fetching;
         const ended: ge.HandBack = if (free) .unread else .failed;
-        _ = propose(shard, .group_release, ge.Release.Value{ .ns = p.ns, .stream = p.stream, .group = p.group, .holder = p.holder, .token = .{ .term = e.header.term, .index = e.header.index }, .expiry_ns = expiry, .items = .{ .bytes = buf[0..w], .count = count }, .delay_ms = 0, .dead = false, .@"error" = if (free) "" else LOST, .ended = ended }) catch {};
+        const body: ge.Release.Value = .{ .ns = p.ns, .stream = p.stream, .group = p.group, .holder = p.holder, .token = .{ .term = e.header.term, .index = e.header.index }, .expiry_ns = expiry, .items = .{ .bytes = buf[0..w], .count = count }, .delay_ms = 0, .dead = false, .@"error" = if (free) "" else LOST, .ended = ended };
+        var out: [Shard.HANDBACK_MAX_PAYLOAD]u8 = undefined;
+        const bytes = ge.Release.encodeInto(&out, body) catch {
+            shard.dropHandBack(.group, "its release didn't encode");
+            continue;
+        };
+        shard.proposeHandBack(.group, .group_release, bytes, expiry);
     }
 }
 

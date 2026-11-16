@@ -685,6 +685,33 @@ test "actions machine: failures count to max_attempts; an abandoned delivery cou
     try testing.expectEqual(@as(u32, 2), done.failures);
 }
 
+test "actions machine: a leader's abandon proposed again after the expire applied changes nothing, and the run is delivered once more, not twice" {
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    var ibuf: [ae.ExpireItem.max_size]u8 = undefined;
+    try register(&t, 3);
+    try invoke(&t, "r1", 10 * ms);
+    try testing.expect((try deliver(&t, "r1", 10 * ms, 20 * ms)).refused() == null);
+    // The hand-back a refused propose kept, as it was first proposed.
+    var back = releaseOf(&t, "r1", true);
+    back.delay_ms = 0;
+    back.@"error" = "";
+    const live = t.run(.default, "r1").?.expiry_ns;
+    try testing.expect((try t.apply(.action_expire, try expiring(&ibuf, keyOf("r1", live)), live + ms)).refused() == null);
+    const sums = t.sums();
+    try testing.expect((try t.apply(.action_release, back, live + 2 * ms)).refused() != null);
+    try testing.expectEqual(sums, t.sums());
+    try testing.expectEqual(@as(u32, 1), t.run(.default, "r1").?.failures);
+    // Delivered again once; the kept hand-back still applies nothing.
+    try testing.expect((try deliver(&t, "r1", live + ms, live + 3 * ms)).refused() == null);
+    const again = t.sums();
+    try testing.expect((try t.apply(.action_release, back, live + 4 * ms)).refused() != null);
+    try testing.expectEqual(again, t.sums());
+    const run = t.run(.default, "r1").?;
+    try testing.expectEqual(Status.leased, run.status);
+    try testing.expectEqual(@as(u32, 2), run.deliveries);
+}
+
 test "actions machine: 500 deliver and abandon cycles leave no deadline key" {
     var t = TestActions.init(testing.allocator);
     defer t.deinit();

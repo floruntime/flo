@@ -1212,9 +1212,12 @@ pub const ActionsHandler = struct {
     fn abandon(self: *ActionsHandler, shard: *Shard, ns: NamespaceId, holder: []const u8, t: Task) void {
         _ = self;
         const run = getRun(shard, ns, t.run) orelse return;
-        _ = propose(shard, .action_release, ae.Release.Value{ .ns = ns.int(), .action = t.action, .run = t.run, .holder = holder, .request_key = run.request_key, .deliveries = t.deliveries, .token = .{ .term = t.term, .index = t.index }, .expiry_ns = run.expiry_ns, .abandoned = true, .retry = true, .delay_ms = 0, .@"error" = "" }) catch |err| {
-            if (!shard.quietHalted(err)) log.warn("shard {d}: run {s} not handed back: {s}; its lease runs out", .{ shard.id, t.run, @errorName(err) });
-        };
+        if (ns == .invalid) return;
+        const body: ae.Release.Value = .{ .ns = ns.int(), .action = t.action, .run = t.run, .holder = holder, .request_key = run.request_key, .deliveries = t.deliveries, .token = .{ .term = t.term, .index = t.index }, .expiry_ns = run.expiry_ns, .abandoned = true, .retry = true, .delay_ms = 0, .@"error" = "" };
+        var out: [Shard.HANDBACK_MAX_PAYLOAD]u8 = undefined;
+        const bytes = ae.Release.encodeInto(&out, body) catch return shard.dropHandBack(.action, "its release is larger than a hand-back holds");
+        // Refused for a while, it is tried again until the lease would end.
+        shard.proposeHandBack(.action, .action_release, bytes, run.expiry_ns);
     }
 
     /// `[ns:u32][holder_len:u16][holder][action_len:u16][action][run_len:u16][run][deliveries:u32][term:u64][index:u64]`.

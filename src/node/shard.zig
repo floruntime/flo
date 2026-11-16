@@ -78,6 +78,8 @@ const apply_marker = @import("apply_marker.zig");
 const offline_mod = @import("offline.zig");
 const qe_caps = @import("../protocol/queue_entries.zig");
 const ge_mod = @import("../protocol/group_entries.zig");
+const action_entries = @import("../protocol/action_entries.zig");
+const action_ops_mod = @import("../protocol/action_ops.zig");
 const group_handler = @import("../stream/group_handler.zig");
 const contract_machine = @import("../contract/machine.zig");
 const contract_machines = @import("../contract/machines.zig");
@@ -677,6 +679,15 @@ pub const Shard = struct {
     /// (cumulative): followers at the same bar take theirs, and this leader's
     /// next is at the next bar.
     snapshot_skips_leader_not_ready: u64 = 0,
+    /// Hand-backs no client waits on (`proposeHandBack`) refused at propose
+    /// for a while (a full log, writes stopped): retried each tick until
+    /// proposed, until their lease would end anyway, or until this node
+    /// stops leading. Each owns its payload.
+    handbacks: std.ArrayListUnmanaged(HandBack) = .empty,
+    /// When the next dropped hand-back may be said, and how many went
+    /// unsaid since the last line.
+    handback_line_ms: u64 = 0,
+    handback_unsaid: u64 = 0,
     /// A committed entry could not be read to apply it — a resource or IO
     /// failure reading below the ring, not a hole. The shard holds it unapplied
     /// and retries, but not on every call: `read_retry_at_ms` paces the retry,
@@ -1788,6 +1799,9 @@ pub const Shard = struct {
     pub fn deinit(self: *Shard) void {
         self.marker.close();
         self.channel.deinit();
+        // Freed only: the registry may be gone, and expiry returns them.
+        for (self.handbacks.items) |h| self.allocator.free(h.payload);
+        self.handbacks.deinit(self.allocator);
         self.skips.deinit(self.allocator);
         self.closing_fds.deinit(self.allocator);
         self.resume_fds.deinit(self.allocator);
@@ -3202,6 +3216,117 @@ pub const Shard = struct {
                 mb.wake.set(.stream_appended);
             }
         }
+    }
+
+    pub const HandBackKind = ShardMetrics.HandBackKind;
+
+    /// A hand-back waiting to be proposed again.
+    pub const HandBack = struct {
+        kind: HandBackKind,
+        etype: entry_mod.EntryType,
+        /// The encoded release, owned: at most `HANDBACK_MAX_PAYLOAD`.
+        payload: []u8,
+        /// The term it was first proposed in: a later term's leader doesn't
+        /// send it.
+        term: u64,
+        /// Its lease's expiry, by the log's clock: past it the expire sweep
+        /// returns the record, and a release would only be refused.
+        not_after_ns: u64,
+    };
+
+    /// Most hand-backs waiting on one shard, and most bytes one may hold:
+    /// a group's release of a read's batch fits whole, and a run's abandon
+    /// carries no error, so is far smaller than its schema's most. So the
+    /// list holds at most 1 MiB.
+    pub const HANDBACK_MAX = 64;
+    pub const HANDBACK_MAX_PAYLOAD = 16 * 1024;
+    comptime {
+        std.debug.assert(ge_mod.Release.max_size <= HANDBACK_MAX_PAYLOAD);
+        std.debug.assert(action_entries.Release.max_size - action_ops_mod.MAX_ERROR <= HANDBACK_MAX_PAYLOAD);
+    }
+
+    /// Proposes a release no client waits on: a group's records a read's
+    /// answer couldn't carry, or a run whose taker went away. Refused for a
+    /// while (a full log, writes stopped), it is kept and tried again each
+    /// tick, so the record comes back now rather than at its lease's end,
+    /// where expiry would count it a failure. Either way the release is
+    /// fenced by its delivery: one that lands after the expire, or after a
+    /// redelivery, applies nothing.
+    pub fn proposeHandBack(self: *Shard, kind: HandBackKind, etype: entry_mod.EntryType, payload: []const u8, not_after_ns: u64) void {
+        const err = if (self.raft_node.propose(etype, entry_mod.Flags.NONE, payload)) |_| return else |e| e;
+        if (!handBackRetries(err)) return self.dropHandBack(kind, @errorName(err));
+        if (self.handbacks.items.len >= HANDBACK_MAX) return self.dropHandBack(kind, "too many hand-backs already wait");
+        if (payload.len > HANDBACK_MAX_PAYLOAD) return self.dropHandBack(kind, "its release is larger than any should be");
+        const owned = self.allocator.dupe(u8, payload) catch return self.dropHandBack(kind, "out of memory holding it");
+        self.handbacks.append(self.allocator, .{ .kind = kind, .etype = etype, .payload = owned, .term = self.raft_node.current_term, .not_after_ns = not_after_ns }) catch {
+            self.allocator.free(owned);
+            return self.dropHandBack(kind, "out of memory holding it");
+        };
+    }
+
+    /// Refusals that pass: the log has room again, writes resume.
+    fn handBackRetries(err: anyerror) bool {
+        return err == error.Overloaded or err == error.WritesStopped;
+    }
+
+    /// The hand-backs waiting, oldest first, until the log is full again.
+    fn retryHandBacks(self: *Shard) void {
+        const items = self.handbacks.items;
+        const now = self.raft_node.now();
+        var stop = false;
+        var keep: usize = 0;
+        for (items) |h| {
+            const why: ?[]const u8 = if (self.raft_node.role != .leader or self.raft_node.current_term != h.term)
+                "this node no longer leads the term it was taken in"
+            else if (now >= h.not_after_ns)
+                "its lease has run out"
+            else
+                null;
+            if (why) |w| {
+                self.allocator.free(h.payload);
+                self.dropHandBack(h.kind, w);
+                continue;
+            }
+            if (!stop) {
+                if (self.raft_node.propose(h.etype, entry_mod.Flags.NONE, h.payload)) |_| {
+                    self.allocator.free(h.payload);
+                    if (self.shard_metrics) |m| m.recordHandBack(h.kind, .retried);
+                    continue;
+                } else |err| if (handBackRetries(err)) {
+                    stop = true;
+                } else {
+                    self.allocator.free(h.payload);
+                    self.dropHandBack(h.kind, @errorName(err));
+                    continue;
+                }
+            }
+            items[keep] = h;
+            keep += 1;
+        }
+        self.handbacks.shrinkRetainingCapacity(keep);
+    }
+
+    /// Every waiting hand-back given up, on a step-down.
+    fn dropHandBacks(self: *Shard, why: []const u8) void {
+        for (self.handbacks.items) |h| {
+            self.allocator.free(h.payload);
+            self.dropHandBack(h.kind, why);
+        }
+        self.handbacks.clearRetainingCapacity();
+    }
+
+    /// A hand-back given up: its lease's expiry returns the record, counting
+    /// a failure. Said once every 30 s, with how many went unsaid between.
+    pub fn dropHandBack(self: *Shard, kind: HandBackKind, why: []const u8) void {
+        if (self.shard_metrics) |m| m.recordHandBack(kind, .dropped);
+        const now = nowMs();
+        if (now < self.handback_line_ms) {
+            self.handback_unsaid += 1;
+            return;
+        }
+        self.handback_line_ms = now + 30_000;
+        log.warn("shard {d}: a {s} hand-back was given up ({s}); its lease's expiry returns it, counting a failure ({d} more given up since the last line)", .{ self.id, @tagName(kind), why, self.handback_unsaid });
+        self.handback_unsaid = 0;
     }
 
     /// How a run a workflow here waits on ended, or a workflow's shard
@@ -5299,6 +5424,7 @@ pub const Shard = struct {
         self.actions_handler.stoppedLeading(self);
         self.queue_handler.stoppedLeading(self);
         group_handler.stoppedLeading(self);
+        self.dropHandBacks("this node stopped leading");
         self.resolvePending(message);
         // Blocking reads that hand out work belong to the leader: a parked
         // dequeue woken here would take a message from this node's copy
@@ -6159,6 +6285,7 @@ pub const Shard = struct {
         // A halted leader still delivers what it sent before the halt.
         if (leads or holds) self.tickChannels();
         self.stepSnapshotWindow();
+        if (self.handbacks.items.len > 0) self.retryHandBacks();
         _ = self.coldCaughtUp();
 
         // Shard 0: namespaces created this tick go to disk, then into the
@@ -6389,6 +6516,9 @@ pub const Shard = struct {
     /// answer reaches its asker. One arriving later is freed by `deinit`,
     /// and its asker answers it from the slot it holds.
     fn refuseUnrunRequests(self: *Shard) void {
+        // Stopping: what this shard would have handed back, it doesn't;
+        // the next leader's expiry returns the records, counting a failure.
+        self.dropHandBacks("the shard is stopping");
         var buf: [64]InboxMessage = undefined;
         while (true) {
             const count = self.mailbox.inbox.drain(&buf);
@@ -8941,7 +9071,6 @@ fn applyLoggedTo(handler: anytype, e: *const entry_mod.Entry) !void {
     try handler.replayEntry(e, &out);
 }
 
-const action_entries = @import("../protocol/action_entries.zig");
 const action_machine = @import("../actions/machine.zig");
 
 /// An action entry applied to `shard`'s store, as its log applies it.
@@ -27495,4 +27624,90 @@ test "Shard: parked messages are the same on a replica that applies the same log
     const rread: contract_view.ReadView = .{ .store = &r.defaultPartition().store };
     try std.testing.expectEqual(@as(u64, 2), channels_mod.shardParked(rread).count);
     try std.testing.expectEqual(b.defaultPartition().store.encodedBytes(), r.defaultPartition().store.encodedBytes());
+}
+
+/// A run's abandon, as a leader proposes one no client waits on.
+fn testHandBack(buf: []u8, run_id: []const u8) ![]const u8 {
+    return action_entries.Release.encodeInto(buf, .{ .ns = ns_table.Id.default.int(), .action = "a", .run = run_id, .holder = "w", .request_key = null, .deliveries = 1, .token = .{ .term = 1, .index = 1 }, .expiry_ns = 0, .abandoned = true, .retry = true, .delay_ms = 0, .@"error" = "" });
+}
+
+test "Shard: a hand-back refused while writes are stopped is kept, then proposed once they resume, counted retried" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    var sm = ShardMetrics{ .shard_id = 0 };
+    t.shard.shard_metrics = &sm;
+    defer t.shard.shard_metrics = null;
+    const raft = t.shard.raft_node;
+    var buf: [512]u8 = undefined;
+    const payload = try testHandBack(&buf, "r1");
+    const until = raft.now() + 60 * std.time.ns_per_s;
+
+    raft.writes_stopped = true;
+    const tip = raft.log.lastIndex();
+    t.shard.proposeHandBack(.action, .action_release, payload, until);
+    try std.testing.expectEqual(@as(usize, 1), t.shard.handbacks.items.len);
+    // Still stopped: kept, nothing proposed.
+    t.shard.retryHandBacks();
+    try std.testing.expectEqual(@as(usize, 1), t.shard.handbacks.items.len);
+    try std.testing.expectEqual(tip, raft.log.lastIndex());
+
+    raft.writes_stopped = false;
+    t.shard.retryHandBacks();
+    try std.testing.expectEqual(@as(usize, 0), t.shard.handbacks.items.len);
+    try std.testing.expectEqual(tip + 1, raft.log.lastIndex());
+    try std.testing.expectEqual(@as(u64, 1), sm.handbacks[@backingInt(ShardMetrics.HandBackKind.action)][@backingInt(ShardMetrics.HandBackOutcome.retried)].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), sm.handbacks[@backingInt(ShardMetrics.HandBackKind.action)][@backingInt(ShardMetrics.HandBackOutcome.dropped)].load(.monotonic));
+}
+
+test "Shard: a kept hand-back is given up at its lease's end, on a step-down, or when the list is full, each counted dropped" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    var sm = ShardMetrics{ .shard_id = 0 };
+    t.shard.shard_metrics = &sm;
+    defer t.shard.shard_metrics = null;
+    const raft = t.shard.raft_node;
+    var buf: [512]u8 = undefined;
+    const payload = try testHandBack(&buf, "r1");
+    const dropped = &sm.handbacks[@backingInt(ShardMetrics.HandBackKind.group)][@backingInt(ShardMetrics.HandBackOutcome.dropped)];
+    raft.writes_stopped = true;
+    defer raft.writes_stopped = false;
+
+    // Its lease already over: given up on the next pass, not proposed.
+    t.shard.proposeHandBack(.group, .action_release, payload, raft.now() -| 1);
+    try std.testing.expectEqual(@as(usize, 1), t.shard.handbacks.items.len);
+    raft.writes_stopped = false;
+    const tip = raft.log.lastIndex();
+    t.shard.retryHandBacks();
+    try std.testing.expectEqual(@as(usize, 0), t.shard.handbacks.items.len);
+    try std.testing.expectEqual(tip, raft.log.lastIndex());
+    try std.testing.expectEqual(@as(u64, 1), dropped.load(.monotonic));
+
+    // Full: the one past the cap is given up at once.
+    raft.writes_stopped = true;
+    const until = raft.now() + 60 * std.time.ns_per_s;
+    for (0..Shard.HANDBACK_MAX + 1) |_| t.shard.proposeHandBack(.group, .action_release, payload, until);
+    try std.testing.expectEqual(@as(usize, Shard.HANDBACK_MAX), t.shard.handbacks.items.len);
+    try std.testing.expectEqual(@as(u64, 2), dropped.load(.monotonic));
+
+    // A step-down gives up every one, freeing each.
+    t.shard.stoppedLeading("stepped down");
+    try std.testing.expectEqual(@as(usize, 0), t.shard.handbacks.items.len);
+    try std.testing.expectEqual(@as(u64, 2 + Shard.HANDBACK_MAX), dropped.load(.monotonic));
+}
+
+test "Shard: a hand-back refused for good is given up at once, not kept" {
+    var t: AdminTest = undefined;
+    try t.init(3, .join);
+    defer t.deinit();
+    var sm = ShardMetrics{ .shard_id = 0 };
+    t.shard.shard_metrics = &sm;
+    defer t.shard.shard_metrics = null;
+    // Not leading: a new leader holds the lease, and its expiry returns it.
+    t.shard.raft_node.role = .follower;
+    var buf: [512]u8 = undefined;
+    t.shard.proposeHandBack(.action, .action_release, try testHandBack(&buf, "r1"), t.shard.raft_node.now() + std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 0), t.shard.handbacks.items.len);
+    try std.testing.expectEqual(@as(u64, 1), sm.handbacks[@backingInt(ShardMetrics.HandBackKind.action)][@backingInt(ShardMetrics.HandBackOutcome.dropped)].load(.monotonic));
 }
