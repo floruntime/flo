@@ -2134,14 +2134,30 @@ pub const Shard = struct {
         // go to the wrong shard: a delete there finds no key, and the key
         // survives. Before the publish, a shard other than 0 asks shard 0,
         // and looks again once shard 0 has published any create it holds.
-        if (self.shardCount() > 1 and req.ns_id == .invalid and req.key.len > 0 and namespaced(op)) {
+        //
+        // On a node of several shards, a write that creates nothing in a
+        // namespace that doesn't exist is refused as having none through
+        // shard 0, as shard 0's answer to another shard's ask refuses it
+        // there. A lone shard answers it as it always has.
+        const creates = op < proto.MAX_OPCODES and dispatcher_mod.opCreates(@fromBackingInt(@intCast(op)));
+        if (req.key.len > 0 and namespaced(op)) {
             const name = if (req.namespace.len == 0) "default" else req.namespace;
-            if (self.namespace_handler.table.lookup(name)) |id| {
-                var routed = req;
-                routed.ns_id = id;
-                return self.route(conn, routed, auth);
+            const nh = self.namespace_handler;
+            if (req.ns_id == .invalid) {
+                if (nh.table.lookup(name)) |id| {
+                    var routed = req;
+                    routed.ns_id = id;
+                    return self.route(conn, routed, auth);
+                }
+                if (self.id != 0) return self.askShard0(conn, req, name, auth.origin);
+                if (self.shardCount() > 1 and requestWrites(req) and !creates and !nh.creating(name)) return self.sendRefusal(conn, req.header.request_id, .no_namespace, NO_NAMESPACE);
             }
-            if (self.id != 0) return self.askShard0(conn, req, name, auth.origin);
+            // Shard 0 routes by its own registry's id a namespace it applied
+            // but hasn't published, and the owning shard, which resolves
+            // names by the table, would find none: a write that creates
+            // nothing is held until the publish, as a read is (`edgeMiss`).
+            if (self.id == 0 and self.shardCount() > 1 and requestWrites(req) and !creates) if (nh.unpublishedIndex(name)) |index|
+                return self.holdAtEdgeFor(conn, req, name, auth.origin, nowMs(), index);
         }
 
         // A start that chooses its run id is decided on its workflow's
@@ -24727,10 +24743,60 @@ test "Shard: after a restart, a delete through another shard before shard 0 publ
     // for the name, then goes where the key is.
     b.runRequest(c.conn, testReq(.kv_delete, 4, "xs", key, "", ""), .client);
     two.settle();
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, b, &out)).header.status);
+    try expectDeleted(try nextAnswer(c, b, &out));
     b.runRequest(c.conn, edgeGet(&body, 5, "xs", key), .client);
     two.settle();
     try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), (try nextAnswer(c, b, &out)).header.status);
+}
+
+fn expectDeleted(r: proto.Response) !void {
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
+    var diag: schema.Diagnostic = .{};
+    try std.testing.expectEqual(@as(?bool, true), (try table_run.op("kv.delete").response.decodeAll(r.data, &diag)).existed);
+}
+
+test "Shard: after a restart, a delete through shard 0 before it publishes its namespace waits for the publish, then deletes the key where it is" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    var key_buf: [8]u8 = undefined;
+    const key = try twoShardsWithXsKey(data_dir, &key_buf);
+    var two: TwoShards = undefined;
+    try restartedBeforePublish(&two, data_dir);
+    defer two.deinit();
+    const a = &two.shards[0];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var body: [64]u8 = undefined;
+    var out: [512]u8 = undefined;
+    // Shard 0 holds the name by its registry; the key's shard resolves by
+    // the table, which hasn't it yet: held, not sent there now.
+    a.runRequest(c.conn, testReq(.kv_delete, 4, "xs", key, "", ""), .client);
+    drainBoth(&two);
+    try expectNoAnswer(c, a);
+    _ = try a.tick(0);
+    two.settle();
+    try expectDeleted(try nextAnswer(c, a, &out));
+    a.runRequest(c.conn, edgeGet(&body, 5, "xs", key), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), (try nextAnswer(c, a, &out)).header.status);
+}
+
+test "Shard: a delete in a namespace never created is refused as having none on a node of several shards, whichever shard it reaches" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    var out: [512]u8 = undefined;
+    for (&two.shards, 0..) |*sh, i| {
+        const c = try TestClient.open(sh);
+        defer _ = std.c.close(c.pair[1]);
+        sh.runRequest(c.conn, testReq(.kv_delete, i + 1, "nope", "k", "", ""), .client);
+        two.settle();
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), (try nextAnswer(c, sh, &out)).header.status);
+    }
 }
 
 test "Shard: on a lone node of several shards, a read pipelined behind the write that creates its namespace is answered once shard 0's tick publishes it" {
