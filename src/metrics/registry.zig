@@ -677,6 +677,9 @@ pub const ShardMetrics = struct {
     /// Requests to another shard refused at once, before they ran, for want
     /// of a reply slot or of room in its inbox, by class (`CrossShardClass`).
     cross_shard_overloaded: [3]Atomic(u64) = @splat(Atomic(u64).init(0)),
+    /// Reads a follower found no stream or series for, by op and by how
+    /// they were answered (`ReadMiss`).
+    read_misses: [2][2]Atomic(u64) = @splat(@splat(Atomic(u64).init(0))),
     /// Answers dropped for want of a reply slot or of room on the asker's
     /// reply ring. Both are reserved before every request, so a count means
     /// an answer came twice or long after its slot expired.
@@ -775,6 +778,10 @@ pub const ShardMetrics = struct {
     /// resync.
     buffer_failures: Atomic(u64) = Atomic(u64).init(0),
     buffer_failing_for_ms: Atomic(u64) = Atomic(u64).init(0),
+    /// How long a disk-staging gap has been open under async_flush (0 when
+    /// none): writes at or past it are held, not acked, until it fills. A
+    /// duration, computed at publish, like `flushes_failing_for_ms`.
+    gap_open_for_ms: Atomic(u64) = Atomic(u64).init(0),
     /// 1 while the shard is offline on this node.
     offline: Atomic(u8) = Atomic(u8).init(0),
     /// 1 while a committed entry cannot be read to apply it. Alert on this:
@@ -793,6 +800,14 @@ pub const ShardMetrics = struct {
     pub const PAUSE_REASONS = [_][]const u8{ "in_flight", "blocking_reads", "reply_capacity", "inbox", "unsent_answers" };
 
     pub const CrossShardClass = enum(u2) { client_forward, engine, gather };
+    pub const ReadMissOp = enum(u1) { stream_read, ts_read };
+    /// Sent to the leader, or answered here, stale, past the forwards a
+    /// follower may hold.
+    pub const ReadMiss = enum(u1) { leader, stale };
+
+    pub fn recordReadMiss(self: *ShardMetrics, op: ReadMissOp, how: ReadMiss) void {
+        _ = self.read_misses[@backingInt(op)][@backingInt(how)].fetchAdd(1, .monotonic);
+    }
 
     pub const LivePending = struct {
         ctx: *const anyopaque,
@@ -935,6 +950,7 @@ pub const ShardMetrics = struct {
         inbox_pending: u64,
         cross_shard_in_flight: u64,
         cross_shard_overloaded: [3]u64,
+        read_misses: [2][2]u64,
         replies_dropped: u64,
         removal_notices: [4]u64,
         handler_no_answer: u64,
@@ -974,6 +990,7 @@ pub const ShardMetrics = struct {
         hardstate_failing_for_ms: u64,
         buffer_failures: u64,
         buffer_failing_for_ms: u64,
+        gap_open_for_ms: u64,
         offline: u8,
         read_blocked: u8,
         read_blocks_total: u64,
@@ -993,6 +1010,7 @@ pub const ShardMetrics = struct {
             .inbox_pending = if (self.live_pending) |lp| lp.read(lp.ctx) else self.inbox_pending.load(.monotonic),
             .cross_shard_in_flight = self.cross_shard_in_flight.load(.monotonic),
             .cross_shard_overloaded = .{ self.cross_shard_overloaded[0].load(.monotonic), self.cross_shard_overloaded[1].load(.monotonic), self.cross_shard_overloaded[2].load(.monotonic) },
+            .read_misses = .{ .{ self.read_misses[0][0].load(.monotonic), self.read_misses[0][1].load(.monotonic) }, .{ self.read_misses[1][0].load(.monotonic), self.read_misses[1][1].load(.monotonic) } },
             .replies_dropped = self.replies_dropped.load(.monotonic),
             .removal_notices = .{ self.removal_notices[0].load(.monotonic), self.removal_notices[1].load(.monotonic), self.removal_notices[2].load(.monotonic), self.removal_notices[3].load(.monotonic) },
             .handler_no_answer = self.handler_no_answer.load(.monotonic),
@@ -1043,6 +1061,7 @@ pub const ShardMetrics = struct {
             .hardstate_failing_for_ms = self.hardstate_failing_for_ms.load(.monotonic),
             .buffer_failures = self.buffer_failures.load(.monotonic),
             .buffer_failing_for_ms = self.buffer_failing_for_ms.load(.monotonic),
+            .gap_open_for_ms = self.gap_open_for_ms.load(.monotonic),
             .offline = self.offline.load(.monotonic),
             .read_blocked = self.read_blocked.load(.monotonic),
             .read_blocks_total = self.read_blocks_total.load(.monotonic),
@@ -1850,6 +1869,11 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     inline for (cinfo.field_names, cinfo.field_values) |cname, cvalue| {
         try writer.print("flo_shard_cross_shard_overloaded_total{{shard_id=\"{d}\",class=\"" ++ cname ++ "\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_overloaded[cvalue] });
     }
+    const minfo = @typeInfo(ShardMetrics.ReadMissOp).@"enum";
+    const hinfo = @typeInfo(ShardMetrics.ReadMiss).@"enum";
+    inline for (minfo.field_names, minfo.field_values) |mname, mvalue| inline for (hinfo.field_names, hinfo.field_values) |hname, hvalue| {
+        try writer.print("flo_shard_read_misses_total{{shard_id=\"{d}\",op=\"" ++ mname ++ "\",answer=\"" ++ hname ++ "\"}} {d}\n", .{ snap.shard_id, snap.read_misses[mvalue][hvalue] });
+    };
     try writer.print("flo_shard_cross_shard_timeouts_total{{shard_id=\"{d}\",class=\"client_forward\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_timeouts });
     try writer.print("flo_shard_cross_shard_timeouts_total{{shard_id=\"{d}\",class=\"gather\"}} {d}\n", .{ snap.shard_id, snap.gather_timeouts });
     try writer.print("flo_shard_raft_stranger_frames_dropped_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.stranger_frames_dropped });
@@ -1892,6 +1916,7 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_hardstate_failing_for_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.hardstate_failing_for_ms / 1000, snap.hardstate_failing_for_ms % 1000 });
     try writer.print("flo_shard_buffer_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.buffer_failures });
     try writer.print("flo_shard_buffer_failing_for_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.buffer_failing_for_ms / 1000, snap.buffer_failing_for_ms % 1000 });
+    try writer.print("flo_shard_gap_open_for_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.gap_open_for_ms / 1000, snap.gap_open_for_ms % 1000 });
     try writer.print("flo_shard_offline{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.offline });
     try writer.print("flo_shard_read_blocked{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.read_blocked });
     try writer.print("flo_shard_read_blocks_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.read_blocks_total });
@@ -2066,6 +2091,22 @@ test "registry: per-shard prometheus export" {
     try testing.expect(std.mem.indexOf(u8, text, "flo_shard_connections{shard_id=\"0\"} 1") != null);
     try testing.expect(std.mem.indexOf(u8, text, "flo_shard_commands_total{shard_id=\"0\"} 1") != null);
     try testing.expect(std.mem.indexOf(u8, text, "flo_shard_bytes_received_total{shard_id=\"1\"} 512") != null);
+}
+
+test "registry: a follower's read misses are counted by op and by how they were answered" {
+    const allocator = testing.allocator;
+    var registry = MetricsRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.initShards(1);
+    const shard0 = registry.shardMetrics(0).?;
+    shard0.recordReadMiss(.stream_read, .leader);
+    shard0.recordReadMiss(.stream_read, .leader);
+    shard0.recordReadMiss(.ts_read, .stale);
+    const text = try registry.exportPrometheus(allocator);
+    defer allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "flo_shard_read_misses_total{shard_id=\"0\",op=\"stream_read\",answer=\"leader\"} 2") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "flo_shard_read_misses_total{shard_id=\"0\",op=\"stream_read\",answer=\"stale\"} 0") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "flo_shard_read_misses_total{shard_id=\"0\",op=\"ts_read\",answer=\"stale\"} 1") != null);
 }
 
 test "registry: double initShards fails" {

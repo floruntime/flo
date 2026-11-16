@@ -217,25 +217,119 @@ test "e2e/ts: write batch from file stores every point" {
     }
 }
 
-test "e2e/ts: write batch converts the timestamp precision" {
+test "e2e/ts: write batch keeps each precision's timestamp to the nanosecond" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    const tmp_path = "/tmp/flo-e2e-ts-batch-ns.txt";
+    const cases = [_]struct { precision: []const u8, stamp: []const u8, ns: []const u8 }{
+        .{ .precision = "ns", .stamp = "1708700400123456789", .ns = "1708700400123456789" },
+        .{ .precision = "us", .stamp = "1708700400123456", .ns = "1708700400123456000" },
+        .{ .precision = "ms", .stamp = "1708700400123", .ns = "1708700400123000000" },
+        .{ .precision = "s", .stamp = "1708700400", .ns = "1708700400000000000" },
+    };
+    const tmp_path = "/tmp/flo-e2e-ts-batch-precision.txt";
+    defer @import("stdx").fs.deleteFile(tmp_path) catch {};
+    for (cases) |c| {
+        {
+            var line: [96]u8 = undefined;
+            const file = try @import("stdx").fs.createFile(tmp_path, .{});
+            defer @import("stdx").fs.closeFile(file);
+            try @import("stdx").fs.writeAll(file, try std.fmt.bufPrint(&line, "disk,unit={s} free=12.5 {s}\n", .{ c.precision, c.stamp }));
+        }
+        var w = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", tmp_path, "--precision", c.precision });
+        defer w.deinit();
+        try testing.expectEqual(@as(u8, 0), w.exit_code);
+        try testing.expect(w.stdoutContains("Wrote 1 points"));
+
+        var tags: [16]u8 = undefined;
+        var r = try ctx.cli.run(&.{ "ts", "read", "disk", "--tags", try std.fmt.bufPrint(&tags, "unit={s}", .{c.precision}), "--field", "free", "--from", "1708700000000", "-o", "json" });
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 0), r.exit_code);
+        var want: [48]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, r.stdout, try std.fmt.bufPrint(&want, "\"time_ns\": {s},", .{c.ns})) != null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.stdout, "\"time_ns\""));
+    }
+    // A timestamp later than an i64 of nanoseconds is refused, not wrapped.
     {
         const file = try @import("stdx").fs.createFile(tmp_path, .{});
         defer @import("stdx").fs.closeFile(file);
-        try @import("stdx").fs.writeAll(file, "disk,host=a free=12.5 1708700400123000000\n");
+        try @import("stdx").fs.writeAll(file, "disk,unit=late free=1 9300000000000\n");
     }
+    var late = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", tmp_path, "--precision", "ms" });
+    defer late.deinit();
+    try testing.expectEqual(@as(u8, 2), late.exit_code);
+    try testing.expect(late.stdoutContains("Wrote 0 points"));
+    try testing.expect(late.stderrContains("line 1: timestamp '9300000000000' is past 2262-04-11T23:47:16Z, the latest time a point can have"));
+}
+
+test "e2e/ts: info, query and floql answer times in ns, to the nanosecond" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const tmp_path = "/tmp/flo-e2e-ts-wire-ns.txt";
     defer @import("stdx").fs.deleteFile(tmp_path) catch {};
+    {
+        const file = try @import("stdx").fs.createFile(tmp_path, .{});
+        defer @import("stdx").fs.closeFile(file);
+        try @import("stdx").fs.writeAll(file, "wire v=1 1708700400123456789\nwire v=2 1708700400987654321\n");
+    }
+    try ctx.exec(&.{ "ts", "write", "--batch", "--file", tmp_path, "--precision", "ns" });
 
-    var w = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", tmp_path, "--precision", "ns" });
-    defer w.deinit();
-    try testing.expectEqual(@as(u8, 0), w.exit_code);
+    var info = try ctx.cli.run(&.{ "ts", "info", "wire", "-o", "json" });
+    defer info.deinit();
+    try testing.expectEqual(@as(u8, 0), info.exit_code);
+    try testing.expect(info.stdoutContains("1708700400123456789"));
+    try testing.expect(info.stdoutContains("1708700400987654321"));
+    // The table reads in ms, as the CLI's other times do.
+    var info_table = try ctx.cli.run(&.{ "ts", "info", "wire" });
+    defer info_table.deinit();
+    try testing.expectEqual(@as(u8, 0), info_table.exit_code);
+    try testing.expect(info_table.stdoutContains("oldest_ms: 1708700400123\n"));
+    try testing.expect(info_table.stdoutContains("newest_ms: 1708700400987\n"));
 
-    var r = try ctx.cli.run(&.{ "ts", "read", "disk", "--tags", "host=a", "--field", "free", "--from", "1708700000000", "-o", "raw" });
-    defer r.deinit();
-    try testing.expectEqualStrings("1708700400123 12.500000\n", r.stdout);
+    // A query's buckets: one second-long window, its start in ns beside ms.
+    var query = try ctx.cli.run(&.{ "ts", "query", "wire", "--field", "v", "--from", "1708700000000", "--window", "1s", "--agg", "count", "-o", "json" });
+    defer query.deinit();
+    try testing.expectEqual(@as(u8, 0), query.exit_code);
+    try testing.expect(query.stdoutContains("\"start_ms\": 1708700400000, \"start_ns\": 1708700400000000000, \"value\": 2.000000"));
+    // A window of 0 would be read as none, so a minute: refused here.
+    var no_window = try ctx.cli.run(&.{ "ts", "query", "wire", "--field", "v", "--window", "0s" });
+    defer no_window.deinit();
+    try testing.expectEqual(@as(u8, 2), no_window.exit_code);
+    try testing.expect(no_window.stderrContains("--window must be more than 0"));
+    // An unknown aggregation is refused by the server, not answered empty.
+    var bad_agg = try ctx.cli.run(&.{ "ts", "query", "wire", "--field", "v", "--from", "1708700000000", "--agg", "mean" });
+    defer bad_agg.deinit();
+    try testing.expectEqual(@as(u8, 3), bad_agg.exit_code);
+    try testing.expect(bad_agg.stderrContains("unknown aggregation; use avg, sum, count, min or max"));
+
+    // FloQL: a bare range is epoch ms; one in ns is refused, saying so.
+    var floql = try ctx.cli.run(&.{ "ts", "floql", "wire[1708700400000..1708700401000] | field(v)" });
+    defer floql.deinit();
+    try testing.expectEqual(@as(u8, 0), floql.exit_code);
+    try testing.expect(floql.stdoutContains("1708700400123: 1.0000"));
+    var pasted = try ctx.cli.run(&.{ "ts", "floql", "wire[1708700400123456789] | field(v)" });
+    defer pasted.deinit();
+    // Refused by the server: exit 3.
+    try testing.expectEqual(@as(u8, 3), pasted.exit_code);
+    try testing.expect(pasted.stderrContains("past the year 3000 as epoch milliseconds"));
+    // A start of 0 is a time: the end still bounds the range, and is checked.
+    var from_zero = try ctx.cli.run(&.{ "ts", "floql", "wire[0..1708700400500] | field(v)" });
+    defer from_zero.deinit();
+    try testing.expectEqual(@as(u8, 0), from_zero.exit_code);
+    try testing.expect(from_zero.stdoutContains("1708700400123: 1.0000"));
+    try testing.expect(!from_zero.stdoutContains("1708700400987"));
+    var zero_pasted = try ctx.cli.run(&.{ "ts", "floql", "wire[0..1708700400123456789] | field(v)" });
+    defer zero_pasted.deinit();
+    try testing.expectEqual(@as(u8, 3), zero_pasted.exit_code);
+    try testing.expect(zero_pasted.stderrContains("past the year 3000 as epoch milliseconds"));
+    // Backwards, absolute or relative: refused, not read as empty.
+    for ([_][]const u8{ "wire[1708700401000..1708700400000] | field(v)", "wire[1h..2h] | field(v)" }) |q| {
+        var backwards = try ctx.cli.run(&.{ "ts", "floql", q });
+        defer backwards.deinit();
+        try testing.expectEqual(@as(u8, 3), backwards.exit_code);
+        try testing.expect(backwards.stderrContains("the range's start is after its end"));
+    }
 }
 
 test "e2e/ts: write batch reports a bad line and stores the rest" {
@@ -1736,17 +1830,20 @@ test "e2e/ts: a delete with tags removes only the matching series, and stays don
     }
 }
 
-test "e2e/ts: a read or query with no data is still JSON under -o json" {
+test "e2e/ts: a read or query with no data is still JSON under -o json; a read of no such series is not found" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     // A measurement that doesn't exist, then one with no points in range.
     try ctx.exec(&.{ "ts", "write", "json_empty", "--value", "1", "--timestamp", "1708700000000" });
+    var missing = try ctx.cli.run(&.{ "ts", "read", "json_nosuch", "--from", "1", "--to", "2", "-o", "json" });
+    defer missing.deinit();
+    try testing.expectEqual(@as(u8, 1), missing.exit_code);
+    try testing.expect(missing.stderrContains("not found: 'json_nosuch' has no series of field 'value' [not_found"));
+    var empty = try ctx.cli.run(&.{ "ts", "read", "json_empty", "--from", "1", "--to", "2", "-o", "json" });
+    defer empty.deinit();
+    try testing.expectEqualStrings("{\"points\": [], \"cursor\": null}", std.mem.trim(u8, empty.stdout, &std.ascii.whitespace));
     for ([_][]const u8{ "json_nosuch", "json_empty" }) |m| {
-        var read = try ctx.cli.run(&.{ "ts", "read", m, "--from", "1", "--to", "2", "-o", "json" });
-        defer read.deinit();
-        try testing.expectEqualStrings("{\"points\": [], \"cursor\": null}", std.mem.trim(u8, read.stdout, &std.ascii.whitespace));
-
         var query = try ctx.cli.run(&.{ "ts", "query", m, "--from", "1", "--to", "2", "--window", "1m", "--agg", "avg", "-o", "json" });
         defer query.deinit();
         try testing.expectEqualStrings("{\"series\":[]}", std.mem.trim(u8, query.stdout, &std.ascii.whitespace));

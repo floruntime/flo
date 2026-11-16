@@ -204,9 +204,9 @@ jobs:
           path: src/node/dashboard/dist
 
       # A hung test is killed at --test-timeout and fails by name, about three
-      # times the slowest test (list paging, 34 s on CI). The halt tests drive
-      # a fault only a -Dtest-faults build carries; without it they skip, and
-      # the skip count in test-e2e catches it.
+      # times the slowest test (list paging, 34 s on CI). The fault e2e files
+      # spawn the flo-faults binary, which build.zig builds as a test-e2e
+      # dependency.
       - name: zig build test-e2e -De2e-shard=${{ matrix.shard }}
         env:
           SHARD: ${{ matrix.shard }}
@@ -216,7 +216,7 @@ jobs:
         run: |
           set +e -o pipefail
           mkdir -p "$OUT"
-          zig build test-e2e -De2e-shard="$SHARD" -Dtest-faults=true --test-timeout 300s --summary all 2>&1 | tee build.log
+          zig build test-e2e -De2e-shard="$SHARD" --test-timeout 300s --summary all 2>&1 | tee build.log
           status=$?
           grep '^Build Summary:' build.log | tail -1 > "$OUT/summary.txt"
           exit $status
@@ -352,21 +352,18 @@ jobs:
       - name: Build (ReleaseSafe)
         run: zig build -Drelease
       - name: The binary carries no test faults
-        # A -Dtest-faults build halts a shard, or crashes it in apply, on a
-        # kv set of a key with this prefix.
+        # A build with the fault hooks (only flo-faults) halts or crashes a
+        # shard on a kv set of a key with this prefix; the shipped flo must not
+        # carry them. Kept as insurance against a build.zig edit wiring the
+        # faults options into the wrong artifact.
         run: |
           if grep -qa 'flo-test-fault-' zig-out/bin/flo; then
-            echo "::error::a build without -Dtest-faults carries the test faults"; exit 1
+            echo "::error::the shipped flo carries the test faults (they belong only in flo-faults)"; exit 1
           fi
       - name: Release allocator
         # main roots every allocation in libc's allocator outside Debug; a
         # toolchain bump must not quietly swap in Zig's slower default.
         run: ./zig-out/bin/flo version --verbose | tee /dev/stderr | grep -qF 'alloc=libc'
-      - name: The binary says it carries no test faults
-        run: |
-          if ./zig-out/bin/flo version --verbose | grep -qF 'test-faults'; then
-            echo "::error::a build without -Dtest-faults says it carries them"; exit 1
-          fi
       - name: The binary carries no VOPR plant
         run: |
           if ./zig-out/bin/flo version --verbose | grep -qF 'plant='; then

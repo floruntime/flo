@@ -21,9 +21,9 @@ pub fn deinit() void {
     if (builtin.mode == .debug) _ = safe_allocator.deinit();
 }
 
-/// Whether the faults e2e tests drive are compiled in (`-Dtest-faults`).
-/// The line says so, so a test can refuse a build without them, and a
-/// release check can refuse one with them.
+/// Whether the faults e2e drive is compiled in (true only for the flo-faults
+/// e2e binary). The line says so, so a release check can refuse a build that
+/// carries the hooks.
 pub const test_faults = @import("build_options").test_faults;
 const plant = @import("plant.zig");
 

@@ -175,6 +175,7 @@ pub const Parser = struct {
                     .duration_ms = 0,
                     .from_ms = dur_ms,
                     .to_ms = to_dur,
+                    .relative = true,
                 };
             }
             // Simple duration
@@ -187,13 +188,10 @@ pub const Parser = struct {
             self.skipWhitespace();
             if (self.consumeStr("..")) {
                 const to_ms = self.parseIntLiteral() orelse return error.InvalidNumber;
-                return TimeRange{
-                    .from_ms = from_ms,
-                    .to_ms = to_ms,
-                };
+                return TimeRange{ .from_ms = from_ms, .to_ms = to_ms, .absolute = true, .to_given = true };
             }
-            // Single absolute timestamp as duration
-            return TimeRange{ .from_ms = from_ms };
+            // One absolute timestamp: a lower bound, with no upper one.
+            return TimeRange{ .from_ms = from_ms, .absolute = true };
         }
 
         return error.InvalidDuration;
@@ -758,4 +756,8 @@ test "parser: a query's measurement is read without parsing the rest" {
     try std.testing.expectEqualStrings("http.requests", Parser.sourceMeasurement("http.requests").?);
     try std.testing.expect(Parser.sourceMeasurement("|||bad") == null);
     try std.testing.expect(Parser.sourceMeasurement("") == null);
+}
+
+test "parser: an unknown aggregation stage is refused, not skipped" {
+    try std.testing.expectError(error.UnknownFunction, Parser.parse("cpu[1h] | window(5m) | mean()", std.testing.allocator));
 }

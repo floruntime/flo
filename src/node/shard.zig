@@ -203,6 +203,18 @@ const ShardIo = struct {
         return Host.of(r).flushForAck();
     }
 
+    /// Under async_flush, whether this node's disk has fallen far enough behind
+    /// that it should stop acking appends: a follower withholds its ack so it
+    /// no longer counts toward commit until a flush lands. Always false under
+    /// sync (which goes through `flushForAck` instead) and when no bound is set.
+    pub fn asyncAckBlocked(r: *Replica) bool {
+        const s = Host.of(r);
+        // An open gap withholds the ack even once it is permanent (writes_stopped
+        // makes asyncBoundCrossed return .none): entries at or past the gap must
+        // never count toward commit, since they cannot reach this node's disk.
+        return s.gapHeld() or s.asyncBoundCrossed() != .none;
+    }
+
     /// The voters the network lets dial in and votes among.
     pub fn setVoters(r: *Replica, ids: []const u32) void {
         if (Host.of(r).raft_network) |rn| rn.setVoters(ids);
@@ -238,6 +250,14 @@ const ShardIo = struct {
         /// not report the same block again.
         pub fn readBlocked(r: *Replica) bool {
             return of(r).read_blocked;
+        }
+
+        /// Apply is held at an open disk-staging gap under async_flush: a
+        /// committed entry at or past it is deliberately not applied until the
+        /// gap fills, so `applyCommitted` returning false is expected, not an
+        /// error — callers stay quiet, as they do for a blocked read.
+        pub fn gapHolding(r: *Replica) bool {
+            return of(r).gapHeld();
         }
 
         pub fn clearRemovalNotices(r: *Replica) void {
@@ -577,6 +597,14 @@ pub const Shard = struct {
     unpark_full: bool = false,
     /// When `publishParked` last logged.
     parked_warn_ms: u64 = 0,
+    /// Async-flush write bound. Under async_flush, refuse new writes once
+    /// flushing has been failing for `async_flush_bound_ms`, or once
+    /// `async_flush_bound_bytes` sit unflushed in the writer's buffer, so the
+    /// node stops acking writes it can't promise are on disk. 0 on either
+    /// disables that half. Both 0 under sync and ephemeral, which never ack an
+    /// unflushed write anyway.
+    async_flush_bound_ms: u64,
+    async_flush_bound_bytes: u64,
 
     /// Where the Raft node persists its term and vote (null if ephemeral).
     hard_state_store: ?*HardStateStore,
@@ -785,6 +813,12 @@ pub const Shard = struct {
         /// The node's namespace table, shared by its shards; a shard built
         /// without one makes its own.
         namespaces: ?*@import("../namespace/table.zig").Table = null,
+        /// Async-flush write bound: refuse new writes once flushing has been
+        /// failing this long, or this many bytes sit unflushed. 0 disables
+        /// that half of the bound. Both default off, so a shard built for a
+        /// test carries no bound unless it asks for one.
+        async_flush_bound_ms: u64 = 0,
+        async_flush_bound_bytes: u64 = 0,
 
         fn cancelled(self: Boot) bool {
             const cancel = self.cancel orelse return false;
@@ -1139,7 +1173,6 @@ pub const Shard = struct {
         // whose entries are already covered by the Raft log's persistence.
         raft_node.log.ual.on_append_ctx = @ptrCast(seg_writer);
         raft_node.log.ual.on_append = segmentBufferCallback;
-        seg_writer.stop_at_gap = durability == .sync;
         var catch_up: ?*CatchUp = null;
         errdefer if (catch_up) |cu| {
             cu.deinit();
@@ -1279,6 +1312,10 @@ pub const Shard = struct {
             .losses = losses,
             .health = boot.health,
             .node_health = boot.node_health,
+            // The bound only governs async_flush: sync and ephemeral never ack
+            // an unflushed write, so there is nothing to hold back.
+            .async_flush_bound_ms = if (durability == .async_flush) boot.async_flush_bound_ms else 0,
+            .async_flush_bound_bytes = if (durability == .async_flush) boot.async_flush_bound_bytes else 0,
             .join_first_asked_ms = 0,
             .join_warned_ms = 0,
             .join_refused_warn_ms = 0,
@@ -1533,6 +1570,84 @@ pub const Shard = struct {
         if (self.flushes_failing_since_ms == 0) self.flushes_failing_since_ms = nowMs();
     }
 
+    /// Which half of the async-flush write bound is crossed right now, if any.
+    /// Both inputs are local and recover on their own: the failing clock resets
+    /// when a flush lands (`flushSegmentToDisk`), and the buffer drains with it.
+    pub const AsyncBound = union(enum) {
+        none,
+        /// An entry could not be staged for disk and the gap is still open
+        /// (its index); nothing at or past it is acked until it is re-staged.
+        gap: u64,
+        /// Flushing has been failing this many ms (>= async_flush_bound_ms).
+        time: u64,
+        /// This many bytes sit unflushed (>= async_flush_bound_bytes).
+        size: u64,
+    };
+
+    fn asyncBoundCrossed(self: *const Shard) AsyncBound {
+        // Only under async_flush: sync acks a write only once it is on disk, so
+        // it never acks past a gap or an unflushed backlog, and its own path
+        // handles a staging failure.
+        if (self.durability != .async_flush) return .none;
+        // Once an entry has left memory the gap is permanent and writes_stopped
+        // is set. Admission then defers to the proposal's writes_stopped refusal
+        // (restart needed) rather than any transient bound ("retry"), whether the
+        // bound that would otherwise fire is the gap, the time or the size. The
+        // follower ack-withhold does NOT key off this — it uses gapHeld(), so it
+        // keeps withholding acks for the entries at or past the permanent gap.
+        if (self.raft_node.writes_stopped) return .none;
+        // A recorded gap is the most urgent: an entry already missed the disk
+        // buffer, so nothing at or past it may be acked until it is re-staged.
+        if (self.durable_log) |dl| {
+            if (dl.writer.first_unbuffered) |from| return .{ .gap = from };
+        }
+        // Flushing failing for too long is the primary bound signal that the
+        // disk has stopped keeping up; the size bound also catches a burst that
+        // outruns the once-a-second flush before a failure is even recorded.
+        if (self.async_flush_bound_ms != 0 and self.flushes_failing_since_ms != 0) {
+            const failing_for = nowMs() -| self.flushes_failing_since_ms;
+            if (failing_for >= self.async_flush_bound_ms) return .{ .time = failing_for };
+        }
+        if (self.async_flush_bound_bytes != 0) {
+            if (self.durable_log) |dl| {
+                const unflushed = dl.writer.dataSize();
+                if (unflushed >= self.async_flush_bound_bytes) return .{ .size = unflushed };
+            }
+        }
+        return .none;
+    }
+
+    /// The refusal text for a crossed bound, naming the measured value and the
+    /// configured limit, into `buf`.
+    fn asyncBoundMessage(self: *const Shard, buf: []u8, bound: AsyncBound) []const u8 {
+        return switch (bound) {
+            .none => "",
+            .gap => |idx| std.fmt.bufPrint(buf, "unavailable: a write to this shard (entry {d}) has not reached disk; later writes are held until it does, and this one was not run — retry", .{idx}) catch "unavailable: a write to this shard has not reached disk; later writes are held, and this one was not run — retry",
+            .time => |ms| std.fmt.bufPrint(buf, "unavailable: writes to this shard haven't reached disk for {d:.1} s (limit {d} s); the write was not run — retry", .{
+                @as(f64, @floatFromInt(ms)) / 1000.0,
+                self.async_flush_bound_ms / 1000,
+            }) catch "unavailable: writes to this shard aren't reaching disk; the write was not run — retry",
+            .size => |bytes| std.fmt.bufPrint(buf, "unavailable: {d:.1} MiB written to this shard hasn't reached disk (limit {d} MiB); the write was not run — retry", .{
+                @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0),
+                self.async_flush_bound_bytes / (1024 * 1024),
+            }) catch "unavailable: this shard's writes aren't reaching disk; the write was not run — retry",
+        };
+    }
+
+    /// A gap is open under async_flush: the append hook could not buffer an
+    /// entry, so nothing at or past it has reached disk and apply holds there.
+    /// Derived from the writer, which opens and clears the gap (and its start
+    /// stamp) in lockstep, so this reads true from the moment the gap opens —
+    /// before the entry commits — until a flush heals it or a truncation cuts it.
+    /// Limited to async_flush: only async acks before disk, so only async holds
+    /// apply, marks reads stale and quiets the follower apply-log at a gap; sync
+    /// re-stages its own gap through flushForAck without any of that.
+    fn gapHeld(self: *const Shard) bool {
+        if (self.durability != .async_flush) return false;
+        const dl = self.durable_log orelse return false;
+        return dl.writer.first_unbuffered != null;
+    }
+
     /// Buffer again what the append hook could not, from the log, so the
     /// flush writes a run without a gap. The log evicts by size, so the
     /// entry may be gone; then nothing after it can reach disk, and the
@@ -1545,6 +1660,7 @@ pub const Shard = struct {
                 raft.writes_stopped = false;
                 log.info("shard {d}: the entry that never reached disk was cut from the log; taking writes again", .{self.id});
             }
+            writer.gap_open_since_ms = 0;
             return;
         };
         var idx = from;
@@ -1553,6 +1669,15 @@ pub const Shard = struct {
                 if (!raft.writes_stopped) {
                     raft.writes_stopped = true;
                     log.err("shard {d}: entry index={d} left memory before it reached disk, so nothing after it can be flushed; this shard takes no more writes until it restarts", .{ self.id, idx });
+                    // The held writes at or past the gap can't reach THIS node's
+                    // disk, so answer their clients now rather than leave them
+                    // waiting (ran=unknown). Alone, the entry is truly gone and a
+                    // resend after restart is safe (LOST_AT_RESTART). In a cluster
+                    // the followers may hold and commit it, so a blind resend would
+                    // apply it twice: tell the client it may still apply and to
+                    // check before resending (NOT_ON_DISK), as the sync path does.
+                    const alone = raft.role == .leader and raft.voterPeers() == 0;
+                    self.failPendingAbove(from -| 1, if (alone) LOST_AT_RESTART else NOT_ON_DISK);
                 }
                 return error.EntryUnavailable;
             };
@@ -1562,10 +1687,11 @@ pub const Shard = struct {
             };
         }
         writer.first_unbuffered = null;
-        // Buffering has caught up: end any failing run. Behind a sync gap the
-        // append hook returns early, so this is the only place a sync-mode run
-        // ends; the cumulative count stays.
+        // Buffering has caught up: end any failing run. Behind a gap the append
+        // hook returns early, so this is the only place a run ends; the
+        // cumulative count stays.
         writer.buffer_failing_since_ms = 0;
+        writer.gap_open_since_ms = 0;
     }
 
     /// Start applying what replay loaded into the log above the commit
@@ -1928,7 +2054,7 @@ pub const Shard = struct {
         }
         // A read of a namespace no one created finds none; a client's read
         // is resolved here, once, before it goes anywhere.
-        if ((origin == .client or origin == .admin) and self.edgeMiss(conn, req, origin)) return;
+        if ((origin == .client or origin == .admin) and self.edgeMiss(conn, &req, origin)) return;
 
         switch (origin) {
             .client, .admin => self.route(conn, req, auth),
@@ -1936,10 +2062,14 @@ pub const Shard = struct {
             // A node forwards only writes to its leader.
             .peer => if (!self.dispatcher.serves(req.header.op_code))
                 answerUnknownOp(@ptrCast(self), @ptrCast(conn), req.header.request_id, req.header.op_code)
-            else if (requestToLeader(req) or req.header.op_code == @backingInt(proto.OpCode.namespace_published))
+            else if (missForwarded(req) and self.leaderApplying())
+                // A read a follower found nothing for: a leader still
+                // applying earlier terms can't say there's none either.
+                self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = LEADER_NOT_READY_REFUSAL })
+            else if (requestToLeader(req) or req.header.op_code == @backingInt(proto.OpCode.namespace_published) or missForwarded(req))
                 self.dispatchLocal(conn, req, auth)
             else
-                self.sendRefusal(conn, req.header.request_id, .bad_request, proto.notRun("bad request: only writes, reads the leader answers, and a follower's ask about the namespaces, are forwarded to a leader")),
+                self.sendRefusal(conn, req.header.request_id, .bad_request, proto.notRun("bad request: only writes, reads the leader answers, a follower's ask about the namespaces, and a read a follower found nothing for, are forwarded to a leader")),
         }
     }
 
@@ -2020,6 +2150,39 @@ pub const Shard = struct {
             var routed = req;
             routed.ns_id = self.namespaceIdOf(req);
             return self.route(conn, routed, auth);
+        }
+
+        // Any other request routed by key still without an id (a write that
+        // creates nothing: a delete, an expire, an ack) goes by the id the
+        // table has now, as a read does past the edge: shard 0 may have
+        // published the name since it was resolved. Routed by none it would
+        // go to the wrong shard: a delete there finds no key, and the key
+        // survives. Before the publish, a shard other than 0 asks shard 0,
+        // and looks again once shard 0 has published any create it holds.
+        //
+        // On a node of several shards, a write that creates nothing in a
+        // namespace that doesn't exist is refused as having none through
+        // shard 0, as shard 0's answer to another shard's ask refuses it
+        // there. A lone shard answers it as it always has.
+        const creates = op < proto.MAX_OPCODES and dispatcher_mod.opCreates(@fromBackingInt(@intCast(op)));
+        if (req.key.len > 0 and namespaced(op)) {
+            const name = if (req.namespace.len == 0) "default" else req.namespace;
+            const nh = self.namespace_handler;
+            if (req.ns_id == .invalid) {
+                if (nh.table.lookup(name)) |id| {
+                    var routed = req;
+                    routed.ns_id = id;
+                    return self.route(conn, routed, auth);
+                }
+                if (self.id != 0) return self.askShard0(conn, req, name, auth.origin);
+                if (self.shardCount() > 1 and requestWrites(req) and !creates and !nh.creating(name)) return self.sendRefusal(conn, req.header.request_id, .no_namespace, NO_NAMESPACE);
+            }
+            // Shard 0 routes by its own registry's id a namespace it applied
+            // but hasn't published, and the owning shard, which resolves
+            // names by the table, would find none: a write that creates
+            // nothing is held until the publish, as a read is (`edgeMiss`).
+            if (self.id == 0 and self.shardCount() > 1 and requestWrites(req) and !creates) if (nh.unpublishedIndex(name)) |index|
+                return self.holdAtEdgeFor(conn, req, name, auth.origin, nowMs(), index);
         }
 
         // A start that chooses its run id is decided on its workflow's
@@ -2378,9 +2541,10 @@ pub const Shard = struct {
         if (!writes and !at_leader and !exempt and !internal_from_client and auth.origin != .peer and self.refusedRead(conn, req)) return;
         const was_stale = proto.answering_stale;
         // A read is stale when this node can't apply what the group committed:
-        // halted, diverged, or blocked reading a committed entry — the
-        // projections sit behind the commit either way.
-        proto.answering_stale = was_stale or ((self.halted != null or self.replica.diverged or self.read_blocked) and !writes);
+        // halted, diverged, blocked reading a committed entry, or holding apply
+        // at a disk-staging gap under async_flush — the projections sit behind
+        // the commit either way.
+        proto.answering_stale = was_stale or ((self.halted != null or self.replica.diverged or self.read_blocked or self.gapHeld()) and !writes);
         defer proto.answering_stale = was_stale;
         if (self.raft_network != null and (writes or at_leader) and (self.replica.diverged or self.raft_node.role != .leader)) {
             if (self.replica.diverged) {
@@ -2397,7 +2561,7 @@ pub const Shard = struct {
             // the leader-side refusal still answers the cases this can't see (a
             // sender no config names, or one that wrongly believes it's a
             // voter). A non-leader voter forwards, below, which the guard admits.
-            if (!self.raft_node.timer_enabled and self.raft_node.self_named)
+            if (self.isReplica())
                 return self.redirectToLeader(conn, req, if (membership_op or repair_op) .admin else .write);
             if (conn.replyTo() == .remote) {
                 // Already forwarded once; a second hop during an election
@@ -2422,10 +2586,33 @@ pub const Shard = struct {
         const in_txn_read = table_run.readsInTxn(req);
         const worker_op = req.header.op_code == @backingInt(proto.OpCode.worker_register) or req.header.op_code == @backingInt(proto.OpCode.worker_heartbeat) or
             req.header.op_code == @backingInt(proto.OpCode.worker_deregister) or req.header.op_code == @backingInt(proto.OpCode.worker_drain);
-        const refuses_write = writes and !in_txn_read and !membership_op and !repair_op and !worker_op and !table_run.runsOnApplyingLeader(req);
+        // A real data write from a client or forwarded from a peer. The async
+        // bound applies to every one of these, including the ops that run on an
+        // applying leader (kv.*, namespace.create/ensure, action.await): they
+        // also ack before the entry reaches disk. runsOnApplyingLeader exempts
+        // that set from the leaderApplying refusal only, so the bound keeps its
+        // own gate rather than inheriting that exemption and skipping kv writes.
+        const bound_eligible = writes and !in_txn_read and !membership_op and !repair_op and !worker_op;
+        const refuses_write = bound_eligible and !table_run.runsOnApplyingLeader(req);
         if ((at_leader or in_txn_read or refuses_write) and self.leaderApplying()) {
             self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = LEADER_NOT_READY_REFUSAL });
             return;
+        }
+        // Under async_flush this node acks a write before it reaches disk. When
+        // the disk has fallen too far behind — flushing failing past the time
+        // bound, or too many bytes unflushed — refuse the write here, before it
+        // is proposed, rather than acknowledge one more that may be lost. ran=no
+        // is exact: nothing was proposed. It clears on its own once a flush
+        // lands. Only client and forwarded writes are held; duties propose
+        // directly and are small and bounded. A write already in flight is
+        // unaffected, so the buffer can overshoot by what that holds.
+        if (bound_eligible) {
+            const bound = self.asyncBoundCrossed();
+            if (bound != .none) {
+                var buf: [256]u8 = undefined;
+                self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .unclassified, .ran = .no, .message = self.asyncBoundMessage(&buf, bound) });
+                return;
+            }
         }
         // A write that brings data into a namespace this shard has not seen
         // creates it. Checked after forwarding because only the leader knows
@@ -3328,7 +3515,7 @@ pub const Shard = struct {
             // Reached its entry, or the pass drained fully (not stopped by the
             // budget, and not held by a blocked read): otherwise it parks and
             // is answered when the rest applies.
-            break :here self.raft_node.last_applied >= proposed.index or (!self.apply_behind and !self.read_blocked and self.snapshot_window == null);
+            break :here self.raft_node.last_applied >= proposed.index or (!self.apply_behind and !self.read_blocked and self.snapshot_window == null and !self.gapHeld());
         };
         if (answered_here) {
             defer if (release) |r| r(self, ctx);
@@ -3462,6 +3649,57 @@ pub const Shard = struct {
     /// Send a client's write to the leader, and
     /// hold the client until the leader answers. With no leader known the
     /// write waits for one, up to FORWARD_TIMEOUT_MS.
+    /// A read whose stream or series isn't here, on a follower: it may be
+    /// one the leader has and this node hasn't applied yet, so the leader
+    /// answers it, and not found is only ever the leader's. One hop only,
+    /// and never into the slots kept for writes; false when not sent, and
+    /// the caller answers what it found, marked stale.
+    pub fn missToLeader(self: *Shard, conn: *Connection, req: proto.Request) bool {
+        if (self.raft_network == null or self.raft_node.role == .leader or self.raft_node.leader_id == 0) return false;
+        // The leader refuses a replica's forwarded frames, so a replica's
+        // miss answers stale here rather than unavailable from there.
+        if (self.isReplica()) return false;
+        if (conn.replyTo() == .remote) return false;
+        if (self.forward_count >= FORWARD_SLOTS - FORWARD_WRITE_RESERVE) return false;
+        self.forwardToLeader(conn, req);
+        self.noteReadMiss(req.header.op_code, .leader);
+        return true;
+    }
+
+    /// A read missToLeader didn't send: on a follower, answered from its
+    /// state, which may be behind; true when it should be marked stale.
+    pub fn staleMiss(self: *Shard, op: u16) bool {
+        if (!self.followsLeader()) return false;
+        self.noteReadMiss(op, .stale);
+        return true;
+    }
+
+    fn noteReadMiss(self: *Shard, op: u16, how: ShardMetrics.ReadMiss) void {
+        const m = self.shard_metrics orelse return;
+        m.recordReadMiss(if (op == @backingInt(proto.OpCode.ts_read)) .ts_read else .stream_read, how);
+    }
+
+    /// The reads a follower sends its leader when it finds nothing. A
+    /// blocking stream read never is: it waits where it is, and a peer
+    /// mustn't park a waiter on the leader.
+    fn missForwarded(req: proto.Request) bool {
+        const op = req.header.op_code;
+        if (op == @backingInt(proto.OpCode.ts_read)) return true;
+        return op == @backingInt(proto.OpCode.stream_read) and req.getBlockMs() == null;
+    }
+
+    /// A non-voting member: it serves reads, and the leader refuses the
+    /// frames it forwards.
+    fn isReplica(self: *const Shard) bool {
+        return !self.raft_node.timer_enabled and self.raft_node.self_named;
+    }
+
+    /// Whether this node answers from a replica's state: a follower in a
+    /// cluster, which may be behind its leader.
+    pub fn followsLeader(self: *const Shard) bool {
+        return self.raft_network != null and self.raft_node.role != .leader;
+    }
+
     fn forwardToLeader(self: *Shard, conn: *Connection, req: proto.Request) void {
         const wait_ms = blockingWait(req) orelse 0;
         if (wait_ms > 0 and self.blocking_forwards >= FORWARD_SLOTS - FORWARD_WRITE_RESERVE) {
@@ -3645,10 +3883,12 @@ pub const Shard = struct {
     /// A read in a namespace this node's table doesn't have. The table
     /// shows a create once shard 0 has published it, which is after a write
     /// that created it implicitly may have been answered; so:
-    /// - shard 0 knows its own creates, applied or under way;
     /// - another shard asks shard 0 (`namespace.published`, a gather), which
     ///   answers once a create of the name it holds is published, and then
     ///   looks again (`EdgeAsk`);
+    /// - shard 0 on a node of several shards holds a read of a create it
+    ///   applied until it publishes it; one still under way, or any on a
+    ///   lone shard, reads by the id shard 0 holds;
     /// - on one node, or the leader, shard 0 has every create there is, so a
     ///   name it doesn't hold is none;
     /// - a follower's shard 0 may be behind: it holds the read and asks the
@@ -3659,15 +3899,34 @@ pub const Shard = struct {
     ///
     /// A shard other than 0 never asks the leader: a cluster member runs one
     /// shard, so it has none, and on one node shard 0 holds every create.
-    fn edgeMiss(self: *Shard, conn: *Connection, req: proto.Request, origin: run_mod.Origin) bool {
+    ///
+    /// A read the table resolves here routes by that id: shard 0 publishes
+    /// on its own thread, so an id resolved before could be none, and a read
+    /// routed by none goes to the wrong shard, which resolves the name and
+    /// answers not found for a key it doesn't hold.
+    fn edgeMiss(self: *Shard, conn: *Connection, req_in: *proto.Request, origin: run_mod.Origin) bool {
+        const req = req_in.*;
         if (!namespaced(req.header.op_code) or requestWrites(req)) return false;
         const name = if (req.namespace.len == 0) "default" else req.namespace;
         const nh = self.namespace_handler;
-        if (nh.table.lookup(name) != null) return false;
+        if (nh.table.lookup(name)) |id| {
+            req_in.ns_id = id;
+            return false;
+        }
         if (self.id != 0) {
             self.askShard0(conn, req, name, origin);
             return true;
         }
+        // On a node of several shards, shard 0 holds a read of a create it
+        // applied but hasn't published until it publishes it: the shard
+        // that owns the read's key resolves the name from the table, and
+        // before the publish finds none, answering not found for what
+        // exists (as after a restart, until shard 0's first publish). A
+        // lone shard reads by the id it holds.
+        if (self.shardCount() > 1) if (nh.unpublishedIndex(name)) |index| {
+            self.holdAtEdgeFor(conn, req, name, origin, nowMs(), index);
+            return true;
+        };
         if (nh.creating(name)) return false;
         if (self.raft_network == null or self.raft_node.role == .leader) {
             // A new leader may not have applied its predecessor's creates.
@@ -3730,6 +3989,12 @@ pub const Shard = struct {
     }
 
     fn holdAtEdge(self: *Shard, conn: *Connection, req: proto.Request, name: []const u8, origin: run_mod.Origin, now: u64) void {
+        self.holdAtEdgeFor(conn, req, name, origin, now, null);
+    }
+
+    /// Hold a read until this node's table is published through `index`, or,
+    /// with none, until the leader says how far its own is.
+    fn holdAtEdgeFor(self: *Shard, conn: *Connection, req: proto.Request, name: []const u8, origin: run_mod.Origin, now: u64, at: ?u64) void {
         if (conn.forwards_in_flight >= Connection.MAX_FORWARDS_IN_FLIGHT) return self.sendRefusal(conn, req.header.request_id, .overloaded, .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many requests on this connection are waiting; this request was not run — back off and retry" });
         const w = self.edge.free() orelse return self.sendRefusal(conn, req.header.request_id, .overloaded, EDGE_FULL);
         const bytes = serializeRequest(self.allocator, req) catch return self.sendRefusal(conn, req.header.request_id, .internal_error, proto.notRun("internal error: out of memory"));
@@ -3737,9 +4002,9 @@ pub const Shard = struct {
             self.allocator.free(bytes);
             return self.sendRefusal(conn, req.header.request_id, .internal_error, proto.notRun("internal error: out of memory"));
         };
-        const index = self.edge.knownIndex(name);
+        const index = at orelse self.edge.knownIndex(name);
         const asked = index != null or self.askingAbout(name);
-        w.* = .{ .active = true, .reply_to = conn.replyTo(), .origin = origin, .request_id = req.header.request_id, .bytes = bytes, .name = owned, .index = index, .deadline_ms = now + edge_mod.WAIT_MS };
+        w.* = .{ .active = true, .reply_to = conn.replyTo(), .origin = origin, .request_id = req.header.request_id, .bytes = bytes, .name = owned, .index = index, .local = at != null, .deadline_ms = now + edge_mod.WAIT_MS };
         self.edge.count += 1;
         // One of the connection's requests waiting elsewhere, as a gather's.
         conn.forwards_in_flight += 1;
@@ -3805,7 +4070,10 @@ pub const Shard = struct {
                 continue;
             };
             if (now >= w.deadline_ms) {
-                self.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, proto.notRun("unavailable: this node hasn't caught up with the leader's namespaces yet; the request was not run — retry"));
+                self.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, proto.notRun(if (w.local)
+                    "unavailable: the namespace is created but not yet on disk; the request was not run — retry"
+                else
+                    "unavailable: this node hasn't caught up with the leader's namespaces yet; the request was not run — retry"));
                 self.endEdgeWait(w);
             }
         }
@@ -4342,7 +4610,6 @@ pub const Shard = struct {
         if (self.raft_node.role == .leader) self.adjustMembership(now);
         if (self.joinWanted(now)) self.askToJoin(now);
         if (self.forward_count > 0) self.sweepForwards(now);
-        if (self.edge.count > 0) self.sweepEdge(now);
     }
 
     /// Stop at entry `e`, which no replica can apply: its `last_applied`
@@ -4741,6 +5008,14 @@ pub const Shard = struct {
         if (self.halted != null) return .halted;
         const raft = self.raft_node;
         if (raft.writes_stopped) return .cannot_flush;
+        // A disk-staging gap is open under async_flush: writes at or past it are
+        // held and not acked until it fills — the same not-on-disk condition
+        // sync reports, so it reads the same way.
+        if (self.gapHeld()) return .cannot_flush;
+        // The async-flush time or size bound is crossed: new writes are being
+        // refused because flushing has fallen behind, so the node is not healthy
+        // and should not read ready while it is turning writes away.
+        if (self.asyncBoundCrossed() != .none) return .cannot_flush;
         // A node no config names is joining. It is guarded too, since an
         // empty log could be a lost one, but it holds nothing a group
         // counts on yet, and joining says what it waits for.
@@ -4863,6 +5138,7 @@ pub const Shard = struct {
             if (self.durable_log) |dl| {
                 sm.buffer_failures.store(dl.writer.buffer_failures, .monotonic);
                 sm.buffer_failing_for_ms.store(if (dl.writer.buffer_failing_since_ms == 0) 0 else nowMs() -| dl.writer.buffer_failing_since_ms, .monotonic);
+                sm.gap_open_for_ms.store(if (dl.writer.gap_open_since_ms == 0) 0 else nowMs() -| dl.writer.gap_open_since_ms, .monotonic);
             }
         }
         const slot = self.health orelse return;
@@ -4925,6 +5201,7 @@ pub const Shard = struct {
         if (self.durable_log) |dl| {
             slot.buffer_failures.store(dl.writer.buffer_failures, .monotonic);
             slot.buffer_failing_for_ms.store(if (dl.writer.buffer_failing_since_ms == 0) 0 else nowMs() -| dl.writer.buffer_failing_since_ms, .monotonic);
+            slot.gap_open_for_ms.store(if (dl.writer.gap_open_since_ms == 0) 0 else nowMs() -| dl.writer.gap_open_since_ms, .monotonic);
         }
         slot.publish(self.healthState(), raft.role, raft.last_applied, raft.commit_index);
     }
@@ -5339,6 +5616,21 @@ pub const Shard = struct {
                 // Advanced before the apply: whatever a notification does, this
                 // entry is never taken twice, and the loop cannot stall.
                 raft.last_applied = next_idx;
+                // An entry the append hook could not stage for disk under
+                // async_flush opens a gap. Hold apply at it, as a blocked read
+                // does: nothing at or past it applies or is acked until the
+                // flush re-stages it (clearing the gap), or stops writes if it
+                // has left memory. Without this, async would ack an entry that
+                // may never reach disk.
+                if (self.durability == .async_flush) {
+                    if (self.durable_log) |dl| if (dl.writer.first_unbuffered) |from| if (next_idx >= from) {
+                        // The gap's start was stamped in the append hook when it
+                        // opened; apply only has to hold here, not re-stamp.
+                        raft.last_applied = next_idx - 1;
+                        all_applied = false;
+                        break :drain;
+                    };
+                }
                 switch (raft.log.readForApply(next_idx, self.apply_buf)) {
                     .blocked => |b| {
                         // The entry's segment could not be read right now (a
@@ -5870,8 +6162,10 @@ pub const Shard = struct {
         // node's table, and what waited for them is answered.
         self.namespace_handler.settle(self);
         // After shard 0 publishes, so a forward held there for this tick's
-        // creates runs now.
+        // creates runs now, and so does a read held for them: on a node
+        // with no peers too, whose ticks take no membership steps.
         if (self.edge.held_count > 0) self.sweepHeldForwards(nowMs());
+        if (self.edge.count > 0) self.sweepEdge(nowMs());
 
         if (leads or holds) self.runStepping();
 
@@ -7626,8 +7920,10 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
             return true;
         },
     };
-    // A read held only for its disk payloads is answered as a fresh read
-    // would be now, records or none: its stream may be trimmed or deleted.
+    // A read held only for its disk payloads is answered from its window as
+    // it reads now, records or none: a stream trimmed meanwhile answers what
+    // is left, and one deleted meanwhile answers empty, not not_found (the
+    // name check was made when the read arrived).
     if (records.len == 0 and waiter.kind == .stream_disk_read) {
         switch (result) {
             .stream_messages => |m| shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, m.data),
@@ -7664,16 +7960,19 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
 fn segmentBufferCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
     const writer: *SegmentWriter = @ptrCast(@alignCast(ctx));
     // Behind a gap nothing is buffered: the flush re-buffers from the gap.
-    if (writer.stop_at_gap and writer.first_unbuffered != null) return;
+    if (writer.first_unbuffered != null) return;
     writer.addEntry(entry) catch |err| {
+        // A hole on disk would break the on-disk ack promise (sync acks only on
+        // disk; async acks before it), so a staging failure always opens a gap
+        // rather than drop the entry and buffer past it. The early return above
+        // means no gap is open yet, so this entry opens it. Stamp the start now,
+        // at append time — before the entry commits — so health and metrics
+        // report the gap even on a follower withholding acks on it.
         writer.buffer_failures += 1;
         if (writer.buffer_failing_since_ms == 0) writer.buffer_failing_since_ms = Shard.nowMs();
-        if (writer.stop_at_gap) {
-            writer.first_unbuffered = entry.header.index;
-            log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; buffering resumes from it at the next flush (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
-        } else {
-            log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; it will be missing from disk after a restart (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
-        }
+        writer.first_unbuffered = entry.header.index;
+        writer.gap_open_since_ms = Shard.nowMs();
+        log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; buffering resumes from it at the next flush (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
         return;
     };
     // Buffered again: end any failing run. The cumulative count stays.
@@ -8603,7 +8902,14 @@ fn replaySegmentFile(
             break :v verdictOf(losses, shard_id, Shard.nowMs(), &seg_entry, applyEntryCore(partition, replay_registry, &seg_entry, &replay_result));
         };
         switch (verdict) {
-            .applied, .duplicate => {},
+            .applied => {},
+            // At boot, segments replay in index order, so every entry should
+            // apply exactly once; a duplicate means overlapping segments or a
+            // wrong watermark.
+            .duplicate => {
+                const type_name = std.enums.tagName(entry_mod.EntryType, @fromBackingInt(@intCast(seg_entry.header.entry_type))) orelse "unknown";
+                log.warn("shard {d}: replayed entry {d} ({s}) was skipped at apply (the partition rejected it as not increasing); its effect is absent after this boot", .{ shard_id, seg_entry.header.index, type_name });
+            },
             .halt => |why| {
                 const type_name = std.enums.tagName(entry_mod.EntryType, @fromBackingInt(@intCast(seg_entry.header.entry_type))) orelse "unknown";
                 out.halt = Halt.init(&seg_entry, "entry {d} ({s}): {s} (a Flo bug)", .{ seg_entry.header.index, type_name, why });
@@ -9558,6 +9864,7 @@ fn testReq(op: proto.OpCode, id: u64, ns: []const u8, key: []const u8, value: []
 fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8) []const u8 {
     switch (op) {
         .kv_put => return table_run.op("kv.set").request.encodeInto(buf, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null }) catch unreachable,
+        .kv_delete => return table_run.op("kv.delete").request.encodeInto(buf, .{ .cas_version = null, .txn = null }) catch unreachable,
         .kv_get => {
             const opts: proto.Request = .{ .header = undefined, .namespace = "", .key = "", .value = "", .options = options };
             var w: schema.Writer = .{ .buf = buf };
@@ -9811,10 +10118,16 @@ const TwoShards = struct {
     namespaces: *@import("../namespace/table.zig").Table,
 
     fn init(self: *TwoShards) !void {
+        return self.initAt(null);
+    }
+
+    /// Two shards keeping their logs under `data_dir`: a second `initAt`
+    /// on the same directory is a restart.
+    fn initAt(self: *TwoShards, data_dir: ?[]const u8) !void {
         self.namespaces = try @import("../namespace/table.zig").Table.create(std.testing.allocator);
         for (&self.pipes, 0..) |*p, i| {
             p.* = try @import("stdx").io.pipe();
-            self.shards[i] = try Shard.init(std.testing.allocator, @intCast(i), 2, p[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{ .namespaces = self.namespaces });
+            self.shards[i] = try Shard.init(std.testing.allocator, @intCast(i), 2, p[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{ .namespaces = self.namespaces });
         }
         for (0..2) |i| {
             self.mailboxes[i] = self.shards[i].mailbox;
@@ -11675,7 +11988,7 @@ test "Shard: source reads and pages are freed when dropped: a page for a pipelin
     defer builder.deinit(a.allocator);
     try builder.begin(a.allocator, read);
     try builder.record(a.allocator, 1, 0, "x");
-    const page = try builder.finish(a.allocator, 1, 0);
+    const page = try builder.finish(a.allocator, 1, 0, 0);
     // A page for a pipeline that was removed: dropped, freed.
     try std.testing.expect(a.mailbox.inbox.send(.{ .tag = .source_page, .src_shard = 1, .payload_len = @intCast(page.len), .payload_ptr = page.ptr }));
     _ = a.drainInbox();
@@ -11685,7 +11998,7 @@ test "Shard: source reads and pages are freed when dropped: a page for a pipelin
     var builder2: @import("../processing/source_page.zig").Page.Builder = .{};
     defer builder2.deinit(b.allocator);
     try builder2.begin(b.allocator, read);
-    const page2 = try builder2.finish(b.allocator, 0, 0);
+    const page2 = try builder2.finish(b.allocator, 0, 0, 0);
     try std.testing.expect(b.mailbox.inbox.send(.{ .tag = .source_page, .src_shard = 0, .payload_len = @intCast(page2.len), .payload_ptr = page2.ptr }));
     b.refuseUnrunRequests();
     try std.testing.expectEqual(@as(usize, 0), b.mailbox.inbox.pending());
@@ -14429,7 +14742,7 @@ test "shard: a real HARDSTATE persist failure shows in the field, the metric sna
     try std.testing.expectEqual(@as(u64, 0), shard.shard_metrics.?.snapshot().hardstate_failing_for_ms);
 }
 
-test "shard: a real buffer failure shows in the field, the metric snapshot and text, /status, and a later entry that buffers ends the run" {
+test "shard: a real buffer failure shows in the field, the metric snapshot and text, /status, and a flush that re-stages the gap ends the run" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const data_dir = try testDataDir(&tmp);
@@ -14486,12 +14799,198 @@ test "shard: a real buffer failure shows in the field, the metric snapshot and t
     try std.testing.expectEqual(@as(i64, 1), s0.get("buffer_failures").?.integer);
     try std.testing.expect(s0.get("buffer_failing_for_ms").?.integer >= 1000);
 
-    // A later entry that buffers ends the run; the cumulative count stays.
-    _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "k2", "v");
+    // A flush re-stages the gapped entry from the log and ends the run; the
+    // cumulative count stays. Both durabilities now stop at the gap (the entry
+    // is held, not dropped past), so the run ends when buffering catches up at
+    // a flush, not when a later append slips in behind the hole.
+    try shard.flushSegmentToDisk();
     try std.testing.expectEqual(@as(u64, 0), writer.buffer_failing_since_ms);
     try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures);
     shard.publishHealth();
     try std.testing.expectEqual(@as(u64, 0), shard.shard_metrics.?.snapshot().buffer_failing_for_ms);
+}
+
+test "shard: the async-flush time bound trips after flushes fail long enough and clears on a flush" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    // The server converts [server] async_flush_bound_seconds/mb to ms/bytes.
+    var shard = try Shard.init(std.testing.allocator, 0, 4, pipe_fds[0], data_dir, 8 * 1024 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{ .async_flush_bound_ms = 3000, .async_flush_bound_bytes = 64 * 1024 * 1024 });
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+
+    // Healthy: nothing failing, buffer under 64 MiB.
+    try std.testing.expect(shard.asyncBoundCrossed() == .none);
+
+    // Make a real flush fail, then age the failing clock past the 3 s bound.
+    const raft = shard.raft_node;
+    _ = try raft.propose(.raft_noop, entry_mod.Flags.NONE, "x");
+    const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
+    defer std.testing.allocator.free(segs);
+    var zbuf: [600:0]u8 = undefined;
+    const z = try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{segs}, 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(z, 0o500));
+    defer _ = std.c.chmod(z, 0o700);
+    try std.testing.expect(!shard.flushForAck());
+    try std.testing.expect(shard.flushes_failing_since_ms != 0);
+
+    // Just under the bound: not yet crossed. Past it: the time bound, named.
+    shard.flushes_failing_since_ms = Shard.nowMs() -| 2_900;
+    try std.testing.expect(shard.asyncBoundCrossed() == .none);
+    shard.flushes_failing_since_ms = Shard.nowMs() -| 3_200;
+    switch (shard.asyncBoundCrossed()) {
+        .time => |ms| try std.testing.expect(ms >= 3_000),
+        else => return error.ExpectedTimeBound,
+    }
+    var buf: [256]u8 = undefined;
+    const msg = shard.asyncBoundMessage(&buf, shard.asyncBoundCrossed());
+    try std.testing.expect(std.mem.indexOf(u8, msg, "haven't reached disk for 3.2 s (limit 3 s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "was not run") != null);
+    // While it refuses writes, health reads cannot_flush (not ok), so the node
+    // does not read ready while turning writes away.
+    try std.testing.expectEqual(health_mod.ShardState.cannot_flush, shard.healthState());
+
+    // A flush that reaches disk clears the run and the bound with it.
+    _ = std.c.chmod(z, 0o700);
+    try std.testing.expect(shard.flushForAck());
+    try std.testing.expect(shard.asyncBoundCrossed() == .none);
+    try std.testing.expectEqual(health_mod.ShardState.ok, shard.healthState());
+}
+
+test "shard: the async-flush size bound trips on unflushed bytes and clears on a flush" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    // Only the size bound is armed (1 byte), so any buffered entry crosses it.
+    var shard = try Shard.init(std.testing.allocator, 0, 4, pipe_fds[0], data_dir, 8 * 1024 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{ .async_flush_bound_ms = 0, .async_flush_bound_bytes = 1 });
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+
+    // Drain the bootstrap noop the single-node start buffered, so the test
+    // begins with an empty buffer.
+    const raft = shard.raft_node;
+    try std.testing.expect(shard.flushForAck());
+    try std.testing.expect(shard.asyncBoundCrossed() == .none);
+
+    // One buffered entry is already over a 1-byte bound.
+    _ = try raft.propose(.raft_noop, entry_mod.Flags.NONE, "x");
+    switch (shard.asyncBoundCrossed()) {
+        .size => |bytes| try std.testing.expect(bytes >= 1),
+        else => return error.ExpectedSizeBound,
+    }
+    // Flushing it to disk drains the buffer, so the bound clears.
+    try std.testing.expect(shard.flushForAck());
+    try std.testing.expect(shard.asyncBoundCrossed() == .none);
+}
+
+test "shard: the async-flush bound refusal names the measured value and the configured limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, pipe_fds[0], data_dir, 8 * 1024 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{ .async_flush_bound_ms = 3000, .async_flush_bound_bytes = 64 * 1024 * 1024 });
+    defer shard.deinit();
+
+    var tbuf: [256]u8 = undefined;
+    const t = shard.asyncBoundMessage(&tbuf, .{ .time = 3_200 });
+    try std.testing.expect(std.mem.indexOf(u8, t, "haven't reached disk for 3.2 s (limit 3 s)") != null);
+
+    var sbuf: [256]u8 = undefined;
+    // ~64.1 MiB unflushed.
+    const s = shard.asyncBoundMessage(&sbuf, .{ .size = 64 * 1024 * 1024 + 110_000 });
+    try std.testing.expect(std.mem.indexOf(u8, s, "hasn't reached disk (limit 64 MiB)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "64.1 MiB") != null);
+}
+
+test "shard: a client write is refused with the bound text once the async-flush bound is crossed, and admitted again after a flush" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], data_dir, 8 * 1024 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{ .async_flush_bound_ms = 3000, .async_flush_bound_bytes = 64 * 1024 * 1024 });
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    // Fail a real flush and age the failing clock past the 3 s time bound.
+    const raft = shard.raft_node;
+    _ = try raft.propose(.raft_noop, entry_mod.Flags.NONE, "x");
+    const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
+    defer std.testing.allocator.free(segs);
+    var zbuf: [600:0]u8 = undefined;
+    const z = try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{segs}, 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(z, 0o500));
+    defer _ = std.c.chmod(z, 0o700);
+    try std.testing.expect(!shard.flushForAck());
+    shard.flushes_failing_since_ms = Shard.nowMs() -| 3_200;
+
+    // A client write is refused before it is proposed: unavailable, naming the
+    // bound. Assert the answer itself — the CLI exits 0 even on a refusal.
+    var out: [512]u8 = undefined;
+    shard.runRequest(conn, testReq(.kv_put, 5, "", "k", "v", ""), .client);
+    const resp = try readOne(&shard, conn, pair[1], &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 5), resp.header.request_id);
+    try std.testing.expect(std.mem.indexOf(u8, resp.data, "haven't reached disk for 3.2 s (limit 3 s)") != null);
+
+    // The bound covers every data write, not only the ops the leaderApplying
+    // refusal would catch. kv.* runs on an applying leader (so it's exempt from
+    // that refusal) but is still acked before disk — the kv_put above proves it
+    // is held. A queue write, which the leaderApplying refusal does catch, is
+    // held here too: the refusal is at admission, so either op reaches it.
+    shard.runRequest(conn, testReq(.queue_complete, 7, "", "q", "v", ""), .client);
+    const respq = try readOne(&shard, conn, pair[1], &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), respq.header.status);
+    try std.testing.expectEqual(@as(u64, 7), respq.header.request_id);
+    try std.testing.expect(std.mem.indexOf(u8, respq.data, "haven't reached disk") != null);
+
+    // A flush that reaches disk clears the bound; the next write is admitted and
+    // applies here, so its ok answer is delivered (a refusal answers at once; an
+    // admitted write is answered once it applies).
+    _ = std.c.chmod(z, 0o700);
+    try std.testing.expect(shard.flushForAck());
+    try std.testing.expect(shard.asyncBoundCrossed() == .none);
+    shard.runRequest(conn, testReq(.kv_put, 6, "", "k", "v", ""), .client);
+    _ = shard.applyCommitted();
+    const resp2 = try readOne(&shard, conn, pair[1], &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp2.header.status);
+    try std.testing.expectEqual(@as(u64, 6), resp2.header.request_id);
+}
+
+/// Flush the shard's buffered answers to the connection and read exactly one
+/// response, without blocking — the shard buffers answers per connection, so a
+/// test must flush before it can read one from the socket.
+fn readOne(sh: *Shard, conn: *Connection, fd: std.posix.fd_t, buf: []u8) !proto.Response {
+    sh.flushToClient(conn.fd);
+    var total: usize = 0;
+    while (total < buf.len) {
+        const r = std.c.recv(fd, buf[total..].ptr, buf.len - total, std.c.MSG.DONTWAIT);
+        if (r <= 0) break;
+        total += @intCast(r);
+    }
+    try std.testing.expect(total > 0);
+    return proto.Response.parse(buf[0..total]);
 }
 
 test "Shard: a data directory that belonged to a group refuses to run alone, and rejoins as a member" {
@@ -14914,7 +15413,7 @@ test "Shard: a node forwards only writes to its leader; a forwarded read is refu
     const reply = rn.outbound.items[0].frame[transport.HEADER_SIZE..];
     const resp = try proto.Response.parse(reply[12..]);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
-    try std.testing.expectEqualStrings("bad request: only writes, reads the leader answers, and a follower's ask about the namespaces, are forwarded to a leader", (try resp.refused()).message);
+    try std.testing.expectEqualStrings("bad request: only writes, reads the leader answers, a follower's ask about the namespaces, and a read a follower found nothing for, are forwarded to a leader", (try resp.refused()).message);
     try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
 }
 
@@ -15403,8 +15902,7 @@ test "Shard: appends, enqueues and a time-series write parked behind a peer's ac
     try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, rs[4].data[0..8], .little));
     // Server-stamped: the point's timestamp is its entry header's clock,
     // its sequence its entry's index.
-    const hdr_ms = raft.log.getEntry(ts_index).?.header.timestamp_ns / 1_000_000;
-    try std.testing.expectEqual(hdr_ms, std.mem.readInt(u64, rs[2].data[8..16], .little));
+    try std.testing.expectEqual(raft.log.getEntry(ts_index).?.header.timestamp_ns, std.mem.readInt(u64, rs[2].data[8..16], .little));
     try std.testing.expectEqual(ts_index, std.mem.readInt(u64, rs[2].data[16..24], .little));
 }
 
@@ -17984,8 +18482,8 @@ test "Shard: in sync mode a buffer-failure run holds behind the gap and ends onc
     _ = try kv_handler_mod.KVHandler.testProposePut(&s.shard, "k1", "v");
     writer.allocator = real;
     try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures);
-    // The run started. Behind the sync gap the append hook returns early, so
-    // the next entry does not clear it — it holds until rebuffering catches up.
+    // The run started. Behind the gap the append hook returns early, so the
+    // next entry does not clear it — it holds until rebuffering catches up.
     try std.testing.expect(writer.buffer_failing_since_ms != 0);
     _ = try kv_handler_mod.KVHandler.testProposePut(&s.shard, "k2", "v");
     try std.testing.expect(writer.buffer_failing_since_ms != 0);
@@ -18024,6 +18522,213 @@ test "Shard: with sync durability, an entry that left memory before reaching dis
     try std.testing.expectEqual(proto.StatusCode.unavailable, refused.getStatus());
     try std.testing.expect(std.mem.indexOf(u8, refused.data, "stopped taking writes") != null);
     try std.testing.expectEqual(last, s.shard.raft_node.log.lastIndex());
+}
+
+const GapAlone = struct {
+    data_dir: []const u8,
+    pipe_fds: [2]i32,
+    pair: [2]std.posix.fd_t,
+    shard: Shard,
+    conn: *Connection,
+
+    fn init(self: *GapAlone, tmp: *std.testing.TmpDir) !void {
+        self.data_dir = try testDataDir(tmp);
+        self.pipe_fds = try @import("stdx").io.pipe();
+        // Bounds off (0/0): only the staging-gap path is under test here.
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, self.pipe_fds[0], self.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+        self.shard.wireHandlerShardPtrs();
+        try std.testing.expect(self.shard.applyCommitted());
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &self.pair));
+        self.conn = try self.shard.addConnection(self.pair[0]);
+    }
+
+    fn deinit(self: *GapAlone) void {
+        self.shard.deinit();
+        _ = std.c.close(self.pair[1]);
+        _ = std.c.close(self.pipe_fds[0]);
+        _ = std.c.close(self.pipe_fds[1]);
+        std.testing.allocator.free(self.data_dir);
+    }
+
+    /// Flush what is buffered to disk and drop the writer's spare capacity, so
+    /// the very next append must allocate — and the next `openGap` can fail it.
+    fn settleEmpty(self: *GapAlone) !void {
+        try self.shard.flushSegmentToDisk();
+        const writer = self.shard.durable_log.?.writer;
+        writer.data.clearAndFree(writer.allocator);
+        writer.sparse_index.clearAndFree(writer.allocator);
+    }
+
+    /// Send a put whose append cannot be staged for disk (its allocation
+    /// fails), opening a gap. Caller has already `settleEmpty`.
+    fn openGap(self: *GapAlone, id: u64, key: []const u8) !void {
+        const writer = self.shard.durable_log.?.writer;
+        const real = writer.allocator;
+        var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
+        writer.allocator = failing.allocator();
+        try ParkTest.send(&self.shard, self.conn, .kv_put, id, key, "v");
+        writer.allocator = real;
+        _ = self.shard.applyCommitted();
+    }
+
+    fn put(self: *GapAlone, id: u64, key: []const u8, buf: []u8) !proto.Response {
+        try ParkTest.send(&self.shard, self.conn, .kv_put, id, key, "v");
+        _ = self.shard.applyCommitted();
+        var r: [1]proto.Response = undefined;
+        try ParkTest.responses(&self.shard, self.conn, self.pair[1], buf, &r);
+        return r[0];
+    }
+
+    fn reply(self: *GapAlone, buf: []u8) !proto.Response {
+        _ = self.shard.applyCommitted();
+        var r: [1]proto.Response = undefined;
+        try ParkTest.responses(&self.shard, self.conn, self.pair[1], buf, &r);
+        return r[0];
+    }
+};
+
+test "Shard: alone with async_flush, a write that can't be staged for disk is held, not acked, then acked once it is re-staged" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: GapAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+    var buf: [1024]u8 = undefined;
+
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.put(1, "k0", &buf)).getStatus());
+    try s.settleEmpty();
+    try s.openGap(2, "k1");
+
+    // The entry is a gap: its write is held (not answered), it is not applied,
+    // and the shard reports the stall like a failed flush would.
+    const writer = s.shard.durable_log.?.writer;
+    try std.testing.expect(writer.first_unbuffered != null);
+    try std.testing.expect(s.conn.response_deferred);
+    try std.testing.expect(s.shard.kv_handler.kv.getIn(.default, "k1") == null);
+    try std.testing.expect(s.shard.asyncBoundCrossed() == .gap);
+    try std.testing.expectEqual(health_mod.ShardState.cannot_flush, s.shard.healthState());
+    try std.testing.expect(writer.gap_open_since_ms != 0);
+
+    // The flush re-stages the entry from the log, clearing the gap; the held
+    // write is then answered, once, and the value is present.
+    try s.shard.flushSegmentToDisk();
+    try std.testing.expect(writer.first_unbuffered == null);
+    try std.testing.expectEqual(@as(u64, 0), writer.gap_open_since_ms);
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.reply(&buf)).getStatus());
+    try std.testing.expect(s.shard.kv_handler.kv.getIn(.default, "k1") != null);
+    try std.testing.expectEqual(health_mod.ShardState.ok, s.shard.healthState());
+
+    // A later write lands once, as normal.
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.put(3, "k2", &buf)).getStatus());
+    try std.testing.expect(s.shard.kv_handler.kv.getIn(.default, "k2") != null);
+}
+
+test "Shard: alone with async_flush, a held write whose entry leaves memory before disk is told it is lost, and writes stop" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: GapAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+    var buf: [1024]u8 = undefined;
+
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.put(1, "k0", &buf)).getStatus());
+    try s.settleEmpty();
+    try s.openGap(2, "k1");
+    try std.testing.expect(s.conn.response_deferred);
+
+    // The gap entry is evicted from the log before it could be re-staged: it is
+    // nowhere, so the shard stops writes and the held write is told it is lost.
+    _ = s.shard.raft_node.log.ual.evictOlderThan(std.math.maxInt(u64));
+    s.shard.flushSegmentToDisk() catch {};
+    try std.testing.expect(s.shard.raft_node.writes_stopped);
+    const lost = try s.reply(&buf);
+    try std.testing.expectEqual(proto.StatusCode.unavailable, lost.getStatus());
+    try std.testing.expect(std.mem.indexOf(u8, lost.data, "lost when the node restarts") != null);
+
+    // A new write is refused before it reaches the log.
+    const last = s.shard.raft_node.log.lastIndex();
+    const refused = try s.put(3, "k3", &buf);
+    try std.testing.expectEqual(proto.StatusCode.unavailable, refused.getStatus());
+    try std.testing.expect(std.mem.indexOf(u8, refused.data, "stopped taking writes") != null);
+    try std.testing.expectEqual(last, s.shard.raft_node.log.lastIndex());
+
+    // writes_stopped is permanent, so admission keeps deferring to it even once
+    // flushing has been failing past the time bound — it never flips back to a
+    // transient "retry". And a follower still withholds its ack (gapHeld stays
+    // true), since the gap entry must never count toward commit on a node whose
+    // disk it can't reach.
+    s.shard.async_flush_bound_ms = 3000;
+    s.shard.flushes_failing_since_ms = Shard.nowMs() -| 5000; // well past the bound
+    try std.testing.expect(s.shard.asyncBoundCrossed() == .none);
+    try std.testing.expect(s.shard.gapHeld());
+}
+
+test "Shard: in a cluster with async_flush, a held write whose entry is evicted may still apply, so it is not told it is lost" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: GapAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+    var buf: [1024]u8 = undefined;
+
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.put(1, "k0", &buf)).getStatus());
+    try s.settleEmpty();
+    try s.openGap(2, "k1");
+    try std.testing.expect(s.conn.response_deferred);
+
+    // A voter peer: this node is no longer alone. The evicted entry may still
+    // hold and commit on that peer, so a blind resend would apply it twice — the
+    // held write is told it may still apply and to check before resending, not
+    // that it is lost (which the alone case says).
+    s.shard.raft_node.addPeer(2);
+    try std.testing.expect(s.shard.raft_node.voterPeers() > 0);
+    _ = s.shard.raft_node.log.ual.evictOlderThan(std.math.maxInt(u64));
+    s.shard.flushSegmentToDisk() catch {};
+    try std.testing.expect(s.shard.raft_node.writes_stopped);
+    const held = try s.reply(&buf);
+    try std.testing.expectEqual(proto.StatusCode.unavailable, held.getStatus());
+    try std.testing.expect(std.mem.indexOf(u8, held.data, "check before resending") != null);
+    try std.testing.expect(std.mem.indexOf(u8, held.data, "lost when the node restarts") == null);
+}
+
+test "Shard: alone with async_flush, a gap held open never lets channelDurable pass the flushed tip" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: GapAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+    var buf: [1024]u8 = undefined;
+
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.put(1, "k0", &buf)).getStatus());
+    try s.settleEmpty(); // k0 on disk; the flushed tip is at k0.
+    const durable_before = s.shard.channelDurable();
+
+    try s.openGap(2, "k1");
+    const gap_at = s.shard.durable_log.?.writer.first_unbuffered.?;
+    // The flushed tip a channel delivers against must sit before the gap.
+    try std.testing.expect(s.shard.channelDurable() < gap_at);
+    try std.testing.expectEqual(durable_before, s.shard.channelDurable());
+
+    // Writes commit behind the gap (held by the apply-hold, never staged).
+    _ = try kv_handler_mod.KVHandler.testProposePut(&s.shard, "k2", "v");
+    _ = try kv_handler_mod.KVHandler.testProposePut(&s.shard, "k3", "v");
+    _ = s.shard.applyCommitted();
+
+    // A flush that can't re-stage the gap must not advance the flushed tip:
+    // channelDurable stays put, so a channel trims no further than disk holds.
+    const writer = s.shard.durable_log.?.writer;
+    const real = writer.allocator;
+    var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
+    writer.allocator = failing.allocator();
+    s.shard.flushSegmentToDisk() catch {};
+    writer.allocator = real;
+    try std.testing.expect(s.shard.channelDurable() < gap_at);
+    try std.testing.expectEqual(durable_before, s.shard.channelDurable());
+
+    // Healed: the flush re-stages from the gap and the tip advances past it.
+    try s.shard.flushSegmentToDisk();
+    try std.testing.expect(writer.first_unbuffered == null);
+    try std.testing.expect(s.shard.channelDurable() >= gap_at);
 }
 
 test "Shard: a namespace create is published, and answered, only once its segment and directory are on disk" {
@@ -18120,7 +18825,7 @@ test "Shard: a second create of a name being created waits for the first, and is
     try std.testing.expectEqual(@backingInt(proto.StatusCode.conflict), by_id[1].header.status);
 }
 
-test "Shard: with async durability, an entry the writer could not buffer is a hole, and buffering goes on" {
+test "Shard: with async durability, an entry the writer could not buffer opens a gap and holds; a flush re-stages it and what follows" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const data_dir = try testDataDir(&tmp);
@@ -18133,20 +18838,36 @@ test "Shard: with async durability, an entry the writer could not buffer is a ho
     shard.wireHandlerShardPtrs();
     try shard.flushSegmentToDisk();
 
+    // Async acks before disk, so a hole would be acked-but-lost. Async now holds
+    // at the gap exactly as sync does: the entry that failed to stage is kept,
+    // and nothing after it buffers until a flush re-stages from the gap.
     const writer = shard.durable_log.?.writer;
     writer.data.clearAndFree(writer.allocator);
     writer.sparse_index.clearAndFree(writer.allocator);
     const real = writer.allocator;
     var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
     writer.allocator = failing.allocator();
-    _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "k1", "v");
+    const first = try kv_handler_mod.KVHandler.testProposePut(&shard, "k1", "v");
     writer.allocator = real;
-    const second = try kv_handler_mod.KVHandler.testProposePut(&shard, "k2", "v");
+    _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "k2", "v");
     try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures);
-    try std.testing.expect(writer.first_unbuffered == null);
-    try std.testing.expectEqual(@as(u32, 1), writer.entry_count);
-    try std.testing.expectEqual(second.index, writer.first_index);
+    try std.testing.expectEqual(first.index, writer.first_unbuffered);
+    try std.testing.expect(writer.gap_open_since_ms != 0);
+    try std.testing.expectEqual(@as(u32, 0), writer.entry_count); // nothing buffered past the gap
+    try std.testing.expectEqual(health_mod.ShardState.cannot_flush, shard.healthState());
+
+    // The flush re-stages from the gap: the held entry and the one after it both
+    // reach disk once each, in order; the gap clears and health recovers.
     try shard.flushSegmentToDisk();
+    try std.testing.expect(writer.first_unbuffered == null);
+    try std.testing.expectEqual(@as(u64, 0), writer.gap_open_since_ms);
+    try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures); // the count stays
+    try std.testing.expectEqual(health_mod.ShardState.ok, shard.healthState());
+    var got: [4]entry_mod.Entry = undefined;
+    var arena: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), shard.durable_log.?.readRange(first.index, &got, &arena).count);
+    try std.testing.expectEqual(first.index, got[0].header.index);
+    try std.testing.expectEqual(first.index + 1, got[1].header.index);
 }
 
 test "shard: a forwarded request parsed without its options trailer re-serializes whole" {
@@ -23521,6 +24242,103 @@ test "Shard: a skip seals its segment as it applies, under a watermark at or pas
     try std.testing.expect(shard.halted == null);
 }
 
+test "Shard: a follower sends its leader a read it found no stream or series for, and answers stale past the forwards it may hold" {
+    var t: AdminTest = undefined;
+    try t.init(3, .join);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    raft.role = .follower;
+    raft.leader_id = 1;
+    var body: [64]u8 = undefined;
+    const read_ts = table_run.op("ts.read").request.encodeInto(&body, .{ .field = "value", .tags = "", .from_ns = null, .to_ns = null, .limit = 10, .order = .oldest_first, .cursor = "" }) catch unreachable;
+    // Not here: it may be the leader's, not yet applied here.
+    const held = t.shard.forward_count;
+    t.shard.runRequest(t.conn, try ParkTest.request(.stream_read, 1, "", "nosuch", "", ""), .client);
+    try std.testing.expectEqual(held + 1, t.shard.forward_count);
+    try std.testing.expect(t.conn.response_deferred);
+    t.conn.response_deferred = false;
+    t.shard.runRequest(t.conn, .{ .header = proto.RequestHeader.init(.ts_read, 2), .namespace = "", .key = "nosuch", .value = read_ts }, .client);
+    try std.testing.expectEqual(held + 2, t.shard.forward_count);
+
+    // Past the forwards a follower may hold for reads: answered here, as
+    // not found from a replica's state, marked stale.
+    t.shard.forward_count = FORWARD_SLOTS - FORWARD_WRITE_RESERVE;
+    defer t.shard.forward_count = held + 2;
+    var buf: [256]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    t.conn.response_deferred = false;
+    t.shard.runRequest(t.conn, try ParkTest.request(.stream_read, 3, "", "nosuch", "", ""), .client);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), one[0].header.status);
+    try std.testing.expect(one[0].header.flags & proto.RESPONSE_STALE != 0);
+    try std.testing.expectEqual(proto.Reason.not_found, (try one[0].refused()).reason);
+}
+
+test "Shard: a leader still applying earlier terms refuses a read a follower sent it for want of a stream, rather than say there's none" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    try std.testing.expect(raft.leaderReady());
+    // Leading, its term's first entry not yet applied.
+    raft.ready_index = raft.last_applied + 1;
+    defer raft.ready_index = raft.last_applied;
+    var buf: [256]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    t.shard.runRequest(t.conn, try ParkTest.request(.stream_read, 1, "", "nosuch", "", ""), .peer);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try one[0].refused()).ran);
+}
+
+test "Shard: a replica answers a read it found no stream for itself, stale, since the leader refuses what it forwards" {
+    var t: AdminTest = undefined;
+    try t.init(3, .join);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    raft.self_named = true;
+    raft.timer_enabled = false;
+    raft.role = .follower;
+    raft.leader_id = 1;
+    const held = t.shard.forward_count;
+    var buf: [256]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    t.shard.runRequest(t.conn, try ParkTest.request(.stream_read, 1, "", "nosuch", "", ""), .client);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(held, t.shard.forward_count);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), one[0].header.status);
+    try std.testing.expect(one[0].header.flags & proto.RESPONSE_STALE != 0);
+    try std.testing.expectEqual(proto.Reason.not_found, (try one[0].refused()).reason);
+}
+
+test "Shard: a leader refuses a blocking stream read a peer sends it, so no peer parks a waiter there" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    var ob_buf: [32]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&ob_buf);
+    try ob.addU32(.block_ms, 5000);
+    var buf: [256]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    t.shard.runRequest(t.conn, try ParkTest.request(.stream_read, 1, "", "nosuch", "", ob.getOptions()), .peer);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try one[0].refused()).ran);
+}
+
+test "Shard: a leader answers a read a follower sent it for want of a stream" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    var buf: [256]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    t.shard.runRequest(t.conn, try ParkTest.request(.stream_read, 1, "", "nosuch", "", ""), .peer);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    // Run, and answered by the leader's own state: no such stream, not stale.
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), one[0].header.status);
+    try std.testing.expect(one[0].header.flags & proto.RESPONSE_STALE == 0);
+}
+
 test "Shard: a replica refuses a repair from its admin socket up front, naming the leader" {
     var t: AdminTest = undefined;
     try t.init(3, .join);
@@ -23732,6 +24550,206 @@ const EdgeFollower = struct {
         f.t.deinit();
     }
 };
+
+test "Shard: a read resolved before shard 0 published its namespace routes by the id the edge found, not by none" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var body: [64]u8 = undefined;
+    // As `runRequest` resolves it before shard 0's thread publishes: none.
+    var req = edgeGet(&body, 1, "xs", "k");
+    req.ns_id = .invalid;
+    const id: ns_table.Id = .of(ns_table.FIRST_ALLOCATED.int() + 3);
+    try two.namespaces.publish(id, "xs", 1);
+    // Published by the time the edge looks: let through, with that id.
+    try std.testing.expect(!b.edgeMiss(c.conn, &req, .client));
+    try std.testing.expectEqual(id, req.ns_id);
+}
+
+/// A first life of two shards under `data_dir`: namespace "xs" created,
+/// and key "v" written under a key shard 1 owns by the namespace's id but
+/// shard 0 would own by none, so a request routed by no id goes astray.
+fn twoShardsWithXsKey(data_dir: []const u8, key_buf: *[8]u8) ![]const u8 {
+    var out: [512]u8 = undefined;
+    var two: TwoShards = undefined;
+    try two.initAt(data_dir);
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const a = &two.shards[0];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    a.runRequest(c.conn, try ParkTest.request(.namespace_create, 1, "", "xs", "", ""), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, a, &out)).header.status);
+    const id = two.namespaces.lookup("xs").?;
+    var key: []const u8 = "";
+    var i: u8 = 0;
+    while (key.len == 0) : (i += 1) {
+        const k = try std.fmt.bufPrint(key_buf, "k{d}", .{i});
+        if (a.router.hashToShard(node_router.routeNsKey(id, k)) == 1 and a.router.hashToShard(node_router.routeNsKey(.invalid, k)) == 0) key = k;
+    }
+    a.runRequest(c.conn, testReq(.kv_put, 2, "xs", key, "v", ""), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, a, &out)).header.status);
+    for (&two.shards) |*s| try s.flushSegmentToDisk();
+    return key;
+}
+
+/// The second life: both shards booted from `data_dir`, everything applied,
+/// "xs" held by shard 0 and not yet in the node's table.
+fn restartedBeforePublish(two: *TwoShards, data_dir: []const u8) !void {
+    try two.initAt(data_dir);
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    for (&two.shards) |*s| _ = s.applyCommitted();
+    try std.testing.expect(two.namespaces.lookup("xs") == null);
+}
+
+fn drainBoth(two: *TwoShards) void {
+    for (0..4) |_| for (&two.shards) |*s| {
+        _ = s.drainInbox();
+    };
+}
+
+test "Shard: after a restart, a read through shard 0 of a key another shard owns waits for shard 0 to publish its namespace, then finds it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    var key_buf: [8]u8 = undefined;
+    const key = try twoShardsWithXsKey(data_dir, &key_buf);
+    var two: TwoShards = undefined;
+    try restartedBeforePublish(&two, data_dir);
+    defer two.deinit();
+    const a = &two.shards[0];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var body: [64]u8 = undefined;
+    var out: [512]u8 = undefined;
+    a.runRequest(c.conn, edgeGet(&body, 3, "xs", key), .client);
+    drainBoth(&two);
+    // Held, not answered as missing; answered once shard 0's tick publishes.
+    try expectNoAnswer(c, a);
+    _ = try a.tick(0);
+    two.settle();
+    const got = try nextAnswer(c, a, &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), got.header.status);
+    var diag: schema.Diagnostic = .{};
+    try std.testing.expectEqualStrings("v", (try table_run.op("kv.get").response.decodeAll(got.data, &diag)).value);
+}
+
+test "Shard: after a restart, a delete through another shard before shard 0 publishes its namespace deletes the key where it is" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    var key_buf: [8]u8 = undefined;
+    const key = try twoShardsWithXsKey(data_dir, &key_buf);
+    var two: TwoShards = undefined;
+    try restartedBeforePublish(&two, data_dir);
+    defer two.deinit();
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var body: [64]u8 = undefined;
+    var out: [512]u8 = undefined;
+    // By no id the key is shard 0's, where there is none: the delete waits
+    // for the name, then goes where the key is.
+    b.runRequest(c.conn, testReq(.kv_delete, 4, "xs", key, "", ""), .client);
+    two.settle();
+    try expectDeleted(try nextAnswer(c, b, &out));
+    b.runRequest(c.conn, edgeGet(&body, 5, "xs", key), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), (try nextAnswer(c, b, &out)).header.status);
+}
+
+fn expectDeleted(r: proto.Response) !void {
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
+    var diag: schema.Diagnostic = .{};
+    try std.testing.expectEqual(@as(?bool, true), (try table_run.op("kv.delete").response.decodeAll(r.data, &diag)).existed);
+}
+
+test "Shard: after a restart, a delete through shard 0 before it publishes its namespace waits for the publish, then deletes the key where it is" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    var key_buf: [8]u8 = undefined;
+    const key = try twoShardsWithXsKey(data_dir, &key_buf);
+    var two: TwoShards = undefined;
+    try restartedBeforePublish(&two, data_dir);
+    defer two.deinit();
+    const a = &two.shards[0];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var body: [64]u8 = undefined;
+    var out: [512]u8 = undefined;
+    // Shard 0 holds the name by its registry; the key's shard resolves by
+    // the table, which hasn't it yet: held, not sent there now.
+    a.runRequest(c.conn, testReq(.kv_delete, 4, "xs", key, "", ""), .client);
+    drainBoth(&two);
+    try expectNoAnswer(c, a);
+    _ = try a.tick(0);
+    two.settle();
+    try expectDeleted(try nextAnswer(c, a, &out));
+    a.runRequest(c.conn, edgeGet(&body, 5, "xs", key), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), (try nextAnswer(c, a, &out)).header.status);
+}
+
+test "Shard: a delete in a namespace never created is refused as having none on a node of several shards, whichever shard it reaches" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    var out: [512]u8 = undefined;
+    for (&two.shards, 0..) |*sh, i| {
+        const c = try TestClient.open(sh);
+        defer _ = std.c.close(c.pair[1]);
+        sh.runRequest(c.conn, testReq(.kv_delete, i + 1, "nope", "k", "", ""), .client);
+        two.settle();
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), (try nextAnswer(c, sh, &out)).header.status);
+    }
+}
+
+test "Shard: on a lone node of several shards, a read pipelined behind the write that creates its namespace is answered once shard 0's tick publishes it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const a = &two.shards[0];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var body: [64]u8 = undefined;
+    var out: [512]u8 = undefined;
+    a.runRequest(c.conn, testReq(.kv_put, 1, "fresh", "k", "v", ""), .client);
+    // The write applied the create here; it isn't published yet.
+    try std.testing.expect(two.namespaces.lookup("fresh") == null);
+    a.runRequest(c.conn, edgeGet(&body, 2, "fresh", "k"), .client);
+    try std.testing.expectEqual(@as(u32, 1), a.edge.count);
+    // No peers, so no membership steps: the tick alone releases the read.
+    for (0..4) |_| {
+        for (&two.shards) |*s| _ = try s.tick(0);
+        two.settle();
+    }
+    var answers: [2]proto.Response = undefined;
+    try ParkTest.responses(a, c.conn, c.pair[1], &out, &answers);
+    for (answers) |r| {
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
+        if (r.header.request_id == 2) {
+            var diag: schema.Diagnostic = .{};
+            try std.testing.expectEqualStrings("v", (try table_run.op("kv.get").response.decodeAll(r.data, &diag)).value);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), a.edge.count);
+}
 
 test "Shard: a lone node's read of a namespace never created is answered missing at once, and a write creates it" {
     const pipe_fds = try @import("stdx").io.pipe();

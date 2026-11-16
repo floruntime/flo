@@ -255,6 +255,8 @@ fn printProcessingJobStatus(ctx: *commander.Context, data: []const u8) commander
     const tick_avg_us = r.readU64() orelse return outcome.malformed(ctx, what);
     _ = r.readU64() orelse return outcome.malformed(ctx, what); // tick_max_us
     const uptime_ms = r.readU64() orelse return outcome.malformed(ctx, what);
+    const late_edge_ms = r.readU64() orelse return outcome.malformed(ctx, what);
+    const late_points = r.readU64() orelse return outcome.malformed(ctx, what);
     _ = r.readLengthPrefixed(u32) orelse return outcome.malformed(ctx, what); // yaml
     if (r.remainingLen() != 0) return outcome.malformed(ctx, what);
 
@@ -274,6 +276,20 @@ fn printProcessingJobStatus(ctx: *commander.Context, data: []const u8) commander
     ctx.print("Processed:  {d} records\n", .{records});
     ctx.print("Created:    {d}ms\n", .{created_at});
     if (running) ctx.print("On this node: {d} in, {d} out over {d}ms; ticks avg {d}us\n", .{ records_in, records_out, uptime_ms, tick_avg_us });
+    // Every edge is a whole number of seconds.
+    if (running and late_edge_ms != std.math.maxInt(u64)) {
+        var eb: [16]u8 = undefined;
+        const edge = if (late_edge_ms >= std.time.ms_per_hour and late_edge_ms % std.time.ms_per_hour == 0)
+            std.fmt.bufPrint(&eb, "{d}h", .{late_edge_ms / std.time.ms_per_hour}) catch unreachable
+        else if (late_edge_ms >= std.time.ms_per_min and late_edge_ms % std.time.ms_per_min == 0)
+            std.fmt.bufPrint(&eb, "{d}m", .{late_edge_ms / std.time.ms_per_min}) catch unreachable
+        else
+            std.fmt.bufPrint(&eb, "{d}s", .{late_edge_ms / std.time.ms_per_s}) catch unreachable;
+        if (late_points == 0)
+            ctx.print("Late points: none more than {s} behind their field's newest\n", .{edge})
+        else
+            ctx.print("Late points: at least {d}, more than {s} behind their field's newest\n", .{ late_points, edge });
+    }
 }
 
 fn runList(ctx: *commander.Context) commander.Error!void {

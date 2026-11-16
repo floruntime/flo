@@ -30,16 +30,16 @@ fn salvage(ctx: *stdx.testing.TestContext, after: []const u8, yes: bool) !stdx.t
     return offline.runRaw(if (yes) &args else &base);
 }
 
-/// The sorted segment files of shard 0.
 /// From here on each sync write seals its own segment, so a test can
 /// damage one among several: the newest segment is otherwise appended to
-/// until it reaches 64 MiB. A test fault, so only a `-Dtest-faults` build.
+/// until it reaches 64 MiB. A test fault, so this runs on flo-faults
+/// (`.faults = true`).
 fn sealEachFlush(ctx: *stdx.testing.TestContext) !void {
     const test_faults = @import("src").node.test_faults;
-    if (!test_faults.enabled) return error.SkipZigTest;
     try ctx.exec(&.{ "kv", "set", test_faults.Fault.seal_each_flush.key(), "x" });
 }
 
+/// The sorted segment files of shard 0.
 fn segments(ctx: *stdx.testing.TestContext, out: *std.ArrayListUnmanaged([]const u8)) ![]const u8 {
     const segs = try std.fmt.allocPrint(testing.allocator, "{s}/00000/segs", .{ctx.server.getDataDir()});
     var dir = try stdx.fs.openDir(segs, .{ .iterate = true });
@@ -58,7 +58,7 @@ fn segments(ctx: *stdx.testing.TestContext, out: *std.ArrayListUnmanaged([]const
 
 test "e2e/salvage: a shard offline on a segment that won't read comes up with the entries before it" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true },
+        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     try sealEachFlush(ctx);
@@ -144,9 +144,8 @@ test "e2e/salvage: a shard offline on a segment that won't read comes up with th
 
 test "e2e/salvage: a cut that drops a repair of an entry it keeps is refused unless told to undo it" {
     const test_faults = @import("src").node.test_faults;
-    if (!test_faults.enabled) return error.SkipZigTest;
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true },
+        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     {
@@ -225,7 +224,7 @@ fn spoilSecondLast(ctx: *stdx.testing.TestContext) !u64 {
 
 test "e2e/salvage: a cluster founder's data directory is refused, whatever its damage" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true, .cluster_enabled = true },
+        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true, .cluster_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     try sealEachFlush(ctx);
@@ -242,7 +241,7 @@ test "e2e/salvage: a cluster founder's data directory is refused, whatever its d
 
 test "e2e/salvage: a cut recorded before a crash is finished by the next start, damaged file and all" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true },
+        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     try sealEachFlush(ctx);

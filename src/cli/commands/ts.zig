@@ -206,13 +206,14 @@ fn parseDuration(s: []const u8) ?i64 {
     const unit = s[s.len - 1];
     const num = std.fmt.parseInt(i64, num_str, 10) catch return null;
 
-    return switch (unit) {
-        's' => num * 1000,
-        'm' => num * 60 * 1000,
-        'h' => num * 3600 * 1000,
-        'd' => num * 86400 * 1000,
-        else => null,
+    const scale: i64 = switch (unit) {
+        's' => 1000,
+        'm' => 60 * 1000,
+        'h' => 3600 * 1000,
+        'd' => 86400 * 1000,
+        else => return null,
     };
+    return std.math.mul(i64, num, scale) catch null;
 }
 
 // ========================================================================
@@ -249,14 +250,18 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
     const fields_flag = ctx.getString("fields") orelse "";
 
     const ts_str = ctx.getString("timestamp") orelse "";
-    var timestamp_ms: ?i64 = null;
+    // --timestamp is ms; the server takes ns.
+    var timestamp_ns: ?i64 = null;
     if (ts_str.len > 0) {
-        timestamp_ms = std.fmt.parseInt(i64, ts_str, 10) catch {
+        const ms = std.fmt.parseInt(i64, ts_str, 10) catch {
             return outcome.usage(ctx, "--timestamp '{s}' is not a whole number of milliseconds", .{ts_str});
         };
-        if (timestamp_ms.? <= 0) {
+        if (ms <= 0) {
             return outcome.usage(ctx, "--timestamp must be > 0 ms, not {s}", .{ts_str});
         }
+        timestamp_ns = std.math.mul(i64, ms, std.time.ns_per_ms) catch {
+            return outcome.usage(ctx, "--timestamp {s} ms is past the latest time a point can have", .{ts_str});
+        };
     }
 
     if (value_flag.len > 0 and fields_flag.len > 0) {
@@ -266,13 +271,14 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
     if (value_flag.len > 0) {
         const value = parseValue(ctx, "--value", value_flag) orelse return error.Usage;
         client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-        var result = client_mod.ts.write(&client, namespace, measurement, null, value, tags, timestamp_ms) catch |err| return outcome.requestFailed(ctx, err);
+        var result = client_mod.ts.write(&client, namespace, measurement, null, value, tags, timestamp_ns) catch |err| return outcome.requestFailed(ctx, err);
         defer result.deinit();
         try outcome.check(ctx, result);
-        // [series_hash:u64][timestamp_ms:i64][sequence:u64]
+        // [series_hash:u64][timestamp_ns:i64][sequence:u64], printed in ms
+        // as --timestamp takes it.
         const data = result.asRawData() orelse return outcome.malformed(ctx, "write response (empty)");
         if (data.len != 24) return outcome.malformed(ctx, "write response");
-        ctx.print("OK ({d}-{d})\n", .{ std.mem.readInt(i64, data[8..16], .little), std.mem.readInt(u64, data[16..24], .little) });
+        ctx.print("OK ({d}-{d})\n", .{ @divFloor(std.mem.readInt(i64, data[8..16], .little), std.time.ns_per_ms), std.mem.readInt(u64, data[16..24], .little) });
         return;
     }
 
@@ -311,7 +317,7 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // One timestamp for every field, so they read back as one point.
-    const ts = timestamp_ms orelse @import("stdx").time.milliTimestamp();
+    const ts = timestamp_ns orelse nowNs();
     for (names[0..n], values[0..n], 0..) |name, value, written| {
         var result = client_mod.ts.write(&client, namespace, measurement, name, value, tags, ts) catch |err| {
             const failed = outcome.requestFailed(ctx, err);
@@ -323,7 +329,13 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
             return outcome.refusal(ctx, result.status, result.reason(), result.errorMessage(), "field {s} ({d} of {d} fields written): ", .{ name, written, n });
         }
     }
-    ctx.print("OK ({d} fields at {d})\n", .{ n, ts });
+    ctx.print("OK ({d} fields at {d})\n", .{ n, @divFloor(ts, std.time.ns_per_ms) });
+}
+
+/// Now, in ns, for a point the CLI stamps itself: a whole millisecond,
+/// so the ms it prints, given back as --timestamp, names the same time.
+fn nowNs() i64 {
+    return @import("stdx").time.milliTimestamp() * std.time.ns_per_ms;
 }
 
 /// A value the server will store: a finite number.
@@ -347,6 +359,7 @@ fn parseValue(ctx: *commander.Context, what: []const u8, text: []const u8) ?f64 
 fn lineError(buf: []u8, err: anyerror, token: []const u8) []const u8 {
     return switch (err) {
         error.InvalidTimestamp => std.fmt.bufPrint(buf, "timestamp '{s}' is not a positive whole number", .{token}),
+        error.TimestampTooLate => std.fmt.bufPrint(buf, "timestamp '{s}' is past 2262-04-11T23:47:16Z, the latest time a point can have", .{token}),
         error.TrailingInput => std.fmt.bufPrint(buf, "unexpected '{s}' after the timestamp", .{token}),
         error.EscapesNotSupported => std.fmt.bufPrint(buf, "backslash escapes ('{s}') are not supported", .{token}),
         error.DuplicateTag => std.fmt.bufPrint(buf, "tag key '{s}' is given more than once", .{token}),
@@ -429,7 +442,7 @@ fn runWriteBatch(ctx: *commander.Context, client: *Client, namespace: []const u8
             // The parser checked every field, so a line is written whole
             // unless the server refuses part of it. A line without a
             // timestamp is stamped once, so its fields agree.
-            const ts = if (parsed.timestamp_ms != 0) parsed.timestamp_ms else @import("stdx").time.milliTimestamp();
+            const ts = if (parsed.timestamp_ns != 0) parsed.timestamp_ns else nowNs();
             for (parsed.fields, 0..) |field, written| {
                 var result = client_mod.ts.write(client, namespace, parsed.measurement, field.name, field.value, tags_w.buffered(), ts) catch |err| {
                     const failed = outcome.requestFailed(ctx, err);
@@ -514,6 +527,12 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
             .cursor = cursor,
         }) catch |err| return outcome.requestFailed(ctx, err);
         defer result.deinit();
+        // A later page refused: close what was printed, its cursor the page
+        // that failed, so the read can go on from there.
+        if (format == .json and pages > 0 and result.isError()) {
+            const at = std.fmt.bytesToHex(cursor[0..ts_ops.CURSOR_LEN].*, .lower);
+            ctx.print("{s}], \"cursor\": \"{s}\"}}\n", .{ if (printed > 0) "\n" else "", &at });
+        }
         try outcome.check(ctx, result);
         if (format == .json and pages == 0) ctx.print("{{\"points\": [", .{});
         pages += 1;
@@ -578,9 +597,12 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
     const window_str = ctx.getString("window") orelse "1m";
     const agg = ctx.getString("agg") orelse "avg";
 
-    const from_ms = parseTimeArg(from_str) orelse 0;
-    const to_ms = parseTimeArg(to_str) orelse 0;
-    const window_ms = parseDuration(window_str) orelse 60000;
+    // Times are ms here, as --from and --to take them; the server takes ns.
+    const from_ms = if (from_str.len > 0) parseTimeArg(from_str) orelse return outcome.usage(ctx, "--from '{s}' isn't a time", .{from_str}) else 0;
+    const to_ms = if (to_str.len > 0) parseTimeArg(to_str) orelse return outcome.usage(ctx, "--to '{s}' isn't a time", .{to_str}) else 0;
+    const window_ms = parseDuration(window_str) orelse return outcome.usage(ctx, "--window '{s}' isn't a duration (Ns, Nm, Nh or Nd)", .{window_str});
+    // Sent as 0, a window would be read as absent, so a minute.
+    if (window_ms <= 0) return outcome.usage(ctx, "--window must be more than 0", .{});
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -590,9 +612,9 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
     var result = client_mod.ts.query(&client, namespace, measurement, .{
         .tags = tags,
         .field = field,
-        .from_ms = from_ms,
-        .to_ms = to_ms,
-        .window_ms = window_ms,
+        .from_ns = msToNs(from_ms),
+        .to_ns = msToNs(to_ms),
+        .window_ns = msToNs(window_ms),
         .aggregation = agg,
     }) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
@@ -634,7 +656,7 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
                 for (0..sr.points.len()) |b| {
                     const p = sr.points.at(b);
                     var ts_buf: [32]u8 = undefined;
-                    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{p.ms}) catch "";
+                    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{p.ms()}) catch "";
                     var val_buf: [32]u8 = undefined;
                     const val_str = std.fmt.bufPrint(&val_buf, "{d:.4}", .{p.value}) catch "";
                     table.addRow(&.{ ts_str, val_str }) catch return error.OutOfMemory;
@@ -650,7 +672,7 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
                 for (0..sr.points.len()) |b| {
                     const p = sr.points.at(b);
                     if (b > 0) ctx.print(",\n", .{});
-                    ctx.print("      {{\"start_ms\": {d}, \"value\": {d:.6}}}", .{ p.ms, p.value });
+                    ctx.print("      {{\"start_ms\": {d}, \"start_ns\": {d}, \"value\": {d:.6}}}", .{ p.ms(), p.ns, p.value });
                 }
                 ctx.print("\n    ]}}", .{});
             }
@@ -660,7 +682,7 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
             for (series) |sr| {
                 for (0..sr.points.len()) |b| {
                     const p = sr.points.at(b);
-                    ctx.print("{d} {d:.6}\n", .{ p.ms, p.value });
+                    ctx.print("{d} {d:.6}\n", .{ p.ms(), p.value });
                 }
             }
         },
@@ -826,7 +848,7 @@ fn runFloql(ctx: *commander.Context) commander.Error!void {
         ctx.print("--- {s} ({s}) [{d} points] ---\n", .{ sr.key, sr.field, sr.points.len() });
         for (0..sr.points.len()) |i| {
             const p = sr.points.at(i);
-            ctx.print("  {d}: {d:.4}\n", .{ p.ms, p.value });
+            ctx.print("  {d}: {d:.4}\n", .{ p.ms(), p.value });
         }
     }
 }
@@ -835,9 +857,17 @@ fn runFloql(ctx: *commander.Context) commander.Error!void {
 // Response parsing
 // ========================================================================
 
-const Point = struct { ms: i64, value: f64 };
+/// A point or bucket as the server answers it, its time in ns; shown in ms.
+const Point = struct {
+    ns: i64,
+    value: f64,
 
-/// `n` points of `[ms:i64][value:f64]`, read in place.
+    fn ms(p: Point) i64 {
+        return @divFloor(p.ns, std.time.ns_per_ms);
+    }
+};
+
+/// `n` points of `[ns:i64][value:f64]`, read in place.
 const Points = struct {
     bytes: []const u8,
 
@@ -848,7 +878,7 @@ const Points = struct {
     fn at(self: Points, i: usize) Point {
         const p = self.bytes[i * 16 ..][0..16];
         return .{
-            .ms = std.mem.readInt(i64, p[0..8], .little),
+            .ns = std.mem.readInt(i64, p[0..8], .little),
             .value = @bitCast(std.mem.readInt(u64, p[8..16], .little)),
         };
     }
@@ -943,6 +973,8 @@ test "parseDuration" {
     try std.testing.expectEqual(@as(i64, 3600000), parseDuration("1h").?);
     try std.testing.expectEqual(@as(i64, 86400000), parseDuration("1d").?);
     try std.testing.expectEqual(@as(i64, 30000), parseDuration("30s").?);
+    // Too long for an i64 of ms: not a duration, not an overflow.
+    try std.testing.expectEqual(@as(?i64, null), parseDuration("999999999999999d"));
 }
 
 test "ts: query and floql answers parse, and cut-short ones are Truncated" {
@@ -954,7 +986,7 @@ test "ts: query and floql answers parse, and cut-short ones are Truncated" {
     const q = try parseSeriesSet(a, query, .query);
     defer a.free(q);
     try std.testing.expectEqualStrings("cpu", q[0].key);
-    try std.testing.expectEqual(@as(i64, 9), q[0].points.at(0).ms);
+    try std.testing.expectEqual(@as(i64, 9), q[0].points.at(0).ns);
 
     const f = try parseSeriesSet(a, floql, .floql);
     defer a.free(f);

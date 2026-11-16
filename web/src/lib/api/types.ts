@@ -379,6 +379,10 @@ export interface ProcessingJobMetrics {
   tick_max_us: number
   watermark_ms: number | null
   uptime_ms: number
+  /** At least late_points of the source fields' points came more than
+   *  late_edge_ms behind their field's newest. Null without a count. */
+  late_edge_ms: number | null
+  late_points: number | null
 }
 export interface ProcessingJobDetail extends ProcessingJobInfo {
   /** Full submitted pipeline definition (parsed client-side into the DAG). */

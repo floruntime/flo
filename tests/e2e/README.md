@@ -4,6 +4,19 @@ Each test spawns real `zig-out/bin/flo` servers. The full suite takes about
 11 minutes of test time and loads a machine hard, so run only the groups your
 change touches locally, and leave the full suite to CI.
 
+The fault files (`apply_crash`, `halt`, `repair_skip`, `salvage`,
+`snapshot_window`) instead spawn `zig-out/test/flo-faults` — a second `flo`
+compiled with the fault drive the shipped binary never carries. `test-e2e`
+builds it automatically, so any `test-e2e` run pays one extra full `flo`
+compile the first time `flo`'s sources change; zig caches by content, so a
+warm rebuild is free.
+
+`zig build test` runs the whole suite — unit, stdx, integration and e2e — so
+it is minutes, not a quick check, and loads the machine. On macOS it is not
+total either: the Linux-only cluster e2e tests skip here; they run in CI, or
+locally via `scripts/linux/run.sh`. Locally, prefer `zig build test-unit` plus
+the targeted `test-e2e -Dtest-filter` below.
+
 ## Run only what you touched
 
 Tests are named `e2e/<group>: …`, and `-Dtest-filter` keeps the tests whose

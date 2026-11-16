@@ -122,6 +122,12 @@ pub const RuntimeConfig = struct {
     /// value is used as given. Over it, a new connection is accepted and closed
     /// at once rather than held.
     max_connections: u32 = 0,
+    /// With async_flush, refuse new writes once flushing has been failing for
+    /// this many seconds, or this many MiB sit unflushed — rather than ack more
+    /// writes that aren't on disk. 0 on either disables that bound. No effect
+    /// under sync, which already refuses a write it can't flush.
+    async_flush_bound_seconds: u32 = 3,
+    async_flush_bound_mb: u32 = 64,
     worker_remove_after_ms: u64 = 600_000,
     /// How long a workflow step waits for its action to be registered.
     missing_action_wait_ms: u64 = 600_000,
@@ -1276,7 +1282,14 @@ const ShardBoot = struct {
                 self.cluster_node_id,
                 if (i == 0) self.shard0_role else .single,
                 self.raft_config,
-                .{ .health = slot, .node_health = self.health.shards, .cancel = &self.cancel, .namespaces = self.namespaces },
+                .{
+                    .health = slot,
+                    .node_health = self.health.shards,
+                    .cancel = &self.cancel,
+                    .namespaces = self.namespaces,
+                    .async_flush_bound_ms = @as(u64, rt.config.async_flush_bound_seconds) * 1000,
+                    .async_flush_bound_bytes = @as(u64, rt.config.async_flush_bound_mb) * 1024 * 1024,
+                },
             )) |shard| {
                 self.shards[i] = shard;
                 self.failed[i] = null;

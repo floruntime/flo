@@ -1,5 +1,5 @@
 {
-  "seed": 10,
+  "seed": 12,
   "node_count": 5,
   "log_capacity": 262144,
   "small_ring": false,

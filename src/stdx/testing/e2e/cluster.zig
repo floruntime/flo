@@ -85,6 +85,9 @@ pub const ClusterConfig = struct {
     node_env: [MAX_NODES][]const [2][]const u8 = @splat(&.{}),
     /// Config file text added to each node's, by node.
     node_config: [MAX_NODES]?[]const u8 = @splat(null),
+    /// Spawn the flo-faults binary on every node (the fault e2e drive). The
+    /// fault e2e files set this. See ServerConfig.faults.
+    faults: bool = false,
 };
 
 /// Multi-node cluster context for e2e testing
@@ -127,6 +130,7 @@ pub const ClusterContext = struct {
             .cluster_enabled = true, // Seed node needs Raft listener
             .metrics_enabled = config.metrics_enabled,
             .extra_config = config.node_config[0],
+            .faults = config.faults,
         });
         self.servers[0].?.extra_env = config.node_env[0];
         // Covers every node created so far. A per-iteration `errdefer` in the
@@ -153,6 +157,7 @@ pub const ClusterContext = struct {
                 .join_addresses = seed_endpoint,
                 .metrics_enabled = config.metrics_enabled,
                 .extra_config = config.node_config[i],
+                .faults = config.faults,
             });
             self.servers[i].?.extra_env = config.node_env[i];
             startServerWithRetry(self.servers[i].?) catch |err| {
@@ -238,9 +243,25 @@ pub const ClusterContext = struct {
         self.seed_endpoint = null;
     }
 
+    /// Fail the test loudly if any node has exited unexpectedly. Called from
+    /// every command path below — including the retry/poll loops, which reach it
+    /// through these base calls each attempt — so a node that died mid-test (a
+    /// peer-bind collision, a crash) is reported as that exit, with the node
+    /// index and reason, instead of masking as a not_found on a surviving node
+    /// that the poll then spins on. An intentional stopNode (the SIGTERM/SIGKILL
+    /// the harness sent) and an awaited crash are not flagged.
+    pub fn assertNodesAlive(self: *Self) void {
+        for (self.servers[0..self.node_count], 0..) |maybe, i| {
+            const server = maybe orelse continue;
+            var buf: [32]u8 = undefined;
+            server.assertAlive(std.fmt.bufPrint(&buf, "cluster node {d}", .{i}) catch "a cluster node");
+        }
+    }
+
     /// Execute command on specific node (fire-and-forget, asserts success)
     pub fn execOn(self: *Self, node: usize, args: []const []const u8) !void {
         if (node >= self.node_count) return error.InvalidNodeIndex;
+        self.assertNodesAlive();
         const cli = self.clis[node] orelse return error.NodeNotRunning;
 
         var result = try cli.run(args);
@@ -282,6 +303,7 @@ pub const ClusterContext = struct {
     /// Caller owns returned memory
     pub fn execCaptureOn(self: *Self, node: usize, args: []const []const u8) ![]const u8 {
         if (node >= self.node_count) return error.InvalidNodeIndex;
+        self.assertNodesAlive();
         const cli = self.clis[node] orelse return error.NodeNotRunning;
 
         var result = try cli.run(args);
@@ -302,6 +324,7 @@ pub const ClusterContext = struct {
     /// Caller owns returned memory
     pub fn execCaptureAnyOn(self: *Self, node: usize, args: []const []const u8) ![]const u8 {
         if (node >= self.node_count) return error.InvalidNodeIndex;
+        self.assertNodesAlive();
         const cli = self.clis[node] orelse return error.NodeNotRunning;
 
         var result = try cli.run(args);

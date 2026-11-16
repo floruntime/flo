@@ -174,6 +174,9 @@ pub const ShardSlot = struct {
     /// memory, then restart or resync.
     buffer_failures: Atomic(u64) = .init(0),
     buffer_failing_for_ms: Atomic(u64) = .init(0),
+    /// How long a disk-staging gap has been open under async_flush (0 when
+    /// none): writes at or past it are held, not acked, until it fills.
+    gap_open_for_ms: Atomic(u64) = .init(0),
     /// Set with a `read_blocked` state on a lone shard, whose only copy this is:
     /// `readiness` keeps the node ready then, since a 503 would pull it and no
     /// other node could serve. In a cluster it is false and `read_blocked` is a
@@ -315,6 +318,10 @@ pub const NodeHealth = struct {
             if (hardstate_failures > 0) try w.print(",\"hardstate_failures\":{d},\"hardstate_failing_for_ms\":{d}", .{ hardstate_failures, s.hardstate_failing_for_ms.load(.monotonic) });
             const buffer_failures = s.buffer_failures.load(.monotonic);
             if (buffer_failures > 0) try w.print(",\"buffer_failures\":{d},\"buffer_failing_for_ms\":{d}", .{ buffer_failures, s.buffer_failing_for_ms.load(.monotonic) });
+            // A staging gap can be open with no flush failure, so show it on its
+            // own: writes at or past it are held, not acked, until it fills.
+            const gap_open_for_ms = s.gap_open_for_ms.load(.monotonic);
+            if (gap_open_for_ms > 0) try w.print(",\"gap_open_for_ms\":{d}", .{gap_open_for_ms});
             if (state == .replaying) {
                 try w.print(",\"replay\":{{\"index\":{d},\"last\":{d}}}", .{ s.replay_index.load(.monotonic), s.replay_last.load(.monotonic) });
             }

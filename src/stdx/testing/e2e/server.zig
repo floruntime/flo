@@ -90,6 +90,18 @@ fn claimCheckout() !void {
     }
     claim = .held;
 
+    // Sweep leftover servers of both binaries: a killed faults run leaves
+    // flo-faults servers the normal path would miss.
+    pkillServers(binary);
+    if (findFloFaultsBinary(std.heap.page_allocator)) |faults_binary| {
+        defer std.heap.page_allocator.free(faults_binary);
+        pkillServers(faults_binary);
+    } else |_| {}
+}
+
+/// `pkill -9` every `<binary> server …` process left over from a prior run,
+/// then pause for freed ports if any matched. Best effort: errors are ignored.
+fn pkillServers(binary: []const u8) void {
     // pkill -f takes an extended regex: escape the path so it matches only itself.
     var pattern: std.ArrayListUnmanaged(u8) = .empty;
     defer pattern.deinit(std.heap.page_allocator);
@@ -128,6 +140,11 @@ pub const ServerProcess = struct {
     dashboard_port: u16,
     metrics_port: u16,
     raft_port: u16,
+    /// Set once the node has started on `raft_port`, so a restart rebinds the
+    /// same peer port — the address its peers know — instead of picking a new
+    /// one. Clear during the first start's attempts, so a bind collision there
+    /// re-picks.
+    raft_port_pinned: bool = false,
     data_dir: []const u8,
     config_file: []const u8,
     log_file_path: []const u8,
@@ -172,8 +189,12 @@ pub const ServerProcess = struct {
     pub const READY_POLL_INTERVAL_MS: u64 = 50;
     /// Timeout for graceful shutdown before SIGKILL (ms)
     pub const SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
-    /// Wait time between SIGTERM and SIGKILL (ms)
-    pub const SHUTDOWN_GRACE_PERIOD_MS: u64 = 500;
+    /// How long to wait after SIGTERM for a graceful exit before force-killing.
+    /// A graceful exit runs each shard's final segment flush; a force-kill skips
+    /// it, losing async_flush writes acked but not yet flushed. 5 s so a loaded
+    /// queue runner — exactly where shutdown is slow — still flushes; a healthy
+    /// server exits well before this, so the test pays nothing.
+    pub const SHUTDOWN_GRACE_PERIOD_MS: u64 = 5_000;
     /// Wait time after SIGKILL before proceeding (ms)
     /// Each server binds ports the OS picks, so a short wait suffices
     pub const POST_KILL_WAIT_MS: u64 = 100;
@@ -220,6 +241,10 @@ pub const ServerProcess = struct {
         log_level: []const u8 = "info",
         /// Durability mode (sync = guaranteed persistence, async_flush = fast)
         durability: Durability = .async_flush,
+        /// Spawn the `flo-faults` binary (zig-out/test/flo-faults) instead of the
+        /// shipped `flo`. The fault e2e files set this; it carries the faults
+        /// drive the shipped binary never has. See build.zig.
+        faults: bool = false,
         /// Serve from this data dir rather than the node's own, e.g. another
         /// node's. Config and log stay in the node's own.
         data_dir_of: ?[]const u8 = null,
@@ -295,8 +320,7 @@ pub const ServerProcess = struct {
         errdefer allocator.free(log_path);
         self.log_file_path = log_path;
 
-        // Find flo binary
-        self.flo_binary = try findFloBinary(allocator);
+        self.flo_binary = if (config.faults) try findFloFaultsBinary(allocator) else try findFloBinary(allocator);
 
         self.allocator = allocator;
         self.process = null;
@@ -304,6 +328,7 @@ pub const ServerProcess = struct {
         self.dashboard_port = 0;
         self.metrics_port = 0;
         self.raft_port = 0;
+        self.raft_port_pinned = false;
         self.started = false;
         // `allocator.create` leaves the struct uninitialised, so the field
         // defaults declared above do NOT apply — every field must be assigned
@@ -418,6 +443,18 @@ pub const ServerProcess = struct {
             try stdx.fs.writeAll(config_file, fbs.buffered());
         }
 
+        // Keep the previous run's log across a restart: rotate it to
+        // `server.log.prev` before this run truncates `server.log`. Without it
+        // a restart test's log dump shows only the new boot, losing the old
+        // run's shutdown and final flush — so it can't tell "never flushed"
+        // from "flushed but not replayed". A missing file (the first start) is
+        // fine; only the immediately previous run is kept.
+        {
+            var prev_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const prev = std.fmt.bufPrint(&prev_buf, "{s}.prev", .{self.log_file_path}) catch "";
+            if (prev.len > 0) stdx.fs.rename(self.log_file_path, prev) catch {};
+        }
+
         // Open log file for output redirection
         var log_file = try stdx.fs.createFileAbsolute(self.log_file_path, .{
             .truncate = true,
@@ -436,6 +473,14 @@ pub const ServerProcess = struct {
         // 0 for the server to pick on a first start.
         if (self.config.raft_port > 0) self.raft_port = self.config.raft_port;
         const cluster_node = self.config.join_addresses != null or self.config.cluster_enabled;
+        // At first start, bind a peer port below the OS ephemeral range rather
+        // than letting the OS pick one it may later hand to a transient
+        // connection (see pickRaftPort). Re-picked each unpinned attempt, so a
+        // bind collision is retried; pinned once the node is up, so a restart
+        // rebinds the same address. An explicit `[cluster] raft_port` wins.
+        if (cluster_node and self.config.raft_port == 0 and !self.raft_port_pinned) {
+            self.raft_port = pickRaftPort();
+        }
         if (cluster_node and self.config.node_id == 0 and !self.config.derive_node_id) self.config.node_id = nextNodeId();
 
         // Build argv dynamically
@@ -580,6 +625,9 @@ pub const ServerProcess = struct {
         };
 
         self.started = true;
+        // It is up on this peer port now; pin it so a restart rebinds the same
+        // address instead of picking a new one.
+        if (self.raft_port > 0 and self.config.raft_port == 0) self.raft_port_pinned = true;
     }
 
     /// Stop the server gracefully, then fail the test (see `checkExit`) if
@@ -603,9 +651,15 @@ pub const ServerProcess = struct {
                 }
 
                 if (!self.reaped) {
-                    // Server didn't respond to SIGTERM, force kill its group
+                    // Server didn't respond to SIGTERM in time, force-kill its
+                    // group. Under async_flush a force-kill skips the final flush,
+                    // so writes acked but not yet flushed (segment flush runs at
+                    // most once a second) are lost — the restart then reads them
+                    // not_found. Say so loudly so a later not_found explains
+                    // itself; the test is not failed on the kill itself.
                     forced = true;
                     self.sent_kill = true;
+                    std.debug.print("[server] pid {d} did not exit within {d} ms of SIGTERM; killed (a kill skips the async-flush final flush — unflushed writes are lost)\n", .{ pid, SHUTDOWN_GRACE_PERIOD_MS });
                     if (std.c.kill(-pid, .KILL) != 0) _ = std.c.kill(pid, .KILL);
                     const kill_start = stdx.time.milliTimestamp();
                     while (!self.tryReap(pid) and stdx.time.milliTimestamp() - kill_start < 1000) {
@@ -693,6 +747,21 @@ pub const ServerProcess = struct {
         return std.fmt.bufPrint(buf, "died of signal {d}", .{low}) catch "died of a signal";
     }
 
+    /// Fail the test loudly, now, if this server has already exited. A node that
+    /// dies mid-test — e.g. its peer bind collides with another run's — is
+    /// otherwise only met as a downstream not_found on a surviving node (and the
+    /// real reason only surfaces at teardown's checkExit). Called from every path
+    /// that talks to a node, including poll loops, where the masking bites. `what`
+    /// names the node for the message. Non-blocking: it reaps without waiting.
+    pub fn assertAlive(self: *Self, what: []const u8) void {
+        if (self.process) |*proc| _ = self.tryReap(proc.id);
+        var buf: [160]u8 = undefined;
+        const why = self.abnormalExit(&buf) orelse return;
+        std.debug.print("[e2e] {s} ended mid-test: {s}\n", .{ what, why });
+        self.dumpLogTail();
+        @panic("an e2e server ended mid-test; its log is above");
+    }
+
     /// A server that panics or aborts after a test's last read would leave
     /// the test passing; stop() runs inside deinit and can't return an error,
     /// so this panics, after the reason and the log tail, to fail loudly.
@@ -755,7 +824,11 @@ pub const ServerProcess = struct {
 
     /// Read server logs (returns owned slice - caller must free)
     pub fn readLogs(self: *Self) ![]const u8 {
-        const file = stdx.fs.openFileAbsolute(self.log_file_path, .{}) catch |err| {
+        return self.readLogAt(self.log_file_path);
+    }
+
+    fn readLogAt(self: *Self, path: []const u8) ![]const u8 {
+        const file = stdx.fs.openFileAbsolute(path, .{}) catch |err| {
             if (err == error.FileNotFound) return try self.allocator.dupe(u8, "");
             return err;
         };
@@ -800,8 +873,19 @@ pub const ServerProcess = struct {
         return matches.toOwnedSlice(self.allocator);
     }
 
-    /// Print server logs to stderr (useful for debugging failed tests)
+    /// Print server logs to stderr (useful for debugging failed tests). After a
+    /// restart, the previous run's log (its shutdown and final flush) is printed
+    /// first, from the rotated `server.log.prev`, then this run's.
     pub fn dumpLogs(self: *Self) void {
+        var prev_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const prev = std.fmt.bufPrint(&prev_buf, "{s}.prev", .{self.log_file_path}) catch "";
+        if (prev.len > 0) {
+            if (self.readLogAt(prev)) |plogs| {
+                defer self.allocator.free(plogs);
+                if (plogs.len > 0) std.debug.print("\n=== PREVIOUS RUN LOGS ({s}) ===\n{s}\n=== END PREVIOUS RUN LOGS ===\n", .{ prev, plogs });
+            } else |_| {}
+        }
+
         const logs = self.readLogs() catch |err| {
             std.debug.print("\n=== SERVER LOGS (error: {}) ===\n", .{err});
             return;
@@ -925,6 +1009,24 @@ fn nextNodeId() u32 {
     return next_node_id.fetchAdd(1, .monotonic);
 }
 
+/// A peer (Raft) port for a cluster node's first start: below the OS ephemeral
+/// range (Linux 32768+, macOS 49152+) and above the privileged ports. The OS
+/// never hands a port in this range to a transient connection, so a restart can
+/// rebind the same port — the address its peers know — without another
+/// process's transient connection having taken it. Seeded by the pid so
+/// concurrent test processes start at different ports, and advanced per pick so
+/// a bind collision retried at first start tries a new one.
+var raft_port_seq: std.atomic.Value(u32) = .init(0);
+
+fn pickRaftPort() u16 {
+    if (raft_port_seq.load(.monotonic) == 0) {
+        const base: u32 = @intCast(@mod(std.c.getpid(), 20_000));
+        _ = raft_port_seq.cmpxchgStrong(0, base, .monotonic, .monotonic);
+    }
+    const span: u32 = 20_000; // 10000..30000, below every common ephemeral floor
+    return @intCast(10_000 + raft_port_seq.fetchAdd(1, .monotonic) % span);
+}
+
 const PORTS_LINE = "Flo server ports: ";
 const READY_LINE = "Flo server ready on ";
 
@@ -940,15 +1042,22 @@ fn portAfter(line: []const u8, key: []const u8) ?u16 {
 
 /// Find the flo binary path
 pub fn findFloBinary(allocator: Allocator) ![]const u8 {
-    // Try relative path from workspace root
-    const paths_to_try = [_][]const u8{
-        "zig-out/bin/flo",
-        "./zig-out/bin/flo",
-        "../zig-out/bin/flo",
-        "../../zig-out/bin/flo",
-    };
+    return findBinary(allocator, "bin", "flo");
+}
 
-    for (paths_to_try) |rel_path| {
+/// The faults e2e binary (zig-out/test/flo-faults), spawned by the fault e2e
+/// files via `ServerConfig.faults`. It carries the faults drive the shipped
+/// `flo` never has; build.zig keeps it out of zig-out/bin.
+pub fn findFloFaultsBinary(allocator: Allocator) ![]const u8 {
+    return findBinary(allocator, "test", "flo-faults");
+}
+
+fn findBinary(allocator: Allocator, sub: []const u8, name: []const u8) ![]const u8 {
+    // Try relative path from workspace root
+    const prefixes = [_][]const u8{ "zig-out", "./zig-out", "../zig-out", "../../zig-out" };
+    for (prefixes) |prefix| {
+        const rel_path = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ prefix, sub, name });
+        defer allocator.free(rel_path);
         const abs_path = stdx.fs.realpathAlloc(allocator, rel_path) catch continue;
         // Verify it exists (access check for existence)
         stdx.fs.access(rel_path, .{}) catch {
@@ -975,7 +1084,7 @@ pub fn findFloBinary(allocator: Allocator) ![]const u8 {
     };
 
     const dir = std.fs.path.dirname(self_exe) orelse return error.FloBinaryNotFound;
-    const flo_path = try std.fs.path.join(allocator, &.{ dir, "flo" });
+    const flo_path = try std.fs.path.join(allocator, &.{ dir, name });
 
     stdx.fs.access(flo_path, .{}) catch {
         allocator.free(flo_path);

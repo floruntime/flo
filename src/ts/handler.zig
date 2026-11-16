@@ -51,6 +51,8 @@ pub const MAX_FLOQL_POINTS = 1 << 17;
 pub const MAX_QUERY_SCANNED = 1 << 20;
 pub const TOO_MANY_FLOQL_SCANNED = std.fmt.comptimePrint("bad request: more than {d} points match a FloQL query; narrow its range or its tags", .{MAX_FLOQL_POINTS});
 pub const TOO_MANY_QUERY_POINTS = std.fmt.comptimePrint("bad request: more than {d} points match a query; narrow its range or its tags", .{MAX_QUERY_SCANNED});
+pub const UNKNOWN_AGGREGATION = "bad request: unknown aggregation; use avg, sum, count, min or max";
+pub const TOO_MANY_QUERY_BUCKETS = std.fmt.comptimePrint("bad request: the matching points span more than {d} windows of this width; widen the window (it is in nanoseconds) or narrow the range", .{MAX_QUERY_BUCKETS});
 const StoredPoint = ts_mod.StoredPoint;
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
@@ -145,13 +147,22 @@ pub const TSHandler = struct {
             .fields_capped = sum.fields_capped or listed < sum.fields,
             .fields = .{ .bytes = self.info_buf[0..w.pos], .count = listed },
             .points = sum.points,
-            .oldest_ms = if (has_points) @intCast(sum.oldest_ns / std.time.ns_per_ms) else null,
-            .newest_ms = if (has_points) @intCast(sum.newest_ns / std.time.ns_per_ms) else null,
+            .oldest_ns = if (has_points) @intCast(sum.oldest_ns) else null,
+            .newest_ns = if (has_points) @intCast(sum.newest_ns) else null,
         } };
     }
 
-    fn runRead(shard: *Shard, _: *Connection, req: Request, field: []const u8, tags: []const u8, from_ns: ?i64, to_ns: ?i64, limit: u32, order: ts_ops.Order, cursor: []const u8) Error!ReadOutcome {
-        return shard.ts_handler.readPage(req.ns_id, req.key, field, tags, from_ns, to_ns, limit, order, cursor);
+    fn runRead(shard: *Shard, conn: *Connection, req: Request, field: []const u8, tags: []const u8, from_ns: ?i64, to_ns: ?i64, limit: u32, order: ts_ops.Order, cursor: []const u8) Error!ReadOutcome {
+        const page = shard.ts_handler.readPage(req.ns_id, req.key, field, tags, from_ns, to_ns, limit, order, cursor);
+        // No such series here, on a follower: the leader answers whether
+        // there is one, or this answers stale.
+        if (page == .refused and page.refused.status == .not_found) {
+            if (shard.missToLeader(conn, req)) return .wait;
+            // Answered after this returns, still inside dispatchLocal, which
+            // restores the flag once the answer is sent.
+            if (shard.staleMiss(req.header.op_code)) proto.answering_stale = true;
+        }
+        return page;
     }
 
     fn badRead(message: []const u8) ReadOutcome {
@@ -186,6 +197,16 @@ pub const TSHandler = struct {
         defer self.allocator.free(buf);
         const n = if (min > max) 0 else self.ts.readPage(ns, measurement, field, filter.preds, min, max, @fromBackingInt(@intCast(@backingInt(order))), after, buf) catch
             return .{ .refused = .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "ts read failed" } } };
+        // No points: a read of a series that doesn't exist is not_found; one
+        // that exists, with none in range or past the cursor, is an empty page.
+        if (n == 0) {
+            const exists = self.ts.hasFieldSeries(ns, measurement, field, filter.preds) catch
+                return .{ .refused = .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "ts read failed" } } };
+            if (!exists) return .{ .refused = .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = if (filter.canonical.len == 0)
+                std.fmt.bufPrint(&self.why_buf, "not found: '{s}' has no series of field '{s}'", .{ measurement, field }) catch "not found: no such series"
+            else
+                std.fmt.bufPrint(&self.why_buf, "not found: '{s}' has no series of field '{s}' with tags {s}", .{ measurement, field, filter.canonical }) catch "not found: no such series" } } };
+        }
         const page = buf[0..@min(n, limit)];
         var w: schema.Writer = .{ .buf = &self.read_buf };
         for (page) |p| ts_ops.Point.encode(&w, .{ .time_ns = @intCast(p.timestamp_ns), .value = p.field_value }) catch unreachable; // sized for MAX_READ
@@ -290,13 +311,14 @@ pub const TSHandler = struct {
         sendTSResponse(shard, conn, request_id, writeOk(key, r.int(u64) orelse result.timestamp_ns, result.index));
     }
 
-    /// The timestamp the client gave its point, in ns; null when it left
-    /// the choice to the server. Refused past what nanoseconds can hold.
-    fn clientTimestampNs(req: Request) error{Overflow}!?u64 {
-        const opt = req.findOption(.ts_timestamp) orelse return null;
-        const ts_ms = opt.asI64() orelse 0;
-        if (ts_ms <= 0) return null;
-        return try std.math.mul(u64, @intCast(ts_ms), 1_000_000);
+    /// The time the client gave its point, in ns; null when it left the
+    /// choice to the server (no option, or 0). An i64, so never past what a
+    /// read answers; one before 1970, or not 8 bytes, is refused.
+    fn clientTimestampNs(req: Request) error{ BeforeEpoch, NotI64 }!?u64 {
+        const opt = req.findOption(.ts_timestamp_ns) orelse return null;
+        const ns = opt.asI64() orelse return error.NotI64;
+        if (ns < 0) return error.BeforeEpoch;
+        return if (ns == 0) null else @intCast(ns);
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -338,9 +360,10 @@ pub const TSHandler = struct {
         }
 
         // Timestamp: from options, or server-generated
-        const client_ts = clientTimestampNs(req) catch {
-            return .{ .err = .{ .code = .invalid_request, .message = "ts write: timestamp out of range" } };
-        };
+        const client_ts = clientTimestampNs(req) catch |err| return .{ .err = .{ .code = .invalid_request, .message = switch (err) {
+            error.BeforeEpoch => "ts write: a point's time must not be before 1970",
+            error.NotI64 => "ts write: the timestamp option must be an 8-byte i64 of nanoseconds",
+        } } };
 
         // Canonical tag hash — sorted pairs, so tag ordering is not part of
         // the series identity (see ts_mod.canonicalTagHash).
@@ -388,7 +411,7 @@ pub const TSHandler = struct {
     fn writeOk(measurement: []const u8, timestamp_ns: u64, sequence: u64) CommandResult {
         return .{ .ts_write_ok = .{
             .series_hash = std.hash.Wyhash.hash(0, measurement),
-            .timestamp_ms = @intCast(timestamp_ns / 1_000_000),
+            .timestamp_ns = @intCast(timestamp_ns),
             .sequence = sequence,
         } };
     }
@@ -459,29 +482,35 @@ pub const TSHandler = struct {
         else
             "value";
 
-        const from_ns = if (req.findOption(.ts_from_ms)) |opt| blk: {
-            const ms = opt.asI64() orelse 0;
-            break :blk if (ms > 0) time_units.msToNsSat(@intCast(ms)) else 0;
-        } else 0;
-
-        const to_ns = if (req.findOption(.ts_to_ms)) |opt| blk: {
-            const ms = opt.asI64() orelse 0;
-            break :blk if (ms > 0) time_units.msToNsSat(@intCast(ms)) else std.math.maxInt(u64);
-        } else std.math.maxInt(u64);
+        // Times in ns; 0 (or none) leaves the bound open.
+        const from_ns: u64 = switch (nsOption(req, .ts_from_ns)) {
+            .bad => |why| return .{ .err = .{ .code = .invalid_request, .message = why } },
+            .none => 0,
+            .ns => |t| t,
+        };
+        const to_ns: u64 = switch (nsOption(req, .ts_to_ns)) {
+            .bad => |why| return .{ .err = .{ .code = .invalid_request, .message = why } },
+            .none => std.math.maxInt(u64),
+            .ns => |t| t,
+        };
 
         const agg_name = if (req.findOption(.ts_aggregation)) |opt|
             opt.asString()
         else
             "avg";
+        // Checked before the scan: an unknown name would leave every bucket
+        // without a value, so an answer of none.
+        const agg = floql_ast.AggFunction.fromString(agg_name) orelse
+            return .{ .err = .{ .code = .invalid_request, .message = UNKNOWN_AGGREGATION } };
 
-        // `--window` was accepted on the wire and then ignored: every query
-        // collapsed to a single aggregate and reported window_start_ms = 0.
         // Buckets are aligned to the epoch (ts / window * window) so a bucket's
-        // identity does not depend on the query's `from`.
-        const window_ms: i64 = if (req.findOption(.ts_window_ms)) |opt| blk: {
-            const w = opt.asI64() orelse 0;
-            break :blk if (w > 0) w else DEFAULT_WINDOW_MS;
-        } else DEFAULT_WINDOW_MS;
+        // identity does not depend on the query's `from`. Absent, the window
+        // is a minute; given, it must be more than 0.
+        const window_ns: u64 = if (req.findOption(.ts_window_ns) == null) DEFAULT_WINDOW_NS else switch (nsOption(req, .ts_window_ns)) {
+            .bad => |why| return .{ .err = .{ .code = .invalid_request, .message = why } },
+            .none => return .{ .err = .{ .code = .invalid_request, .message = "ts query: a window must be more than 0 ns" } },
+            .ns => |w| w,
+        };
 
         const ns_id = req.ns_id;
         var pred_buf: [32]ts_mod.TagPredicate = undefined;
@@ -492,23 +521,26 @@ pub const TSHandler = struct {
         // produced in order and a point can only ever extend the most
         // recent bucket.
         const Buckets = struct {
-            window_ms: i64,
-            starts: [MAX_QUERY_BUCKETS]i64 = undefined,
+            window_ns: u64,
+            starts: [MAX_QUERY_BUCKETS]u64 = undefined,
             accs: [MAX_QUERY_BUCKETS]BucketAcc = undefined,
             nb: usize = 0,
             scanned: usize = 0,
             max: usize,
+            too_many_windows: bool = false,
 
             fn add(acc: *@This(), pt: StoredPoint) bool {
                 acc.scanned += 1;
                 if (acc.scanned > acc.max) return false;
-                const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
-                const start = @divFloor(ts_ms, acc.window_ms) * acc.window_ms;
+                const start = pt.timestamp_ns / acc.window_ns * acc.window_ns;
                 if (acc.nb > 0 and acc.starts[acc.nb - 1] == start) {
                     acc.accs[acc.nb - 1].add(pt.field_value);
                     return true;
                 }
-                if (acc.nb >= MAX_QUERY_BUCKETS) return false;
+                if (acc.nb >= MAX_QUERY_BUCKETS) {
+                    acc.too_many_windows = true;
+                    return false;
+                }
                 acc.starts[acc.nb] = start;
                 acc.accs[acc.nb] = .{};
                 acc.accs[acc.nb].add(pt.field_value);
@@ -516,11 +548,12 @@ pub const TSHandler = struct {
                 return true;
             }
         };
-        var b: Buckets = .{ .window_ms = window_ms, .max = self.query_scanned_max };
+        var b: Buckets = .{ .window_ns = window_ns, .max = self.query_scanned_max };
         self.ts.scanFiltered(ns_id, measurement, field_name, preds, from_ns, to_ns, &b, Buckets.add) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts query failed" } };
         };
         if (b.scanned > b.max) return .{ .err = .{ .code = .invalid_request, .message = TOO_MANY_QUERY_POINTS } };
+        if (b.too_many_windows) return .{ .err = .{ .code = .invalid_request, .message = TOO_MANY_QUERY_BUCKETS } };
         const starts = b.starts[0..b.nb];
         const accs = b.accs[0..b.nb];
         const nb = b.nb;
@@ -528,8 +561,8 @@ pub const TSHandler = struct {
         var buckets: [MAX_QUERY_BUCKETS]QueryBucket = undefined;
         var out_n: usize = 0;
         for (starts[0..nb], accs[0..nb]) |start, acc| {
-            if (acc.value(agg_name)) |v| {
-                buckets[out_n] = .{ .start_ms = start, .value = v };
+            if (acc.value(agg)) |v| {
+                buckets[out_n] = .{ .start_ns = @intCast(start), .value = v };
                 out_n += 1;
             }
         }
@@ -561,20 +594,10 @@ pub const TSHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "floql: measurement name is required" } };
         }
 
-        // Resolve time range
-        const now_ms: i64 = @import("stdx").time.milliTimestamp();
-        var from_ns: u64 = 0;
-        var to_ns: u64 = std.math.maxInt(u64);
-        if (query.source.range.duration_ms > 0) {
-            const from_ms = now_ms - query.source.range.duration_ms;
-            from_ns = if (from_ms > 0) time_units.msToNsSat(@intCast(from_ms)) else 0;
-            to_ns = time_units.msToNsSat(@intCast(now_ms));
-        } else if (query.source.range.from_ms > 0) {
-            from_ns = time_units.msToNsSat(@intCast(query.source.range.from_ms));
-            if (query.source.range.to_ms > 0) {
-                to_ns = time_units.msToNsSat(@intCast(query.source.range.to_ms));
-            }
-        }
+        const from_ns: u64, const to_ns: u64 = switch (floqlRange(query.source.range, @import("stdx").time.milliTimestamp(), &self.why_buf)) {
+            .bad => |why| return .{ .err = .{ .code = .invalid_request, .message = why } },
+            .ok => |r| .{ r.from_ns, r.to_ns },
+        };
 
         // Resolve field: from field() stage (if present), default to "value"
         var field_name: []const u8 = "value";
@@ -600,7 +623,7 @@ pub const TSHandler = struct {
 
             fn take(c: *@This(), sp: StoredPoint) bool {
                 if (c.list.items.len > c.max) return false;
-                c.list.append(c.allocator, .{ .timestamp_ms = @intCast(sp.timestamp_ns / 1_000_000), .value = sp.field_value }) catch {
+                c.list.append(c.allocator, .{ .timestamp_ns = @intCast(sp.timestamp_ns), .value = sp.field_value }) catch {
                     c.failed = true;
                     return false;
                 };
@@ -644,7 +667,7 @@ pub const TSHandler = struct {
         // When pipeline has stages, it returns a new SeriesSet and does NOT free initial.
         var result_set = floql_executor.execute(query.stages, initial, self.allocator) catch |err| {
             initial.deinit();
-            if (err == error.InvalidInput) return .{ .err = .{ .code = .invalid_request, .message = "floql: a stage argument is out of range (percentile 0-100, at most 1000000 buckets per series)" } };
+            if (err == error.InvalidInput) return .{ .err = .{ .code = .invalid_request, .message = "floql: a stage argument is out of range (percentile 0-100, at most 1000000 buckets per series, a window or rate of at most 106751 days)" } };
             return .{ .err = .{ .code = .internal_error, .message = "floql: execution failed" } };
         };
         defer result_set.deinit();
@@ -769,7 +792,7 @@ pub const TSHandler = struct {
     }
 
     fn serverTimestampNs() u64 {
-        return @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
+        return @intCast(@import("stdx").time.nanoTimestamp());
     }
 
     pub fn freeResult(self: *TSHandler, cmd_result: CommandResult) void {
@@ -808,10 +831,10 @@ fn sendTSResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
             shard.sendRefusal(conn, request_id, e.code.toStatus(), e.refusal());
         },
         .ts_write_ok => |w| {
-            // Send [series_hash:u64][timestamp_ms:i64][sequence:u64] (24 bytes)
+            // [series_hash:u64][timestamp_ns:i64][sequence:u64]
             var buf: [24]u8 = undefined;
             std.mem.writeInt(u64, buf[0..8], w.series_hash, .little);
-            std.mem.writeInt(i64, buf[8..16], w.timestamp_ms, .little);
+            std.mem.writeInt(i64, buf[8..16], w.timestamp_ns, .little);
             std.mem.writeInt(u64, buf[16..24], w.sequence, .little);
             shard.sendOkResponse(conn, request_id, &buf);
         },
@@ -834,14 +857,53 @@ fn sendTSResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
 // Serialization
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Past this a bare FloQL time, epoch ms, is likely a ns or us one pasted.
+const FLOQL_LATEST_MS: i64 = 32_503_680_000_000; // 3000-01-01
+
+/// A FloQL range in ns: a duration back from now; two durations back from
+/// now; or bare numbers, epoch ms. One whose start is after its end is
+/// refused, not read as empty.
+fn floqlRange(range: floql_ast.TimeRange, now_ms: i64, buf: []u8) union(enum) { ok: struct { from_ns: u64, to_ns: u64 }, bad: []const u8 } {
+    var from_ms: i64 = 0;
+    var to_ms: ?i64 = null;
+    if (range.duration_ms > 0) {
+        from_ms = now_ms -| range.duration_ms;
+        to_ms = now_ms;
+    } else if (range.relative) {
+        from_ms = now_ms -| range.from_ms;
+        to_ms = now_ms -| range.to_ms;
+    } else if (range.absolute) {
+        if (range.from_ms < 0) return .{ .bad = "floql: a bare time in a range is epoch ms and must not be negative" };
+        const ends = [_]i64{ range.from_ms, range.to_ms };
+        for (ends[0..if (range.to_given) 2 else 1]) |t| if (t > FLOQL_LATEST_MS)
+            return .{ .bad = std.fmt.bufPrint(buf, "floql: {d} is past the year 3000 as epoch milliseconds; a bare time in a range is ms (did you paste ns or us?)", .{t}) catch "floql: a bare time in a range is epoch ms, and this one is past the year 3000" };
+        from_ms = range.from_ms;
+        if (range.to_given) to_ms = range.to_ms;
+    }
+    if (to_ms) |t| if (from_ms > t) return .{ .bad = "floql: the range's start is after its end" };
+    return .{ .ok = .{
+        .from_ns = if (from_ms > 0) time_units.msToNsSat(@intCast(from_ms)) else 0,
+        .to_ns = if (to_ms) |t| (if (t > 0) time_units.msToNsSat(@intCast(t)) else 0) else std.math.maxInt(u64),
+    } };
+}
+
 /// Default aggregation window when the request does not specify one.
-const DEFAULT_WINDOW_MS: i64 = 60_000;
+const DEFAULT_WINDOW_NS: u64 = std.time.ns_per_min;
+
+/// A query's time or window option, in ns: absent or 0 is none. One that
+/// isn't an 8-byte i64, or is negative, is refused rather than ignored.
+fn nsOption(req: Request, tag: proto.OptionTag) union(enum) { none, ns: u64, bad: []const u8 } {
+    const opt = req.findOption(tag) orelse return .none;
+    const v = opt.asI64() orelse return .{ .bad = "ts query: a time or window option must be an 8-byte i64 of nanoseconds" };
+    if (v < 0) return .{ .bad = "ts query: a time or window must not be negative" };
+    return if (v == 0) .none else .{ .ns = @intCast(v) };
+}
 
 /// Upper bound on buckets returned by one `ts query`.
 const MAX_QUERY_BUCKETS: usize = 1024;
 
 const QueryBucket = struct {
-    start_ms: i64,
+    start_ns: i64,
     value: f64,
 };
 
@@ -859,24 +921,23 @@ const BucketAcc = struct {
         if (v > self.max_v) self.max_v = v;
     }
 
-    /// Null for an empty bucket or an unrecognised aggregation name.
-    fn value(self: BucketAcc, agg: []const u8) ?f64 {
+    /// Null for an empty bucket.
+    fn value(self: BucketAcc, agg: floql_ast.AggFunction) ?f64 {
         if (self.n == 0) return null;
-        if (std.mem.eql(u8, agg, "avg")) return self.sum / @as(f64, @floatFromInt(self.n));
-        if (std.mem.eql(u8, agg, "sum")) return self.sum;
-        if (std.mem.eql(u8, agg, "min")) return self.min_v;
-        if (std.mem.eql(u8, agg, "max")) return self.max_v;
-        if (std.mem.eql(u8, agg, "count")) return @floatFromInt(self.n);
-        return null;
+        return switch (agg) {
+            .avg => self.sum / @as(f64, @floatFromInt(self.n)),
+            .sum => self.sum,
+            .min => self.min_v,
+            .max => self.max_v,
+            .count => @floatFromInt(self.n),
+        };
     }
 };
 
 /// Serialize an aggregate query result.
 ///
-/// Wire format (the CLI parser in cli/commands/ts.zig must match byte for byte —
-/// it previously read a `[hash:u64]` here that no encoder ever wrote, which
-/// misaligned the whole stream and rendered an empty table):
-///   [series_count:u32][key_len:u32][key][bucket_count:u32]([start_ms:i64][value:f64])*
+/// Wire format (the CLI parser in cli/commands/ts.zig must match byte for byte):
+///   [series_count:u32][key_len:u32][key][bucket_count:u32]([start_ns:i64][value:f64])*
 fn serializeQueryResult(allocator: Allocator, measurement: []const u8, buckets: []const QueryBucket) ![]u8 {
     if (buckets.len == 0) {
         const buf = try allocator.alloc(u8, 4);
@@ -898,7 +959,7 @@ fn serializeQueryResult(allocator: Allocator, measurement: []const u8, buckets: 
     std.mem.writeInt(u32, buf[offset..][0..4], @intCast(buckets.len), .little);
     offset += 4;
     for (buckets) |b| {
-        std.mem.writeInt(i64, buf[offset..][0..8], b.start_ms, .little);
+        std.mem.writeInt(i64, buf[offset..][0..8], b.start_ns, .little);
         offset += 8;
         std.mem.writeInt(u64, buf[offset..][0..8], @bitCast(b.value), .little);
         offset += 8;
@@ -986,7 +1047,7 @@ test "ts handler: write with string value" {
     switch (result) {
         .ts_write_ok => |w| {
             try testing.expect(w.series_hash != 0);
-            try testing.expect(w.timestamp_ms > 0);
+            try testing.expect(w.timestamp_ns > 0);
             try testing.expectEqual(@as(u64, 1), w.sequence);
         },
         else => return error.TestUnexpectedResult,
@@ -1035,21 +1096,51 @@ test "ts handler: write with field name option" {
     }
 }
 
-test "ts handler: a client timestamp past what nanoseconds hold is refused, not wrapped" {
+test "ts handler: a write's time is nanoseconds, read back exactly; 0 is the server's, and one before 1970 is refused" {
     const allocator = testing.allocator;
     var ts = TSProjection.init(allocator);
     defer ts.deinit();
     var handler = TSHandler.init(allocator, &ts);
 
+    const exact: i64 = 1_700_000_000_123_456_789;
     var opts_buf: [64]u8 = undefined;
     var builder = OptionsBuilder.init(&opts_buf);
-    try builder.addI64(.ts_timestamp, std.math.maxInt(i64) / 1_000);
-    const result = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(82.5), builder.getOptions()));
-    switch (result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
+    try builder.addI64(.ts_timestamp_ns, exact);
+    switch (handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(82.5), builder.getOptions()))) {
+        .ts_write_ok => |w| try testing.expectEqual(exact, w.timestamp_ns),
         else => return error.TestUnexpectedResult,
     }
-    try testing.expectEqual(@as(u64, 0), ts.stats.points_inserted);
+    const page = try testRead(&handler, "cpu", .{});
+    try testing.expectEqual(@as(u32, 1), page.n);
+    try testing.expectEqual(exact, page.times[0]);
+
+    // 0 is the server's time.
+    const before: i64 = @intCast(TSHandler.serverTimestampNs());
+    var zero = OptionsBuilder.init(&opts_buf);
+    try zero.addI64(.ts_timestamp_ns, 0);
+    switch (handler.handleCommand(makeRequest(.ts_write, "mem", &f64Bytes(1), zero.getOptions()))) {
+        .ts_write_ok => |w| try testing.expect(w.timestamp_ns >= before),
+        else => return error.TestUnexpectedResult,
+    }
+    // Before 1970, or not an i64: refused, not taken as the server's time.
+    var neg_buf: [64]u8 = undefined;
+    var neg = OptionsBuilder.init(&neg_buf);
+    try neg.addI64(.ts_timestamp_ns, -1);
+    var short_buf: [64]u8 = undefined;
+    var short = OptionsBuilder.init(&short_buf);
+    try short.addString(.ts_timestamp_ns, "1234");
+    const cases = [_]struct { opts: []const u8, why: []const u8 }{
+        .{ .opts = neg.getOptions(), .why = "ts write: a point's time must not be before 1970" },
+        .{ .opts = short.getOptions(), .why = "ts write: the timestamp option must be an 8-byte i64 of nanoseconds" },
+    };
+    for (cases) |c| switch (handler.handleCommand(makeRequest(.ts_write, "mem", &f64Bytes(1), c.opts))) {
+        .err => |e| {
+            try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code);
+            try testing.expectEqualStrings(c.why, e.message);
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(u64, 2), ts.stats.points_inserted);
 }
 
 test "ts handler: write empty measurement" {
@@ -1102,9 +1193,13 @@ fn testRead(h: *TSHandler, measurement: []const u8, args: ReadArgs) !TestPage {
 }
 
 fn refusalOf(h: *TSHandler, measurement: []const u8, args: ReadArgs) ![]const u8 {
+    return refusedAs(.bad_request, h, measurement, args);
+}
+
+fn refusedAs(status: proto.StatusCode, h: *TSHandler, measurement: []const u8, args: ReadArgs) ![]const u8 {
     switch (h.readPage(.default, measurement, args.field, args.tags, args.from_ns, args.to_ns, args.limit, args.order, args.cursor)) {
         .refused => |r| {
-            try testing.expectEqual(proto.StatusCode.bad_request, r.status);
+            try testing.expectEqual(status, r.status);
             return r.refusal.message;
         },
         else => return error.TestUnexpectedResult,
@@ -1127,8 +1222,8 @@ test "ts handler: read" {
     try testing.expectEqual(@as(u32, 1), rest.n);
     try testing.expectEqual(@as(f64, 30.0), rest.values[0]);
     try testing.expect(rest.cursor == null);
-    // A measurement with none: an empty page.
-    try testing.expectEqual(@as(u32, 0), (try testRead(&handler, "nonexistent", .{})).n);
+    // A measurement with no such series: not found.
+    try testing.expectEqualStrings("not found: 'nonexistent' has no series of field 'value'", try refusedAs(.not_found, &handler, "nonexistent", .{}));
 }
 
 test "ts handler: a read takes one field, the series a tag filter names, and its time range, ends included" {
@@ -1142,7 +1237,10 @@ test "ts handler: a read takes one field, the series a tag filter names, and its
     try ts.insert(.default, "cpu", "idle", 9, 200, 0, "host=a,dc=x");
     try testing.expectEqual(@as(u32, 3), (try testRead(&handler, "cpu", .{ .field = "user" })).n);
     try testing.expectEqual(@as(u32, 1), (try testRead(&handler, "cpu", .{ .field = "idle" })).n);
-    try testing.expectEqual(@as(u32, 0), (try testRead(&handler, "cpu", .{})).n);
+    // No series of the field, or none with the filter's tags: not found.
+    // A series with no points in range or past the cursor: an empty page.
+    try testing.expectEqualStrings("not found: 'cpu' has no series of field 'value'", try refusedAs(.not_found, &handler, "cpu", .{}));
+    try testing.expectEqualStrings("not found: 'cpu' has no series of field 'idle' with tags host=b", try refusedAs(.not_found, &handler, "cpu", .{ .field = "idle", .tags = "host=b" }));
     const a = try testRead(&handler, "cpu", .{ .field = "user", .tags = "host=a" });
     try testing.expectEqual(@as(u32, 2), a.n);
     try testing.expectEqual(@as(u32, 1), (try testRead(&handler, "cpu", .{ .field = "user", .tags = "dc=x,host=b" })).n);
@@ -1214,6 +1312,153 @@ test "ts handler: query avg" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+/// A command's refusal message, invalid_request; "" when it answers.
+fn refusedWith(h: *TSHandler, req: Request) ![]const u8 {
+    const result = h.handleCommand(req);
+    switch (result) {
+        .err => |e| {
+            try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code);
+            return e.message;
+        },
+        else => {
+            h.freeResult(result);
+            return "";
+        },
+    }
+}
+
+const TestBucket = struct { start_ns: i64, value: f64 };
+
+/// A query's buckets: start_ns stays an i64, which an f64 can't hold exactly.
+fn queryBuckets(h: *TSHandler, measurement: []const u8, opts: []const u8, out: []TestBucket) ![]const TestBucket {
+    const result = h.handleCommand(makeRequest(.ts_query, measurement, "", opts));
+    defer h.freeResult(result);
+    const data = switch (result) {
+        .ts_query_result => |r| r.data,
+        else => return error.TestUnexpectedResult,
+    };
+    if (std.mem.readInt(u32, data[0..4], .little) == 0) return out[0..0];
+    const key_len = std.mem.readInt(u32, data[4..8], .little);
+    var at: usize = 8 + key_len;
+    const n = std.mem.readInt(u32, data[at..][0..4], .little);
+    at += 4;
+    for (out[0..n]) |*b| {
+        b.* = .{ .start_ns = std.mem.readInt(i64, data[at..][0..8], .little), .value = @bitCast(std.mem.readInt(u64, data[at + 8 ..][0..8], .little)) };
+        at += 16;
+    }
+    return out[0..n];
+}
+
+test "ts handler: a query takes its range and window in ns, and answers bucket starts in ns" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator);
+    defer ts.deinit();
+    var handler = TSHandler.init(allocator, &ts);
+    const base: u64 = 1_700_000_000_000_000_000;
+    // Three points within one millisecond, 400 ns apart.
+    for ([_]u64{ 100, 500, 900 }, [_]f64{ 1, 2, 3 }) |off, v| try ts.insert(.default, "disk", "value", v, base + off, 0, "");
+
+    var ob: [96]u8 = undefined;
+    var b = OptionsBuilder.init(&ob);
+    try b.addString(.ts_aggregation, "sum");
+    try b.addI64(.ts_window_ns, 400);
+    var out: [8]TestBucket = undefined;
+    // Windows of 400 ns from the epoch: [0,400) [400,800) [800,1200) past base.
+    const got = try queryBuckets(&handler, "disk", b.getOptions(), &out);
+    try testing.expectEqual(@as(usize, 3), got.len);
+    try testing.expectEqual(@as(i64, @intCast(base)), got[0].start_ns);
+    try testing.expectEqual(@as(i64, @intCast(base + 400)), got[1].start_ns);
+    try testing.expectEqual(@as(i64, @intCast(base + 800)), got[2].start_ns);
+    try testing.expectEqual(@as(f64, 3), got[2].value);
+
+    // A range in ns: from the second point on.
+    var rb_buf: [96]u8 = undefined;
+    var rb = OptionsBuilder.init(&rb_buf);
+    try rb.addString(.ts_aggregation, "count");
+    try rb.addI64(.ts_from_ns, @intCast(base + 500));
+    const ranged = try queryBuckets(&handler, "disk", rb.getOptions(), &out);
+    try testing.expectEqual(@as(usize, 1), ranged.len);
+    try testing.expectEqual(@as(f64, 2), ranged[0].value);
+
+    // A window of 0 is refused, as is one so narrow the matching points
+    // span more windows than an answer holds.
+    var zb_buf: [64]u8 = undefined;
+    var zb = OptionsBuilder.init(&zb_buf);
+    try zb.addI64(.ts_window_ns, 0);
+    try testing.expectEqualStrings("ts query: a window must be more than 0 ns", try refusedWith(&handler, makeRequest(.ts_query, "disk", "", zb.getOptions())));
+    // An unknown aggregation is refused, not answered with no buckets.
+    var ab_buf: [64]u8 = undefined;
+    var ab = OptionsBuilder.init(&ab_buf);
+    try ab.addString(.ts_aggregation, "mean");
+    try testing.expectEqualStrings(UNKNOWN_AGGREGATION, try refusedWith(&handler, makeRequest(.ts_query, "disk", "", ab.getOptions())));
+    for (0..MAX_QUERY_BUCKETS + 1) |i| try ts.insert(.default, "many", "value", 1, base + i * 1000, 0, "");
+    var nb_buf: [64]u8 = undefined;
+    var nb = OptionsBuilder.init(&nb_buf);
+    try nb.addI64(.ts_window_ns, 1000);
+    try testing.expectEqualStrings(TOO_MANY_QUERY_BUCKETS, try refusedWith(&handler, makeRequest(.ts_query, "many", "", nb.getOptions())));
+
+    // A negative time, or one that isn't 8 bytes, is refused.
+    for ([_]struct { tag: proto.OptionTag, neg: bool }{ .{ .tag = .ts_from_ns, .neg = true }, .{ .tag = .ts_window_ns, .neg = true }, .{ .tag = .ts_to_ns, .neg = false } }) |c| {
+        var bad_buf: [64]u8 = undefined;
+        var bad = OptionsBuilder.init(&bad_buf);
+        if (c.neg) try bad.addI64(c.tag, -1) else try bad.addString(c.tag, "1234");
+        switch (handler.handleCommand(makeRequest(.ts_query, "disk", "", bad.getOptions()))) {
+            .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "ts handler: a floql range counts back from now, takes bare numbers as epoch ms, and refuses one backwards or past the year 3000" {
+    var buf: [256]u8 = undefined;
+    const now: i64 = 1_700_000_000_000;
+    const ms = std.time.ns_per_ms;
+    const R = floql_ast.TimeRange;
+    const Case = struct { range: R, from: u64, to: u64 };
+    const cases = [_]Case{
+        .{ .range = .{ .duration_ms = 3_600_000 }, .from = (now - 3_600_000) * ms, .to = now * ms },
+        // [2h..1h]: two hours ago to one hour ago.
+        .{ .range = .{ .from_ms = 7_200_000, .to_ms = 3_600_000, .relative = true }, .from = (now - 7_200_000) * ms, .to = (now - 3_600_000) * ms },
+        .{ .range = .{ .from_ms = 1_000, .to_ms = 2_000, .absolute = true, .to_given = true }, .from = 1_000 * ms, .to = 2_000 * ms },
+        // One bare number: a lower bound.
+        .{ .range = .{ .from_ms = 1_000, .absolute = true }, .from = 1_000 * ms, .to = std.math.maxInt(u64) },
+        // 0 is a time like any other: [0..T] keeps its upper bound.
+        .{ .range = .{ .from_ms = 0, .to_ms = 2_000, .absolute = true, .to_given = true }, .from = 0, .to = 2_000 * ms },
+    };
+    for (cases) |c| {
+        const r = floqlRange(c.range, now, &buf).ok;
+        try testing.expectEqual(c.from, r.from_ns);
+        try testing.expectEqual(c.to, r.to_ns);
+    }
+    try testing.expectEqualStrings("floql: the range's start is after its end", floqlRange(.{ .from_ms = 3_600_000, .to_ms = 7_200_000, .relative = true }, now, &buf).bad);
+    try testing.expectEqualStrings("floql: the range's start is after its end", floqlRange(.{ .from_ms = 2_000, .to_ms = 1_000, .absolute = true, .to_given = true }, now, &buf).bad);
+    try testing.expect(std.mem.startsWith(u8, floqlRange(.{ .from_ms = 1_708_700_400_000_000_000, .absolute = true }, now, &buf).bad, "floql: 1708700400000000000 is past the year 3000 as epoch milliseconds"));
+    // With a start of 0 the upper bound is still checked.
+    try testing.expect(std.mem.startsWith(u8, floqlRange(.{ .from_ms = 0, .to_ms = 1_708_700_400_000_000_000, .absolute = true, .to_given = true }, now, &buf).bad, "floql: 1708700400000000000 is past the year 3000"));
+    try testing.expectEqualStrings("floql: a bare time in a range is epoch ms and must not be negative", floqlRange(.{ .from_ms = -5, .to_ms = 1_000, .absolute = true, .to_given = true }, now, &buf).bad);
+}
+
+test "ts handler: a floql answer's points carry their time in ns" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator);
+    defer ts.deinit();
+    var handler = TSHandler.init(allocator, &ts);
+    const t: u64 = 1_700_000_000_123_456_789;
+    try ts.insert(.default, "cpu", "value", 7, t, 0, "");
+    const result = handler.handleCommand(makeRequest(.ts_floql, "", "cpu[1700000000000]", ""));
+    defer handler.freeResult(result);
+    const data = switch (result) {
+        .ts_floql_result => |r| r.data,
+        else => return error.TestUnexpectedResult,
+    };
+    // [series:u32][key_len:u32][key][field_len:u32][field][points:u32][ns:i64][value:f64]
+    var at: usize = 4;
+    at += 4 + std.mem.readInt(u32, data[at..][0..4], .little);
+    at += 4 + std.mem.readInt(u32, data[at..][0..4], .little);
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, data[at..][0..4], .little));
+    try testing.expectEqual(@as(i64, @intCast(t)), std.mem.readInt(i64, data[at + 4 ..][0..8], .little));
 }
 
 test "ts handler: query count" {
@@ -1468,7 +1713,7 @@ test "ts handler: delete measurement" {
         else => return error.TestUnexpectedResult,
     }
 
-    try testing.expectEqual(@as(u32, 0), (try testRead(&handler, "cpu", .{})).n);
+    try testing.expectEqualStrings("not found: 'cpu' has no series of field 'value'", try refusedAs(.not_found, &handler, "cpu", .{}));
     try testing.expectEqual(@as(u32, 1), (try testRead(&handler, "memory", .{})).n);
 }
 
@@ -1623,21 +1868,6 @@ test "ts handler: a query or FloQL query reading past its budget is refused, not
     var handler = TSHandler.init(allocator, &ts);
     const now_ns: u64 = @intCast(@import("stdx").time.milliTimestamp() * std.time.ns_per_ms);
     for (0..11) |i| try ts.insert(.default, "cpu", "value", 1, now_ns - i * std.time.ns_per_ms, 0, "");
-    const refusedWith = struct {
-        fn f(h: *TSHandler, req: Request) ![]const u8 {
-            const result = h.handleCommand(req);
-            switch (result) {
-                .err => |e| {
-                    try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code);
-                    return e.message;
-                },
-                else => {
-                    h.freeResult(result);
-                    return "";
-                },
-            }
-        }
-    }.f;
     handler.query_scanned_max = 11;
     handler.floql_points_max = 11;
     try testing.expectEqualStrings("", try refusedWith(&handler, makeRequest(.ts_query, "cpu", "", "")));

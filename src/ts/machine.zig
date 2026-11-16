@@ -84,6 +84,13 @@ const NS_PER_S = std.time.ns_per_s;
 /// The edges as the metric labels them.
 pub const LATE_EDGE_NAMES = [_][]const u8{ "0s", "1s", "5s", "15s", "30s", "1m", "5m", "1h" };
 
+/// The smallest edge at or above a lateness window of `window_ns`, so a
+/// point counted past it was later than the window; none past the last.
+pub fn lateEdgeFor(window_ns: u64) ?usize {
+    for (LATE_EDGES_NS, 0..) |edge, i| if (edge >= window_ns) return i;
+    return null;
+}
+
 /// A measurement field: `[newest_ns u64][series u64][writes u64][late u64
 /// × edges]`, little-endian.
 pub const FieldValue = struct {
@@ -663,6 +670,17 @@ fn fieldIn(store: *store_mod.Store, ns: NamespaceId, m: []const u8, f: []const u
     defer testing.allocator.free(k);
     const rv = view_mod.ReadView{ .store = store };
     return rv.get(Fields, k);
+}
+
+test "time series: a lateness window reports against the smallest edge at or above it" {
+    const s_ns = std.time.ns_per_s;
+    try testing.expectEqual(@as(?usize, 0), lateEdgeFor(0));
+    try testing.expectEqual(@as(?usize, 1), lateEdgeFor(1));
+    try testing.expectEqual(@as(?usize, 2), lateEdgeFor(3 * s_ns));
+    try testing.expectEqual(@as(?usize, 4), lateEdgeFor(30 * s_ns));
+    try testing.expectEqual(@as(?usize, 5), lateEdgeFor(30 * s_ns + 1));
+    try testing.expectEqual(@as(?usize, 7), lateEdgeFor(3600 * s_ns));
+    try testing.expectEqual(@as(?usize, null), lateEdgeFor(3600 * s_ns + 1));
 }
 
 test "time series: a late point counts past each edge it trails its field's newest time by, not at the edge" {

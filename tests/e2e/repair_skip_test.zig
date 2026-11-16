@@ -1,8 +1,8 @@
 //! A shard halted at an entry is repaired offline on a stopped single node:
 //! `flo server repair skip` appends a skip of that entry, and the shard
 //! comes up past it. The write never runs, on this build or a later one
-//! that could apply it. The halting entry comes from a fault only a
-//! `-Dtest-faults` build carries; without one these skip.
+//! that could apply it. The halting entry comes from a test fault, so these
+//! run on the flo-faults e2e binary (`.faults = true`).
 
 const std = @import("std");
 const testing = std.testing;
@@ -87,9 +87,8 @@ fn startFaultsOff(ctx: *stdx.testing.TestContext) !void {
 }
 
 test "e2e/repair: a halted shard repaired offline comes up past the entry, which never runs" {
-    if (!test_faults.enabled) return error.SkipZigTest;
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true },
+        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     const h = try haltOne(ctx);
@@ -124,11 +123,10 @@ test "e2e/repair: a halted shard repaired offline comes up past the entry, which
 }
 
 test "e2e/repair: a later build that could apply a skipped entry still skips it" {
-    if (!test_faults.enabled) return error.SkipZigTest;
     // Without the repair, a build with the fault off applies the write.
     {
         var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-            .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true },
+            .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true, .faults = true },
         });
         defer ctx.deinit();
         _ = try haltOne(ctx);
@@ -138,7 +136,7 @@ test "e2e/repair: a later build that could apply a skipped entry still skips it"
     }
     // With it, that build passes over the entry.
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true },
+        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     const h = try haltOne(ctx);
@@ -155,9 +153,8 @@ test "e2e/repair: a later build that could apply a skipped entry still skips it"
 }
 
 test "e2e/repair: a running server's data directory is refused" {
-    if (!test_faults.enabled) return error.SkipZigTest;
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true },
+        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     const h = try haltOne(ctx);
@@ -170,7 +167,7 @@ test "e2e/repair: a running server's data directory is refused" {
 
 test "e2e/repair: only the entry a shard is halted at is skipped; an acked write is refused" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true },
+        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     try ctx.exec(&.{ "kv", "set", "acked", "yes" });

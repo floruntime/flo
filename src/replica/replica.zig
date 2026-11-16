@@ -119,6 +119,10 @@ pub fn Replica(comptime Io: type) type {
             return Io.flushForAck(self);
         }
 
+        fn asyncAckBlocked(self: *Self) bool {
+            return Io.asyncAckBlocked(self);
+        }
+
         // ─── The host ────────────────────────────────────────────────────
 
         fn raftNode(self: *Self) *RaftNode {
@@ -146,6 +150,13 @@ pub fn Replica(comptime Io: type) type {
         /// callers stay quiet rather than log the same block each frame.
         fn readBlocked(self: *Self) bool {
             return Io.Host.readBlocked(self);
+        }
+
+        /// Apply is held at an open disk-staging gap under async_flush:
+        /// `applyCommitted` returns false by design until the gap fills, so
+        /// callers stay quiet rather than log a block every AppendEntries.
+        fn gapHolding(self: *Self) bool {
+            return Io.Host.gapHolding(self);
         }
 
         fn clearRemovalNotices(self: *Self) void {
@@ -263,14 +274,23 @@ pub fn Replica(comptime Io: type) type {
                     // A leader of this term still sends to this node as a member.
                     if (hdr.term == raft.current_term) self.clearRemovalNotices();
                     // An ack means "in my log, on disk" when commits are durable.
-                    if (resp.success and count > 0 and self.durableCommits()) {
-                        if (!self.flushForAck()) return;
-                        raft.markDurable(raft.log.lastIndex());
+                    if (resp.success and count > 0) {
+                        if (self.durableCommits()) {
+                            if (!self.flushForAck()) return;
+                            raft.markDurable(raft.log.lastIndex());
+                        } else if (self.asyncAckBlocked()) {
+                            // async_flush, but this node's disk has fallen too far
+                            // behind: withhold the ack, as the durable path does,
+                            // so it stops counting toward commit until a flush
+                            // lands. If a majority withhold, commit stalls and
+                            // clients time out (ran=unknown), which is correct.
+                            return;
+                        }
                     }
                     var buf: [transport.APPEND_RESP_SIZE]u8 = undefined;
                     const n = transport.serializeAppendResponse(resp, &buf) orelse return;
                     self.sendRaft(frame.source_node, .append_entries_response, buf[0..n]);
-                    if (!self.applyCommitted() and !self.readBlocked()) log.err("shard {d}: a committed entry could not be applied", .{self.id});
+                    if (!self.applyCommitted() and !self.readBlocked() and !self.gapHolding()) log.err("shard {d}: a committed entry could not be applied", .{self.id});
                 },
                 .append_entries_response => {
                     const resp = transport.deserializeAppendResponse(frame.payload) orelse return self.badFrame(frame);
@@ -279,7 +299,7 @@ pub fn Replica(comptime Io: type) type {
                     raft.handleAppendResponse(resp);
                     // Applied first: a leader whose own removal just committed
                     // answers what it parked on that commit before it lets go.
-                    if (!self.applyCommitted() and !self.readBlocked()) log.err("shard {d}: a committed entry could not be applied", .{self.id});
+                    if (!self.applyCommitted() and !self.readBlocked() and !self.gapHolding()) log.err("shard {d}: a committed entry could not be applied", .{self.id});
                     if (was == .leader and raft.role != .leader) {
                         if (raft.left_group) {
                             raft.left_group = false;
@@ -615,7 +635,7 @@ pub fn Replica(comptime Io: type) type {
                     if (raft.role == .leader) {
                         log.info("shard {d}: elected leader for term {d} as the only member", .{ self.id, raft.current_term });
                         // Alone, the win commits the whole log.
-                        if (!self.applyCommitted() and !self.readBlocked()) log.err("shard {d}: a committed entry could not be applied", .{self.id});
+                        if (!self.applyCommitted() and !self.readBlocked() and !self.gapHolding()) log.err("shard {d}: a committed entry could not be applied", .{self.id});
                     }
                 }
             }
@@ -832,6 +852,10 @@ const TestIo = struct {
         return true;
     }
 
+    pub fn asyncAckBlocked(_: *TestReplica) bool {
+        return false;
+    }
+
     pub fn setVoters(_: *TestReplica, _: []const u32) void {}
 
     pub const Host = struct {
@@ -849,6 +873,9 @@ const TestIo = struct {
             return true;
         }
         pub fn readBlocked(_: *TestReplica) bool {
+            return false;
+        }
+        pub fn gapHolding(_: *TestReplica) bool {
             return false;
         }
         pub fn clearRemovalNotices(_: *TestReplica) void {}
@@ -1130,6 +1157,10 @@ const VouchIo = struct {
         return true;
     }
 
+    pub fn asyncAckBlocked(_: *VouchReplica) bool {
+        return false;
+    }
+
     pub fn setVoters(_: *VouchReplica, _: []const u32) void {}
 
     pub const Host = struct {
@@ -1147,6 +1178,9 @@ const VouchIo = struct {
             return true;
         }
         pub fn readBlocked(_: *VouchReplica) bool {
+            return false;
+        }
+        pub fn gapHolding(_: *VouchReplica) bool {
             return false;
         }
         pub fn clearRemovalNotices(_: *VouchReplica) void {}

@@ -144,7 +144,7 @@ test "e2e/time: a lower bound past the clock matches nothing, and an age past it
     // The point is there from zero; from past the clock, nothing is.
     try testing.expectEqual(@as(u32, 1), try tsReadCount(ctx, 1, &out));
     try testing.expectEqual(@as(u32, 0), try tsReadCount(ctx, std.math.maxInt(i64), &out));
-    try testing.expectEqual(@as(u32, 0), try leadingCount(try rawCall(ctx, .ts_query, "m", "", try option(&obuf, .ts_from_ms, i64, std.math.maxInt(i64)), &out)));
+    try testing.expectEqual(@as(u32, 0), try leadingCount(try rawCall(ctx, .ts_query, "m", "", try option(&obuf, .ts_from_ns, i64, std.math.maxInt(i64)), &out)));
     const query = try rawCall(ctx, .ts_floql, "", "m[20000000000000]", "", &out);
     try testing.expectEqual(@backingInt(proto.StatusCode.ok), query.status);
 
