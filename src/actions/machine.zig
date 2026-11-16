@@ -699,13 +699,13 @@ test "actions machine: a leader's abandon proposed again after the expire applie
     const live = t.run(.default, "r1").?.expiry_ns;
     try testing.expect((try t.apply(.action_expire, try expiring(&ibuf, keyOf("r1", live)), live + ms)).refused() == null);
     const sums = t.sums();
-    try testing.expect((try t.apply(.action_release, back, live + 2 * ms)).refused() != null);
+    try testing.expectEqualStrings("stale report: the lease expired and the run moved on", (try t.apply(.action_release, back, live + 2 * ms)).refused().?.refusal.message);
     try testing.expectEqual(sums, t.sums());
     try testing.expectEqual(@as(u32, 1), t.run(.default, "r1").?.failures);
     // Delivered again once; the kept hand-back still applies nothing.
     try testing.expect((try deliver(&t, "r1", live + ms, live + 3 * ms)).refused() == null);
     const again = t.sums();
-    try testing.expect((try t.apply(.action_release, back, live + 4 * ms)).refused() != null);
+    try testing.expectEqualStrings("stale report: the run was delivered again since", (try t.apply(.action_release, back, live + 4 * ms)).refused().?.refusal.message);
     try testing.expectEqual(again, t.sums());
     const run = t.run(.default, "r1").?;
     try testing.expectEqual(Status.leased, run.status);

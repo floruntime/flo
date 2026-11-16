@@ -3230,7 +3230,7 @@ pub const Shard = struct {
         /// send it.
         term: u64,
         /// Its lease's expiry, by the log's clock: past it the expire sweep
-        /// returns the record, and a release would only be refused.
+        /// proposes its expire, and whichever applies first wins.
         not_after_ns: u64,
     };
 
@@ -3246,15 +3246,14 @@ pub const Shard = struct {
     }
 
     /// Proposes a release no client waits on: a group's records a read's
-    /// answer couldn't carry, or a run whose taker went away. Refused for a
-    /// while (a full log, writes stopped), it is kept and tried again each
-    /// tick, so the record comes back now rather than at its lease's end,
+    /// answer couldn't carry, or a run whose taker went away. Refused for
+    /// want of room in the log, it is kept and tried again each tick, so the record comes back now rather than at its lease's end,
     /// where expiry would count it a failure. Either way the release is
     /// fenced by its delivery: one that lands after the expire, or after a
     /// redelivery, applies nothing.
     pub fn proposeHandBack(self: *Shard, kind: HandBackKind, etype: entry_mod.EntryType, payload: []const u8, not_after_ns: u64) void {
         const err = if (self.raft_node.propose(etype, entry_mod.Flags.NONE, payload)) |_| return else |e| e;
-        if (!handBackRetries(err)) return self.dropHandBack(kind, @errorName(err));
+        if (err != error.Overloaded) return self.refusedHandBack(kind, err);
         if (self.handbacks.items.len >= HANDBACK_MAX) return self.dropHandBack(kind, "too many hand-backs already wait");
         if (payload.len > HANDBACK_MAX_PAYLOAD) return self.dropHandBack(kind, "its release is larger than any should be");
         const owned = self.allocator.dupe(u8, payload) catch return self.dropHandBack(kind, "out of memory holding it");
@@ -3264,16 +3263,21 @@ pub const Shard = struct {
         };
     }
 
-    /// Refusals that pass: the log has room again, writes resume.
-    fn handBackRetries(err: anyerror) bool {
-        return err == error.Overloaded or err == error.WritesStopped;
+    /// A hand-back refused for good. A halted shard says so with its own
+    /// count of refused writes, as its other duties do.
+    fn refusedHandBack(self: *Shard, kind: HandBackKind, err: anyerror) void {
+        if (self.quietHalted(err)) {
+            if (self.shard_metrics) |m| m.recordHandBack(kind, .dropped);
+            return;
+        }
+        self.dropHandBack(kind, @errorName(err));
     }
 
-    /// The hand-backs waiting, oldest first, until the log is full again.
+    /// The hand-backs waiting, oldest first. One the log has no room for
+    /// stays, as do those after it: each gets the same refusal.
     fn retryHandBacks(self: *Shard) void {
         const items = self.handbacks.items;
         const now = self.raft_node.now();
-        var stop = false;
         var keep: usize = 0;
         for (items) |h| {
             const why: ?[]const u8 = if (self.raft_node.role != .leader or self.raft_node.current_term != h.term)
@@ -3287,18 +3291,14 @@ pub const Shard = struct {
                 self.dropHandBack(h.kind, w);
                 continue;
             }
-            if (!stop) {
-                if (self.raft_node.propose(h.etype, entry_mod.Flags.NONE, h.payload)) |_| {
-                    self.allocator.free(h.payload);
-                    if (self.shard_metrics) |m| m.recordHandBack(h.kind, .retried);
-                    continue;
-                } else |err| if (handBackRetries(err)) {
-                    stop = true;
-                } else {
-                    self.allocator.free(h.payload);
-                    self.dropHandBack(h.kind, @errorName(err));
-                    continue;
-                }
+            if (self.raft_node.propose(h.etype, entry_mod.Flags.NONE, h.payload)) |_| {
+                self.allocator.free(h.payload);
+                if (self.shard_metrics) |m| m.recordHandBack(h.kind, .retried);
+                continue;
+            } else |err| if (err != error.Overloaded) {
+                self.allocator.free(h.payload);
+                self.refusedHandBack(h.kind, err);
+                continue;
             }
             items[keep] = h;
             keep += 1;
@@ -3306,13 +3306,19 @@ pub const Shard = struct {
         self.handbacks.shrinkRetainingCapacity(keep);
     }
 
-    /// Every waiting hand-back given up, on a step-down.
+    /// Every waiting hand-back given up, on a step-down or at stop: said in
+    /// one line, with any given up unsaid before it.
     fn dropHandBacks(self: *Shard, why: []const u8) void {
+        const n = self.handbacks.items.len;
+        if (n == 0) return;
         for (self.handbacks.items) |h| {
             self.allocator.free(h.payload);
-            self.dropHandBack(h.kind, why);
+            if (self.shard_metrics) |m| m.recordHandBack(h.kind, .dropped);
         }
         self.handbacks.clearRetainingCapacity();
+        log.warn("shard {d}: {d} hand-backs given up ({s}); their leases' expiry returns them, counting a failure ({d} more given up since the last line)", .{ self.id, n, why, self.handback_unsaid });
+        self.handback_unsaid = 0;
+        self.handback_line_ms = nowMs() + 30_000;
     }
 
     /// A hand-back given up: its lease's expiry returns the record, counting
@@ -27631,38 +27637,81 @@ fn testHandBack(buf: []u8, run_id: []const u8) ![]const u8 {
     return action_entries.Release.encodeInto(buf, .{ .ns = ns_table.Id.default.int(), .action = "a", .run = run_id, .holder = "w", .request_key = null, .deliveries = 1, .token = .{ .term = 1, .index = 1 }, .expiry_ns = 0, .abandoned = true, .retry = true, .delay_ms = 0, .@"error" = "" });
 }
 
-test "Shard: a hand-back refused while writes are stopped is kept, then proposed once they resume, counted retried" {
-    var t: AdminTest = undefined;
-    try t.init(1, .bootstrap);
-    defer t.deinit();
-    var sm = ShardMetrics{ .shard_id = 0 };
-    t.shard.shard_metrics = &sm;
-    defer t.shard.shard_metrics = null;
-    const raft = t.shard.raft_node;
-    var buf: [512]u8 = undefined;
-    const payload = try testHandBack(&buf, "r1");
-    const until = raft.now() + 60 * std.time.ns_per_s;
-
-    raft.writes_stopped = true;
-    const tip = raft.log.lastIndex();
-    t.shard.proposeHandBack(.action, .action_release, payload, until);
-    try std.testing.expectEqual(@as(usize, 1), t.shard.handbacks.items.len);
-    // Still stopped: kept, nothing proposed.
-    t.shard.retryHandBacks();
-    try std.testing.expectEqual(@as(usize, 1), t.shard.handbacks.items.len);
-    try std.testing.expectEqual(tip, raft.log.lastIndex());
-
-    raft.writes_stopped = false;
-    t.shard.retryHandBacks();
-    try std.testing.expectEqual(@as(usize, 0), t.shard.handbacks.items.len);
-    try std.testing.expectEqual(tip + 1, raft.log.lastIndex());
-    try std.testing.expectEqual(@as(u64, 1), sm.handbacks[@backingInt(ShardMetrics.HandBackKind.action)][@backingInt(ShardMetrics.HandBackOutcome.retried)].load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 0), sm.handbacks[@backingInt(ShardMetrics.HandBackKind.action)][@backingInt(ShardMetrics.HandBackOutcome.dropped)].load(.monotonic));
+/// Proposes no-ops, uncommitted until the peer acks, until the log has
+/// `room` left before it refuses for want of it.
+fn fillLog(sh: *Shard, room: u64) !void {
+    const r = sh.raft_node;
+    while (r.log.lastIndex() - r.last_applied < raft_node_mod.MAX_OUTSTANDING - room) _ = try r.propose(.raft_noop, entry_mod.Flags.NONE, "");
 }
 
-test "Shard: a kept hand-back is given up at its lease's end, on a step-down, or when the list is full, each counted dropped" {
-    var t: AdminTest = undefined;
-    try t.init(1, .bootstrap);
+fn handBacks(sm: *const ShardMetrics, kind: ShardMetrics.HandBackKind, outcome: ShardMetrics.HandBackOutcome) u64 {
+    return sm.handbacks[@backingInt(kind)][@backingInt(outcome)].load(.monotonic);
+}
+
+test "Shard: a run whose taker went away, handed back while the log is full, is kept and proposed once there's room, counting no failure" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var sm = ShardMetrics{ .shard_id = 0 };
+    t.shard.shard_metrics = &sm;
+    defer t.shard.shard_metrics = null;
+    try t.setUp(&.{"r1"}, t.shard.raft_node.now());
+    const run = ActionsHandler.for_tests.run(&t.shard, .default, "r1").?;
+    try std.testing.expectEqual(action_machine.Status.leased, run.status);
+
+    // The abandon an orphaned answer sends the run's shard.
+    var bytes: [64]u8 = undefined;
+    var w: usize = 0;
+    std.mem.writeInt(u32, bytes[0..4], ns_table.DEFAULT.int(), .little);
+    w = 4;
+    for ([_][]const u8{ "w1", "act", "r1" }) |part| {
+        std.mem.writeInt(u16, bytes[w..][0..2], @intCast(part.len), .little);
+        @memcpy(bytes[w + 2 ..][0..part.len], part);
+        w += 2 + part.len;
+    }
+    std.mem.writeInt(u32, bytes[w..][0..4], run.deliveries, .little);
+    std.mem.writeInt(u64, bytes[w + 4 ..][0..8], run.token.term, .little);
+    std.mem.writeInt(u64, bytes[w + 12 ..][0..8], run.token.index, .little);
+    w += 20;
+
+    try fillLog(&t.shard, 0);
+    t.shard.actions_handler.abandonFromInbox(&t.shard, bytes[0..w]);
+    try std.testing.expectEqual(@as(usize, 1), t.shard.handbacks.items.len);
+
+    // Room again: proposed on the next pass, and it applies.
+    try ParkTest.ack(&t.shard);
+    t.shard.retryHandBacks();
+    try std.testing.expectEqual(@as(usize, 0), t.shard.handbacks.items.len);
+    try std.testing.expectEqual(@as(u64, 1), handBacks(&sm, .action, .retried));
+    try ParkTest.ack(&t.shard);
+    const back = ActionsHandler.for_tests.run(&t.shard, .default, "r1").?;
+    try std.testing.expectEqual(action_machine.Status.ready, back.status);
+    try std.testing.expectEqual(action_machine.Ended.abandoned, back.ended);
+    try std.testing.expectEqual(@as(u32, 0), back.failures);
+}
+
+test "Shard: kept hand-backs go oldest first; one the log has no room for stays, and the ones after it" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const until = t.shard.raft_node.now() + 60 * std.time.ns_per_s;
+    var b1: [512]u8 = undefined;
+    var b2: [512]u8 = undefined;
+    try fillLog(&t.shard, 0);
+    t.shard.proposeHandBack(.action, .action_release, try testHandBack(&b1, "r1"), until);
+    t.shard.proposeHandBack(.action, .action_release, try testHandBack(&b2, "r2"), until);
+    try std.testing.expectEqual(@as(usize, 2), t.shard.handbacks.items.len);
+    // Room for one.
+    try ParkTest.ack(&t.shard);
+    try fillLog(&t.shard, 1);
+    t.shard.retryHandBacks();
+    try std.testing.expectEqual(@as(usize, 1), t.shard.handbacks.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, t.shard.handbacks.items[0].payload, "r2") != null);
+}
+
+test "Shard: a kept hand-back is given up at its lease's end, or past the cap, each counted dropped" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
     defer t.deinit();
     var sm = ShardMetrics{ .shard_id = 0 };
     t.shard.shard_metrics = &sm;
@@ -27670,31 +27719,79 @@ test "Shard: a kept hand-back is given up at its lease's end, on a step-down, or
     const raft = t.shard.raft_node;
     var buf: [512]u8 = undefined;
     const payload = try testHandBack(&buf, "r1");
-    const dropped = &sm.handbacks[@backingInt(ShardMetrics.HandBackKind.group)][@backingInt(ShardMetrics.HandBackOutcome.dropped)];
-    raft.writes_stopped = true;
-    defer raft.writes_stopped = false;
 
     // Its lease already over: given up on the next pass, not proposed.
-    t.shard.proposeHandBack(.group, .action_release, payload, raft.now() -| 1);
+    try fillLog(&t.shard, 0);
+    t.shard.proposeHandBack(.action, .action_release, payload, raft.now() -| 1);
     try std.testing.expectEqual(@as(usize, 1), t.shard.handbacks.items.len);
-    raft.writes_stopped = false;
+    try ParkTest.ack(&t.shard);
     const tip = raft.log.lastIndex();
     t.shard.retryHandBacks();
     try std.testing.expectEqual(@as(usize, 0), t.shard.handbacks.items.len);
     try std.testing.expectEqual(tip, raft.log.lastIndex());
-    try std.testing.expectEqual(@as(u64, 1), dropped.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), handBacks(&sm, .action, .dropped));
 
     // Full: the one past the cap is given up at once.
-    raft.writes_stopped = true;
+    try fillLog(&t.shard, 0);
     const until = raft.now() + 60 * std.time.ns_per_s;
-    for (0..Shard.HANDBACK_MAX + 1) |_| t.shard.proposeHandBack(.group, .action_release, payload, until);
+    for (0..Shard.HANDBACK_MAX + 1) |_| t.shard.proposeHandBack(.action, .action_release, payload, until);
     try std.testing.expectEqual(@as(usize, Shard.HANDBACK_MAX), t.shard.handbacks.items.len);
-    try std.testing.expectEqual(@as(u64, 2), dropped.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), handBacks(&sm, .action, .dropped));
+}
 
-    // A step-down gives up every one, freeing each.
+test "Shard: a kept hand-back isn't sent by a later term's leader, or once this node follows, even before its step-down is handled" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var sm = ShardMetrics{ .shard_id = 0 };
+    t.shard.shard_metrics = &sm;
+    defer t.shard.shard_metrics = null;
+    const raft = t.shard.raft_node;
+    var buf: [512]u8 = undefined;
+    const payload = try testHandBack(&buf, "r1");
+    const until = raft.now() + 60 * std.time.ns_per_s;
+    try fillLog(&t.shard, 0);
+    t.shard.proposeHandBack(.action, .action_release, payload, until);
+    try ParkTest.ack(&t.shard);
+
+    // A later term, still leading: the one kept in the old term goes.
+    raft.current_term += 1;
+    const tip = raft.log.lastIndex();
+    t.shard.retryHandBacks();
+    raft.current_term -= 1;
+    try std.testing.expectEqual(@as(usize, 0), t.shard.handbacks.items.len);
+    try std.testing.expectEqual(tip, raft.log.lastIndex());
+
+    // Following, the step-down not yet handled: it goes too.
+    try fillLog(&t.shard, 0);
+    t.shard.proposeHandBack(.action, .action_release, payload, until);
+    try ParkTest.ack(&t.shard);
+    raft.role = .follower;
+    t.shard.retryHandBacks();
+    raft.role = .leader;
+    try std.testing.expectEqual(@as(usize, 0), t.shard.handbacks.items.len);
+    try std.testing.expectEqual(@as(u64, 2), handBacks(&sm, .action, .dropped));
+}
+
+test "Shard: a step-down, and a stop, give up every kept hand-back, each counted dropped" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var sm = ShardMetrics{ .shard_id = 0 };
+    t.shard.shard_metrics = &sm;
+    defer t.shard.shard_metrics = null;
+    var buf: [512]u8 = undefined;
+    const payload = try testHandBack(&buf, "r1");
+    const until = t.shard.raft_node.now() + 60 * std.time.ns_per_s;
+    try fillLog(&t.shard, 0);
+    for (0..3) |_| t.shard.proposeHandBack(.action, .action_release, payload, until);
+    t.shard.refuseUnrunRequests();
+    try std.testing.expectEqual(@as(usize, 0), t.shard.handbacks.items.len);
+    try std.testing.expectEqual(@as(u64, 3), handBacks(&sm, .action, .dropped));
+    for (0..2) |_| t.shard.proposeHandBack(.action, .action_release, payload, until);
     t.shard.stoppedLeading("stepped down");
     try std.testing.expectEqual(@as(usize, 0), t.shard.handbacks.items.len);
-    try std.testing.expectEqual(@as(u64, 2 + Shard.HANDBACK_MAX), dropped.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 5), handBacks(&sm, .action, .dropped));
 }
 
 test "Shard: a hand-back refused for good is given up at once, not kept" {
@@ -27709,5 +27806,5 @@ test "Shard: a hand-back refused for good is given up at once, not kept" {
     var buf: [512]u8 = undefined;
     t.shard.proposeHandBack(.action, .action_release, try testHandBack(&buf, "r1"), t.shard.raft_node.now() + std.time.ns_per_s);
     try std.testing.expectEqual(@as(usize, 0), t.shard.handbacks.items.len);
-    try std.testing.expectEqual(@as(u64, 1), sm.handbacks[@backingInt(ShardMetrics.HandBackKind.action)][@backingInt(ShardMetrics.HandBackOutcome.dropped)].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), handBacks(&sm, .action, .dropped));
 }

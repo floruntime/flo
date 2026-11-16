@@ -1212,7 +1212,8 @@ pub const ActionsHandler = struct {
     fn abandon(self: *ActionsHandler, shard: *Shard, ns: NamespaceId, holder: []const u8, t: Task) void {
         _ = self;
         const run = getRun(shard, ns, t.run) orelse return;
-        if (ns == .invalid) return;
+        // An entry naming no namespace would halt every replica that applied it.
+        if (ns == .invalid) return shard.dropHandBack(.action, "it names no namespace");
         const body: ae.Release.Value = .{ .ns = ns.int(), .action = t.action, .run = t.run, .holder = holder, .request_key = run.request_key, .deliveries = t.deliveries, .token = .{ .term = t.term, .index = t.index }, .expiry_ns = run.expiry_ns, .abandoned = true, .retry = true, .delay_ms = 0, .@"error" = "" };
         var out: [Shard.HANDBACK_MAX_PAYLOAD]u8 = undefined;
         const bytes = ae.Release.encodeInto(&out, body) catch return shard.dropHandBack(.action, "its release is larger than a hand-back holds");
