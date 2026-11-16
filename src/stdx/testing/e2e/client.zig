@@ -227,6 +227,12 @@ pub const CliRunner = struct {
     allocator: Allocator,
     flo_binary: []const u8,
     endpoint: []const u8,
+    /// Run before every command, when set, to fail the test loudly if the server
+    /// backing this CLI has already exited — so a poll loop that keeps calling
+    /// `run` doesn't mask a dead server as a timeout or a not_found. The owning
+    /// context sets it (TestContext → its server's assertAlive).
+    before_run_ctx: ?*anyopaque = null,
+    before_run: ?*const fn (*anyopaque) void = null,
     /// API key injected as --api-key flag on every command (set when auth is enabled)
     /// Initialize CLI runner
     pub fn init(allocator: Allocator, flo_binary: []const u8, endpoint: []const u8) !*Self {
@@ -373,8 +379,14 @@ pub const CliRunner = struct {
         };
     }
 
+    /// Fail the test if the backing server died, before spawning a command.
+    fn beforeRun(self: *Self) void {
+        if (self.before_run) |f| f(self.before_run_ctx.?);
+    }
+
     /// Run a CLI command (automatically inserts --endpoint and --api-key before any `--` separator)
     pub fn run(self: *Self, args: []const []const u8) !CommandResult {
+        self.beforeRun();
         // Build full argument list: [flo_binary] + args_before_-- + [--endpoint, endpoint, (--api-key, key)] + args_from_--
         // We must insert flags BEFORE "--" because commander treats everything
         // after "--" as positional (no flag parsing).
@@ -446,6 +458,7 @@ pub const CliRunner = struct {
 
     /// Run a CLI command without appending --endpoint
     pub fn runRaw(self: *Self, args: []const []const u8) !CommandResult {
+        self.beforeRun();
         const total_args = 1 + args.len;
 
         var argv = try self.allocator.alloc([]const u8, total_args);

@@ -718,6 +718,21 @@ pub const ServerProcess = struct {
         return std.fmt.bufPrint(buf, "died of signal {d}", .{low}) catch "died of a signal";
     }
 
+    /// Fail the test loudly, now, if this server has already exited. A node that
+    /// dies mid-test — e.g. its peer bind collides with another run's — is
+    /// otherwise only met as a downstream not_found on a surviving node (and the
+    /// real reason only surfaces at teardown's checkExit). Called from every path
+    /// that talks to a node, including poll loops, where the masking bites. `what`
+    /// names the node for the message. Non-blocking: it reaps without waiting.
+    pub fn assertAlive(self: *Self, what: []const u8) void {
+        if (self.process) |*proc| _ = self.tryReap(proc.id);
+        var buf: [160]u8 = undefined;
+        const why = self.abnormalExit(&buf) orelse return;
+        std.debug.print("[e2e] {s} ended mid-test: {s}\n", .{ what, why });
+        self.dumpLogTail();
+        @panic("an e2e server ended mid-test; its log is above");
+    }
+
     /// A server that panics or aborts after a test's last read would leave
     /// the test passing; stop() runs inside deinit and can't return an error,
     /// so this panics, after the reason and the log tail, to fail loudly.

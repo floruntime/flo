@@ -162,6 +162,8 @@ pub const TestContext = struct {
 
         // Initialize CLI runner
         self.cli = try CliRunner.init(allocator, self.server.flo_binary, self.endpoint);
+        self.cli.before_run_ctx = self.server;
+        self.cli.before_run = serverAliveThunk;
         errdefer self.cli.deinit();
 
         self.allocator = allocator;
@@ -315,8 +317,15 @@ pub const TestContext = struct {
         // Recreate CLI with new endpoint
         self.cli.deinit();
         self.cli = try CliRunner.init(self.allocator, self.server.flo_binary, self.endpoint);
+        self.cli.before_run_ctx = self.server;
+        self.cli.before_run = serverAliveThunk;
     }
 };
+
+/// CliRunner before_run hook: fail the test if the single server died mid-run.
+fn serverAliveThunk(ctx: *anyopaque) void {
+    @as(*ServerProcess, @ptrCast(@alignCast(ctx))).assertAlive("server");
+}
 
 /// Create multiple test contexts for cluster testing
 pub fn createCluster(allocator: Allocator, node_count: usize) ![]*TestContext {
