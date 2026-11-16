@@ -1,7 +1,7 @@
 //! A snapshot bar suspends apply on every replica while Raft runs on: writes
 //! keep committing and are answered once apply resumes, and leadership holds.
 //! Until snapshots exist a window opens only at a test fault's entry, so these
-//! skip in a build without `-Dtest-faults`.
+//! run on the flo-faults e2e binary (`.faults = true`).
 
 const std = @import("std");
 const testing = std.testing;
@@ -38,8 +38,7 @@ fn leaderNode(cluster: *stdx.testing.ClusterContext) !usize {
 }
 
 test "e2e/snapshot: on a three-node group every node suspends apply at the bar; a write during it is answered once apply resumes, and the leader keeps leading" {
-    if (!test_faults.enabled) return error.SkipZigTest;
-    var cluster = try stdx.testing.ClusterContext.init(testing.allocator, .{ .node_count = 3, .metrics_enabled = true });
+    var cluster = try stdx.testing.ClusterContext.init(testing.allocator, .{ .node_count = 3, .metrics_enabled = true, .faults = true });
     defer cluster.deinit();
     try cluster.execOnWithRetry(0, &.{ "kv", "set", "before", "kept" }, 20, 250);
     const leader = try leaderNode(&cluster);

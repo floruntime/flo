@@ -35,16 +35,19 @@ pub fn build(b: *std.Build) void {
 
     // ── Version (git describe) ──
 
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", getGitVersion(b));
-    build_options.addOption(bool, "require_hw_crc", b.option(bool, "require-hw-crc", "Fail unless the target CPU has a CRC32C instruction (release builds set this)") orelse false);
-    // Faults e2e drives to reach states no valid request can (a halted
-    // shard). Off unless asked for, so no release or image carries them.
-    const test_faults = b.option(bool, "test-faults", "Compile in the faults e2e tests drive; never for a release") orelse false;
-    build_options.addOption(bool, "test_faults", test_faults);
+    const version = getGitVersion(b);
+    const require_hw_crc = b.option(bool, "require-hw-crc", "Fail unless the target CPU has a CRC32C instruction (release builds set this)") orelse false;
     // An undo of a fix a VOPR seed guards (src/plant.zig). None unless asked
     // for, so no release or image carries one.
-    build_options.addOption([]const u8, "vopr_plant", b.option([]const u8, "vopr-plant", "Undo a fix a VOPR regression seed guards; never for a release") orelse "none");
+    const vopr_plant = b.option([]const u8, "vopr-plant", "Undo a fix a VOPR regression seed guards; never for a release") orelse "none";
+
+    // The faults e2e drive reaches states no valid request can (a halted shard).
+    // It has no build flag: it is compiled only into the separate `flo-faults`
+    // test binary (build_options_faults below), which the fault e2e files spawn.
+    // The shipped `flo` always gets test_faults=false, so no release or image can
+    // carry the hooks — not even a job that also ran test-e2e.
+    const build_options = buildOptions(b, version, require_hw_crc, vopr_plant, false);
+    const build_options_faults = buildOptions(b, version, require_hw_crc, vopr_plant, true);
 
     // ── Dashboard Assets ──
     // Generate assets.zig by scanning src/node/dashboard/dist at configure time.
@@ -66,6 +69,24 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addOptions("build_options", build_options);
 
     b.installArtifact(exe);
+
+    // The faults e2e drive, compiled into its own binary the fault e2e files
+    // spawn. Installed to zig-out/test (NOT zig-out/bin) and only as a dependency
+    // of the e2e run (below), so no plain `zig build`, release, or image build
+    // ever produces it, and nothing that globs or packages zig-out/bin picks it
+    // up.
+    const exe_faults = b.addExecutable(.{
+        .name = "flo-faults",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    exe_faults.root_module.addImport("stdx", stdx_module);
+    exe_faults.root_module.addOptions("build_options", build_options_faults);
+    const install_faults = b.addInstallArtifact(exe_faults, .{ .dest_dir = .{ .override = .{ .custom = "test" } } });
 
     // ── Generated descriptions ──
 
@@ -192,6 +213,7 @@ pub fn build(b: *std.Build) void {
 
     const run_e2e_tests = b.addRunArtifact(e2e_tests);
     run_e2e_tests.step.dependOn(b.getInstallStep());
+    run_e2e_tests.step.dependOn(&install_faults.step);
     // harness_test.zig runs it: a process that starts servers, then dies
     // without cleanup.
     if (e2e_root.missing == null) {
@@ -207,10 +229,11 @@ pub fn build(b: *std.Build) void {
         orphan.root_module.addImport("stdx", stdx_module);
         run_e2e_tests.step.dependOn(&b.addInstallArtifact(orphan, .{}).step);
     }
-    // The tests spawn the installed flo. Its bytes are part of the run's
-    // cache key, or a change to flo alone would replay the last result
-    // without running anything.
+    // The tests spawn the installed flo (and flo-faults, for the fault files).
+    // Their bytes are part of the run's cache key, or a change to either binary
+    // alone would replay the last result without running anything.
     run_e2e_tests.addFileInput(exe.getEmittedBin());
+    run_e2e_tests.addFileInput(exe_faults.getEmittedBin());
 
     // ── Integration Tests ──
 
@@ -232,10 +255,15 @@ pub fn build(b: *std.Build) void {
 
     // ── Test Steps ──
 
-    addTestStep(b, "test", "Run all tests", &.{ &run_unit_tests.step, &run_stdx_tests.step }, &.{ unit_root, stdx_root }, test_filters);
+    addTestStep(b, "test", "Run every test (unit, stdx, integration, e2e)", &.{ &run_unit_tests.step, &run_stdx_tests.step, &run_integration_tests.step, &run_e2e_tests.step }, &.{ unit_root, stdx_root, integration_root, e2e_root }, test_filters);
     addTestStep(b, "test-unit", "Run unit tests only", &.{ &run_unit_tests.step, &run_stdx_tests.step }, &.{ unit_root, stdx_root }, test_filters);
     addTestStep(b, "test-e2e", "Run end-to-end tests", &.{&run_e2e_tests.step}, &.{e2e_root}, test_filters);
     addTestStep(b, "test-integration", "Run integration tests", &.{&run_integration_tests.step}, &.{integration_root}, test_filters);
+
+    // Install flo-faults on its own (zig-out/test/flo-faults), for a tool that
+    // needs the faults binary without running e2e. Honours -Dtarget/-Dcpu/--release.
+    const faults_step = b.step("faults-binary", "Build the flo-faults e2e binary (zig-out/test/flo-faults)");
+    faults_step.dependOn(&install_faults.step);
 
     // ── VOPR simulator ──
 
@@ -346,6 +374,9 @@ pub fn build(b: *std.Build) void {
 // ── Test Roots ──
 
 const TestRoot = struct {
+    /// The directory this root was generated from (e.g. "tests/e2e"), named in
+    /// the no-match message so a combined step says which suites it searched.
+    dir: []const u8,
     /// The generated root.
     source: std.Build.LazyPath,
     /// `declared` (top-level test declarations the walk found), for the
@@ -452,6 +483,19 @@ fn addTestStep(b: *std.Build, name: []const u8, description: []const u8, runs: [
     failIfNoTestMatched(b, step, name, filters, roots);
 }
 
+/// The `build_options` module, built twice: once for the shipped `flo` and
+/// every other artifact (`test_faults` false), and once for the `flo-faults`
+/// test binary (`test_faults` true). Everything else is identical, so a change
+/// to the real options can't drift between the two.
+fn buildOptions(b: *std.Build, version: []const u8, require_hw_crc: bool, vopr_plant: []const u8, test_faults: bool) *std.Build.Step.Options {
+    const o = b.addOptions();
+    o.addOption([]const u8, "version", version);
+    o.addOption(bool, "require_hw_crc", require_hw_crc);
+    o.addOption(bool, "test_faults", test_faults);
+    o.addOption([]const u8, "vopr_plant", vopr_plant);
+    return o;
+}
+
 /// A filtered test step whose roots hold no test matching any filter would
 /// run only the nameless tests and pass, so fail it instead, naming the
 /// filters.
@@ -461,8 +505,11 @@ fn failIfNoTestMatched(b: *std.Build, step: *std.Build.Step, name: []const u8, f
     var msg: std.Io.Writer.Allocating = .init(b.allocator);
     msg.writer.print("no test in {s} matched", .{name}) catch @panic("out of memory");
     for (filters) |f| msg.writer.print(" -Dtest-filter={s}", .{f}) catch @panic("out of memory");
-    msg.writer.writeAll(" (filters are plain substrings of the test name") catch @panic("out of memory");
-    if (std.mem.eql(u8, name, "test")) msg.writer.writeAll("; test-e2e and test-integration are separate steps") catch @panic("out of memory");
+    msg.writer.writeAll(" (filters are plain substrings of the test name across ") catch @panic("out of memory");
+    for (roots, 0..) |root, i| {
+        if (i > 0) msg.writer.writeAll(", ") catch @panic("out of memory");
+        msg.writer.print("{s}", .{root.dir}) catch @panic("out of memory");
+    }
     msg.writer.writeAll(")") catch @panic("out of memory");
     step.dependOn(&b.addFail(msg.written()).step);
 }
@@ -480,7 +527,7 @@ fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, fi
     var root_dir = b.root.root_dir.handle.openDir(io, dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => {
             const stub = b.addWriteFiles().add(out_name, "test {}\n");
-            return .{ .source = stub, .options = b.addOptions(), .matched = 0, .missing = dir };
+            return .{ .dir = dir, .source = stub, .options = b.addOptions(), .matched = 0, .missing = dir };
         },
         else => std.debug.panic("cannot open {s} to find its tests: {t}", .{ dir, err }),
     };
@@ -615,6 +662,7 @@ fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, fi
     matched += countMatchingTests(b, out_name, "test \"every test declared under this directory is compiled\" {", filters);
     options.addOption(usize, "matched", matched);
     return .{
+        .dir = dir,
         .source = b.path(b.fmt("{s}/{s}", .{ dir, out_name })),
         .options = options,
         .matched = matched,

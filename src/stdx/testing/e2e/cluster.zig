@@ -85,6 +85,9 @@ pub const ClusterConfig = struct {
     node_env: [MAX_NODES][]const [2][]const u8 = @splat(&.{}),
     /// Config file text added to each node's, by node.
     node_config: [MAX_NODES]?[]const u8 = @splat(null),
+    /// Spawn the flo-faults binary on every node (the fault e2e drive). The
+    /// fault e2e files set this. See ServerConfig.faults.
+    faults: bool = false,
 };
 
 /// Multi-node cluster context for e2e testing
@@ -127,6 +130,7 @@ pub const ClusterContext = struct {
             .cluster_enabled = true, // Seed node needs Raft listener
             .metrics_enabled = config.metrics_enabled,
             .extra_config = config.node_config[0],
+            .faults = config.faults,
         });
         self.servers[0].?.extra_env = config.node_env[0];
         // Covers every node created so far. A per-iteration `errdefer` in the
@@ -153,6 +157,7 @@ pub const ClusterContext = struct {
                 .join_addresses = seed_endpoint,
                 .metrics_enabled = config.metrics_enabled,
                 .extra_config = config.node_config[i],
+                .faults = config.faults,
             });
             self.servers[i].?.extra_env = config.node_env[i];
             startServerWithRetry(self.servers[i].?) catch |err| {

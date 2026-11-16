@@ -49,9 +49,10 @@ COPY --from=web-builder /build/web/dist/ ./src/node/dashboard/dist/
 ARG TARGETPLATFORM
 ARG FLO_VERSION=dev
 # The CPU floor is hardware CRC32C: x86-64-v2, ARMv8 with CRC.
-# A -Dtest-faults build halts or crashes a shard on a kv set of a key with
-# the prefix grepped for; no image carries one. The binary may be for
-# another platform, so it is read, not run.
+# A build with the fault hooks (only flo-faults) halts or crashes a shard on a
+# kv set of a key with the prefix grepped for; the shipped flo must not carry
+# them, and no image does. Kept as insurance against a build.zig miswiring. The
+# binary may be for another platform, so it is read, not run.
 RUN case "${TARGETPLATFORM}" in \
       linux/arm64)  ZIG_TARGET="aarch64-linux-musl"; ZIG_CPU="generic+crc" ;; \
       linux/amd64)  ZIG_TARGET="x86_64-linux-musl";  ZIG_CPU="x86_64_v2" ;; \

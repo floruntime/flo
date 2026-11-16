@@ -1,8 +1,8 @@
 //! An entry whose apply crashes the node, on every replica, would crash it
 //! again on every restart. Instead the crash is recorded, and the restart
 //! comes up with that entry's shard halted at it; the other shards serve.
-//! The crashing entries come from faults only a `-Dtest-faults` build
-//! carries; without one these skip.
+//! The crashing entries come from a test fault, so these run on the
+//! flo-faults e2e binary (`.faults = true`).
 
 const std = @import("std");
 const testing = std.testing;
@@ -45,7 +45,7 @@ fn crashedShard(port: u16) !Halted {
 /// with that key's shard halted at it and the other shard serving.
 fn crashOnce(fault: test_faults.Fault) !void {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true },
+        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     try ctx.exec(&.{ "kv", "set", "before", "kept" });
@@ -71,17 +71,14 @@ fn crashOnce(fault: test_faults.Fault) !void {
 }
 
 test "e2e/apply-crash: a panic in apply comes back up halted at the entry, on its shard alone, across restarts" {
-    if (!test_faults.enabled) return error.SkipZigTest;
     try crashOnce(.panic);
 }
 
 test "e2e/apply-crash: a memory fault in apply comes back up halted at the entry" {
-    if (!test_faults.enabled) return error.SkipZigTest;
     try crashOnce(.segv);
 }
 
 test "e2e/apply-crash: a panic in the triggers and metrics after apply comes back up halted at the entry" {
-    if (!test_faults.enabled) return error.SkipZigTest;
     try crashOnce(.panic_after_apply);
 }
 
@@ -98,10 +95,9 @@ fn servesAfterPlainCrash(ctx: *stdx.testing.TestContext, key: []const u8) !void 
 }
 
 test "e2e/apply-crash: a panic in the leader's own step after apply is a plain crash, and the node comes back serving" {
-    if (!test_faults.enabled) return error.SkipZigTest;
     const key = test_faults.Fault.panic_leader_step.key();
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true },
+        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     {
@@ -112,10 +108,9 @@ test "e2e/apply-crash: a panic in the leader's own step after apply is a plain c
 }
 
 test "e2e/apply-crash: a panic answering a waiting read is a plain crash, and the node comes back serving" {
-    if (!test_faults.enabled) return error.SkipZigTest;
     const key = test_faults.Fault.panic_answering_waiter.key();
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true },
+        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     var waiting = try ctx.cli.runAsync(&.{ "kv", "get", key, "--wait-ms", "10000" });
@@ -133,9 +128,8 @@ test "e2e/apply-crash: a panic answering a waiting read is a plain crash, and th
 }
 
 test "e2e/apply-crash: a crash another build retries at boot, and that crashes it again, halts the next boot" {
-    if (!test_faults.enabled) return error.SkipZigTest;
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true },
+        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true, .faults = true },
     });
     defer ctx.deinit();
     {
@@ -163,8 +157,7 @@ test "e2e/apply-crash: a crash another build retries at boot, and that crashes i
 }
 
 test "e2e/apply-crash: every node of a three-node group crashes on the entry and comes up halted at it" {
-    if (!test_faults.enabled) return error.SkipZigTest;
-    var cluster = try stdx.testing.ClusterContext.init(testing.allocator, .{ .node_count = 3, .metrics_enabled = true });
+    var cluster = try stdx.testing.ClusterContext.init(testing.allocator, .{ .node_count = 3, .metrics_enabled = true, .faults = true });
     defer cluster.deinit();
     try cluster.execOnWithRetry(0, &.{ "kv", "set", "before", "kept" }, 20, 250);
     {
