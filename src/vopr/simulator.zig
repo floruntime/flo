@@ -3063,10 +3063,11 @@ test "vopr sim: an effect only live apply runs fails state_checksum between a re
 }
 
 test "vopr sim: in every run, KV merges JSON patches, deletes fields, refuses batches after staging, and decides conditions both ways" {
-    // Swarm seeds, the reviewed low-merge ones (7, 13, 16) among them; each
-    // run is checked on its own, not summed, and each entry counts once
-    // however many replicas apply it.
-    for ([_]u64{ 1, 3, 7, 9, 10, 13, 15, 16 }) |seed| {
+    // Swarm seeds, the lower-merge ones (7, 9) among them; each run is checked
+    // on its own, not summed, and each entry counts once however many replicas
+    // apply it. Re-derived after client writes to a not-ready leader are
+    // refused: the old set's 1, 15, 16 no longer clear the thresholds.
+    for ([_]u64{ 2, 3, 4, 6, 7, 9, 10, 13 }) |seed| {
         var sim = try Simulator.init(testing.allocator, Scenario.fromSeed(seed), .{});
         defer sim.deinit();
         const s = try sim.run();
@@ -3869,7 +3870,10 @@ test "vopr sim: a truncated uncommitted config leaves the node with the members 
 
 /// Catching-up seeds that run long enough to create namespaces under every
 /// fault the swarm has.
-const CATCHING_UP_SEEDS = [_]u64{ 2, 3, 4, 6 };
+// Re-derived after client writes to a not-ready leader are refused: 15 and 38
+// are the seeds whose stopped run still leaves acked ops unapplied (the
+// secondary durability line); the old 2, 3, 4, 6 no longer do.
+const CATCHING_UP_SEEDS = [_]u64{ 3, 4, 15, 38 };
 
 test "vopr sim: in every catching-up run, leaders refuse creates until ready, and no create loses its id" {
     for (CATCHING_UP_SEEDS) |seed| {
