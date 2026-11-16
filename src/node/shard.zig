@@ -11566,8 +11566,9 @@ test "Shard: a pipeline's writes to another shard's queue that fills park there,
         _ = try a.stream_handler.appendPayloadToStream(source, "default", try std.fmt.bufPrint(&rb, "r{d}", .{i}));
     }
     two.settle();
-    // The queue holds two at most: the sender's caps go with each write.
-    a.queue_handler.caps.max_messages = 2;
+    // The queue holds two at most: the receiver's caps are what a sink's
+    // write applies under, whatever its sender's are.
+    b.queue_handler.caps.max_messages = 2;
     const c = try TestClient.open(a);
     defer _ = std.c.close(c.pair[1]);
     var yb: [128]u8 = undefined;

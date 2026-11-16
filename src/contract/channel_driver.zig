@@ -200,9 +200,12 @@ const Peer = struct {
     /// seq order: what `Driver.target_bytes` counts.
     in_flight: std.ArrayListUnmanaged(InFlightMessage) = .empty,
     recv_gen: struct { term: u64 = 0, counter: u32 = 0 } = .{},
-    /// Its last batch with messages was answered `busy`: until one is
-    /// taken, every answer to it, probes' too, says a target is full.
-    refused_busy: bool = false,
+    /// This shard's parked bytes when a target over its cap last refused
+    /// its batch, or null: while they are no fewer, every answer to it,
+    /// probes' too, says a target is full. Read from the replicated parked
+    /// totals, so a refusal is named until an unpark frees room, never by
+    /// a clock.
+    refused_parked: ?u64 = null,
     told_applied: u64 = 0,
     told_durable: u64 = 0,
 };
@@ -248,6 +251,9 @@ pub const Mutant = enum {
     /// Apply a message whose target has room even while earlier ones to it
     /// are parked (`channels.zig`), not park it behind them.
     no_park_behind,
+    /// Never release what was proposed once it applies: its target's
+    /// in-flight bytes only grow, until it refuses everything.
+    leak_in_flight,
 };
 
 pub const Driver = struct {
@@ -396,6 +402,7 @@ pub const Driver = struct {
 
     /// `from`'s messages through `applied` have applied: no longer in flight.
     fn releaseApplied(self: *Driver, from: u16, applied: u64) void {
+        if (self.mutant == .leak_in_flight) return;
         const p = &self.peers[from];
         var gone: usize = 0;
         for (p.in_flight.items) |m| {
@@ -576,18 +583,21 @@ pub const Driver = struct {
         self.releaseApplied(a, in.applied);
         const dur = self.durableAck(a, in, durable);
         if (in.applied <= p.told_applied and dur <= p.told_durable) return;
-        self.answer(a, p, in.applied, dur, 0, .ok, io);
+        self.answer(a, p, in.applied, dur, 0, .ok, read, io);
     }
 
     /// What writes through this group are queued behind, written to `w`,
-    /// and how many: its own state, a full target while `to`'s last batch
-    /// was refused for one, and each group its outbox to is full, up to
-    /// `MAX_PRESSURE`.
-    fn pressure(self: *const Driver, status: Status, to: *const Peer, w: *schema.Writer) u32 {
+    /// and how many: its own state, a full target while nothing has
+    /// unparked since one refused `to`'s batch, and each group its outbox
+    /// to is full, up to `MAX_PRESSURE`. None of it reaches an apply: it
+    /// only tells senders' leaders to wait.
+    fn pressure(self: *const Driver, status: Status, to: *const Peer, read: ReadView, w: *schema.Writer) u32 {
         var n: u32 = 0;
         const own: ?Cause = if (status == .halted) .halted else self.own_cause;
         if (own) |c| n += @intFromBool(addStall(w, self.group, c));
-        if (status == .busy or to.refused_busy) n += @intFromBool(addStall(w, self.group, .target_full));
+        if (to.refused_parked) |at| if (channels.shardParked(read).bytes >= at) {
+            n += @intFromBool(addStall(w, self.group, .target_full));
+        };
         for (self.peers, 0..) |*p, c| {
             if (n == MAX_PRESSURE) break;
             if (c == self.group or !p.outbox_full) continue;
@@ -607,10 +617,10 @@ pub const Driver = struct {
         return if (a == self.group) in.applied else channels.appliedAsOf(in, durable);
     }
 
-    fn answer(self: *Driver, a: u16, p: *Peer, applied: u64, dur: u64, gap: u64, status: Status, io: anytype) void {
+    fn answer(self: *Driver, a: u16, p: *Peer, applied: u64, dur: u64, gap: u64, status: Status, read: ReadView, io: anytype) void {
         var pb: [Pressure.max_size]u8 = undefined;
         var pw: schema.Writer = .{ .buf = &pb };
-        const n = self.pressure(status, p, &pw);
+        const n = self.pressure(status, p, read, &pw);
         if (n > 0) self.counts.pressured += 1;
         var buf: [128]u8 = undefined;
         const f = encodeFrame(&buf, .answer, Answer.Value{
@@ -650,24 +660,25 @@ pub const Driver = struct {
         if (p.accepted == null or p.accepted.? < applied) p.accepted = applied;
         self.releaseApplied(from, applied);
         p.recv_gen = .{ .term = b.gen_term, .counter = b.gen_counter };
-        if (halted) return self.answer(from, p, applied, dur, 0, .halted, io);
-        if (b.messages.count == 0) return self.answer(from, p, applied, dur, 0, .ok, io);
+        if (halted) return self.answer(from, p, applied, dur, 0, .halted, read, io);
+        if (b.messages.count == 0) return self.answer(from, p, applied, dur, 0, .ok, read, io);
         const accepted = p.accepted.?;
         const last = b.first_seq + b.messages.count - 1;
         if (last <= accepted) {
-            if (self.mutant == .ack_last_seq) return self.answer(from, p, last, last, 0, .ok, io);
-            return self.answer(from, p, applied, dur, 0, .ok, io);
+            if (self.mutant == .ack_last_seq) return self.answer(from, p, last, last, 0, .ok, read, io);
+            return self.answer(from, p, applied, dur, 0, .ok, read, io);
         }
         if (b.first_seq > accepted + 1) {
             self.counts.gaps += 1;
-            return self.answer(from, p, applied, dur, accepted + 1, .ok, io);
+            return self.answer(from, p, applied, dur, accepted + 1, .ok, read, io);
         }
         // Propose from the first seq not yet accepted.
-        if (!self.buffers()) return self.answer(from, p, applied, dur, 0, .busy, io);
+        if (!self.buffers()) return self.answer(from, p, applied, dur, 0, .busy, read, io);
         var w: schema.Writer = .{ .buf = self.msgs };
         var it = b.messages.iterator();
         var seq = b.first_seq;
         var n: u32 = 0;
+        var target_full = false;
         while (it.next() catch null) |m| : (seq += 1) {
             if (seq <= accepted) continue;
             // A message whose target is over its parked cap, counting what
@@ -676,7 +687,10 @@ pub const Driver = struct {
             // node's caps before it is logged, so every replica applies it
             // under the same ones, and counted as it is logged.
             const target = if (self.sink_target) |f| f(m) else null;
-            if (self.admits) |admits| if (!admits(read, m, self.inFlight(target))) break;
+            if (self.admits) |admits| if (!admits(read, m, self.inFlight(target))) {
+                target_full = true;
+                break;
+            };
             var logged = m;
             if (self.stamp) |f| if (f(self.stamp_ctx, m, self.stamp_buf)) |payload| {
                 logged.payload = payload;
@@ -690,10 +704,10 @@ pub const Driver = struct {
         }
         if (n == 0) {
             self.counts.busy += 1;
-            p.refused_busy = true;
-            return self.answer(from, p, applied, dur, 0, .busy, io);
+            if (target_full) p.refused_parked = channels.shardParked(read).bytes;
+            return self.answer(from, p, applied, dur, 0, .busy, read, io);
         }
-        p.refused_busy = false;
+        p.refused_parked = null;
         const entry = ce.Inbound.encodeInto(self.buf, .{ .from = from, .first_seq = accepted + 1, .messages = .{ .bytes = w.written(), .count = n } }) catch {
             self.untrackAfter(from, accepted);
             return;
@@ -701,11 +715,11 @@ pub const Driver = struct {
         if (!io.propose(.channel_inbound, entry)) {
             self.untrackAfter(from, accepted);
             self.counts.busy += 1;
-            return self.answer(from, p, applied, dur, 0, .busy, io);
+            return self.answer(from, p, applied, dur, 0, .busy, read, io);
         }
         p.accepted = accepted + n;
         self.counts.inbound_proposed += 1;
-        self.answer(from, p, applied, dur, 0, .ok, io);
+        self.answer(from, p, applied, dur, 0, .ok, read, io);
     }
 
     fn onAnswer(self: *Driver, from: u16, a: Answer.Value, now_ms: u64, read: ReadView) void {
