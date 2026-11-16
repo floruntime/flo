@@ -1521,10 +1521,13 @@ pub const Shard = struct {
     fn tickChannels(self: *Shard) void {
         const st = &self.defaultPartition().store;
         const fams = &st.families;
-        if (fams[channels_mod.OutFam.ID].count == 0 and fams[channels_mod.InFam.ID].count == 0 and fams[channels_mod.ParkFam.ID].count == 0) return;
+        // Live pressure keeps it ticking with nothing left to send, so it
+        // probes, and the pressure expires.
+        const now = nowMs();
+        if (fams[channels_mod.OutFam.ID].count == 0 and fams[channels_mod.InFam.ID].count == 0 and fams[channels_mod.ParkFam.ID].count == 0 and !self.channel.pressured(now)) return;
         self.channelTerm();
         self.channel.own_cause = self.channelCause();
-        self.channel.tick(nowMs(), .{ .store = st }, self.channelDurable(), ChannelIo{ .shard = self });
+        self.channel.tick(now, .{ .store = st }, self.channelDurable(), ChannelIo{ .shard = self });
         self.tickUnpark(st);
     }
 
@@ -11841,7 +11844,7 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
     }
     var jobs = a.processing_handler.jobs.valueIterator();
     var lb: [512]u8 = undefined;
-    try std.testing.expectEqualStrings("waiting: the outbox to shard 1 is full (0 of 0 MiB)", a.processing_handler.liveNote(jobs.next().?, &lb).?);
+    try std.testing.expectEqualStrings("waiting: the outbox to shard 1 is full (46 B of 1 B)", a.processing_handler.liveNote(jobs.next().?, &lb).?);
     // Delivered, acked and trimmed: room again, and the next record goes.
     pumpChannels(&two);
     try std.testing.expectEqual(@as(u64, 0), channels_mod.metaOf(read, 1).bytes);
@@ -11866,6 +11869,52 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
     pumpChannels(&two);
     var bodies: [8][]const u8 = undefined;
     try std.testing.expectEqual(@as(usize, 3), queueBodies(b, q.name, &bodies));
+}
+
+test "Shard: pressure that arrived as a send-only shard's outbox emptied still expires, and its pipeline reads on" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    var qb: [16]u8 = undefined;
+    const q = try queueOwnedBy(&two, 1, &qb);
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "r0");
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var yb: [128]u8 = undefined;
+    const pipe = try sinkJob(&two, c, source, try std.fmt.bufPrint(&yb, "  - name: out\n    queue: {{ name: {s} }}", .{q.name}));
+    tickNow(a, pipe);
+    two.settle();
+    a.channel.peers[1].last_trim_ms = 0;
+    pumpChannels(&two);
+    // Everything sent is taken and trimmed: nothing left for a's channels.
+    const fams = &a.defaultPartition().store.families;
+    try std.testing.expectEqual(@as(usize, 0), fams[channels_mod.OutFam.ID].count + fams[channels_mod.InFam.ID].count + fams[channels_mod.ParkFam.ID].count);
+    // The last answer before the trim said shard 1 is halted.
+    const p = &a.channel.peers[1];
+    p.pressure[0] = .{ .shard = 1, .cause = @backingInt(channel_driver.Cause.halted) };
+    p.pressure_len = 1;
+    p.pressure_ms = Shard.nowMs();
+    p.probe_ms = 0;
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "r1");
+    two.settle();
+    tickNow(a, pipe);
+    try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
+    try std.testing.expect(pipe.wait == .pressure);
+    // Its channels keep ticking while the pressure is live: it probes.
+    a.tickChannels();
+    try std.testing.expect(p.probe_ms > 0);
+    // A second on, with no answer carrying it, it is gone: reads on.
+    @import("stdx").time.sleep((channel_driver.PRESSURE_EXPIRY_MS + 50) * std.time.ns_per_ms);
+    a.tickChannels();
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expect(pipe.wait == .none);
+    try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
 }
 
 test "Shard: records whose operators emit nothing aren't read again while their cursor waits to be logged" {

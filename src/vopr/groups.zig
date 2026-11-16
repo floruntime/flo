@@ -438,9 +438,6 @@ pub const GroupChannel = struct {
         c.store.strict_keys = true;
         c.driver.admits = Probed.admits;
         c.driver.sink_target = Probed.sinkTarget;
-        // Small enough that probes reach it, so a full outbox's pressure
-        // is reported and read back.
-        c.driver.caps = .{ .shard = 4 * OUTBOX_CAP, .channel = OUTBOX_CAP };
         return c;
     }
 
@@ -561,8 +558,6 @@ pub const GroupChannel = struct {
         c.unparks += 1;
     }
 
-    /// What one channel's outbox may hold before its leader reports it full.
-    pub const OUTBOX_CAP = 64 << 10;
     /// What a target may park before more to it is refused.
     pub const PARKED_TARGET_CAP = 8 << 10;
 
