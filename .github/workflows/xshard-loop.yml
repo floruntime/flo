@@ -1,0 +1,72 @@
+# THROWAWAY — do not merge. Reproduces the intermittent cross-shard KV-sink
+# restart-durability failure of
+# `e2e/processing: kv sink routes to the owning shard (multi-shard)` by running
+# that one test many times on the CI Linux runner. Paired branches run the same
+# loop on dev (has #481) and on 603c9dfa (pre-#481) for a like-for-like compare.
+name: xshard-loop
+
+on:
+  push:
+    branches:
+      - 'loop/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.17.0"
+  # A plain substring that matches only the target test. `zig test
+  # --test-filter` applies it at compile time, so the built binary contains
+  # only this test; running the binary directly then re-executes it every
+  # time (the build system would otherwise cache an identical run step).
+  FILTER: "kv sink routes to the owning shard"
+  ITERATIONS: "50"
+
+jobs:
+  loop:
+    name: xshard sink restart loop
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # The server embeds the console; an empty dir keeps the build from
+      # failing on a missing dist (the console isn't exercised by this test).
+      - name: Placeholder console dist
+        run: mkdir -p src/node/dashboard/dist && : > src/node/dashboard/dist/.keep
+
+      # Build flo, the faults binary and the single-test e2e binary (this run
+      # executes the test once); then find that binary.
+      - name: Build and locate the test binary
+        run: |
+          set -euo pipefail
+          zig build
+          zig build test-e2e -Dtest-filter="$FILTER" --verbose 2>&1 | tee verbose.log
+          BIN=$(grep -oE '\.zig-cache/o/[a-f0-9]+/test' verbose.log | tail -1)
+          test -x "$BIN"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+
+      # Run the binary directly N times. Each invocation re-executes the test
+      # (no build-system caching). On any failure, print that iteration's full
+      # output — which carries #495's per-key report and, via the kept
+      # server.log.prev, both the pre-restart shutdown log and the boot log.
+      - name: Run the test in a loop
+        run: |
+          set -uo pipefail
+          fails=0
+          for i in $(seq 1 "$ITERATIONS"); do
+            if "./$BIN" > "iter-$i.log" 2>&1; then
+              echo "iter $i: ok"
+            else
+              fails=$((fails + 1))
+              echo "===== ITERATION $i FAILED ====="
+              cat "iter-$i.log"
+              echo "===== end iteration $i ====="
+            fi
+          done
+          echo "---- $fails / $ITERATIONS iterations failed ----"
+          test "$fails" -eq 0
