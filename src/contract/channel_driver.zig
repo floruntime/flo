@@ -93,6 +93,8 @@ fn encodeFrame(buf: []u8, comptime kind: Kind, v: anytype) ?[]const u8 {
 
 pub const SinkRefusals = std.EnumArray(@import("../protocol/reason.zig").Reason, u64);
 
+const InFlightMessage = struct { seq: u64, target: channels.Target, bytes: u64 };
+
 const Peer = struct {
     // Sending to it.
     gen_counter: u32 = 0,
@@ -113,6 +115,9 @@ const Peer = struct {
     // Receiving from it.
     /// The highest seq proposed or applied from it; null until rebuilt.
     accepted: ?u64 = null,
+    /// Its sink messages proposed and not yet applied that may park, in
+    /// seq order: what `Driver.target_bytes` counts.
+    in_flight: std.ArrayListUnmanaged(InFlightMessage) = .empty,
     recv_gen: struct { term: u64 = 0, counter: u32 = 0 } = .{},
     told_applied: u64 = 0,
     told_durable: u64 = 0,
@@ -166,9 +171,19 @@ pub const Driver = struct {
     term: u64 = 0,
     /// One per group on the node.
     peers: []Peer,
-    /// Whether this group takes a message in now (`Channels.admits`); null
-    /// takes every one.
-    admits: ?*const fn (read: ReadView, m: ce.Message.Value) bool = null,
+    /// Whether this group takes a message in now, given what it has
+    /// taken and not yet applied (`Channels.admits`); null takes every one.
+    admits: ?*const fn (read: ReadView, m: ce.Message.Value, in_flight: channels.InFlight) bool = null,
+    /// The target a sink's message may park under (`Channels.sinkTarget`),
+    /// so what this leader proposed to it and hasn't applied counts
+    /// against its cap; null when nothing parks.
+    sink_target: ?*const fn (m: ce.Message.Value) ?channels.Target = null,
+    /// A sink's message bytes this leader proposed and its log hasn't
+    /// applied, by target and in all. Leader-local and kept per sender
+    /// (`Peer.in_flight`), so a term's end, or an apply, releases them;
+    /// never read by apply.
+    target_bytes: std.AutoHashMapUnmanaged(channels.Target, u64) = .empty,
+    in_flight_bytes: u64 = 0,
     counts: Counts = .{},
     /// Messages each group sent this one that were refused as its own bug,
     /// by reason (`store.SenderBug`). Counted where they apply, on every
@@ -207,6 +222,8 @@ pub const Driver = struct {
     }
 
     pub fn deinit(self: *Driver) void {
+        for (self.peers) |*p| p.in_flight.deinit(self.allocator);
+        self.target_bytes.deinit(self.allocator);
         self.allocator.free(self.peers);
         self.allocator.free(self.sender_bugs);
         self.allocator.free(self.sink_refusals);
@@ -240,8 +257,65 @@ pub const Driver = struct {
     /// message an earlier leader sent is in state by then.
     pub fn reset(self: *Driver, term: u64) void {
         self.term = term;
-        @memset(self.peers, .{});
+        for (self.peers) |*p| {
+            var list = p.in_flight;
+            list.clearRetainingCapacity();
+            p.* = .{ .in_flight = list };
+        }
+        self.target_bytes.clearRetainingCapacity();
+        self.in_flight_bytes = 0;
         self.quiet = false;
+    }
+
+    /// What a sink's messages to `target` this leader proposed and hasn't
+    /// applied take, and all of them.
+    pub fn inFlight(self: *const Driver, target: ?channels.Target) channels.InFlight {
+        const t = if (target) |x| self.target_bytes.get(x) orelse 0 else 0;
+        return .{ .target = t, .total = self.in_flight_bytes };
+    }
+
+    /// `from`'s messages through `applied` have applied: no longer in flight.
+    fn releaseApplied(self: *Driver, from: u16, applied: u64) void {
+        const p = &self.peers[from];
+        var gone: usize = 0;
+        for (p.in_flight.items) |m| {
+            if (m.seq > applied) break;
+            self.forget(m);
+            gone += 1;
+        }
+        if (gone == 0) return;
+        const rest = p.in_flight.items.len - gone;
+        std.mem.copyForwards(InFlightMessage, p.in_flight.items[0..rest], p.in_flight.items[gone..]);
+        p.in_flight.shrinkRetainingCapacity(rest);
+    }
+
+    fn forget(self: *Driver, m: InFlightMessage) void {
+        self.in_flight_bytes -= m.bytes;
+        const e = self.target_bytes.getPtr(m.target).?;
+        e.* -= m.bytes;
+        if (e.* == 0) _ = self.target_bytes.remove(m.target);
+    }
+
+    /// Counts `m` in flight to `target`; false out of memory, when it
+    /// must not be proposed.
+    fn track(self: *Driver, from: u16, seq: u64, target: channels.Target, bytes: u64) bool {
+        const p = &self.peers[from];
+        p.in_flight.append(self.allocator, .{ .seq = seq, .target = target, .bytes = bytes }) catch return false;
+        const e = self.target_bytes.getOrPut(self.allocator, target) catch {
+            _ = p.in_flight.pop();
+            return false;
+        };
+        if (!e.found_existing) e.value_ptr.* = 0;
+        e.value_ptr.* += bytes;
+        self.in_flight_bytes += bytes;
+        return true;
+    }
+
+    /// Takes back what `track` counted for `from` past `seq`: a batch
+    /// whose inbound wasn't proposed.
+    fn untrackAfter(self: *Driver, from: u16, seq: u64) void {
+        const p = &self.peers[from];
+        while (p.in_flight.items.len > 0 and p.in_flight.items[p.in_flight.items.len - 1].seq > seq) self.forget(p.in_flight.pop().?);
     }
 
     /// The periodic work: deliver, resend, probe, trim, and tell senders
@@ -366,6 +440,7 @@ pub const Driver = struct {
     fn tickAnswer(self: *Driver, a: u16, read: ReadView, durable: u64, io: anytype) void {
         const p = &self.peers[a];
         const in = channels.inOf(read, a) orelse return;
+        self.releaseApplied(a, in.applied);
         const dur = self.durableAck(a, in, durable);
         if (in.applied <= p.told_applied and dur <= p.told_durable) return;
         self.answer(a, p, in.applied, dur, 0, .ok, io);
@@ -412,6 +487,7 @@ pub const Driver = struct {
         const applied = if (in) |x| x.applied else 0;
         const dur = if (in) |x| self.durableAck(from, x, durable) else 0;
         if (p.accepted == null or p.accepted.? < applied) p.accepted = applied;
+        self.releaseApplied(from, applied);
         p.recv_gen = .{ .term = b.gen_term, .counter = b.gen_counter };
         if (halted) return self.answer(from, p, applied, dur, 0, .halted, io);
         if (b.messages.count == 0) return self.answer(from, p, applied, dur, 0, .ok, io);
@@ -433,18 +509,28 @@ pub const Driver = struct {
         var n: u32 = 0;
         while (it.next() catch null) |m| : (seq += 1) {
             if (seq <= accepted) continue;
-            // A message whose target is over its parked cap waits at its
-            // sender, and so do those after it: the batch's prefix goes.
-            if (self.admits) |admits| if (!admits(read, m)) break;
-            ce.Message.encode(&w, m) catch return;
+            // A message whose target is over its parked cap, counting what
+            // is on its way there, waits at its sender, and so do those
+            // after it: the batch's prefix goes.
+            const target = if (self.sink_target) |f| f(m) else null;
+            if (self.admits) |admits| if (!admits(read, m, self.inFlight(target))) break;
+            if (target) |t| if (!self.track(from, seq, t, m.payload.len)) break;
+            ce.Message.encode(&w, m) catch {
+                self.untrackAfter(from, accepted);
+                return;
+            };
             n += 1;
         }
         if (n == 0) {
             self.counts.busy += 1;
             return self.answer(from, p, applied, dur, 0, .busy, io);
         }
-        const entry = ce.Inbound.encodeInto(self.buf, .{ .from = from, .first_seq = accepted + 1, .messages = .{ .bytes = w.written(), .count = n } }) catch return;
+        const entry = ce.Inbound.encodeInto(self.buf, .{ .from = from, .first_seq = accepted + 1, .messages = .{ .bytes = w.written(), .count = n } }) catch {
+            self.untrackAfter(from, accepted);
+            return;
+        };
         if (!io.propose(.channel_inbound, entry)) {
+            self.untrackAfter(from, accepted);
             self.counts.busy += 1;
             return self.answer(from, p, applied, dur, 0, .busy, io);
         }
@@ -485,3 +571,22 @@ pub const Driver = struct {
         }
     }
 };
+
+test "channel driver: what a leader proposed and hasn't applied is released when it applies, and all of it with the term" {
+    var d = try Driver.init(std.testing.allocator, 1, 3);
+    defer d.deinit();
+    const t1: channels.Target = @splat(1);
+    const t2: channels.Target = @splat(2);
+    try std.testing.expect(d.track(0, 1, t1, 100));
+    try std.testing.expect(d.track(0, 2, t2, 50));
+    try std.testing.expect(d.track(2, 1, t1, 10));
+    try std.testing.expectEqual(channels.InFlight{ .target = 110, .total = 160 }, d.inFlight(t1));
+    // Sender 0's first applied.
+    d.releaseApplied(0, 1);
+    try std.testing.expectEqual(channels.InFlight{ .target = 10, .total = 60 }, d.inFlight(t1));
+    try std.testing.expectEqual(channels.InFlight{ .target = 50, .total = 60 }, d.inFlight(t2));
+    // A new term: none of it is this leader's any more.
+    d.reset(7);
+    try std.testing.expectEqual(channels.InFlight{}, d.inFlight(t2));
+    try std.testing.expectEqual(@as(usize, 0), d.target_bytes.count());
+}

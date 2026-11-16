@@ -130,7 +130,11 @@ pub var test_parked_shard_max: ?u64 = null;
 pub var mutant_no_park_behind = false;
 
 pub const TARGET_LEN = ce.TARGET_LEN;
-const Target = [ce.TARGET_LEN]u8;
+pub const Target = [ce.TARGET_LEN]u8;
+
+/// What a receiving leader has proposed and not yet applied of sink
+/// messages that may park: to one target, and to all.
+pub const InFlight = struct { target: u64 = 0, total: u64 = 0 };
 
 /// The target entry `e` writes as parking keys it, or null for none: its
 /// machine's tag (the machine's first entry type, which no other machine
@@ -614,21 +618,31 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
         /// cap none is taken; past its target's, none for that target.
         /// The driver proposes a batch's messages before the first not
         /// taken, and that one and those after wait at their sender
-        /// (`busy`), so only a sink to a full target pushes back.
+        /// (`busy`), so only a sink to a full target, or one with as much
+        /// on its way as would fill it, pushes back.
         ///
-        /// This reads committed state: inbounds proposed and not yet
-        /// applied aren't counted, so either cap may be passed by what
-        /// they park, at most a sender's window of messages each
-        /// (`channel_driver.WINDOW`).
-        pub fn admits(read: ReadView, m: ce.Message.Value) bool {
-            if (m.flags & entry_mod.Flags.SINK == 0) return true;
-            const t = std.enums.fromInt(EntryType, m.entry_type) orelse return true;
-            const owner = machine_mod.ownerOf(targets, t) orelse return true;
-            const as = bare(m.entry_type, m.flags, m.payload);
-            const target = targetOf(owner, &as) orelse return true;
-            if (shardParked(read).bytes >= (test_parked_shard_max orelse PARKED_SHARD_MAX)) return false;
+        /// Parked bytes are read from committed state, and the bytes this
+        /// leader proposed to the target and hasn't applied (`in_flight`,
+        /// leader-local) count beside them, so a cap is passed by at most
+        /// one message: the one admitted below it. A new leader proposes
+        /// only once its predecessor's inbounds have applied, so none is
+        /// in flight uncounted.
+        pub fn admits(read: ReadView, m: ce.Message.Value, in_flight: InFlight) bool {
+            const target = sinkTarget(m) orelse return true;
+            if (shardParked(read).bytes + in_flight.total >= (test_parked_shard_max orelse PARKED_SHARD_MAX)) return false;
             const parked = targetParked(read, target);
-            return parked.count == 0 or parked.bytes < (test_parked_target_max orelse PARKED_TARGET_MAX);
+            if (parked.count == 0 and in_flight.target == 0) return true;
+            return parked.bytes + in_flight.target < (test_parked_target_max orelse PARKED_TARGET_MAX);
+        }
+
+        /// The target a sink's message `m` may park under, or null for one
+        /// that never parks: not a sink's, or for a machine with no targets.
+        pub fn sinkTarget(m: ce.Message.Value) ?Target {
+            if (m.flags & entry_mod.Flags.SINK == 0) return null;
+            const t = std.enums.fromInt(EntryType, m.entry_type) orelse return null;
+            const owner = machine_mod.ownerOf(targets, t) orelse return null;
+            const as = bare(m.entry_type, m.flags, m.payload);
+            return targetOf(owner, &as);
         }
 
         /// What this group has parked: messages, bytes, targets, and the
@@ -1244,11 +1258,11 @@ test "channels: past a target's parked cap, only that target's messages wait at 
     try deliver(&a, &b, 1, 2);
     try testing.expect(targetParked(b.read(), probeTarget(1)).bytes >= 16);
     const full = a.outRecord(1, 2).?;
-    try testing.expect(!Probed.admits(b.read(), .{ .slot = full.slot, .entry_type = full.entry_type, .layout_epoch = 0, .flags = full.flags, .payload = full.payload }));
+    try testing.expect(!Probed.admits(b.read(), .{ .slot = full.slot, .entry_type = full.entry_type, .layout_epoch = 0, .flags = full.flags, .payload = full.payload }, .{}));
     // Another target on the same channel is taken.
     try a.probeTo(3, "message-thr-0003");
     const other = a.outRecord(1, 3).?;
-    try testing.expect(Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = other.flags, .payload = other.payload }));
+    try testing.expect(Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = other.flags, .payload = other.payload }, .{}));
 }
 
 test "channels: past the shard's parked cap, a sink's message to any target waits at its sender, even one with nothing parked" {
@@ -1265,9 +1279,9 @@ test "channels: past the shard's parked cap, a sink's message to any target wait
     try a.probeTo(3, "message-thr-0003");
     const other = a.outRecord(1, 3).?;
     try testing.expectEqual(@as(u64, 0), targetParked(b.read(), probeTarget(3)).count);
-    try testing.expect(!Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = other.flags, .payload = other.payload }));
+    try testing.expect(!Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = other.flags, .payload = other.payload }, .{}));
     // Not a sink's: it never parks, so it is taken.
-    try testing.expect(Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = 0, .payload = other.payload }));
+    try testing.expect(Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = 0, .payload = other.payload }, .{}));
 }
 
 test "channels: only a sink's message parks behind; another for the same target goes to it" {
