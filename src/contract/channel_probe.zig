@@ -110,7 +110,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     // A drain of a slot this group owns applies here, as a consumer's
     // dequeue would: sent, it could wait behind messages to that same slot
     // its owner refuses until it drains.
-    if (view.message == null and std.mem.startsWith(u8, p.body, "drai")) if (view.place) |pl| if (p.slot % pl.count == pl.group) {
+    if (view.message == null and std.mem.startsWith(u8, p.body, "drai")) if (view.place) |pl| if (@import("channels.zig").ownerOf(pl, p.slot) == pl.group) {
         return view.delete(GotFam, full_key);
     };
     const m = view.message orelse return view.sendFlagged(p.slot, @backingInt(entry_mod.EntryType.channel_probe), entry_mod.Flags.SINK, e.payload);

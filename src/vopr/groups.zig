@@ -762,6 +762,22 @@ pub const Groups = struct {
         if (up) for (self.chans) |*c| c.tick();
     }
 
+    /// Each outbox's recorded bytes are the payload bytes of the records
+    /// it holds: a count every replica gets wrong the same way agrees with
+    /// itself, so it is checked against what it counts.
+    fn checkOutboxBytes(self: *Groups) void {
+        for (self.chans) |*c| for (0..self.chans.len) |to_| {
+            const to: u16 = @intCast(to_);
+            const read = c.read();
+            const meta = channels_mod.metaOf(read, to);
+            var pb: [channels_mod.GROUP_KEY]u8 = undefined;
+            var it = read.range(channels_mod.OutFam, channels_mod.outPrefix(&pb, to));
+            var held: u64 = 0;
+            while (it.next() catch null) |rec| held += rec.value.v.payload.len;
+            if (held != meta.bytes) self.oracle.fail(c.g, @intCast(to), meta.acked + 1, "an outbox's recorded bytes are not what it holds");
+        };
+    }
+
     pub fn run(self: *Groups) !Summary {
         for (self.chans) |*c| c.groups = self;
         while (!self.sims[0].safetyDone() and !self.failed()) try self.step();
@@ -798,6 +814,7 @@ pub const Groups = struct {
             if (!self.failed()) {
                 var buf: [MAX_GROUPS]bool = undefined;
                 self.oracle.finish(self.haltedGroups(&buf));
+                self.checkOutboxBytes();
             }
         }
         const summaries = try self.allocator.alloc(simulator.Summary, self.sims.len);

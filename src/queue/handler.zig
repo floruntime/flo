@@ -192,7 +192,6 @@ pub const Caps = struct {
     }
 };
 
-/// An enqueue under `caps`.
 /// A sink's enqueue another shard sent, rewritten to the caps at `ctx`
 /// (this node's `[queues]` caps) before its receiver logs it, as its own
 /// clients' enqueues carry them; null when it is no sink's enqueue, or
@@ -210,6 +209,7 @@ pub fn stampSinkCaps(ctx: ?*const anyopaque, m: ce.Message.Value, buf: []u8) ?[]
     return qe.Enqueue.encodeInto(buf, p) catch null;
 }
 
+/// An enqueue under `caps`.
 pub fn enqueueValue(caps: Caps, ns: NamespaceId, name: []const u8, priority: u32, delay_ms: u64, payload: []const u8) qe.Enqueue.Value {
     return .{ .ns = ns.int(), .queue = name, .priority = priority, .delay_ms = delay_ms, .payload = payload, .max_messages = caps.max_messages, .max_bytes = caps.max_bytes, .shard_held_bytes = caps.shard_held_bytes };
 }

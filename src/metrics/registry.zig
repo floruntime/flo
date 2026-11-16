@@ -1811,7 +1811,7 @@ fn writeProcessingMetrics(writer: anytype, snapshot: ProcessingMetrics.Snapshot)
     try writer.print("# TYPE flo_processing_errors_total counter\n", .{});
     try writer.print("flo_processing_errors_total {d}\n", .{snapshot.errors_total});
 
-    try writer.print("# HELP flo_processing_ticks_held_total Pipeline ticks that waited for room on a sink's shard or in the log\n", .{});
+    try writer.print("# HELP flo_processing_ticks_held_total Pipeline ticks that waited: for a namespace, a halted sink shard, a full outbox, writes queued behind a shard that is halted, can't flush or has a full target, or room in the log\n", .{});
     try writer.print("# TYPE flo_processing_ticks_held_total counter\n", .{});
     try writer.print("flo_processing_ticks_held_total {d}\n", .{snapshot.ticks_held_total});
     try writer.print("# HELP flo_processing_pipelines_waiting_namespace Pipelines waiting for a sink's namespace to be created\n", .{});
