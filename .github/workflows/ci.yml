@@ -5,10 +5,14 @@ on:
     branches: [dev, main, 'feat/*']
   push:
     branches: [dev, main]
+  # The merge queue builds each candidate on a gh-readonly-queue/* ref and
+  # requires the same checks as a PR, so CI must run on it too.
+  merge_group:
   workflow_dispatch:
 
 # A new push to a PR makes the in-flight run obsolete. Never cancel on
-# dev/main — those runs are the record of what the branch actually did.
+# dev/main — those runs are the record of what the branch actually did —
+# nor a merge-queue run, which gates whether the candidate merges.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
