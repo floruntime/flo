@@ -280,6 +280,9 @@ fn print(ctx: *Context, comptime op: ops.Op, answer: op.response.Value) Error!vo
 }
 
 /// An optional integer named `*_ns` (ts info's oldest and newest): a time.
+/// It matches by name alone, so the contract is that a top-level optional
+/// `*_ns` field is a point in time; a duration in ns must be named otherwise,
+/// or its table would print it as `*_ms` since the epoch.
 fn isNsTime(comptime f: schema.Field) bool {
     return f.T.kind == .optional and f.T.Inner.kind == .integer and std.mem.endsWith(u8, f.name, "_ns");
 }
