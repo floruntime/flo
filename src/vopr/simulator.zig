@@ -1060,6 +1060,11 @@ pub const Simulator = struct {
     convergence_target: u64 = 0,
     elections_won: u64 = 0,
     apply_stalls: u64 = 0,
+    /// Client writes the sim did not propose because the target leader was
+    /// still applying earlier terms (not leaderReady) — the LEADER_NOT_READY
+    /// refusal production answers. Modelled so the sim never commits a write
+    /// production would have refused.
+    leader_not_ready_refused: u64 = 0,
     /// Frames from a node outside the receiver's membership, dropped.
     stranger_frames: u64 = 0,
     /// Join, removal and forward frames, which nothing here sends.
@@ -1918,6 +1923,16 @@ pub const Simulator = struct {
         if (self.scenario.queue_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.queue_percent) return self.submitQueueOp(target);
         const op = try self.workload.nextOp();
         if (op.entry_type == .namespace_create) return self.submitCreate(target, op.id, op.payload);
+        // Production refuses a client write on a leader still applying earlier
+        // terms (LEADER_NOT_READY). The sim proposes straight to raft, so model
+        // the refusal: mark the op refused — the checker then treats it as never
+        // applied — and skip. Creates run the real handler, which refuses while
+        // catching up on its own, so they are left to submitCreate.
+        if (!target.raft.leaderReady()) {
+            self.workload.markRefused(op.id);
+            self.leader_not_ready_refused += 1;
+            return;
+        }
         // The model of `[kv] max_txn_ops`: a leader takes a transaction only
         // within its own limit, whatever the node it came from allows.
         if (op.entry_type == .kv_batch and self.scenario.hasTxnLimits() and self.options.family_mutant != .leader_ignores_limit and kv_entries.batchOpCount(op.payload) > self.scenario.txnLimit(target.id)) {
@@ -1925,6 +1940,10 @@ pub const Simulator = struct {
             self.txn_counts.leader_refused += 1;
             return;
         }
+        // Invariant: the sim never proposes a client op on a leader still
+        // applying earlier terms — production refuses it. The gate above keeps
+        // this true; the assert fails loudly if the gate ever regresses.
+        std.debug.assert(target.raft.leaderReady());
         const res = target.raft.propose(op.entry_type, 0, op.payload) catch return;
         self.workload.recordProposal(op.id, target.id, res.term, res.index);
         try self.pending_ops.append(self.allocator, op.id);
@@ -1933,6 +1952,12 @@ pub const Simulator = struct {
     /// An action entry, made from the leader's own applied action state as
     /// its handler would make it.
     fn submitActionOp(self: *Simulator, target: *SimNode) !void {
+        // Same LEADER_NOT_READY refusal as submitOps: do not draw or propose an
+        // action op while the target leader is still applying earlier terms.
+        if (!target.raft.leaderReady()) {
+            self.leader_not_ready_refused += 1;
+            return;
+        }
         const now = target.raft.wall_clock.read();
         if (target.actions_term != target.raft.current_term) {
             target.actions_term = target.raft.current_term;
@@ -1943,6 +1968,7 @@ pub const Simulator = struct {
         const made = action_workload.make(&target.actions, leader, self.action_prng.random(), op_id, self.action_buf, self.scenario.payload_max) orelse return;
         const id = try self.workload.nextActionOp(made.entry_type, made.payload);
         std.debug.assert(id == op_id);
+        std.debug.assert(target.raft.leaderReady());
         const res = target.raft.propose(made.entry_type, 0, made.payload) catch return;
         self.workload.recordProposal(id, target.id, res.term, res.index);
         try self.pending_ops.append(self.allocator, id);
@@ -1951,6 +1977,12 @@ pub const Simulator = struct {
     /// A queue entry, made from the leader's own applied queue state as its
     /// handler would make it.
     fn submitQueueOp(self: *Simulator, target: *SimNode) !void {
+        // Same LEADER_NOT_READY refusal as submitOps: do not draw or propose a
+        // queue op while the target leader is still applying earlier terms.
+        if (!target.raft.leaderReady()) {
+            self.leader_not_ready_refused += 1;
+            return;
+        }
         const now = target.raft.wall_clock.read();
         if (target.queues_term != target.raft.current_term) {
             target.queues_term = target.raft.current_term;
@@ -1961,6 +1993,7 @@ pub const Simulator = struct {
         const made = queue_workload.make(&target.queues, leader, self.action_prng.random(), op_id, self.action_buf, self.scenario.payload_max) orelse return;
         const id = try self.workload.nextActionOp(made.entry_type, made.payload);
         std.debug.assert(id == op_id);
+        std.debug.assert(target.raft.leaderReady());
         const res = target.raft.propose(made.entry_type, 0, made.payload) catch return;
         self.workload.recordProposal(id, target.id, res.term, res.index);
         try self.pending_ops.append(self.allocator, id);
