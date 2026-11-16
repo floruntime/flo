@@ -2914,10 +2914,26 @@ test "e2e/processing: kv sink routes to the owning shard (multi-shard)" {
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "xshard" });
     // Each write went through its owning shard's log, so a restart replays it.
     try ctx.restartServer();
+    // Check every key, collecting all that didn't survive, before failing: a
+    // contiguous missing suffix points at a replay that stopped early, a
+    // scatter points elsewhere. On any loss, dump the restarted server's own
+    // boot log (how many entries it replayed, any gap/writes_stopped), which
+    // the test's stderr alone doesn't carry.
+    var missing: usize = 0;
     inline for (ids) |id| {
-        const out = try ctx.execCapture(&.{ "kv", "get", "u:" ++ id, "-n", "xshard" });
-        // The sink stores the whole record.
-        try testing.expectEqualStrings("{\"id\":\"" ++ id ++ "\",\"v\":\"val-" ++ id ++ "\"}", std.mem.trim(u8, out, &std.ascii.whitespace));
+        const want = "{\"id\":\"" ++ id ++ "\",\"v\":\"val-" ++ id ++ "\"}";
+        var result = try ctx.execResult(&.{ "kv", "get", "u:" ++ id, "-n", "xshard" });
+        const got = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+        if (!std.mem.eql(u8, got, want)) {
+            missing += 1;
+            std.debug.print("[xshard-restart] u:{s} not restored: exit_ok={} stdout='{s}' stderr='{s}'\n", .{ id, result.succeeded(), got, std.mem.trim(u8, result.stderr, &std.ascii.whitespace) });
+        }
+        result.deinit();
+    }
+    if (missing > 0) {
+        std.debug.print("[xshard-restart] {d}/{d} sink keys missing after a graceful restart; restarted server log follows\n", .{ missing, ids.len });
+        ctx.dumpServerLogs();
+        return error.SinkKeysLostOnRestart;
     }
 }
 
