@@ -323,7 +323,7 @@ pub const CommandResult = union(enum) {
 
     /// Query result with aggregated buckets (pre-serialized)
     /// Wire format: [series_count:u32] per series:
-    ///   [key_len:u32][key][bucket_count:u32] per bucket: [window_start_ms:i64][value:f64]
+    ///   [key_len:u32][key][bucket_count:u32] per bucket: [window_start_ns:i64][value:f64]
     ts_query_result: struct {
         data: []const u8,
     },

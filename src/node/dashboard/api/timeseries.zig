@@ -124,8 +124,9 @@ pub fn getMeasurementDetail(allocator: Allocator, measurement: []const u8, query
     try obj.intField("series_count", info.series);
     try obj.nullField("series");
     try obj.intField("points", info.points);
-    if (info.oldest_ms) |t| try obj.intField("oldest_ms", t) else try obj.nullField("oldest_ms");
-    if (info.newest_ms) |t| try obj.intField("newest_ms", t) else try obj.nullField("newest_ms");
+    // The console's times are ms, as a browser's Date is.
+    if (info.oldest_ns) |t| try obj.intField("oldest_ms", @divFloor(t, std.time.ns_per_ms)) else try obj.nullField("oldest_ms");
+    if (info.newest_ns) |t| try obj.intField("newest_ms", @divFloor(t, std.time.ns_per_ms)) else try obj.nullField("newest_ms");
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
@@ -284,12 +285,12 @@ pub fn executeFloql(allocator: Allocator, method: Method, query_string: ?[]const
                 var pts_arr = try sobj.arrayField("points");
                 try pts_arr.begin();
                 for (0..point_count) |_| {
-                    const ts_ms = r.readI64().?;
+                    const ts_ns = r.readI64().?;
                     const bits = r.readU64().?;
                     try pts_arr.next();
                     var pobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                     try pobj.begin();
-                    try pobj.intField("timestamp", ts_ms);
+                    try pobj.intField("timestamp", @divFloor(ts_ns, std.time.ns_per_ms));
                     try pobj.floatField("value", @bitCast(bits));
                     try pobj.end();
                 }
@@ -305,7 +306,7 @@ pub fn executeFloql(allocator: Allocator, method: Method, query_string: ?[]const
 
 /// Whether `data` is a whole encoded SeriesSet: `[series_count:u32]`, then
 /// per series `[key_len:u32][key][field_len:u32][field][point_count:u32]`
-/// and that many `[timestamp_ms:i64][value:f64]`.
+/// and that many `[timestamp_ns:i64][value:f64]`.
 fn wholeSeriesSet(data: []const u8) bool {
     var r = WireReader.init(data);
     const series_count = r.readU32() orelse return false;

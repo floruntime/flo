@@ -175,6 +175,7 @@ pub const Parser = struct {
                     .duration_ms = 0,
                     .from_ms = dur_ms,
                     .to_ms = to_dur,
+                    .relative = true,
                 };
             }
             // Simple duration
@@ -192,7 +193,7 @@ pub const Parser = struct {
                     .to_ms = to_ms,
                 };
             }
-            // Single absolute timestamp as duration
+            // One absolute timestamp: a lower bound, with no upper one.
             return TimeRange{ .from_ms = from_ms };
         }
 

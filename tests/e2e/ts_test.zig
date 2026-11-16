@@ -262,6 +262,43 @@ test "e2e/ts: write batch keeps each precision's timestamp to the nanosecond" {
     try testing.expect(late.stderrContains("line 1: timestamp '9300000000000' is past 2262-04-11T23:47:16Z, the latest time a point can have"));
 }
 
+test "e2e/ts: info, query and floql answer times in ns, to the nanosecond" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const tmp_path = "/tmp/flo-e2e-ts-wire-ns.txt";
+    defer @import("stdx").fs.deleteFile(tmp_path) catch {};
+    {
+        const file = try @import("stdx").fs.createFile(tmp_path, .{});
+        defer @import("stdx").fs.closeFile(file);
+        try @import("stdx").fs.writeAll(file, "wire v=1 1708700400123456789\nwire v=2 1708700400987654321\n");
+    }
+    try ctx.exec(&.{ "ts", "write", "--batch", "--file", tmp_path, "--precision", "ns" });
+
+    var info = try ctx.cli.run(&.{ "ts", "info", "wire", "-o", "json" });
+    defer info.deinit();
+    try testing.expectEqual(@as(u8, 0), info.exit_code);
+    try testing.expect(info.stdoutContains("1708700400123456789"));
+    try testing.expect(info.stdoutContains("1708700400987654321"));
+
+    // A query's buckets: one second-long window, its start in ns beside ms.
+    var query = try ctx.cli.run(&.{ "ts", "query", "wire", "--field", "v", "--from", "1708700000000", "--window", "1s", "--agg", "count", "-o", "json" });
+    defer query.deinit();
+    try testing.expectEqual(@as(u8, 0), query.exit_code);
+    try testing.expect(query.stdoutContains("\"start_ms\": 1708700400000, \"start_ns\": 1708700400000000000, \"value\": 2.000000"));
+
+    // FloQL: a bare range is epoch ms; one in ns is refused, saying so.
+    var floql = try ctx.cli.run(&.{ "ts", "floql", "wire[1708700400000..1708700401000] | field(v)" });
+    defer floql.deinit();
+    try testing.expectEqual(@as(u8, 0), floql.exit_code);
+    try testing.expect(floql.stdoutContains("1708700400123: 1.0000"));
+    var pasted = try ctx.cli.run(&.{ "ts", "floql", "wire[1708700400123456789] | field(v)" });
+    defer pasted.deinit();
+    // Refused by the server: exit 3.
+    try testing.expectEqual(@as(u8, 3), pasted.exit_code);
+    try testing.expect(pasted.stderrContains("past the year 3000 as epoch milliseconds"));
+}
+
 test "e2e/ts: write batch reports a bad line and stores the rest" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();

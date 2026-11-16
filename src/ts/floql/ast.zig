@@ -62,15 +62,19 @@ pub const FilterOp = enum {
 };
 
 /// Time range specification.
-/// Duration-only: [1h] means "last 1 hour from now".
-/// Explicit: [from..to] for absolute timestamps or durations.
+/// `[1h]`: the last hour, up to now.
+/// `[2h..1h]`: from two hours ago to one hour ago (`relative`).
+/// `[a..b]` with bare numbers: absolute epoch ms; `[a]` alone is a lower
+/// bound, with no upper one.
 pub const TimeRange = struct {
     /// Duration in milliseconds (for relative ranges like "1h", "30m")
     duration_ms: i64 = 0,
 
-    /// Explicit from/to (ms since epoch, 0 = unset → use duration_ms)
+    /// Explicit from/to: epoch ms, or with `relative` durations back from
+    /// now. 0 = unset.
     from_ms: i64 = 0,
     to_ms: i64 = 0,
+    relative: bool = false,
 };
 
 // ============================================================================

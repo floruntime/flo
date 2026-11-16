@@ -8,7 +8,7 @@ const Allocator = std.mem.Allocator;
 
 /// A single time-series data point.
 pub const DataPoint = struct {
-    timestamp_ms: i64,
+    timestamp_ns: i64,
     value: f64,
 };
 
@@ -85,7 +85,7 @@ pub const SeriesSet = struct {
     ///     [field_len: u32][field: bytes]
     ///     [point_count: u32]
     ///     per point:
-    ///       [timestamp_ms: i64][value: f64]
+    ///       [timestamp_ns: i64][value: f64]
     pub fn encode(self: SeriesSet, allocator: Allocator) ![]u8 {
         var size: usize = 4; // series_count
         for (self.series) |s| {
@@ -116,7 +116,7 @@ pub const SeriesSet = struct {
             offset += 4;
 
             for (s.points) |p| {
-                std.mem.writeInt(i64, buf[offset..][0..8], p.timestamp_ms, .little);
+                std.mem.writeInt(i64, buf[offset..][0..8], p.timestamp_ns, .little);
                 offset += 8;
                 @memcpy(buf[offset..][0..8], std.mem.asBytes(&p.value));
                 offset += 8;
@@ -156,8 +156,8 @@ test "series_set_encode_single_series" {
     const allocator = std.testing.allocator;
 
     var points = try allocator.alloc(DataPoint, 2);
-    points[0] = .{ .timestamp_ms = 1000, .value = 42.5 };
-    points[1] = .{ .timestamp_ms = 2000, .value = 43.1 };
+    points[0] = .{ .timestamp_ns = 1000, .value = 42.5 };
+    points[1] = .{ .timestamp_ns = 2000, .value = 43.1 };
 
     var series = try allocator.alloc(Series, 1);
     series[0] = .{

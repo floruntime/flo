@@ -329,13 +329,13 @@ pub const OptionTag = enum(u8) {
     // Workflow Options (0x50 - 0x5F)
 
     // Time-Series Options (0x60 - 0x6F)
-    ts_from_ms = 0x60, // i64: Start of time range (inclusive, unix ms)
-    ts_to_ms = 0x61, // i64: End of time range (inclusive, 0 = now)
-    ts_window_ms = 0x62, // i64: Aggregation window size (ms)
+    ts_from_ns = 0x60, // i64: start of the range, inclusive, in Unix ns (0 = none)
+    ts_to_ns = 0x61, // i64: end of the range, inclusive, in Unix ns (0 = none)
+    ts_window_ns = 0x62, // i64: aggregation window width, in ns (0 = a minute)
     ts_aggregation = 0x63, // string: Aggregation function name (avg, sum, count, min, max)
     ts_field = 0x64, // string: Field name filter (empty = "value")
     ts_tags = 0x65, // string: Comma-separated tag filters "key=val,key2=val2"
-    ts_timestamp_ns = 0x67, // i64: a write's time in ns (≤ 0 = server-assigned)
+    ts_timestamp_ns = 0x67, // i64: a write's time in ns (0 = the server's time; negative is refused)
     ts_raw_ttl = 0x68, // string: Raw data TTL (e.g., "7d")
     ts_downsample = 0x69, // string: refused — downsampling isn't supported
 

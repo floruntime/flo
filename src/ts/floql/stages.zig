@@ -24,12 +24,12 @@ pub const StageError = error{
 /// Group points into time windows. Each window gets one output point
 /// with value = NaN (to be filled by a subsequent aggregation stage).
 /// If no aggregation follows, the last point in each bucket is kept.
-pub fn applyWindow(input: SeriesSet, interval_ms: i64, allocator: Allocator) StageError!SeriesSet {
+pub fn applyWindow(input: SeriesSet, interval_ns: i64, allocator: Allocator) StageError!SeriesSet {
     // Window is a declarative stage — it establishes the bucketing interval
     // for subsequent aggregate stages. The actual bucketing is performed by
-    // applyAggregate using the current_window_ms context tracked by the executor.
+    // applyAggregate using the current window the executor tracks.
     // Here we simply pass through all points unchanged.
-    _ = interval_ms;
+    _ = interval_ns;
 
     var output_series = allocator.alloc(Series, input.series.len) catch return error.OutOfMemory;
 
@@ -67,25 +67,25 @@ const BucketSpan = struct { min_ts: i64, count: usize };
 
 /// The earliest point and the bucket count covering every point. Taken over
 /// all points, not the ends, so no point falls before the first bucket.
-fn bucketSpan(points: []const DataPoint, interval_ms: i64) StageError!BucketSpan {
-    var min_ts = points[0].timestamp_ms;
+fn bucketSpan(points: []const DataPoint, interval_ns: i64) StageError!BucketSpan {
+    var min_ts = points[0].timestamp_ns;
     var max_ts = min_ts;
     for (points) |pt| {
-        min_ts = @min(min_ts, pt.timestamp_ms);
-        max_ts = @max(max_ts, pt.timestamp_ms);
+        min_ts = @min(min_ts, pt.timestamp_ns);
+        max_ts = @max(max_ts, pt.timestamp_ns);
     }
     const width = std.math.sub(i64, max_ts, min_ts) catch return error.InvalidInput;
-    const count = @divTrunc(width, interval_ms) + 1;
+    const count = @divTrunc(width, interval_ns) + 1;
     if (count > MAX_BUCKETS) return error.InvalidInput;
     return .{ .min_ts = min_ts, .count = @intCast(count) };
 }
 
-pub fn applyAggregate(input: SeriesSet, func: ast.AggFunction, interval_ms: i64, allocator: Allocator) StageError!SeriesSet {
-    if (interval_ms <= 0) return error.InvalidInput;
+pub fn applyAggregate(input: SeriesSet, func: ast.AggFunction, interval_ns: i64, allocator: Allocator) StageError!SeriesSet {
+    if (interval_ns <= 0) return error.InvalidInput;
 
     // Checked before anything is allocated, so a refusal leaves nothing behind.
     for (input.series) |s| if (s.points.len > 0) {
-        _ = try bucketSpan(s.points, interval_ms);
+        _ = try bucketSpan(s.points, interval_ns);
     };
 
     var output_series = allocator.alloc(Series, input.series.len) catch return error.OutOfMemory;
@@ -96,7 +96,7 @@ pub fn applyAggregate(input: SeriesSet, func: ast.AggFunction, interval_ms: i64,
             continue;
         }
 
-        const span = bucketSpan(s.points, interval_ms) catch unreachable;
+        const span = bucketSpan(s.points, interval_ns) catch unreachable;
         const min_ts = span.min_ts;
         const bucket_count = span.count;
 
@@ -105,7 +105,7 @@ pub fn applyAggregate(input: SeriesSet, func: ast.AggFunction, interval_ms: i64,
         for (buckets) |*b| b.* = BucketAcc{};
 
         for (s.points) |p| {
-            const idx: usize = @intCast(@divTrunc(p.timestamp_ms - min_ts, interval_ms));
+            const idx: usize = @intCast(@divTrunc(p.timestamp_ns - min_ts, interval_ns));
             if (idx < bucket_count) {
                 buckets[idx].sum += p.value;
                 buckets[idx].count += 1;
@@ -126,7 +126,7 @@ pub fn applyAggregate(input: SeriesSet, func: ast.AggFunction, interval_ms: i64,
                     .max => b.max,
                 };
                 points.append(allocator, .{
-                    .timestamp_ms = min_ts + @as(i64, @intCast(bi)) * interval_ms,
+                    .timestamp_ns = min_ts + @as(i64, @intCast(bi)) * interval_ns,
                     .value = val,
                 }) catch return error.OutOfMemory;
             }
@@ -149,8 +149,8 @@ pub fn applyAggregate(input: SeriesSet, func: ast.AggFunction, interval_ms: i64,
 // ============================================================================
 
 /// Compute per-second rate of change. Handles counter resets.
-pub fn applyRate(input: SeriesSet, interval_ms: i64, allocator: Allocator) StageError!SeriesSet {
-    _ = interval_ms; // Rate is always per-second regardless of interval
+pub fn applyRate(input: SeriesSet, interval_ns: i64, allocator: Allocator) StageError!SeriesSet {
+    _ = interval_ns; // Rate is always per-second regardless of interval
 
     var output_series = allocator.alloc(Series, input.series.len) catch return error.OutOfMemory;
 
@@ -165,7 +165,7 @@ pub fn applyRate(input: SeriesSet, interval_ms: i64, allocator: Allocator) Stage
         while (pi < s.points.len) : (pi += 1) {
             const prev = s.points[pi - 1];
             const curr = s.points[pi];
-            const dt_sec = @as(f64, @floatFromInt(curr.timestamp_ms - prev.timestamp_ms)) / 1000.0;
+            const dt_sec = @as(f64, @floatFromInt(curr.timestamp_ns - prev.timestamp_ns)) / std.time.ns_per_s;
 
             if (dt_sec <= 0) continue;
 
@@ -173,7 +173,7 @@ pub fn applyRate(input: SeriesSet, interval_ms: i64, allocator: Allocator) Stage
             if (delta < 0) delta = curr.value; // Counter reset: treat as starting from 0
 
             points.append(allocator, .{
-                .timestamp_ms = curr.timestamp_ms,
+                .timestamp_ns = curr.timestamp_ns,
                 .value = delta / dt_sec,
             }) catch return error.OutOfMemory;
         }
@@ -207,7 +207,7 @@ pub fn applyDelta(input: SeriesSet, allocator: Allocator) StageError!SeriesSet {
         var pi: usize = 1;
         while (pi < s.points.len) : (pi += 1) {
             points.append(allocator, .{
-                .timestamp_ms = s.points[pi].timestamp_ms,
+                .timestamp_ns = s.points[pi].timestamp_ns,
                 .value = s.points[pi].value - s.points[pi - 1].value,
             }) catch return error.OutOfMemory;
         }
@@ -335,7 +335,7 @@ pub fn applyGroupBy(input: SeriesSet, tag: []const u8, allocator: Allocator) Sta
         // Sort merged points by timestamp for correct downstream processing
         std.mem.sort(DataPoint, merged_points.items, {}, struct {
             fn lessThan(_: void, a: DataPoint, b: DataPoint) bool {
-                return a.timestamp_ms < b.timestamp_ms;
+                return a.timestamp_ns < b.timestamp_ns;
             }
         }.lessThan);
 
@@ -483,7 +483,7 @@ pub fn applyRound(input: SeriesSet, decimals: u32, allocator: Allocator) StageEr
         var points = allocator.alloc(DataPoint, s.points.len) catch return error.OutOfMemory;
         for (s.points, 0..) |p, pi| {
             points[pi] = .{
-                .timestamp_ms = p.timestamp_ms,
+                .timestamp_ns = p.timestamp_ns,
                 .value = @round(p.value * factor) / factor,
             };
         }
@@ -499,7 +499,7 @@ fn applyPointwiseTransform(input: SeriesSet, allocator: Allocator, comptime tran
     for (input.series, 0..) |s, i| {
         var points = allocator.alloc(DataPoint, s.points.len) catch return error.OutOfMemory;
         for (s.points, 0..) |p, pi| {
-            points[pi] = .{ .timestamp_ms = p.timestamp_ms, .value = transform(p.value) };
+            points[pi] = .{ .timestamp_ns = p.timestamp_ns, .value = transform(p.value) };
         }
         output_series[i] = .{ .key = s.key, .field = s.field, .points = points, .tags = s.tags };
     }
@@ -528,7 +528,7 @@ pub fn applyMath(input: SeriesSet, op: ast.MathOp, operand: f64, allocator: Allo
                 .div => if (operand != 0) p.value / operand else p.value,
                 .mod => if (operand != 0) @mod(p.value, operand) else p.value,
             };
-            points[pi] = .{ .timestamp_ms = p.timestamp_ms, .value = v };
+            points[pi] = .{ .timestamp_ns = p.timestamp_ns, .value = v };
         }
         output_series[i] = .{ .key = s.key, .field = s.field, .points = points, .tags = s.tags };
     }
@@ -542,14 +542,14 @@ pub fn applyMath(input: SeriesSet, op: ast.MathOp, operand: f64, allocator: Allo
 
 /// Compute the P-th percentile per window bucket.
 /// Requires windowed input (points already bucketed).
-pub fn applyPercentile(input: SeriesSet, p: f64, interval_ms: i64, allocator: Allocator) StageError!SeriesSet {
-    if (interval_ms <= 0) return error.InvalidInput;
+pub fn applyPercentile(input: SeriesSet, p: f64, interval_ns: i64, allocator: Allocator) StageError!SeriesSet {
+    if (interval_ns <= 0) return error.InvalidInput;
     // Also refuses NaN, which no comparison admits.
     if (!(p >= 0 and p <= 100)) return error.InvalidInput;
 
     // Checked before anything is allocated, so a refusal leaves nothing behind.
     for (input.series) |s| if (s.points.len > 0) {
-        _ = try bucketSpan(s.points, interval_ms);
+        _ = try bucketSpan(s.points, interval_ns);
     };
 
     var output_series = allocator.alloc(Series, input.series.len) catch return error.OutOfMemory;
@@ -560,7 +560,7 @@ pub fn applyPercentile(input: SeriesSet, p: f64, interval_ms: i64, allocator: Al
             continue;
         }
 
-        const span = bucketSpan(s.points, interval_ms) catch unreachable;
+        const span = bucketSpan(s.points, interval_ns) catch unreachable;
         const min_ts = span.min_ts;
         const bucket_count = span.count;
 
@@ -578,7 +578,7 @@ pub fn applyPercentile(input: SeriesSet, p: f64, interval_ms: i64, allocator: Al
         }
 
         for (s.points) |pt| {
-            const idx: usize = @intCast(@divTrunc(pt.timestamp_ms - min_ts, interval_ms));
+            const idx: usize = @intCast(@divTrunc(pt.timestamp_ns - min_ts, interval_ns));
             if (idx < bucket_count) {
                 bucket_values.items[idx].append(allocator, pt.value) catch return error.OutOfMemory;
             }
@@ -610,7 +610,7 @@ pub fn applyPercentile(input: SeriesSet, p: f64, interval_ms: i64, allocator: Al
             }
 
             points.append(allocator, .{
-                .timestamp_ms = min_ts + @as(i64, @intCast(bvi)) * interval_ms,
+                .timestamp_ns = min_ts + @as(i64, @intCast(bvi)) * interval_ns,
                 .value = val,
             }) catch return error.OutOfMemory;
         }
@@ -669,12 +669,12 @@ pub fn applyLast(input: SeriesSet, allocator: Allocator) StageError!SeriesSet {
 
 fn makeTestSeries(allocator: Allocator) !SeriesSet {
     var points = try allocator.alloc(DataPoint, 6);
-    points[0] = .{ .timestamp_ms = 0, .value = 10.0 };
-    points[1] = .{ .timestamp_ms = 1000, .value = 20.0 };
-    points[2] = .{ .timestamp_ms = 2000, .value = 30.0 };
-    points[3] = .{ .timestamp_ms = 3000, .value = 40.0 };
-    points[4] = .{ .timestamp_ms = 4000, .value = 50.0 };
-    points[5] = .{ .timestamp_ms = 5000, .value = 60.0 };
+    points[0] = .{ .timestamp_ns = 0, .value = 10.0 };
+    points[1] = .{ .timestamp_ns = 1 * std.time.ns_per_s, .value = 20.0 };
+    points[2] = .{ .timestamp_ns = 2 * std.time.ns_per_s, .value = 30.0 };
+    points[3] = .{ .timestamp_ns = 3 * std.time.ns_per_s, .value = 40.0 };
+    points[4] = .{ .timestamp_ns = 4 * std.time.ns_per_s, .value = 50.0 };
+    points[5] = .{ .timestamp_ns = 5 * std.time.ns_per_s, .value = 60.0 };
 
     var series = try allocator.alloc(Series, 1);
     series[0] = .{ .key = "test", .field = "value", .points = points };
@@ -687,7 +687,7 @@ test "stages_window" {
     var input = try makeTestSeries(allocator);
     defer input.deinit();
 
-    var result = try applyWindow(input, 2000, allocator);
+    var result = try applyWindow(input, 2 * std.time.ns_per_s, allocator);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.series.len);
@@ -700,7 +700,7 @@ test "stages_aggregate_avg" {
     var input = try makeTestSeries(allocator);
     defer input.deinit();
 
-    var result = try applyAggregate(input, .avg, 3000, allocator);
+    var result = try applyAggregate(input, .avg, 3 * std.time.ns_per_s, allocator);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.series.len);
@@ -717,7 +717,7 @@ test "stages_aggregate_sum" {
     var input = try makeTestSeries(allocator);
     defer input.deinit();
 
-    var result = try applyAggregate(input, .sum, 3000, allocator);
+    var result = try applyAggregate(input, .sum, 3 * std.time.ns_per_s, allocator);
     defer result.deinit();
 
     // First bucket: sum(10, 20, 30) = 60
@@ -732,7 +732,7 @@ test "stages_rate" {
     var input = try makeTestSeries(allocator);
     defer input.deinit();
 
-    var result = try applyRate(input, 1000, allocator);
+    var result = try applyRate(input, std.time.ns_per_s, allocator);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.series.len);
@@ -771,9 +771,9 @@ test "stages_where_gt" {
 test "stages_abs" {
     const allocator = std.testing.allocator;
     var points = try allocator.alloc(DataPoint, 3);
-    points[0] = .{ .timestamp_ms = 0, .value = -5.0 };
-    points[1] = .{ .timestamp_ms = 1000, .value = 3.0 };
-    points[2] = .{ .timestamp_ms = 2000, .value = -7.0 };
+    points[0] = .{ .timestamp_ns = 0, .value = -5.0 };
+    points[1] = .{ .timestamp_ns = 1000, .value = 3.0 };
+    points[2] = .{ .timestamp_ns = 2000, .value = -7.0 };
 
     var series = try allocator.alloc(Series, 1);
     series[0] = .{ .key = "test", .field = "value", .points = points };
@@ -792,9 +792,9 @@ test "stages_abs" {
 test "stages_round_zero_decimals" {
     const allocator = std.testing.allocator;
     var points = try allocator.alloc(DataPoint, 3);
-    points[0] = .{ .timestamp_ms = 0, .value = 3.14 };
-    points[1] = .{ .timestamp_ms = 1000, .value = 2.7 };
-    points[2] = .{ .timestamp_ms = 2000, .value = -1.5 };
+    points[0] = .{ .timestamp_ns = 0, .value = 3.14 };
+    points[1] = .{ .timestamp_ns = 1000, .value = 2.7 };
+    points[2] = .{ .timestamp_ns = 2000, .value = -1.5 };
 
     var series = try allocator.alloc(Series, 1);
     series[0] = .{ .key = "test", .field = "value", .points = points };
@@ -813,9 +813,9 @@ test "stages_round_zero_decimals" {
 test "stages_round_with_decimals" {
     const allocator = std.testing.allocator;
     var points = try allocator.alloc(DataPoint, 3);
-    points[0] = .{ .timestamp_ms = 0, .value = 3.14159 };
-    points[1] = .{ .timestamp_ms = 1000, .value = 2.71828 };
-    points[2] = .{ .timestamp_ms = 2000, .value = -1.555 };
+    points[0] = .{ .timestamp_ns = 0, .value = 3.14159 };
+    points[1] = .{ .timestamp_ns = 1000, .value = 2.71828 };
+    points[2] = .{ .timestamp_ns = 2000, .value = -1.555 };
 
     var series = try allocator.alloc(Series, 1);
     series[0] = .{ .key = "test", .field = "value", .points = points };
@@ -913,11 +913,11 @@ test "stages_topk" {
 
     // Create 3 series with different totals
     var p1 = try allocator.alloc(DataPoint, 1);
-    p1[0] = .{ .timestamp_ms = 0, .value = 100 };
+    p1[0] = .{ .timestamp_ns = 0, .value = 100 };
     var p2 = try allocator.alloc(DataPoint, 1);
-    p2[0] = .{ .timestamp_ms = 0, .value = 300 };
+    p2[0] = .{ .timestamp_ns = 0, .value = 300 };
     var p3 = try allocator.alloc(DataPoint, 1);
-    p3[0] = .{ .timestamp_ms = 0, .value = 200 };
+    p3[0] = .{ .timestamp_ns = 0, .value = 200 };
 
     var series = try allocator.alloc(Series, 3);
     series[0] = .{ .key = "a", .field = "value", .points = p1 };
@@ -945,16 +945,16 @@ test "stages_group_by_merges_by_tag" {
 
     // Two series sharing host=web-01 but different dc values
     var p1 = try allocator.alloc(DataPoint, 2);
-    p1[0] = .{ .timestamp_ms = 1000, .value = 10.0 };
-    p1[1] = .{ .timestamp_ms = 3000, .value = 30.0 };
+    p1[0] = .{ .timestamp_ns = 1000, .value = 10.0 };
+    p1[1] = .{ .timestamp_ns = 3000, .value = 30.0 };
 
     var p2 = try allocator.alloc(DataPoint, 2);
-    p2[0] = .{ .timestamp_ms = 2000, .value = 20.0 };
-    p2[1] = .{ .timestamp_ms = 4000, .value = 40.0 };
+    p2[0] = .{ .timestamp_ns = 2000, .value = 20.0 };
+    p2[1] = .{ .timestamp_ns = 4000, .value = 40.0 };
 
     // Third series with host=web-02
     var p3 = try allocator.alloc(DataPoint, 1);
-    p3[0] = .{ .timestamp_ms = 1500, .value = 99.0 };
+    p3[0] = .{ .timestamp_ns = 1500, .value = 99.0 };
 
     const tags_a = try allocator.alloc(Series.Tag, 2);
     tags_a[0] = .{ .key = "host", .value = "web-01" };
@@ -992,10 +992,10 @@ test "stages_group_by_merges_by_tag" {
     // web-01 group: 4 points merged and sorted by timestamp
     try std.testing.expect(web01 != null);
     try std.testing.expectEqual(@as(usize, 4), web01.?.points.len);
-    try std.testing.expectEqual(@as(i64, 1000), web01.?.points[0].timestamp_ms);
-    try std.testing.expectEqual(@as(i64, 2000), web01.?.points[1].timestamp_ms);
-    try std.testing.expectEqual(@as(i64, 3000), web01.?.points[2].timestamp_ms);
-    try std.testing.expectEqual(@as(i64, 4000), web01.?.points[3].timestamp_ms);
+    try std.testing.expectEqual(@as(i64, 1000), web01.?.points[0].timestamp_ns);
+    try std.testing.expectEqual(@as(i64, 2000), web01.?.points[1].timestamp_ns);
+    try std.testing.expectEqual(@as(i64, 3000), web01.?.points[2].timestamp_ns);
+    try std.testing.expectEqual(@as(i64, 4000), web01.?.points[3].timestamp_ns);
 
     // web-02 group: 1 point
     try std.testing.expect(web02 != null);
@@ -1017,10 +1017,10 @@ test "stages_group_by_untagged_series" {
 
     // One series has the tag, the other doesn't
     var p1 = try allocator.alloc(DataPoint, 1);
-    p1[0] = .{ .timestamp_ms = 1000, .value = 5.0 };
+    p1[0] = .{ .timestamp_ns = 1000, .value = 5.0 };
 
     var p2 = try allocator.alloc(DataPoint, 1);
-    p2[0] = .{ .timestamp_ms = 2000, .value = 7.0 };
+    p2[0] = .{ .timestamp_ns = 2000, .value = 7.0 };
 
     const tags_a = try allocator.alloc(Series.Tag, 1);
     tags_a[0] = .{ .key = "host", .value = "web-01" };
@@ -1069,9 +1069,9 @@ test "stages: a percentile outside 0..100 is refused" {
 test "stages: buckets cover points out of order, and too many buckets are refused" {
     const allocator = std.testing.allocator;
     var points = try allocator.alloc(DataPoint, 3);
-    points[0] = .{ .timestamp_ms = 2000, .value = 1.0 };
-    points[1] = .{ .timestamp_ms = 0, .value = 2.0 };
-    points[2] = .{ .timestamp_ms = 1000, .value = 3.0 };
+    points[0] = .{ .timestamp_ns = 2000, .value = 1.0 };
+    points[1] = .{ .timestamp_ns = 0, .value = 2.0 };
+    points[2] = .{ .timestamp_ns = 1000, .value = 3.0 };
     var series = try allocator.alloc(Series, 1);
     series[0] = .{ .key = "test", .field = "value", .points = points };
     var input = SeriesSet.fromOwned(allocator, series);
@@ -1084,7 +1084,7 @@ test "stages: buckets cover points out of order, and too many buckets are refuse
     defer pct.deinit();
     try std.testing.expectEqual(@as(usize, 3), pct.series[0].points.len);
 
-    points[0].timestamp_ms = @intCast(MAX_BUCKETS);
+    points[0].timestamp_ns = @intCast(MAX_BUCKETS);
     try std.testing.expectError(error.InvalidInput, applyAggregate(input, .sum, 1, allocator));
     try std.testing.expectError(error.InvalidInput, applyPercentile(input, 50, 1, allocator));
 }
