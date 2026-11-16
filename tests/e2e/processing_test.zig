@@ -1161,6 +1161,12 @@ test "e2e/processing: ts source - a point up to its lateness window behind is st
     try testing.expectEqual(@as(usize, 4), std.mem.count(u8, all.stdout, "\"timestamp_ms\""));
     var b9: [40]u8 = undefined;
     try testing.expect(std.mem.indexOf(u8, all.stdout, try std.fmt.bufPrint(&b9, "\"timestamp_ms\":{d}", .{base + 9_000})) == null);
+    // Status counts it against the 5 s edge, the smallest at or above the
+    // 3 s window: it came 11 s behind. The one 2 s behind isn't past it.
+    var status = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_tswin" });
+    defer status.deinit();
+    try testing.expectEqual(@as(u8, 0), status.exit_code);
+    try testing.expect(std.mem.indexOf(u8, status.stdout, "\nLate points: at least 1, more than 5s behind their field's newest\n") != null);
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_tswin" });
 }
 

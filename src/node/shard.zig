@@ -11939,7 +11939,7 @@ test "Shard: source reads and pages are freed when dropped: a page for a pipelin
     defer builder.deinit(a.allocator);
     try builder.begin(a.allocator, read);
     try builder.record(a.allocator, 1, 0, "x");
-    const page = try builder.finish(a.allocator, 1, 0);
+    const page = try builder.finish(a.allocator, 1, 0, 0);
     // A page for a pipeline that was removed: dropped, freed.
     try std.testing.expect(a.mailbox.inbox.send(.{ .tag = .source_page, .src_shard = 1, .payload_len = @intCast(page.len), .payload_ptr = page.ptr }));
     _ = a.drainInbox();
@@ -11949,7 +11949,7 @@ test "Shard: source reads and pages are freed when dropped: a page for a pipelin
     var builder2: @import("../processing/source_page.zig").Page.Builder = .{};
     defer builder2.deinit(b.allocator);
     try builder2.begin(b.allocator, read);
-    const page2 = try builder2.finish(b.allocator, 0, 0);
+    const page2 = try builder2.finish(b.allocator, 0, 0, 0);
     try std.testing.expect(b.mailbox.inbox.send(.{ .tag = .source_page, .src_shard = 0, .payload_len = @intCast(page2.len), .payload_ptr = page2.ptr }));
     b.refuseUnrunRequests();
     try std.testing.expectEqual(@as(usize, 0), b.mailbox.inbox.pending());

@@ -44,6 +44,7 @@ const stream_handler_mod = @import("../stream/handler.zig");
 const kv_handler_mod = @import("../kv/handler.zig");
 const ns_keys = @import("../namespace/handler.zig");
 const ts_handler_mod = @import("../ts/handler.zig");
+const ts_machine = @import("../ts/machine.zig");
 const queue_handler_mod = @import("../queue/handler.zig");
 const StreamID = @import("../projection/stream.zig").StreamID;
 const Shard = shard_mod.Shard;
@@ -209,6 +210,9 @@ pub const ProcessingHandler = struct {
         seen_writes: ?u64 = null,
         seen_known: bool = false,
         seen_at_ms: u64 = 0,
+        /// TS source: its field's late points past the edge its window
+        /// reports against (`lateEdge`), as last read.
+        late_points: u64 = 0,
         stream_cursor_ts: u64, // Stream source: last StreamID timestamp_ms read
         stream_cursor_seq: u64, // Stream source: last StreamID sequence read
         last_poll_ms: i64, // last time this pipeline was ticked
@@ -281,6 +285,14 @@ pub const ProcessingHandler = struct {
             if (self.lateness_ms == 0 or !self.seen_known) return 0;
             const writes = self.seen_writes orelse return 0;
             return if (now_ms -| self.seen_at_ms >= self.lateness_ms) writes else 0;
+        }
+
+        /// The index of the late-point edge a TS source reports against:
+        /// the smallest at or above its window. None for a stream source, or
+        /// a window past every edge.
+        pub fn lateEdge(self: *const PipelineState) ?usize {
+            if (self.source_kind != .ts) return null;
+            return ts_machine.lateEdgeFor(@as(u64, self.lateness_ms) * std.time.ns_per_ms);
         }
 
         pub fn holdBackNs(self: *const PipelineState, now_ms: u64) u64 {
@@ -798,10 +810,18 @@ pub const ProcessingHandler = struct {
         tick_max_us: u64 = 0,
         /// Since the earliest of them started.
         uptime_ms: u64 = 0,
+        /// At least `late_points` of the source fields' points came more
+        /// than `late_edge_ms` behind their field's newest: the largest edge
+        /// the job's TS sources report against. `NO_LATE_EDGE` for none.
+        late_edge_ms: u64 = NO_LATE_EDGE,
+        late_points: u64 = 0,
+
+        pub const NO_LATE_EDGE = std.math.maxInt(u64);
 
         /// `[running:u8][records_in:u64][records_out:u64][watermark_ms:i64]`
         /// `[tick_avg_us:u64][tick_max_us:u64][uptime_ms:u64]`
-        pub const SIZE = 1 + 8 * 6;
+        /// `[late_edge_ms:u64][late_points:u64]`
+        pub const SIZE = 1 + 8 * 8;
 
         fn write(self: Runtime, w: *std.Io.Writer) std.Io.Writer.Error!void {
             try w.writeByte(@intFromBool(self.running));
@@ -811,6 +831,8 @@ pub const ProcessingHandler = struct {
             try w.writeInt(u64, self.tick_avg_us, .little);
             try w.writeInt(u64, self.tick_max_us, .little);
             try w.writeInt(u64, self.uptime_ms, .little);
+            try w.writeInt(u64, self.late_edge_ms, .little);
+            try w.writeInt(u64, self.late_points, .little);
         }
     };
 
@@ -821,6 +843,7 @@ pub const ProcessingHandler = struct {
         var started: i64 = std.math.maxInt(i64);
         var tick_sum: u64 = 0;
         var ticks: u64 = 0;
+        var late_edge: ?usize = null;
         var it = self.pipelines.iterator();
         while (it.next()) |e| {
             const key = e.key_ptr.*;
@@ -835,10 +858,45 @@ pub const ProcessingHandler = struct {
             tick_sum += p.tick_ns_sum;
             ticks += p.tick_count;
             started = @min(started, p.started_ms);
+            if (p.lateEdge()) |edge| late_edge = @max(late_edge orelse edge, edge);
+        }
+        // Each field once: its count is the whole field's, however many of
+        // the job's sources read it. A source on a smaller edge isn't
+        // counted, as its count past the larger one isn't carried for it.
+        if (late_edge) |edge| {
+            r.late_edge_ms = ts_machine.LATE_EDGES_NS[edge] / std.time.ns_per_ms;
+            var outer = self.pipelines.iterator();
+            var at: usize = 0;
+            while (outer.next()) |e| : (at += 1) {
+                const p = e.value_ptr;
+                if (!self.lateCounts(e.key_ptr.*, p, job_id, edge)) continue;
+                var inner = self.pipelines.iterator();
+                var seen = false;
+                var i: usize = 0;
+                while (inner.next()) |q| : (i += 1) {
+                    if (i == at) break;
+                    if (self.lateCounts(q.key_ptr.*, q.value_ptr, job_id, edge) and sameField(p, q.value_ptr)) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) r.late_points += p.late_points;
+            }
         }
         if (ticks > 0) r.tick_avg_us = tick_sum / ticks / std.time.ns_per_us;
         if (r.running) r.uptime_ms = @intCast(@max(0, now_ms - started));
         return r;
+    }
+
+    /// Whether pipeline `key` is one of job `job_id`'s, reporting late
+    /// points against `edge`.
+    fn lateCounts(_: *const ProcessingHandler, key: []const u8, p: *const PipelineState, job_id: []const u8, edge: usize) bool {
+        const base = if (std.mem.indexOfScalar(u8, key, 0)) |nul| key[0..nul] else key;
+        return std.mem.eql(u8, base, job_id) and p.lateEdge() == edge;
+    }
+
+    fn sameField(a: *const PipelineState, b: *const PipelineState) bool {
+        return std.mem.eql(u8, a.src_namespace, b.src_namespace) and std.mem.eql(u8, a.src_measurement, b.src_measurement) and std.mem.eql(u8, a.src_field, b.src_field);
     }
 
     // ── List ─────────────────────────────────────────────────────────────
@@ -1616,7 +1674,7 @@ pub const ProcessingHandler = struct {
     /// The latest time a TS source's read reaches, on the shard holding
     /// its field: `behind` short of the field's newest point, or every
     /// point when `behind` is 0 or the field has no series.
-    pub fn throughFor(f: ?@import("../ts/machine.zig").FieldValue, behind: u64) u64 {
+    pub fn throughFor(f: ?ts_machine.FieldValue, behind: u64) u64 {
         if (behind == 0) return std.math.maxInt(u64);
         const v = f orelse return std.math.maxInt(u64);
         return v.newest_ns -| behind;
@@ -1638,6 +1696,7 @@ pub const ProcessingHandler = struct {
         const now = self.mono_ms();
         const f = shard.ts_handler.ts.fieldRecord(ns, pipe.src_measurement, pipe.src_field);
         pipe.noteWrites(if (f) |v| v.writes else null, now);
+        if (pipe.lateEdge()) |e| pipe.late_points = if (f) |v| v.late[e] else 0;
         const n = source_page.readTsPage(shard.ts_handler.ts, ns, pipe.src_measurement, pipe.src_field, pipe.src_tag_hash, pipe.ts_cursor, throughFor(f, pipe.holdBackNs(now)), limit, &points);
         self.processTsPage(pipeline_key, pipe, shard, job, points[0..n]);
     }
@@ -1849,7 +1908,7 @@ pub const ProcessingHandler = struct {
                 const result = shard.stream_handler.readPayloadsForStream(r.source, r.namespace, from, r.limit);
                 defer result.deinit(shard.stream_handler.allocator);
                 for (result.payloads, result.ids) |p, id| try b.record(shard.allocator, id.timestamp_ms, id.sequence, p);
-                return b.finish(shard.allocator, result.last_id.timestamp_ms, result.last_id.sequence);
+                return b.finish(shard.allocator, result.last_id.timestamp_ms, result.last_id.sequence, 0);
             },
             .ts => {
                 var points: [source_page.TS_PAGE_POINTS]TsPoint = undefined;
@@ -1860,7 +1919,8 @@ pub const ProcessingHandler = struct {
                 const idle = r.idle_at != 0 and f != null and f.?.writes == r.idle_at;
                 const n = source_page.readTsPage(shard.ts_handler.ts, ns, r.source, r.field, r.tag_hash, .{ .ns = r.from_a, .ual = r.from_b }, throughFor(f, if (idle) 0 else r.behind_ns), r.limit, &points);
                 for (points[0..n]) |p| try b.point(shard.allocator, p);
-                return b.finish(shard.allocator, if (f) |v| v.newest_ns else 0, if (f) |v| v.writes else 0);
+                const late = if (f) |v| if (ts_machine.lateEdgeFor(r.behind_ns)) |e| v.late[e] else 0 else 0;
+                return b.finish(shard.allocator, if (f) |v| v.newest_ns else 0, if (f) |v| v.writes else 0, late);
             },
         }
     }
@@ -1917,6 +1977,7 @@ pub const ProcessingHandler = struct {
                 var points: [source_page.TS_PAGE_POINTS]TsPoint = undefined;
                 const got = page.points(&points) orelse return;
                 pipe.noteWrites(if (page.last_b != 0) page.last_b else null, self.mono_ms());
+                pipe.late_points = page.late;
                 self.processTsPage(pipeline_key, pipe, shard, job, got);
             },
         }
@@ -3507,6 +3568,47 @@ test "ProcessingHandler: jobs that share a name are each listed" {
     try std.testing.expect(handler.listedJob(.of(16), "job-a") == null);
 }
 
+test "processing: a job's status counts its TS sources' late points at the largest edge they report against, each field once" {
+    const allocator = std.testing.allocator;
+    var handler = ProcessingHandler.init(allocator);
+    defer handler.deinit();
+    const Src = struct {
+        fn ts(measurement: []const u8, lateness_ms: u32) definition.SourceSpec {
+            return .{ .kind = .ts, .name = "t", .stream = "", .namespace = "default", .batch_size = 0, .ts_measurement = measurement, .ts_field = "value", .ts_lateness_ms = lateness_ms };
+        }
+    };
+    // Windows of 30 s and 20 s both report against the 30 s edge; the
+    // 3 s one reports against 5 s, and its count past 30 s isn't carried
+    // for it, so it isn't counted. Two sources reading cpu.value (say,
+    // one host each) count its late points once: the count is the field's.
+    const sources = [_]struct { key: []const u8, measurement: []const u8, lateness_ms: u32, late: u64 }{
+        .{ .key = "job-a\x000", .measurement = "cpu", .lateness_ms = 30_000, .late = 5 },
+        .{ .key = "job-a\x001", .measurement = "cpu", .lateness_ms = 3_000, .late = 9 },
+        .{ .key = "job-a\x002", .measurement = "mem", .lateness_ms = 20_000, .late = 2 },
+        .{ .key = "job-a\x003", .measurement = "cpu", .lateness_ms = 30_000, .late = 5 },
+        .{ .key = "job-h", .measurement = "cpu", .lateness_ms = 2 * 3_600_000, .late = 4 },
+    };
+    for (sources) |s| {
+        const src = Src.ts(s.measurement, s.lateness_ms);
+        var pipe = try ProcessingHandler.makePipeState(allocator, &src, &.{}, 0);
+        pipe.late_points = s.late;
+        try handler.pipelines.put(try allocator.dupe(u8, s.key), pipe);
+    }
+    const stream_src = definition.SourceSpec{ .kind = .stream, .name = "s", .stream = "in", .namespace = "default", .batch_size = 0 };
+    try handler.pipelines.put(try allocator.dupe(u8, "job-s"), try ProcessingHandler.makePipeState(allocator, &stream_src, &.{}, 0));
+
+    const a = handler.runtimeOf("job-a", 0);
+    try std.testing.expectEqual(@as(u64, 30_000), a.late_edge_ms);
+    try std.testing.expectEqual(@as(u64, 7), a.late_points);
+    // A window past every edge, or no TS source: no count.
+    for ([_][]const u8{ "job-h", "job-s" }) |id| {
+        const r = handler.runtimeOf(id, 0);
+        try std.testing.expect(r.running);
+        try std.testing.expectEqual(ProcessingHandler.Runtime.NO_LATE_EDGE, r.late_edge_ms);
+        try std.testing.expectEqual(@as(u64, 0), r.late_points);
+    }
+}
+
 test "processing: a TS source holds back its lateness window until its field has had no write, late or not, for that long" {
     var pipe: ProcessingHandler.PipelineState = undefined;
     pipe.lateness_ms = 3000;
@@ -3539,7 +3641,7 @@ test "processing: a TS source holds back its lateness window until its field has
     pipe.seen_known = false;
     try std.testing.expectEqual(@as(u64, 0), pipe.holdBackNs(0));
 
-    const F = @import("../ts/machine.zig").FieldValue;
+    const F = ts_machine.FieldValue;
     const max = std.math.maxInt(u64);
     try std.testing.expectEqual(max, ProcessingHandler.throughFor(null, w));
     try std.testing.expectEqual(max, ProcessingHandler.throughFor(F{ .newest_ns = 100 * std.time.ns_per_s }, 0));

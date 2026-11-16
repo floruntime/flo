@@ -108,9 +108,9 @@ pub const TsPoint = struct { timestamp_ns: u64, ual: u64, value: f64, tags: []co
 /// and the records.
 ///
 /// `[term u64][seq u64][kind u8][pipeline len u16][pipeline][from_a u64]
-/// [from_b u64][last_a u64][last_b u64][count u32]` then each stream record
-/// `[ms u64][seq u64][len u32][payload]` or TS point `[ns u64][ual u64]
-/// [value u64][tags len u16][tags]`.
+/// [from_b u64][last_a u64][last_b u64][late u64][count u32]` then each
+/// stream record `[ms u64][seq u64][len u32][payload]` or TS point
+/// `[ns u64][ual u64][value u64][tags len u16][tags]`.
 pub const Page = struct {
     term: u64,
     seq: u64,
@@ -123,6 +123,9 @@ pub const Page = struct {
     /// its write count (0 when it has no series).
     last_a: u64,
     last_b: u64,
+    /// TS: the field's late points past the edge the read's window
+    /// reports against (`lateEdgeFor`); 0 for a stream.
+    late: u64,
     count: u32,
     items: []const u8,
 
@@ -143,6 +146,7 @@ pub const Page = struct {
             try appendInt(w, allocator, u64, r.from_a);
             try appendInt(w, allocator, u64, r.from_b);
             b.last_at = w.items.len;
+            try appendInt(w, allocator, u64, 0);
             try appendInt(w, allocator, u64, 0);
             try appendInt(w, allocator, u64, 0);
             b.count_at = w.items.len;
@@ -168,10 +172,11 @@ pub const Page = struct {
         }
 
         /// The page's bytes, owned by the caller.
-        pub fn finish(b: *Builder, allocator: Allocator, last_a: u64, last_b: u64) ![]u8 {
+        pub fn finish(b: *Builder, allocator: Allocator, last_a: u64, last_b: u64, late: u64) ![]u8 {
             const s = b.list.items;
             std.mem.writeInt(u64, s[b.last_at..][0..8], last_a, .little);
             std.mem.writeInt(u64, s[b.last_at + 8 ..][0..8], last_b, .little);
+            std.mem.writeInt(u64, s[b.last_at + 16 ..][0..8], late, .little);
             std.mem.writeInt(u32, s[b.count_at..][0..4], b.count, .little);
             return b.list.toOwnedSlice(allocator);
         }
@@ -195,8 +200,9 @@ pub const Page = struct {
         const from_b = r.int(u64) orelse return null;
         const last_a = r.int(u64) orelse return null;
         const last_b = r.int(u64) orelse return null;
+        const late = r.int(u64) orelse return null;
         const count = r.int(u32) orelse return null;
-        return .{ .term = term, .seq = seq, .kind = kind, .pipeline = pipeline, .from_a = from_a, .from_b = from_b, .last_a = last_a, .last_b = last_b, .count = count, .items = bytes[r.at..] };
+        return .{ .term = term, .seq = seq, .kind = kind, .pipeline = pipeline, .from_a = from_a, .from_b = from_b, .last_a = last_a, .last_b = last_b, .late = late, .count = count, .items = bytes[r.at..] };
     }
 
     pub const Record = struct { ms: u64, seq: u64, payload: []const u8 };
@@ -294,16 +300,17 @@ test "source read and page: fields come back as sent; a cut one doesn't decode" 
     try b.begin(a, .{ .term = 3, .seq = 9, .kind = .stream, .pipeline = "j", .namespace = "default", .source = "s", .from_a = 1, .from_b = 2, .limit = 5 });
     try b.record(a, 10, 0, "x");
     try b.record(a, 10, 1, "");
-    const pb = try b.finish(a, 10, 1);
+    const pb = try b.finish(a, 10, 1, 4);
     defer a.free(pb);
     const page = Page.decode(pb).?;
     try std.testing.expectEqual(@as(u32, 2), page.count);
+    try std.testing.expectEqual(@as(u64, 4), page.late);
     try std.testing.expectEqual(@as(u64, 2), page.from_b);
     var recs: [4]Page.Record = undefined;
     const rs = page.records(&recs).?;
     try std.testing.expectEqualStrings("x", rs[0].payload);
     try std.testing.expectEqual(@as(u64, 1), rs[1].seq);
-    try std.testing.expectEqual(@as(?[]Page.Record, null), (Page{ .term = 0, .seq = 0, .kind = .stream, .pipeline = "", .from_a = 0, .from_b = 0, .last_a = 0, .last_b = 0, .count = 2, .items = page.items[0 .. page.items.len - 1] }).records(&recs));
+    try std.testing.expectEqual(@as(?[]Page.Record, null), (Page{ .term = 0, .seq = 0, .kind = .stream, .pipeline = "", .from_a = 0, .from_b = 0, .last_a = 0, .last_b = 0, .late = 0, .count = 2, .items = page.items[0 .. page.items.len - 1] }).records(&recs));
 }
 
 test "readTsPage: pages may end among points sharing a time, and together read each point once" {
