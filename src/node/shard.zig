@@ -126,6 +126,15 @@ const hard_state_mod = @import("../raft/hard_state.zig");
 const Durability = @import("../config/server.zig").Durability;
 const SegmentReader = @import("../storage/ual/reader.zig").SegmentReader;
 const entry_mod = @import("../storage/ual/entry.zig");
+// The boot-replay contract, shared with the deterministic simulator so it
+// drives the real decisions. Aliased here where call sites read better.
+const replay = @import("replay.zig");
+const Verdict = replay.Verdict;
+const Halt = replay.Halt;
+const ReplayOutcome = replay.ReplayOutcome;
+const ReplayApply = replay.ReplayApply;
+const ReplayCtx = replay.ReplayCtx;
+const isSkip = replay.isSkip;
 const segment_mod = @import("../storage/ual/segment.zig");
 const Entry = entry_mod.Entry;
 const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
@@ -5783,7 +5792,7 @@ pub const Shard = struct {
                             log.info("shard {d}: committed entries are readable again; applying from {d}", .{ self.id, next_idx });
                         }
                         spent += applyCost(&e);
-                        if (skippedHere(&self.skips, &e)) {
+                        if (replay.skippedHere(&self.skips, &e)) {
                             self.last_entry_applied = false;
                             self.last_result.reset(&e);
                             self.defaultPartition().passOverSkipped(&e) catch |err| {
@@ -8600,39 +8609,6 @@ pub const ApplyResult = union(enum) {
     no_applier,
 };
 
-/// An entry every replica fails the same way, and why. A shard halted at
-/// it applies nothing from it on until a repair.
-pub const Halt = struct {
-    index: u64,
-    term: u64,
-    /// The entry's checksum: with its index and term, what a repair names.
-    crc: u32,
-    len: usize = 0,
-    buf: [192]u8 = undefined,
-
-    pub fn init(e: *const entry_mod.Entry, comptime fmt: []const u8, args: anytype) Halt {
-        var h: Halt = .{ .index = e.header.index, .term = e.header.term, .crc = e.header.crc32c };
-        // Too long for the buffer: kept cut short.
-        h.len = if (std.fmt.bufPrint(&h.buf, fmt, args)) |w| w.len else |_| h.buf.len;
-        return h;
-    }
-
-    pub fn reason(self: *const Halt) []const u8 {
-        return self.buf[0..self.len];
-    }
-};
-
-/// What an apply came to, for the shard: whether to go on.
-const Verdict = union(enum) {
-    applied,
-    /// An index the partition already holds: counted, nothing lost.
-    duplicate,
-    /// No replica can apply it: why.
-    halt: []const u8,
-    /// This node couldn't, for want of memory or a disk; another may.
-    local: silent_loss.Damage,
-};
-
 /// Why a shard halts at an entry whose apply crashed the node.
 const CRASHED = "applying it crashed this node";
 
@@ -8781,49 +8757,9 @@ fn listDurable(dl: *DurableLog) ![]const durable_log_mod.SegmentFile {
     return dl.segments();
 }
 
-/// Feed a durable entry back into the Raft log at boot: the last index, the
-/// term index and the hot-ring tail all come from this pass. A hole is
-/// damage: an entry this node committed is gone.
-fn restoreRaftEntry(shard_id: u16, raft_log: *RaftLog, e: *const entry_mod.Entry) ?silent_loss.Damage {
-    _ = raft_log.append(e) catch |err| switch (err) {
-        error.IndexGap => {
-            const tip = raft_log.lastIndex();
-            if (e.header.index <= tip) {
-                log.err("shard {d}: segments hold index {d} twice (log tip {d}); the later copy is ignored", .{ shard_id, e.header.index, tip });
-                return null;
-            }
-            return silent_loss.Damage.init(.index_hole, "no segment holds entries {d}..{d}", .{ tip + 1, e.header.index - 1 });
-        },
-        else => log.err("shard {d}: cannot restore index {d}: {s}", .{ shard_id, e.header.index, @errorName(err) }),
-    };
-    return null;
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Segment Replay — recover state from .flseg files on startup
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/// What boot replay did: the last index it applied, and the damage it
-/// stopped at, if any.
-const ReplayOutcome = struct {
-    applied_through: u64 = 0,
-    damage: ?silent_loss.Damage = null,
-    /// The entry replay halted at: the rest of the log is restored, and
-    /// none of it applied.
-    halt: ?Halt = null,
-    /// The stamp of the last entry applied.
-    last_stamp: u64 = 0,
-    /// Another shard's boot failed, and this one stopped early.
-    cancelled: bool = false,
-    /// A segment that would not open for want of resources.
-    blocked: ?BlockedRead = null,
-    /// Entries read back, for the progress lines.
-    entries: u64 = 0,
-    started_ms: u64 = 0,
-    next_line_ms: u64 = 0,
-};
-
-const BlockedRead = struct { name: []const u8, err: anyerror };
 
 /// A file boot could not read for a resource failure: that says nothing
 /// about the log, so boot refuses rather than taking it as damage and
@@ -8889,22 +8825,43 @@ fn collectSkips(allocator: std.mem.Allocator, files: []const durable_log_mod.Seg
     return null;
 }
 
-/// Whether a committed repair skips `e` on this shard. A skip entry itself
-/// is never skipped: it changes nothing a pass-over would leave out.
-fn skippedHere(skips: *const repair.Skips, e: *const entry_mod.Entry) bool {
-    return !isSkip(e) and skips.skips(e);
-}
+/// Production's `ReplayApply`: `applyEntryCore` on a `Partition`, wrapped in the
+/// crash marker and `verdictOf`, and `passOverSkipped` for a repair skip.
+const PartitionReplay = struct {
+    partition: *Partition,
+    registry: *const ReplayRegistry,
+    marker: *apply_marker.Marker,
+    losses: *silent_loss.Counts,
+    shard_id: u16,
+    result: persistence_mod.Result = .{},
 
-fn isSkip(e: *const entry_mod.Entry) bool {
-    return e.header.entry_type == @backingInt(entry_mod.EntryType.repair_skip);
-}
+    fn applier(self: *PartitionReplay) ReplayApply {
+        return .{ .ctx = self, .apply = apply, .pass_over = passOver };
+    }
 
-/// Replay all .flseg segment files in `dir_path`: every entry is restored
-/// into the Raft log and applied through `applyEntryCore`, exactly as when
-/// it was first committed. Replay stops at the first damage: what follows
-/// it would apply over a hole.
-///
-/// Entries above `watermark` are restored into the Raft log but not applied.
+    fn apply(ctx: *anyopaque, entry: *const entry_mod.Entry) Verdict {
+        const self: *PartitionReplay = @ptrCast(@alignCast(ctx));
+        if (self.marker.crashedOn(entry)) return .{ .halt = CRASHED };
+        const prev = apply_marker.begin(self.marker, entry);
+        defer apply_marker.end(prev);
+        self.result.reset(entry);
+        return verdictOf(self.losses, self.shard_id, Shard.nowMs(), entry, applyEntryCore(self.partition, self.registry, entry, &self.result));
+    }
+
+    fn passOver(ctx: *anyopaque, entry: *const entry_mod.Entry) ?silent_loss.Damage {
+        const self: *PartitionReplay = @ptrCast(@alignCast(ctx));
+        self.partition.passOverSkipped(entry) catch |err|
+            return localDamage(err, silent_loss.Damage.init(.partition_reject, "entry {d}, which a repair skips, could not be passed over on this node: {s}", .{ entry.header.index, @errorName(err) }));
+        return null;
+    }
+};
+
+/// Replay the durable segments into the Raft log, and below the watermark into
+/// the projections, driving each entry through `replay.replayOneEntry` on a
+/// `PartitionReplay` applier. Entries above the watermark are restored but not
+/// applied. Replay stops at the first damage — what follows it would apply over
+/// a hole — and the outcome (applied-through, last stamp, any halt) goes back to
+/// the boot caller.
 fn replaySegments(
     allocator: std.mem.Allocator,
     files: []const durable_log_mod.SegmentFile,
@@ -8925,13 +8882,15 @@ fn replaySegments(
     var last: u64 = 0;
     for (files) |sf| last = @max(last, sf.last_index);
     if (boot.health) |slot| slot.replay_last.store(last, .monotonic);
+    var prod: PartitionReplay = .{ .partition = partition, .registry = replay_registry, .marker = marker, .losses = losses, .shard_id = shard_id };
+    const ctx: ReplayCtx = .{ .raft_log = raft_log, .watermark = watermark, .skips = skips, .shard_id = shard_id, .apply = prod.applier() };
     for (files) |sf| {
         // Before reading and checksumming a whole segment it would not use.
         if (boot.cancelled()) {
             out.cancelled = true;
             break;
         }
-        replaySegmentFile(allocator, sf.path, partition, replay_registry, watermark, raft_log, shard_id, losses, marker, skips, boot, last, &out);
+        replaySegmentFile(allocator, sf.path, ctx, boot, last, &out);
         if (out.damage != null or out.cancelled or out.blocked != null) break;
     }
     if (out.entries > 0 and !out.cancelled) {
@@ -8943,21 +8902,12 @@ fn replaySegments(
 fn replaySegmentFile(
     allocator: std.mem.Allocator,
     full_path: []const u8,
-    partition: *Partition,
-    replay_registry: *const ReplayRegistry,
-    watermark: u64,
-    raft_log: *RaftLog,
-    shard_id: u16,
-    losses: *silent_loss.Counts,
-    marker: *apply_marker.Marker,
-    skips: *const repair.Skips,
+    ctx: ReplayCtx,
     boot: Shard.Boot,
     last: u64,
     out: *ReplayOutcome,
 ) void {
     const name = std.fs.path.basename(full_path);
-    // One result for the segment's entries, reset for each.
-    var replay_result: persistence_mod.Result = .{};
     // Sealed segments are written whole and renamed into place, so one
     // that will not open, or fails its checksum, is damage, never a crash;
     // one that won't open for want of resources refuses the boot.
@@ -9005,66 +8955,16 @@ fn replaySegmentFile(
             const now = Shard.nowMs();
             if (now >= out.next_line_ms) {
                 out.next_line_ms = now + REPLAY_PROGRESS_MS;
-                log.info("shard {d} replaying: index {d} of {d}", .{ shard_id, seg_entry.header.index, last });
+                log.info("shard {d} replaying: index {d} of {d}", .{ ctx.shard_id, seg_entry.header.index, last });
             }
         }
 
-        // Every durable entry is part of the Raft log.
-        if (restoreRaftEntry(shard_id, raft_log, &seg_entry)) |damage| {
-            out.damage = damage;
-            return;
-        }
-
-        // Above the watermark: in the log, not yet in the projections.
-        // Past a halt: in the log, and nothing of it applies until a repair.
-        if (seg_entry.header.index > watermark or out.halt != null) continue;
-
-        // A repair skips it: taken as a halt on it left a replica that
-        // halted live, and its applier never runs.
-        if (skippedHere(skips, &seg_entry)) {
-            partition.passOverSkipped(&seg_entry) catch |err| {
-                out.damage = localDamage(err, silent_loss.Damage.init(.partition_reject, "entry {d}, which a repair skips, could not be passed over on this node: {s}", .{ seg_entry.header.index, @errorName(err) }));
-                return;
-            };
-            log.info("shard {d}: entry {d} is skipped by a repair; passing over it", .{ shard_id, seg_entry.header.index });
-            out.applied_through = seg_entry.header.index;
-            continue;
-        }
-        if (out.last_stamp != 0 and seg_entry.header.timestamp_ns <= out.last_stamp and !isSkip(&seg_entry)) {
-            out.halt = Halt.init(&seg_entry, "entry {d}: its stamp {d} is not after the last applied entry's, {d} (a Flo bug)", .{ seg_entry.header.index, seg_entry.header.timestamp_ns, out.last_stamp });
-            continue;
-        }
-        // Nobody waits on a replayed entry's answer.
-        replay_result.reset(&seg_entry);
-        const verdict: Verdict = if (marker.crashedOn(&seg_entry)) .{ .halt = CRASHED } else v: {
-            const prev = apply_marker.begin(marker, &seg_entry);
-            defer apply_marker.end(prev);
-            break :v verdictOf(losses, shard_id, Shard.nowMs(), &seg_entry, applyEntryCore(partition, replay_registry, &seg_entry, &replay_result));
-        };
-        switch (verdict) {
-            .applied => {},
-            // At boot, segments replay in index order, so every entry should
-            // apply exactly once; a duplicate means overlapping segments or a
-            // wrong watermark.
-            .duplicate => {
-                const type_name = std.enums.tagName(entry_mod.EntryType, @fromBackingInt(@intCast(seg_entry.header.entry_type))) orelse "unknown";
-                log.warn("shard {d}: replayed entry {d} ({s}) was skipped at apply (the partition rejected it as not increasing); its effect is absent after this boot", .{ shard_id, seg_entry.header.index, type_name });
-            },
-            .halt => |why| {
-                const type_name = std.enums.tagName(entry_mod.EntryType, @fromBackingInt(@intCast(seg_entry.header.entry_type))) orelse "unknown";
-                out.halt = Halt.init(&seg_entry, "entry {d} ({s}): {s} (a Flo bug)", .{ seg_entry.header.index, type_name, why });
-                continue;
-            },
-            .local => |damage| {
-                out.damage = damage;
-                return;
-            },
-        }
-        // A skip is exempt from the stamp check, so it may be stamped
-        // before the entry ahead of it; the applied stamp never goes back,
-        // as live.
-        out.last_stamp = @max(out.last_stamp, seg_entry.header.timestamp_ns);
-        out.applied_through = seg_entry.header.index;
+        // The restore, watermark, repair-skip, stamp-halt, apply and verdict
+        // decisions — the ones the simulator also drives.
+        replay.replayOneEntry(ctx, &seg_entry, out);
+        // A halt restores the rest of the log but applies nothing more, so the
+        // loop goes on; damage stops it.
+        if (out.damage != null) return;
     }
 }
 
