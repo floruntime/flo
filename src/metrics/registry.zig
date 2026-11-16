@@ -2,6 +2,7 @@ const std = @import("std");
 const silent_loss = @import("../node/silent_loss.zig");
 const Allocator = std.mem.Allocator;
 const Atomic = std.atomic.Value;
+const Reason = @import("../protocol/reason.zig").Reason;
 const StreamMetrics = @import("../stream/metrics.zig").Metrics;
 const MAX_SHARDS = @import("../config/server.zig").MAX_SHARDS;
 /// The lateness edges `flo_ts_late_points_total` labels, fixed: a shard's
@@ -291,16 +292,17 @@ pub const ProcessingMetrics = struct {
     records_processed_total: Atomic(u64) = Atomic(u64).init(0),
     /// Total records dropped (late data, rejected)
     records_dropped_total: Atomic(u64) = Atomic(u64).init(0),
-    /// Total checkpoints completed
-    checkpoints_completed_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Sink batches proposed: a pipeline's writes with the cursor they move it to.
+    sink_batches_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Records skipped because their writes don't fit one entry.
+    records_too_large_total: Atomic(u64) = Atomic(u64).init(0),
     /// Total processing errors
     errors_total: Atomic(u64) = Atomic(u64).init(0),
-    /// Pipeline ticks stopped because a sink's shard was full.
+    /// Pipeline ticks that waited for room: a busy sink shard, a whole
+    /// window of writes unacked, or a full log.
     ticks_held_total: Atomic(u64) = Atomic(u64).init(0),
-    /// Sink writes proposed and not yet applied, on every shard.
-    sink_pending: Atomic(u64) = Atomic(u64).init(0),
-    /// Sink writes refused for room at apply, their records read again.
-    sink_rewinds_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Pipelines waiting for a sink's namespace to be created, on every shard.
+    pipelines_waiting_namespace: Atomic(u64) = Atomic(u64).init(0),
 
     pub fn init() ProcessingMetrics {
         return .{};
@@ -337,8 +339,13 @@ pub const ProcessingMetrics = struct {
         _ = self.records_dropped_total.fetchAdd(1, .monotonic);
     }
 
-    pub fn recordCheckpoint(self: *ProcessingMetrics) void {
-        _ = self.checkpoints_completed_total.fetchAdd(1, .monotonic);
+    pub fn recordSinkBatch(self: *ProcessingMetrics) void {
+        _ = self.sink_batches_total.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordTooLarge(self: *ProcessingMetrics) void {
+        _ = self.records_too_large_total.fetchAdd(1, .monotonic);
+        _ = self.records_dropped_total.fetchAdd(1, .monotonic);
     }
 
     pub fn recordError(self: *ProcessingMetrics) void {
@@ -349,13 +356,9 @@ pub const ProcessingMetrics = struct {
         _ = self.ticks_held_total.fetchAdd(1, .monotonic);
     }
 
-    /// A shard's pending sink writes moved from `was` to `now`.
-    pub fn moveSinkPending(self: *ProcessingMetrics, was: usize, now: usize) void {
-        if (now > was) _ = self.sink_pending.fetchAdd(now - was, .monotonic) else _ = self.sink_pending.fetchSub(was - now, .monotonic);
-    }
-
-    pub fn recordSinkRewind(self: *ProcessingMetrics) void {
-        _ = self.sink_rewinds_total.fetchAdd(1, .monotonic);
+    /// A shard's pipelines waiting for a namespace moved from `was` to `now`.
+    pub fn moveWaitingNamespace(self: *ProcessingMetrics, was: usize, now: usize) void {
+        if (now > was) _ = self.pipelines_waiting_namespace.fetchAdd(now - was, .monotonic) else _ = self.pipelines_waiting_namespace.fetchSub(was - now, .monotonic);
     }
 
     pub const Snapshot = struct {
@@ -366,11 +369,11 @@ pub const ProcessingMetrics = struct {
         jobs_cancelled_total: u64,
         records_processed_total: u64,
         records_dropped_total: u64,
-        checkpoints_completed_total: u64,
+        sink_batches_total: u64,
+        records_too_large_total: u64,
         errors_total: u64,
         ticks_held_total: u64,
-        sink_pending: u64,
-        sink_rewinds_total: u64,
+        pipelines_waiting_namespace: u64,
     };
 
     pub fn snapshot(self: *const ProcessingMetrics) Snapshot {
@@ -382,11 +385,11 @@ pub const ProcessingMetrics = struct {
             .jobs_cancelled_total = self.jobs_cancelled_total.load(.monotonic),
             .records_processed_total = self.records_processed_total.load(.monotonic),
             .records_dropped_total = self.records_dropped_total.load(.monotonic),
-            .checkpoints_completed_total = self.checkpoints_completed_total.load(.monotonic),
+            .sink_batches_total = self.sink_batches_total.load(.monotonic),
+            .records_too_large_total = self.records_too_large_total.load(.monotonic),
             .errors_total = self.errors_total.load(.monotonic),
             .ticks_held_total = self.ticks_held_total.load(.monotonic),
-            .sink_pending = self.sink_pending.load(.monotonic),
-            .sink_rewinds_total = self.sink_rewinds_total.load(.monotonic),
+            .pipelines_waiting_namespace = self.pipelines_waiting_namespace.load(.monotonic),
         };
     }
 };
@@ -735,20 +738,18 @@ pub const ShardMetrics = struct {
     /// Snapshot bars passed without a snapshot by a leader still applying
     /// earlier terms (cumulative).
     snapshot_skipped_leader_not_ready: Atomic(u64) = Atomic(u64).init(0),
-    /// Processing KV sink writes from other shards waiting here for room
-    /// (gauge), and those dropped because that list was full (cumulative).
-    sink_retry_pending: Atomic(u64) = Atomic(u64).init(0),
-    sink_retry_bytes: Atomic(u64) = Atomic(u64).init(0),
     /// Time-series points the shard holds, and the store bytes they take.
     ts_points: Atomic(u64) = Atomic(u64).init(0),
     ts_point_bytes: Atomic(u64) = Atomic(u64).init(0),
     /// Time-series points this node applied behind their field's newest
     /// time, past each lateness edge, since it started.
     ts_late: [TS_LATE_EDGES.len]Atomic(u64) = @splat(Atomic(u64).init(0)),
-    sink_retry_overflow: Atomic(u64) = Atomic(u64).init(0),
     /// Channel messages refused here as their sender's bug, by reason
     /// (`contract.store.SenderBug`): wrong slot, bad payload.
     channel_sender_bugs: [2]Atomic(u64) = @splat(Atomic(u64).init(0)),
+    /// A sink's channel messages refused here for good by their target,
+    /// by reason, summed over the shards that sent them.
+    channel_sink_refusals: std.EnumArray(Reason, Atomic(u64)) = .initFill(Atomic(u64).init(0)),
     /// Channel messages parked here for a full target (gauges), the targets
     /// they wait on, and how long the longest-waiting target has waited.
     channel_parked_messages: Atomic(u64) = Atomic(u64).init(0),
@@ -954,13 +955,11 @@ pub const ShardMetrics = struct {
         persist_failures: u64,
         flushes_failing_for_ms: u64,
         snapshot_skipped_leader_not_ready: u64,
-        sink_retry_pending: u64,
-        sink_retry_bytes: u64,
         ts_points: u64,
         ts_point_bytes: u64,
         ts_late: [TS_LATE_EDGES.len]u64,
-        sink_retry_overflow: u64,
         channel_sender_bugs: [2]u64,
+        channel_sink_refusals: std.EnumArray(Reason, u64),
         channel_parked_messages: u64,
         channel_parked_bytes: u64,
         channel_parked_targets: u64,
@@ -1016,8 +1015,6 @@ pub const ShardMetrics = struct {
             .persist_failures = self.persist_failures.load(.monotonic),
             .flushes_failing_for_ms = self.flushes_failing_for_ms.load(.monotonic),
             .snapshot_skipped_leader_not_ready = self.snapshot_skipped_leader_not_ready.load(.monotonic),
-            .sink_retry_pending = self.sink_retry_pending.load(.monotonic),
-            .sink_retry_bytes = self.sink_retry_bytes.load(.monotonic),
             .ts_points = self.ts_points.load(.monotonic),
             .ts_point_bytes = self.ts_point_bytes.load(.monotonic),
             .ts_late = blk: {
@@ -1025,8 +1022,12 @@ pub const ShardMetrics = struct {
                 for (&v, &self.ts_late) |*o, *a| o.* = a.load(.monotonic);
                 break :blk v;
             },
-            .sink_retry_overflow = self.sink_retry_overflow.load(.monotonic),
             .channel_sender_bugs = .{ self.channel_sender_bugs[0].load(.monotonic), self.channel_sender_bugs[1].load(.monotonic) },
+            .channel_sink_refusals = blk: {
+                var r: std.EnumArray(Reason, u64) = .initFill(0);
+                for (std.enums.values(Reason)) |k| r.set(k, self.channel_sink_refusals.getPtrConst(k).load(.monotonic));
+                break :blk r;
+            },
             .channel_parked_messages = self.channel_parked_messages.load(.monotonic),
             .channel_parked_bytes = self.channel_parked_bytes.load(.monotonic),
             .channel_parked_targets = self.channel_parked_targets.load(.monotonic),
@@ -1761,23 +1762,23 @@ fn writeProcessingMetrics(writer: anytype, snapshot: ProcessingMetrics.Snapshot)
     try writer.print("# TYPE flo_processing_records_dropped_total counter\n", .{});
     try writer.print("flo_processing_records_dropped_total {d}\n", .{snapshot.records_dropped_total});
 
-    try writer.print("# HELP flo_processing_checkpoints_completed_total Total checkpoints completed\n", .{});
-    try writer.print("# TYPE flo_processing_checkpoints_completed_total counter\n", .{});
-    try writer.print("flo_processing_checkpoints_completed_total {d}\n", .{snapshot.checkpoints_completed_total});
+    try writer.print("# HELP flo_processing_sink_batches_total Sink batches proposed: a pipeline's writes with the cursor they move it to\n", .{});
+    try writer.print("# TYPE flo_processing_sink_batches_total counter\n", .{});
+    try writer.print("flo_processing_sink_batches_total {d}\n", .{snapshot.sink_batches_total});
+    try writer.print("# HELP flo_processing_records_too_large_total Records skipped because their sink writes don't fit one entry\n", .{});
+    try writer.print("# TYPE flo_processing_records_too_large_total counter\n", .{});
+    try writer.print("flo_processing_records_too_large_total {d}\n", .{snapshot.records_too_large_total});
 
     try writer.print("# HELP flo_processing_errors_total Total processing errors\n", .{});
     try writer.print("# TYPE flo_processing_errors_total counter\n", .{});
     try writer.print("flo_processing_errors_total {d}\n", .{snapshot.errors_total});
 
-    try writer.print("# HELP flo_processing_ticks_held_total Pipeline ticks stopped because a sink's shard was full\n", .{});
+    try writer.print("# HELP flo_processing_ticks_held_total Pipeline ticks that waited for room on a sink's shard or in the log\n", .{});
     try writer.print("# TYPE flo_processing_ticks_held_total counter\n", .{});
     try writer.print("flo_processing_ticks_held_total {d}\n", .{snapshot.ticks_held_total});
-    try writer.print("# HELP flo_processing_sink_pending Sink writes proposed and not yet applied\n", .{});
-    try writer.print("# TYPE flo_processing_sink_pending gauge\n", .{});
-    try writer.print("flo_processing_sink_pending {d}\n", .{snapshot.sink_pending});
-    try writer.print("# HELP flo_processing_sink_rewinds_total Sink writes refused for room at apply, their records read again\n", .{});
-    try writer.print("# TYPE flo_processing_sink_rewinds_total counter\n", .{});
-    try writer.print("flo_processing_sink_rewinds_total {d}\n", .{snapshot.sink_rewinds_total});
+    try writer.print("# HELP flo_processing_pipelines_waiting_namespace Pipelines waiting for a sink's namespace to be created\n", .{});
+    try writer.print("# TYPE flo_processing_pipelines_waiting_namespace gauge\n", .{});
+    try writer.print("flo_processing_pipelines_waiting_namespace {d}\n", .{snapshot.pipelines_waiting_namespace});
 }
 
 /// Write replication metrics in Prometheus format
@@ -1864,14 +1865,16 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_persist_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.persist_failures });
     try writer.print("flo_shard_flushes_failing_for_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.flushes_failing_for_ms / 1000, snap.flushes_failing_for_ms % 1000 });
     try writer.print("flo_shard_snapshot_skipped_total{{shard_id=\"{d}\",reason=\"leader_not_ready\"}} {d}\n", .{ snap.shard_id, snap.snapshot_skipped_leader_not_ready });
-    try writer.print("flo_shard_sink_retry_pending{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.sink_retry_pending });
-    try writer.print("flo_shard_sink_retry_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.sink_retry_bytes });
     try writer.print("flo_shard_ts_points{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.ts_points });
     try writer.print("flo_shard_ts_point_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.ts_point_bytes });
     for (TS_LATE_EDGES, snap.ts_late) |edge, n| try writer.print("flo_ts_late_points_total{{shard_id=\"{d}\",behind=\"{s}\"}} {d}\n", .{ snap.shard_id, edge, n });
-    try writer.print("flo_shard_sink_retry_overflow_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.sink_retry_overflow });
     try writer.print("flo_shard_channel_sender_bugs_total{{shard_id=\"{d}\",reason=\"wrong_slot\"}} {d}\n", .{ snap.shard_id, snap.channel_sender_bugs[0] });
     try writer.print("flo_shard_channel_sender_bugs_total{{shard_id=\"{d}\",reason=\"bad_payload\"}} {d}\n", .{ snap.shard_id, snap.channel_sender_bugs[1] });
+    // Only reasons seen: most targets refuse a sink's write for few.
+    for (std.enums.values(Reason)) |k| {
+        const n = snap.channel_sink_refusals.get(k);
+        if (n > 0) try writer.print("flo_shard_channel_sink_refusals_total{{shard_id=\"{d}\",reason=\"{s}\"}} {d}\n", .{ snap.shard_id, @tagName(k), n });
+    }
     try writer.print("flo_shard_channel_parked_messages{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.channel_parked_messages });
     try writer.print("flo_shard_channel_parked_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.channel_parked_bytes });
     try writer.print("flo_shard_channel_parked_targets{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.channel_parked_targets });

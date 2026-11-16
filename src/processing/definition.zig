@@ -424,6 +424,19 @@ pub const JobDefinition = struct {
         return null;
     }
 
+    /// Why this job can't run, written into `buf`, if a record it reads
+    /// could have more sink writes than one entry carries: a pipeline's
+    /// writes for a record go in one entry with its cursor, so such a record
+    /// could never be written. Each sink writes once per record; a TS sink
+    /// with a `fields` map, once per field. A record may match every sink.
+    pub fn sinkWritesRefusal(self: *const JobDefinition, buf: []u8) ?[]const u8 {
+        const max = @import("../contract/channels.zig").MAX_SENDS;
+        var writes: usize = 0;
+        for (self.sinks.items) |snk| writes += if (snk.kind == .ts and snk.ts_field_keys.len > 0) snk.ts_field_keys.len / 2 else 1;
+        if (writes <= max) return null;
+        return std.fmt.bufPrint(buf, "a record of this job could make {d} sink writes, past the {d} one record may make", .{ writes, max }) catch "a record of this job could make more sink writes than one record may make";
+    }
+
     /// Free all owned memory.
     pub fn deinit(self: *JobDefinition, allocator: Allocator) void {
         allocator.free(self.name);
@@ -556,4 +569,27 @@ test "JobDefinition: kv_lookup is refused on a server of more than one shard" {
     try std.testing.expect(with.shardRefusal(1) == null);
     try std.testing.expect(std.mem.indexOf(u8, with.shardRefusal(2).?, "--shards 1") != null);
     try std.testing.expect(without.shardRefusal(2) == null);
+}
+
+test "JobDefinition: a job whose record could make more sink writes than one entry carries is refused" {
+    const parser = @import("parser.zig");
+    const allocator = std.testing.allocator;
+    // One TS sink with a fields map of `n` fields, beside one stream sink.
+    const Job = struct {
+        fn of(buf: []u8, n: usize) ![]const u8 {
+            var w: std.Io.Writer = .fixed(buf);
+            try w.writeAll("{\"kind\":\"Processing\",\"sources\":[{\"stream\":{\"name\":\"in\"}}],\"sinks\":[{\"stream\":{\"name\":\"out\"}},{\"ts\":{\"measurement\":\"m\",\"fields\":{");
+            for (0..n) |i| try w.print("{s}\"f{d}\":\"v{d}\"", .{ if (i == 0) "" else ",", i, i });
+            try w.writeAll("}}}]}");
+            return w.buffered();
+        }
+    };
+    var buf: [4096]u8 = undefined;
+    var why: [256]u8 = undefined;
+    var fits = try parser.parseJobDefinition(allocator, try Job.of(&buf, 63), null);
+    defer fits.deinit(allocator);
+    try std.testing.expect(fits.sinkWritesRefusal(&why) == null);
+    var past = try parser.parseJobDefinition(allocator, try Job.of(&buf, 64), null);
+    defer past.deinit(allocator);
+    try std.testing.expectEqualStrings("a record of this job could make 65 sink writes, past the 64 one record may make", past.sinkWritesRefusal(&why).?);
 }

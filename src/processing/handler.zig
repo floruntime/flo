@@ -59,7 +59,15 @@ const Flags = entry_mod.Flags;
 
 const native_registry = @import("operators/native_registry.zig");
 const kv_lookup_mod = @import("operators/kv_lookup.zig");
-const SinkWrite = @import("sink_write.zig").SinkWrite;
+const sink_payload = @import("sink_payload.zig");
+const sinks_machine = @import("sinks_machine.zig");
+const pe = @import("../protocol/processing_entries.zig");
+const ce = @import("../protocol/channel_entries.zig");
+const schema = @import("../protocol/schema.zig");
+const limits = @import("../protocol/limits.zig");
+const view_mod = @import("../contract/view.zig");
+const channels_mod = @import("../contract/channels.zig");
+const channel_driver = @import("../contract/channel_driver.zig");
 const source_page = @import("source_page.zig");
 const TsPoint = source_page.TsPoint;
 const ReadAt = ts_mod.TSProjection.ReadAt;
@@ -93,24 +101,11 @@ pub const ProcessingHandler = struct {
     /// In-memory job store: job_id → JobRecord.
     jobs: std.StringHashMap(JobRecord),
     sink_drops: u64 = 0,
-    /// Sink writes proposed on this shard and not yet applied, every pipeline's.
-    pending_sinks: usize = 0,
-    /// Where the pending gauge is kept: a pipeline dropped with writes
-    /// pending, off any tick, takes them off it there.
-    pending_metrics: ?*MetricsRegistry = null,
-    /// The term every pending write was proposed in.
-    pending_term: u64 = 0,
-    /// Sink writes refused for room at apply, whose records were read again.
-    sink_rewinds: u64 = 0,
     sink_warn_ms: i64 = 0,
     chain_errors: u64 = 0,
     chain_warn_ms: i64 = 0,
     /// The job whose pipeline is ticking, so a drop or chain error names it.
     ticking_job: []const u8 = "",
-    /// A sink write in this tick was refused because the shard can take no
-    /// more writes for now: the pipeline stops and keeps its cursor, and the
-    /// next tick reads the batch again (at-least-once), so nothing is dropped.
-    sink_overloaded: bool = false,
     /// When a held pipeline was last said to be waiting (`noteHeld`).
     held_warn_ms: i64 = 0,
 
@@ -127,10 +122,16 @@ pub const ProcessingHandler = struct {
     /// The shard this handler runs on.
     own_shard: u16 = 0,
 
-    /// Sink enqueues proposed on this shard and not yet applied, from its
-    /// own pipelines and other shards': what a queue's caps must still
-    /// leave room for (`queueFits`).
-    sink_enqueues: std.ArrayListUnmanaged(SinkEnqueue) = .empty,
+    /// The sink batch a page is building, and the buffers it and its
+    /// entry are built in, allocated at the first batch.
+    batch: Batch = .{ .w = .{ .buf = &.{} } },
+    batch_buf: []u8 = &.{},
+    entry_buf: []u8 = &.{},
+    msg_buf: []u8 = &.{},
+    /// Records skipped because their writes don't fit one entry.
+    too_large: u64 = 0,
+    /// Pipelines here waiting for a sink's namespace, as last counted.
+    waiting_ns: usize = 0,
 
     /// Most jobs a server holds. Every held job counts, stopped or not: each
     /// keeps its definition, up to 256 KiB, until `processing.remove` drops
@@ -166,23 +167,6 @@ pub const ProcessingHandler = struct {
     };
 
     /// Per-job pipeline state: source/sink config + read cursor + operator chain.
-    /// Where a pipeline reads again from: past this stream id, or from this
-    /// time on.
-    pub const Resume = union(enum) { stream: StreamID, ts: ReadAt };
-
-    /// A sink write proposed and not yet applied.
-    pub const PendingSink = struct {
-        term: u64,
-        index: u64,
-        /// Where its record is read again from, should it be refused for room.
-        again: Resume,
-        kind: SinkKind,
-        /// The sink's target, as its `SinkConfig` holds it.
-        target: []const u8,
-    };
-
-    const SinkEnqueue = struct { index: u64, ns: NamespaceId, name: u64, held: u64 };
-
     pub const PipelineState = struct {
         // Source configuration
         source_kind: SourceKind,
@@ -213,13 +197,6 @@ pub const ProcessingHandler = struct {
         stream_cursor_seq: u64, // Stream source: last StreamID sequence read
         last_poll_ms: i64, // last time this pipeline was ticked
 
-        // Durable-cursor checkpointing: the last cursor persisted via a
-        // processing_checkpoint UAL entry, plus when. Debounces persistence so a
-        // continuously-fed pipeline doesn't emit a Raft write per poll.
-        persisted_cursor_ts: u64 = 0,
-        persisted_cursor_seq: u64 = 0,
-        last_persist_ms: i64 = 0,
-
         // Operator chain — instantiated from job definition
         operators: []Operator = &.{},
         operator_backings: []native_registry.CreateResult = &.{},
@@ -237,22 +214,23 @@ pub const ProcessingHandler = struct {
         last_read_count: u32 = 0,
         /// Highest event-time watermark observed (0 = none / processing-time source).
         watermark_ms: i64 = 0,
-        /// When its ticks began stopping for room in a sink's shard, or a
-        /// sink write was refused for room at apply; 0 while they go through.
+        /// When its ticks began waiting for room; 0 while they go through.
         held_since_ms: i64 = 0,
-        /// Where the record whose sinks are being written is read again from.
-        resume_here: Resume = .{ .ts = .{ .ns = 0, .ual = 0 } },
+        /// Why it last couldn't read (`waitOf`).
+        wait: Wait = .none,
+        /// Its cursor as its last applied batch left it: the `from` of its
+        /// next batch. The batch it proposed and hasn't seen apply, by
+        /// index and term (index 0: none), and when it last proposed one.
+        from: sinks_machine.At = .{},
+        batch_index: u64 = 0,
+        batch_term: u64 = 0,
+        last_batch_ms: i64 = 0,
         /// A read of a source another shard owns, in flight: its number
         /// (0 for none), the term it was asked in, and when.
         read_seq: u64 = 0,
         read_term: u64 = 0,
         read_sent_ms: i64 = 0,
         next_read_seq: u64 = 0,
-        /// The sink writes this leader proposed on this shard that haven't
-        /// applied: one refused at apply is read again or counted, never lost
-        /// in silence. Each is a log entry not yet applied, so the log's cap
-        /// on those (`sinkRoom`) bounds the list.
-        pending: std.ArrayListUnmanaged(PendingSink) = .empty,
         /// Per-tick processing time (ns) over productive ticks: last/max/sum/count.
         tick_ns_last: u64 = 0,
         tick_ns_max: u64 = 0,
@@ -329,11 +307,12 @@ pub const ProcessingHandler = struct {
         /// persisted: replay recomputes it.
         held: bool = false,
         held_owned: []const u8 = "",
-        /// Each source's last saved cursor, kept with the job so one without
-        /// a pipeline (stopped, or failed to rebuild) doesn't lose it.
-        cursors: std.ArrayListUnmanaged(Cursor) = .empty,
-
-        pub const Cursor = struct { source: u32, a: u64, b: u64 };
+        /// Records this leader skipped for good, and the last one's place
+        /// and reason, for its status. Not replicated: a new leader starts
+        /// them again.
+        drops: u64 = 0,
+        last_drop: [160]u8 = undefined,
+        last_drop_len: usize = 0,
     };
 
     /// The most of a failure reason a job keeps.
@@ -364,7 +343,7 @@ pub const ProcessingHandler = struct {
             self.freeJobRecord(entry.value_ptr);
         }
         self.jobs.deinit();
-        self.sink_enqueues.deinit(self.allocator);
+        for ([_][]u8{ self.batch_buf, self.entry_buf, self.msg_buf }) |b| if (b.len > 0) self.allocator.free(b);
     }
 
     /// Shard that owns `key` in `namespace`, by the router the dispatchers use
@@ -384,31 +363,12 @@ pub const ProcessingHandler = struct {
         return t.lookup(name) orelse .invalid;
     }
 
-    /// Whether `pipe` may write now. Every sink routes by its namespace's
-    /// published id: before shard 0 publishes it, a sink can't tell which
-    /// shard owns its target, so the pipeline reads nothing and waits,
-    /// its cursor where it was.
-    fn sinksReady(self: *const ProcessingHandler, shard: *Shard, pipe: *const PipelineState) bool {
-        var ready = true;
-        for (pipe.sinks) |snk| {
-            if (self.namespaceIdOf(snk.namespace) != .invalid) continue;
-            // A namespace this shard refuses for good takes no write; its
-            // records are dropped and counted as they come. One only shard
-            // 0 can publish is waited for.
-            if (shard.namespace_handler.admission(snk.namespace)) |r| if (r.status != .unavailable) continue;
-            shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
-            ready = false;
-        }
-        return ready;
-    }
-
     fn freeJobRecord(self: *ProcessingHandler, job: *JobRecord) void {
         self.allocator.free(job.job_id_owned);
         self.allocator.free(job.name_owned);
         self.allocator.free(job.yaml_owned);
         if (job.failure_owned.len > 0) self.allocator.free(job.failure_owned);
         self.freeHeldReason(job);
-        job.cursors.deinit(self.allocator);
     }
 
     fn setStatus(self: *ProcessingHandler, job: *JobRecord, status: JobStatus) void {
@@ -466,10 +426,6 @@ pub const ProcessingHandler = struct {
     }
 
     fn freePipelineState(self: *ProcessingHandler, pipe: *PipelineState) void {
-        const was = self.pending_sinks;
-        self.pending_sinks -|= pipe.pending.items.len;
-        if (self.pending_metrics) |m| m.processing.moveSinkPending(was, self.pending_sinks);
-        pipe.pending.deinit(self.allocator);
         // Free operator chain
         for (pipe.operator_backings) |*backing| {
             backing.deinit(self.allocator);
@@ -649,6 +605,10 @@ pub const ProcessingHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
             return;
         }
+        if (def.sinkWritesRefusal(&why_buf)) |why| {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+            return;
+        }
         if (self.operatorRefusal(&def)) |refused| switch (refused) {
             .invalid => |name| {
                 var buf: [192]u8 = undefined;
@@ -756,7 +716,11 @@ pub const ProcessingHandler = struct {
             // [yaml_len:u32][yaml], the submitted definition.
             // Sized to the job. The id is 32 bytes and the name came from a
             // submit entry under 64 KiB, so both lengths fit u16.
-            const note = noteOf(job);
+            var live_buf: [LIVE_NOTE_MAX]u8 = undefined;
+            const note: Note = switch (noteOf(job)) {
+                .none => if (self.liveNote(job, &live_buf)) |t| .{ .live = t } else .none,
+                else => |n| n,
+            };
             const runtime = self.runtimeOf(job.job_id_owned, @import("stdx").time.milliTimestamp());
             const size = 2 + job.job_id_owned.len + 2 + job.name_owned.len + 1 + 4 + 8 + 8 + 2 + note.reasonLen() + Runtime.SIZE + 4 + job.yaml_owned.len;
             const buf = self.allocator.alloc(u8, size) catch {
@@ -920,23 +884,50 @@ pub const ProcessingHandler = struct {
         return .none;
     }
 
+    const LIVE_NOTE_MAX = 512;
+
+    /// What a running job's pipelines here are waiting for, and the last
+    /// record skipped for good, if any: "waiting for namespace X",
+    /// "waiting for room on shard N (queue Q)"; "N records dropped, the
+    /// last <where>: <why>".
+    pub fn liveNote(self: *const ProcessingHandler, job: *const JobRecord, buf: []u8) ?[]const u8 {
+        if (job.status != .running) return null;
+        var w: std.Io.Writer = .fixed(buf);
+        var it = self.pipelines.iterator();
+        while (it.next()) |e| {
+            const key = e.key_ptr.*;
+            const base = if (std.mem.indexOfScalar(u8, key, 0)) |nul| key[0..nul] else key;
+            if (!std.mem.eql(u8, base, job.job_id_owned) or e.value_ptr.wait == .none) continue;
+            var wb: [160]u8 = undefined;
+            w.writeAll(waitText(e.value_ptr.wait, &wb)) catch {};
+            break;
+        }
+        if (job.drops > 0) {
+            if (w.end > 0) w.writeAll("; ") catch {};
+            w.print("{d} records dropped, the last {s}", .{ job.drops, job.last_drop[0..job.last_drop_len] }) catch {};
+        }
+        return if (w.end == 0) null else w.buffered();
+    }
+
     const Note = union(enum) {
         none,
         failed: []const u8,
         held: []const u8,
+        /// A running job's pipelines here, as `liveNote` says them.
+        live: []const u8,
 
         /// The status answer's reason: as it is, or "held here: <why>".
         fn reasonLen(n: Note) usize {
             return switch (n) {
                 .none => 0,
-                .failed => |r| r.len,
+                .failed, .live => |r| r.len,
                 .held => |r| HELD.len + r.len,
             };
         }
         fn writeReason(n: Note, w: *std.Io.Writer) void {
             switch (n) {
                 .none => {},
-                .failed => |r| w.writeAll(r) catch unreachable,
+                .failed, .live => |r| w.writeAll(r) catch unreachable,
                 .held => |r| {
                     w.writeAll(HELD) catch unreachable;
                     w.writeAll(r) catch unreachable;
@@ -952,7 +943,7 @@ pub const ProcessingHandler = struct {
         const note = noteOf(job);
         return job.status.toString().len + switch (note) {
             .none => 0,
-            .failed => |r| 2 + r.len,
+            .failed, .live => |r| 2 + r.len,
             .held => 2 + note.reasonLen() + 1,
         };
     }
@@ -962,7 +953,7 @@ pub const ProcessingHandler = struct {
         const note = noteOf(job);
         switch (note) {
             .none => {},
-            .failed => |r| {
+            .failed, .live => |r| {
                 w.writeAll(": ") catch unreachable;
                 w.writeAll(r) catch unreachable;
             },
@@ -1026,7 +1017,6 @@ pub const ProcessingHandler = struct {
         registry.register(.processing_submit, @ptrCast(self), replayEntryThunk);
         registry.register(.processing_stop, @ptrCast(self), replayEntryThunk);
         registry.register(.processing_cancel, @ptrCast(self), replayEntryThunk);
-        registry.register(.processing_checkpoint, @ptrCast(self), replayEntryThunk);
         registry.register(.processing_remove, @ptrCast(self), replayEntryThunk);
     }
 
@@ -1047,7 +1037,6 @@ pub const ProcessingHandler = struct {
             .processing_stop => self.replayStatusChange(cmd.key, .stopped, out),
             .processing_cancel => self.replayStatusChange(cmd.key, .cancelled, out),
             .processing_remove => self.replayRemove(cmd.key, cmd.namespace_id, out),
-            .processing_checkpoint => self.replayCheckpoint(cmd.key, cmd.value),
             else => error.Halt,
         };
     }
@@ -1088,8 +1077,9 @@ pub const ProcessingHandler = struct {
         // endpoints and lookups that name none resolve alike on every replica
         // and restart. `def` stays alive for createPipeline, which deep-copies
         // what it keeps. A stored job that no longer parses, or that the
-        // server now refuses, is kept as failed with its definition and
-        // cursors; only running out of memory here drops it.
+        // server now refuses, is kept as failed with its definition; only
+        // running out of memory here drops it. Its pipelines' cursors are
+        // the sinks machine's, untouched by any of this.
         var diag: parser.Diagnostic = .{};
         var why_buf: [256]u8 = undefined;
         var failure: ?[]const u8 = null;
@@ -1115,14 +1105,11 @@ pub const ProcessingHandler = struct {
             return error.OutOfMemory;
         };
 
-        // Replace an existing record (idempotent replay), keeping its cursors.
-        var cursors: std.ArrayListUnmanaged(JobRecord.Cursor) = .empty;
+        // Replace an existing record (idempotent replay).
         if (self.jobs.fetchRemove(owned_id)) |old| {
             var rec = old.value;
             if (rec.status == .failed) self.failed_jobs -= 1;
             if (rec.held) self.held_jobs -= 1;
-            cursors = rec.cursors;
-            rec.cursors = .empty;
             self.freeJobRecord(&rec);
         }
 
@@ -1135,12 +1122,10 @@ pub const ProcessingHandler = struct {
             .yaml_owned = owned_yaml,
             .created_at_ms = created_at_ms,
             .records_processed = 0,
-            .cursors = cursors,
         }) catch {
             self.allocator.free(owned_id);
             self.allocator.free(name);
             self.allocator.free(owned_yaml);
-            cursors.deinit(self.allocator);
             return error.OutOfMemory;
         };
         if (status == .failed) self.failed_jobs += 1;
@@ -1154,9 +1139,8 @@ pub const ProcessingHandler = struct {
 
         // Rebuild the execution pipeline so a RUNNING job resumes consuming
         // after restart instead of just reappearing in the registry.
-        // Guard against a double build on idempotent replay. Its cursors
-        // come from the record, and from replayCheckpoint for checkpoints
-        // after this submit in log order.
+        // Guard against a double build on idempotent replay. Each pipeline
+        // reads from its cursor as the sinks machine holds it.
         if (status == .running and self.pipelines.getPtr(owned_id) == null) {
             if (self.startPipelines(owned_id, &parsed.?, &why_buf)) |refused| switch (refused) {
                 .failed => |why| self.failJob(job, why),
@@ -1201,52 +1185,6 @@ pub const ProcessingHandler = struct {
         var removed = self.jobs.fetchRemove(key).?;
         if (removed.value.status == .failed) self.failed_jobs -= 1;
         self.freeJobRecord(&removed.value);
-    }
-
-    /// Replay a processing_checkpoint entry: advance the pipeline's source
-    /// cursor, if it has one, and the cursor its job keeps, so it resumes
-    /// where it left off instead of from the start.
-    /// Key = pipeline_key (job_id, or job_id\0idx); value = [a:u64 LE][b:u64 LE].
-    fn replayCheckpoint(self: *ProcessingHandler, key: []const u8, value: []const u8) persistence_mod.ApplyError!void {
-        if (value.len < 16) return error.Halt;
-        const a = std.mem.readInt(u64, value[0..8], .little);
-        const b = std.mem.readInt(u64, value[8..16], .little);
-        // A pipeline stopped since its checkpoint was proposed has no
-        // cursor left to move.
-        if (self.pipelines.getPtr(key)) |pipe| {
-            applyCursor(pipe, a, b);
-            pipe.persisted_cursor_ts = a;
-            pipe.persisted_cursor_seq = b;
-        }
-        // The job keeps it too, for a pipeline built later.
-        const sep = std.mem.indexOfScalar(u8, key, 0);
-        const job = self.jobs.getPtr(key[0 .. sep orelse key.len]) orelse return;
-        const source: u32 = if (sep) |i| std.fmt.parseInt(u32, key[i + 1 ..], 10) catch return else 0;
-        for (job.cursors.items) |*c| {
-            if (c.source != source) continue;
-            if (a > c.a or (a == c.a and b > c.b)) {
-                c.a = a;
-                c.b = b;
-            }
-            return;
-        }
-        try job.cursors.append(self.allocator, .{ .source = source, .a = a, .b = b });
-    }
-
-    /// Move a pipeline's read cursor to `(a, b)`, forward only: this is also
-    /// the live applier, and a leader may have read further by the time its
-    /// checkpoint commits. `(a, b)` is a stream source's (timestamp,
-    /// sequence), or a TS source's last point's (time, position).
-    fn applyCursor(pipe: *PipelineState, a: u64, b: u64) void {
-        switch (pipe.source_kind) {
-            .stream => if (a > pipe.stream_cursor_ts or (a == pipe.stream_cursor_ts and b > pipe.stream_cursor_seq)) {
-                pipe.stream_cursor_ts = a;
-                pipe.stream_cursor_seq = b;
-            },
-            .ts => if (pipe.ts_cursor.before(.{ .ns = a, .ual = b })) {
-                pipe.ts_cursor = .{ .ns = a, .ual = b };
-            },
-        }
     }
 
     // ── Pipeline Execution ──────────────────────────────────────────────
@@ -1310,17 +1248,6 @@ pub const ProcessingHandler = struct {
             }
         }
 
-        // Pick up where the job's kept cursors say.
-        const job = self.jobs.getPtr(job_id) orelse return null;
-        var it = self.pipelines.iterator();
-        while (it.next()) |e| {
-            const source = pipelineSource(e.key_ptr.*, job_id) orelse continue;
-            for (job.cursors.items) |c| if (c.source == source) {
-                applyCursor(e.value_ptr, c.a, c.b);
-                e.value_ptr.persisted_cursor_ts = c.a;
-                e.value_ptr.persisted_cursor_seq = c.b;
-            };
-        }
         return null;
     }
 
@@ -1546,7 +1473,8 @@ pub const ProcessingHandler = struct {
 
     /// Whether one of `pipe`'s sinks writes to a halted shard. Then the
     /// pipeline reads nothing, so its cursor stays at the first record
-    /// not written. Writes already on their way are dropped and counted.
+    /// not written. Writes already sent wait in its outbox until the
+    /// halted shard is repaired.
     fn sinksHeld(self: *const ProcessingHandler, shard: *const Shard, pipe: *const PipelineState) bool {
         for (pipe.sinks) |snk| {
             if (self.sinkShard(snk)) |to| {
@@ -1556,12 +1484,87 @@ pub const ProcessingHandler = struct {
         return false;
     }
 
-    /// Drive all running pipelines: poll sources, push to sinks. Returns
-    /// whether one was held for a halted sink shard.
+    /// Why a pipeline reads nothing now, as its job's status says it.
+    pub const Wait = union(enum) {
+        none,
+        /// A sink's namespace isn't in the node's table: no shard can tell
+        /// where its targets are. Sinks don't create namespaces.
+        namespace: []const u8,
+        /// A sink's shard is halted.
+        halted,
+        /// A sink's shard answers `busy` (a target there is over its
+        /// parked cap), or a whole window of this shard's writes to it is
+        /// unacked. `target` is the sink whose write waits, when the first
+        /// unacked message is one of this pipeline's; "" otherwise.
+        room: struct { shard: u16, target: []const u8, since_ms: u64 },
+        /// This shard's log has no room for another entry now.
+        log,
+    };
+
+    /// Why `pipe` can't read now, or `.none`. A sink batch commits all its
+    /// writes or none, so a pipeline waits whole: one full target delays
+    /// every sink of the job, and every job sending to that shard, until it
+    /// has room. Below its parked cap a full target parks what it can't
+    /// take, so this waits only past it.
+    fn waitOf(self: *const ProcessingHandler, shard: *Shard, pipe: *const PipelineState) Wait {
+        for (pipe.sinks) |snk| if (self.namespaceIdOf(snk.namespace) == .invalid) return .{ .namespace = snk.namespace };
+        if (self.sinksHeld(shard, pipe)) return .halted;
+        const read: view_mod.ReadView = .{ .store = &shard.defaultPartition().store };
+        var to: u16 = 0;
+        const shards: u16 = @max(self.peer_shard_count, 1);
+        while (to < shards) : (to += 1) {
+            if (!self.sendsTo(pipe, to)) continue;
+            const meta = channels_mod.metaOf(read, to);
+            const unacked = meta.next_seq - 1 - meta.acked;
+            // A `busy` answer holds only while something to it is unacked:
+            // one with nothing outstanding has nothing to clear it.
+            const busy = if (unacked > 0) shard.channel.busySince(to) else null;
+            // The outbox has no cap of its own yet: a pipeline stops adding
+            // to a channel a whole window behind.
+            if (busy == null and unacked < channel_driver.WINDOW) continue;
+            return .{ .room = .{ .shard = to, .target = self.waitingSink(read, pipe, to, meta.acked + 1), .since_ms = busy orelse 0 } };
+        }
+        const raft = shard.raft_node;
+        if (raft.log.lastIndex() -| raft.last_applied >= raft_node_mod.MAX_OUTSTANDING) return .log;
+        return .none;
+    }
+
+    /// Whether one of `pipe`'s sinks may write to shard `to`.
+    fn sendsTo(self: *const ProcessingHandler, pipe: *const PipelineState, to: u16) bool {
+        for (pipe.sinks) |snk| {
+            const s = self.sinkShard(snk) orelse return true;
+            if (s == to) return true;
+        }
+        return false;
+    }
+
+    /// The sink of `pipe` the message at `seq` to `to` is for, by its
+    /// slot, or "": a KV sink's keys are many, and the message may be
+    /// another job's.
+    fn waitingSink(self: *const ProcessingHandler, read: view_mod.ReadView, pipe: *const PipelineState, to: u16, seq: u64) []const u8 {
+        var kb: [channels_mod.OUT_KEY]u8 = undefined;
+        const out = (read.get(channels_mod.OutFam, channels_mod.outKey(&kb, to, seq)) catch null) orelse return "";
+        for (pipe.sinks) |snk| {
+            const name = if (snk.kind == .ts) snk.measurement else snk.target;
+            if (snk.kind == .kv) continue;
+            const slot = router.slot(router.routeNsKey(self.namespaceIdOf(snk.namespace), name));
+            if (slot == out.v.slot) return name;
+        }
+        return "";
+    }
+
+    /// Drive all running pipelines this node leads: each reads a page from
+    /// its source's cursor, runs it through its operators, and proposes the
+    /// records' sink writes with the cursor they move it to, one batch at a
+    /// time. Returns whether one was held for a halted sink shard.
     /// Called from Shard.tick() on each reactor iteration.
     pub fn tickPipelines(self: *ProcessingHandler, shard: *Shard) bool {
         var held = false;
         const now_ms = @import("stdx").time.milliTimestamp();
+        const raft = shard.raft_node;
+        const leads = raft.role == .leader and raft.leaderReady();
+        var waiting_ns: usize = 0;
+        defer self.noteWaitingNamespace(shard, waiting_ns);
 
         var it = self.pipelines.iterator();
         while (it.next()) |entry| {
@@ -1577,15 +1580,31 @@ pub const ProcessingHandler = struct {
             // Only run for RUNNING jobs
             const job = self.jobs.getPtr(base_job_id) orelse continue;
             if (job.status != .running or job.held) continue;
+            if (!leads) continue;
 
             // Enforce poll interval
             const poll_ms: i64 = @intCast(pipe.src_poll_ms);
             if (now_ms - pipe.last_poll_ms < poll_ms) continue;
-            if (!self.sinksReady(shard, pipe)) continue;
-            if (self.sinksHeld(shard, pipe)) {
-                held = true;
-                continue;
+            // Its batch in the log: nothing more until it applies.
+            if (pipe.batch_term == raft.current_term and pipe.batch_index > raft.last_applied) continue;
+            self.loadCursor(shard, job.ns_id, pipeline_key, pipe);
+            pipe.wait = self.waitOf(shard, pipe);
+            switch (pipe.wait) {
+                .none => {},
+                .namespace => {
+                    waiting_ns += 1;
+                    continue;
+                },
+                .halted => {
+                    held = true;
+                    continue;
+                },
+                else => {
+                    self.noteHeld(shard, pipe);
+                    continue;
+                },
             }
+            pipe.held_since_ms = 0;
             pipe.last_poll_ms = now_ms;
 
             // Time the tick, but only record latency/throughput for *productive*
@@ -1613,6 +1632,30 @@ pub const ProcessingHandler = struct {
         return held;
     }
 
+    /// Pipelines here waiting for a sink's namespace, into the node's gauge.
+    fn noteWaitingNamespace(self: *ProcessingHandler, shard: *Shard, now: usize) void {
+        if (now == self.waiting_ns) return;
+        if (shard.metrics_registry) |m| m.processing.moveWaitingNamespace(self.waiting_ns, now);
+        self.waiting_ns = now;
+    }
+
+    /// The pipeline's cursor as its last applied batch left it: where it
+    /// reads from, and the `from` its next batch names. A batch a leader
+    /// change lost, or one that applied, is behind it either way.
+    fn loadCursor(self: *ProcessingHandler, shard: *Shard, ns: NamespaceId, pipeline_key: []const u8, pipe: *PipelineState) void {
+        _ = self;
+        const at = sinks_machine.cursorOf(.{ .store = &shard.defaultPartition().store }, ns, pipeline_key);
+        pipe.from = at;
+        pipe.batch_index = 0;
+        switch (pipe.source_kind) {
+            .stream => {
+                pipe.stream_cursor_ts = at.a;
+                pipe.stream_cursor_seq = at.b;
+            },
+            .ts => pipe.ts_cursor = .{ .ns = at.a, .ual = at.b },
+        }
+    }
+
     /// The latest time a TS source's read reaches, on the shard holding
     /// its field: `behind` short of the field's newest point, or every
     /// point when `behind` is 0 or the field has no series.
@@ -1626,11 +1669,7 @@ pub const ProcessingHandler = struct {
     /// It reads in time order, so a point written with a time behind its
     /// cursor (late, or from a writer whose clock lags) is never read.
     fn tickTsSource(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
-        const room = sinkRoom(shard, pipe);
-        // Room for none: the source waits, its cursor where it is. So it
-        // does while a batch of its writes is still to apply.
-        if (room == 0 or pipe.pending.items.len >= pipe.batch_size) return;
-        const limit = @min(room, source_page.TS_PAGE_POINTS);
+        const limit = @min(pipe.batch_size, source_page.TS_PAGE_POINTS);
         const owner = self.sinkOwner(shard, pipe.src_namespace, pipe.src_measurement);
         if (owner != shard.id) return self.askSource(pipeline_key, pipe, shard, owner, limit);
         var points: [source_page.TS_PAGE_POINTS]TsPoint = undefined;
@@ -1643,25 +1682,21 @@ pub const ProcessingHandler = struct {
     }
 
     /// A page of a TS source, read here or sent by the shard that owns it,
-    /// in (time, position) order after the cursor.
+    /// in (time, position) order after the cursor. Its points' writes go in
+    /// one batch, as many whole points as fit.
     fn processTsPage(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord, points: []const TsPoint) void {
-        if (points.len == 0) return maybePersistCheckpoint(pipeline_key, pipe, shard, job.ns_id);
-        const cursor = pipe.ts_cursor;
-        self.sink_overloaded = false;
-
+        const batch = self.beginBatch() orelse return;
         // One point at a time: its JSON and what its chain allocates are
         // freed once its outputs are written.
         var arena = std.heap.ArenaAllocator.init(shard.allocator);
         defer arena.deinit();
-        for (points, 0..) |pt, i| {
+        for (points) |pt| {
             defer _ = arena.reset(.retain_capacity);
-            // Format TS point as JSON record. Short of memory, the tick
+            // Format TS point as JSON record. Short of memory, the batch
             // stops here, the point still ahead of the cursor.
             const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
             const json = tsPointJson(arena.allocator(), pipe.src_measurement, pt.value, ts_ms) catch break;
-            const before: ReadAt = if (i > 0) .{ .ns = points[i - 1].timestamp_ns, .ual = points[i - 1].ual } else cursor;
-            pipe.resume_here = .{ .ts = before };
-
+            batch.beginRecord();
             // Apply operator chain (or pass through directly). A record
             // the chain failed on is counted and skipped: passing it through
             // raw would write what the operators were there to change.
@@ -1669,114 +1704,73 @@ pub const ProcessingHandler = struct {
                 self.noteChainError(shard, err);
                 break :blk @as(?[]const ProcessingRecord, &.{});
             };
-
             if (output_records) |records| {
-                for (records) |rec| {
-                    self.writeSinkRecord(pipe, shard, rec.value, pt.value, pt.timestamp_ns, pt.tags, rec.tags);
-                }
+                for (records) |rec| self.writeSinkRecord(batch, pipe, shard, arena.allocator(), rec.value, pt.value, pt.timestamp_ns, pt.tags, rec.tags);
             } else {
-                // No operators — direct passthrough
-                self.writeSinkRecord(pipe, shard, json, pt.value, pt.timestamp_ns, pt.tags, 0);
+                self.writeSinkRecord(batch, pipe, shard, arena.allocator(), json, pt.value, pt.timestamp_ns, pt.tags, 0);
             }
-
-            // A sink found its shard full: the next tick reads again from
-            // this point, every sink of those before it written.
-            if (self.sink_overloaded) {
-                self.sink_overloaded = false;
-                pipe.ts_cursor = before;
-                self.noteHeld(shard, pipe);
-                return;
-            }
-
+            var pb: [48]u8 = undefined;
+            if (!self.endRecord(batch, shard, std.fmt.bufPrint(&pb, "point {d}/{d}", .{ pt.timestamp_ns, pt.ual }) catch "a point")) break;
             pipe.ts_cursor = .{ .ns = pt.timestamp_ns, .ual = pt.ual };
             // Event-time watermark = highest source point timestamp seen.
             if (ts_ms > pipe.watermark_ms) pipe.watermark_ms = ts_ms;
-
             job.records_processed += 1;
             pipe.records_in += 1;
         }
-        // Still held while a write it proposed may be refused for room.
-        if (pipe.pending.items.len == 0) pipe.held_since_ms = 0;
-        // As a stream source does: a restart resumes here, not from the
-        // measurement's first point.
-        maybePersistCheckpoint(pipeline_key, pipe, shard, job.ns_id);
+        self.proposeBatch(shard, job.ns_id, pipeline_key, pipe, batch, .{ .a = pipe.ts_cursor.ns, .b = pipe.ts_cursor.ual });
     }
 
     /// Tick a stream source pipeline: read payloads from stream, apply operators, write to sink.
     fn tickStreamSource(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
-        // As many as this shard can write out now; with room for none the
-        // source waits, its cursor where it is.
-        const room = sinkRoom(shard, pipe);
-        if (room == 0 or pipe.pending.items.len >= pipe.batch_size) return;
-        const limit = @min(pipe.batch_size, room);
+        const limit = @min(pipe.batch_size, channels_mod.MAX_SENDS);
         const owner = self.sinkOwner(shard, pipe.src_namespace, pipe.src_stream);
         if (owner != shard.id) return self.askSource(pipeline_key, pipe, shard, owner, limit);
         const cursor = StreamID{ .timestamp_ms = pipe.stream_cursor_ts, .sequence = pipe.stream_cursor_seq };
         const result = shard.stream_handler.readPayloadsForStream(pipe.src_stream, pipe.src_namespace, cursor, limit);
         defer result.deinit(shard.stream_handler.allocator);
-        self.processStreamPage(pipeline_key, pipe, shard, job, cursor, result.payloads, result.ids, result.last_id);
+        self.processStreamPage(pipeline_key, pipe, shard, job, result.payloads, result.ids, result.last_id);
     }
 
-    /// A page of a stream source read from `cursor`, here or sent by the
-    /// shard that owns it: `last_id` is where the read reached.
-    fn processStreamPage(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord, cursor: StreamID, payloads: []const []const u8, ids: []const StreamID, last_id: StreamID) void {
-        self.sink_overloaded = false;
-        if (payloads.len == 0) {
-            // Appends that couldn't be read still move the cursor past them
-            // (the stream handler logged them), so the source doesn't stall.
-            pipe.stream_cursor_ts = last_id.timestamp_ms;
-            pipe.stream_cursor_seq = last_id.sequence;
-            // Idle, the last batch's cursor still reaches disk: a restart
-            // doesn't read it again.
-            maybePersistCheckpoint(pipeline_key, pipe, shard, job.ns_id);
-            return;
-        }
-
+    /// A page of a stream source read from the pipeline's cursor, here or
+    /// sent by the shard that owns it: `last_id` is where the read reached.
+    /// Its records' writes go in one batch, as many whole records as fit.
+    fn processStreamPage(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord, payloads: []const []const u8, ids: []const StreamID, last_id: StreamID) void {
+        const batch = self.beginBatch() orelse return;
         // One payload's chain at a time: what it allocates is freed once its
         // outputs are written.
         var arena = std.heap.ArenaAllocator.init(shard.allocator);
         defer arena.deinit();
-        for (payloads, 0..) |payload, i| {
+        var all = true;
+        for (payloads, ids) |payload, id| {
             defer _ = arena.reset(.retain_capacity);
-            pipe.resume_here = .{ .stream = if (i > 0) ids[i - 1] else cursor };
+            batch.beginRecord();
             const output_records = applyOperatorChain(pipe.operators, payload, @import("stdx").time.milliTimestamp(), arena.allocator()) catch |err| blk: {
                 self.noteChainError(shard, err);
                 break :blk @as(?[]const ProcessingRecord, &.{});
             };
-
             if (output_records) |records| {
-                for (records) |rec| self.writeSinkRecordFromStream(pipe, shard, rec.key, rec.value, rec.tags);
+                for (records) |rec| self.writeSinkRecordFromStream(batch, pipe, shard, arena.allocator(), rec.key, rec.value, rec.tags);
             } else {
-                self.writeSinkRecordFromStream(pipe, shard, "", payload, 0);
+                self.writeSinkRecordFromStream(batch, pipe, shard, arena.allocator(), "", payload, 0);
             }
-
-            // A sink found its shard full: the next tick reads again from
-            // this record, every sink of those before it written.
-            if (self.sink_overloaded) {
-                self.sink_overloaded = false;
-                if (i > 0) {
-                    pipe.stream_cursor_ts = ids[i - 1].timestamp_ms;
-                    pipe.stream_cursor_seq = ids[i - 1].sequence;
-                }
-                self.noteHeld(shard, pipe);
-                return;
+            var pb: [48]u8 = undefined;
+            if (!self.endRecord(batch, shard, std.fmt.bufPrint(&pb, "record {d}-{d}", .{ id.timestamp_ms, id.sequence }) catch "a record")) {
+                all = false;
+                break;
             }
-
+            pipe.stream_cursor_ts = id.timestamp_ms;
+            pipe.stream_cursor_seq = id.sequence;
             job.records_processed += 1;
             pipe.records_in += 1;
         }
-
-        // Advance cursor to last StreamID read
-        pipe.stream_cursor_ts = last_id.timestamp_ms;
-        pipe.stream_cursor_seq = last_id.sequence;
-        // Still held while a write it proposed may be refused for room.
-        if (pipe.pending.items.len == 0) pipe.held_since_ms = 0;
-
-        // Persist the advanced cursor durably (throttled) so the pipeline
-        // resumes from here after restart instead of re-reading from the start.
-        // At-least-once: a crash loses at most CHECKPOINT_INTERVAL_MS
-        // of progress, which redelivers — it never skips records.
-        maybePersistCheckpoint(pipeline_key, pipe, shard, job.ns_id);
+        // Every record taken: the cursor goes where the read reached, past
+        // appends that couldn't be read (the stream handler logged them),
+        // so the source doesn't stall on them.
+        if (all) {
+            pipe.stream_cursor_ts = last_id.timestamp_ms;
+            pipe.stream_cursor_seq = last_id.sequence;
+        }
+        self.proposeBatch(shard, job.ns_id, pipeline_key, pipe, batch, .{ .a = pipe.stream_cursor_ts, .b = pipe.stream_cursor_seq });
     }
 
     /// Most a read of another shard's source waits for its page before it
@@ -1867,8 +1861,9 @@ pub const ProcessingHandler = struct {
 
     /// A page another shard sent for a pipeline here. Processed only if it
     /// answers that pipeline's read in flight, this node still leads in the
-    /// term it asked in, the job runs, and the cursor is still where the
-    /// read began; dropped otherwise. The caller frees the bytes.
+    /// term it asked in, the job runs, the pipeline may write, and its
+    /// cursor is still where the read began; dropped otherwise. The caller
+    /// frees the bytes.
     pub fn takeSourcePage(self: *ProcessingHandler, shard: *Shard, bytes: []const u8) void {
         const page = source_page.Page.decode(bytes) orelse return;
         const entry = self.pipelines.getEntry(page.pipeline) orelse return;
@@ -1881,17 +1876,15 @@ pub const ProcessingHandler = struct {
         const base_job_id = if (std.mem.indexOfScalar(u8, pipeline_key, 0)) |nul| pipeline_key[0..nul] else pipeline_key;
         const job = self.jobs.getPtr(base_job_id) orelse return;
         if (job.status != .running or job.held) return;
-        // A sink write refused since the read was asked moved the cursor
-        // back: read again from there.
-        const from_a: u64, const from_b: u64 = switch (pipe.source_kind) {
-            .stream => .{ pipe.stream_cursor_ts, pipe.stream_cursor_seq },
-            .ts => .{ pipe.ts_cursor.ns, pipe.ts_cursor.ual },
-        };
-        if (from_a != page.from_a or from_b != page.from_b) return;
-        // As a tick checks before it reads: sinks not ready, held, or out of
-        // room take no page now. Asked again next tick, from the same cursor.
-        if (!self.sinksReady(shard, pipe) or self.sinksHeld(shard, pipe)) return;
-        if (sinkRoom(shard, pipe) == 0 or pipe.pending.items.len >= pipe.batch_size) return;
+        if (pipe.batch_term == raft.current_term and pipe.batch_index > raft.last_applied) return;
+        // A batch applied since the read was asked moved the cursor: read
+        // again from there.
+        self.loadCursor(shard, job.ns_id, pipeline_key, pipe);
+        if (pipe.from.a != page.from_a or pipe.from.b != page.from_b) return;
+        // As a tick checks before it reads. Asked again next tick, from
+        // the same cursor.
+        pipe.wait = self.waitOf(shard, pipe);
+        if (pipe.wait != .none) return;
 
         self.ticking_job = base_job_id;
         defer self.ticking_job = "";
@@ -1910,7 +1903,7 @@ pub const ProcessingHandler = struct {
                     p.* = rec.payload;
                     id.* = .{ .timestamp_ms = rec.ms, .sequence = rec.seq };
                 }
-                self.processStreamPage(pipeline_key, pipe, shard, job, .{ .timestamp_ms = page.from_a, .sequence = page.from_b }, payloads, ids, .{ .timestamp_ms = page.last_a, .sequence = page.last_b });
+                self.processStreamPage(pipeline_key, pipe, shard, job, payloads, ids, .{ .timestamp_ms = page.last_a, .sequence = page.last_b });
             },
             .ts => {
                 if (page.kind != .ts) return;
@@ -1924,49 +1917,139 @@ pub const ProcessingHandler = struct {
         if (processed > 0) if (shard.metrics_registry) |m| m.processing.recordProcessed(processed);
     }
 
-    /// Minimum wall-clock gap between durable cursor checkpoints per pipeline.
-    /// Bounds Raft write amplification; a crash loses at most this much progress
-    /// (redelivered on resume — at-least-once, never skipped).
-    const CHECKPOINT_INTERVAL_MS: i64 = 1000;
+    /// Most often a pipeline whose cursor moved with no writes (past
+    /// appends that couldn't be read) logs that move alone.
+    const IDLE_BATCH_MS: i64 = 1000;
 
-    /// Persist a pipeline's source cursor as a processing_checkpoint UAL entry,
-    /// debounced. Key = pipeline_key (job_id, or job_id\0idx for multi-source);
-    /// value as `replayCheckpoint` reads it.
-    fn maybePersistCheckpoint(pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, ns_id: NamespaceId) void {
-        var a: u64, var b: u64 = switch (pipe.source_kind) {
-            .stream => .{ pipe.stream_cursor_ts, pipe.stream_cursor_seq },
-            .ts => .{ pipe.ts_cursor.ns, pipe.ts_cursor.ual },
+    /// The sink batch a page builds: its writes as channel messages, and
+    /// the record being added, which goes whole or not at all. Its buffers
+    /// are the handler's, allocated once.
+    const Batch = struct {
+        w: schema.Writer,
+        n: u32 = 0,
+        bytes: usize = 0,
+        rec_pos: usize = 0,
+        rec_n: u32 = 0,
+        rec_bytes: usize = 0,
+        /// A write of the record being added didn't fit.
+        over: bool = false,
+        /// The batch took no more records: the next one is the next batch's.
+        full: bool = false,
+
+        fn beginRecord(b: *Batch) void {
+            b.rec_pos = b.w.pos;
+            b.rec_n = b.n;
+            b.rec_bytes = b.bytes;
+            b.over = false;
+        }
+
+        /// Adds one write; past an entry's sends or bytes, or its room,
+        /// marks the record over.
+        fn add(b: *Batch, built: sink_payload.Built) void {
+            if (b.over) return;
+            if (b.n + 1 > channels_mod.MAX_SENDS or b.bytes + built.payload.len > channels_mod.MAX_SEND_BYTES) {
+                b.over = true;
+                return;
+            }
+            pe.SinkMessage.encode(&b.w, .{ .slot = built.slot, .entry_type = @backingInt(built.entry_type), .flags = Flags.SINK, .payload = built.payload }) catch {
+                b.over = true;
+                return;
+            };
+            b.n += 1;
+            b.bytes += built.payload.len;
+        }
+
+        fn undoRecord(b: *Batch) void {
+            b.w.pos = b.rec_pos;
+            b.n = b.rec_n;
+            b.bytes = b.rec_bytes;
+        }
+    };
+
+    /// Room in a batch's message list beside its other fields.
+    const BATCH_MESSAGES_MAX = pe.Messages.byte_bound.?;
+
+    /// A new batch over the handler's buffers, or null out of memory:
+    /// the tick reads nothing, its cursor where it was.
+    fn beginBatch(self: *ProcessingHandler) ?*Batch {
+        if (self.batch_buf.len == 0) {
+            self.batch_buf = self.allocator.alloc(u8, BATCH_MESSAGES_MAX) catch return null;
+            self.entry_buf = self.allocator.alloc(u8, limits.MAX_LOG_ENTRY_PAYLOAD) catch {
+                self.allocator.free(self.batch_buf);
+                self.batch_buf = &.{};
+                return null;
+            };
+            self.msg_buf = self.allocator.alloc(u8, sink_payload.MAX_PAYLOAD) catch {
+                self.allocator.free(self.batch_buf);
+                self.allocator.free(self.entry_buf);
+                self.batch_buf = &.{};
+                self.entry_buf = &.{};
+                return null;
+            };
+        }
+        self.batch = .{ .w = .{ .buf = self.batch_buf } };
+        return &self.batch;
+    }
+
+    /// The record just added: kept if its writes fit; if they don't, and
+    /// others are in the batch, the batch ends before it (false); if they
+    /// don't fit an entry even alone, it is skipped and counted, loudly,
+    /// and the cursor moves past it. `at` names it for that.
+    fn endRecord(self: *ProcessingHandler, batch: *Batch, shard: *Shard, at: []const u8) bool {
+        if (!batch.over) return true;
+        const alone = batch.rec_n == 0;
+        batch.undoRecord();
+        if (!alone) {
+            batch.full = true;
+            return false;
+        }
+        self.too_large += 1;
+        if (shard.metrics_registry) |m| m.processing.recordTooLarge();
+        self.noteDrop(shard, at, std.fmt.comptimePrint("its writes don't fit one entry (at most {d} writes and {d} bytes a record)", .{ channels_mod.MAX_SENDS, channels_mod.MAX_SEND_BYTES }));
+        return true;
+    }
+
+    /// Proposes `batch` with the cursor it moves the pipeline to: its
+    /// writes and its cursor apply together, once. One with no writes and
+    /// the cursor where it was is nothing to log; one with no writes that
+    /// moves it is logged at most once a second.
+    fn proposeBatch(self: *ProcessingHandler, shard: *Shard, ns: NamespaceId, pipeline_key: []const u8, pipe: *PipelineState, batch: *Batch, to: sinks_machine.At) void {
+        const moved = to.a != pipe.from.a or to.b != pipe.from.b;
+        if (batch.n == 0 and !moved) return;
+        const now = @import("stdx").time.milliTimestamp();
+        if (batch.n == 0 and now - pipe.last_batch_ms < IDLE_BATCH_MS) return self.rewindTo(pipe, pipe.from);
+        const entry = pe.SinkBatch.encodeInto(self.entry_buf, .{
+            .ns = ns.int(),
+            .pipeline = pipeline_key,
+            .from_a = pipe.from.a,
+            .from_b = pipe.from.b,
+            .to_a = to.a,
+            .to_b = to.b,
+            .messages = .{ .bytes = batch.w.written(), .count = batch.n },
+        }) catch {
+            log.err("job '{s}': a sink batch didn't encode; read again", .{self.ticking_job});
+            return self.rewindTo(pipe, pipe.from);
         };
-        // Never past a record whose sink write may yet be refused.
-        if (earliestPending(pipe)) |at| switch (at) {
-            .stream => |id| if (id.lessThan(.{ .timestamp_ms = a, .sequence = b })) {
-                a = id.timestamp_ms;
-                b = id.sequence;
+        const r = shard.raft_node.propose(.processing_sink_batch, Flags.NONE, entry) catch |err| {
+            if (!shard.quietHalted(err)) log.warn("job '{s}': sink batch not proposed: {s}; read again", .{ self.ticking_job, @errorName(err) });
+            return self.rewindTo(pipe, pipe.from);
+        };
+        pipe.batch_index = r.index;
+        pipe.batch_term = r.term;
+        pipe.last_batch_ms = now;
+        if (shard.metrics_registry) |m| m.processing.recordSinkBatch();
+    }
+
+    /// Back to where the pipeline's last applied batch left it: what it
+    /// read since is read again.
+    fn rewindTo(_: *ProcessingHandler, pipe: *PipelineState, at: sinks_machine.At) void {
+        switch (pipe.source_kind) {
+            .stream => {
+                pipe.stream_cursor_ts = at.a;
+                pipe.stream_cursor_seq = at.b;
             },
-            .ts => |t| if (t.before(.{ .ns = a, .ual = b })) {
-                a = t.ns;
-                b = t.ual;
-            },
-        };
-        // Only when the cursor actually advanced past what we last persisted.
-        if (a == pipe.persisted_cursor_ts and b == pipe.persisted_cursor_seq) return;
-
-        const now_ms = @import("stdx").time.milliTimestamp();
-        if (pipe.last_persist_ms != 0 and now_ms - pipe.last_persist_ms < CHECKPOINT_INTERVAL_MS) return;
-        // Set before the attempt so a failing disk is retried once per
-        // interval, not once per tick.
-        pipe.last_persist_ms = now_ms;
-
-        var val_buf: [16]u8 = undefined;
-        std.mem.writeInt(u64, val_buf[0..8], a, .little);
-        std.mem.writeInt(u64, val_buf[8..16], b, .little);
-        // The applier records the persisted cursor.
-        _ = persistence_mod.proposeEntryIn(shard, .processing_checkpoint, Flags.NONE, ns_id, pipeline_key, &val_buf) catch |err| {
-            if (!shard.quietHalted(err)) log.err("pipeline {s}: checkpoint not persisted: {s}", .{ pipeline_key, @errorName(err) });
-            if (shard.metrics_registry) |m| m.processing.recordError();
-            return;
-        };
-        if (shard.metrics_registry) |m| m.processing.recordCheckpoint();
+            .ts => pipe.ts_cursor = .{ .ns = at.a, .ual = at.b },
+        }
     }
 
     /// The operator chain over one input value: its output records, or
@@ -1996,15 +2079,9 @@ pub const ProcessingHandler = struct {
         return collector.records.items;
     }
 
-    /// A record a sink could not write is lost to that sink (the cursor
-    /// has moved past it); said once per interval with the count.
-    /// A sink write found the shard full: stop the tick here.
-    fn holdForRoom(self: *ProcessingHandler) void {
-        self.sink_overloaded = true;
-    }
-
-    /// A tick stopped for room. A pipeline held this long by the same full
-    /// shard is said so, once per interval, as a stuck one would be.
+    /// A pipeline that can't read for room (a busy sink shard, a whole
+    /// window unacked, a full log). One held this long is said so, once
+    /// per interval, as a stuck one would be.
     fn noteHeld(self: *ProcessingHandler, shard: *Shard, pipe: *PipelineState) void {
         if (shard.metrics_registry) |m| m.processing.recordHeldTick();
         const now = @import("stdx").time.milliTimestamp();
@@ -2012,36 +2089,29 @@ pub const ProcessingHandler = struct {
         const held_for = now - pipe.held_since_ms;
         if (held_for < HELD_WARN_MS or now - self.held_warn_ms < 30_000) return;
         self.held_warn_ms = now;
-        log.warn("job '{s}': a pipeline has waited {d} s for room in a sink's shard", .{ self.ticking_job, @divTrunc(held_for, 1000) });
+        var wb: [160]u8 = undefined;
+        log.warn("job '{s}': a pipeline has waited {d} s: {s}", .{ self.ticking_job, @divTrunc(held_for, 1000), waitText(pipe.wait, &wb) });
     }
 
     const HELD_WARN_MS: i64 = 30_000;
 
-    /// How many source records a tick may take now: the writes this shard
-    /// can still propose before its cap, shared among the pipeline's sinks.
-    /// An operator that emits several records per input can still exceed
-    /// it; that write is held (`holdForRoom`), not dropped.
-    fn sinkRoom(shard: *const Shard, pipe: *const PipelineState) usize {
-        const raft = shard.raft_node;
-        const used = raft.log.lastIndex() -| raft.last_applied;
-        // One spare, for a sink namespace's implicit create.
-        const room = raft_node_mod.MAX_OUTSTANDING -| used -| 1;
-        const sinks = @max(pipe.sinks.len, 1);
-        const log_room = room / sinks;
-        // A write whose target is on another shard goes through that
-        // shard's inbox, which no larger batch fits: a send it refuses holds
-        // the tick, and a batch that never fits would be refused at the same
-        // record every tick.
-        const mailboxes = shard.peer_mailboxes orelse return log_room;
-        if (mailboxes.len <= 1) return log_room;
-        var inbox_room: usize = std.math.maxInt(usize);
-        for (mailboxes, 0..) |mb, i| {
-            if (i == shard.id) continue;
-            inbox_room = @min(inbox_room, mb.inbox.capacity -| mb.inbox.pending());
-        }
-        return @min(log_room, inbox_room / sinks);
+    /// What a pipeline waits for, in words.
+    fn waitText(w: Wait, buf: []u8) []const u8 {
+        return switch (w) {
+            .none => "",
+            .namespace => |ns| std.fmt.bufPrint(buf, "waiting for namespace {s}", .{ns}) catch "waiting for a namespace",
+            .halted => "waiting: a sink's shard is halted",
+            .room => |r| if (r.target.len > 0)
+                std.fmt.bufPrint(buf, "waiting for room on shard {d} ({s})", .{ r.shard, r.target }) catch "waiting for room on a sink's shard"
+            else
+                std.fmt.bufPrint(buf, "waiting for room on shard {d}", .{r.shard}) catch "waiting for room on a sink's shard",
+            .log => "waiting for room in this shard's log",
+        };
     }
 
+    /// A sink write refused at the pipeline's shard, before it was sent:
+    /// the record is lost to that sink. Counted, and said once per
+    /// interval with the count.
     pub fn noteSinkDrop(self: *ProcessingHandler, metrics: ?*MetricsRegistry, kind: []const u8, target: []const u8, why: []const u8) void {
         self.sink_drops += 1;
         if (metrics) |m| m.processing.recordDropped();
@@ -2049,6 +2119,17 @@ pub const ProcessingHandler = struct {
         if (now - self.sink_warn_ms < 30_000) return;
         self.sink_warn_ms = now;
         log.err("job '{s}': {s} sink '{s}': record dropped: {s} ({d} sink records dropped so far)", .{ self.ticking_job, kind, target, why, self.sink_drops });
+    }
+
+    /// A whole record skipped: counted as dropped, said in the job's
+    /// status with where and why, and logged once per interval.
+    fn noteDrop(self: *ProcessingHandler, shard: *Shard, at: []const u8, why: []const u8) void {
+        if (self.jobs.getPtr(self.ticking_job)) |job| {
+            job.drops += 1;
+            const text = std.fmt.bufPrint(&job.last_drop, "{s}: {s}", .{ at, why }) catch null;
+            job.last_drop_len = if (text) |t| t.len else job.last_drop.len;
+        }
+        self.noteSinkDrop(shard.metrics_registry, "every", at, why);
     }
 
     /// A record the operator chain failed on is skipped; said once per
@@ -2065,25 +2146,16 @@ pub const ProcessingHandler = struct {
     /// Write a processed record to all matching sinks (TS source variant).
     /// Tag filtering: sinks with required_tags=0 (firehose) get all records;
     /// sinks with required_tags set only get records where record_tags matches.
-    fn writeSinkRecord(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, payload: []const u8, field_value: f64, timestamp_ns: u64, src_tags: []const u8, record_tags: u32) void {
-        if (self.sink_overloaded) return;
+    fn writeSinkRecord(self: *ProcessingHandler, batch: *Batch, pipe: *PipelineState, shard: *Shard, scratch: Allocator, payload: []const u8, field_value: f64, timestamp_ns: u64, src_tags: []const u8, record_tags: u32) void {
         pipe.records_out += 1; // operator chain emitted a record into the sink stage
         for (pipe.sinks) |snk| {
-            // A sink held the record: it is read again, so the sinks after
-            // this one take it then, not twice.
-            if (self.sink_overloaded) return;
             if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
-            // A sink writes without passing a client's request gate: a
-            // namespace this shard may not create takes no write.
-            if (shard.namespace_handler.admission(snk.namespace)) |r| {
-                self.noteSinkDrop(shard.metrics_registry, @tagName(snk.kind), snk.target, r.message);
-                continue;
-            }
+            const ns = self.namespaceIdOf(snk.namespace);
             switch (snk.kind) {
-                .stream => self.sendSinkWrite(pipe, shard, snk, .{ .kind = .stream, .namespace = snk.namespace, .target = snk.target, .value = payload }),
-                .ts => self.sendTsPoint(pipe, shard, snk, snk.value_field, field_value, timestamp_ns, src_tags),
-                .kv => self.writeKvSink(pipe, snk, shard, "", payload),
-                .queue => self.sendSinkWrite(pipe, shard, snk, .{ .kind = .queue, .namespace = snk.namespace, .target = snk.target, .value = payload, .priority = snk.queue_priority }),
+                .stream => self.addWrite(batch, shard, snk, sink_payload.stream(self.msg_buf, scratch, ns, snk.target, payload)),
+                .ts => self.sendTsPoint(batch, shard, snk, snk.value_field, field_value, timestamp_ns, src_tags),
+                .kv => self.writeKvSink(batch, snk, shard, "", payload),
+                .queue => self.addWrite(batch, shard, snk, sink_payload.queue(self.msg_buf, shard.queue_handler.caps, ns, snk.target, snk.queue_priority, payload)),
             }
         }
     }
@@ -2091,41 +2163,41 @@ pub const ProcessingHandler = struct {
     /// Write a processed record to all matching sinks (stream source variant).
     /// `record_key` is the record's partitioning key (set by `keyby`, empty otherwise);
     /// it is used to construct the KV sink key.
-    fn writeSinkRecordFromStream(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, record_key: []const u8, payload: []const u8, record_tags: u32) void {
-        if (self.sink_overloaded) return;
+    fn writeSinkRecordFromStream(self: *ProcessingHandler, batch: *Batch, pipe: *PipelineState, shard: *Shard, scratch: Allocator, record_key: []const u8, payload: []const u8, record_tags: u32) void {
         pipe.records_out += 1; // operator chain emitted a record into the sink stage
         for (pipe.sinks) |snk| {
-            // A sink held the record: it is read again, so the sinks after
-            // this one take it then, not twice.
-            if (self.sink_overloaded) return;
             if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
-            // A sink writes without passing a client's request gate: a
-            // namespace this shard may not create takes no write.
-            if (shard.namespace_handler.admission(snk.namespace)) |r| {
-                self.noteSinkDrop(shard.metrics_registry, @tagName(snk.kind), snk.target, r.message);
-                continue;
-            }
+            const ns = self.namespaceIdOf(snk.namespace);
             switch (snk.kind) {
-                .stream => self.sendSinkWrite(pipe, shard, snk, .{ .kind = .stream, .namespace = snk.namespace, .target = snk.target, .value = payload }),
-                .ts => self.writeTsSinkFromJson(pipe, snk, shard, payload),
-                .kv => self.writeKvSink(pipe, snk, shard, record_key, payload),
-                .queue => self.sendSinkWrite(pipe, shard, snk, .{ .kind = .queue, .namespace = snk.namespace, .target = snk.target, .value = payload, .priority = snk.queue_priority }),
+                .stream => self.addWrite(batch, shard, snk, sink_payload.stream(self.msg_buf, scratch, ns, snk.target, payload)),
+                .ts => self.writeTsSinkFromJson(batch, pipe, snk, shard, payload),
+                .kv => self.writeKvSink(batch, snk, shard, record_key, payload),
+                .queue => self.addWrite(batch, shard, snk, sink_payload.queue(self.msg_buf, shard.queue_handler.caps, ns, snk.target, snk.queue_priority, payload)),
             }
+        }
+    }
+
+    /// One sink write into the batch; one its client path would refuse is
+    /// counted dropped instead.
+    fn addWrite(self: *ProcessingHandler, batch: *Batch, shard: *Shard, snk: SinkConfig, r: sink_payload.Result) void {
+        switch (r) {
+            .built => |b| batch.add(b),
+            .refused => |why| self.noteSinkDrop(shard.metrics_registry, @tagName(snk.kind), if (snk.kind == .ts) snk.measurement else snk.target, why.why),
         }
     }
 
     /// TS sink (JSON source variant): honors the `fields:` map (one point per
     /// `field_name ← json_key` pair) and the `tags:` map (real tag hash). Falls back
     /// to the `value_field` shorthand (single "value" field) when no fields map is set.
-    /// Each point takes the stamp of the entry its owner proposes.
-    fn writeTsSinkFromJson(self: *ProcessingHandler, pipe: *PipelineState, snk: SinkConfig, shard: *Shard, payload: []const u8) void {
+    /// Each point takes the stamp of the entry its target applies.
+    fn writeTsSinkFromJson(self: *ProcessingHandler, batch: *Batch, pipe: *PipelineState, snk: SinkConfig, shard: *Shard, payload: []const u8) void {
+        _ = pipe;
         var sink_tag_buf: [ts_mod.MAX_TAG_STRING]u8 = undefined;
         const sink_tags = computeTsSinkTags(snk.ts_tag_keys, payload, &sink_tag_buf);
 
         if (snk.ts_field_keys.len > 0) {
             var it = FlatPairIterator.init(snk.ts_field_keys);
             while (it.next()) |pair| {
-                if (self.sink_overloaded) return;
                 // pair.key = TS field name, pair.value = JSON field to extract from.
                 const value = extractJsonFloat(payload, pair.value) orelse {
                     self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the record has no numeric field for it");
@@ -2135,7 +2207,7 @@ pub const ProcessingHandler = struct {
                     self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the value is not a finite number");
                     continue;
                 }
-                self.sendTsPoint(pipe, shard, snk, pair.key, value, 0, sink_tags);
+                self.sendTsPoint(batch, shard, snk, pair.key, value, 0, sink_tags);
             }
             return;
         }
@@ -2144,14 +2216,12 @@ pub const ProcessingHandler = struct {
         const value = extractJsonFloat(payload, snk.value_field) orelse
             (std.fmt.parseFloat(f64, payload) catch return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the record is not a number"));
         if (!std.math.isFinite(value)) return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the value is not a finite number");
-        self.sendTsPoint(pipe, shard, snk, "value", value, 0, sink_tags);
+        self.sendTsPoint(batch, shard, snk, "value", value, 0, sink_tags);
     }
 
     /// One TS point, at `timestamp_ns` (0: its entry's stamp).
-    fn sendTsPoint(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, snk: SinkConfig, field: []const u8, value: f64, timestamp_ns: u64, tags: []const u8) void {
-        var bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &bytes, @bitCast(value), .little);
-        self.sendSinkWrite(pipe, shard, snk, .{ .kind = .ts, .namespace = snk.namespace, .target = snk.measurement, .value = &bytes, .timestamp_ns = timestamp_ns, .field = field, .tags = tags });
+    fn sendTsPoint(self: *ProcessingHandler, batch: *Batch, shard: *Shard, snk: SinkConfig, field: []const u8, value: f64, timestamp_ns: u64, tags: []const u8) void {
+        self.addWrite(batch, shard, snk, sink_payload.ts(self.msg_buf, self.namespaceIdOf(snk.namespace), snk.measurement, field, value, timestamp_ns, tags));
     }
 
     const MAX_SINK_KEY = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
@@ -2180,12 +2250,10 @@ pub const ProcessingHandler = struct {
 
     /// KV sink: write the record under `key_prefix + separator + record_key`,
     /// on the shard that owns that key, so a later `kv get` finds it.
-    fn writeKvSink(self: *ProcessingHandler, pipe: *PipelineState, snk: SinkConfig, shard: *Shard, record_key: []const u8, payload: []const u8) void {
+    fn writeKvSink(self: *ProcessingHandler, batch: *Batch, snk: SinkConfig, shard: *Shard, record_key: []const u8, payload: []const u8) void {
         var key_buf: [MAX_SINK_KEY]u8 = undefined;
         const full_key = self.kvSinkKeyOrDrop(&key_buf, snk, shard.metrics_registry, record_key) orelse return;
-        // As a client's key: the CLI and SDKs have never written one with NUL.
-        if (std.mem.indexOfScalar(u8, full_key, 0) != null) return self.noteSinkDrop(shard.metrics_registry, "kv", full_key, "key must not contain NUL");
-        self.sendSinkWrite(pipe, shard, snk, .{ .kind = .kv, .namespace = snk.namespace, .target = full_key, .value = payload, .ttl_ms = snk.kv_ttl_ms });
+        self.addWrite(batch, shard, snk, sink_payload.kv(self.msg_buf, self.namespaceIdOf(snk.namespace), full_key, payload, snk.kv_ttl_ms));
     }
 
     /// The shard that owns `target` in `namespace`: this one when there are
@@ -2196,286 +2264,6 @@ pub const ProcessingHandler = struct {
         const owner = self.peerShardId(namespace, target);
         return if (owner < mailboxes.len) owner else @intCast(shard.id);
     }
-
-    /// A sink write goes where its target is: proposed here when this
-    /// shard owns it, and watched until it applies; otherwise sent to the
-    /// owner's inbox, which proposes it from its own thread. A full log
-    /// here, a full inbox, or a target not ready holds the tick, so the
-    /// record is read and sent again.
-    fn sendSinkWrite(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, snk: SinkConfig, w: SinkWrite) void {
-        // What a pending write names: the sink's own, as its key may not outlive the tick.
-        const label = if (snk.kind == .ts) snk.measurement else snk.target;
-        const owner = self.sinkOwner(shard, w.namespace, w.target);
-        if (owner == shard.id) {
-            switch (self.proposeSinkWrite(shard, w)) {
-                .proposed => |p| self.notePending(shard, pipe, p, snk.kind, label),
-                .room, .wait => self.holdForRoom(),
-                .dropped => {},
-            }
-            return;
-        }
-        const message = w.encode(shard.allocator) orelse
-            return self.noteSinkDrop(shard.metrics_registry, @tagName(w.kind), label, "out of memory, or a name too long to send");
-        if (!shard.peer_mailboxes.?[owner].inbox.send(.{ .tag = .sink_write, .src_shard = @intCast(shard.id), .payload_len = @intCast(message.len), .payload_ptr = message.ptr })) {
-            shard.allocator.free(message);
-            if (shard.shard_metrics) |sm| sm.recordCrossShardOverloaded(.engine);
-            self.holdForRoom();
-        }
-    }
-
-    /// What became of a sink write on the shard that owns its target.
-    pub const Proposed = union(enum) {
-        /// In the log, not yet applied.
-        proposed: persistence_mod.ProposeResult,
-        /// The log is full: try again once it drains.
-        room,
-        /// Its target can't take it yet (a queue at its caps, a namespace
-        /// not yet in this shard's table): try again later.
-        wait,
-        /// Refused for good, and counted dropped.
-        dropped,
-    };
-
-    /// A sink write proposed on this shard, which owns its target, as a
-    /// client's write is: through the namespace's write gate and the
-    /// target's handler, marked as a sink's (`Flags.SINK`). Only ever
-    /// called on this shard's own thread.
-    pub fn proposeSinkWrite(self: *ProcessingHandler, shard: *Shard, w: SinkWrite) Proposed {
-        const label: []const u8 = @tagName(w.kind);
-        switch (shard.namespace_handler.prepareWrite(shard, w.namespace)) {
-            .go => {},
-            .ensure => return .wait,
-            .refused => |r| return if (r.status == .overloaded) .room else self.dropped(shard, label, w.target, r.message),
-        }
-        const ns = shard.namespaceId(w.namespace);
-        if (ns == .invalid) return .wait;
-        switch (w.kind) {
-            .kv => return switch (kv_handler_mod.KVHandler.sinkPropose(shard, w.namespace, w.target, w.value, w.ttl_ms)) {
-                .proposed => |p| .{ .proposed = p },
-                .held => .room,
-                .dropped => |why| self.dropped(shard, label, w.target, why),
-            },
-            .queue => {
-                // Past the queue's caps, counting the sink enqueues proposed
-                // here and not yet applied, it would be refused at apply.
-                if (!self.queueFits(shard, ns, w.target, w.value.len)) return .wait;
-                var opt_buf: [64]u8 = undefined;
-                var ob = proto.OptionsBuilder.init(&opt_buf);
-                if (w.priority > 0) ob.addU8(.priority, w.priority) catch {};
-                const result = shard.queue_handler.sinkEnqueue(.{
-                    .header = makeSinkHeader(.queue_enqueue),
-                    .namespace = w.namespace,
-                    .ns_id = ns,
-                    .key = w.target,
-                    .value = w.value,
-                    .options = opt_buf[0..ob.offset],
-                });
-                defer shard.queue_handler.freeResult(result);
-                switch (result) {
-                    .parked => |p| {
-                        // Short of memory the queue is counted short of
-                        // these, and its caps refuse the excess at apply.
-                        self.sink_enqueues.append(self.allocator, .{ .index = p.index, .ns = ns, .name = queueNameHash(w.target), .held = queue_machine.heldBy(w.value.len, 0) }) catch {};
-                        return .{ .proposed = p };
-                    },
-                    .err => |e| return if (e.code == .overloaded) .room else self.dropped(shard, label, w.target, e.message),
-                    else => return self.dropped(shard, label, w.target, "the enqueue gave no answer"),
-                }
-            },
-            .stream => {
-                const p = shard.stream_handler.appendPayloadToStream(w.target, w.namespace, w.value) catch |err| return switch (err) {
-                    error.Overloaded => .room,
-                    else => self.dropped(shard, label, w.target, @errorName(err)),
-                };
-                return .{ .proposed = p };
-            },
-            .ts => {
-                if (w.value.len != 8) return self.dropped(shard, label, w.target, "the value is not a number");
-                const value: f64 = @bitCast(std.mem.readInt(u64, w.value[0..8], .little));
-                const result = ts_handler_mod.TSHandler.proposeWrite(shard, w.namespace, w.target, w.field, value, if (w.timestamp_ns == 0) null else w.timestamp_ns, w.tags, Flags.SINK);
-                return switch (result) {
-                    .parked => |p| .{ .proposed = p },
-                    .err => |e| if (e.code == .overloaded) .room else self.dropped(shard, label, w.target, e.message),
-                    else => self.dropped(shard, label, w.target, "the write gave no answer"),
-                };
-            },
-        }
-    }
-
-    fn dropped(self: *ProcessingHandler, shard: *Shard, kind: []const u8, target: []const u8, why: []const u8) Proposed {
-        self.noteSinkDrop(shard.metrics_registry, kind, target, why);
-        return .dropped;
-    }
-
-    fn queueNameHash(name: []const u8) u64 {
-        return std.hash.Wyhash.hash(0, name);
-    }
-
-    /// Whether queue `name` takes a message of `len` bytes, counting the
-    /// sink enqueues proposed here and not yet applied.
-    fn queueFits(self: *ProcessingHandler, shard: *Shard, ns: NamespaceId, name: []const u8, len: usize) bool {
-        // Those applied are in the queue's own counts now; one a leader
-        // change dropped goes once the log applies past its index.
-        const applied = shard.raft_node.last_applied;
-        var keep: usize = 0;
-        for (self.sink_enqueues.items) |e| if (e.index > applied) {
-            self.sink_enqueues.items[keep] = e;
-            keep += 1;
-        };
-        self.sink_enqueues.shrinkRetainingCapacity(keep);
-        const hash = queueNameHash(name);
-        var msgs: u64 = 0;
-        var bytes: u64 = 0;
-        for (self.sink_enqueues.items) |e| if (e.ns == ns and e.name == hash) {
-            msgs += 1;
-            bytes += e.held;
-        };
-        return queue_handler_mod.sinkWouldFit(shard.queue_handler.caps, shard, ns, name, len, msgs, bytes);
-    }
-
-    /// A sink write this shard's log took: kept until it applies. One the
-    /// list can't take is read again at once rather than go unwatched.
-    pub fn notePending(self: *ProcessingHandler, shard: *Shard, pipe: *PipelineState, proposed: persistence_mod.ProposeResult, kind: SinkKind, target: []const u8) void {
-        // The first write of a new term: those of earlier terms were lost
-        // with the leadership, or apply under their own term unwatched.
-        // Either way their records are read again, and none is left to
-        // count against a batch.
-        if (proposed.term != self.pending_term) {
-            self.rewindEveryPending(shard);
-            self.pending_term = proposed.term;
-        }
-        pipe.pending.append(self.allocator, .{ .term = proposed.term, .index = proposed.index, .again = pipe.resume_here, .kind = kind, .target = target }) catch {
-            rewind(pipe, pipe.resume_here);
-            self.holdForRoom();
-            return;
-        };
-        self.pending_sinks += 1;
-        self.pending_metrics = shard.metrics_registry;
-        if (shard.metrics_registry) |m| m.processing.moveSinkPending(self.pending_sinks - 1, self.pending_sinks);
-    }
-
-    fn rewindEveryPending(self: *ProcessingHandler, shard: *Shard) void {
-        if (self.pending_sinks == 0) return;
-        const was = self.pending_sinks;
-        var it = self.pipelines.valueIterator();
-        while (it.next()) |pipe| {
-            for (pipe.pending.items) |p| self.rewindHeld(shard, pipe, p.again);
-            pipe.pending.clearRetainingCapacity();
-        }
-        self.pending_sinks = 0;
-        if (shard.metrics_registry) |m| m.processing.moveSinkPending(was, 0);
-    }
-
-    /// The pipeline reads again from `at`, if that is before where it is.
-    fn rewind(pipe: *PipelineState, at: Resume) void {
-        switch (at) {
-            .stream => |id| {
-                const cur: StreamID = .{ .timestamp_ms = pipe.stream_cursor_ts, .sequence = pipe.stream_cursor_seq };
-                if (id.lessThan(cur)) {
-                    pipe.stream_cursor_ts = id.timestamp_ms;
-                    pipe.stream_cursor_seq = id.sequence;
-                }
-            },
-            .ts => |t| if (t.before(pipe.ts_cursor)) {
-                pipe.ts_cursor = t;
-            },
-        }
-    }
-
-    /// The earliest place a pending write's record is read again from: no
-    /// checkpoint may pass it, or a restart would resume past a record still
-    /// to be refused.
-    fn earliestPending(pipe: *const PipelineState) ?Resume {
-        var out: ?Resume = null;
-        for (pipe.pending.items) |p| {
-            const o = out orelse {
-                out = p.again;
-                continue;
-            };
-            out = switch (p.again) {
-                .stream => |id| if (id.lessThan(o.stream)) p.again else o,
-                .ts => |t| if (t.before(o.ts)) p.again else o,
-            };
-        }
-        return out;
-    }
-
-    /// A sink write applied, on any replica: the one this leader proposed is
-    /// settled. Applied, it is done and the pipeline isn't held; refused for
-    /// room, its record is read again (at least once: records after it may
-    /// go twice); refused otherwise, it is counted dropped. An entry at its
-    /// index from another term means the write was lost to a leader change:
-    /// read again. Only ever this node's own bookkeeping and new proposals;
-    /// applied state is untouched.
-    ///
-    /// A sink write no pipeline here is watching came from a pipeline on
-    /// another shard, which can't see this apply, or one removed since:
-    /// refused, it is lost, and this shard's leader counts it.
-    pub fn afterApply(self: *ProcessingHandler, shard: *Shard, entry: *const entry_mod.Entry, result: *const persistence_mod.Result) void {
-        const watched = self.settlePending(shard, entry, result);
-        if (watched or entry.header.flags & Flags.SINK == 0) return;
-        const r = result.refused() orelse return;
-        const raft = shard.raft_node;
-        if (raft.role != .leader or entry.header.term != raft.current_term) return;
-        const kind: []const u8 = switch (@as(EntryType, @fromBackingInt(@intCast(entry.header.entry_type)))) {
-            .queue_enqueue => "queue",
-            .stream_append => "stream",
-            .ts_write => "ts",
-            else => "kv",
-        };
-        self.noteSinkDrop(shard.metrics_registry, kind, "(not watched here: another shard's pipeline, or one since removed)", r.refusal.message);
-    }
-
-    /// Settles each pipeline's pending writes up to this entry's index;
-    /// true if one of them is this entry.
-    fn settlePending(self: *ProcessingHandler, shard: *Shard, entry: *const entry_mod.Entry, result: *const persistence_mod.Result) bool {
-        if (self.pending_sinks == 0) return false;
-        const was = self.pending_sinks;
-        defer if (shard.metrics_registry) |m| m.processing.moveSinkPending(was, self.pending_sinks);
-        const index = entry.header.index;
-        var watched = false;
-        var it = self.pipelines.valueIterator();
-        while (it.next()) |pipe| {
-            // Every one at or before this index is settled, wherever it
-            // sits: the list is a batch or two long.
-            var keep: usize = 0;
-            for (pipe.pending.items) |p| {
-                if (p.index > index) {
-                    pipe.pending.items[keep] = p;
-                    keep += 1;
-                    continue;
-                }
-                if (p.index < index or p.term != entry.header.term) {
-                    self.rewindHeld(shard, pipe, p.again);
-                    continue;
-                }
-                watched = true;
-                if (result.refused()) |r| {
-                    if (r.status == .overloaded) {
-                        self.rewindHeld(shard, pipe, p.again);
-                    } else self.noteSinkDrop(shard.metrics_registry, @tagName(p.kind), p.target, r.refusal.message);
-                } else pipe.held_since_ms = 0;
-            }
-            self.pending_sinks -= pipe.pending.items.len - keep;
-            pipe.pending.shrinkRetainingCapacity(keep);
-        }
-        return watched;
-    }
-
-    /// A write refused for room at apply: its record is read again, and the
-    /// pipeline counts as held until a write of it applies.
-    fn rewindHeld(self: *ProcessingHandler, shard: *Shard, pipe: *PipelineState, at: Resume) void {
-        rewind(pipe, at);
-        self.sink_rewinds += 1;
-        if (shard.metrics_registry) |m| m.processing.recordSinkRewind();
-        if (pipe.held_since_ms == 0) pipe.held_since_ms = @import("stdx").time.milliTimestamp();
-    }
-
-    /// Build a minimal in-process request header carrying just the opcode.
-    fn makeSinkHeader(op: proto.OpCode) proto.RequestHeader {
-        return proto.RequestHeader.init(op, 0);
-    }
-
     /// Iterates serialized flat pairs (`a\0b\0c\0d\0`) as (key, value) tuples.
     const FlatPair = struct { key: []const u8, value: []const u8 };
     const FlatPairIterator = struct {
@@ -2638,92 +2426,6 @@ test "ProcessingHandler: init and deinit" {
     const handler = ProcessingHandler.init(std.testing.allocator);
     var h = handler;
     h.deinit();
-}
-
-test "ProcessingHandler: replayCheckpoint restores a pipeline's stream cursor" {
-    const allocator = std.testing.allocator;
-    var handler = ProcessingHandler.init(allocator);
-    defer handler.deinit();
-
-    // A minimal stream-source pipeline; deinit frees its key.
-    const src = definition.SourceSpec{
-        .name = "s",
-        .stream = "raw",
-        .namespace = "default",
-        .batch_size = 0,
-    };
-    try handler.pipelines.put(try allocator.dupe(u8, "job-cp"), try ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
-
-    var val: [16]u8 = undefined;
-    std.mem.writeInt(u64, val[0..8], 1700, .little);
-    std.mem.writeInt(u64, val[8..16], 5, .little);
-    try handler.replayCheckpoint("job-cp", &val);
-
-    const pipe = handler.pipelines.getPtr("job-cp").?;
-    try std.testing.expectEqual(@as(u64, 1700), pipe.stream_cursor_ts);
-    try std.testing.expectEqual(@as(u64, 5), pipe.stream_cursor_seq);
-    // persisted_* mirror the restored cursor so the first post-restart tick
-    // doesn't immediately re-persist an unchanged cursor.
-    try std.testing.expectEqual(@as(u64, 1700), pipe.persisted_cursor_ts);
-    try std.testing.expectEqual(@as(u64, 5), pipe.persisted_cursor_seq);
-
-    // Unknown key is a no-op; short value is ignored (no crash, cursor unchanged).
-    try handler.replayCheckpoint("missing", &val);
-    try std.testing.expectError(error.Halt, handler.replayCheckpoint("job-cp", &[_]u8{0}));
-    try std.testing.expectEqual(@as(u64, 1700), pipe.stream_cursor_ts);
-}
-
-test "processing: a TS source's checkpoint restores its cursor, and never moves it back" {
-    const allocator = std.testing.allocator;
-    var handler = ProcessingHandler.init(allocator);
-    defer handler.deinit();
-    const src = definition.SourceSpec{
-        .kind = .ts,
-        .name = "t",
-        .stream = "",
-        .namespace = "default",
-        .batch_size = 0,
-        .ts_measurement = "cpu",
-        .ts_field = "value",
-    };
-    try handler.pipelines.put(try allocator.dupe(u8, "job-ts"), try ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
-    var val: [16]u8 = undefined;
-    std.mem.writeInt(u64, val[0..8], 1_700_000_000_123, .little);
-    std.mem.writeInt(u64, val[8..16], 42, .little);
-    try handler.replayCheckpoint("job-ts", &val);
-    const pipe = handler.pipelines.getPtr("job-ts").?;
-    try std.testing.expectEqual(ReadAt{ .ns = 1_700_000_000_123, .ual = 42 }, pipe.ts_cursor);
-    try std.testing.expectEqual(@as(u64, 0), pipe.stream_cursor_ts);
-    try std.testing.expectEqual(@as(u64, 1_700_000_000_123), pipe.persisted_cursor_ts);
-
-    // A checkpoint that commits after the pipeline read further does not
-    // move it back.
-    pipe.ts_cursor = .{ .ns = 1_700_000_000_500, .ual = 7 };
-    try handler.replayCheckpoint("job-ts", &val);
-    try std.testing.expectEqual(ReadAt{ .ns = 1_700_000_000_500, .ual = 7 }, pipe.ts_cursor);
-}
-
-test "processing: a stream source's checkpoint never moves its cursor back" {
-    const allocator = std.testing.allocator;
-    var handler = ProcessingHandler.init(allocator);
-    defer handler.deinit();
-    const src = definition.SourceSpec{ .name = "s", .stream = "raw", .namespace = "default", .batch_size = 0 };
-    try handler.pipelines.put(try allocator.dupe(u8, "job-fw"), try ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
-    const pipe = handler.pipelines.getPtr("job-fw").?;
-    pipe.stream_cursor_ts = 2000;
-    pipe.stream_cursor_seq = 3;
-    var val: [16]u8 = undefined;
-    for ([_][2]u64{ .{ 1999, 9 }, .{ 2000, 2 } }) |older| {
-        std.mem.writeInt(u64, val[0..8], older[0], .little);
-        std.mem.writeInt(u64, val[8..16], older[1], .little);
-        try handler.replayCheckpoint("job-fw", &val);
-        try std.testing.expectEqual(@as(u64, 2000), pipe.stream_cursor_ts);
-        try std.testing.expectEqual(@as(u64, 3), pipe.stream_cursor_seq);
-    }
-    std.mem.writeInt(u64, val[0..8], 2000, .little);
-    std.mem.writeInt(u64, val[8..16], 4, .little);
-    try handler.replayCheckpoint("job-fw", &val);
-    try std.testing.expectEqual(@as(u64, 4), pipe.stream_cursor_seq);
 }
 
 test "ProcessingHandler: applyOperatorChain with no operators returns null" {
@@ -2992,45 +2694,6 @@ test "ProcessingHandler: stopping a stopped job succeeds and changes nothing; ca
     try std.testing.expect(refused.status == .conflict);
     try std.testing.expectEqualStrings("job isn't running (it is stopped)", refused.refusal.message);
     try std.testing.expectEqual(ProcessingHandler.JobStatus.stopped, handler.jobs.get("job-s").?.status);
-}
-
-test "ProcessingHandler: a job without a pipeline keeps its cursor, forward only, and a pipeline built later starts from it" {
-    const yaml =
-        \\kind: Processing
-        \\name: kept
-        \\sources:
-        \\  - name: src
-        \\    stream:
-        \\      name: in
-        \\sinks:
-        \\  - name: out
-        \\    stream:
-        \\      name: out
-    ;
-    var handler = ProcessingHandler.init(std.testing.allocator);
-    defer handler.deinit();
-    var buf: [512]u8 = undefined;
-    _ = try applySubmit(&handler, "job-k", testSubmitValue(&buf, .stopped, yaml), 1);
-    try std.testing.expectEqual(@as(usize, 0), handler.pipelines.count());
-
-    var val: [16]u8 = undefined;
-    std.mem.writeInt(u64, val[0..8], 10, .little);
-    std.mem.writeInt(u64, val[8..16], 5, .little);
-    try handler.replayCheckpoint("job-k", &val);
-    // A stale checkpoint doesn't move it back.
-    std.mem.writeInt(u64, val[0..8], 9, .little);
-    std.mem.writeInt(u64, val[8..16], 9, .little);
-    try handler.replayCheckpoint("job-k", &val);
-    const kept = handler.jobs.getPtr("job-k").?.cursors.items;
-    try std.testing.expectEqual(@as(usize, 1), kept.len);
-    try std.testing.expectEqual(ProcessingHandler.JobRecord.Cursor{ .source = 0, .a = 10, .b = 5 }, kept[0]);
-
-    // The submit applied again as running builds the pipeline at the kept cursor.
-    _ = try applySubmit(&handler, "job-k", testSubmitValue(&buf, .running, yaml), 1);
-    const pipe = handler.pipelines.getPtr("job-k").?;
-    try std.testing.expectEqual(@as(u64, 10), pipe.stream_cursor_ts);
-    try std.testing.expectEqual(@as(u64, 5), pipe.stream_cursor_seq);
-    try std.testing.expectEqual(@as(u64, 10), pipe.persisted_cursor_ts);
 }
 
 test "ProcessingHandler: a failure reason is kept up to 1 KiB, cut on a character and marked" {

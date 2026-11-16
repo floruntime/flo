@@ -4800,10 +4800,6 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.hold_sync_flush = false;
     shard.test_bar = 0;
     shard.snapshot_skips_leader_not_ready = 0;
-    shard.sink_retries = .empty;
-    shard.sink_retry_overflow = 0;
-    shard.sink_retry_bytes = 0;
-    shard.sink_retry_blocked = .empty;
     shard.replica.diverged = false;
     shard.losses = .{};
     const raft_node = try std.testing.allocator.create(RaftNode);

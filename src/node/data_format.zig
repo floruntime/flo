@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 30;
+pub const CURRENT: u32 = 31;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -102,6 +102,11 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // A channel message whose target is full is parked under it, and a
     // `channel_unpark` applies a target's parked messages once it has room.
     .{ .format = 30, .segment_version = 20, .entries = 0xc4e3a23975b2cf62 },
+    // A pipeline's sink writes and its source cursor are one entry
+    // (`processing_sink_batch`), sent as channel messages; the cursor is
+    // the sinks machine's (`processing.cursor`). `processing_checkpoint`
+    // is gone.
+    .{ .format = 31, .segment_version = 21, .entries = 0xf3bbabb586de9d4c },
 };
 
 comptime {

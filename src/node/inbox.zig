@@ -41,7 +41,6 @@ pub const Tag = enum(u8) {
     shutdown, // Graceful shutdown signal
     action_start, // Start an action run on the owning shard: payload from ActionsHandler.encodeStartRunMessage
     cancel_reads, // a client of the sender closed: drop its blocking reads parked here, answering each empty; sequence as forward_request
-    sink_write, // a processing sink's write of a target this shard owns: payload from processing/sink_write.zig SinkWrite.encode
     source_read, // a pipeline on the sender asks for a page of a source this shard owns: payload from processing/source_page.zig Read.encode
     source_page, // the page a source_read asked for, for a pipeline here: payload from processing/source_page.zig Page.Builder
     action_finished, // how a run a workflow on the receiver waits on ended: payload from ActionsHandler.sendFinished
