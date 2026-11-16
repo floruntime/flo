@@ -280,12 +280,23 @@ test "e2e/ts: info, query and floql answer times in ns, to the nanosecond" {
     try testing.expectEqual(@as(u8, 0), info.exit_code);
     try testing.expect(info.stdoutContains("1708700400123456789"));
     try testing.expect(info.stdoutContains("1708700400987654321"));
+    // The table reads in ms, as the CLI's other times do.
+    var info_table = try ctx.cli.run(&.{ "ts", "info", "wire" });
+    defer info_table.deinit();
+    try testing.expectEqual(@as(u8, 0), info_table.exit_code);
+    try testing.expect(info_table.stdoutContains("oldest_ms: 1708700400123\n"));
+    try testing.expect(info_table.stdoutContains("newest_ms: 1708700400987\n"));
 
     // A query's buckets: one second-long window, its start in ns beside ms.
     var query = try ctx.cli.run(&.{ "ts", "query", "wire", "--field", "v", "--from", "1708700000000", "--window", "1s", "--agg", "count", "-o", "json" });
     defer query.deinit();
     try testing.expectEqual(@as(u8, 0), query.exit_code);
     try testing.expect(query.stdoutContains("\"start_ms\": 1708700400000, \"start_ns\": 1708700400000000000, \"value\": 2.000000"));
+    // A window of 0 would be read as none, so a minute: refused here.
+    var no_window = try ctx.cli.run(&.{ "ts", "query", "wire", "--field", "v", "--window", "0s" });
+    defer no_window.deinit();
+    try testing.expectEqual(@as(u8, 2), no_window.exit_code);
+    try testing.expect(no_window.stderrContains("--window must be more than 0"));
 
     // FloQL: a bare range is epoch ms; one in ns is refused, saying so.
     var floql = try ctx.cli.run(&.{ "ts", "floql", "wire[1708700400000..1708700401000] | field(v)" });
@@ -297,6 +308,23 @@ test "e2e/ts: info, query and floql answer times in ns, to the nanosecond" {
     // Refused by the server: exit 3.
     try testing.expectEqual(@as(u8, 3), pasted.exit_code);
     try testing.expect(pasted.stderrContains("past the year 3000 as epoch milliseconds"));
+    // A start of 0 is a time: the end still bounds the range, and is checked.
+    var from_zero = try ctx.cli.run(&.{ "ts", "floql", "wire[0..1708700400500] | field(v)" });
+    defer from_zero.deinit();
+    try testing.expectEqual(@as(u8, 0), from_zero.exit_code);
+    try testing.expect(from_zero.stdoutContains("1708700400123: 1.0000"));
+    try testing.expect(!from_zero.stdoutContains("1708700400987"));
+    var zero_pasted = try ctx.cli.run(&.{ "ts", "floql", "wire[0..1708700400123456789] | field(v)" });
+    defer zero_pasted.deinit();
+    try testing.expectEqual(@as(u8, 3), zero_pasted.exit_code);
+    try testing.expect(zero_pasted.stderrContains("past the year 3000 as epoch milliseconds"));
+    // Backwards, absolute or relative: refused, not read as empty.
+    for ([_][]const u8{ "wire[1708700401000..1708700400000] | field(v)", "wire[1h..2h] | field(v)" }) |q| {
+        var backwards = try ctx.cli.run(&.{ "ts", "floql", q });
+        defer backwards.deinit();
+        try testing.expectEqual(@as(u8, 3), backwards.exit_code);
+        try testing.expect(backwards.stderrContains("the range's start is after its end"));
+    }
 }
 
 test "e2e/ts: write batch reports a bad line and stores the rest" {

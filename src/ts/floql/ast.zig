@@ -70,11 +70,13 @@ pub const TimeRange = struct {
     /// Duration in milliseconds (for relative ranges like "1h", "30m")
     duration_ms: i64 = 0,
 
-    /// Explicit from/to: epoch ms, or with `relative` durations back from
-    /// now. 0 = unset.
+    /// Explicit from/to: with `absolute` epoch ms (to only if `to_given`),
+    /// with `relative` durations back from now.
     from_ms: i64 = 0,
     to_ms: i64 = 0,
     relative: bool = false,
+    absolute: bool = false,
+    to_given: bool = false,
 };
 
 // ============================================================================

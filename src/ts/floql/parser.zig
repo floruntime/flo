@@ -188,13 +188,10 @@ pub const Parser = struct {
             self.skipWhitespace();
             if (self.consumeStr("..")) {
                 const to_ms = self.parseIntLiteral() orelse return error.InvalidNumber;
-                return TimeRange{
-                    .from_ms = from_ms,
-                    .to_ms = to_ms,
-                };
+                return TimeRange{ .from_ms = from_ms, .to_ms = to_ms, .absolute = true, .to_given = true };
             }
             // One absolute timestamp: a lower bound, with no upper one.
-            return TimeRange{ .from_ms = from_ms };
+            return TimeRange{ .from_ms = from_ms, .absolute = true };
         }
 
         return error.InvalidDuration;

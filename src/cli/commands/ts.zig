@@ -206,13 +206,14 @@ fn parseDuration(s: []const u8) ?i64 {
     const unit = s[s.len - 1];
     const num = std.fmt.parseInt(i64, num_str, 10) catch return null;
 
-    return switch (unit) {
-        's' => num * 1000,
-        'm' => num * 60 * 1000,
-        'h' => num * 3600 * 1000,
-        'd' => num * 86400 * 1000,
-        else => null,
+    const scale: i64 = switch (unit) {
+        's' => 1000,
+        'm' => 60 * 1000,
+        'h' => 3600 * 1000,
+        'd' => 86400 * 1000,
+        else => return null,
     };
+    return std.math.mul(i64, num, scale) catch null;
 }
 
 // ========================================================================
@@ -594,6 +595,8 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
     const from_ms = if (from_str.len > 0) parseTimeArg(from_str) orelse return outcome.usage(ctx, "--from '{s}' isn't a time", .{from_str}) else 0;
     const to_ms = if (to_str.len > 0) parseTimeArg(to_str) orelse return outcome.usage(ctx, "--to '{s}' isn't a time", .{to_str}) else 0;
     const window_ms = parseDuration(window_str) orelse return outcome.usage(ctx, "--window '{s}' isn't a duration (Ns, Nm, Nh or Nd)", .{window_str});
+    // Sent as 0, a window would be read as absent, so a minute.
+    if (window_ms <= 0) return outcome.usage(ctx, "--window must be more than 0", .{});
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -964,6 +967,8 @@ test "parseDuration" {
     try std.testing.expectEqual(@as(i64, 3600000), parseDuration("1h").?);
     try std.testing.expectEqual(@as(i64, 86400000), parseDuration("1d").?);
     try std.testing.expectEqual(@as(i64, 30000), parseDuration("30s").?);
+    // Too long for an i64 of ms: not a duration, not an overflow.
+    try std.testing.expectEqual(@as(?i64, null), parseDuration("999999999999999d"));
 }
 
 test "ts: query and floql answers parse, and cut-short ones are Truncated" {

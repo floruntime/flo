@@ -51,7 +51,7 @@ pub const MAX_FLOQL_POINTS = 1 << 17;
 pub const MAX_QUERY_SCANNED = 1 << 20;
 pub const TOO_MANY_FLOQL_SCANNED = std.fmt.comptimePrint("bad request: more than {d} points match a FloQL query; narrow its range or its tags", .{MAX_FLOQL_POINTS});
 pub const TOO_MANY_QUERY_POINTS = std.fmt.comptimePrint("bad request: more than {d} points match a query; narrow its range or its tags", .{MAX_QUERY_SCANNED});
-pub const TOO_MANY_QUERY_BUCKETS = std.fmt.comptimePrint("bad request: the range holds more than {d} windows of this width; widen the window (it is in nanoseconds) or narrow the range", .{MAX_QUERY_BUCKETS});
+pub const TOO_MANY_QUERY_BUCKETS = std.fmt.comptimePrint("bad request: the matching points span more than {d} windows of this width; widen the window (it is in nanoseconds) or narrow the range", .{MAX_QUERY_BUCKETS});
 const StoredPoint = ts_mod.StoredPoint;
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
@@ -462,7 +462,7 @@ pub const TSHandler = struct {
         else
             "value";
 
-        // Times and the window in ns; 0 (or none) leaves the bound open.
+        // Times in ns; 0 (or none) leaves the bound open.
         const from_ns: u64 = switch (nsOption(req, .ts_from_ns)) {
             .bad => |why| return .{ .err = .{ .code = .invalid_request, .message = why } },
             .none => 0,
@@ -480,10 +480,8 @@ pub const TSHandler = struct {
             "avg";
 
         // Buckets are aligned to the epoch (ts / window * window) so a bucket's
-        // identity does not depend on the query's `from`.
-        // A window given as 0 is refused, not taken as the default: a client
-        // still sending ms would otherwise get windows a million times too
-        // narrow, or none.
+        // identity does not depend on the query's `from`. Absent, the window
+        // is a minute; given, it must be more than 0.
         const window_ns: u64 = if (req.findOption(.ts_window_ns) == null) DEFAULT_WINDOW_NS else switch (nsOption(req, .ts_window_ns)) {
             .bad => |why| return .{ .err = .{ .code = .invalid_request, .message = why } },
             .none => return .{ .err = .{ .code = .invalid_request, .message = "ts query: a window must be more than 0 ns" } },
@@ -645,7 +643,7 @@ pub const TSHandler = struct {
         // When pipeline has stages, it returns a new SeriesSet and does NOT free initial.
         var result_set = floql_executor.execute(query.stages, initial, self.allocator) catch |err| {
             initial.deinit();
-            if (err == error.InvalidInput) return .{ .err = .{ .code = .invalid_request, .message = "floql: a stage argument is out of range (percentile 0-100, at most 1000000 buckets per series)" } };
+            if (err == error.InvalidInput) return .{ .err = .{ .code = .invalid_request, .message = "floql: a stage argument is out of range (percentile 0-100, at most 1000000 buckets per series, a window or rate of at most 106751 days)" } };
             return .{ .err = .{ .code = .internal_error, .message = "floql: execution failed" } };
         };
         defer result_set.deinit();
@@ -850,11 +848,13 @@ fn floqlRange(range: floql_ast.TimeRange, now_ms: i64, buf: []u8) union(enum) { 
     } else if (range.relative) {
         from_ms = now_ms -| range.from_ms;
         to_ms = now_ms -| range.to_ms;
-    } else if (range.from_ms > 0) {
-        for ([_]i64{ range.from_ms, range.to_ms }) |t| if (t > FLOQL_LATEST_MS)
+    } else if (range.absolute) {
+        if (range.from_ms < 0) return .{ .bad = "floql: a bare time in a range is epoch ms and must not be negative" };
+        const ends = [_]i64{ range.from_ms, range.to_ms };
+        for (ends[0..if (range.to_given) 2 else 1]) |t| if (t > FLOQL_LATEST_MS)
             return .{ .bad = std.fmt.bufPrint(buf, "floql: {d} is past the year 3000 as epoch milliseconds; a bare time in a range is ms (did you paste ns or us?)", .{t}) catch "floql: a bare time in a range is epoch ms, and this one is past the year 3000" };
         from_ms = range.from_ms;
-        if (range.to_ms > 0) to_ms = range.to_ms;
+        if (range.to_given) to_ms = range.to_ms;
     }
     if (to_ms) |t| if (from_ms > t) return .{ .bad = "floql: the range's start is after its end" };
     return .{ .ok = .{
@@ -911,9 +911,7 @@ const BucketAcc = struct {
 
 /// Serialize an aggregate query result.
 ///
-/// Wire format (the CLI parser in cli/commands/ts.zig must match byte for byte —
-/// it previously read a `[hash:u64]` here that no encoder ever wrote, which
-/// misaligned the whole stream and rendered an empty table):
+/// Wire format (the CLI parser in cli/commands/ts.zig must match byte for byte):
 ///   [series_count:u32][key_len:u32][key][bucket_count:u32]([start_ns:i64][value:f64])*
 fn serializeQueryResult(allocator: Allocator, measurement: []const u8, buckets: []const QueryBucket) ![]u8 {
     if (buckets.len == 0) {
@@ -1299,8 +1297,10 @@ fn refusedWith(h: *TSHandler, req: Request) ![]const u8 {
     }
 }
 
-/// A query's buckets as `(start_ns, value)`.
-fn queryBuckets(h: *TSHandler, measurement: []const u8, opts: []const u8, out: [][2]f64) ![]const [2]f64 {
+const TestBucket = struct { start_ns: i64, value: f64 };
+
+/// A query's buckets: start_ns stays an i64, which an f64 can't hold exactly.
+fn queryBuckets(h: *TSHandler, measurement: []const u8, opts: []const u8, out: []TestBucket) ![]const TestBucket {
     const result = h.handleCommand(makeRequest(.ts_query, measurement, "", opts));
     defer h.freeResult(result);
     const data = switch (result) {
@@ -1313,7 +1313,7 @@ fn queryBuckets(h: *TSHandler, measurement: []const u8, opts: []const u8, out: [
     const n = std.mem.readInt(u32, data[at..][0..4], .little);
     at += 4;
     for (out[0..n]) |*b| {
-        b.* = .{ @floatFromInt(std.mem.readInt(i64, data[at..][0..8], .little)), @bitCast(std.mem.readInt(u64, data[at + 8 ..][0..8], .little)) };
+        b.* = .{ .start_ns = std.mem.readInt(i64, data[at..][0..8], .little), .value = @bitCast(std.mem.readInt(u64, data[at + 8 ..][0..8], .little)) };
         at += 16;
     }
     return out[0..n];
@@ -1332,13 +1332,14 @@ test "ts handler: a query takes its range and window in ns, and answers bucket s
     var b = OptionsBuilder.init(&ob);
     try b.addString(.ts_aggregation, "sum");
     try b.addI64(.ts_window_ns, 400);
-    var out: [8][2]f64 = undefined;
+    var out: [8]TestBucket = undefined;
     // Windows of 400 ns from the epoch: [0,400) [400,800) [800,1200) past base.
     const got = try queryBuckets(&handler, "disk", b.getOptions(), &out);
     try testing.expectEqual(@as(usize, 3), got.len);
-    try testing.expectEqual(@as(f64, @floatFromInt(base)), got[0][0]);
-    try testing.expectEqual(@as(f64, @floatFromInt(base + 800)), got[2][0]);
-    try testing.expectEqual(@as(f64, 3), got[2][1]);
+    try testing.expectEqual(@as(i64, @intCast(base)), got[0].start_ns);
+    try testing.expectEqual(@as(i64, @intCast(base + 400)), got[1].start_ns);
+    try testing.expectEqual(@as(i64, @intCast(base + 800)), got[2].start_ns);
+    try testing.expectEqual(@as(f64, 3), got[2].value);
 
     // A range in ns: from the second point on.
     var rb_buf: [96]u8 = undefined;
@@ -1347,10 +1348,10 @@ test "ts handler: a query takes its range and window in ns, and answers bucket s
     try rb.addI64(.ts_from_ns, @intCast(base + 500));
     const ranged = try queryBuckets(&handler, "disk", rb.getOptions(), &out);
     try testing.expectEqual(@as(usize, 1), ranged.len);
-    try testing.expectEqual(@as(f64, 2), ranged[0][1]);
+    try testing.expectEqual(@as(f64, 2), ranged[0].value);
 
-    // A window of 0, or one so narrow the points span more windows than an
-    // answer holds (a client still sending ms), is refused.
+    // A window of 0 is refused, as is one so narrow the matching points
+    // span more windows than an answer holds.
     var zb_buf: [64]u8 = undefined;
     var zb = OptionsBuilder.init(&zb_buf);
     try zb.addI64(.ts_window_ns, 0);
@@ -1383,9 +1384,11 @@ test "ts handler: a floql range counts back from now, takes bare numbers as epoc
         .{ .range = .{ .duration_ms = 3_600_000 }, .from = (now - 3_600_000) * ms, .to = now * ms },
         // [2h..1h]: two hours ago to one hour ago.
         .{ .range = .{ .from_ms = 7_200_000, .to_ms = 3_600_000, .relative = true }, .from = (now - 7_200_000) * ms, .to = (now - 3_600_000) * ms },
-        .{ .range = .{ .from_ms = 1_000, .to_ms = 2_000 }, .from = 1_000 * ms, .to = 2_000 * ms },
+        .{ .range = .{ .from_ms = 1_000, .to_ms = 2_000, .absolute = true, .to_given = true }, .from = 1_000 * ms, .to = 2_000 * ms },
         // One bare number: a lower bound.
-        .{ .range = .{ .from_ms = 1_000 }, .from = 1_000 * ms, .to = std.math.maxInt(u64) },
+        .{ .range = .{ .from_ms = 1_000, .absolute = true }, .from = 1_000 * ms, .to = std.math.maxInt(u64) },
+        // 0 is a time like any other: [0..T] keeps its upper bound.
+        .{ .range = .{ .from_ms = 0, .to_ms = 2_000, .absolute = true, .to_given = true }, .from = 0, .to = 2_000 * ms },
     };
     for (cases) |c| {
         const r = floqlRange(c.range, now, &buf).ok;
@@ -1393,8 +1396,11 @@ test "ts handler: a floql range counts back from now, takes bare numbers as epoc
         try testing.expectEqual(c.to, r.to_ns);
     }
     try testing.expectEqualStrings("floql: the range's start is after its end", floqlRange(.{ .from_ms = 3_600_000, .to_ms = 7_200_000, .relative = true }, now, &buf).bad);
-    try testing.expectEqualStrings("floql: the range's start is after its end", floqlRange(.{ .from_ms = 2_000, .to_ms = 1_000 }, now, &buf).bad);
-    try testing.expect(std.mem.startsWith(u8, floqlRange(.{ .from_ms = 1_708_700_400_000_000_000 }, now, &buf).bad, "floql: 1708700400000000000 is past the year 3000 as epoch milliseconds"));
+    try testing.expectEqualStrings("floql: the range's start is after its end", floqlRange(.{ .from_ms = 2_000, .to_ms = 1_000, .absolute = true, .to_given = true }, now, &buf).bad);
+    try testing.expect(std.mem.startsWith(u8, floqlRange(.{ .from_ms = 1_708_700_400_000_000_000, .absolute = true }, now, &buf).bad, "floql: 1708700400000000000 is past the year 3000 as epoch milliseconds"));
+    // With a start of 0 the upper bound is still checked.
+    try testing.expect(std.mem.startsWith(u8, floqlRange(.{ .from_ms = 0, .to_ms = 1_708_700_400_000_000_000, .absolute = true, .to_given = true }, now, &buf).bad, "floql: 1708700400000000000 is past the year 3000"));
+    try testing.expectEqualStrings("floql: a bare time in a range is epoch ms and must not be negative", floqlRange(.{ .from_ms = -5, .to_ms = 1_000, .absolute = true, .to_given = true }, now, &buf).bad);
 }
 
 test "ts handler: a floql answer's points carry their time in ns" {

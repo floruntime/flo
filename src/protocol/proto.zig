@@ -331,7 +331,7 @@ pub const OptionTag = enum(u8) {
     // Time-Series Options (0x60 - 0x6F)
     ts_from_ns = 0x60, // i64: start of the range, inclusive, in Unix ns (0 = none)
     ts_to_ns = 0x61, // i64: end of the range, inclusive, in Unix ns (0 = none)
-    ts_window_ns = 0x62, // i64: aggregation window width, in ns (0 = a minute)
+    ts_window_ns = 0x62, // i64: aggregation window width, in ns (absent = a minute; 0 is refused)
     ts_aggregation = 0x63, // string: Aggregation function name (avg, sum, count, min, max)
     ts_field = 0x64, // string: Field name filter (empty = "value")
     ts_tags = 0x65, // string: Comma-separated tag filters "key=val,key2=val2"

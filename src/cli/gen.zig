@@ -258,8 +258,13 @@ fn print(ctx: *Context, comptime op: ops.Op, answer: op.response.Value) Error!vo
             if (op.cli.render == .table) try printTable(ctx, f.T, v, format != .raw) else try printListRecord(ctx, f, v);
         } else if (f.T.kind == .optional) {
             if (v) |x| {
-                emit(ctx, side, f.name ++ ": ", .{});
-                if (comptime isHex(op, f.name)) emit(ctx, side, "{x}", .{x}) else printScalarTo(ctx, side, f.T.Inner, x);
+                if (comptime isNsTime(f)) {
+                    // Times in ms read as the other CLI times do; -o json keeps the ns.
+                    emit(ctx, side, f.name[0 .. f.name.len - 3] ++ "_ms: {d}", .{@divFloor(x, std.time.ns_per_ms)});
+                } else {
+                    emit(ctx, side, f.name ++ ": ", .{});
+                    if (comptime isHex(op, f.name)) emit(ctx, side, "{x}", .{x}) else printScalarTo(ctx, side, f.T.Inner, x);
+                }
                 emit(ctx, side, "\n", .{});
                 printed = true;
             }
@@ -272,6 +277,11 @@ fn print(ctx: *Context, comptime op: ops.Op, answer: op.response.Value) Error!vo
     }
     // An answer with nothing to say (an expire, a rollback) says it went.
     if (!printed) ctx.print("OK\n", .{});
+}
+
+/// An optional integer named `*_ns` (ts info's oldest and newest): a time.
+fn isNsTime(comptime f: schema.Field) bool {
+    return f.T.kind == .optional and f.T.Inner.kind == .integer and std.mem.endsWith(u8, f.name, "_ns");
 }
 
 const Stream = enum { out, err };

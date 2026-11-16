@@ -47,7 +47,7 @@ pub fn execute(
 
         // Update window tracking
         switch (stage) {
-            .window => |w| current_window_ns = w.interval_ms * std.time.ns_per_ms,
+            .window => |w| current_window_ns = try durationNs(w.interval_ms),
             else => {},
         }
 
@@ -63,6 +63,11 @@ pub fn execute(
     return current;
 }
 
+/// A query's duration, ms, in ns: one too long for an i64 of ns is refused.
+fn durationNs(ms: i64) ExecuteError!i64 {
+    return std.math.mul(i64, ms, std.time.ns_per_ms) catch error.InvalidInput;
+}
+
 fn applyStage(
     stage: Stage,
     input: SeriesSet,
@@ -70,9 +75,9 @@ fn applyStage(
     allocator: Allocator,
 ) ExecuteError!SeriesSet {
     return switch (stage) {
-        .window => |w| stages.applyWindow(input, w.interval_ms * std.time.ns_per_ms, allocator) catch return error.InvalidInput,
+        .window => |w| stages.applyWindow(input, try durationNs(w.interval_ms), allocator) catch return error.InvalidInput,
         .aggregate => |a| stages.applyAggregate(input, a.function, current_window_ns, allocator) catch return error.InvalidInput,
-        .rate => |r| stages.applyRate(input, r.interval_ms * std.time.ns_per_ms, allocator) catch return error.InvalidInput,
+        .rate => |r| stages.applyRate(input, try durationNs(r.interval_ms), allocator) catch return error.InvalidInput,
         .delta => stages.applyDelta(input, allocator) catch return error.InvalidInput,
         .where_filter => |w| stages.applyWhere(input, w.predicate, allocator) catch return error.InvalidInput,
         .group_by => |g| stages.applyGroupBy(input, g.tag, allocator) catch return error.InvalidInput,
@@ -131,6 +136,19 @@ fn makeTestInput(allocator: Allocator) !SeriesSet {
     series[0] = .{ .key = "cpu,host=web-01", .field = "value", .points = points };
 
     return SeriesSet.fromOwned(allocator, series);
+}
+
+test "executor: a window or rate too long for an i64 of nanoseconds is refused, not overflowed" {
+    const allocator = std.testing.allocator;
+    // 106752 days is past what an i64 of ns holds; it still parses as ms.
+    const days: i64 = 106752;
+    const too_long = (@import("ast.zig").parseDuration("106752d")).?;
+    try std.testing.expectEqual(days * 86_400_000, too_long);
+    for ([_]Stage{ .{ .window = .{ .interval_ms = too_long } }, .{ .rate = .{ .interval_ms = too_long } } }) |stage| {
+        var input = try makeTestInput(allocator);
+        defer input.deinit();
+        try std.testing.expectError(error.InvalidInput, execute(&.{stage}, input, allocator));
+    }
 }
 
 test "executor_window_avg_pipeline" {
