@@ -99,7 +99,8 @@ pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []con
 /// [status:u8][batch_size:u32][records_processed:u64][created_at:i64]
 /// [reason_len:u16][reason], this node's runtime of it ([running:u8]
 /// [records_in:u64][records_out:u64][watermark_ms:i64][tick_avg_us:u64]
-/// [tick_max_us:u64][uptime_ms:u64]) and [yaml_len:u32][yaml].
+/// [tick_max_us:u64][uptime_ms:u64][late_edge_ms:u64][late_points:u64]) and
+/// [yaml_len:u32][yaml].
 const JobStatus = struct {
     id: []const u8,
     name: []const u8,
@@ -115,6 +116,9 @@ const JobStatus = struct {
     tick_avg_us: u64,
     tick_max_us: u64,
     uptime_ms: u64,
+    /// maxInt with no count: no TS source, or a window past every edge.
+    late_edge_ms: u64,
+    late_points: u64,
     yaml: []const u8,
 
     fn decode(data: []const u8) ?JobStatus {
@@ -134,6 +138,8 @@ const JobStatus = struct {
             .tick_avg_us = r.readU64() orelse return null,
             .tick_max_us = r.readU64() orelse return null,
             .uptime_ms = r.readU64() orelse return null,
+            .late_edge_ms = r.readU64() orelse return null,
+            .late_points = r.readU64() orelse return null,
             .yaml = r.readLengthPrefixed(u32) orelse return null,
         };
         return if (r.remainingLen() == 0) st else null;
@@ -161,6 +167,13 @@ const JobStatus = struct {
         try m.intField("tick_max_us", self.tick_max_us);
         if (self.watermark_ms > 0) try m.intField("watermark_ms", self.watermark_ms) else try m.nullField("watermark_ms");
         try m.intField("uptime_ms", self.uptime_ms);
+        if (self.late_edge_ms != std.math.maxInt(u64)) {
+            try m.intField("late_edge_ms", self.late_edge_ms);
+            try m.intField("late_points", self.late_points);
+        } else {
+            try m.nullField("late_edge_ms");
+            try m.nullField("late_points");
+        }
         try m.end();
     }
 };
@@ -375,8 +388,9 @@ test "processing: a listed status reads as its first word, and a status answer d
             return std.mem.toBytes(std.mem.nativeToLittle(u64, v));
         }
     }.of;
-    // Running on this node for 2 s: 40 in, 10 out, ticks of 1500 us on average.
-    const runtime = [_]u8{1} ++ u64le(40) ++ u64le(10) ++ u64le(5) ++ u64le(1500) ++ u64le(3000) ++ u64le(2000);
+    // Running on this node for 2 s: 40 in, 10 out, ticks of 1500 us on
+    // average, and 3 points more than 30 s late.
+    const runtime = [_]u8{1} ++ u64le(40) ++ u64le(10) ++ u64le(5) ++ u64le(1500) ++ u64le(3000) ++ u64le(2000) ++ u64le(30_000) ++ u64le(3);
     const answer = [_]u8{ 1, 0, 'j', 1, 0, 'n', 3, 10, 0, 0, 0 } ++ u64le(7) ++ u64le(9) ++ [_]u8{ 2, 0, 'n', 'o' } ++ runtime ++ [_]u8{ 2, 0, 0, 0, 'a', ':' };
     const st = JobStatus.decode(&answer).?;
     try std.testing.expectEqualStrings("j", st.id);
@@ -387,6 +401,8 @@ test "processing: a listed status reads as its first word, and a status answer d
     try std.testing.expect(st.running);
     try std.testing.expectEqual(@as(u64, 20), st.perSec(st.records_in));
     try std.testing.expectEqual(@as(u64, 5), st.perSec(st.records_out));
+    try std.testing.expectEqual(@as(u64, 30_000), st.late_edge_ms);
+    try std.testing.expectEqual(@as(u64, 3), st.late_points);
     try std.testing.expectEqualStrings("a:", st.yaml);
     try std.testing.expect(JobStatus.decode(answer[0 .. answer.len - 1]) == null);
 }

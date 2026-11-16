@@ -61,6 +61,13 @@ function pDur(ms0: number): string {
   return Math.floor(h / 24) + 'd ' + (h % 24) + 'h'
 }
 
+/** A late-point edge: whole seconds, minutes or hours. */
+function edgeDur(ms: number): string {
+  if (ms >= 3600000 && ms % 3600000 === 0) return ms / 3600000 + 'h'
+  if (ms >= 60000 && ms % 60000 === 0) return ms / 60000 + 'm'
+  return ms / 1000 + 's'
+}
+
 /* ---------- pipeline YAML → DAG (minimal, structure-specific parser) ---------- */
 type Endpoint = { name: string; kind: string; target: string }
 type Op = { type: string; name: string }
@@ -376,6 +383,7 @@ function JobDetail({ ns, job, onBack }: { ns: string; job: ProcessingJobInfo; on
                   ['Tick avg · max', m ? `${fixed(m.tick_avg_us, 'µs')} · ${fixed(m.tick_max_us, 'µs')}` : DASH],
                   ['Watermark', m?.watermark_ms != null ? tfmt(m.watermark_ms) : DASH],
                   ['Uptime on this node', m ? pDur(m.uptime_ms) : DASH],
+                  ['Late points', m?.late_edge_ms != null ? `≥ ${pfmtN(m.late_points ?? 0)}, over ${edgeDur(m.late_edge_ms)} behind` : DASH],
                 ] as [string, string][]
               ).map(([k, v]) => (
                 <div className="kvrow2" key={k}>
