@@ -584,6 +584,9 @@ pub const Shard = struct {
     flushed_index: u64 = 0,
     /// This shard's side of its channels, while it leads.
     channel: channel_driver.Driver,
+    /// What its channel outboxes may hold before its pipelines stop adding
+    /// to them, sized by the runtime from the node's memory.
+    outbox_caps: channel_driver.OutboxCaps = .{},
     /// When `noteSenderBug` last logged.
     sender_bug_warn_ms: u64 = 0,
     /// When `noteSinkRefusal` last logged, and how many it has counted.
@@ -1463,15 +1466,12 @@ pub const Shard = struct {
         log.err("shard {d}: a channel message from shard {d} was refused as that shard's bug ({s}): {s}; this is a bug in this build, not in the data", .{ self.id, m.from, @tagName(bug), why });
     }
 
-    /// Messages this shard has sent and its receivers haven't acked, over
-    /// every channel.
-    fn channelUnacked(self: *Shard) u64 {
+    /// Payload bytes this shard's channel outboxes hold, over every
+    /// channel: what `outbox_caps.shard` bounds.
+    pub fn outboxBytes(self: *Shard) u64 {
         const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
         var n: u64 = 0;
-        for (0..self.channel.count) |to| {
-            const meta = channels_mod.metaOf(read, @intCast(to));
-            n += meta.next_seq - 1 - meta.acked;
-        }
+        for (0..self.channel.count) |to| n += channels_mod.metaOf(read, @intCast(to)).bytes;
         return n;
     }
 
@@ -5250,7 +5250,7 @@ pub const Shard = struct {
                 for (self.channel.sender_bugs) |by_reason| n += by_reason[reason];
                 total.store(n, .monotonic);
             }
-            sm.channel_unacked_messages.store(self.channelUnacked(), .monotonic);
+            sm.channel_outbox_bytes.store(self.outboxBytes(), .monotonic);
             for (std.enums.values(proto.Reason)) |k| {
                 var n: u64 = 0;
                 for (self.channel.sink_refusals) |by_reason| n += by_reason.get(k);

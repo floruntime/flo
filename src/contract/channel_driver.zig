@@ -33,6 +33,23 @@ const Record = schema.Record;
 
 /// Most messages in flight past the receiver's applied ack.
 pub const WINDOW = 1024;
+
+/// How much a shard's channel outboxes may hold before the edge stops
+/// adding to them: per channel and in all. Sized per node, from its
+/// memory, and read only by its leaders at the edge, so two nodes may
+/// size them differently; never in state.
+pub const OutboxCaps = struct {
+    shard: u64 = 1 << 30,
+    channel: u64 = 128 << 20,
+
+    /// The caps for a node of `memory` bytes running `shards` shards:
+    /// an eighth of its memory over its shards, at most 1 GiB a shard,
+    /// and a quarter of that a channel, at most 128 MiB.
+    pub fn of(memory: u64, shards: u16) OutboxCaps {
+        const shard = @min(@as(u64, 1 << 30), memory / 8 / @max(shards, 1));
+        return .{ .shard = shard, .channel = @min(@as(u64, 128 << 20), shard / 4) };
+    }
+};
 /// Most payload bytes in one batch.
 pub const MAX_BATCH_BYTES = 1 << 20;
 pub const RESEND_MIN_MS = 200;

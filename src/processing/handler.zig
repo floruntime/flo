@@ -1625,9 +1625,10 @@ pub const ProcessingHandler = struct {
         /// parked cap). `target` is the sink whose write waits, when the
         /// first unacked message is one of this pipeline's; "" otherwise.
         busy: struct { shard: u16, target: []const u8 },
-        /// A whole window of this shard's writes to a sink's shard is
-        /// unacked, with no `busy` answer: it is slow or can't be reached.
-        unacked: struct { shard: u16, count: u64 },
+        /// This shard's outbox to a sink's shard (`to`), or all its
+        /// outboxes together (`to` null), hold their cap: what it sent
+        /// isn't taken as fast as it is made.
+        outbox: struct { to: ?u16, bytes: u64, cap: u64 },
         /// This shard's log has no room for another entry now.
         log,
         /// Its operators couldn't be built anew for this leader term, and
@@ -1644,6 +1645,12 @@ pub const ProcessingHandler = struct {
         for (pipe.sinks) |snk| if (self.namespaceIdOf(snk.namespace) == .invalid) return .{ .namespace = snk.namespace };
         if (self.haltedSinkShard(shard, pipe)) |to| return .{ .halted = to };
         const read: view_mod.ReadView = .{ .store = &shard.defaultPartition().store };
+        // Writes are never refused at apply for an outbox's sake: the edge
+        // stops adding to one at its cap, and a batch passes it by at most
+        // its own size.
+        const caps = shard.outbox_caps;
+        const total = shard.outboxBytes();
+        if (total >= caps.shard) return .{ .outbox = .{ .to = null, .bytes = total, .cap = caps.shard } };
         var to: u16 = 0;
         const shards: u16 = @max(self.peer_shard_count, 1);
         while (to < shards) : (to += 1) {
@@ -1654,9 +1661,7 @@ pub const ProcessingHandler = struct {
             // one with nothing outstanding has nothing to clear it.
             if (unacked > 0 and shard.channel.busySince(to) != null)
                 return .{ .busy = .{ .shard = to, .target = self.waitingSink(read, pipe, to, meta.acked + 1) } };
-            // The outbox has no cap of its own: a pipeline stops adding to
-            // a channel a whole window behind.
-            if (unacked >= channel_driver.WINDOW) return .{ .unacked = .{ .shard = to, .count = unacked } };
+            if (meta.bytes >= caps.channel) return .{ .outbox = .{ .to = to, .bytes = meta.bytes, .cap = caps.channel } };
         }
         const raft = shard.raft_node;
         if (raft.log.lastIndex() -| raft.last_applied >= raft_node_mod.MAX_OUTSTANDING) return .log;
@@ -2405,7 +2410,10 @@ pub const ProcessingHandler = struct {
                 std.fmt.bufPrint(buf, "waiting for room on shard {d} ({s})", .{ r.shard, r.target }) catch "waiting for room on a sink's shard"
             else
                 std.fmt.bufPrint(buf, "waiting for room on shard {d}", .{r.shard}) catch "waiting for room on a sink's shard",
-            .unacked => |u| std.fmt.bufPrint(buf, "waiting: {d} writes to shard {d} unacked", .{ u.count, u.shard }) catch "waiting: writes to a sink's shard unacked",
+            .outbox => |o| (if (o.to) |to|
+                std.fmt.bufPrint(buf, "waiting: the outbox to shard {d} is full ({d} of {d} MiB)", .{ to, o.bytes >> 20, o.cap >> 20 })
+            else
+                std.fmt.bufPrint(buf, "waiting: this shard's outboxes are full ({d} of {d} MiB)", .{ o.bytes >> 20, o.cap >> 20 })) catch "waiting: an outbox is full",
             .log => "waiting for room in this shard's log",
             .operators => |why| std.fmt.bufPrint(buf, "waiting: its operators couldn't be rebuilt: {s}", .{why}) catch "waiting: its operators couldn't be rebuilt",
         };
@@ -2943,7 +2951,8 @@ test "processing: what a pipeline waits for, in words" {
         .{ .w = .{ .halted = 2 }, .says = "waiting: sink shard 2 is halted" },
         .{ .w = .{ .busy = .{ .shard = 3, .target = "jobs" } }, .says = "waiting for room on shard 3 (jobs)" },
         .{ .w = .{ .busy = .{ .shard = 3, .target = "" } }, .says = "waiting for room on shard 3" },
-        .{ .w = .{ .unacked = .{ .shard = 1, .count = 1024 } }, .says = "waiting: 1024 writes to shard 1 unacked" },
+        .{ .w = .{ .outbox = .{ .to = 1, .bytes = 130 << 20, .cap = 128 << 20 } }, .says = "waiting: the outbox to shard 1 is full (130 of 128 MiB)" },
+        .{ .w = .{ .outbox = .{ .to = null, .bytes = 1 << 30, .cap = 1 << 30 } }, .says = "waiting: this shard's outboxes are full (1024 of 1024 MiB)" },
         .{ .w = .log, .says = "waiting for room in this shard's log" },
         .{ .w = .{ .operators = "out of memory" }, .says = "waiting: its operators couldn't be rebuilt: out of memory" },
     };
