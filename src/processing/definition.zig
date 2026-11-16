@@ -425,19 +425,18 @@ pub const JobDefinition = struct {
     }
 
     /// Why this job can't run, written into `buf`, if a record it reads
-    /// could have more sink writes than one entry carries: a pipeline's
-    /// writes for a record go in one entry with its cursor, so such a record
-    /// could never be written. Each sink writes once per record; a TS sink
-    /// with a `fields` map, once per field. A record may match every sink.
-    /// A floor, not a bound: an operator that emits several records for
-    /// one (a flatmap) multiplies it, and a record past it at run time is
-    /// skipped and counted.
+    /// can make more sink writes than one entry carries: a pipeline's
+    /// writes for a record go in one entry with its cursor, so such a
+    /// record could never be written. Each sink writes once per record it
+    /// matches; a TS sink with a `fields` map, once per field. This is the
+    /// most one record can make before an operator's fan-out (a flatmap)
+    /// multiplies it; a record past the limit at run time is skipped.
     pub fn sinkWritesRefusal(self: *const JobDefinition, buf: []u8) ?[]const u8 {
         const max = @import("../contract/channels.zig").MAX_SENDS;
         var writes: usize = 0;
         for (self.sinks.items) |snk| writes += if (snk.kind == .ts and snk.ts_field_keys.len > 0) snk.ts_field_keys.len / 2 else 1;
         if (writes <= max) return null;
-        return std.fmt.bufPrint(buf, "a record of this job makes at least {d} sink writes (one per sink, one per field of a TS sink's fields map), and one record may make at most {d}: use fewer sinks or fields, or split the job", .{ writes, max }) catch "a record of this job makes more sink writes than one record may make: use fewer sinks or fields, or split the job";
+        return std.fmt.bufPrint(buf, "a record of this job can make up to {d} sink writes (one per sink, one per field of a TS sink's fields map), and one record may make at most {d}: use fewer sinks or fields, or split the job", .{ writes, max }) catch "a record of this job can make more sink writes than one record may make: use fewer sinks or fields, or split the job";
     }
 
     /// Free all owned memory.
@@ -594,5 +593,5 @@ test "JobDefinition: a job whose record could make more sink writes than one ent
     try std.testing.expect(fits.sinkWritesRefusal(&why) == null);
     var past = try parser.parseJobDefinition(allocator, try Job.of(&buf, 64), null);
     defer past.deinit(allocator);
-    try std.testing.expectEqualStrings("a record of this job makes at least 65 sink writes (one per sink, one per field of a TS sink's fields map), and one record may make at most 64: use fewer sinks or fields, or split the job", past.sinkWritesRefusal(&why).?);
+    try std.testing.expectEqualStrings("a record of this job can make up to 65 sink writes (one per sink, one per field of a TS sink's fields map), and one record may make at most 64: use fewer sinks or fields, or split the job", past.sinkWritesRefusal(&why).?);
 }

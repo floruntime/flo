@@ -6141,7 +6141,10 @@ pub const Shard = struct {
         // A halted shard's leader is never ready (its applied index stops
         // short of the halt), yet its duties are still its own: held.
         const holds = self.raft_node.role == .leader and self.offline == null and self.halted != null;
-        if (leads or holds) self.runProducers() else self.duties.clear();
+        if (leads or holds) self.runProducers() else {
+            self.duties.clear();
+            self.processing_handler.stopLeading(self);
+        }
 
         // Shard 0's leader keeps the memory-budget settings rows current. It
         // runs here, not in the membership tick, because that tick is part of
@@ -6215,7 +6218,7 @@ pub const Shard = struct {
         // Drive processing pipelines (poll sources → write sinks)
         if (!self.heldIfHalted(.processing, self.processing_handler.pipelines.count() > 0)) {
             self.duties.note(.processing, if (self.processing_handler.tickPipelines(self)) .sink_halted else null, now);
-        }
+        } else self.processing_handler.stopLeading(self);
         // Drive workflow stream triggers (poll streams → start runs)
         if (!self.heldIfHalted(.stream_triggers, self.workflow_handler.stream_triggers.count() > 0)) {
             self.workflow_handler.tickStreamTriggers(self);
@@ -11207,19 +11210,19 @@ test "Shard: a processing sink in a namespace not yet published writes nothing u
     try std.testing.expectEqualStrings("pns", it.next().?.wait.namespace);
     try std.testing.expectEqual(@as(usize, 0), entriesOf(a, .processing_sink_batch, from_a));
     try std.testing.expectEqual(@as(u64, 1), metrics.processing.pipelines_waiting_namespace.load(.monotonic));
-    // A node that stops leading says nothing of it: its next leader will.
+    // A node that stops leading says nothing of it, gauge included: its
+    // next leader will.
     a.raft_node.role = .follower;
-    _ = a.processing_handler.tickPipelines(a);
+    _ = try a.tick(0);
     it = a.processing_handler.pipelines.valueIterator();
     try std.testing.expect(it.next().?.wait == .none);
     try std.testing.expectEqual(@as(u64, 0), metrics.processing.pipelines_waiting_namespace.load(.monotonic));
     a.raft_node.role = .leader;
     two.settle();
     try std.testing.expectEqual(id, two.namespaces.lookup("pns").?);
-    // Published: the stream is on shard 1, which applies the record its
-    // channel brings; nothing lands here.
-    it = a.processing_handler.pipelines.valueIterator();
-    while (it.next()) |pipe| pipe.last_poll_ms = 0;
+    // Published: the next tick, not the next poll, writes it. The stream
+    // is on shard 1, which applies the record its channel brings; nothing
+    // lands here.
     _ = a.processing_handler.tickPipelines(a);
     two.settle();
     pumpChannels(&two);
@@ -11505,6 +11508,74 @@ test "Shard: a poll reads its batch_size, a page after another as each batch app
         pumpChannels(&two);
         try std.testing.expectEqual(@as(usize, pipe.records_in), streamRecords(a, "bs-out", "default") + streamRecords(&two.shards[1], "bs-out", "default"));
     }
+}
+
+test "Shard: a stateful operator starts empty in a new term, as its records are read again, and counts none twice" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    for ([_][]const u8{ "r0", "r1", "r2" }) |r| _ = try a.stream_handler.appendPayloadToStream(source, "default", r);
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: windowed
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\operators:
+        \\  - name: five
+        \\    type: aggregate
+        \\    function: count
+        \\    window: count
+        \\    window_count: 5
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: win-out }}
+    , .{source});
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    const pipe = pit.next().?;
+    const Out = struct {
+        fn count(t: *TwoShards) usize {
+            return streamRecords(&t.shards[0], "win-out", "default") + streamRecords(&t.shards[1], "win-out", "default");
+        }
+    };
+    // Three counted, the window open: nothing to write, and the cursor
+    // not yet logged (the last batch was just now).
+    pipe.last_batch_ms = a.processing_handler.mono_ms();
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+    try std.testing.expect(pipe.ahead);
+    // Leader again in a later term: the three are read again from the
+    // logged cursor. Counted on top of what it held, they and the first
+    // two of them would close the window here.
+    const raft = a.raft_node;
+    raft.current_term += 1;
+    raft.ready_index = raft.last_applied;
+    pipe.last_batch_ms = a.processing_handler.mono_ms();
+    tickNow(a, pipe);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 6), pipe.records_in);
+    try std.testing.expectEqual(@as(usize, 0), Out.count(&two));
+    // Two more: the window closes on the fifth, once.
+    for ([_][]const u8{ "r3", "r4" }) |r| _ = try a.stream_handler.appendPayloadToStream(source, "default", r);
+    two.settle();
+    tickNow(a, pipe);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(usize, 1), Out.count(&two));
+    _ = b;
 }
 
 test "Shard: records whose operators emit nothing aren't read again while their cursor waits to be logged" {

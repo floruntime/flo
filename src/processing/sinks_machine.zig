@@ -1,8 +1,5 @@
 //! The sinks machine: each pipeline's source cursor, and the sink writes
-//! that move it. A sink batch moves a pipeline's cursor and sends its
-//! writes in one apply, so a record is written exactly once: a batch whose
-//! cursor has moved on (one a leader change left behind, or applied
-//! already) changes nothing.
+//! that move it.
 
 const std = @import("std");
 const entry_mod = @import("../storage/ual/entry.zig");

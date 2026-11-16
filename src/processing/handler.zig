@@ -133,6 +133,9 @@ pub const ProcessingHandler = struct {
     too_large: u64 = 0,
     /// Pipelines here waiting for a sink's namespace, as last counted.
     waiting_ns: usize = 0,
+    /// A wait or a skipped record has been reported since this node last
+    /// stopped leading: `stopLeading` has something to forget.
+    reported: bool = false,
 
     /// Most jobs a server holds. Every held job counts, stopped or not: each
     /// keeps its definition, up to 256 KiB, until `processing.remove` drops
@@ -218,24 +221,25 @@ pub const ProcessingHandler = struct {
         last_read_count: u32 = 0,
         /// Highest event-time watermark observed (0 = none / processing-time source).
         watermark_ms: i64 = 0,
-        /// When its ticks began waiting for room; 0 while they go through.
+        /// When it began waiting; 0 while it reads.
         held_since_ms: i64 = 0,
         /// Why it last couldn't read (`waitOf`).
         wait: Wait = .none,
         /// Its cursor as its last applied batch left it: the `from` of its
-        /// next batch. The batch it proposed and hasn't seen apply, by
-        /// index and term (index 0: none), and when it last proposed one.
+        /// next batch.
         from: sinks_machine.At = .{},
         /// Its read cursor is past `from` in term `ahead_term`, for records
         /// its operators have run on that no batch has logged yet: an idle
         /// page, or a record cut from a full batch, whose writes wait in
-        /// `carry` for the next. Read again only if the term moves on, as
-        /// operator state is.
+        /// `carry` for the next. A new term reads them again, its operators
+        /// built anew (`ops_term`).
         ahead: bool = false,
         ahead_term: u64 = 0,
         carry: std.ArrayListUnmanaged(u8) = .empty,
         carry_n: u32 = 0,
         carry_bytes: usize = 0,
+        /// The batch it proposed and hasn't seen apply, by index and term
+        /// (index 0: none), and when it last proposed one.
         batch_index: u64 = 0,
         batch_term: u64 = 0,
         last_batch_ms: u64 = 0,
@@ -244,9 +248,11 @@ pub const ProcessingHandler = struct {
         /// once that batch applies. `page_limit` is the last page's size.
         poll_left: u32 = 0,
         more: bool = false,
+        page_limit: usize = 0,
         /// When a poll last found it waiting, and counted it.
         wait_counted_ms: i64 = 0,
-        page_limit: usize = 0,
+        /// The leader term its operators' state is from (0: none yet).
+        ops_term: u64 = 0,
         /// A read of a source another shard owns, in flight: its number
         /// (0 for none), the term it was asked in, and when.
         read_seq: u64 = 0,
@@ -338,7 +344,8 @@ pub const ProcessingHandler = struct {
         held: bool = false,
         held_owned: []const u8 = "",
         /// Records this leader skipped for good, and the last one's place
-        /// and reason, for its status. Not replicated: a new leader starts
+        /// and reason, for its status. Not replicated: forgotten when this
+        /// node stops leading (`stopLeading`), and its next leader starts
         /// them again.
         drops: u64 = 0,
         last_drop: [160]u8 = undefined,
@@ -1428,29 +1435,11 @@ pub const ProcessingHandler = struct {
             return false;
         };
 
-        var count: usize = 0;
-        log.debug("createPipeline: {d} operator specs to process", .{op_specs.len});
-        for (op_specs) |*spec| {
-            log.debug("createPipeline: spec type='{s}' name='{s}' has_config={}", .{ spec.type_name, spec.name, spec.config != null });
-            if (spec.config) |cfg| {
-                for (cfg) |entry| {
-                    log.debug("createPipeline:   config: {s} = {s}", .{ entry.key, entry.value });
-                }
-            }
-            const result = native_registry.create(self.allocator, spec, tags) catch |err| {
-                log.err("processing job {s}: pipeline not started: operator '{s}' (type {s}) can't be built: {}", .{ job_id, spec.name, spec.type_name, err });
-                for (backings[0..count]) |*b| b.deinit(self.allocator);
-                self.allocator.free(backings);
-                self.allocator.free(ops);
-                return false;
-            };
-            if (result.backing == .kv_lookup) {
-                result.backing.kv_lookup.setLookupFn(shardKvLookup, @ptrCast(self));
-            }
-            backings[count] = result;
-            ops[count] = result.op;
-            count += 1;
-        }
+        const count = self.fillOperators(job_id, op_specs, tags, ops, backings) orelse {
+            self.allocator.free(backings);
+            self.allocator.free(ops);
+            return false;
+        };
 
         var pipe_state = makePipeState(self.allocator, src, sinks, tag_hash) catch {
             for (backings[0..count]) |*b| b.deinit(self.allocator);
@@ -1473,6 +1462,56 @@ pub const ProcessingHandler = struct {
             self.allocator.free(job_id);
             return false;
         };
+        return true;
+    }
+
+    /// Builds `specs` into `ops` and `backings`, each as long; how many, or
+    /// null with none left built when one can't be.
+    fn fillOperators(self: *ProcessingHandler, job_id: []const u8, specs: []const definition.OperatorSpec, tags: *const definition.TagRegistry, ops: []Operator, backings: []native_registry.CreateResult) ?usize {
+        var count: usize = 0;
+        for (specs) |*spec| {
+            const result = native_registry.create(self.allocator, spec, tags) catch |err| {
+                log.err("processing job {s}: pipeline not started: operator '{s}' (type {s}) can't be built: {}", .{ job_id, spec.name, spec.type_name, err });
+                for (backings[0..count]) |*b| b.deinit(self.allocator);
+                return null;
+            };
+            if (result.backing == .kv_lookup) {
+                result.backing.kv_lookup.setLookupFn(shardKvLookup, @ptrCast(self));
+            }
+            backings[count] = result;
+            ops[count] = result.op;
+            count += 1;
+        }
+        return count;
+    }
+
+    /// The pipeline's operators built again from its job's definition,
+    /// their state empty: what a new leader term starts from, as it reads
+    /// again from the logged cursor. False, the old ones kept, if they
+    /// can't be (out of memory); the caller tries again.
+    fn resetOperators(self: *ProcessingHandler, job: *const JobRecord, pipe: *PipelineState) bool {
+        const ns_name = if (job.ns_id == .default) "default" else if (self.ns_table) |t| t.nameOf(job.ns_id) orelse return false else return false;
+        var diag: parser.Diagnostic = .{};
+        var def = parser.parseJobDefinitionWithNamespace(self.allocator, job.yaml_owned, ns_name, &diag) catch return false;
+        defer def.deinit(self.allocator);
+        if (def.operators.items.len != pipe.operators.len) return false;
+        var tags = definition.TagRegistry{};
+        fillTagRegistry(&tags, &def);
+        const ops = self.allocator.alloc(Operator, pipe.operators.len) catch return false;
+        const backings = self.allocator.alloc(native_registry.CreateResult, pipe.operators.len) catch {
+            self.allocator.free(ops);
+            return false;
+        };
+        _ = self.fillOperators(job.job_id_owned, def.operators.items, &tags, ops, backings) orelse {
+            self.allocator.free(ops);
+            self.allocator.free(backings);
+            return false;
+        };
+        for (pipe.operator_backings) |*b| b.deinit(self.allocator);
+        self.allocator.free(pipe.operator_backings);
+        self.allocator.free(pipe.operators);
+        pipe.operators = ops;
+        pipe.operator_backings = backings;
         return true;
     }
 
@@ -1679,15 +1718,23 @@ pub const ProcessingHandler = struct {
             // that batch applies, not at the next poll.
             const poll_ms: i64 = @intCast(pipe.src_poll_ms);
             const due = now_ms - pipe.last_poll_ms >= poll_ms;
-            if (!due and !pipe.more) continue;
+            // A waiting one looks again each tick, so its wait ends as soon
+            // as it can.
+            if (!due and !pipe.more and pipe.wait == .none) continue;
             // Its batch in the log: nothing more until it applies.
             if (pipe.batch_term == raft.current_term and pipe.batch_index > raft.last_applied) continue;
+            // Operator state is a leader term's: a new term reads again
+            // from the logged cursor, so its operators start empty.
+            if (pipe.ops_term != raft.current_term) {
+                if (pipe.ops_term != 0 and pipe.operators.len > 0 and !self.resetOperators(job, pipe)) continue;
+                pipe.ops_term = raft.current_term;
+            }
             self.loadCursor(shard, job.ns_id, pipeline_key, pipe);
             pipe.wait = self.waitOf(shard, pipe);
             if (pipe.wait != .none) {
-                // Looked at again next tick, so the wait ends, and status
-                // stops saying so, as soon as it can; counted once a poll.
-                pipe.more = false;
+                self.reported = true;
+                // Counted once a poll; a poll it was partway through goes
+                // on once the wait ends.
                 self.noteWait(shard, pipe, now_ms - pipe.wait_counted_ms >= poll_ms);
                 continue;
             }
@@ -1723,6 +1770,28 @@ pub const ProcessingHandler = struct {
         return held;
     }
 
+    /// This node no longer runs its pipelines (it stopped leading, or its
+    /// shard halted): what it reported of them, their waits and the
+    /// records it skipped, is its next leader's to say. Forgotten, and out
+    /// of the node's gauges.
+    pub fn stopLeading(self: *ProcessingHandler, shard: *Shard) void {
+        self.noteWaitingNamespace(shard, 0);
+        if (!self.reported) return;
+        self.reported = false;
+        var it = self.pipelines.valueIterator();
+        while (it.next()) |pipe| {
+            pipe.wait = .none;
+            pipe.held_since_ms = 0;
+            pipe.more = false;
+        }
+        var jit = self.jobs.valueIterator();
+        while (jit.next()) |job| {
+            job.drops = 0;
+            job.last_drop_len = 0;
+            job.write_drops = 0;
+        }
+    }
+
     /// Pipelines here waiting for a sink's namespace, into the node's gauge.
     fn noteWaitingNamespace(self: *ProcessingHandler, shard: *Shard, now: usize) void {
         if (now == self.waiting_ns) return;
@@ -1732,7 +1801,8 @@ pub const ProcessingHandler = struct {
 
     /// Its logged cursor, as its last applied batch left it: the `from` its
     /// next batch names, and where it reads from unless it read past it
-    /// in this term. A batch a leader change lost is behind it.
+    /// in this term. Forgets the batch in flight: a lost one never applies,
+    /// and an applied one is already in the cursor.
     fn loadCursor(self: *ProcessingHandler, shard: *Shard, ns: NamespaceId, pipeline_key: []const u8, pipe: *PipelineState) void {
         const at = sinks_machine.cursorOf(.{ .store = &shard.defaultPartition().store }, ns, pipeline_key);
         pipe.from = at;
@@ -2006,15 +2076,18 @@ pub const ProcessingHandler = struct {
         const job = self.jobs.getPtr(base_job_id) orelse return;
         if (job.status != .running or job.held) return;
         if (pipe.batch_term == raft.current_term and pipe.batch_index > raft.last_applied) return;
-        // A leader change since the read was asked moved the cursor back:
-        // read again from there.
+        // A batch applied since the read was asked moved the cursor: read
+        // again from there.
         self.loadCursor(shard, job.ns_id, pipeline_key, pipe);
         const read = readAt(pipe);
         if (read.a != page.from_a or read.b != page.from_b) return;
         // As a tick checks before it reads. Asked again next tick, from
         // the same cursor.
         pipe.wait = self.waitOf(shard, pipe);
-        if (pipe.wait != .none) return;
+        if (pipe.wait != .none) {
+            self.reported = true;
+            return;
+        }
 
         self.ticking_job = base_job_id;
         defer self.ticking_job = "";
@@ -2048,7 +2121,7 @@ pub const ProcessingHandler = struct {
         if (processed > 0) if (shard.metrics_registry) |m| m.processing.recordProcessed(processed);
     }
 
-    /// Most often a pipeline logs a cursor move with no writes: records
+    /// At most this often a pipeline logs a cursor move with no writes: records
     /// its operators emitted nothing for, or appends that couldn't be
     /// read. Until then it reads on, ahead of its logged cursor.
     const IDLE_BATCH_MS: u64 = 1000;
@@ -2211,10 +2284,14 @@ pub const ProcessingHandler = struct {
             .messages = .{ .bytes = batch.w.written(), .count = batch.n },
         }) catch {
             log.err("job '{s}': a sink batch didn't encode; read again", .{self.ticking_job});
+            pipe.more = false;
             return self.rewindTo(pipe, pipe.from);
         };
         const r = shard.raft_node.propose(.processing_sink_batch, Flags.NONE, entry) catch |err| {
             if (!shard.quietHalted(err)) log.warn("job '{s}': sink batch not proposed: {s}; read again", .{ self.ticking_job, @errorName(err) });
+            // Read again at the next poll, not every tick while the log
+            // refuses it (a halted shard's does for good).
+            pipe.more = false;
             return self.rewindTo(pipe, pipe.from);
         };
         pipe.batch_index = r.index;
@@ -2317,6 +2394,7 @@ pub const ProcessingHandler = struct {
         self.sink_drops += 1;
         if (metrics) |m| m.processing.recordDropped();
         const job = self.jobs.getPtr(self.ticking_job) orelse return;
+        self.reported = true;
         job.write_drops += 1;
         const now = @import("stdx").time.milliTimestamp();
         if (now - job.drop_warn_ms < 30_000) return;
@@ -2331,6 +2409,7 @@ pub const ProcessingHandler = struct {
         self.sink_drops += 1;
         if (shard.metrics_registry) |m| m.processing.recordDropped();
         const job = self.jobs.getPtr(self.ticking_job) orelse return;
+        self.reported = true;
         job.drops += 1;
         const text = std.fmt.bufPrint(&job.last_drop, "{s}: {s}", .{ at, why }) catch null;
         job.last_drop_len = if (text) |t| t.len else job.last_drop.len;
