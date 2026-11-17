@@ -113,11 +113,15 @@ pub fn check(comptime machines: []const Machine) void {
 /// Every machine that follows `e`, an entry another applier applied and
 /// didn't refuse, in the list's order: each commits before the next runs, so
 /// a later one reads what an earlier one wrote, on every replica alike.
-pub fn observeAll(comptime machines: []const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, streams: ?Streams, e: *const Entry) ApplyError!void {
+/// Where an observed entry came from: the log itself, or a message another
+/// group sent, applied inside an inbound.
+pub const ObservedFrom = enum { entry, message };
+
+pub fn observeAll(comptime machines: []const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, streams: ?Streams, e: *const Entry, from: ObservedFrom) ApplyError!void {
     const etype: EntryType = @fromBackingInt(@intCast(e.header.entry_type));
     inline for (machines) |*m| {
         for (m.observes) |t| if (t == etype) {
-            try observeEntry(m, store, scratch, streams, e);
+            try observeEntry(m, store, scratch, streams, e, from);
             break;
         };
     }
@@ -131,7 +135,7 @@ pub fn observeAll(comptime machines: []const Machine, store: *store_mod.Store, s
 /// a leader's own proposal: a completion, a refusal), never because of a
 /// message it applied. So a chain of applies never sends, and needs no fuel
 /// or `hops` to bound it.
-pub fn observeEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, streams: ?Streams, e: *const Entry) ApplyError!void {
+pub fn observeEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, streams: ?Streams, e: *const Entry, from: ObservedFrom) ApplyError!void {
     if (m.observe_needed) |needed| if (!needed(.{ .store = store }, e)) return;
     _ = scratch.reset(.retain_capacity);
     const arena = scratch.allocator();
@@ -142,8 +146,9 @@ pub fn observeEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.he
     try m.observe.?(&view, e);
     for (view.ops.items) |op| if (!ownsFamily(m, op.fam)) return error.Halt;
     if (view.sends.items.len > 0) {
-        // An observed entry is never a message, so it is no channel's.
-        if (e.header.entry_type == @backingInt(EntryType.channel_inbound)) return error.Halt;
+        // Never for a message it observed: that would start a chain of
+        // sends no edge paid for. A bug in this build, so it halts.
+        if (from == .message) return error.Halt;
         if (channels.tooMuchSent(view.sends.items) != null) return error.Halt;
         try channels.writeSends(&view, e.header.index);
     }

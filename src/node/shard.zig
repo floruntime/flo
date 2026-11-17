@@ -8878,7 +8878,7 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
             const had = registry.dispatch(&msg.entry, &msg.result) catch |err| return .{ .applier_failed = err };
             if (!had) return .no_applier;
             // Followed as the same entry applied alone would be.
-            if (msg.result.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, &msg.entry) catch |err| return .{ .applier_failed = err };
+            if (msg.result.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, &msg.entry, .message) catch |err| return .{ .applier_failed = err };
         };
         return .applied;
     }
@@ -8886,7 +8886,7 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
     if (!had) return if (listed(&APPLIES_NOTHING, etype)) .applied else .no_applier;
     // The machines that follow this entry (groups, a trim of their stream),
     // after its owner, unless the owner refused it.
-    if (out.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, entry) catch |err| return .{ .applier_failed = err };
+    if (out.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, entry, .entry) catch |err| return .{ .applier_failed = err };
     return .applied;
 }
 

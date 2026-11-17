@@ -1046,7 +1046,7 @@ pub const StreamHandler = struct {
     fn followLocal(self: *StreamHandler, etype: EntryType, ns: router.NamespaceId, name: []const u8) !void {
         var payload_buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
         const entry = entry_mod.buildCommandEntry(etype, entry_mod.Flags.NONE, 0, self.partition.committed_index + 1, 0, ns, name, "", &payload_buf) orelse return error.NameTooLong;
-        try contract_machine.observeEntry(&stream_machine.machine, &self.partition.store, &self.partition.apply_scratch, null, &entry);
+        try contract_machine.observeEntry(&stream_machine.machine, &self.partition.store, &self.partition.apply_scratch, null, &entry, .entry);
     }
 
     /// The request's stream, if it exists.
@@ -1526,7 +1526,7 @@ pub const StreamHandler = struct {
         _ = try self.partition.apply(&entry);
         var out = Result.start(&entry);
         replayEntry(@ptrCast(self), &entry, &out) catch return error.AppendNotApplied;
-        contract_machine.observeEntry(&stream_machine.machine, &self.partition.store, &self.partition.apply_scratch, null, &entry) catch return error.AppendNotApplied;
+        contract_machine.observeEntry(&stream_machine.machine, &self.partition.store, &self.partition.apply_scratch, null, &entry, .entry) catch return error.AppendNotApplied;
         const answer = appendedFrom(&out).stream_append_ok;
         return .{ .sequence = answer.sequence, .timestamp_ms = @intCast(answer.timestamp_ms) };
     }
@@ -1817,7 +1817,7 @@ fn applyLogged(h: *StreamHandler, e: *const entry_mod.Entry) persistence_mod.App
         return out;
     }
     try StreamHandler.replayEntry(h, e, &out);
-    if (out.refused() == null) try contract_machine.observeAll(&.{stream_machine.machine}, &h.partition.store, &h.partition.apply_scratch, null, e);
+    if (out.refused() == null) try contract_machine.observeAll(&.{stream_machine.machine}, &h.partition.store, &h.partition.apply_scratch, null, e, .entry);
     return out;
 }
 
