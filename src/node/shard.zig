@@ -9098,8 +9098,10 @@ fn replaySegmentFile(
         // decisions — the ones the simulator also drives.
         replay.replayOneEntry(ctx, &seg_entry, out);
         // A halt restores the rest of the log but applies nothing more, so the
-        // loop goes on; damage stops it.
-        if (out.damage != null) return;
+        // loop goes on; damage or a resource block stops it. Reading on past a
+        // blocked entry would hit IndexGap on the next one and record a
+        // misleading index_hole alongside the block.
+        if (out.damage != null or out.blocked != null) return;
     }
 }
 
@@ -22491,6 +22493,66 @@ test "a segment boot cannot read for a resource failure refuses the boot, and is
     try std.testing.expectError(error.BootReadBlocked, Shard.init(refusing.allocator(), 0, 4, t.pipe_fds[0], t.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{}, .{}));
     try std.testing.expect(refusing.refused > 0);
     // Once it reads, the log is whole: every enqueue is there.
+    var shard = try t.open();
+    defer shard.deinit();
+    try std.testing.expect(shard.offline == null);
+    try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES), DamageTest.queued(&shard));
+}
+
+/// The testing allocator, refusing the raft log's term-run array growth — the
+/// first allocation `RaftLog.append` makes while restoring an entry, so the
+/// restore hits OutOfMemory, a resource failure that must refuse the boot rather
+/// than drop the entry. A term-run growth always calls the allocator from the
+/// same `ensureTotalCapacity` (not inlined in a debug/test build), so its return
+/// address pins it exactly, with no fragile size or ordering guess; `record`
+/// captures that address from a probe growth of the same array type first.
+const RefuseTermRunAllocator = struct {
+    recorded_ra: usize = 0,
+    recording: bool = false,
+    refused: usize = 0,
+    fn allocator(self: *RefuseTermRunAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    /// Capture the return address of a growth of an `ArrayListUnmanaged(TermRun)`.
+    fn record(self: *RefuseTermRunAllocator) !void {
+        self.recording = true;
+        var probe: std.ArrayListUnmanaged(raft_log_mod.TermRun) = .empty;
+        defer probe.deinit(self.allocator());
+        try probe.append(self.allocator(), .{ .first_index = 1, .term = 1 });
+        self.recording = false;
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *RefuseTermRunAllocator = @ptrCast(@alignCast(ctx));
+        if (self.recording) self.recorded_ra = ra;
+        if (self.refused == 0 and !self.recording and ra == self.recorded_ra) {
+            self.refused += 1;
+            return null;
+        }
+        return std.testing.allocator.rawAlloc(len, a, ra);
+    }
+    fn resize(_: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        return std.testing.allocator.rawResize(m, a, n, ra);
+    }
+    fn remap(_: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        return std.testing.allocator.rawRemap(m, a, n, ra);
+    }
+    fn free(_: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        std.testing.allocator.rawFree(m, a, ra);
+    }
+};
+
+test "a boot that runs out of memory restoring an entry refuses the boot, and does not drop it" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var refusing: RefuseTermRunAllocator = .{};
+    try refusing.record();
+    try std.testing.expect(refusing.recorded_ra != 0);
+    // The restore's term-run allocation fails, so an entry cannot be appended to
+    // the raft log during replay: the boot is refused, not booted over a hole.
+    try std.testing.expectError(error.BootReadBlocked, Shard.init(refusing.allocator(), 0, 4, t.pipe_fds[0], t.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{}, .{}));
+    try std.testing.expect(refusing.refused > 0);
+    // A retry with memory free reads the whole log: the entry was not lost.
     var shard = try t.open();
     defer shard.deinit();
     try std.testing.expect(shard.offline == null);
