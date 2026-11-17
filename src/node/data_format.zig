@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 36;
+pub const CURRENT: u32 = 37;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -126,6 +126,10 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // goes back to its run's shard the same way (`action_abandon_send`,
     // `action_abandon`).
     .{ .format = 36, .segment_version = 25, .entries = 0x6f01d8b343532827 },
+    // A stream's existence, name and settings are the streams machine's
+    // (`stream.meta`, `stream.retention`), kept in snapshots; the log is
+    // unchanged.
+    .{ .format = 37, .segment_version = 25, .entries = 0x6f01d8b343532827 },
 };
 
 comptime {

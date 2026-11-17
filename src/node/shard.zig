@@ -96,6 +96,8 @@ const duties_mod = @import("duties.zig");
 const build_options = @import("build_options");
 const txn_mod = @import("../kv/txn.zig");
 const stream_mod = @import("../projection/stream.zig");
+const stream_machine = @import("../stream/machine.zig");
+const view_mod = @import("../contract/view.zig");
 const stream_proj_mod = @import("../projection/stream.zig");
 const StreamProjection = stream_proj_mod.StreamProjection;
 const StreamID = stream_proj_mod.StreamID;
@@ -6253,6 +6255,18 @@ pub const Shard = struct {
                     } else |_| {}
                 }
             },
+            // A created stream has its series from the start, idle or not,
+            // on every node that applied the create; an alter changes none.
+            .stream_config => {
+                if (result.refused() != null) return;
+                const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+                const c = stream_machine.StreamConfig.decode(cmd.value) orelse return;
+                if (c.op != .create) return;
+                if (self.metrics_registry) |mr| {
+                    const ns = self.metricsNamespace(cmd.namespace_id) orelse return;
+                    _ = mr.registerStream(ns, cmd.key, 0) catch {};
+                }
+            },
             .stream_delete => {
                 // The stream is gone on every node that applied this entry;
                 // drop its series here, not in the leader-only handler. One
@@ -6862,19 +6876,20 @@ pub const Shard = struct {
         // Trims are proposals: only the leader makes them.
         if (self.raft_node.role != .leader) return 0;
         const proj = self.stream_handler.stream;
-        if (self.heldIfHalted(.stream_retention, self.halted != null and anyRetention(proj))) return 0;
+        const read: view_mod.ReadView = .{ .store = &self.defaultPartition().store };
+        if (self.heldIfHalted(.stream_retention, self.halted != null and anyRetention(read))) return 0;
         self.duties.note(.stream_retention, null, nowMs());
         const now_ns = self.raft_node.now();
         var trims_proposed: u64 = 0;
 
-        var it = proj.stream_metadata.iterator();
-        while (it.next()) |kv| {
-            const meta = kv.value_ptr;
-            if (!meta.hasRetention()) continue;
-            // Settings are keyed by the stream's id and name; its records,
-            // by the id and the name's hash.
-            const name_key = kv.key_ptr.*;
-            const key = stream_mod.streamKey(stream_mod.keyNamespace(name_key), name_key[4..]);
+        // Only the streams with a retention policy: their index's key is
+        // the stream's own key.
+        var it = read.range(stream_machine.Retained, "");
+        while (it.next() catch null) |item| {
+            if (item.key.len != @sizeOf(stream_mod.StreamKey)) continue;
+            const key: stream_mod.StreamKey = item.key[0..@sizeOf(stream_mod.StreamKey)].*;
+            const found = read.get(stream_machine.Metas, &key) catch continue;
+            const meta = (found orelse continue).v;
 
             // Age-based retention: the trim carries the age, and each replica
             // cuts at its entry's stamp; this node's time only decides
@@ -6906,10 +6921,9 @@ pub const Shard = struct {
         return trims_proposed;
     }
 
-    fn anyRetention(proj: anytype) bool {
-        var it = proj.stream_metadata.valueIterator();
-        while (it.next()) |meta| if (meta.hasRetention()) return true;
-        return false;
+    fn anyRetention(read: view_mod.ReadView) bool {
+        var it = read.range(stream_machine.Retained, "");
+        return (it.next() catch null) != null;
     }
 
     /// TaskScheduler callback: on the leader, end action leases past their
@@ -8818,16 +8832,16 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
             defer partition.stream.applying_part = 0;
             const had = registry.dispatch(&msg.entry, &msg.result) catch |err| return .{ .applier_failed = err };
             if (!had) return .no_applier;
+            // Followed as the same entry applied alone would be.
+            if (msg.result.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, &msg.entry) catch |err| return .{ .applier_failed = err };
         };
         return .applied;
     }
     const had = registry.dispatch(entry, out) catch |err| return .{ .applier_failed = err };
     if (!had) return if (listed(&APPLIES_NOTHING, etype)) .applied else .no_applier;
-    // A machine that follows this entry (a group, a trim of its stream),
+    // The machines that follow this entry (groups, a trim of their stream),
     // after its owner, unless the owner refused it.
-    if (out.refused() == null) if (contract_machine.observerOf(machines, etype)) |m| {
-        contract_machine.observeEntry(m, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, entry) catch |err| return .{ .applier_failed = err };
-    };
+    if (out.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, entry) catch |err| return .{ .applier_failed = err };
     return .applied;
 }
 
@@ -17464,11 +17478,10 @@ test "Shard: a stream's first append to a namespace nobody created is listed und
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
-    var k_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-    const names = shard.stream_handler.stream.stream_names;
+    const read: view_mod.ReadView = .{ .store = &shard.defaultPartition().store };
     try std.testing.expect(shard.namespaceId("fresh") != .invalid);
-    try std.testing.expect(names.contains(stream_mod.nameKey(&k_buf, shard.namespaceId("fresh"), "s").?));
-    try std.testing.expect(!names.contains(stream_mod.nameKey(&k_buf, .default, "s").?));
+    try std.testing.expect(stream_machine.metaOf(read, shard.namespaceId("fresh"), "s") != null);
+    try std.testing.expect(stream_machine.metaOf(read, .default, "s") == null);
 }
 
 test "Shard: a blocking stream read wakes on its own namespace's append, even one proposed before it parked, and returns only what is past its cursor" {
@@ -22162,6 +22175,44 @@ test "Shard: a list page whose scan couldn't hold its names is refused, not cut 
     try std.testing.expect(!dispatcher_mod.takeScanShort());
 }
 
+/// The default namespace's stream `name` created with this retention, as
+/// an applied `stream_config` leaves it.
+fn streamSettings(shard: *Shard, name: []const u8, age_s: u64, count: u64) !void {
+    var value: [stream_machine.StreamConfig.SIZE]u8 = undefined;
+    (stream_machine.StreamConfig{ .op = .create, .partition_count = 1, .retention_age_s = age_s, .retention_count = count }).encode(&value);
+    var pb: [256]u8 = undefined;
+    const e = entry_mod.buildCommandEntry(.stream_config, entry_mod.Flags.NONE, 1, 1, 1, .default, name, &value, &pb).?;
+    var out = persistence_mod.Result.start(&e);
+    const p = shard.defaultPartition();
+    try contract_machine.applyEntry(&stream_machine.machine, &p.store, &p.apply_scratch, &e, &out);
+    try std.testing.expect(out.refused() == null);
+}
+
+test "Shard: a stream create applied gives the stream its metrics series at once, before any append" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    var registry = MetricsRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    shard.metrics_registry = &registry;
+    defer shard.metrics_registry = null;
+
+    var value: [stream_machine.StreamConfig.SIZE]u8 = undefined;
+    (stream_machine.StreamConfig{ .op = .create, .partition_count = 1, .retention_age_s = 0, .retention_count = 0 }).encode(&value);
+    _ = try persistence_mod.proposeEntry(&shard, .stream_config, entry_mod.Flags.NONE, "default", "idle", &value);
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expectEqual(@as(usize, 1), registry.streamCount());
+    // An alter makes no other.
+    (stream_machine.StreamConfig{ .op = .alter, .partition_count = 0, .retention_age_s = 60, .retention_count = 0 }).encode(&value);
+    _ = try persistence_mod.proposeEntry(&shard, .stream_config, entry_mod.Flags.NONE, "default", "idle", &value);
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expectEqual(@as(usize, 1), registry.streamCount());
+}
+
 test "a stream's retention age counts in seconds when the sweeper trims by it" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
@@ -22173,8 +22224,7 @@ test "a stream's retention age counts in seconds when the sweeper trims by it" {
 
     const stream = shard.stream_handler.stream;
     const h = stream_mod.streamKey(.default, "aged");
-    var k_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-    try stream.registerStreamMetadata(stream_mod.nameKey(&k_buf, .default, "aged").?, .{ .retention_age_s = 5 });
+    try streamSettings(&shard, "aged", 5, 0);
     const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
     _ = try stream.appendToStreamAt(h, 1, 0, 0, now_ms - 10_000, 1, 10);
     _ = try stream.appendToStreamAt(h, 2, 0, 0, now_ms - 1_000, 1, 10);
@@ -23222,8 +23272,7 @@ test "a halted shard's duties stop, and one with work counts as held until the s
 
     // A stream past its retention: no trim while halted.
     const h = stream_mod.streamKey(.default, "kept");
-    var k_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-    try shard.stream_handler.stream.registerStreamMetadata(stream_mod.nameKey(&k_buf, .default, "kept").?, .{ .retention_count = 1 });
+    try streamSettings(&shard, "kept", 0, 1);
     for (1..4) |i| _ = try shard.stream_handler.stream.appendToStreamAt(h, i, 0, 0, 1, 1, 1);
     shard.halted = .{ .index = 1, .term = 1, .crc = 0 };
     try std.testing.expectEqual(@as(u64, 0), Shard.streamRetentionTask(@ptrCast(&shard)));
@@ -25169,7 +25218,6 @@ test "applyEntryCore: a machine reads the streams every entry below its own left
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
 
-    const view_mod = @import("../contract/view.zig");
     const Reader = struct {
         var hash: stream_mod.StreamKey = @splat(0);
         var seen: [8]StreamID = undefined;
@@ -27799,6 +27847,38 @@ test "Shard: a sink's write its target refuses for good is counted by the shard 
     try std.testing.expectEqual(@as(u64, 1), sm.channel_sink_refusals.getPtrConst(.condition_failed).load(.monotonic));
 }
 
+test "Shard: a stream append a channel carries to a new stream makes its stream.meta record, as an append applied alone does" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    // A stream shard 1 owns.
+    var nbuf: [16]u8 = undefined;
+    const name = for (0..1000) |ni| {
+        const n = try std.fmt.bufPrint(&nbuf, "s{d}", .{ni});
+        if (b.router.hashToShard(node_router.routeNsKey(.default, n)) == 1) break n;
+    } else return error.NoStreamOnShard;
+    const read: view_mod.ReadView = .{ .store = &b.defaultPartition().store };
+    try std.testing.expect(stream_machine.metaOf(read, .default, name) == null);
+    const ce = @import("../protocol/channel_entries.zig");
+    var mb: [1024]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &mb };
+    // Partition 0, then one record.
+    var cb: [128]u8 = undefined;
+    const append = entry_mod.buildCommandEntry(.stream_append, 0, 1, 1, 0, .default, name, "\x00\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00x\x00\x00", &cb).?.payload;
+    try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, name))), .entry_type = @backingInt(entry_mod.EntryType.stream_append), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = append });
+    var ib: [1024]u8 = undefined;
+    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } });
+    const e = entry_mod.buildEntry(.channel_inbound, 0, b.raft_node.current_term, b.raft_node.last_applied + 1, 1, inbound);
+    var out = persistence_mod.Result.start(&e);
+    try std.testing.expect(b.applyEntry(&e, &out));
+    try std.testing.expectEqual(@as(u64, 1), b.stream_handler.stream.streamLogicalCount(stream_mod.streamKey(.default, name)));
+    const m = stream_machine.metaOf(read, .default, name) orelse return error.NoStreamMeta;
+    try std.testing.expect(!m.explicit);
+}
+
 test "Shard: a carried stream append its client path would refuse is refused as its sender's bug, creates no stream, and is counted and shown" {
     var two: TwoShards = undefined;
     try two.init();
@@ -27822,7 +27902,7 @@ test "Shard: a carried stream append its client path would refuse is refused as 
     try std.testing.expect(b.applyEntry(&e, &out));
     try std.testing.expectEqual(@as(u64, 2), channels_mod.inOf(.{ .store = &b.defaultPartition().store }, 0).?.applied);
     try std.testing.expectEqual(@as(u64, 2), b.channel.sender_bugs[0][@backingInt(contract_store.SenderBug.bad_payload)]);
-    try std.testing.expectEqual(@as(usize, 0), b.stream_handler.stream.streamCount());
+    try std.testing.expectEqual(@as(u32, 0), b.stream_handler.stream.streams.count());
     try std.testing.expectEqual(highest, b.defaultPartition().highest_namespace);
     var sm: @import("../metrics/registry.zig").ShardMetrics = .{ .shard_id = 1 };
     b.shard_metrics = &sm;

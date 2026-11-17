@@ -12,11 +12,9 @@ const schema = @import("../protocol/schema.zig");
 const table_run = @import("table_run.zig");
 const gather_mod = @import("gather.zig");
 const dispatcher_mod = @import("dispatcher.zig");
-const stream_mod = @import("../projection/stream.zig");
 const Shard = @import("shard.zig").Shard;
 const Connection = @import("connection.zig").Connection;
-const StreamProjection = stream_mod.StreamProjection;
-const StreamMetadata = stream_mod.StreamMetadata;
+const StreamHandler = @import("../stream/handler.zig").StreamHandler;
 const QueueHandler = @import("../queue/handler.zig").QueueHandler;
 const ProcessingHandler = @import("../processing/handler.zig").ProcessingHandler;
 const WorkflowHandler = @import("../workflow/handler.zig").WorkflowHandler;
@@ -108,17 +106,10 @@ fn writeEntryTo(op: OpCode, ctx: *anyopaque, ns: dispatcher_mod.WalkNamespace, n
     const namespace = ns.name;
     switch (op) {
         // [name_len:u32][name][partition_count:u32][retention_age_s:u64]
-        // [retention_count:u64], from the stream's metadata, keyed by its
-        // namespace's id and its name; 0 is no limit.
+        // [retention_count:u64], from the stream's metadata; 0 is no limit.
         .stream_list => {
-            const stream: *const StreamProjection = @ptrCast(@alignCast(ctx));
-            var kbuf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-            const meta: StreamMetadata = if (stream_mod.nameKey(&kbuf, ns.id, name)) |k| stream.stream_metadata.get(k) orelse .{} else .{};
-            try w.writeInt(u32, @intCast(name.len), .little);
-            try w.writeAll(name);
-            try w.writeInt(u32, meta.partition_count, .little);
-            try w.writeInt(u64, meta.retention_age_s, .little);
-            try w.writeInt(u64, meta.retention_count, .little);
+            const handler: *const StreamHandler = @ptrCast(@alignCast(ctx));
+            try handler.writeListEntry(ns.id, name, w);
         },
         // [name_len:u32][name][ns_len:u32][ns][ready][leased][enqueued][delivered][dead], u64 each.
         .queue_list => {

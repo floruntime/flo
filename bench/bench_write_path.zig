@@ -123,6 +123,8 @@ pub fn main() !void {
         (Run{ .name = c.name, .ops = c.iters, .ns = ns }).print();
     }
 
+    std.debug.print("\n=== Applying stream appends ===\n\n", .{});
+    try streamApply(&shard, 20_000);
     std.debug.print("\n=== A committed backlog, applied in passes ===\n\n", .{});
     try backlog(&shard, "kv_put", 10_000, 1);
     try backlog(&shard, "kv_batch of 32", 1_000, 32);
@@ -178,4 +180,42 @@ fn backlog(shard: *Shard, name: []const u8, n: usize, ops: u16) !void {
     }
     const total: u64 = @intCast(stdx.time.nanoTimestamp() - t0);
     std.debug.print("  {s:<16} {d:>6} entries  {d:>4} passes   worst pass {d:>6} µs   total {d:>6} µs\n", .{ name, n, passes, worst / 1000, total / 1000 });
+}
+
+/// `n` stream appends over 1024 streams, proposed a chunk at a time with
+/// nothing applied, each chunk then applied: what apply costs an append.
+/// Chunks stay under the shard's cap on proposals not yet applied.
+fn streamApply(shard: *Shard, n: usize) !void {
+    const entry_mod = src.storage.ual.entry;
+    const raft = shard.raft_node;
+    // Partition 0, then one record: [count:u32][len:u32][payload][header_count:u16].
+    const record = "value-padding-padding-padding";
+    var buf: [64]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 0, .little);
+    std.mem.writeInt(u32, buf[4..8], 1, .little);
+    std.mem.writeInt(u32, buf[8..12], record.len, .little);
+    @memcpy(buf[12..][0..record.len], record);
+    std.mem.writeInt(u16, buf[12 + record.len ..][0..2], 0, .little);
+    const value = buf[0 .. 14 + record.len];
+    const CHUNK = 128;
+    var kbuf: [32]u8 = undefined;
+    var payload: [512]u8 = undefined;
+    var applying: u64 = 0;
+    var i: usize = 0;
+    while (i < n) {
+        const end = @min(n, i + CHUNK);
+        while (i < end) : (i += 1) {
+            const key = try std.fmt.bufPrint(&kbuf, "bs-{d:0>4}", .{i % 1024});
+            const cmd: entry_mod.CommandPayload = .{ .namespace_id = .default, .key_length = @intCast(key.len), .value_length = @intCast(value.len), .key = key, .value = value };
+            const len = cmd.serialize(&payload) orelse return error.TooLarge;
+            shard.applying = true;
+            _ = try raft.propose(.stream_append, 0, payload[0..len]);
+            shard.applying = false;
+        }
+        raft.commit_index = raft.log.lastIndex();
+        const t0 = stdx.time.nanoTimestamp();
+        while (raft.last_applied < raft.commit_index) _ = shard.applyCommitted();
+        applying += @intCast(stdx.time.nanoTimestamp() - t0);
+    }
+    std.debug.print("  stream_append    {d:>6} entries applied   {d:>6} ns/entry\n", .{ n, applying / n });
 }
