@@ -1,7 +1,7 @@
 import { useMemo, useState, type ReactNode } from 'react'
 import { DASH, cfmt, jhl, tfmt } from '@/lib/format'
 import { cx } from '@/lib/cx'
-import { useQueueDetail, useQueueDLQ, useQueueMessages } from '@/lib/api/queues'
+import { useDeleteDLQ, useQueueDetail, useQueueDLQ, useQueueMessages, useRequeueDLQ } from '@/lib/api/queues'
 import { Crumb, Stats, Stat } from '@/components/layout'
 import { Button } from '@/components/buttons/Button'
 import { OpPill, Tag } from '@/components/feedback'
@@ -10,8 +10,11 @@ import type { QueueDLQEntry, QueueMessage } from '@/lib/api/types'
 type Tab = 'ready' | 'inflight' | 'dlq'
 type Sel = { kind: 'ready'; m: QueueMessage } | { kind: 'dlq'; m: QueueDLQEntry }
 
-// The server refuses both today; the buttons stay visible so the gap is plain.
-const DLQ_ACTIONS_NOTE = 'Requeue and delete aren’t supported yet'
+/** A dead letter's row key: a message requeued and dead again while pages
+    load shows up again, as a new death, so its seq alone isn't unique. */
+function dlqKey(m: QueueDLQEntry): string {
+  return `${m.moved_at}.${m.seq}`
+}
 
 function prioMeta(p: number): [string, string] {
   return p <= 1 ? ['var(--crit)', 'urgent'] : p <= 5 ? ['var(--warn)', 'high'] : ['var(--tx-3)', 'normal']
@@ -41,12 +44,34 @@ function bfmt(b: number): string {
 function shown(m: QueueMessage): string {
   return m.truncated ? `${m.payload}… ${bfmt(m.size)} total` : m.payload
 }
-function DlqActions({ compact }: { compact?: boolean }) {
+/** Requeue, and in full Delete (asked twice: it can't be undone). A refusal
+    shows the server's reason. `onDone` runs once one has applied. */
+function DlqActions({ ns, name, m, compact, onDone }: { ns: string; name: string; m: QueueDLQEntry; compact?: boolean; onDone?: () => void }) {
+  const requeue = useRequeueDLQ(ns, name)
+  const del = useDeleteDLQ(ns, name)
+  const [confirming, setConfirming] = useState(false)
   const st = compact ? { flex: 'none' as const, padding: '4px 10px', fontSize: 12 } : { flex: 'none' as const }
+  const busy = requeue.isPending || del.isPending
+  const err = (requeue.error ?? del.error) as Error | null
   return (
     <>
-      <Button style={st} disabled title={DLQ_ACTIONS_NOTE}>Requeue</Button>
-      {!compact && <Button variant="danger" style={st} disabled title={DLQ_ACTIONS_NOTE}>Delete</Button>}
+      <Button style={st} disabled={busy} title="Ready again at once, its attempts reset" onClick={() => requeue.mutate(m.seq, { onSuccess: onDone })}>
+        {requeue.isPending ? 'Requeueing…' : 'Requeue'}
+      </Button>
+      {!compact && (
+        <Button
+          variant="danger"
+          style={st}
+          disabled={busy}
+          onClick={() => (confirming ? del.mutate(m.seq, { onSuccess: onDone, onSettled: () => setConfirming(false) }) : setConfirming(true))}
+        >
+          {del.isPending ? 'Deleting…' : confirming ? 'Delete for good' : 'Delete'}
+        </Button>
+      )}
+      {!compact && confirming && !busy && (
+        <Button variant="quiet" style={st} onClick={() => setConfirming(false)}>Keep</Button>
+      )}
+      {err && <span className="mono" style={{ fontSize: 11.5, color: 'var(--crit)', alignSelf: 'center' }}>{err.message}</span>}
     </>
   )
 }
@@ -67,7 +92,7 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
   const dlqCount = dlqQ.data?.pages[0]?.count ?? d?.dlq_count ?? null
   const empty = msgsQ.isSuccess && ready.length === 0 && !d?.inflight && !dlqCount
   const sw = sel ? '1.35fr 1fr' : '1fr'
-  const selSeq = sel?.m.seq
+  const selKey = sel ? (sel.kind === 'dlq' ? dlqKey(sel.m) : `r.${sel.m.seq}`) : null
 
   const payloadObj = (() => {
     if (!sel || sel.m.truncated) return null
@@ -140,7 +165,7 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
                       <div className="c r">Enqueued</div>
                     </div>
                     {ready.map((m) => (
-                      <div className="li" key={m.seq} style={{ gridTemplateColumns: '96px 64px 1fr 96px', background: selSeq === m.seq ? 'var(--hover)' : undefined }} onClick={() => setSel({ kind: 'ready', m })}>
+                      <div className="li" key={m.seq} style={{ gridTemplateColumns: '96px 64px 1fr 96px', background: selKey === `r.${m.seq}` ? 'var(--hover)' : undefined }} onClick={() => setSel({ kind: 'ready', m })}>
                         <span className="mono nw" style={{ fontSize: 12.5, color: 'var(--tx-2)' }}>#{m.seq}</span>
                         <span><PrioTag p={m.priority} /></span>
                         <span className="mono nw" style={{ fontSize: 12, color: 'var(--tx-3)', overflow: 'hidden', textOverflow: 'ellipsis' }}>{shown(m)}</span>
@@ -177,17 +202,17 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
                       <div className="c r">Action</div>
                     </div>
                     {dlq.map((m) => (
-                      <div className="li" key={m.seq} style={{ gridTemplateColumns: '96px 70px 1fr 96px 96px', background: selSeq === m.seq ? 'var(--hover)' : undefined }} onClick={() => setSel({ kind: 'dlq', m })}>
+                      <div className="li" key={dlqKey(m)} style={{ gridTemplateColumns: '96px 70px 1fr 96px 96px', background: selKey === dlqKey(m) ? 'var(--hover)' : undefined }} onClick={() => setSel({ kind: 'dlq', m })}>
                         <span className="mono nw" style={{ fontSize: 12.5, color: 'var(--tx-2)' }}>#{m.seq}</span>
                         <span className="c r mono" style={{ color: 'var(--crit)' }}>{m.deliveries}×</span>
                         <span className="nw" style={{ fontSize: 12, color: 'var(--tx-3)', overflow: 'hidden', textOverflow: 'ellipsis' }}>{shown(m)}</span>
                         <span className="c r mono" style={{ fontSize: 11.5, color: 'var(--tx-3)' }}>{ago(m.moved_at)}</span>
-                        <span className="c r" onClick={(e) => e.stopPropagation()}><DlqActions compact /></span>
+                        <span className="c r" onClick={(e) => e.stopPropagation()}><DlqActions ns={ns} name={name} m={m} compact onDone={() => selKey === dlqKey(m) && setSel(null)} /></span>
                       </div>
                     ))}
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
-                    <More>Oldest first · {dlq.length} of {dlqCount != null ? cfmt(dlqCount) : DASH} · {DLQ_ACTIONS_NOTE.toLowerCase()}</More>
+                    <More>Oldest dead first · {dlq.length} of {dlqCount != null ? cfmt(dlqCount) : DASH}</More>
                     {dlqQ.hasNextPage && (
                       <Button variant="quiet" style={{ flex: 'none', marginTop: 10, padding: '4px 10px', fontSize: 12 }} disabled={dlqQ.isFetchingNextPage} onClick={() => dlqQ.fetchNextPage()}>
                         {dlqQ.isFetchingNextPage ? 'Loading…' : 'Load more'}
@@ -209,7 +234,9 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
               <div className="kvrow2"><span>State</span><span className="mono" style={{ color: 'var(--tx)' }}>{sel.kind === 'dlq' ? 'dead-lettered' : 'ready'}</span></div>
               <div className="kvrow2"><span>Deliveries</span><span className="mono" style={{ color: sel.m.deliveries > 1 ? 'var(--warn)' : 'var(--tx)' }}>{sel.m.deliveries}</span></div>
               <div className="kvrow2"><span>Enqueued</span><span className="mono" style={{ color: 'var(--tx)' }} title={tfmt(sel.m.enqueued_at)}>{ago(sel.m.enqueued_at)}</span></div>
+              {sel.kind === 'dlq' && <div className="kvrow2"><span>Failures</span><span className="mono" style={{ color: 'var(--tx)' }}>{sel.m.failures}</span></div>}
               {sel.kind === 'dlq' && <div className="kvrow2"><span>Dead-lettered</span><span className="mono" style={{ color: 'var(--tx)' }} title={tfmt(sel.m.moved_at)}>{ago(sel.m.moved_at)}</span></div>}
+              {sel.kind === 'dlq' && sel.m.error && <div className="kvrow2"><span>Last error</span><span className="mono" style={{ color: 'var(--crit)', wordBreak: 'break-word' }}>{sel.m.error}</span></div>}
               <div className="kvrow2"><span>Size</span><span className="mono" style={{ color: 'var(--tx)' }}>{bfmt(sel.m.size)}</span></div>
               <div className="set-h" style={{ padding: 0, margin: '14px 0 6px' }}>Payload{sel.m.truncated ? ' · first 4 KB' : ''}</div>
               {payloadObj ? (
@@ -219,8 +246,8 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
               )}
               {sel.kind === 'dlq' && (
                 <>
-                  <div style={{ display: 'flex', gap: 8, marginTop: 14 }}><DlqActions /></div>
-                  <More>{DLQ_ACTIONS_NOTE}.</More>
+                  <div style={{ display: 'flex', gap: 8, marginTop: 14, flexWrap: 'wrap' }}><DlqActions key={dlqKey(sel.m)} ns={ns} name={name} m={sel.m} onDone={() => setSel(null)} /></div>
+                  <More>Requeue makes it ready at once with its attempts reset; delete removes it for good.</More>
                 </>
               )}
             </div>
