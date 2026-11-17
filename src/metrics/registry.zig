@@ -743,10 +743,12 @@ pub const ShardMetrics = struct {
     /// Prometheus see a plain duration, not a raw clock reading.
     persist_failures: Atomic(u64) = Atomic(u64).init(0),
     flushes_failing_for_ms: Atomic(u64) = Atomic(u64).init(0),
-    /// Poll arms that failed even after the reactor's retries, so the fd was
-    /// closed rather than left un-polled (a dropped multishot re-arm, a writable
-    /// arm, or an interest change; the kind is in the log). Nonzero means a
-    /// client saw a forced reconnect from reactor back-pressure.
+    /// Poll arms that could not be placed even after the reactor's retries (a
+    /// dropped multishot re-arm, a writable arm, or an interest change; the kind
+    /// is in the log). A re-arm is deferred to the next tick and a stuck client
+    /// fd is then closed; a fresh registration is closed. Sums the shard's own
+    /// arm failures and the reactor's deferred re-arms. Watch it for reactor
+    /// back-pressure under load.
     arm_failures: Atomic(u64) = Atomic(u64).init(0),
     /// Snapshot bars passed without a snapshot by a leader still applying
     /// earlier terms (cumulative).

@@ -139,15 +139,30 @@ pub const Reactor = struct {
     // Internal result cache to hold converted events between poll calls
     result_cache: [MAX_EVENTS]Event = undefined,
 
-    /// Times a dropped multishot poll could not be re-armed even after a submit
-    /// and retry, so the fd was surfaced as an error for the owner to close
-    /// rather than left silently un-polled. The owner reads this for a metric.
+    /// Times a multishot poll could not be re-armed, so the fd was put on
+    /// `deferred_rearm` to try again rather than left silently un-polled. The
+    /// owner reads this for a metric.
     rearm_failures: u64 = 0,
 
-    /// Tests only: when set, the next arm (`pollAdd`/`pollUpdate`) returns this
-    /// error instead of touching the ring, and clears it — so a test can force
-    /// the back-pressure the fix must surface. Null in production.
+    /// Monotonic ms of the last deferred-re-arm log, so a burst under load logs
+    /// at most once an interval rather than per fd.
+    arm_log_ms: u64 = 0,
+
+    /// fds whose multishot re-arm could not be placed this tick (a full ring, an
+    /// io_uring_enter that failed): re-armed at the start of the next poll,
+    /// after that tick's submit has made room. An enter failure under load is
+    /// then a one-tick delay for every tag, not a wave of closes; a client fd
+    /// that still cannot be armed on the retry is closed loudly.
+    deferred_rearm: std.ArrayList(DeferredArm) = .empty,
+
+    /// Tests only (gated on `builtin.is_test`): when set, the next `pollAdd` or
+    /// `pollUpdate` returns this error instead of touching the ring, and clears
+    /// it. Every arm path (a fresh registration, `armWritable`, `modifyInterests`,
+    /// and the multishot re-arm) runs through those two, so one set exercises the
+    /// re-arm-or-defer path. Null in production.
     test_arm_error: ?anyerror = null,
+
+    const DeferredArm = struct { fd: i32, mask: u32, tag: Tag, user_data: usize };
 
     const Self = @This();
 
@@ -207,6 +222,7 @@ pub const Reactor = struct {
             self.ring.deinit();
         }
         self.sources.deinit();
+        self.deferred_rearm.deinit(self.allocator);
         if (comptime is_bsd) {
             _ = std.c.close(self.poll_fd);
         }
@@ -234,10 +250,6 @@ pub const Reactor = struct {
 
     /// Modify event interests for an existing fd.
     pub fn modifyInterests(self: *Self, fd: i32, interests: Interests) !void {
-        if (self.test_arm_error) |e| {
-            self.test_arm_error = null;
-            return e;
-        }
         if (self.sources.getPtr(fd)) |source| {
             if (comptime is_bsd) {
                 try self.kqueueModifyInterests(fd, interests, source);
@@ -250,10 +262,6 @@ pub const Reactor = struct {
 
     /// Arm writable interest for a connection (commonly used after queueing response bytes).
     pub fn armWritable(self: *Self, fd: i32) !void {
-        if (self.test_arm_error) |e| {
-            self.test_arm_error = null;
-            return e;
-        }
         if (self.sources.getPtr(fd)) |source| {
             if (!source.interests.writable) {
                 if (comptime is_bsd) {
@@ -490,13 +498,20 @@ pub const Reactor = struct {
     // lost: a connection never read again, or polled twice. Each of these
     // sends what is queued and tries once more.
 
-    /// How many times an arm submits the queue and tries again before giving
-    /// up. A full submission queue clears once the kernel takes it, so a couple
-    /// of retries almost always find room; past that the caller must not leave
-    /// the fd un-armed — it closes the connection loudly.
+    /// How many times an arm submits the queue and tries again before it
+    /// returns the error. A full submission queue clears once the kernel takes
+    /// it, so a couple of retries almost always find room; past that the arm
+    /// fails and the caller must not leave the fd un-armed — a re-arm defers it
+    /// to the next tick, a fresh registration closes the new connection.
     const ARM_TRIES = 3;
 
     fn pollAdd(self: *Self, user_data: u64, fd: i32, mask: u32) !void {
+        if (builtin.is_test) {
+            if (self.test_arm_error) |e| {
+                self.test_arm_error = null;
+                return e;
+            }
+        }
         var tries: u8 = 0;
         while (true) : (tries += 1) {
             if (self.ring.poll_add(user_data, fd, mask)) |sqe| {
@@ -510,6 +525,12 @@ pub const Reactor = struct {
     }
 
     fn pollUpdate(self: *Self, fd_u64: u64, mask: u32) !void {
+        if (builtin.is_test) {
+            if (self.test_arm_error) |e| {
+                self.test_arm_error = null;
+                return e;
+            }
+        }
         const flags = linux.IORING_POLL_UPDATE_EVENTS | linux.IORING_POLL_ADD_MULTI;
         var tries: u8 = 0;
         while (true) : (tries += 1) {
@@ -562,11 +583,16 @@ pub const Reactor = struct {
         // Submit any pending SQEs (new registrations, poll_updates, etc.)
         _ = try self.ring.submit();
 
+        // Now that the submit has drained the SQ, retry any re-arms a previous
+        // tick could not fit. Error events it raises (a client fd that fails
+        // twice) go at the front of result_cache; this tick's completions follow.
+        const start = self.drainDeferredRearm();
+
         if (timeout_ms) |ms| {
             if (ms == 0) {
                 // Non-blocking: just check for available completions
                 const n = try self.ring.copy_cqes(&self.cqe_buf, 0);
-                return self.iouringProcessCqes(n);
+                return self.iouringProcessCqes(start, n);
             }
             // Timed wait: submit a timeout SQE, then block until an event or timeout
             var ts = linux.kernel_timespec{
@@ -579,20 +605,20 @@ pub const Reactor = struct {
             // A signal landing on this thread (a stop, say) is an empty poll,
             // as on kqueue, not a failed tick.
             _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
-                error.SignalInterrupt => return &.{},
+                error.SignalInterrupt => return self.result_cache[0..start],
                 else => return err,
             };
             const n = try self.ring.copy_cqes(&self.cqe_buf, 0);
-            return self.iouringProcessCqes(n);
+            return self.iouringProcessCqes(start, n);
         } else {
             // Block indefinitely until at least one event
             const n = try self.ring.copy_cqes(&self.cqe_buf, 1);
-            return self.iouringProcessCqes(n);
+            return self.iouringProcessCqes(start, n);
         }
     }
 
-    fn iouringProcessCqes(self: *Self, n: u32) ![]const Event {
-        var count: usize = 0;
+    fn iouringProcessCqes(self: *Self, start: usize, n: u32) ![]const Event {
+        var count: usize = start;
         for (self.cqe_buf[0..n]) |cqe| {
             // Skip timeout sentinel CQEs
             if (cqe.user_data == TIMEOUT_SENTINEL) continue;
@@ -600,12 +626,17 @@ pub const Reactor = struct {
             // Skip internal CQEs (poll_update/poll_remove results)
             if (cqe.user_data & INTERNAL_FLAG != 0) continue;
 
-            // Skip error CQEs (e.g., cancelled operations)
-            if (cqe.res < 0) continue;
-
             const fd: i32 = @bitCast(@as(u32, @intCast(cqe.user_data & 0xFFFFFFFF)));
-
             const source = self.sources.get(fd) orelse continue;
+
+            // A negative result ends the multishot poll. -ECANCELED is a
+            // deliberate pollRemove (the fd is being dropped), so let it go; any
+            // other end leaves a source that still wants events un-polled, so
+            // re-arm it rather than silently stop reading the fd.
+            if (cqe.res < 0) {
+                if (cqe.res != -@as(i32, @backingInt(linux.E.CANCELED))) self.rearmOrDefer(fd, source);
+                continue;
+            }
 
             // Timer: drain the timerfd counter to prevent re-triggering
             if (source.tag == .timer) {
@@ -617,7 +648,7 @@ pub const Reactor = struct {
             // completes: report only what is asked for now, as kqueue does,
             // or a connection taken off reading would be read.
             const revents: u32 = @intCast(cqe.res);
-            var event: Event = .{
+            const event: Event = .{
                 .fd = fd,
                 .tag = source.tag,
                 .user_data = source.user_data,
@@ -626,31 +657,74 @@ pub const Reactor = struct {
                 .err = (revents & linux.POLL.ERR) != 0,
                 .hangup = (revents & linux.POLL.HUP) != 0,
             };
-
-            // A multishot poll the kernel dropped (IORING_CQE_F_MORE not set)
-            // must be re-armed or the fd is never polled again. pollAdd submits
-            // and retries on a full queue; if it still cannot arm, do not leave
-            // the fd silently un-polled — surface it as an error so the owner
-            // closes it (the client reconnects) instead of hanging forever.
-            if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
-                var mask: u32 = 0;
-                if (source.interests.readable) mask |= linux.POLL.IN;
-                if (source.interests.writable) mask |= linux.POLL.OUT;
-                if (mask != 0) {
-                    const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
-                    self.pollAdd(fd_u64, fd, mask) catch |err| {
-                        self.rearm_failures += 1;
-                        log.err("reactor: could not re-arm fd {d} after a dropped poll ({s}); closing it so the client reconnects", .{ fd, @errorName(err) });
-                        event.err = true;
-                    };
+            if (event.readable or event.writable or event.err or event.hangup) {
+                if (count < self.result_cache.len) {
+                    self.result_cache[count] = event;
+                    count += 1;
                 }
             }
-            if (event.readable or event.writable or event.err or event.hangup) {
-                self.result_cache[count] = event;
-                count += 1;
-            }
+
+            // A multishot poll the kernel dropped (IORING_CQE_F_MORE not set)
+            // must be re-armed, or the fd is never polled again.
+            if (cqe.flags & linux.IORING_CQE_F_MORE == 0) self.rearmOrDefer(fd, source);
         }
         return self.result_cache[0..count];
+    }
+
+    /// Re-arm a multishot poll that ended while its source still wants events.
+    /// On a full ring (or an io_uring_enter that failed) the arm is deferred to
+    /// the next poll, after its submit makes room, rather than silently lost.
+    fn rearmOrDefer(self: *Self, fd: i32, source: EventSource) void {
+        var mask: u32 = 0;
+        if (source.interests.readable) mask |= linux.POLL.IN;
+        if (source.interests.writable) mask |= linux.POLL.OUT;
+        if (mask == 0) return;
+        const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
+        self.pollAdd(fd_u64, fd, mask) catch {
+            self.rearm_failures += 1;
+            self.deferred_rearm.append(self.allocator, .{ .fd = fd, .mask = mask, .tag = source.tag, .user_data = source.user_data }) catch {
+                log.err("reactor: fd {d} could not be re-armed or even deferred; it is no longer polled", .{fd});
+                return;
+            };
+            const now = @import("stdx").time.monotonicMs();
+            if (now -| self.arm_log_ms >= ARM_LOG_INTERVAL_MS) {
+                self.arm_log_ms = now;
+                log.warn("reactor: ring full, deferred a poll re-arm to the next tick (rearm_failures={d}, deferred={d})", .{ self.rearm_failures, self.deferred_rearm.items.len });
+            }
+        };
+    }
+
+    const ARM_LOG_INTERVAL_MS = 1000;
+
+    /// At the start of a poll (after its submit has made room), re-arm every fd
+    /// a previous tick could not. One that arms is dropped; a client fd that
+    /// fails again is surfaced as an error so the shard closes it (rare, loud);
+    /// an infrastructure fd (the acceptor pipe, a Raft wake, the inbox) keeps
+    /// being retried, since it cannot be closed. Returns how many error events
+    /// it wrote at the front of `result_cache`.
+    fn drainDeferredRearm(self: *Self) usize {
+        var errs: usize = 0;
+        var i: usize = 0;
+        while (i < self.deferred_rearm.items.len) {
+            const d = self.deferred_rearm.items[i];
+            if (!self.sources.contains(d.fd)) {
+                _ = self.deferred_rearm.swapRemove(i);
+                continue;
+            }
+            const fd_u64: u64 = @intCast(@as(u32, @bitCast(d.fd)));
+            if (self.pollAdd(fd_u64, d.fd, d.mask)) |_| {
+                _ = self.deferred_rearm.swapRemove(i);
+            } else |_| {
+                if (d.tag == .client_read and errs < self.result_cache.len) {
+                    self.result_cache[errs] = .{ .fd = d.fd, .tag = d.tag, .user_data = d.user_data, .readable = false, .writable = false, .err = true, .hangup = false };
+                    errs += 1;
+                    _ = self.deferred_rearm.swapRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        return errs;
     }
 
     // ───────────────────────────────────────────────────────────────
@@ -864,21 +938,90 @@ test "Reactor: more interest changes in one tick than the submission queue holds
     try std.testing.expectEqual(@as(usize, n), seen.count());
 }
 
-test "Reactor: an arm the ring refuses comes back as an error, so the owner closes the fd rather than hang it" {
-    var pair: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
-    defer {
-        _ = std.c.close(pair[0]);
-        _ = std.c.close(pair[1]);
+test "Reactor: a dropped multishot re-arm the ring refuses is deferred, then re-armed next tick" {
+    // Drives io_uring internals (cqe_buf, poll_add); the kqueue path has no such
+    // re-arm. Runs on Linux only.
+    if (is_linux) {
+        var pair: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+        defer {
+            _ = std.c.close(pair[0]);
+            _ = std.c.close(pair[1]);
+        }
+        var reactor = try Reactor.init(std.testing.allocator);
+        defer reactor.deinit();
+        try reactor.addSource(.{ .fd = pair[0], .tag = .client_read, .interests = .{ .readable = true } });
+
+        // A readable completion whose multishot the kernel dropped (no F_MORE):
+        // the reactor must re-arm the fd. Make that re-arm's poll_add fail the
+        // way a wedged ring would; the fd goes on the deferred list, not left
+        // un-polled, and the event still comes back.
+        reactor.test_arm_error = error.SubmissionQueueFull;
+        reactor.cqe_buf[0] = .{
+            .user_data = @intCast(@as(u32, @bitCast(pair[0]))),
+            .res = @intCast(linux.POLL.IN),
+            .flags = 0,
+        };
+        const events = try reactor.iouringProcessCqes(0, 1);
+        try std.testing.expectEqual(@as(usize, 1), events.len);
+        try std.testing.expect(events[0].readable);
+        try std.testing.expectEqual(pair[0], events[0].fd);
+        try std.testing.expectEqual(@as(u64, 1), reactor.rearm_failures);
+        try std.testing.expectEqual(@as(usize, 1), reactor.deferred_rearm.items.len);
+
+        // Next tick: the ring takes the arm (the one-shot error cleared), so the
+        // deferred fd clears with no error event.
+        const errs = reactor.drainDeferredRearm();
+        try std.testing.expectEqual(@as(usize, 0), errs);
+        try std.testing.expectEqual(@as(usize, 0), reactor.deferred_rearm.items.len);
     }
-    var reactor = try Reactor.init(std.testing.allocator);
-    defer reactor.deinit();
-    try reactor.addSource(.{ .fd = pair[0], .tag = .client_read, .interests = .{ .readable = true } });
-    // Force the writable arm (a poll_update) to fail the way a wedged ring would.
-    // It must surface as an error the shard acts on — before the fix the shard
-    // swallowed it and left the fd un-armed, so a queued answer never flushed.
-    reactor.test_arm_error = error.SubmissionQueueFull;
-    try std.testing.expectError(error.SubmissionQueueFull, reactor.armWritable(pair[0]));
-    // The one-shot is cleared; the arm works on the next try.
-    try reactor.armWritable(pair[0]);
+}
+
+test "Reactor: a client fd whose deferred re-arm fails again surfaces as an error to close it" {
+    if (is_linux) {
+        var pair: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+        defer {
+            _ = std.c.close(pair[0]);
+            _ = std.c.close(pair[1]);
+        }
+        var reactor = try Reactor.init(std.testing.allocator);
+        defer reactor.deinit();
+        try reactor.addSource(.{ .fd = pair[0], .tag = .client_read, .interests = .{ .readable = true } });
+
+        // First failure: the dropped re-arm is deferred.
+        reactor.test_arm_error = error.SubmissionQueueFull;
+        reactor.cqe_buf[0] = .{ .user_data = @intCast(@as(u32, @bitCast(pair[0]))), .res = @intCast(linux.POLL.IN), .flags = 0 };
+        _ = try reactor.iouringProcessCqes(0, 1);
+        try std.testing.expectEqual(@as(usize, 1), reactor.deferred_rearm.items.len);
+
+        // The retry fails too: a client fd is given up on and reported as an
+        // error event so the shard closes it; the deferred entry is dropped.
+        reactor.test_arm_error = error.SubmissionQueueFull;
+        const errs = reactor.drainDeferredRearm();
+        try std.testing.expectEqual(@as(usize, 1), errs);
+        try std.testing.expect(reactor.result_cache[0].err);
+        try std.testing.expectEqual(pair[0], reactor.result_cache[0].fd);
+        try std.testing.expectEqual(@as(usize, 0), reactor.deferred_rearm.items.len);
+    }
+}
+
+test "Reactor: armWritable surfaces a refused arm so the shard can close the fd" {
+    // flushToClient arms writable after queueing a response and closes the fd if
+    // the arm fails; this checks the arm propagates the error. Linux only.
+    if (is_linux) {
+        var pair: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+        defer {
+            _ = std.c.close(pair[0]);
+            _ = std.c.close(pair[1]);
+        }
+        var reactor = try Reactor.init(std.testing.allocator);
+        defer reactor.deinit();
+        try reactor.addSource(.{ .fd = pair[0], .tag = .client_read, .interests = .{ .readable = true } });
+        reactor.test_arm_error = error.SubmissionQueueFull;
+        try std.testing.expectError(error.SubmissionQueueFull, reactor.armWritable(pair[0]));
+        // One-shot cleared; the arm works on the next try.
+        try reactor.armWritable(pair[0]);
+    }
 }
