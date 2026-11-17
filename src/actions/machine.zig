@@ -262,8 +262,10 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 return out.refuse(.not_found, .not_found, NO_ACTION);
             };
             const rk = try idKey(view, .of(p.ns), p.run);
-            if (try view.get(Runs, rk) != null) {
-                if (call) return reply(view, p, .started);
+            if (try view.get(Runs, rk)) |old| {
+                // Asked again for the run it started; one a run id repeated
+                // across callers (a clock stepped back) names is another's.
+                if (call and eqlOpt(old.v.caller_run, p.caller_run) and eqlOpt(old.v.caller_workflow, p.caller_workflow)) return reply(view, p, .started);
                 return out.refuse(.conflict, .unclassified, RUN_EXISTS);
             }
             try view.put(Runs, rk, .{ .v = .{
@@ -412,6 +414,11 @@ fn expireOne(view: *View, item: ae.ExpireItem.Value, stamp: u64) ApplyError!bool
     try view.put(Runs, rk, run);
     try tellCaller(view, .of(item.ns), item.run, run.v);
     return true;
+}
+
+fn eqlOpt(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 /// The answer to a call's start, to the calling workflow's slot.

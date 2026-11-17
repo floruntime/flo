@@ -29,6 +29,7 @@ const WorkerHandler = @import("../worker/handler.zig").WorkerHandler;
 const action_ops = @import("../protocol/action_ops.zig");
 const ae = @import("../protocol/action_entries.zig");
 const machine = @import("machine.zig");
+const calls_machine = @import("calls_machine.zig");
 const view_mod = @import("../contract/view.zig");
 const store_mod = @import("../contract/store.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -204,6 +205,9 @@ pub const ActionsHandler = struct {
     /// action.info copies the action's owner here: the answer is encoded
     /// after the handler returns, so its own stack is gone.
     info_owner_buf: [action_ops.MAX_OWNER]u8 = undefined,
+    /// A report refused for its caller's outbox says why here: the answer
+    /// is encoded after the handler returns.
+    refusal_buf: [256]u8 = undefined,
 
     const Pending = struct {
         index: u64,
@@ -1176,6 +1180,9 @@ pub const ActionsHandler = struct {
             const run = getRun(shard, ns, t.run) orelse return;
             return self.abandon(shard, ns, if (holder.len > 0) holder else run.holder, t);
         }
+        // Sent to the run's shard: not past the outbox caps, where its
+        // lease, ending, gives it back instead.
+        if (shard.sendWait(ownerOf(shard, ns, t.action), ns) != null) return shard.dropHandBack(.action, "the outbox to its run's shard is full; its lease ends it");
         var out: [ae.Abandon.max_size]u8 = undefined;
         const bytes = ae.Abandon.encodeInto(&out, .{ .ns = ns.int(), .action = t.action, .run = t.run, .holder = holder, .deliveries = t.deliveries, .token = .{ .term = t.term, .index = t.index } }) catch return shard.dropHandBack(.action, "it is larger than a hand-back holds");
         _ = shard.raft_node.propose(.action_abandon_send, Flags.NONE, bytes) catch |err| return shard.dropHandBack(.action, @errorName(err));
@@ -1353,8 +1360,20 @@ pub const ActionsHandler = struct {
         return run;
     }
 
+    /// A report that ends a run a workflow step called sends the run's end
+    /// to the caller's shard, from the entry that ends it: refused here, as
+    /// any write past the outbox caps is, while that outbox, this shard's,
+    /// or the namespace's share of either has no room.
+    fn endWait(shard: *Shard, ns: NamespaceId, run: Run) ?table_run.Refused {
+        if (run.source != .workflow) return null;
+        const workflow = run.caller_workflow orelse return null;
+        const w = shard.sendWait(shard.router.slotToShard(calls_machine.callerSlot(ns, workflow)), ns) orelse return null;
+        return .{ .status = .overloaded, .refusal = .{ .reason = .unclassified, .ran = .no, .message = Shard.sendWaitText(w, &shard.actions_handler.refusal_buf) } };
+    }
+
     fn runComplete(shard: *Shard, _: *Connection, req: Request, action: []const u8, worker: []const u8, deliveries: u32, term: u64, index: u64, outcome: []const u8, result: []const u8) Error!table_run.Outcome(EmptyResponse) {
         const run = try reported(shard, req, action);
+        if (endWait(shard, req.ns_id, run)) |r| return .{ .refused = r };
         const proposed = propose(shard, .action_settle, ae.Settle.Value{ .ns = req.ns_id.int(), .action = action, .run = req.key, .holder = worker, .request_key = run.request_key, .deliveries = deliveries, .token = .{ .term = term, .index = index }, .expiry_ns = run.expiry_ns, .outcome = outcome, .result = result }) catch |err|
             return .{ .refused = .{ .status = persistence.failureStatus(err), .refusal = persistence.failureRefusal(err, "complete not persisted") } };
         recordReport(shard, req.ns_id, worker, action, false);
@@ -1363,6 +1382,9 @@ pub const ActionsHandler = struct {
 
     fn runFail(shard: *Shard, _: *Connection, req: Request, action: []const u8, worker: []const u8, deliveries: u32, term: u64, index: u64, retry: bool, abandoned: bool, delay_ms: u64, err_text: []const u8) Error!table_run.Outcome(EmptyResponse) {
         const run = try reported(shard, req, action);
+        // Only a fail that ends the run sends its end.
+        const ends = !abandoned and (!retry or run.failures +| 1 >= run.max_attempts);
+        if (ends) if (endWait(shard, req.ns_id, run)) |r| return .{ .refused = r };
         const proposed = propose(shard, .action_release, ae.Release.Value{ .ns = req.ns_id.int(), .action = action, .run = req.key, .holder = worker, .request_key = run.request_key, .deliveries = deliveries, .token = .{ .term = term, .index = index }, .expiry_ns = run.expiry_ns, .abandoned = abandoned, .retry = retry, .delay_ms = delay_ms, .@"error" = err_text }) catch |err|
             return .{ .refused = .{ .status = persistence.failureStatus(err), .refusal = persistence.failureRefusal(err, "fail not persisted") } };
         if (!abandoned) recordReport(shard, req.ns_id, worker, action, true);
@@ -1561,9 +1583,8 @@ pub const ActionsHandler = struct {
         self.rebuilding = false;
     }
 
-    /// A one-way message to another shard's actions handler: a worker's
-    /// report, or an abandon. Not state, so a full inbox drops it, and
-    /// counts it.
+    /// A worker's report to another shard's actions handler: stats, not
+    /// state, so a full inbox drops it, and counts it.
     fn send(self: *ActionsHandler, shard: *Shard, target: u16, tag: @import("../node/inbox.zig").Tag, bytes: []u8) void {
         const mailboxes = shard.peer_mailboxes orelse return self.allocator.free(bytes);
         if (target >= mailboxes.len) return self.allocator.free(bytes);
@@ -1629,6 +1650,9 @@ pub const ActionsHandler = struct {
             if (getRun(shard, k.ns, k.id)) |run| if (run.status == .leased and run.expiry_ns == k.expiry_ns) {
                 const grace = @as(u64, @min(run.lease_ms, MAX_GRACE_MS)) *| std.time.ns_per_ms;
                 if (now < self.duty_since_ns +| grace) continue;
+                // One that ends a run a step called sends its end: left for
+                // a later tick while the caller's outbox has no room.
+                if (run.failures +| 1 >= run.max_attempts and endWait(shard, k.ns, run) != null) continue;
                 holder = run.holder;
                 request_key = run.request_key;
             };

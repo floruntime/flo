@@ -240,6 +240,9 @@ pub const Answer = enum(u8) {
     started = 1,
     /// No such action is registered.
     no_action = 2,
+    /// Reserved: the action's slot moved to another shard, to be asked
+    /// there. Nothing answers it until slots move.
+    moved = 3,
 };
 
 /// The action's shard's answer to a call's start, sent back to the

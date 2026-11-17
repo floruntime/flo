@@ -120,7 +120,7 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // and, when the run ends, `action_done`. A task its await couldn't give
     // goes back to its run's shard the same way (`action_abandon_send`,
     // `action_abandon`).
-    .{ .format = 34, .segment_version = 23, .entries = 0x0f21f1aa06aafc83 },
+    .{ .format = 34, .segment_version = 23, .entries = 0x515f5940b2422b8c },
 };
 
 comptime {

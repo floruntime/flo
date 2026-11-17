@@ -327,8 +327,11 @@ pub const WorkflowHandler = struct {
         /// Its step's call found its action not registered: said once in
         /// its history. Leader memory, like the rest of a step's wait.
         call_unregistered_noted: bool = false,
-        /// When this leader may next ask again for that call.
+        /// When this leader may next ask again for that call, and the index
+        /// of the last time it did: until that applies, the step waits on
+        /// it, so it can't give up as the start goes out again.
         call_retry_at_ms: i64 = 0,
+        call_retry_index: u64 = 0,
 
         /// Retry attempt counter for the current step (reset on step transition).
         retry_count: u32 = 0,
@@ -2219,9 +2222,13 @@ pub const WorkflowHandler = struct {
         // tells this one when the run ends. The run's id is chosen here, so
         // asking again names the same run.
         const slot = router.nsKeySlot(ns, action_name);
+        if (input.len > ae.MAX_INPUT) return definition.StepOutcome.execution_failure;
+        // Its start goes to the action's shard: held, as for a full log,
+        // while that outbox, this shard's, or the namespace's share of
+        // either has no room, so one tenant's calls can't fill them.
+        if (shard.sendWait(shard.router.slotToShard(slot), ns) != null) return self.holdStepForRoom(run, step_label, now_ms);
         var run_id_buf: [32]u8 = undefined;
         const run_id = shard.run_id_gen.next(.action, slot, &run_id_buf);
-        if (input.len > ae.MAX_INPUT) return definition.StepOutcome.execution_failure;
         const buf = self.allocator.alloc(u8, ae.Call.max_size) catch return definition.StepOutcome.execution_failure;
         defer self.allocator.free(buf);
         const payload = ae.Call.encodeInto(buf, .{
@@ -2319,6 +2326,7 @@ pub const WorkflowHandler = struct {
                     run.call_unregistered_noted = true;
                     self.addHistoryEvent(run, "action_not_registered", c.action, now_ms);
                 }
+                if (run.call_retry_index > shard.raft_node.last_applied) return false;
                 const now_ns: u64 = @intCast(@max(now_ms, 0) *| std.time.ns_per_ms);
                 if ((now_ns -| c.first_ns) / std.time.ns_per_ms >= shard.actions_handler.missing_action_wait_ms) return true;
                 const wait_ms = callRetryMs(c.attempts);
@@ -2334,9 +2342,11 @@ pub const WorkflowHandler = struct {
     fn retryCall(self: *WorkflowHandler, shard: *Shard, run: *RunRecord, action_rid: []const u8, c: calls_mod.Call.Value, now_ms: i64) void {
         run.call_retry_at_ms = now_ms +| 1_000;
         const ns = keyNamespace(run.ns_key);
+        // Its start is sent again: not while its outbox has no room.
+        if (shard.sendWait(shard.router.slotToShard(router.nsKeySlot(ns, c.action)), ns) != null) return;
         var buf: [ae.CallRetry.max_size]u8 = undefined;
         const payload = ae.CallRetry.encodeInto(&buf, .{ .ns = ns.int(), .slot = calls_mod.callerSlot(ns, run.workflow_name_owned), .run = action_rid }) catch return;
-        _ = proposeCharged(shard, ns, .action_call_retry, payload) catch return;
+        run.call_retry_index = (proposeCharged(shard, ns, .action_call_retry, payload) catch return).index;
         if (shard.metrics_registry) |m| m.workflow.recordActionCallRetry();
         var nb: [ae.MAX_ACTION_NAME + 96]u8 = undefined;
         const next_s = callRetryMs(c.attempts +| 1) / 1000;
@@ -2801,6 +2811,7 @@ pub const WorkflowHandler = struct {
         if (call != null) clearCall(shard, run, action_rid);
         run.call_unregistered_noted = false;
         run.call_retry_at_ms = 0;
+        run.call_retry_index = 0;
 
         // Clear pending action state
         if (run.pending_action_run_id_owned) |a| self.allocator.free(a);
@@ -4957,12 +4968,16 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     const processing = try std.testing.allocator.create(@import("../processing/handler.zig").ProcessingHandler);
     processing.* = @import("../processing/handler.zig").ProcessingHandler.init(std.testing.allocator);
     shard.processing_handler = processing;
-    // One group of one: a step's call sends to this shard itself.
+    // One group of one: a step's call sends to this shard itself, held to
+    // its outbox caps like any send.
     partition.store.place = .{ .group = 0, .count = 1 };
+    shard.channel = try @import("../contract/channel_driver.zig").Driver.init(std.testing.allocator, 0, 1);
+    shard.outbox_caps = .{};
     return shard;
 }
 
 fn destroyTestShard(shard: *Shard) void {
+    shard.channel.deinit();
     shard.waiter_pool.deinit(std.testing.allocator);
     shard.raft_node.deinit();
     std.testing.allocator.destroy(shard.raft_node);
@@ -5451,6 +5466,68 @@ test "a leader drops the calls whose workflow run has ended or is gone, and keep
     const slot = calls_mod.callerSlot(.default, "test-wf");
     try testing.expect(calls_mod.callOf(read, .default, slot, "act-live") != null);
     try testing.expect(calls_mod.callOf(read, .default, slot, "act-gone") == null);
+}
+
+test "step executor: a step whose action's outbox is at its cap waits for room, and calls once there is" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
+    registerTestAction(&shard, "step-a");
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    createTestRun(&handler, testKey(.default, "run-1"), "run-1", "test-wf");
+    createTestRun(&handler, testKey(.default, "run-2"), "run-2", "test-wf");
+    // The first run's call leaves its start in the outbox, untrimmed.
+    handler.advanceWorkflow(&shard, testKey(.default, "run-1"));
+    settleTest(&shard);
+    try testing.expect(handler.runs.getPtr(testKey(.default, "run-1")).?.pending_action_run_id_owned != null);
+    // One byte a channel: the second's step waits, and logs no call.
+    shard.outbox_caps = .{ .shard = 1 << 30, .channel = 1 };
+    const before = shard.raft_node.log.lastIndex();
+    handler.advanceWorkflow(&shard, testKey(.default, "run-2"));
+    const held = handler.runs.getPtr(testKey(.default, "run-2")).?;
+    try testing.expect(held.waiting_for_room);
+    try testing.expect(held.pending_action_run_id_owned == null);
+    try testing.expectEqual(before, shard.raft_node.log.lastIndex());
+    // Room again: its next try calls.
+    shard.outbox_caps = .{};
+    handler.advanceWorkflow(&shard, testKey(.default, "run-2"));
+    try testing.expect(handler.runs.getPtr(testKey(.default, "run-2")).?.pending_action_run_id_owned != null);
+}
+
+test "step executor: a step whose action isn't registered doesn't give up while it asks again" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    createTestRun(&handler, testKey(.default, "run-r"), "run-r", "test-wf");
+    // A wait already over the moment it's answered.
+    actions.missing_action_wait_ms = 1;
+    handler.advanceWorkflow(&shard, testKey(.default, "run-r"));
+    settleTest(&shard);
+    @import("stdx").time.sleep(2 * std.time.ns_per_ms);
+    // A retry proposed and not applied: the start may yet go out, so the
+    // step waits for it rather than give up under it.
+    const run = handler.runs.getPtr(testKey(.default, "run-r")).?;
+    run.call_retry_index = shard.raft_node.last_applied + 1;
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.runs.getPtr(testKey(.default, "run-r")).?.status);
+    // Applied (and answered, no action): now it gives up.
+    handler.runs.getPtr(testKey(.default, "run-r")).?.call_retry_index = 0;
+    handler.checkPendingActions(&shard);
+    settleTest(&shard);
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, handler.runs.getPtr(testKey(.default, "run-r")).?.status);
 }
 
 test "step executor: missing action yields target_not_found" {

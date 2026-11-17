@@ -212,6 +212,8 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         .action_call_clear => if (found != null) try view.delete(Calls, k),
         .action_reply => {
             const p = ae.Reply.decodeAll(e.payload, &diag) catch return error.Halt;
+            // Reserved for when slots move: until then, a sender's bug.
+            if (p.answer == .moved) return out.refuse(.bad_request, .malformed, MOVED_NOT_YET);
             var c = (found orelse return out.putInt(u8, 0)).v;
             out.putInt(u8, 1);
             // A run that ended before its start's answer applied (both are
@@ -220,6 +222,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             c.state = switch (p.answer) {
                 .started => .started,
                 .no_action => .no_action,
+                .moved => unreachable,
             };
             c.last_ns = stamp;
             try view.put(Calls, k, .{ .v = c });
@@ -239,6 +242,8 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         else => return error.Halt,
     }
 }
+
+pub const MOVED_NOT_YET = "bad request: a call's start answered moved, which nothing sends until slots move";
 
 pub const machine: machine_mod.Machine = .{
     .name = "calls",
