@@ -164,6 +164,7 @@ pub const EntryType = enum(u8) {
     settings_pool_share = 0x90,
     settings_node_mem = 0x91,
     settings_node_del = 0x92,
+    settings_budget_clean = 0x93,
 
     // ── Channels (messages between groups) ──
     channel_inbound = 0xA0,
@@ -189,7 +190,7 @@ pub const EntryType = enum(u8) {
             // A sink batch's payload is a schema (`protocol/processing_entries.zig`).
             .processing_sink_batch => false,
             // Cluster-settings entries touch no namespace projection; they are node-level state on shard 0.
-            .settings_pool_share, .settings_node_mem, .settings_node_del => false,
+            .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean => false,
             // A message's own target says what it touches, at its apply.
             .channel_inbound, .channel_trim, .channel_probe, .channel_unpark => false,
             .raft_config, .raft_noop, .raft_snapshot, .repair_skip => false,
