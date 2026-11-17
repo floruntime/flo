@@ -88,9 +88,6 @@ pub const ErrorFn = *const fn (shard: *anyopaque, conn: *anyopaque, request_id: 
 pub fn opReadsAtLeader(op: proto.OpCode) bool {
     return switch (op) {
         .stream_group_info, .stream_group_pending => true,
-        // As its leader has applied them, so a failed message is listed
-        // as soon as its fail is answered.
-        .queue_dlq_list => true,
         // What a job's pipelines wait for, and the records they skipped,
         // only the leader running them knows.
         .processing_status => true,

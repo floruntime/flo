@@ -149,3 +149,57 @@ test "e2e/dashboard: a queue's messages are the next a dequeue takes, and a page
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"truncated\":true") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"more\":true") != null);
 }
+
+test "e2e/dashboard: a queue's dead letters list with their count, and requeue or delete one at a time" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true },
+    });
+    defer ctx.deinit();
+
+    // Seqs 1 and 2, both dead-lettered.
+    for ([_][]const u8{ "a", "b" }) |m| {
+        try ctx.exec(&.{ "queue", "enqueue", "dq", m });
+        const out = try ctx.execCapture(&.{ "queue", "dequeue", "dq" });
+        const space = std.mem.indexOfScalar(u8, out, ' ') orelse return error.NoDelivery;
+        try ctx.exec(&.{ "queue", "nack", "dq", out[0..space], "--dlq", "--error", "boom" });
+    }
+
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+
+    var page = try http.get("/api/v1/queues/dq/dlq?limit=1");
+    defer page.deinit();
+    try testing.expectEqual(@as(u16, 200), page.status);
+    try testing.expect(std.mem.indexOf(u8, page.body, "\"seq\":1,") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "\"error\":\"boom\"") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "\"count\":2,\"has_more\":true,\"next_after\":\"") != null);
+    // The next page starts past the cursor the first one gave.
+    const key = "\"next_after\":\"";
+    const at = (std.mem.indexOf(u8, page.body, key) orelse return error.NoCursor) + key.len;
+    const cursor = page.body[at..][0 .. std.mem.indexOfScalar(u8, page.body[at..], '"') orelse return error.NoCursor];
+    var path_buf: [128]u8 = undefined;
+    var next = try http.get(try std.fmt.bufPrint(&path_buf, "/api/v1/queues/dq/dlq?limit=1&after={s}", .{cursor}));
+    defer next.deinit();
+    try testing.expectEqual(@as(u16, 200), next.status);
+    try testing.expect(std.mem.indexOf(u8, next.body, "\"entries\":[{\"seq\":2,") != null);
+    try testing.expect(std.mem.indexOf(u8, next.body, "\"has_more\":false,\"next_after\":null") != null);
+
+    var rq = try http.post("/api/v1/queues/dq/dlq/1/requeue", "");
+    defer rq.deinit();
+    try testing.expectEqualStrings("{\"ok\":true}", rq.body);
+    // Not dead any more: refused, saying why.
+    var twice = try http.post("/api/v1/queues/dq/dlq/1/requeue", "");
+    defer twice.deinit();
+    try testing.expect(std.mem.indexOf(u8, twice.body, "not dead") != null);
+
+    var del = try http.delete("/api/v1/queues/dq/dlq/2");
+    defer del.deinit();
+    try testing.expectEqualStrings("{\"ok\":true}", del.body);
+    var gone = try http.get("/api/v1/queues/dq/dlq");
+    defer gone.deinit();
+    try testing.expect(std.mem.indexOf(u8, gone.body, "\"entries\":[],\"count\":0,\"has_more\":false,\"next_after\":null") != null);
+
+    var deq = try ctx.cli.run(&.{ "queue", "dequeue", "dq" });
+    defer deq.deinit();
+    try testing.expect(deq.contains(" a"));
+}

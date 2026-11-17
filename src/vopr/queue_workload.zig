@@ -2,9 +2,10 @@
 //! them: from the proposing leader's own applied queue state, so a report
 //! names a live delivery. Every report kind is also spoiled now and then (a
 //! stale token, a wrong delivery count, another consumer, a resend, a
-//! message that's gone) so the machine's per-message refusals are
-//! exercised too. The leader's state can lag the log, so a valid report
-//! may still find its delivery gone when it applies, as on a real leader.
+//! message that's gone; a requeue or drop of one that isn't dead) so the
+//! machine's per-message refusals are exercised too. The leader's state can
+//! lag the log, so a valid report may still find its delivery gone when it
+//! applies, as on a real leader.
 
 const std = @import("std");
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -34,11 +35,11 @@ const MAX_HELD: u64 = 48;
 
 pub const Made = struct { entry_type: EntryType, payload: []const u8 };
 
-const Kind = enum { enqueue, deliver, settle, release, extend, expire, purge };
+const Kind = enum { enqueue, deliver, settle, release, extend, expire, purge, requeue, drop };
 /// Out of 100.
-const WEIGHTS = [_]u8{ 30, 24, 16, 10, 6, 13, 1 };
+const WEIGHTS = [_]u8{ 27, 24, 16, 10, 6, 13, 1, 2, 1 };
 /// Percent of entries spoiled, by kind.
-const SPOIL = [_]u8{ 0, 0, 15, 15, 12, 15, 0 };
+const SPOIL = [_]u8{ 0, 0, 15, 15, 12, 15, 0, 15, 15 };
 
 /// A queue entry for op `op_id`, in `buf`, at most `max_len` bytes; null
 /// when the leader has nothing of the kind drawn to propose.
@@ -66,6 +67,7 @@ pub fn make(q: *families.Queues, l: Leader, r: std.Random, op_id: u64, buf: []u8
         // Rare: a purge ends every lease in its queue, the dead holders'
         // too, which then never expire.
         .purge => if (r.uintLessThan(u8, 10) == 0) purge(out, queue) else null,
+        .requeue, .drop => deadOnes(q, out, kind, r, queue, spoil),
     } catch null;
 }
 
@@ -349,6 +351,45 @@ fn expire(q: *families.Queues, out: []u8, l: Leader, r: std.Random, spoil: bool)
     if (!spoil and live_named < 2 and r.boolean()) return null;
     const payload = try qe.Expire.encodeInto(out, .{ .items = .{ .bytes = items[0..w], .count = n } });
     return .{ .entry_type = .queue_expire, .payload = payload };
+}
+
+fn isDead(v: qm.Msg.Value) bool {
+    return v.status == .dead;
+}
+
+fn isLive(v: qm.Msg.Value) bool {
+    return v.status != .dead;
+}
+
+/// An operator's requeue or drop of dead messages the leader holds: one,
+/// or every one; spoiled, it also names one that isn't dead, or one that's
+/// gone.
+fn deadOnes(q: *families.Queues, out: []u8, kind: Kind, r: std.Random, queue: []const u8, spoil: bool) !?Made {
+    const p = pick(q, r, queue, isDead) orelse return null;
+    var buf: [qe.MAX_BATCH * 9]u8 = undefined;
+    var w: @import("../protocol/schema.zig").Writer = .{ .buf = &buf };
+    const Seq = @import("../protocol/schema.zig").Int(u64);
+    var n: u32 = 0;
+    if (r.boolean()) {
+        var pb: [12]u8 = undefined;
+        const hash = qm.hashOf(queue);
+        var it = q.read().range(qm.Msgs, qm.storeKey(&pb, NS, &hash));
+        while (it.next() catch null) |item| {
+            if (item.value.v.status != .dead or n + 1 == qe.MAX_BATCH) continue;
+            try Seq.encode(&w, qm.seqOf(item.key[4..]));
+            n += 1;
+        }
+    } else {
+        try Seq.encode(&w, p.seq);
+        n += 1;
+    }
+    if (spoil) {
+        const other: u64 = if (r.boolean()) (if (pick(q, r, queue, isLive)) |l| l.seq else std.math.maxInt(u32)) else std.math.maxInt(u32);
+        try Seq.encode(&w, other);
+        n += 1;
+    }
+    const payload = try qe.DeadItems.encodeInto(out, .{ .ns = NS.int(), .queue = queue, .items = .{ .bytes = buf[0..w.pos], .count = n } });
+    return .{ .entry_type = if (kind == .requeue) .queue_requeue else .queue_drop, .payload = payload };
 }
 
 fn purge(out: []u8, queue: []const u8) !?Made {

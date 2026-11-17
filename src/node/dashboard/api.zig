@@ -222,7 +222,7 @@ fn routeQueue(allocator: Allocator, method: Method, rest: []const u8, query_stri
             return queues.requeueDLQEntry(allocator, name, seq_str, query_string, ctx);
         }
         try only(method, &.{.DELETE});
-        return queues.deleteDLQEntry(allocator, name, dlq_rest, ctx);
+        return queues.deleteDLQEntry(allocator, name, dlq_rest, query_string, ctx);
     }
 
     return helpers.jsonError(allocator, "Not found");

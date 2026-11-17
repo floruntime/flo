@@ -47,6 +47,7 @@ const Result = persistence_mod.Result;
 const CommandResult = result_mod.CommandResult;
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
+const Int = schema.Int;
 const OpCode = proto.OpCode;
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
@@ -62,6 +63,8 @@ const PeekResponse = table_run.op("queue.peek").response;
 const DequeueResponse = table_run.op("queue.dequeue").response;
 const ReportResponse = table_run.op("queue.complete").response;
 const TouchResponse = table_run.op("queue.touch").response;
+const DeadListResponse = table_run.op("queue.dlq_list").response;
+const DeadResponse = table_run.op("queue.dlq_requeue").response;
 
 /// How often the expire duty runs: at least every half the shortest lease,
 /// as the delivery model's key bound needs.
@@ -77,11 +80,6 @@ const MAX_GRACE_MS: u64 = 30_000;
 
 /// What each message adds to a dequeue's answer besides its payload.
 const MESSAGE_FRAMING: u32 = @intCast(queue_ops.Message.max_size - qe.MAX_MESSAGE);
-
-const MAX_DLQ_PAGE: u32 = 100;
-const MAX_DLQ_PAYLOAD: usize = 4096;
-/// `[total:u64][has_more:u8][last_seq:u64]` after a page's entries.
-const DLQ_TRAILER: usize = 8 + 1 + 8;
 
 fn storeOf(shard: *Shard) *store_mod.Store {
     return &shard.defaultPartition().store;
@@ -313,9 +311,9 @@ pub const QueueHandler = struct {
         dispatcher.registerWithRoute(.queue_touch, table_run.handler("queue.touch", QueueHandler, runTouch), preRouteByQueue);
         dispatcher.registerWithRoute(.queue_peek, table_run.handler("queue.peek", QueueHandler, runPeek), preRouteByQueue);
         dispatcher.registerWithRoute(.queue_stats, dispatchQueue, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_dlq_list, dispatchQueue, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_dlq_requeue, dispatchQueue, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_dlq_delete, dispatchQueue, preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_dlq_list, table_run.handler("queue.dlq_list", QueueHandler, runDlqList), preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_dlq_requeue, table_run.handler("queue.dlq_requeue", QueueHandler, runRequeue), preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_dlq_delete, table_run.handler("queue.dlq_delete", QueueHandler, runDelete), preRouteByQueue);
         dispatcher.registerWithRoute(.queue_purge, dispatchQueue, preRouteByQueue);
         dispatcher.registerWalk(.queue_list, dispatchQueue, localScanQueues);
     }
@@ -362,7 +360,7 @@ pub const QueueHandler = struct {
         };
     }
 
-    // ── Enqueue, stats, DLQ, purge, list (their wire as before) ─────────
+    // ── Enqueue, stats, purge, list (their wire as before) ─────────────
 
     /// Enqueue on its queue's leader, notifying nothing until it applies.
     fn dispatchEnqueue(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -425,9 +423,6 @@ pub const QueueHandler = struct {
         return switch (op) {
             .queue_enqueue => self.handleEnqueue(shard, req, entry_mod.Flags.NONE),
             .queue_stats => self.handleStats(shard, req),
-            .queue_dlq_list => self.handleDlqList(shard, req),
-            .queue_dlq_requeue => .{ .err = .{ .code = .invalid_request, .message = "dlq requeue not yet implemented" } },
-            .queue_dlq_delete => .{ .err = .{ .code = .invalid_request, .message = "dlq delete not yet implemented" } },
             .queue_purge => self.handlePurge(shard, req),
             .queue_list => self.handleList(shard, req),
             else => .{ .err = .{ .code = .invalid_request, .message = "unknown queue opcode" } },
@@ -461,76 +456,6 @@ pub const QueueHandler = struct {
         for ([_]u64{ m.enqueued, m.delivered, m.settled, m.released, m.dead_lettered, m.expired, m.ready, m.leased, m.dead }, 0..) |v, i|
             std.mem.writeInt(u64, buf[i * 8 ..][0..8], v, .little);
         return .{ .queue_messages = .{ .data = buf } };
-    }
-
-    /// A page of a queue's dead letters, oldest first:
-    ///   [count:u32] ([seq:u64][size:u32][len:u32][payload][enqueued_at_ms:i64]
-    ///                [deliveries:u32][priority:u8][moved_at_ms:i64])*
-    ///   [total:u64][has_more:u8][last_seq:u64]
-    /// `[limit:u32][after:u64]?` picks the page: up to 100, after the dead
-    /// letter whose seq ends the page before, or from the oldest if that one
-    /// is gone. Each payload is cut to 4 KiB (`size` is its whole length).
-    fn handleDlqList(self: *QueueHandler, shard: *Shard, req: Request) CommandResult {
-        var limit: u32 = MAX_DLQ_PAGE;
-        var after: ?u64 = null;
-        if (req.value.len >= 4) limit = std.math.clamp(std.mem.readInt(u32, req.value[0..4], .little), 1, MAX_DLQ_PAGE);
-        if (req.value.len >= 12) after = std.mem.readInt(u64, req.value[4..12], .little);
-        const data = self.dlqPage(shard, req.ns_id, req.key, limit, after) catch
-            return .{ .err = .{ .code = .internal_error, .message = "dlq list serialization failed" } };
-        return .{ .queue_dlq_messages = .{ .data = data } };
-    }
-
-    fn dlqPage(self: *QueueHandler, shard: *Shard, ns: NamespaceId, name: []const u8, limit: u32, after: ?u64) ![]u8 {
-        const hash = machine.hashOf(name);
-        const total: u64 = if (metaOf(shard, ns, name)) |m| m.dead else 0;
-        var pb: [12]u8 = undefined;
-        const prefix = machine.storeKey(&pb, ns, &hash);
-        var ab: [4 + 24]u8 = undefined;
-        var it = blk: {
-            if (total > 0) if (after) |seq| if (msgOf(shard, ns, hash, seq)) |m| if (m.status == .dead) {
-                const dk = machine.deadKey(hash, m.dead_ns, seq);
-                break :blk readOf(shard).rangeAfter(machine.Dead, prefix, machine.storeKey(&ab, ns, &dk));
-            };
-            break :blk readOf(shard).range(machine.Dead, if (total > 0) prefix else "\xff\xff\xff\xff\xff");
-        };
-        var w: std.Io.Writer.Allocating = .init(self.allocator);
-        errdefer w.deinit();
-        try w.writer.writeInt(u32, 0, .little);
-        var count: u32 = 0;
-        var last: u64 = 0;
-        var more = false;
-        while (it.next() catch null) |item| {
-            if (count == limit) {
-                more = true;
-                break;
-            }
-            const k = item.key[4..];
-            if (k.len != 24) continue;
-            const seq = std.mem.readInt(u64, k[16..24], .big);
-            const msg = msgOf(shard, ns, hash, seq) orelse continue;
-            const shown = msg.payload[0..@min(msg.payload.len, MAX_DLQ_PAYLOAD)];
-            const size = 8 + 4 + 4 + shown.len + 8 + 4 + 1 + 8;
-            if (w.written().len + size + DLQ_TRAILER > ops.MAX_RESPONSE_BODY) {
-                more = true;
-                break;
-            }
-            try w.writer.writeInt(u64, seq, .little);
-            try w.writer.writeInt(u32, @intCast(msg.payload.len), .little);
-            try w.writer.writeInt(u32, @intCast(shown.len), .little);
-            try w.writer.writeAll(shown);
-            try w.writer.writeInt(i64, nsToMs(msg.enqueued_ns), .little);
-            try w.writer.writeInt(u32, msg.deliveries, .little);
-            try w.writer.writeInt(u8, @intCast(@min(msg.priority, 255)), .little);
-            try w.writer.writeInt(i64, nsToMs(msg.dead_ns), .little);
-            count += 1;
-            last = seq;
-        }
-        try w.writer.writeInt(u64, total, .little);
-        try w.writer.writeByte(@intFromBool(more));
-        try w.writer.writeInt(u64, last, .little);
-        const out = try w.toOwnedSlice();
-        std.mem.writeInt(u32, out[0..4], count, .little);
-        return out;
     }
 
     fn handlePurge(_: *QueueHandler, shard: *Shard, req: Request) CommandResult {
@@ -579,7 +504,6 @@ pub const QueueHandler = struct {
     pub fn freeResult(self: *QueueHandler, cmd_result: CommandResult) void {
         switch (cmd_result) {
             .queue_messages => |r| self.allocator.free(r.data),
-            .queue_dlq_messages => |r| self.allocator.free(r.data),
             else => {},
         }
     }
@@ -588,7 +512,7 @@ pub const QueueHandler = struct {
 
     fn answerBuf(self: *QueueHandler) Error![]u8 {
         if (self.answer_buf) |b| return b;
-        const b = try self.allocator.alloc(u8, queue_ops.PeekedList.byte_bound.?);
+        const b = try self.allocator.alloc(u8, @max(queue_ops.PeekedList.byte_bound.?, queue_ops.DeadPage.byte_bound.?));
         self.answer_buf = b;
         return b;
     }
@@ -981,6 +905,178 @@ pub const QueueHandler = struct {
         table_run.answer(TouchResponse, shard, conn, request_id, .{ .expires_at_ms = nsToMs(to), .applied = applied, .refused = reportAnswer(&r, &buf) });
     }
 
+    // ── Dead letters ────────────────────────────────────────────────────
+
+    const NO_QUEUE_REFUSAL: table_run.Refused = .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = machine.NO_QUEUE } };
+    const Seqs = schema.List(Int(u64), queue_ops.MAX_BATCH);
+    const DeadRefused = schema.List(queue_ops.Refused, queue_ops.MAX_BATCH);
+
+    /// The checks every dead-letter op makes before it reads the queue.
+    fn deadChecks(shard: *Shard, req: Request) Error!?table_run.Refused {
+        if (req.key.len == 0) return error.NoQueue;
+        if (req.key.len > qe.QueueName.max_size) return .{ .status = .bad_request, .refusal = proto.notRun("bad request: queue name too long") };
+        if (!shard.raft_node.leaderReady()) return error.NotLeading;
+        if (req.ns_id == .invalid) return .{ .status = persistence_mod.failureStatus(error.NamespaceUnknown), .refusal = persistence_mod.failureRefusal(error.NamespaceUnknown, "not run") };
+        if (metaOf(shard, req.ns_id, req.key) == null) return NO_QUEUE_REFUSAL;
+        return null;
+    }
+
+    /// The queue's dead letters from `after` on, oldest dead first.
+    const DeadIter = struct {
+        shard: *Shard,
+        /// The range's prefix and where it resumes, here so the range never
+        /// outlives them: the range opens on the first `next`, once the
+        /// iterator stays put.
+        prefix: [12]u8,
+        after: ?[4 + 24]u8,
+        it: ?view_mod.ReadRange(machine.Dead) = null,
+
+        fn init(shard: *Shard, ns: NamespaceId, hash: [8]u8, after: ?queue_ops.DeadCursor.Value) DeadIter {
+            var d: DeadIter = .{ .shard = shard, .prefix = undefined, .after = null };
+            _ = machine.storeKey(&d.prefix, ns, &hash);
+            if (after) |c| {
+                var k: [4 + 24]u8 = undefined;
+                _ = machine.storeKey(&k, ns, &machine.deadKey(hash, c.dead_ns, c.seq));
+                d.after = k;
+            }
+            return d;
+        }
+
+        /// The next one: when it died, and its seq.
+        fn next(self: *DeadIter) ?struct { dead_ns: u64, seq: u64 } {
+            if (self.it == null) self.it = if (self.after) |*a| readOf(self.shard).rangeAfter(machine.Dead, &self.prefix, a) else readOf(self.shard).range(machine.Dead, &self.prefix);
+            while (self.it.?.next() catch null) |entry| {
+                const k = entry.key[4..];
+                if (k.len != 24) continue;
+                return .{ .dead_ns = std.mem.readInt(u64, k[8..16], .big), .seq = std.mem.readInt(u64, k[16..24], .big) };
+            }
+            return null;
+        }
+    };
+
+    fn runDlqList(shard: *Shard, _: *Connection, req: Request, limit: u32, after: ?queue_ops.DeadCursor.Value) Error!table_run.Outcome(DeadListResponse) {
+        if (try deadChecks(shard, req)) |r| return .{ .refused = r };
+        const hash = machine.hashOf(req.key);
+        // Answered as soon as this returns: the handler's buffer holds it.
+        var page = queue_ops.DeadPage.Builder.init(try shard.queue_handler.answerBuf());
+        // The dead keys first, then each one's message: a read of the store
+        // inside the range would end it.
+        var found: [queue_ops.MAX_DLQ_PAGE + 1]struct { dead_ns: u64, seq: u64 } = undefined;
+        var nf: usize = 0;
+        var it = DeadIter.init(shard, req.ns_id, hash, after);
+        while (nf <= limit) {
+            const d = it.next() orelse break;
+            found[nf] = .{ .dead_ns = d.dead_ns, .seq = d.seq };
+            nf += 1;
+        }
+        var last: ?queue_ops.DeadCursor.Value = null;
+        var more = false;
+        for (found[0..nf]) |d| {
+            if (page.count == limit) {
+                more = true;
+                break;
+            }
+            const m = msgOf(shard, req.ns_id, hash, d.seq) orelse continue;
+            const added = page.add(.{
+                .seq = d.seq,
+                .priority = m.priority,
+                .deliveries = m.deliveries,
+                .failures = m.failures,
+                .enqueued_at_ms = nsToMs(m.enqueued_ns),
+                .dead_at_ms = nsToMs(d.dead_ns),
+                .size = @intCast(m.payload.len),
+                .payload = m.payload[0..@min(m.payload.len, queue_ops.MAX_DLQ_PAYLOAD)],
+                .@"error" = m.@"error"[0..@min(m.@"error".len, queue_ops.MAX_DLQ_ERROR)],
+            }) catch false;
+            if (!added) {
+                more = true;
+                break;
+            }
+            last = .{ .dead_ns = d.dead_ns, .seq = d.seq };
+        }
+        return .{ .answer = .{ .dead = page.value(), .cursor = if (more) last else null } };
+    }
+
+    /// The messages a requeue or delete names, or with `all` the queue's
+    /// oldest dead letters, at most a batch.
+    fn deadBatch(shard: *Shard, req: Request, messages: ?Seqs.Value, all: bool, limit: u32, buf: []u8) Error!struct { items: Seqs.Value, more: bool } {
+        var w: schema.Writer = .{ .buf = buf };
+        var n: u32 = 0;
+        var more = false;
+        if (all) {
+            var it = DeadIter.init(shard, req.ns_id, machine.hashOf(req.key), null);
+            while (it.next()) |d| {
+                if (n == limit) {
+                    more = true;
+                    break;
+                }
+                Int(u64).encode(&w, d.seq) catch return error.OutOfMemory;
+                n += 1;
+            }
+        } else if (messages) |given| {
+            var it = given.iterator();
+            while (it.next() catch null) |seq| {
+                Int(u64).encode(&w, seq) catch return error.OutOfMemory;
+                n += 1;
+            }
+        }
+        return .{ .items = .{ .bytes = buf[0..w.pos], .count = n }, .more = more };
+    }
+
+    fn runRequeue(shard: *Shard, _: *Connection, req: Request, messages: ?Seqs.Value, all: bool, limit: u32) Error!table_run.Outcome(DeadResponse) {
+        return runDead(shard, req, messages, all, limit, true, false);
+    }
+
+    fn runDelete(shard: *Shard, _: *Connection, req: Request, messages: ?Seqs.Value, all: bool, limit: u32, dry_run: bool) Error!table_run.Outcome(DeadResponse) {
+        return runDead(shard, req, messages, all, limit, false, dry_run);
+    }
+
+    fn runDead(shard: *Shard, req: Request, messages: ?Seqs.Value, all: bool, limit: u32, requeue: bool, dry_run: bool) Error!table_run.Outcome(DeadResponse) {
+        if (try deadChecks(shard, req)) |r| return .{ .refused = r };
+        const named_some = messages != null and messages.?.count > 0;
+        if (all == named_some) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(if (all) "bad request: name the dead letters or give all, not both" else "bad request: name the dead letters, or all") } };
+        var ib: [Seqs.max_size]u8 = undefined;
+        const batch = try deadBatch(shard, req, messages, all, limit, &ib);
+        if (dry_run) {
+            // What a delete would take: each named message that is dead now.
+            const hash = machine.hashOf(req.key);
+            var refused = DeadRefused.Builder.init(try shard.queue_handler.answerBuf());
+            var would: u32 = 0;
+            var it = batch.items.iterator();
+            while (it.next() catch null) |seq| {
+                const m = msgOf(shard, req.ns_id, hash, seq);
+                if (m != null and m.?.status == .dead) {
+                    would += 1;
+                    continue;
+                }
+                const why: machine.Why = if (m == null) .gone else .not_dead;
+                _ = refused.add(.{ .seq = seq, .why = why, .reason = why.text() }) catch break;
+            }
+            return .{ .answer = .{ .applied = would, .refused = refused.value(), .more = batch.more } };
+        }
+        if (batch.items.count == 0) return .{ .answer = .{ .applied = 0, .refused = .{ .bytes = "", .count = 0 }, .more = false } };
+        const body: qe.DeadItems.Value = .{ .ns = req.ns_id.int(), .queue = req.key, .items = batch.items };
+        const proposed = (if (requeue) propose(shard, .queue_requeue, body) else propose(shard, .queue_drop, body)) catch |err|
+            return .{ .refused = .{ .status = persistence_mod.failureStatus(err), .refusal = persistence_mod.failureRefusal(err, "not persisted") } };
+        return .{ .park = .{ .proposed = proposed, .answer = if (batch.more) answerDeadMore else answerDead } };
+    }
+
+    fn answerDead(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        deadAnswer(shard, conn, request_id, result, false);
+    }
+
+    fn answerDeadMore(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        deadAnswer(shard, conn, request_id, result, true);
+    }
+
+    fn deadAnswer(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result, more: bool) void {
+        if (result.refused()) |r| return shard.sendRefusal(conn, request_id, r.status, r.refusal);
+        var r = result.reader();
+        const applied = r.int(u32) orelse 0;
+        var buf: [DeadRefused.max_size]u8 = undefined;
+        table_run.answer(DeadResponse, shard, conn, request_id, .{ .applied = applied, .refused = reportAnswer(&r, &buf), .more = more });
+    }
+
     // ── After apply ─────────────────────────────────────────────────────
 
     /// What the leader does once a queue entry applies: answer the dequeue
@@ -1137,7 +1233,6 @@ fn sendQueueResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_resu
             shard.sendOkResponse(conn, request_id, &seq_buf);
         },
         .queue_messages => |m| shard.sendOkResponse(conn, request_id, m.data),
-        .queue_dlq_messages => |m| shard.sendOkResponse(conn, request_id, m.data),
         .queue_purged => |p| {
             var cnt_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &cnt_buf, p.count, .little);

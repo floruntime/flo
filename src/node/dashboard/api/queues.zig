@@ -3,7 +3,7 @@
 //! - GET    /queues                           — All queues
 //! - GET    /queues/:name                     — Queue detail
 //! - GET    /queues/:name/messages            — Queue messages
-//! - GET    /queues/:name/dlq                 — Dead-letter queue count
+//! - GET    /queues/:name/dlq                 — A page of dead letters
 //! - POST   /queues/:name/dlq/:seq/requeue   — Requeue DLQ entry
 //! - DELETE /queues/:name/dlq/:seq            — Delete DLQ entry
 //! - POST   /queues/:name/purge              — Purge queue
@@ -202,12 +202,16 @@ pub fn getQueueMessages(allocator: Allocator, queue_name: []const u8, query_stri
 }
 
 /// GET /queues/:name/dlq?namespace=&limit=&after= - A page of the queue's
-/// dead letters, oldest first (`queue_dlq_list`): up to `limit` (at most
-/// 100), after the entry whose seq is `after`, the last of the page before.
+/// dead letters, oldest dead first (`queue.dlq_list`): up to `limit` (at
+/// most 100), past `after`, the `next_after` of the page before
+/// (`dead_ns.seq`). `count` is every dead letter, from `queue_stats`.
 pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
-    const limit = std.math.clamp(h.parseQueryParam(u32, query_string, "limit") orelse 100, 1, 100);
-    const after = h.parseQueryParam(u64, query_string, "after");
+    const limit = std.math.clamp(h.parseQueryParam(u32, query_string, "limit") orelse 100, 1, queue_ops.MAX_DLQ_PAGE);
+    const after: ?queue_ops.DeadCursor.Value = if (h.parseQueryParam([]const u8, query_string, "after")) |a|
+        parseCursor(a) orelse return try h.jsonError(allocator, "queue dlq: after is dead_ns.seq, as next_after gave it")
+    else
+        null;
 
     var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "queue dlq", err);
     defer reader.deinit();
@@ -216,10 +220,21 @@ pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?
         return try loopback.readFailed(allocator, "queue dlq", err);
     defer got.deinit();
     if (got.isError() and !got.isNotFound()) return try h.jsonError(allocator, got.errorMessage());
-    // A namespace never created holds none.
-    const empty: client_mod.queue.DlqPage = .{ .count = 0, .entries = "", .total = 0, .more = false, .last_seq = 0 };
-    const page = if (got.isNotFound()) empty else client_mod.queue.DlqPage.decode(got.data) orelse
+    // A queue or namespace never written to holds none.
+    const Answer = queue_ops.op("queue.dlq_list").response;
+    var diag: schema.Diagnostic = .{};
+    const page: Answer.Value = if (got.isNotFound()) .{ .dead = .{ .bytes = "", .count = 0 }, .cursor = null } else Answer.decodeAll(got.data, &diag) catch
         return try h.jsonError(allocator, "queue dlq: malformed answer");
+    // Every dead letter, from the queue's stats; if they can't be read,
+    // what this page shows, so the count is never below the rows.
+    var total: u64 = page.dead.count;
+    if (!got.isNotFound()) {
+        var st = client.sendRequest(.queue_stats, ns_q, queue_name, "") catch |err| return try loopback.readFailed(allocator, "queue stats", err);
+        defer st.deinit();
+        if (!st.isError()) if (parseStats(st.data)) |s| {
+            total = s.dlq;
+        };
+    }
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     defer json_aw.deinit();
@@ -230,42 +245,70 @@ pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?
     {
         var arr = try obj.arrayField("entries");
         try arr.begin();
-        var it = page.iterator();
-        while (it.next()) |d| {
+        var it = page.dead.iterator();
+        while (it.next() catch null) |d| {
             try arr.next();
             var e = json.ObjectBuilder(@TypeOf(writer)).init(writer);
             try e.begin();
             try e.intField("seq", d.seq);
             try e.intField("deliveries", d.deliveries);
+            try e.intField("failures", d.failures);
             try e.intField("priority", d.priority);
             try e.intField("enqueued_at", d.enqueued_at_ms);
-            try e.intField("moved_at", d.moved_at_ms);
+            try e.intField("moved_at", d.dead_at_ms);
             try e.intField("size", d.size);
             try e.stringField("payload", d.payload);
             try e.boolField("truncated", d.size > d.payload.len);
+            try e.stringField("error", d.@"error");
             try e.end();
         }
         try arr.end();
     }
-    try obj.intField("count", page.total);
-    try obj.boolField("has_more", page.more);
-    if (page.more) try obj.intField("next_after", page.last_seq) else try obj.nullField("next_after");
+    try obj.intField("count", total);
+    try obj.boolField("has_more", page.cursor != null);
+    if (page.cursor) |c| {
+        var cb: [48]u8 = undefined;
+        try obj.stringField("next_after", std.fmt.bufPrint(&cb, "{d}.{d}", .{ c.dead_ns, c.seq }) catch unreachable);
+    } else try obj.nullField("next_after");
     try obj.stringField("queue", queue_name);
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
 
-/// POST /queues/:name/dlq/:seq/requeue?namespace= - Requeue a DLQ entry (loopback write)
+fn parseCursor(text: []const u8) ?queue_ops.DeadCursor.Value {
+    const dot = std.mem.indexOfScalar(u8, text, '.') orelse return null;
+    const dead_ns = std.fmt.parseInt(u64, text[0..dot], 10) catch return null;
+    const seq = std.fmt.parseInt(u64, text[dot + 1 ..], 10) catch return null;
+    return .{ .dead_ns = dead_ns, .seq = seq };
+}
+
+/// POST /queues/:name/dlq/:seq/requeue?namespace= - Requeue a dead letter (loopback write)
 pub fn requeueDLQEntry(allocator: Allocator, queue_name: []const u8, seq_str: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    return deadOne(allocator, queue_name, seq_str, query_string, ctx, .requeue);
+}
+
+/// DELETE /queues/:name/dlq/:seq?namespace= - Delete a dead letter for good (loopback write)
+pub fn deleteDLQEntry(allocator: Allocator, queue_name: []const u8, seq_str: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    return deadOne(allocator, queue_name, seq_str, query_string, ctx, .delete);
+}
+
+/// One dead letter requeued or deleted: ok, or the reason it wasn't.
+fn deadOne(allocator: Allocator, queue_name: []const u8, seq_str: []const u8, query_string: ?[]const u8, ctx: *DashboardContext, comptime kind: enum { requeue, delete }) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     const seq = std.fmt.parseInt(u64, seq_str, 10) catch return try h.jsonError(allocator, "Invalid seq");
 
     var client = loopback.connect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
-    var resp = client_mod.queue.dlqRequeue(&client, ns_q, queue_name, &[_]u64{seq}) catch
-        return try h.jsonError(allocator, "DLQ requeue failed");
+    const seqs = [_]u64{seq};
+    var resp = (if (kind == .requeue) client_mod.queue.dlqRequeue(&client, ns_q, queue_name, &seqs) else client_mod.queue.dlqDelete(&client, ns_q, queue_name, &seqs)) catch
+        return try h.jsonError(allocator, if (kind == .requeue) "DLQ requeue failed" else "DLQ delete failed");
     defer resp.deinit();
     if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
+    var diag: schema.Diagnostic = .{};
+    const a = queue_ops.op("queue.dlq_requeue").response.decodeAll(resp.data, &diag) catch
+        return try h.jsonError(allocator, "DLQ answer malformed");
+    var rit = a.refused.iterator();
+    if (rit.next() catch null) |r| return try h.jsonError(allocator, r.reason);
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     defer json_aw.deinit();
@@ -275,15 +318,6 @@ pub fn requeueDLQEntry(allocator: Allocator, queue_name: []const u8, seq_str: []
     try obj.boolField("ok", true);
     try obj.end();
     return try json_aw.toOwnedSlice();
-}
-
-/// DELETE /queues/:name/dlq/:seq - The server can't delete a dead letter
-/// yet, so this refuses rather than answer ok.
-pub fn deleteDLQEntry(allocator: Allocator, queue_name: []const u8, seq_str: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
-    _ = queue_name;
-    _ = seq_str;
-    return try h.jsonError(allocator, "DLQ entries can't be deleted yet");
 }
 
 /// POST /queues/:name/purge - Purge all live (ready+leased) messages (loopback write).
@@ -374,7 +408,7 @@ test "queue reads say the node didn't answer, never an empty list" {
     }
 }
 
-test "queue messages say the node didn't answer, and DLQ deletes that they can't be done yet" {
+test "queue messages and DLQ deletes say the node didn't answer" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
@@ -386,9 +420,9 @@ test "queue messages say the node didn't answer, and DLQ deletes that they can't
     const msgs = try getQueueMessages(allocator, "q", null, &ctx);
     defer allocator.free(msgs);
     try std.testing.expect(std.mem.startsWith(u8, msgs, "{\"error\":\"queue peek failed"));
-    const del = try deleteDLQEntry(allocator, "q", "1", &ctx);
+    const del = try deleteDLQEntry(allocator, "q", "1", null, &ctx);
     defer allocator.free(del);
-    try std.testing.expectEqualStrings("{\"error\":\"DLQ entries can't be deleted yet\"}", del);
+    try std.testing.expectEqualStrings("{\"error\":\"Loopback connect failed\"}", del);
 }
 
 test "queue stats answers parse; a short one doesn't" {
