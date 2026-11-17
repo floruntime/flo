@@ -375,12 +375,15 @@ fn channelEntry(t: EntryType) bool {
 /// namespace it was charged to (0 for none: a duty's, or a channel's).
 const Proposed = struct { index: u64, bytes: u64, ns: u32 = 0 };
 
-/// Whether a namespace holding `held` of something shared, holding `total`
-/// of `cap`, may take no more: past three quarters of the cap, or, once it
-/// is three quarters full, past the quarter each is guaranteed. Under
-/// contention the heaviest stop first, and the last quarter is left to the
-/// namespaces below their share. The same rule holds a namespace to its
-/// share of a channel outbox and of this cap.
+/// Whether a namespace holding `held` of something shared, all namespaces
+/// together holding `total` of `cap`, may take no more: once it holds three
+/// quarters of the cap, or, once the cap is three quarters full, once it
+/// holds more than a quarter. A namespace at or below a quarter goes on until
+/// the cap itself refuses it, so with at most four busy namespaces each
+/// keeps a quarter; with more, they share what the heaviest leave. A
+/// namespace holding nothing never waits. The same rule holds a namespace
+/// to its share of a channel outbox, of all of a shard's outboxes, and of
+/// this cap.
 pub fn shareHeld(held: u64, total: u64, cap: u64) bool {
     // A namespace holding nothing never waits on others; and unrounded, so a
     // tiny cap's quarters aren't zero.

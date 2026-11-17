@@ -151,17 +151,19 @@ pub const KeySet = struct {
 };
 
 /// Whose a family's keys are, which a message from another group is held
-/// to: a message may touch only keys of its origin's namespace.
+/// to: a message may touch its own namespace's keys, totals over all of
+/// them, and, the system's alone, the shard's own state.
 pub const Scope = union(enum) {
     /// Keys lead with their namespace's id (`idKey`).
     id,
     /// Keys in no namespace (`key` with "") that name their namespace's id
-    /// at this offset in the key after it: a deadline index, its expiry
-    /// first, so a scan runs across tenants in time order.
+    /// at this offset in the key after it: 8 for a deadline index, its
+    /// expiry first so a scan runs across tenants in time order; 0 for a
+    /// stream's group record.
     naming: u8,
-    /// Totals over every namespace on the shard, never one namespace's
-    /// records: what a message may change for any namespace, since its own
-    /// apply checks the total.
+    /// Totals over every namespace on the shard (queue.held): any
+    /// namespace's message may change one, since the apply checks the
+    /// total itself.
     aggregate,
     /// The shard's own state (settings, channels): no user's message may
     /// touch it.
@@ -211,9 +213,9 @@ pub const MESSAGE_FLAGS: u16 = @import("../storage/ual/entry.zig").Flags.SINK;
 pub const Send = struct { origin: Origin, slot: u16, entry_type: u8, flags: u16 = 0, payload: []const u8 };
 
 /// Who a message is sent for, which its receiver holds it to: the keys it
-/// may touch are its namespace's. A user's is a client's or a job's; only a
-/// node's own duties send as the system, which a reserved namespace takes
-/// alone.
+/// may touch are its namespace's. A job's sink sends as its namespace's
+/// user. The system kind may also touch the shard's own state, and alone
+/// may send for a reserved namespace.
 pub const Origin = struct {
     kind: Kind,
     ns: NamespaceId,

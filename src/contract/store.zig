@@ -32,8 +32,9 @@ pub const SenderBug = enum(u8) {
     /// A message applied after the commit that wouldn't apply, or that its
     /// client path refuses (`channels.AfterCommit`).
     bad_payload,
-    /// Sent for no namespace, for a reserved one by a user, or touching
-    /// keys outside its origin's namespace.
+    /// Sent with no origin kind or for no namespace, for a reserved one by
+    /// a user, with a payload naming a namespace other than its origin's,
+    /// or touching keys outside its origin's namespace.
     wrong_origin,
 };
 

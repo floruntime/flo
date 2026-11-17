@@ -77,7 +77,7 @@ pub const Meta = Record(&.{
     .{ .name = "next_seq", .T = Int(u64) },
     .{ .name = "acked", .T = Int(u64) },
     // Payload bytes sent and not yet trimmed: what the outbox to this peer
-    // holds, against its cap at the edge.
+    // holds, against its cap, held to before anything is sent to it.
     .{ .name = "bytes", .T = Int(u64) },
 });
 
@@ -119,7 +119,7 @@ pub const Parked = Record(&.{
 pub const ParkFam = view_mod.Family(59, "channel.parked", .shard, Stored(Parked));
 
 /// What one namespace's messages to one peer hold of its outbox, in
-/// payload bytes: what its share is held to at the edge. A record only
+/// payload bytes: what its share is held to before it sends (`shareHeld`). A record only
 /// while it holds any, so the family is as sparse as the traffic.
 pub const NsBytes = Record(&.{
     .{ .name = "bytes", .T = Int(u64) },
@@ -441,26 +441,35 @@ pub const AfterCommit = struct {
     namespace: *const fn (payload: []const u8) ?u32,
 };
 
+/// An origin refusal: why, and whether for a reserved namespace, which is
+/// refused as unauthorized rather than as built wrong.
+const OriginRefused = struct { why: []const u8, reserved: bool = false };
+
 /// Why a message `m`, for `owner` (or applied after commit as `after`),
-/// may not be applied for its origin, or null: its origin names no
-/// namespace, a user sends to a reserved one, or it reaches keys outside
-/// its origin's namespace. Its sender built it wrong, so it is refused
-/// alone and counted as the sender's bug. Run before it parks or applies.
-fn originRefusal(comptime scopes: anytype, owner: ?*const machine_mod.Machine, after: ?AfterCommit, as: *const Entry, m: ce.Message.Value, arena: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
-    const kind = std.enums.fromInt(view_mod.Origin.Kind, m.origin_kind) orelse return "bad request: a message with no origin";
+/// may not be applied for its origin, or null: its origin has no kind or
+/// names no namespace, a user sends for a reserved one, its payload names
+/// a namespace other than its origin's, or the keys its owner declares for
+/// it reach outside that namespace. Its sender built it wrong, so it is
+/// refused alone and counted as the sender's bug. Run before it parks or
+/// applies. The check binds the keys declared; that an apply stays inside
+/// what it declared is the applier's existing contract (`strict_keys` in
+/// debug builds), across every message of the inbound.
+fn originRefusal(comptime scopes: anytype, owner: ?*const machine_mod.Machine, after: ?AfterCommit, as: *const Entry, m: ce.Message.Value, arena: std.mem.Allocator) error{OutOfMemory}!?OriginRefused {
+    const kind = std.enums.fromInt(view_mod.Origin.Kind, m.origin_kind) orelse return .{ .why = "bad request: a message with no origin" };
     const ns: ns_table.Id = .of(m.origin_ns);
-    if (ns == .invalid or m.origin_ns >= ns_table.CAPACITY) return "bad request: a message from no namespace";
-    if (ns == ns_table.SYSTEM and kind != .system) return "unauthorized: a user's message to the system's namespace";
+    if (ns == .invalid or m.origin_ns >= ns_table.CAPACITY) return .{ .why = "bad request: a message from no namespace" };
+    if (ns == ns_table.SYSTEM and kind != .system) return .{ .why = "unauthorized: a user's message to the system's namespace", .reserved = true };
     if (after) |a| {
-        if (a.namespace(m.payload)) |named| if (named != m.origin_ns) return "bad request: a message writing outside its origin's namespace";
+        if (a.namespace(m.payload)) |named| if (named != m.origin_ns) return .{ .why = "bad request: a message writing outside its origin's namespace" };
         return null;
     }
     const o = owner orelse return null;
-    if (o.namespace) |nf| if (nf(as)) |named| if (named != m.origin_ns) return "bad request: a message writing outside its origin's namespace";
+    if (o.namespace) |nf| if (nf(as)) |named| if (named != m.origin_ns) return .{ .why = "bad request: a message writing outside its origin's namespace" };
     var declared = KeySet.init(arena);
     try o.keys(as, &declared);
     for ([_][]const view_mod.FamKey{ declared.exact.items, declared.ranges.items }) |list| for (list) |k| {
-        if (!keyInside(scopes[k.fam] orelse .shard, kind, ns, k.key)) return "bad request: a message reaching keys outside its origin's namespace";
+        const scope = scopes[k.fam] orelse return .{ .why = "bad request: a message reaching a family no machine declares" };
+        if (!keyInside(scope, kind, ns, k.key)) return .{ .why = "bad request: a message reaching keys outside its origin's namespace" };
     };
     return null;
 }
@@ -478,7 +487,7 @@ fn keyInside(scope: view_mod.Scope, kind: view_mod.Origin.Kind, ns: ns_table.Id,
 }
 
 /// Each family's scope by id, over `machines`' families; null for an id
-/// none declares, which no message may reach.
+/// none declares, which no message may reach: refused, whatever its origin.
 fn scopesOf(comptime machines: []const machine_mod.Machine) [store_mod.MAX_FAMILIES]?view_mod.Scope {
     var out: [store_mod.MAX_FAMILIES]?view_mod.Scope = @splat(null);
     for (machines) |mm| for (mm.families) |f| {
@@ -626,9 +635,8 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                     // A namespace id no namespace could have: built wrong.
                     r.refuse(.bad_request, .malformed, why);
                     bug = .bad_payload;
-                } else if (try originRefusal(scopes, owner, after, &as, m, view.arena)) |why| {
-                    const reserved = std.mem.startsWith(u8, why, "unauthorized");
-                    r.refuse(if (reserved) .unauthorized else .bad_request, if (reserved) .reserved_key else .malformed, why);
+                } else if (try originRefusal(scopes, owner, after, &as, m, view.arena)) |o| {
+                    r.refuse(if (o.reserved) .unauthorized else .bad_request, if (o.reserved) .reserved_key else .malformed, o.why);
                     bug = .wrong_origin;
                 } else if (after) |a| {
                     // Checked now: past the commit its applier may only run
@@ -1189,10 +1197,10 @@ test "channels: an after-commit message its applier would halt on, or its client
     const o = a.outRecord(1, 1).?;
     try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = 0, .flags = 0, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload });
     // Not a command payload: past the commit, the stream applier would halt.
-    try ce.Message.encode(&mw, .{ .slot = 1, .entry_type = @backingInt(EntryType.stream_append), .layout_epoch = 0, .flags = 0, .origin_kind = 1, .origin_ns = 1, .payload = "x" });
+    try ce.Message.encode(&mw, .{ .slot = 1, .entry_type = @backingInt(EntryType.stream_append), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = "x" });
     // A command, but its batch claims more records than an append may carry.
     var over: [64]u8 = undefined;
-    try ce.Message.encode(&mw, .{ .slot = 1, .entry_type = @backingInt(EntryType.stream_append), .layout_epoch = 0, .flags = 0, .origin_kind = 1, .origin_ns = 1, .payload = appendCommandOf(&over, @import("../projection/stream.zig").MAX_BATCH_RECORDS + 1) });
+    try ce.Message.encode(&mw, .{ .slot = 1, .entry_type = @backingInt(EntryType.stream_append), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = appendCommandOf(&over, @import("../projection/stream.zig").MAX_BATCH_RECORDS + 1) });
     var buf: [2048]u8 = undefined;
     const inbound = try ce.Inbound.encodeInto(&buf, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 3 } });
     _ = try b.run(&Later.machine, .channel_inbound, inbound);
@@ -1593,3 +1601,142 @@ test "channels: a message naming one namespace that reaches another's keys, or a
     // Only the first was applied.
     try testing.expectEqual(@as(usize, 1), st.family(@import("../kv/machine.zig").Values.ID).count);
 }
+
+/// A test machine sending, for `kv_put` payload `[ns u32][slot u16][body]`,
+/// one probe to `slot` as namespace `ns`'s user.
+fn tenantKeys(_: *const Entry, _: *KeySet) error{OutOfMemory}!void {}
+fn tenantApply(view: *View, e: *const Entry, _: *Result) ApplyError!void {
+    const ns: ns_table.Id = .of(std.mem.readInt(u32, e.payload[0..4], .big));
+    const slot = std.mem.readInt(u16, e.payload[4..6], .big);
+    try view.send(.user(ns), slot, @backingInt(EntryType.channel_probe), e.payload[6..]);
+}
+const tenant_machine: machine_mod.Machine = .{ .name = "tenant", .entry_types = &.{.kv_put}, .families = &.{}, .keys = tenantKeys, .apply = tenantApply };
+
+fn tenantSend(g: *Group, ns: ns_table.Id, slot: u16, body: []const u8) !void {
+    var pb: [64]u8 = undefined;
+    std.mem.writeInt(u32, pb[0..4], ns.int(), .big);
+    std.mem.writeInt(u16, pb[4..6], slot, .big);
+    @memcpy(pb[6..][0..body.len], body);
+    const r = try g.run(&tenant_machine, .kv_put, pb[0 .. 6 + body.len]);
+    try testing.expect(r.refused() == null);
+}
+
+test "channels: two namespaces' bytes in one outbox are counted apart, and each one's trimmed alone" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    const seven: ns_table.Id = .of(17);
+    const eight: ns_table.Id = .of(18);
+    try tenantSend(&a, seven, 1, "message-one-0001");
+    try tenantSend(&a, seven, 1, "message-two-0002");
+    try tenantSend(&a, eight, 1, "message-thr-0003");
+    const one = a.outRecord(1, 1).?.payload.len;
+    try testing.expectEqual(3 * one, metaOf(a.read(), 1).bytes);
+    try testing.expectEqual(2 * one, nsBytesOf(a.read(), 1, seven));
+    try testing.expectEqual(one, nsBytesOf(a.read(), 1, eight));
+    var buf: [64]u8 = undefined;
+    // Trimming one of each namespace's, then the rest of the first's.
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 1, .through = 1 }));
+    try testing.expectEqual(one, nsBytesOf(a.read(), 1, seven));
+    try testing.expectEqual(one, nsBytesOf(a.read(), 1, eight));
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 2, .through = 2 }));
+    try testing.expectEqual(@as(u64, 0), nsBytesOf(a.read(), 1, seven));
+    try testing.expectEqual(one, nsBytesOf(a.read(), 1, eight));
+    try testing.expectEqual(@as(usize, 1), a.store.family(OutNsFam.ID).count);
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 3, .through = 3 }));
+    try testing.expectEqual(@as(usize, 0), a.store.family(OutNsFam.ID).count);
+    try testing.expectEqual(@as(u64, 0), metaOf(a.read(), 1).bytes);
+}
+
+const TestMessage = struct { entry_type: EntryType, kind: view_mod.Origin.Kind, ns: ns_table.Id, payload: []const u8 };
+
+/// `msgs`, from shard 0 to slot 0, applied in one inbound by `m` on a
+/// store of one group: what each was reported as.
+fn deliverAll(m: *const machine_mod.Machine, st: *store_mod.Store, scratch: *std.heap.ArenaAllocator, msgs: []const TestMessage) ![]const store_mod.AppliedMessage {
+    var mb: [8192]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &mb };
+    for (msgs) |x| try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(x.entry_type), .layout_epoch = 0, .flags = 0, .origin_kind = @backingInt(x.kind), .origin_ns = x.ns.int(), .payload = x.payload });
+    var ib: [16384]u8 = undefined;
+    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = @intCast(msgs.len) } });
+    var h = std.mem.zeroes(entry_mod.Header);
+    h.entry_type = @backingInt(EntryType.channel_inbound);
+    h.index = 9;
+    h.payload_len = @intCast(inbound.len);
+    const e: Entry = .{ .header = h, .payload = inbound };
+    var out = Result.start(&e);
+    try machine_mod.applyEntry(m, st, scratch, &e, &out);
+    return st.messages.items;
+}
+
+test "channels: a queue write naming a namespace not its origin's is refused, by its namespace or by its keys; a delivery from its own holds a deadline inside it" {
+    const queue_mod = @import("../queue/machine.zig");
+    const qe = @import("../protocol/queue_entries.zig");
+    const Q = Channels(&.{queue_mod.machine});
+    const mine: ns_table.Id = .of(17);
+    const other: ns_table.Id = .of(18);
+    var pbs: [4][256]u8 = undefined;
+    var msgs: [4]TestMessage = undefined;
+    for ([_]ns_table.Id{ mine, other }, 0..) |ns, i| msgs[i] = .{ .entry_type = .queue_enqueue, .kind = .user, .ns = mine, .payload = try qe.Enqueue.encodeInto(&pbs[i], .{ .ns = ns.int(), .queue = "q", .priority = 0, .delay_ms = 0, .payload = "body", .max_messages = 16, .max_bytes = 1 << 20, .shard_held_bytes = 1 << 30 }) };
+    // A delivery names no namespace the hook reads: its keys do, its
+    // lease's deadline by the namespace's id after the expiry.
+    for ([_]ns_table.Id{ mine, other }, 2..) |ns, i| msgs[i] = .{ .entry_type = .queue_deliver, .kind = .user, .ns = mine, .payload = try qe.Deliver.encodeInto(&pbs[i], .{ .ns = ns.int(), .queue = "q", .count = 1, .max_bytes = 1 << 20, .holder = "c1", .lease_ms = 60_000 }) };
+    var st = store_mod.Store.init(testing.allocator);
+    defer st.deinit();
+    st.place = .{ .group = 0, .count = 1 };
+    st.strict_keys = true;
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    const reported = try deliverAll(&Q.machine, &st, &scratch, &msgs);
+    try testing.expectEqual(@as(usize, 4), reported.len);
+    for (reported, [_]?store_mod.SenderBug{ null, .wrong_origin, null, .wrong_origin }) |r, bug| try testing.expectEqual(bug, r.sender_bug);
+    try testing.expectEqualStrings("bad request: a message writing outside its origin's namespace", reported[1].result.refused().?.refusal.message);
+    try testing.expectEqualStrings("bad request: a message reaching keys outside its origin's namespace", reported[3].result.refused().?.refusal.message);
+    try testing.expect(reported[0].result.refused() == null and reported[2].result.refused() == null);
+    try testing.expectEqual(@as(usize, 1), st.family(queue_mod.Msgs.ID).count);
+    try testing.expectEqual(@as(usize, 1), st.family(queue_mod.Deadlines.ID).count);
+}
+
+test "channels: a user's message to the shard's own state is refused as its sender's bug; the system's applies" {
+    const settings = @import("../settings/machine.zig");
+    const S = Channels(&.{settings.machine});
+    var pb: [16]u8 = undefined;
+    const share = try settings.SetShare.encodeInto(&pb, .{ .share_permille = 500 });
+    const msgs = [_]TestMessage{
+        .{ .entry_type = .settings_pool_share, .kind = .user, .ns = ns_table.DEFAULT, .payload = share },
+        .{ .entry_type = .settings_pool_share, .kind = .system, .ns = ns_table.DEFAULT, .payload = share },
+    };
+    var st = store_mod.Store.init(testing.allocator);
+    defer st.deinit();
+    st.place = .{ .group = 0, .count = 1 };
+    st.strict_keys = true;
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    const reported = try deliverAll(&S.machine, &st, &scratch, &msgs);
+    try testing.expectEqual(@as(?store_mod.SenderBug, .wrong_origin), reported[0].sender_bug);
+    try testing.expectEqualStrings("bad request: a message reaching keys outside its origin's namespace", reported[0].result.refused().?.refusal.message);
+    try testing.expectEqual(@as(?store_mod.SenderBug, null), reported[1].sender_bug);
+    try testing.expect(reported[1].result.refused() == null);
+    try testing.expectEqual(@as(usize, 1), st.family(settings.PolicyFam.ID).count);
+}
+
+test "channels: an after-commit append naming a namespace not its origin's is refused before the commit; one from its own goes after it" {
+    var b = Group.init(1, 2);
+    defer b.deinit();
+    var mw: schema.Writer = .{ .buf = try testing.allocator.alloc(u8, 1024) };
+    defer testing.allocator.free(mw.buf);
+    var cb: [64]u8 = undefined;
+    // The command names the default namespace.
+    const append = appendCommand(&cb);
+    for ([_]ns_table.Id{ .of(17), ns_table.DEFAULT }) |ns| try ce.Message.encode(&mw, .{ .slot = 1, .entry_type = @backingInt(EntryType.stream_append), .layout_epoch = 0, .flags = 0, .origin_kind = @backingInt(view_mod.Origin.Kind.user), .origin_ns = ns.int(), .payload = append });
+    var buf: [2048]u8 = undefined;
+    _ = try b.run(&Later.machine, .channel_inbound, try ce.Inbound.encodeInto(&buf, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 2 } }));
+    const reported = b.store.messages.items;
+    try testing.expectEqual(@as(usize, 2), reported.len);
+    try testing.expectEqual(@as(?store_mod.SenderBug, .wrong_origin), reported[0].sender_bug);
+    try testing.expect(!reported[0].after_commit);
+    try testing.expectEqual(@as(?store_mod.SenderBug, null), reported[1].sender_bug);
+    try testing.expect(reported[1].after_commit);
+}
+
+/// A test message's origin: the default namespace's user.
+const TEST_USER: u8 = @backingInt(@import("view.zig").Origin.Kind.user);
+const TEST_DEFAULT_NS: u32 = @import("../namespace/table.zig").DEFAULT.int();

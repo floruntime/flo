@@ -630,7 +630,7 @@ test "time series: two writes at one timestamp in one channel inbound are two po
     const schema = @import("../protocol/schema.zig");
     var mb: [4096]u8 = undefined;
     var w: schema.Writer = .{ .buf = &mb };
-    for (log.entries.items) |e| try ce.Message.encode(&w, .{ .slot = 0, .entry_type = e.header.entry_type, .layout_epoch = 0, .flags = 0, .origin_kind = 1, .origin_ns = 7, .payload = e.payload });
+    for (log.entries.items) |e| try ce.Message.encode(&w, .{ .slot = 0, .entry_type = e.header.entry_type, .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = 7, .payload = e.payload });
     var ib: [8192]u8 = undefined;
     const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
     var h = std.mem.zeroes(entry_mod.Header);
@@ -762,3 +762,7 @@ test "time series: a field goes with its last series, to a delete or retention, 
     // 9 s behind: past 0 s, 1 s and 5 s, not 15 s.
     try testing.expectEqualSlices(u64, &.{ 1, 1, 1, 0, 0, 0, 0, 0 }, &late.ts_late_points);
 }
+
+/// A test message's origin: the default namespace's user.
+const TEST_USER: u8 = @backingInt(@import("../contract/view.zig").Origin.Kind.user);
+const TEST_DEFAULT_NS: u32 = @import("../namespace/table.zig").DEFAULT.int();

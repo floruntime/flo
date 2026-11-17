@@ -1631,8 +1631,9 @@ pub const ProcessingHandler = struct {
         /// isn't taken as fast as it is made.
         outbox: struct { to: ?u16, bytes: u64, cap: u64, cause: ?channel_driver.Cause = null },
         /// A sink's namespace holds its share of this shard's outbox to
-        /// `to` (`raft_node_mod.shareHeld`): others may still send there.
-        share: struct { to: u16, namespace: []const u8, bytes: u64, cap: u64 },
+        /// `to`, or of all its outboxes together (`to` null)
+        /// (`raft_node_mod.shareHeld`): others may still send there.
+        share: struct { to: ?u16, namespace: []const u8, bytes: u64, cap: u64 },
         /// This shard's log has no room for another entry now.
         log,
         /// Its operators couldn't be built anew for this leader term, and
@@ -1645,7 +1646,16 @@ pub const ProcessingHandler = struct {
     /// every sink of the job, and every job sending to that shard, until it
     /// has room. Below its parked cap a full target parks what it can't
     /// take, so this waits only past it.
-    fn waitOf(self: *const ProcessingHandler, shard: *Shard, pipe: *const PipelineState) Wait {
+    /// What namespace `ns`'s messages hold of this shard's outboxes, over
+    /// every peer.
+    fn nsOutboxBytes(self: *const ProcessingHandler, read: view_mod.ReadView, ns: router.NamespaceId) u64 {
+        var n: u64 = 0;
+        var to: u16 = 0;
+        while (to < @max(self.peer_shard_count, 1)) : (to += 1) n += channels_mod.nsBytesOf(read, to, ns);
+        return n;
+    }
+
+    fn waitOf(self: *const ProcessingHandler, shard: *Shard, ns: NamespaceId, pipe: *const PipelineState) Wait {
         for (pipe.sinks) |snk| if (self.namespaceIdOf(snk.namespace) == .invalid) return .{ .namespace = snk.namespace };
         if (self.haltedSinkShard(shard, pipe)) |to| return .{ .halted = to };
         const read: view_mod.ReadView = .{ .store = &shard.defaultPartition().store };
@@ -1659,6 +1669,12 @@ pub const ProcessingHandler = struct {
         const now_ms = @import("stdx").time.monotonicMs();
         const total = shard.outboxBytes();
         if (total >= caps.shard) return .{ .outbox = .{ .to = null, .bytes = total, .cap = caps.shard } };
+        // One namespace's sinks may send to every shard, so its share of
+        // the shard's cap is over all its outboxes together.
+        for (pipe.sinks) |snk| {
+            const held = self.nsOutboxBytes(read, self.namespaceIdOf(snk.namespace));
+            if (raft_node_mod.shareHeld(held, total, caps.shard)) return .{ .share = .{ .to = null, .namespace = snk.namespace, .bytes = held, .cap = caps.shard } };
+        }
         var to: u16 = 0;
         const shards: u16 = @max(self.peer_shard_count, 1);
         while (to < shards) : (to += 1) {
@@ -1677,7 +1693,12 @@ pub const ProcessingHandler = struct {
         if (raft.log.lastIndex() -| raft.last_applied >= raft_node_mod.MAX_OUTSTANDING) return .log;
         // Room for a whole batch within what the log takes of this shard's
         // own writes, so one isn't built only to be refused.
-        if (raft.pendingBytes() + limits.MAX_LOG_ENTRY_PAYLOAD > raft_node_mod.PROPOSAL_BYTES - raft_node_mod.PROPOSAL_RESERVE) return .log;
+        const room = raft_node_mod.PROPOSAL_BYTES - raft_node_mod.PROPOSAL_RESERVE;
+        if (raft.pendingBytes() + limits.MAX_LOG_ENTRY_PAYLOAD > room) return .log;
+        // And within its namespace's share of that room, which its batches
+        // are charged to as its clients' writes are.
+        const in_ns = raft.pendingBytesIn(ns.int());
+        if (in_ns > 0 and raft_node_mod.shareHeld(in_ns + limits.MAX_LOG_ENTRY_PAYLOAD, raft.pendingBytes() + limits.MAX_LOG_ENTRY_PAYLOAD, room)) return .log;
         return .none;
     }
 
@@ -1770,7 +1791,7 @@ pub const ProcessingHandler = struct {
                 pipe.ops_term = raft.current_term;
             }
             self.loadCursor(shard, job.ns_id, pipeline_key, pipe);
-            pipe.wait = self.waitOf(shard, pipe);
+            pipe.wait = self.waitOf(shard, job.ns_id, pipe);
             if (pipe.wait != .none) {
                 self.reported = true;
                 // Counted once a poll; a poll it was partway through goes
@@ -2123,7 +2144,7 @@ pub const ProcessingHandler = struct {
         if (read.a != page.from_a or read.b != page.from_b) return;
         // As a tick checks before it reads. Asked again next tick, from
         // the same cursor.
-        pipe.wait = self.waitOf(shard, pipe);
+        pipe.wait = self.waitOf(shard, job.ns_id, pipe);
         if (pipe.wait != .none) {
             self.reported = true;
             return;
@@ -2327,6 +2348,10 @@ pub const ProcessingHandler = struct {
             pipe.more = false;
             return self.rewindTo(pipe, pipe.from);
         };
+        // A job's batches take its namespace's share of the log's room, so
+        // one job can't take every namespace's clients' room.
+        shard.raft_node.charge_ns = ns.int();
+        defer shard.raft_node.charge_ns = 0;
         const r = shard.raft_node.propose(.processing_sink_batch, Flags.NONE, entry) catch |err| {
             if (!shard.quietHalted(err)) log.warn("job '{s}': sink batch not proposed: {s}; read again", .{ self.ticking_job, @errorName(err) });
             // Read again at the next poll, not every tick while the log
@@ -2441,7 +2466,11 @@ pub const ProcessingHandler = struct {
             .share => |r| blk: {
                 var hb: [16]u8 = undefined;
                 var cb: [16]u8 = undefined;
-                break :blk std.fmt.bufPrint(buf, "waiting: namespace {s} holds its share of the outbox to shard {d} ({s} of {s})", .{ if (r.namespace.len == 0) "default" else r.namespace, r.to, channel_driver.bytesText(&hb, r.bytes), channel_driver.bytesText(&cb, r.cap) }) catch "waiting: a namespace holds its share of an outbox";
+                const ns = if (r.namespace.len == 0) "default" else r.namespace;
+                const held = channel_driver.bytesText(&hb, r.bytes);
+                const cap = channel_driver.bytesText(&cb, r.cap);
+                const to = r.to orelse break :blk std.fmt.bufPrint(buf, "waiting: namespace {s} holds its share of this shard's outboxes ({s} of {s})", .{ ns, held, cap }) catch "waiting: a namespace holds its share of the outboxes";
+                break :blk std.fmt.bufPrint(buf, "waiting: namespace {s} holds its share of the outbox to shard {d} ({s} of {s})", .{ ns, to, held, cap }) catch "waiting: a namespace holds its share of an outbox";
             },
             .log => "waiting for room in this shard's log",
             .operators => |why| std.fmt.bufPrint(buf, "waiting: its operators couldn't be rebuilt: {s}", .{why}) catch "waiting: its operators couldn't be rebuilt",
@@ -2987,6 +3016,7 @@ test "processing: what a pipeline waits for, in words" {
         .{ .w = .{ .outbox = .{ .to = 2, .bytes = 9 << 20, .cap = 8 << 20, .cause = .target_full } }, .says = "waiting: the outbox to shard 2 is full (9 MiB of 8 MiB): it has a full target" },
         .{ .w = .{ .outbox = .{ .to = null, .bytes = 1 << 30, .cap = 1 << 30 } }, .says = "waiting: this shard's outboxes are full (1024 MiB of 1024 MiB)" },
         .{ .w = .{ .share = .{ .to = 3, .namespace = "orders", .bytes = 48 << 20, .cap = 64 << 20 } }, .says = "waiting: namespace orders holds its share of the outbox to shard 3 (48 MiB of 64 MiB)" },
+        .{ .w = .{ .share = .{ .to = null, .namespace = "orders", .bytes = 192 << 20, .cap = 256 << 20 } }, .says = "waiting: namespace orders holds its share of this shard's outboxes (192 MiB of 256 MiB)" },
         .{ .w = .log, .says = "waiting for room in this shard's log" },
         .{ .w = .{ .operators = "out of memory" }, .says = "waiting: its operators couldn't be rebuilt: out of memory" },
     };
