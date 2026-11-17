@@ -25,12 +25,13 @@ means the check stopped catching its bug.
 | `queues.json` | `queue_cap_unchecked` | `queue_rule` | `an enqueue past its caps applied` |
 | `queues.json` | `queue_cap_tightened` | `queue_rule` | `an enqueue within its caps was refused` |
 | `queues.json` | `queue_settle_keeps_bytes` | `queue_rule` | `a queue's held bytes aren't what its messages hold` |
-| `consumer-groups.json` | `group_deliver_cursor_first` | `group_rule` | `a deliver leased other records than the ledger's choice` |
+| `consumer-groups.json` | `group_deliver_cursor_first` | `group_rule` | `a deliver leased` |
 | `consumer-groups.json` | `group_abandon_counts_failure` | `group_rule` | `a group's counters are not the ledger's` |
 | `consumer-groups.json` | `group_expire_ignores_deadline` | `group_rule` | `an expire ended another number of leases than the ledger's` |
 | `consumer-groups.json` | `group_settle_keeps_bytes` | `group_rule` | `a group's held bytes are not what the ledger's records hold` |
 | `consumer-groups.json` | `group_trim_misses_floor` | `group_rule` | `a stream's floor is not the last record it lost` |
 | `consumer-groups.json` | `group_delete_keeps_count` | `group_rule` | `a stream's record has another generation or group count than the ledger's` |
+| `consumer-groups.json` | `group_extend_clock_ahead` | `group_rule` | `an extend answered another expiry than the ledger's` |
 | `txn-limits.json` | `kv_if_absent_holds` | `applied_integrity` | `decided a put's condition` |
 | `txn-limits.json` | `kv_batch_conditions_ignored` | `applied_integrity` | `a condition that can't hold` |
 | `txn-limits.json` | `kv_refuses_over_own_limit` | `state_checksum` | `kv.value` |
@@ -86,12 +87,13 @@ are checked against the ledger, record by record.
 
 | Rule | Proved by |
 |---|---|
-| A deliver leases the leader's ready choice still ready and due, above the floor, then the stream's records past the cursor up to its bound, in order, within its count, answer budget and caps | `group_deliver_cursor_first` |
-| A release counts a failure only for a nack; an abandon or the leader's unread readies the record at once, no failure (unread takes the delivery back); counters are the ledger's | `group_abandon_counts_failure` |
-| An expire ends only a live lease it names, past its deadline | `group_expire_ignores_deadline` |
-| A group's held bytes are what its records hold, and the shard's are every queue's and every group's | `group_settle_keeps_bytes` |
-| A trim moves the stream's floor to the last record it lost, and cleanup removes the records at or below it | `group_trim_misses_floor` |
-| A stream's record counts its groups exactly, and goes with its last | `group_delete_keeps_count` |
+| A deliver leases the leader's ready choice before the stream's records past the cursor | `group_deliver_cursor_first` |
+| An abandon counts no failure | `group_abandon_counts_failure` |
+| An expire ends only a lease past its deadline | `group_expire_ignores_deadline` |
+| A group's held bytes are what its records hold | `group_settle_keeps_bytes` |
+| A trim moves the stream's floor to the last record it lost | `group_trim_misses_floor` |
+| A stream's record counts its groups exactly | `group_delete_keeps_count` |
+| An extend moves a lease only with half of it or less left, and answers where it ends | `group_extend_clock_ahead` |
 | A report applies only to the delivery it names; the same hand-back resent counts as applied, any other is answered by what became of the record | machine tests "a nack after an abandon of the same delivery, or the reverse, is answered released, not applied", "a report to a group that isn't there is refused not_found" |
 | Every ready, leased and dead record has its key, and no ready or dead key is left over | checked by the family from the store itself, after every applied group entry |
 

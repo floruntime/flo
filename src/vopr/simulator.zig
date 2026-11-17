@@ -2103,7 +2103,9 @@ pub const Simulator = struct {
             self.leader_not_ready_refused += 1;
             return;
         }
-        const now = target.raft.wall_clock.read();
+        // The log's clock, which stamps the entry: a lease past half by it is
+        // past half where it applies, whatever the leader's wall clock says.
+        const now = target.raft.now();
         if (target.groups_term != target.raft.current_term) {
             target.groups_term = target.raft.current_term;
             target.groups_term_since_ns = now;

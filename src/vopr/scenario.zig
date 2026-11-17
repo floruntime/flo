@@ -397,6 +397,8 @@ pub const Scenario = struct {
         // Room for a group entry's items: a deliver's ready list, a
         // report's records, an expire's leases.
         s.payload_max = @max(s.payload_max, 1024);
+        // And a ring a full batch of them still fills only half of.
+        s.log_capacity = @max(s.log_capacity, std.math.ceilPowerOfTwoAssert(usize, 2 * @as(usize, s.payload_max) * MAX_BATCH));
         return s;
     }
 
@@ -720,6 +722,15 @@ test "vopr scenario: limits that would test nothing don't load" {
     bad = good;
     bad.payload_min = TXN_OTHER_OPS_PAYLOAD_MAX + 1; // above what other ops draw
     try testing.expectError(error.InvalidField, load(bad));
+}
+
+test "vopr scenario: the consumer-groups slice keeps the batch/ring constraint with its payload floor" {
+    for (0..500) |seed| {
+        const s = Scenario.consumerGroups(seed);
+        try testing.expect(s.payload_max >= 1024 and s.payload_max >= s.payload_min);
+        try testing.expect(@as(usize, s.payload_max) * MAX_BATCH <= s.log_capacity / 2);
+        try testing.expect(s.group_percent > 0);
+    }
 }
 
 test "vopr scenario: swarm bounds and batch/ring constraint" {

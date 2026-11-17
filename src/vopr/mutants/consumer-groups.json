@@ -1,7 +1,7 @@
 {
   "seed": 1,
   "node_count": 3,
-  "log_capacity": 65536,
+  "log_capacity": 131072,
   "small_ring": false,
   "ticks_safety": 51383,
   "ticks_convergence": 60000,

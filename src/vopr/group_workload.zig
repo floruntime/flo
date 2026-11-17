@@ -29,14 +29,17 @@ pub const Made = struct { entry_type: EntryType, payload: []const u8 };
 
 /// Holders whose name starts so never report: their leases expire.
 const DEAD = "x";
-const HOLDERS = [_][]const u8{ "c0", "c1", "c2", "x0" };
+/// Holders whose name starts so hold their records past half the lease
+/// before they report: they keep leases alive, extending.
+const SLOW = "s";
+const HOLDERS = [_][]const u8{ "c0", "c1", "s0", "x0" };
 /// A stream stops growing past this many records: appends wait for trims.
 const MAX_RECORDS: u64 = 64;
 const LEASES = [_]u64{ ae.MIN_LEASE_MS, 2 * ae.MIN_LEASE_MS, ge.DEFAULT_LEASE_MS };
 
 const Kind = enum { append, deliver, settle, release, extend, expire, clean, trim, create, delete, stream_delete };
 /// Out of 100.
-const WEIGHTS = [_]u8{ 20, 24, 13, 12, 4, 10, 7, 3, 4, 2, 1 };
+const WEIGHTS = [_]u8{ 20, 20, 12, 11, 10, 10, 7, 3, 4, 2, 1 };
 /// Percent of reports spoiled.
 const SPOIL: u8 = 15;
 
@@ -60,7 +63,8 @@ pub fn make(g: *ConsumerGroups, store: *store_mod.Store, l: Leader, r: std.Rando
         .clean => clean(out),
         .trim => trim(g, out, r, s),
         .create => create(store, out, r, s, grp),
-        .delete => delete(out, s, grp),
+        // A delete takes every record its group holds, so it is rare.
+        .delete => if (r.uintLessThan(u8, 4) == 0) delete(out, s, grp) else null,
         .stream_delete => if (r.uintLessThan(u8, 8) == 0) streamDelete(out, s) else null,
     } catch null;
 }
@@ -84,9 +88,10 @@ fn trim(g: *ConsumerGroups, out: []u8, r: std.Random, s: usize) !?Made {
     const sk = gm.streamOf(NS, STREAMS[s]);
     var ids: [MAX_RECORDS + 1]StreamID = undefined;
     const n = g.stream.streamIdsAfter(sk, g.stream.streamRemovedThrough(sk), &ids);
-    if (n == 0) return null;
-    // Through some record, the oldest half most often.
-    const at = r.uintLessThan(usize, @max(1, n / 2 + @intFromBool(r.boolean()) * (n / 2)));
+    // Through some of the oldest quarter, and only once the stream has
+    // grown: leases on newer records live long enough to be extended.
+    if (n < MAX_RECORDS / 2) return null;
+    const at = r.uintLessThan(usize, n / 4);
     const key = gf.trimKey(ids[@min(at, n - 1)]);
     const hash = gf.streamHash(STREAMS[s]);
     return .{ .entry_type = .stream_trim, .payload = gf.streamEntry(out, &key, &hash) orelse return null };
@@ -164,7 +169,9 @@ fn deliver(g: *ConsumerGroups, store: *store_mod.Store, out: []u8, l: Leader, r:
         // Some small, so the answer's budget stops a deliver short.
         .max_bytes = if (r.uintLessThan(u8, 4) == 0) 64 else 1 << 20,
         .holder = holder,
-        .lease_ms = LEASES[r.uintLessThan(usize, LEASES.len)],
+        // A slow holder's lease is the shortest, so it passes half while
+        // the holder still holds it.
+        .lease_ms = if (std.mem.startsWith(u8, holder, SLOW)) ae.MIN_LEASE_MS else LEASES[r.uintLessThan(usize, LEASES.len)],
         .create = r.uintLessThan(u8, 8) != 0,
         .ready = .{ .bytes = rb[0..w.pos], .count = @intCast(n) },
         .through_ms = through.timestamp_ms,
@@ -201,7 +208,7 @@ const Delivery = struct {
 
 /// The live delivery of the group's first leased record whose holder
 /// reports, and its other records under the same lease.
-fn liveDelivery(store: *store_mod.Store, s: usize, grp: usize, r: std.Random) ?Delivery {
+fn liveDelivery(store: *store_mod.Store, s: usize, grp: usize, r: std.Random, now: u64, only_past_half: bool) ?Delivery {
     const scope = gm.scopeOf(NS, STREAMS[s], GROUPS[grp]);
     var kb: [4 + gm.SCOPE_LEN]u8 = undefined;
     var it = (view_mod.ReadView{ .store = store }).range(gm.Items, gm.storeKey(&kb, NS, &scope));
@@ -211,6 +218,16 @@ fn liveDelivery(store: *store_mod.Store, s: usize, grp: usize, r: std.Random) ?D
     while (it.next() catch null) |entry| {
         const v = entry.value.v;
         if (v.status != .leased or std.mem.startsWith(u8, v.holder, DEAD) or v.holder.len > 8) continue;
+        // An extend that moves a lease is one sent with half of it or less
+        // left, as a holder's keepalive is; a slow holder reports nothing
+        // else before then.
+        const past_half = v.expiry_ns -| now <= (v.lease_ms *| std.time.ns_per_ms) / 2;
+        // A slow holder settles or releases a record only once it has kept
+        // the lease alive past its first term.
+        const extended = v.expiry_ns > v.delivered_ns +| v.lease_ms *| std.time.ns_per_ms;
+        const slow = std.mem.startsWith(u8, v.holder, SLOW);
+        if (d == null and only_past_half and !past_half) continue;
+        if (d == null and !only_past_half and slow and !extended) continue;
         if (d == null) {
             if (skip > 0) {
                 skip -= 1;
@@ -231,8 +248,8 @@ fn liveDelivery(store: *store_mod.Store, s: usize, grp: usize, r: std.Random) ?D
 }
 
 fn report(store: *store_mod.Store, out: []u8, kind: Kind, l: Leader, r: std.Random, s: usize, grp: usize) !?Made {
-    _ = l;
-    var d = liveDelivery(store, s, grp, r) orelse return null;
+    const extend_late = kind == .extend and r.uintLessThan(u8, 8) != 0;
+    var d = liveDelivery(store, s, grp, r, l.now_ns, extend_late) orelse liveDelivery(store, s, grp, r, l.now_ns, false) orelse return null;
     var holder = d.holderName();
     if (r.uintLessThan(u8, 100) < SPOIL) switch (r.uintLessThan(u8, 4)) {
         0 => d.token.index +%= 1,
@@ -256,7 +273,12 @@ fn report(store: *store_mod.Store, out: []u8, kind: Kind, l: Leader, r: std.Rand
             // abandon or the leader's unread now and then.
             const roll = r.uintLessThan(u8, 10);
             const ended: ge.HandBack = if (roll < 7) .failed else if (roll < 9) .abandoned else .unread;
+            // Now and then a hand-back with a failure's options as well,
+            // from a proposer other than the handler: refused at apply.
+            const mixed = ended != .failed and r.uintLessThan(u8, 6) == 0;
             const failed = ended == .failed;
+            // Which of a failure's options a mixed hand-back carries.
+            const pick = if (mixed) r.uintLessThan(u8, 3) else 0;
             return .{ .entry_type = .group_release, .payload = try ge.Release.encodeInto(out, .{
                 .ns = common.ns,
                 .stream = common.stream,
@@ -265,9 +287,9 @@ fn report(store: *store_mod.Store, out: []u8, kind: Kind, l: Leader, r: std.Rand
                 .token = common.token,
                 .expiry_ns = common.expiry_ns,
                 .items = common.items,
-                .delay_ms = if (failed and r.uintLessThan(u8, 3) == 0) r.uintLessThan(u64, 3_000) else 0,
-                .dead = failed and r.uintLessThan(u8, 10) == 0,
-                .@"error" = if (failed and r.boolean()) "boom" else "",
+                .delay_ms = if (mixed) (if (pick == 0) 500 else 0) else if (failed and r.uintLessThan(u8, 3) == 0) r.uintLessThan(u64, 3_000) else 0,
+                .dead = if (mixed) pick == 1 else failed and r.uintLessThan(u8, 10) == 0,
+                .@"error" = if (mixed) (if (pick == 2) "boom" else "") else if (failed and r.boolean()) "boom" else "",
                 .ended = ended,
             }) };
         },
@@ -281,11 +303,16 @@ fn expire(store: *store_mod.Store, out: []u8, l: Leader, r: std.Random) !?Made {
     // As many as the entry's room holds, a spoiled one's too.
     const room: u32 = @intCast(@min(16, (out.len -| 64) / ge.ExpireItem.max_size));
     if (room < 2) return null;
-    var it = gm.pastDue(.{ .store = store }, l.now_ns);
-    while (it.next()) |d| {
-        if (n == room - 1) break;
-        try ge.ExpireItem.encode(&w, .{ .ns = d.key.ns.int(), .id = d.key.id, .expiry_ns = d.key.expiry_ns });
-        n += 1;
+    // Live leases past due first, then keys a settle or a cleanup left: the
+    // left ones are oldest, and would crowd out the leases that must end.
+    for ([_]bool{ true, false }) |live_pass| {
+        var it = gm.pastDue(.{ .store = store }, l.now_ns);
+        while (it.next()) |d| {
+            if (n == room - 1) break;
+            if (liveLease(store, d.key.ns, d.key.id, d.key.expiry_ns) != live_pass) continue;
+            try ge.ExpireItem.encode(&w, .{ .ns = d.key.ns.int(), .id = d.key.id, .expiry_ns = d.key.expiry_ns });
+            n += 1;
+        }
     }
     // Now and then a live lease not yet due as well, as a leader whose
     // clock ran ahead names it: the machine must leave it.
@@ -301,6 +328,14 @@ fn expire(store: *store_mod.Store, out: []u8, l: Leader, r: std.Random) !?Made {
     }
     if (n == 0) return null;
     return .{ .entry_type = .group_expire, .payload = try ge.Expire.encodeInto(out, .{ .items = .{ .bytes = ib[0..w.pos], .count = n } }) };
+}
+
+/// Whether a deadline key is its record's live lease.
+fn liveLease(store: *store_mod.Store, ns: gm.NamespaceId, id: []const u8, expiry_ns: u64) bool {
+    var b: [4 + gm.ID_LEN]u8 = undefined;
+    const got = (view_mod.ReadView{ .store = store }).get(gm.Items, gm.storeKey(&b, ns, id)) catch return false;
+    const v = (got orelse return false).v;
+    return v.status == .leased and v.expiry_ns == expiry_ns;
 }
 
 fn clean(out: []u8) !?Made {

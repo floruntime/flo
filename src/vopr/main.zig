@@ -28,10 +28,13 @@
 //!                                   a swarm fails if no seed settles or
 //!                                   expires a lease from an earlier term
 //!        [--queues]                 a share of the ops are queue entries;
-//!        [--consumer-groups]        a share of the ops are consumer-group and
-//!                                   stream entries, queue entries beside them;
 //!                                   a swarm fails if no seed settles or
 //!                                   expires a lease from an earlier term
+//!        [--consumer-groups]        a share of the ops are consumer-group and
+//!                                   stream entries, queue entries beside them;
+//!                                   a swarm fails if a kind of effect never
+//!                                   happens, or too few seeds settle and
+//!                                   expire leases from an earlier term
 //!        [--family-mutant=NAME]     plant a family mutant (`families.Mutant`):
 //!                                   the run must fail
 //!        [--catching-up]            namespace creates, and nodes that fall
@@ -420,6 +423,7 @@ fn runGroups(allocator: std.mem.Allocator, args: Args, scenario: Scenario) !bool
 
 const GroupCounts = vopr.group_family.ConsumerGroups.Counts;
 const GROUP_KINDS = std.enums.values(vopr.group_family.ConsumerGroups.Kind);
+const GROUP_MARKS = std.enums.values(vopr.group_family.ConsumerGroups.Mark);
 
 /// One line a parent can read back, as the queues' line is.
 fn printGroupCounts(c: GroupCounts) void {
@@ -427,7 +431,9 @@ fn printGroupCounts(c: GroupCounts) void {
     var w: std.Io.Writer = .fixed(&buf);
     w.writeAll("[vopr] consumer groups:") catch {};
     for (GROUP_KINDS, c.applied, c.refused) |k, a, r| w.print(" {t}={d}/{d}", .{ k, a, r }) catch {};
-    w.print(" items={d}/{d}\n", .{ c.items_applied, c.items_refused }) catch {};
+    w.print(" items={d}/{d}", .{ c.items_applied, c.items_refused }) catch {};
+    for (GROUP_MARKS, c.marks) |m, n| w.print(" {t}={d}", .{ m, n }) catch {};
+    w.writeAll("\n") catch {};
     std.debug.print("{s}", .{w.buffered()});
 }
 
@@ -444,6 +450,10 @@ fn readGroupCounts(allocator: std.mem.Allocator, log_path: []const u8) ?GroupCou
         const eq = std.mem.indexOfScalar(u8, field, '=') orelse return null;
         const name = field[0..eq];
         const value = field[eq + 1 ..];
+        if (std.meta.stringToEnum(vopr.group_family.ConsumerGroups.Mark, name)) |m| {
+            c.marks[@backingInt(m)] = std.fmt.parseInt(u64, value, 10) catch return null;
+            continue;
+        }
         const slash = std.mem.indexOfScalar(u8, value, '/') orelse return null;
         const a = std.fmt.parseInt(u64, value[0..slash], 10) catch return null;
         const r = std.fmt.parseInt(u64, value[slash + 1 ..], 10) catch return null;
@@ -754,7 +764,11 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
                             } else unread_counts += 1;
                         }
                         if (args.consumer_groups) {
-                            if (readGroupCounts(allocator, r.log_path)) |c| group_totals.add(c) else unread_counts += 1;
+                            if (readGroupCounts(allocator, r.log_path)) |c| {
+                                group_totals.add(c);
+                                if (c.marks[@backingInt(vopr.group_family.ConsumerGroups.Mark.cross_term_settle)] > 0) settle_seeds += 1;
+                                if (c.marks[@backingInt(vopr.group_family.ConsumerGroups.Mark.cross_term_expire)] > 0) expire_seeds += 1;
+                            } else unread_counts += 1;
                         }
                         if (args.queues) {
                             if (readQueueCounts(allocator, r.log_path)) |c| {
@@ -874,6 +888,19 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
             std.debug.print("[vopr] FAILED: no seed applied a group {t}\n", .{k});
             covered = false;
         };
+        // An entry that applied but did nothing tested nothing either.
+        std.debug.print("[vopr] consumer groups, effects:", .{});
+        for (GROUP_MARKS, group_totals.marks) |m, n| std.debug.print(" {t}={d}", .{ m, n });
+        std.debug.print("\n[vopr] across a term change: settles in {d} seeds, expires in {d} seeds\n", .{ settle_seeds, expire_seeds });
+        for (GROUP_MARKS, group_totals.marks) |m, n| if (n == 0 and ok_count > 0) {
+            std.debug.print("[vopr] FAILED: no seed had a group {t}\n", .{m});
+            covered = false;
+        };
+        const want = @min(MIN_TAKEOVER_SEEDS, ok_count);
+        if (settle_seeds < want or expire_seeds < want) {
+            std.debug.print("[vopr] FAILED: fewer than {d} seeds settled and expired group leases from an earlier term\n", .{want});
+            covered = false;
+        }
     }
     // Limits that no batch ever went past tested nothing: it fails, as above.
     if (args.txn_limits) {

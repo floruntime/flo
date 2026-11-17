@@ -10,7 +10,10 @@
 //! The oracle is a ledger of its own: each group's records (state, holder,
 //! token, counts, error length), its settings, cursor and counters, and
 //! each stream's floor, generation and group count, kept from the entries
-//! by rules written here, not by the machine's helpers. Each entry's
+//! by rules and arithmetic written here: lease and nack times, the extend
+//! clamp, held bytes and answer bytes are the ledger's own, not the
+//! machine's or the delivery model's. The machine's key builders are used
+//! only to find records in the store, never to decide what an entry does. Each entry's
 //! answer is checked against what the ledger says it must be, and after it
 //! applies every group's store state is checked against the ledger, so a
 //! machine that picks, ends, counts or cleans otherwise is caught at the
@@ -32,7 +35,7 @@ const qm = @import("../queue/machine.zig");
 const stream_proj = @import("../projection/stream.zig");
 const streams_mod = @import("../contract/streams.zig");
 const families = @import("families.zig");
-const delivery = @import("../contract/delivery.zig");
+const qe = @import("../protocol/queue_entries.zig");
 
 const Allocator = std.mem.Allocator;
 const Entry = entry_mod.Entry;
@@ -84,6 +87,37 @@ pub fn streamHash(name: []const u8) [8]u8 {
 /// Bytes one append's records take, as the projection counts them.
 const RECORD_BYTES: u32 = 24;
 
+// The ledger's arithmetic, written here rather than taken from the
+// delivery model or the machine, so a bug in theirs can't pass as the
+// ledger's own. Each restates a rule the wire or the group docs set.
+
+/// `ms` after `stamp`, saturating: a lease's expiry, a nack's due time.
+fn afterMs(stamp_ns: u64, ms: u64) u64 {
+    return stamp_ns +| (ms *| std.time.ns_per_ms);
+}
+
+/// Where an extend moves a lease: a full lease from now, but never past the
+/// hold ceiling from its deliver.
+fn extendTo(stamp_ns: u64, lease_ms: u64, delivered_ns: u64) u64 {
+    const lease = afterMs(stamp_ns, lease_ms);
+    const ceiling = afterMs(delivered_ns, ae.MAX_HOLD_MS);
+    return if (lease < ceiling) lease else ceiling;
+}
+
+/// What a record a group holds counts against the caps: its error text and
+/// the per-message overhead (`qe.PER_MESSAGE`, the queues' wire figure); the
+/// stream holds its payload.
+fn heldOf(err_len: usize) u64 {
+    return err_len + qe.PER_MESSAGE;
+}
+
+/// The most an append's records take in a read's answer: each record's
+/// framing (28 bytes: id, headers and length fields) and its bytes twice
+/// over, as the stream read's answer budget counts them.
+fn answerBytes(byte_len: u32, record_count: u32) u64 {
+    return 2 * @as(u64, byte_len) + 28 * @as(u64, record_count);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // The ledger
 // ═══════════════════════════════════════════════════════════════════════════
@@ -130,7 +164,7 @@ const LGroup = struct {
 
     fn heldBytes(g: *const LGroup) u64 {
         var sum: u64 = 0;
-        for (g.items.values()) |v| sum += gm.heldBy(v.err_len);
+        for (g.items.values()) |v| sum += heldOf(v.err_len);
         return sum;
     }
 
@@ -203,12 +237,16 @@ pub const ConsumerGroups = struct {
 
     pub const Kind = enum { append, trim, stream_delete, create, delete, deliver, settle, release, extend, expire, clean };
 
+    /// What an applied entry did, beyond applying: the swarm fails if one
+    /// never happens, since a rule it never met was never checked.
+    pub const Mark = enum { deliver_leased, extend_moved, abandon, unread, nack_dead, nack_delay, nack_error, mixed_abandon_refused, cross_term_settle, cross_term_expire };
+
     pub const Effect = struct {
         kind: Kind,
         refused: bool,
         applied: u32 = 0,
         refused_items: u32 = 0,
-        cross_term: bool = false,
+        marks: std.EnumSet(Mark) = .empty,
         broke: ?[]const u8 = null,
     };
 
@@ -217,19 +255,15 @@ pub const ConsumerGroups = struct {
         refused: [std.enums.values(Kind).len]u64 = @splat(0),
         items_applied: u64 = 0,
         items_refused: u64 = 0,
-        cross_term_settles: u64 = 0,
-        cross_term_expires: u64 = 0,
+        marks: [std.enums.values(Mark).len]u64 = @splat(0),
 
         pub fn count(self: *Counts, o: Effect) void {
             const k = @backingInt(o.kind);
             if (o.refused) self.refused[k] += 1 else self.applied[k] += 1;
             self.items_applied += o.applied;
             self.items_refused += o.refused_items;
-            if (o.cross_term) switch (o.kind) {
-                .settle => self.cross_term_settles += 1,
-                .expire => self.cross_term_expires += 1,
-                else => {},
-            };
+            var it = o.marks.iterator();
+            while (it.next()) |m| self.marks[@backingInt(m)] += 1;
         }
 
         pub fn add(self: *Counts, other: Counts) void {
@@ -237,8 +271,7 @@ pub const ConsumerGroups = struct {
             for (&self.refused, other.refused) |*a, b| a.* += b;
             self.items_applied += other.items_applied;
             self.items_refused += other.items_refused;
-            self.cross_term_settles += other.cross_term_settles;
-            self.cross_term_expires += other.cross_term_expires;
+            for (&self.marks, other.marks) |*a, b| a.* += b;
         }
     };
 
@@ -368,11 +401,14 @@ pub const ConsumerGroups = struct {
                     effect.refused = true;
                     if (want != .refused) {
                         effect.broke = "the group machine refused an entry the ledger applies";
-                    } else if (want.refused != refused.status) effect.broke = "the group machine refused an entry with another status than the ledger's";
+                    } else if (want.refused != refused.status) {
+                        effect.broke = "the group machine refused an entry with another status than the ledger's";
+                    } else if (kind == .release and refused.status == .bad_request) effect.marks.insert(.mixed_abandon_refused);
                 } else if (want == .refused) {
                     effect.broke = "the group machine applied an entry the ledger refuses";
                 } else {
                     effect.broke = self.answerBroke(want, &out, &effect);
+                    markOf(e, kind, want, &effect);
                     self.commit(e, kind, want);
                     try plantAfter(store, e, kind, want, r);
                 }
@@ -482,9 +518,11 @@ pub const ConsumerGroups = struct {
         refused: @import("../protocol/proto.zig").StatusCode,
         create: struct { s: usize, g: usize, made: bool, lease_ms: u64, max_attempts: u32 },
         delete: struct { s: usize, g: usize, held: u64 },
-        deliver: struct { s: usize, g: usize, made: bool, chosen: []const StreamID, fresh: usize },
-        report: struct { s: usize, g: usize, applied: []const StreamID, refused: []const Refused },
-        expire: []const [3]u128,
+        deliver: struct { s: usize, g: usize, made: bool, chosen: []const StreamID, deliveries: []const u32, fresh: usize },
+        /// An extend's answer: the expiry its last applied record is left
+        /// at, 0 when none applied.
+        report: struct { s: usize, g: usize, applied: []const StreamID, refused: []const Refused, extend_to: u64 = 0, moved: bool = false, held: u32 = 0, cross_term: bool = false },
+        expire: struct { ended: []const [3]u128, cross_term: bool },
         clean: []const Cleaned,
     };
     const Refused = struct { record: StreamID, why: Why };
@@ -521,6 +559,7 @@ pub const ConsumerGroups = struct {
             .expire => {
                 const p = ge.Expire.decodeAll(e.payload, &diag) catch return error.Halt;
                 var ended: std.ArrayListUnmanaged([3]u128) = .empty;
+                var cross = false;
                 var it = p.items.iterator();
                 while (it.next() catch return error.Halt) |named| {
                     if (named.expiry_ns > stamp or named.id.len != gm.ID_LEN) continue;
@@ -534,8 +573,9 @@ pub const ConsumerGroups = struct {
                         if (x[0] == sg[0] and x[1] == sg[1] and x[2] == recKey(rec)) break true;
                     } else false) continue;
                     try ended.append(a, .{ sg[0], sg[1], recKey(rec) });
+                    cross = cross or v.token.term < e.header.term;
                 }
-                return .{ .expire = ended.items };
+                return .{ .expire = .{ .ended = ended.items, .cross_term = cross } };
             },
             .clean => {
                 const p = ge.Clean.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -603,7 +643,7 @@ pub const ConsumerGroups = struct {
             fn f(proj: *const stream_proj.StreamProjection, key: StreamKey, record: StreamID, first: bool, sn: *std.ArrayListUnmanaged(StreamID), u: *u64, max: u64, al: Allocator) !Fit {
                 const ap = proj.streamAppendOf(key, record) orelse return .gone;
                 for (sn.items) |x| if (x.eql(ap.id)) return .fits;
-                const bytes = stream_proj.answerBound(ap);
+                const bytes = answerBytes(ap.byte_len, ap.record_count);
                 if (!first and u.* + bytes > max) return .full;
                 u.* += bytes;
                 try sn.append(al, ap.id);
@@ -642,7 +682,7 @@ pub const ConsumerGroups = struct {
             const held: u64 = if (grp) |x| x.items.count() else 0;
             const held_bytes: u64 = if (grp) |x| x.heldBytes() else 0;
             const shard = shardHeld(store);
-            const each = gm.heldBy(0);
+            const each = heldOf(0);
             const through: StreamID = .{ .timestamp_ms = p.through_ms, .sequence = p.through_seq };
             for (ids[0..got]) |rec| {
                 if (rec.greaterThan(through)) break;
@@ -659,7 +699,13 @@ pub const ConsumerGroups = struct {
             }
         }
         if (chosen.items.len == 0 and capped) return .{ .refused = .overloaded };
-        return .{ .deliver = .{ .s = s, .g = g, .made = made, .chosen = chosen.items, .fresh = fresh } };
+        // Each one's deliveries after this one: a fresh record's first.
+        const deliveries = try a.alloc(u32, chosen.items.len);
+        for (chosen.items, deliveries) |rec, *d| {
+            const before: u32 = if (grp) |x| (if (x.items.get(recKey(rec))) |v| v.deliveries else 0) else 0;
+            d.* = before +| 1;
+        }
+        return .{ .deliver = .{ .s = s, .g = g, .made = made, .chosen = chosen.items, .deliveries = deliveries, .fresh = fresh } };
     }
 
     const ReportOf = struct { stream: []const u8, group: []const u8, holder: []const u8, token: ae.Token.Value, items: ge.Items.Value };
@@ -713,6 +759,12 @@ pub const ConsumerGroups = struct {
         const grp = &L.groups[s][g].?;
         var applied: std.ArrayListUnmanaged(StreamID) = .empty;
         var refused: std.ArrayListUnmanaged(Refused) = .empty;
+        var extend_to: u64 = 0;
+        var moved = false;
+        // Records the report holds the live delivery of, as opposed to a
+        // resend counted as applied.
+        var held: u32 = 0;
+        var cross_term = false;
         var it = c.items.iterator();
         while (it.next() catch return error.Halt) |named| {
             const rec: StreamID = .{ .timestamp_ms = named.ms, .sequence = named.seq };
@@ -741,10 +793,19 @@ pub const ConsumerGroups = struct {
                     try refused.append(a, .{ .record = rec, .why = .delivered_again });
                     continue;
                 }
+                // More than half the lease left, or held to the ceiling: it
+                // stands, and the answer says where it ends.
+                const stamp = e.header.timestamp_ns;
+                const to = extendTo(stamp, v.lease_ms, v.delivered_ns);
+                const stands = v.expiry_ns -| stamp > (v.lease_ms *| std.time.ns_per_ms) / 2 or to <= v.expiry_ns;
+                extend_to = if (stands) v.expiry_ns else to;
+                moved = moved or !stands;
             }
+            held += 1;
+            cross_term = cross_term or v.token.term < e.header.term;
             try applied.append(a, rec);
         }
-        return .{ .report = .{ .s = s, .g = g, .applied = applied.items, .refused = refused.items } };
+        return .{ .report = .{ .s = s, .g = g, .applied = applied.items, .refused = refused.items, .extend_to = extend_to, .moved = moved, .held = held, .cross_term = cross_term } };
     }
 
     /// Whether the machine's answer is the ledger's.
@@ -764,18 +825,22 @@ pub const ConsumerGroups = struct {
             .deliver => |w| {
                 const n = rd.int(u32) orelse return "a deliver answered nothing";
                 if (n != w.chosen.len) return "a deliver leased another number of records than the ledger's choice";
-                for (w.chosen) |c| {
+                for (w.chosen, w.deliveries) |c, d| {
                     const ms = rd.int(u64) orelse return "a deliver's answer is short";
                     const seq = rd.int(u64) orelse return "a deliver's answer is short";
-                    _ = rd.int(u32) orelse return "a deliver's answer is short";
+                    const got = rd.int(u32) orelse return "a deliver's answer is short";
                     if (ms != c.timestamp_ms or seq != c.sequence) return "a deliver leased other records than the ledger's choice, or in another order";
+                    if (got != d) return "a deliver answered a record's deliveries otherwise than the ledger";
                 }
                 effect.applied = n;
             },
             .report => |w| {
                 const n = rd.int(u32) orelse return "a report answered nothing";
                 if (n != w.applied.len) return "a report applied to another number of records than the ledger's";
-                if (effect.kind == .extend) _ = rd.int(u64) orelse return "an extend answered no expiry";
+                if (effect.kind == .extend) {
+                    const to = rd.int(u64) orelse return "an extend answered no expiry";
+                    if (to != w.extend_to) return "an extend answered another expiry than the ledger's";
+                }
                 for (w.refused) |x| {
                     const ms = rd.int(u64) orelse return "a report refused fewer records than the ledger";
                     const seq = rd.int(u64) orelse return "a report refused fewer records than the ledger";
@@ -789,7 +854,7 @@ pub const ConsumerGroups = struct {
             },
             .expire => |w| {
                 const n = rd.int(u32) orelse return "an expire answered nothing";
-                if (n != w.len) return "an expire ended another number of leases than the ledger's";
+                if (n != w.ended.len) return "an expire ended another number of leases than the ledger's";
                 effect.applied = n;
             },
             .clean => |w| {
@@ -841,7 +906,7 @@ pub const ConsumerGroups = struct {
                     v.token = token;
                     v.lease_ms = p.lease_ms;
                     v.delivered_ns = stamp;
-                    v.expiry_ns = delivery.after(stamp, p.lease_ms);
+                    v.expiry_ns = afterMs(stamp, p.lease_ms);
                     v.ended = .none;
                     if (v.started_ns == 0) v.started_ns = stamp;
                 }
@@ -877,18 +942,18 @@ pub const ConsumerGroups = struct {
                                 die(grp, v, stamp);
                             } else {
                                 v.status = .ready;
-                                v.due_ns = delivery.after(stamp, p.delay_ms);
+                                v.due_ns = afterMs(stamp, p.delay_ms);
                             }
                         },
                         else => {
                             if (v.expiry_ns -| stamp > (v.lease_ms *| std.time.ns_per_ms) / 2) continue;
-                            const to = @min(delivery.after(stamp, v.lease_ms), delivery.after(v.delivered_ns, ae.MAX_HOLD_MS));
+                            const to = extendTo(stamp, v.lease_ms, v.delivered_ns);
                             if (to > v.expiry_ns) v.expiry_ns = to;
                         },
                     }
                 }
             },
-            .expire => |w| for (w) |x| {
+            .expire => |w| for (w.ended) |x| {
                 const grp = &L.groups[@intCast(x[0])][@intCast(x[1])].?;
                 const v = grp.items.getPtr(x[2]).?;
                 v.ended = .expired;
@@ -934,6 +999,10 @@ pub const ConsumerGroups = struct {
                 const buf = try a.alloc(u8, ge.Release.encodedSize(p) catch return error.Halt);
                 out.payload = ge.Release.encodeInto(buf, p) catch return error.Halt;
             },
+            .group_extend_clock_ahead => if (kind == .extend) {
+                const p = ge.Extend.decodeAll(e.payload, &diag) catch return error.Halt;
+                out.header.timestamp_ns +|= (p.lease_ms *| std.time.ns_per_ms) / 2 + std.time.ns_per_ms;
+            },
             .group_expire_ignores_deadline => if (kind == .expire) {
                 // As late as its latest named live lease: one not yet due
                 // then ends.
@@ -963,7 +1032,7 @@ pub const ConsumerGroups = struct {
                 const key = gm.storeKey(&b, NS, &scope);
                 const node = store.find(gm.Metas.ID, key) orelse return;
                 var m = (gm.Metas.Value.decode(store_mod.Record.of(node).value) catch return error.Halt).v;
-                m.held_bytes += gm.heldBy(0) * w.applied.len;
+                m.held_bytes += heldOf(0) * w.applied.len;
                 const bytes = try store.allocator.alloc(u8, gm.Meta.encodedSize(m) catch return error.Halt);
                 _ = gm.Meta.encodeInto(bytes, m) catch return error.Halt;
                 store.replace(gm.Metas.ID, node, bytes);
@@ -981,6 +1050,36 @@ pub const ConsumerGroups = struct {
             else => {},
         }
         _ = e;
+    }
+
+    /// The effects an applied entry had, by the ledger's prediction.
+    fn markOf(e: *const Entry, kind: Kind, want: Want, effect: *Effect) void {
+        var diag: schema.Diagnostic = .{};
+        switch (want) {
+            .deliver => |w| if (w.chosen.len > 0) effect.marks.insert(.deliver_leased),
+            .expire => |w| if (w.cross_term) effect.marks.insert(.cross_term_expire),
+            .report => |w| {
+                if (w.held == 0) return;
+                switch (kind) {
+                    .settle => if (w.cross_term) effect.marks.insert(.cross_term_settle),
+                    .extend => if (w.moved) effect.marks.insert(.extend_moved),
+                    .release => {
+                        const p = ge.Release.decodeAll(e.payload, &diag) catch return;
+                        switch (p.ended) {
+                            .abandoned => effect.marks.insert(.abandon),
+                            .unread => effect.marks.insert(.unread),
+                            .failed => {
+                                if (p.dead) effect.marks.insert(.nack_dead);
+                                if (p.delay_ms > 0) effect.marks.insert(.nack_delay);
+                                if (p.@"error".len > 0) effect.marks.insert(.nack_error);
+                            },
+                        }
+                    },
+                    else => {},
+                }
+            },
+            else => {},
+        }
     }
 
     fn die(grp: *LGroup, v: *LItem, stamp: u64) void {
