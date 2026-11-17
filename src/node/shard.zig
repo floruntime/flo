@@ -5349,6 +5349,7 @@ pub const Shard = struct {
             // dropped multishot re-arms, as one back-pressure signal.
             sm.arm_failures.store(self.arm_failures + self.reactor.rearm_failures, .monotonic);
             sm.stale_events_dropped.store(self.reactor.stale_events_dropped, .monotonic);
+            sm.reactor_internal_op_failures.store(self.reactor.internal_op_failures, .monotonic);
             sm.snapshot_skipped_leader_not_ready.store(self.snapshot_skips_leader_not_ready, .monotonic);
             sm.ts_points.store(self.ts_handler.ts.pointCount(), .monotonic);
             sm.ts_point_bytes.store(self.ts_handler.ts.pointBytes(), .monotonic);
