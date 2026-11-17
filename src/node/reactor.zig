@@ -101,6 +101,14 @@ pub const EventSource = struct {
     interests: Interests,
     /// Opaque user data (e.g., pointer to Connection)
     user_data: usize = 0,
+    /// Registration generation, assigned by `addSource` and carried in the
+    /// backend's event identity (io_uring user_data high bits, kqueue udata). An
+    /// fd number is reused across connections; a completion that outlives its fd
+    /// (a lingering io_uring multishot CQE, a batched kevent) would otherwise
+    /// route by fd to the connection that now holds the number. The poll loop
+    /// drops any event whose gen does not match the live source. 0 = never
+    /// bumped (timers, which are not reused).
+    gen: u32 = 0,
     /// Multishot poll ends that came back as a kernel error (a negative CQE, not
     /// `-ECANCELED`), with no good completion in between. A good completion
     /// resets it; a long enough run means re-arming only spins, so the reactor
@@ -148,6 +156,17 @@ pub const Reactor = struct {
     /// `deferred_rearm` to try again rather than left silently un-polled. The
     /// owner reads this for a metric.
     rearm_failures: u64 = 0,
+
+    /// Next registration generation (see `EventSource.gen`). Starts at 1 so a
+    /// zero gen means "never registered through addSource" (timers); wraps
+    /// within 31 bits so it fits beside the fd in the io_uring user_data.
+    next_gen: u32 = 1,
+
+    /// Completions dropped because their generation no longer matched the live
+    /// source — a stale event for an fd that has since been closed and reused.
+    /// The owner reads this for a metric; nonzero means fd-reuse races are
+    /// happening (and being caught).
+    stale_events_dropped: u64 = 0,
 
     /// Monotonic ms of the last deferred-re-arm log, so a burst under load logs
     /// at most once an interval rather than per fd.
@@ -234,14 +253,32 @@ pub const Reactor = struct {
         }
     }
 
-    /// Register an event source (fd + interests).
-    pub fn addSource(self: *Self, source: EventSource) !void {
+    /// Register an event source (fd + interests). Each registration gets a fresh
+    /// generation, so a reused fd number is a distinct source and a completion
+    /// left over from the previous owner is dropped rather than misdelivered.
+    pub fn addSource(self: *Self, source_in: EventSource) !void {
+        var source = source_in;
+        source.gen = self.nextGen();
         if (comptime is_bsd) {
             try self.kqueueAddSource(source);
         } else if (comptime is_linux) {
             try self.iouringAddSource(source);
         }
         try self.sources.put(source.fd, source);
+    }
+
+    /// A fresh registration generation in `[1, 2^31)`, so it never collides with
+    /// a timer's 0 and always fits beside the fd in a 64-bit io_uring user_data.
+    fn nextGen(self: *Self) u32 {
+        const g = self.next_gen;
+        self.next_gen = if (self.next_gen >= 0x7FFF_FFFF) 1 else self.next_gen + 1;
+        return g;
+    }
+
+    /// Pack an fd and its generation into an io_uring poll user_data: fd in the
+    /// low 32 bits, gen in bits [32..62]. Bit 63 stays clear for INTERNAL_FLAG.
+    fn pollUserData(fd: i32, gen: u32) u64 {
+        return @as(u64, @as(u32, @bitCast(fd))) | (@as(u64, gen) << 32);
     }
 
     /// Remove an fd from the reactor.
@@ -276,7 +313,7 @@ pub const Reactor = struct {
             if (!source.interests.writable) {
                 if (comptime is_bsd) {
                     var changelist: [1]posix.Kevent = undefined;
-                    changelist[0] = makeKevent(fd, posix.system.EVFILT.WRITE, posix.system.EV.ADD | posix.system.EV.ENABLE, source.user_data);
+                    changelist[0] = makeKevent(fd, posix.system.EVFILT.WRITE, posix.system.EV.ADD | posix.system.EV.ENABLE, source.gen);
                     _ = try keventCall(self.poll_fd, &changelist, &.{}, null);
                 } else if (comptime is_linux) {
                     try self.iouringSetInterests(fd, source.interests, .{ .readable = source.interests.readable, .writable = true });
@@ -367,12 +404,15 @@ pub const Reactor = struct {
         var changelist: [2]posix.Kevent = undefined;
         var nchanges: usize = 0;
 
+        // The kevent udata carries the registration generation, not the
+        // Connection pointer: the poll loop reads user_data back from the live
+        // source, and uses the udata only to drop a stale event after fd reuse.
         if (source.interests.readable) {
             changelist[nchanges] = makeKevent(
                 source.fd,
                 posix.system.EVFILT.READ,
                 posix.system.EV.ADD | posix.system.EV.ENABLE,
-                source.user_data,
+                source.gen,
             );
             nchanges += 1;
         }
@@ -382,7 +422,7 @@ pub const Reactor = struct {
                 source.fd,
                 posix.system.EVFILT.WRITE,
                 posix.system.EV.ADD | posix.system.EV.ENABLE,
-                source.user_data,
+                source.gen,
             );
             nchanges += 1;
         }
@@ -404,7 +444,7 @@ pub const Reactor = struct {
         var nchanges: usize = 0;
 
         if (interests.readable and !source.interests.readable) {
-            changelist[nchanges] = makeKevent(fd, posix.system.EVFILT.READ, posix.system.EV.ADD | posix.system.EV.ENABLE, source.user_data);
+            changelist[nchanges] = makeKevent(fd, posix.system.EVFILT.READ, posix.system.EV.ADD | posix.system.EV.ENABLE, source.gen);
             nchanges += 1;
         } else if (!interests.readable and source.interests.readable) {
             changelist[nchanges] = makeKevent(fd, posix.system.EVFILT.READ, posix.system.EV.DELETE, 0);
@@ -412,7 +452,7 @@ pub const Reactor = struct {
         }
 
         if (interests.writable and !source.interests.writable) {
-            changelist[nchanges] = makeKevent(fd, posix.system.EVFILT.WRITE, posix.system.EV.ADD | posix.system.EV.ENABLE, source.user_data);
+            changelist[nchanges] = makeKevent(fd, posix.system.EVFILT.WRITE, posix.system.EV.ADD | posix.system.EV.ENABLE, source.gen);
             nchanges += 1;
         } else if (!interests.writable and source.interests.writable) {
             changelist[nchanges] = makeKevent(fd, posix.system.EVFILT.WRITE, posix.system.EV.DELETE, 0);
@@ -460,6 +500,14 @@ pub const Reactor = struct {
             }
 
             const source = self.sources.get(fd);
+            // Drop a stale event whose generation no longer matches the live
+            // source — the fd was closed and reused since this kevent was armed.
+            if (source) |s| {
+                if (s.gen != @as(u32, @intCast(kev.udata & 0x7FFF_FFFF))) {
+                    self.stale_events_dropped += 1;
+                    continue;
+                }
+            }
             const tag = if (source) |s| s.tag else Tag.client_read;
             const udata = if (source) |s| s.user_data else 0;
 
@@ -492,14 +540,16 @@ pub const Reactor = struct {
         if (source.interests.writable) mask |= linux.POLL.OUT;
 
         if (mask != 0) {
-            const fd_u64: u64 = @intCast(@as(u32, @bitCast(source.fd)));
-            try self.pollAdd(fd_u64, source.fd, mask);
+            try self.pollAdd(pollUserData(source.fd, source.gen), source.fd, mask);
         }
     }
 
     fn iouringRemoveSource(self: *Self, fd: i32) void {
-        const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
-        self.pollRemove(fd_u64) catch |err| log.err("reactor: could not stop polling fd {d}: {s}", .{ fd, @errorName(err) });
+        // Target the poll by its full user_data (fd + the live registration's
+        // gen): io_uring matches it exactly, so the bare fd would not be found
+        // and the multishot would leak, pinning the file.
+        const target = pollUserData(fd, if (self.sources.get(fd)) |s| s.gen else 0);
+        self.pollRemove(target) catch |err| log.err("reactor: could not stop polling fd {d}: {s}", .{ fd, @errorName(err) });
     }
 
     // The submission queue is sent to the kernel only when the reactor
@@ -534,7 +584,7 @@ pub const Reactor = struct {
         }
     }
 
-    fn pollUpdate(self: *Self, fd_u64: u64, mask: u32) !void {
+    fn pollUpdate(self: *Self, target: u64, mask: u32) !void {
         if (builtin.is_test) {
             if (self.test_arm_error) |e| {
                 self.test_arm_error = null;
@@ -544,7 +594,9 @@ pub const Reactor = struct {
         const flags = linux.IORING_POLL_UPDATE_EVENTS | linux.IORING_POLL_ADD_MULTI;
         var tries: u8 = 0;
         while (true) : (tries += 1) {
-            if (self.ring.poll_update(fd_u64 | INTERNAL_FLAG, fd_u64, fd_u64, mask, flags)) |_| {
+            // Find the poll by `target` (fd + gen); its own CQE carries
+            // INTERNAL_FLAG so it is skipped. The user_data is unchanged.
+            if (self.ring.poll_update(target | INTERNAL_FLAG, target, target, mask, flags)) |_| {
                 return;
             } else |err| {
                 if (tries + 1 >= ARM_TRIES) return err;
@@ -553,10 +605,10 @@ pub const Reactor = struct {
         }
     }
 
-    fn pollRemove(self: *Self, fd_u64: u64) !void {
-        _ = self.ring.poll_remove(fd_u64 | INTERNAL_FLAG, fd_u64) catch {
+    fn pollRemove(self: *Self, target: u64) !void {
+        _ = self.ring.poll_remove(target | INTERNAL_FLAG, target) catch {
             _ = try self.ring.submit();
-            _ = try self.ring.poll_remove(fd_u64 | INTERNAL_FLAG, fd_u64);
+            _ = try self.ring.poll_remove(target | INTERNAL_FLAG, target);
         };
     }
 
@@ -576,20 +628,24 @@ pub const Reactor = struct {
     /// connection with nothing to send would never be read again. So going
     /// from none to some adds a fresh poll.
     fn iouringSetInterests(self: *Self, fd: i32, old: Interests, new: Interests) !void {
-        const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
         const from = pollMask(old);
         const to = pollMask(new);
         if (from == to) return;
+        // io_uring matches the poll's user_data exactly, so remove, update and
+        // the from==0 re-add all target the poll's full identity: the fd plus
+        // this registration's gen (only addSource bumps gen, so a re-add keeps
+        // it). The bare fd would miss the poll armed by pollUserData.
+        const target = pollUserData(fd, if (self.sources.get(fd)) |s| s.gen else 0);
         if (to == 0) {
-            try self.pollRemove(fd_u64);
+            try self.pollRemove(target);
         } else if (from == 0) {
-            try self.pollAdd(fd_u64, fd, to);
+            try self.pollAdd(target, fd, to);
             // This fd now has a live poll again. If a dropped multishot left it on
             // the deferred list (it went to no interests and back within a tick),
             // drop that entry, or the next drain would arm a second poll on it.
             _ = self.deferred_rearm.swapRemove(fd);
         } else {
-            try self.pollUpdate(fd_u64, to);
+            try self.pollUpdate(target, to);
         }
     }
 
@@ -642,6 +698,15 @@ pub const Reactor = struct {
 
             const fd: i32 = @bitCast(@as(u32, @intCast(cqe.user_data & 0xFFFFFFFF)));
             const source = self.sources.getPtr(fd) orelse continue;
+
+            // Drop a completion whose generation no longer matches: a poll armed
+            // for an earlier owner of this fd number, firing after the fd was
+            // closed and reused. Routing it by fd would hit the new connection.
+            const gen: u32 = @intCast((cqe.user_data >> 32) & 0x7FFF_FFFF);
+            if (source.gen != gen) {
+                self.stale_events_dropped += 1;
+                continue;
+            }
 
             // A negative result ends the multishot poll. -ECANCELED is a
             // deliberate pollRemove (the fd is being dropped) — and older kernels
@@ -719,8 +784,7 @@ pub const Reactor = struct {
     fn rearmOrDefer(self: *Self, fd: i32, source: EventSource) void {
         const mask = pollMask(source.interests);
         if (mask == 0) return;
-        const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
-        self.pollAdd(fd_u64, fd, mask) catch {
+        self.pollAdd(pollUserData(fd, source.gen), fd, mask) catch {
             self.rearm_failures += 1;
             self.deferred_rearm.put(self.allocator, fd, {}) catch {
                 log.err("reactor: fd {d} could not be re-armed or even deferred; it is no longer polled", .{fd});
@@ -764,8 +828,7 @@ pub const Reactor = struct {
                 self.deferred_rearm.swapRemoveAt(i);
                 continue;
             }
-            const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
-            if (self.pollAdd(fd_u64, fd, mask)) |_| {
+            if (self.pollAdd(pollUserData(fd, source.gen), fd, mask)) |_| {
                 self.deferred_rearm.swapRemoveAt(i);
             } else |_| {
                 if (source.tag == .client_read) {
@@ -1013,7 +1076,7 @@ test "Reactor: a dropped multishot re-arm the ring refuses is deferred, then re-
         // un-polled, and the event still comes back.
         reactor.test_arm_error = error.SubmissionQueueFull;
         reactor.cqe_buf[0] = .{
-            .user_data = @intCast(@as(u32, @bitCast(pair[0]))),
+            .user_data = Reactor.pollUserData(pair[0], reactor.sources.get(pair[0]).?.gen),
             .res = @intCast(linux.POLL.IN),
             .flags = 0,
         };
@@ -1046,7 +1109,7 @@ test "Reactor: a client fd whose deferred re-arm fails again surfaces as an erro
 
         // First failure: the dropped re-arm is deferred.
         reactor.test_arm_error = error.SubmissionQueueFull;
-        reactor.cqe_buf[0] = .{ .user_data = @intCast(@as(u32, @bitCast(pair[0]))), .res = @intCast(linux.POLL.IN), .flags = 0 };
+        reactor.cqe_buf[0] = .{ .user_data = Reactor.pollUserData(pair[0], reactor.sources.get(pair[0]).?.gen), .res = @intCast(linux.POLL.IN), .flags = 0 };
         _ = try reactor.iouringProcessCqes(0, 1);
         try std.testing.expectEqual(@as(usize, 1), reactor.deferred_rearm.count());
 
@@ -1095,7 +1158,7 @@ test "Reactor: a deferred re-arm is dropped when its fd is removed, so a reused 
         try reactor.addSource(.{ .fd = pair[0], .tag = .client_read, .interests = .{ .readable = true } });
 
         reactor.test_arm_error = error.SubmissionQueueFull;
-        reactor.cqe_buf[0] = .{ .user_data = @intCast(@as(u32, @bitCast(pair[0]))), .res = @intCast(linux.POLL.IN), .flags = 0 };
+        reactor.cqe_buf[0] = .{ .user_data = Reactor.pollUserData(pair[0], reactor.sources.get(pair[0]).?.gen), .res = @intCast(linux.POLL.IN), .flags = 0 };
         _ = try reactor.iouringProcessCqes(0, 1);
         try std.testing.expectEqual(@as(usize, 1), reactor.deferred_rearm.count());
 
@@ -1121,7 +1184,7 @@ test "Reactor: re-adding a deferred fd's poll (interests to none and back) clear
 
         // Defer a re-arm for the fd.
         reactor.test_arm_error = error.SubmissionQueueFull;
-        reactor.cqe_buf[0] = .{ .user_data = @intCast(@as(u32, @bitCast(pair[0]))), .res = @intCast(linux.POLL.IN), .flags = 0 };
+        reactor.cqe_buf[0] = .{ .user_data = Reactor.pollUserData(pair[0], reactor.sources.get(pair[0]).?.gen), .res = @intCast(linux.POLL.IN), .flags = 0 };
         _ = try reactor.iouringProcessCqes(0, 1);
         try std.testing.expectEqual(@as(usize, 1), reactor.deferred_rearm.count());
 
@@ -1150,7 +1213,7 @@ test "Reactor: the drain re-arms from the live interests, not the mask captured 
 
         // Defer a re-arm while the fd wants readable.
         reactor.test_arm_error = error.SubmissionQueueFull;
-        reactor.cqe_buf[0] = .{ .user_data = @intCast(@as(u32, @bitCast(pair[0]))), .res = @intCast(linux.POLL.IN), .flags = 0 };
+        reactor.cqe_buf[0] = .{ .user_data = Reactor.pollUserData(pair[0], reactor.sources.get(pair[0]).?.gen), .res = @intCast(linux.POLL.IN), .flags = 0 };
         _ = try reactor.iouringProcessCqes(0, 1);
         try std.testing.expectEqual(@as(usize, 1), reactor.deferred_rearm.count());
 
@@ -1184,7 +1247,7 @@ test "Reactor: a source whose re-arm the kernel fails at once is given up, not h
         // spinning forever.
         var k: usize = 0;
         while (k <= Reactor.MAX_NEG_ENDS) : (k += 1) {
-            reactor.cqe_buf[0] = .{ .user_data = @intCast(@as(u32, @bitCast(pair[0]))), .res = -5, .flags = 0 };
+            reactor.cqe_buf[0] = .{ .user_data = Reactor.pollUserData(pair[0], reactor.sources.get(pair[0]).?.gen), .res = -5, .flags = 0 };
             const evs = try reactor.iouringProcessCqes(0, 1);
             if (k < Reactor.MAX_NEG_ENDS) {
                 try std.testing.expectEqual(@as(usize, 0), evs.len);
@@ -1195,4 +1258,125 @@ test "Reactor: a source whose re-arm the kernel fails at once is given up, not h
             }
         }
     } else return error.SkipZigTest;
+}
+
+test "Reactor: re-registering an fd gives it a new generation, and a re-add keeps it" {
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer {
+        _ = std.c.close(pair[0]);
+        _ = std.c.close(pair[1]);
+    }
+    var reactor = try Reactor.init(std.testing.allocator);
+    defer reactor.deinit();
+    try reactor.addSource(.{ .fd = pair[0], .tag = .client_read, .interests = .{ .readable = true } });
+    const g1 = reactor.sources.get(pair[0]).?.gen;
+    try std.testing.expect(g1 != 0);
+
+    // Interests to none and back keeps the same generation (only addSource bumps
+    // it), so the re-added poll's completions still match the live source.
+    try reactor.modifyInterests(pair[0], .{ .readable = false, .writable = false });
+    try reactor.modifyInterests(pair[0], .{ .readable = true, .writable = false });
+    try std.testing.expectEqual(g1, reactor.sources.get(pair[0]).?.gen);
+
+    // Removing and re-adding the same fd (a reused number) bumps the generation.
+    reactor.removeSource(pair[0]);
+    try reactor.addSource(.{ .fd = pair[0], .tag = .client_read, .interests = .{ .readable = true } });
+    try std.testing.expect(reactor.sources.get(pair[0]).?.gen != g1);
+}
+
+test "Reactor: a completion for a reused fd's earlier registration is dropped, not misrouted" {
+    if (is_linux) {
+        var pair: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+        defer {
+            _ = std.c.close(pair[0]);
+            _ = std.c.close(pair[1]);
+        }
+        var reactor = try Reactor.init(std.testing.allocator);
+        defer reactor.deinit();
+        try reactor.addSource(.{ .fd = pair[0], .tag = .client_read, .interests = .{ .readable = true } });
+        const gen1 = reactor.sources.get(pair[0]).?.gen;
+        reactor.removeSource(pair[0]);
+        try reactor.addSource(.{ .fd = pair[0], .tag = .client_read, .interests = .{ .readable = true } });
+        const gen2 = reactor.sources.get(pair[0]).?.gen;
+        try std.testing.expect(gen1 != gen2);
+
+        // A lingering completion from the first registration (gen1) must be
+        // dropped and counted, not delivered to the new connection.
+        reactor.cqe_buf[0] = .{ .user_data = Reactor.pollUserData(pair[0], gen1), .res = @intCast(linux.POLL.IN), .flags = linux.IORING_CQE_F_MORE };
+        try std.testing.expectEqual(@as(usize, 0), (try reactor.iouringProcessCqes(0, 1)).len);
+        try std.testing.expectEqual(@as(u64, 1), reactor.stale_events_dropped);
+
+        // A completion for the current registration is delivered.
+        reactor.cqe_buf[0] = .{ .user_data = Reactor.pollUserData(pair[0], gen2), .res = @intCast(linux.POLL.IN), .flags = linux.IORING_CQE_F_MORE };
+        const evs = try reactor.iouringProcessCqes(0, 1);
+        try std.testing.expectEqual(@as(usize, 1), evs.len);
+        try std.testing.expect(evs[0].readable);
+        try std.testing.expectEqual(@as(u64, 1), reactor.stale_events_dropped);
+    } else return error.SkipZigTest;
+}
+
+test "Reactor: removing an fd takes its poll off the ring, so a reused fd gets no stale event (real ring)" {
+    // Exercises a real io_uring: poll_remove/poll_update must target the poll's
+    // full user_data (fd + gen), or the multishot is never removed and a reused
+    // fd gets duplicate/stale events. Hand-injected CQEs can't catch this.
+    if (is_linux) {
+        var pair: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+        defer {
+            _ = std.c.close(pair[0]);
+            _ = std.c.close(pair[1]);
+        }
+        var reactor = try Reactor.init(std.testing.allocator);
+        defer reactor.deinit();
+
+        // Arm, then remove, then re-register the same fd — each flushed to the
+        // ring before the next, and all before the socket becomes readable, so
+        // only the current registration's poll can fire.
+        try reactor.addSource(.{ .fd = pair[0], .tag = .client_read, .interests = .{ .readable = true } });
+        _ = try reactor.poll(0);
+        reactor.removeSource(pair[0]);
+        _ = try reactor.poll(0);
+        try reactor.addSource(.{ .fd = pair[0], .tag = .client_read, .interests = .{ .readable = true } });
+        _ = try reactor.poll(0);
+
+        _ = std.c.write(pair[1], "X", 1);
+        var saw = false;
+        for (try reactor.poll(100)) |ev| {
+            if (ev.fd == pair[0] and ev.readable) saw = true;
+        }
+        try std.testing.expect(saw);
+        // The removed poll was really gone, so nothing fired with the old gen.
+        try std.testing.expectEqual(@as(u64, 0), reactor.stale_events_dropped);
+    } else return error.SkipZigTest;
+}
+
+test "Reactor: kqueue drops a stale event whose generation no longer matches" {
+    // kqueue only; io_uring has its own real-ring stale-drop test.
+    if (is_bsd) {
+        var pair: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+        defer {
+            _ = std.c.close(pair[0]);
+            _ = std.c.close(pair[1]);
+        }
+        var reactor = try Reactor.init(std.testing.allocator);
+        defer reactor.deinit();
+        try reactor.addSource(.{ .fd = pair[0], .tag = .client_read, .interests = .{ .readable = true } });
+
+        // The kevent was armed with the original gen; a reuse would give the live
+        // source a newer one. Bump it to stand in for that, then fire a readable:
+        // the event carries the old gen and must be dropped, not delivered.
+        reactor.sources.getPtr(pair[0]).?.gen +%= 1;
+        _ = std.c.write(pair[1], "X", 1);
+        var saw = false;
+        for (try reactor.poll(100)) |ev| {
+            if (ev.fd == pair[0] and ev.readable) saw = true;
+        }
+        try std.testing.expect(!saw);
+        try std.testing.expectEqual(@as(u64, 1), reactor.stale_events_dropped);
+    }
+    // On Linux this falls through to a passing no-op (not a skip — the Linux
+    // job asserts zero skips); the io_uring real-ring test covers that backend.
 }

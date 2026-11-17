@@ -772,6 +772,11 @@ pub const ShardMetrics = struct {
     /// arm failures and the reactor's deferred re-arms. Watch it for reactor
     /// back-pressure under load.
     arm_failures: Atomic(u64) = Atomic(u64).init(0),
+    /// Reactor completions dropped because their generation no longer matched the
+    /// live source — a poll event for an fd that was closed and reused since. A
+    /// nonzero value means fd-reuse races are happening and being caught before
+    /// they misroute to the wrong connection.
+    stale_events_dropped: Atomic(u64) = Atomic(u64).init(0),
     /// Snapshot bars passed without a snapshot by a leader still applying
     /// earlier terms (cumulative).
     snapshot_skipped_leader_not_ready: Atomic(u64) = Atomic(u64).init(0),
@@ -1017,6 +1022,7 @@ pub const ShardMetrics = struct {
         duty_oldest_held_ms: u64,
         persist_failures: u64,
         arm_failures: u64,
+        stale_events_dropped: u64,
         flushes_failing_for_ms: u64,
         snapshot_skipped_leader_not_ready: u64,
         ts_points: u64,
@@ -1082,6 +1088,7 @@ pub const ShardMetrics = struct {
             .duty_oldest_held_ms = self.duty_oldest_held_ms.load(.monotonic),
             .persist_failures = self.persist_failures.load(.monotonic),
             .arm_failures = self.arm_failures.load(.monotonic),
+            .stale_events_dropped = self.stale_events_dropped.load(.monotonic),
             .flushes_failing_for_ms = self.flushes_failing_for_ms.load(.monotonic),
             .snapshot_skipped_leader_not_ready = self.snapshot_skipped_leader_not_ready.load(.monotonic),
             .ts_points = self.ts_points.load(.monotonic),
@@ -1958,6 +1965,7 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_duplicate_index_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.duplicate_index });
     try writer.print("flo_shard_persist_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.persist_failures });
     try writer.print("flo_shard_arm_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.arm_failures });
+    try writer.print("flo_shard_stale_events_dropped_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.stale_events_dropped });
     try writer.print("flo_shard_flushes_failing_for_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.flushes_failing_for_ms / 1000, snap.flushes_failing_for_ms % 1000 });
     try writer.print("flo_shard_snapshot_skipped_total{{shard_id=\"{d}\",reason=\"leader_not_ready\"}} {d}\n", .{ snap.shard_id, snap.snapshot_skipped_leader_not_ready });
     try writer.print("flo_shard_ts_points{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.ts_points });
