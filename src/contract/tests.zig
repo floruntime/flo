@@ -480,6 +480,10 @@ const Observers = struct {
     const first: machine_mod.Machine = .{ .name = "first", .entry_types = &.{}, .families = &.{machine_mod.info(Seen)}, .keys = none, .apply = apply, .observes = &.{.stream_delete}, .observe_keys = seenKeys, .observe = seen };
     const second: machine_mod.Machine = .{ .name = "second", .entry_types = &.{}, .families = &.{machine_mod.info(Echo)}, .keys = none, .apply = apply, .observes = &.{.stream_delete}, .observe_keys = echoKeys, .observe = echo };
     const intruder: machine_mod.Machine = .{ .name = "intruder", .entry_types = &.{}, .families = &.{machine_mod.info(Echo)}, .keys = none, .apply = apply, .observes = &.{.stream_delete}, .observe_keys = seenKeys, .observe = trespass };
+    fn sends(view: *View, _: *const Entry) persistence.ApplyError!void {
+        try view.send(.user(.default), 1, @backingInt(entry_mod.EntryType.channel_probe), "x");
+    }
+    const sender: machine_mod.Machine = .{ .name = "sender", .entry_types = &.{}, .families = &.{machine_mod.info(Seen)}, .keys = none, .apply = apply, .observes = &.{.stream_delete}, .observe_keys = none, .observe = sends };
     const list = [_]machine_mod.Machine{ first, second };
 };
 
@@ -496,7 +500,7 @@ test "observers: every machine that follows a type runs, in list order, and a re
     defer scratch.deinit();
     for (&stores) |*store| for (1..4) |i| {
         const e = entry_mod.buildEntry(.stream_delete, entry_mod.Flags.NONE, 1, i, i, "");
-        try machine_mod.observeAll(&Observers.list, store, &scratch, null, &e);
+        try machine_mod.observeAll(&Observers.list, store, &scratch, null, &e, .entry);
     };
     for (&stores) |*store| {
         try testing.expectEqual(@as(?u64, 3), countOf(store, Seen, SEEN_KEY));
@@ -506,7 +510,7 @@ test "observers: every machine that follows a type runs, in list order, and a re
     for ([_]u16{ Seen.ID, Echo.ID }) |fam| try testing.expectEqual(store_mod.checksum(&stores[0], fam), store_mod.checksum(&stores[1], fam));
     // An entry no machine follows changes nothing.
     const other = entry_mod.buildEntry(.stream_trim, entry_mod.Flags.NONE, 1, 9, 9, "");
-    try machine_mod.observeAll(&Observers.list, &stores[0], &scratch, null, &other);
+    try machine_mod.observeAll(&Observers.list, &stores[0], &scratch, null, &other, .entry);
     try testing.expectEqual(@as(?u64, 3), countOf(&stores[0], Seen, SEEN_KEY));
 }
 
@@ -516,6 +520,19 @@ test "observers: one that writes a family it doesn't own halts, and writes nothi
     var scratch = std.heap.ArenaAllocator.init(testing.allocator);
     defer scratch.deinit();
     const e = entry_mod.buildEntry(.stream_delete, entry_mod.Flags.NONE, 1, 1, 1, "");
-    try testing.expectError(error.Halt, machine_mod.observeEntry(&Observers.intruder, &store, &scratch, null, &e));
+    try testing.expectError(error.Halt, machine_mod.observeEntry(&Observers.intruder, &store, &scratch, null, &e, .entry));
     try testing.expect(countOf(&store, Seen, SEEN_KEY) == null);
+}
+
+test "observers: one may send on observing a log entry, and halts if it sends on observing a message's entry" {
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    store.place = .{ .group = 0, .count = 2 };
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    const e = entry_mod.buildEntry(.stream_delete, entry_mod.Flags.NONE, 1, 1, 1, "");
+    try testing.expectError(error.Halt, machine_mod.observeEntry(&Observers.sender, &store, &scratch, null, &e, .message));
+    try testing.expectEqual(@as(u64, 0), store.family(@import("channels.zig").OutFam.ID).count);
+    try machine_mod.observeEntry(&Observers.sender, &store, &scratch, null, &e, .entry);
+    try testing.expectEqual(@as(u64, 1), store.family(@import("channels.zig").OutFam.ID).count);
 }

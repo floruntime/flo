@@ -284,7 +284,7 @@ const TestStreams = struct {
     fn follow(t: *TestStreams, etype: EntryType, name: []const u8, stamp: u64) !void {
         var pb: [256]u8 = undefined;
         const e = t.entry(&pb, etype, name, "", stamp);
-        try machine_mod.observeEntry(&machine, &t.store, &t.scratch, null, &e);
+        try machine_mod.observeEntry(&machine, &t.store, &t.scratch, null, &e, .entry);
     }
 
     fn meta(t: *TestStreams, name: []const u8) ?Meta.Value {

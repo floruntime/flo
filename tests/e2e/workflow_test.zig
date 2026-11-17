@@ -4230,3 +4230,81 @@ test "e2e/workflow/cluster: a workflow disabled on a leader stays disabled on th
     }
     try testing.expect(refused);
 }
+
+// =============================================================================
+// Calls across shards, carried by channels
+// =============================================================================
+
+/// Creates workflow `name`, one step starting child workflow `child`.
+fn createChildStepWorkflow(ctx: *stdx.testing.TestContext, name: []const u8, child: []const u8) !void {
+    var builder = YamlBuilder.init(testing.allocator);
+    defer builder.deinit();
+    _ = builder.workflow(name, "1.0.0");
+    const target = try std.fmt.allocPrint(testing.allocator, "@workflow/{s}", .{child});
+    defer testing.allocator.free(target);
+    _ = builder.start(target).onSuccess("flo.Completed").onFailure("flo.Failed");
+    const yaml = try builder.build();
+    defer testing.allocator.free(yaml);
+    const path = try writeTempYaml(testing.allocator, yaml, "chan-parent.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+}
+
+/// A child workflow and its action on another shard than `parent`, created.
+fn childElsewhere(ctx: *stdx.testing.TestContext, parent: []const u8, kid_buf: []u8, act_buf: []u8) !struct { kid: []const u8, action: []const u8 } {
+    const kid = try actionPlaced(kid_buf, "chan-kid", parent, false);
+    const action = try actionPlaced(act_buf, "chan-act", kid, true);
+    try ctx.exec(&.{ "action", "register", action });
+    try createStepWorkflow(ctx, kid, action);
+    try createChildStepWorkflow(ctx, parent, kid);
+    return .{ .kid = kid, .action = action };
+}
+
+fn takeTask(ctx: *stdx.testing.TestContext, action: []const u8, block_ms: []const u8) ![]u8 {
+    var taken = try ctx.cli.run(&.{ "worker", "await", action, "--worker-id", "chan-w", "--block", block_ms });
+    defer taken.deinit();
+    const id = extractTaskId(std.mem.trim(u8, taken.stdout, &std.ascii.whitespace)) orelse return error.AssertionFailed;
+    return testing.allocator.dupe(u8, id);
+}
+
+test "e2e/workflow: a channel carries a child workflow to another shard and its end back, and the parent completes" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    var kb: [32]u8 = undefined;
+    var ab: [32]u8 = undefined;
+    const c = try childElsewhere(ctx, "chan-par-a", &kb, &ab);
+    try ctx.exec(&.{ "workflow", "start", "chan-par-a", "{}", "--run-id", "chan-run-a" });
+    const id = try takeTask(ctx, c.action, "10000");
+    defer testing.allocator.free(id);
+    try ctx.exec(&.{ "worker", "complete", id, "--worker-id", "chan-w", "--result", "{}" });
+    try awaitRunStatus(ctx, "chan-run-a", "completed", 10_000);
+    try awaitHistory(ctx, "chan-run-a", "child_completed", 2000);
+}
+
+test "e2e/workflow: a channel carries a child's start to its shard across a restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    var kb: [32]u8 = undefined;
+    var ab: [32]u8 = undefined;
+    const c = try childElsewhere(ctx, "chan-par-b", &kb, &ab);
+    try ctx.exec(&.{ "workflow", "start", "chan-par-b", "{}", "--run-id", "chan-run-b" });
+    try ctx.restartServer();
+    // The child started on its shard once the start arrived: its step's
+    // action has a task. The parent's wait is held only in its leader's
+    // memory, so the parent doesn't resume after a restart.
+    const id = try takeTask(ctx, c.action, "15000");
+    defer testing.allocator.free(id);
+}
+
+test "e2e/workflow: a channel carries a step's call to an action on another shard across a restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    var ab: [32]u8 = undefined;
+    const action = try actionPlaced(&ab, "chan-only", "chan-par-c", false);
+    try ctx.exec(&.{ "action", "register", action });
+    try createStepWorkflow(ctx, "chan-par-c", action);
+    try ctx.exec(&.{ "workflow", "start", "chan-par-c", "{}", "--run-id", "chan-run-c" });
+    try ctx.restartServer();
+    const id = try takeTask(ctx, action, "15000");
+    defer testing.allocator.free(id);
+}

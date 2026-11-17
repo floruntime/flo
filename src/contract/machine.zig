@@ -113,20 +113,28 @@ pub fn check(comptime machines: []const Machine) void {
 /// Every machine that follows `e`, an entry another applier applied and
 /// didn't refuse, in the list's order: each commits before the next runs, so
 /// a later one reads what an earlier one wrote, on every replica alike.
-pub fn observeAll(comptime machines: []const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, streams: ?Streams, e: *const Entry) ApplyError!void {
+/// Where an observed entry came from: the log itself, or a message another
+/// group sent, applied inside an inbound.
+pub const ObservedFrom = enum { entry, message };
+
+pub fn observeAll(comptime machines: []const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, streams: ?Streams, e: *const Entry, from: ObservedFrom) ApplyError!void {
     const etype: EntryType = @fromBackingInt(@intCast(e.header.entry_type));
     inline for (machines) |*m| {
         for (m.observes) |t| if (t == etype) {
-            try observeEntry(m, store, scratch, streams, e);
+            try observeEntry(m, store, scratch, streams, e, from);
             break;
         };
     }
 }
 
 /// `m`'s observe of `e`, an entry another applier applied: its writes become
-/// state with it. A write to another machine's family halts: an observer
-/// keeps only its own.
-pub fn observeEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, streams: ?Streams, e: *const Entry) ApplyError!void {
+/// state with it, and what it sends leaves with them. A write to another
+/// machine's family halts: an observer keeps only its own.
+///
+/// An observer sends only on observing an edge entry (a client's write or a
+/// leader's own proposal), never a message it applied, so an observed entry
+/// can't start a chain of sends.
+pub fn observeEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, streams: ?Streams, e: *const Entry, from: ObservedFrom) ApplyError!void {
     if (m.observe_needed) |needed| if (!needed(.{ .store = store }, e)) return;
     _ = scratch.reset(.retain_capacity);
     const arena = scratch.allocator();
@@ -136,6 +144,13 @@ pub fn observeEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.he
     view.streams_read = streams;
     try m.observe.?(&view, e);
     for (view.ops.items) |op| if (!ownsFamily(m, op.fam)) return error.Halt;
+    if (view.sends.items.len > 0) {
+        // Never for a message it observed: that would start a chain of
+        // sends no edge paid for. A bug in this build, so it halts.
+        if (from == .message) return error.Halt;
+        if (channels.tooMuchSent(view.sends.items) != null) return error.Halt;
+        try channels.writeSends(&view, e.header.index);
+    }
     try view.commit();
 }
 

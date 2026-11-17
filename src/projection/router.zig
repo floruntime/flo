@@ -109,7 +109,10 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         // Actions: their contract machine (actions/machine.zig).
         .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => .none,
         // Calls: their contract machine (actions/calls_machine.zig).
-        .action_call, .action_call_retry, .action_call_clear, .action_reply, .action_done => .none,
+        .step_call, .step_call_retry, .step_call_clear, .call_reply, .call_done => .none,
+        // A child workflow's start and refusal: their contract machine
+        // (workflow/children_machine.zig).
+        .child_start, .child_refuse => .none,
         // A hand-back: sent by the actions machine; applied, after its
         // commit, by the actions handler.
         .action_abandon_send, .action_abandon => .none,

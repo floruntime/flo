@@ -203,15 +203,27 @@ pub const Abandon = Record(&.{
 pub const CallerWorkflow = Bytes(limits.MAX_QUALIFIED_KEY);
 pub const StepName = Bytes(limits.MAX_QUALIFIED_KEY);
 
-/// A step asking for a run of `action`, logged on the workflow's shard:
-/// its call is recorded there and the run's start sent to the action's
-/// slot. `run` is chosen here, so asking again names the same run.
+/// What a step calls: an action's run, or a child workflow's.
+pub const CallKind = enum(u8) { action = 1, workflow = 2 };
+
+/// The action's or the child workflow's name.
+pub const TargetName = Bytes(limits.MAX_QUALIFIED_KEY);
+/// A child workflow's pinned version; "" for its latest, and for actions.
+pub const MAX_VERSION: u32 = 128;
+pub const Version = Bytes(MAX_VERSION);
+
+/// A step asking for a run of an action or a child workflow, logged on the
+/// workflow's shard: its call is recorded there and the run's start sent to
+/// the callee's slot. `run` is chosen here, so asking again names the same
+/// run.
 pub const Call = Record(&.{
     .{ .name = "ns", .T = NamespaceId },
+    .{ .name = "kind", .T = schema.Enum(CallKind) },
     .{ .name = "caller_run", .T = Bytes(limits.MAX_QUALIFIED_KEY) },
     .{ .name = "caller_workflow", .T = CallerWorkflow },
     .{ .name = "step", .T = StepName },
-    .{ .name = "action", .T = ActionName },
+    .{ .name = "target", .T = TargetName },
+    .{ .name = "version", .T = Version },
     .{ .name = "run", .T = RunId },
     .{ .name = "input", .T = Bytes(MAX_INPUT) },
     // Whether the step waits for an action not registered yet.
@@ -234,7 +246,7 @@ pub const CallClear = Record(&.{
     .{ .name = "run", .T = RunId },
 });
 
-/// How the action's shard took a call's start.
+/// How the callee's shard took a call's start.
 pub const Answer = enum(u8) {
     /// The run exists: it was created, or was already.
     started = 1,
@@ -258,7 +270,30 @@ pub const Reply = Record(&.{
 });
 
 /// How a called run ended.
-pub const DoneStatus = enum(u8) { completed = 1, failed = 2, timed_out = 3 };
+pub const DoneStatus = enum(u8) { completed = 1, failed = 2, timed_out = 3, cancelled = 4 };
+
+/// A child workflow's start, sent by its parent's call to the child
+/// workflow's slot: the child's shard keeps it as the child's parent until
+/// the child ends, and starts it.
+pub const ChildStart = Record(&.{
+    .{ .name = "ns", .T = NamespaceId },
+    .{ .name = "parent_slot", .T = Int(u16) },
+    .{ .name = "parent_run", .T = Bytes(limits.MAX_QUALIFIED_KEY) },
+    .{ .name = "parent_workflow", .T = CallerWorkflow },
+    .{ .name = "workflow", .T = TargetName },
+    .{ .name = "version", .T = Version },
+    .{ .name = "run", .T = RunId },
+    .{ .name = "input", .T = Bytes(MAX_INPUT) },
+});
+
+/// A child the child's shard couldn't start, and the answer its parent
+/// gets: `no_action` for no such workflow or version, `conflict` for a run
+/// id another run already holds. Its record goes.
+pub const ChildRefuse = Record(&.{
+    .{ .name = "ns", .T = NamespaceId },
+    .{ .name = "run", .T = RunId },
+    .{ .name = "answer", .T = schema.Enum(Answer) },
+});
 
 /// A called run ended: sent to the caller's slot from the entry that
 /// ended it, with what it returned.
@@ -280,11 +315,13 @@ pub const table = [_]entries.Entry{
     .{ .name = "action.release", .type_code = 0x76, .payload = Release, .max_payload = Release.max_size, .doc = "A delivery failed or abandoned by its holder." },
     .{ .name = "action.extend", .type_code = 0x77, .payload = Extend, .max_payload = Extend.max_size, .doc = "A delivery's lease moved out by its holder." },
     .{ .name = "action.expire", .type_code = 0x78, .payload = Expire, .max_payload = Expire.max_size, .doc = "Leases past their deadline ended, as failures." },
-    .{ .name = "action.call", .type_code = 0x79, .payload = Call, .max_payload = Call.max_size, .doc = "A workflow step's call recorded, and its run's start sent." },
-    .{ .name = "action.call_retry", .type_code = 0x7A, .payload = CallRetry, .max_payload = CallRetry.max_size, .doc = "A call whose action wasn't registered, its start sent again." },
-    .{ .name = "action.call_clear", .type_code = 0x7B, .payload = CallClear, .max_payload = CallClear.max_size, .doc = "A call its step is done with, its record dropped." },
-    .{ .name = "action.reply", .type_code = 0x7C, .payload = Reply, .max_payload = Reply.max_size, .doc = "A message: the action's shard's answer to a call's start." },
-    .{ .name = "action.done", .type_code = 0x7D, .payload = Done, .max_payload = Done.max_size, .doc = "A message: a called run ended, and what it returned." },
+    .{ .name = "step.call", .type_code = 0x79, .payload = Call, .max_payload = Call.max_size, .doc = "A workflow step's call recorded, and its run's start sent." },
+    .{ .name = "step.call_retry", .type_code = 0x7A, .payload = CallRetry, .max_payload = CallRetry.max_size, .doc = "A call whose action wasn't registered, its start sent again." },
+    .{ .name = "step.call_clear", .type_code = 0x7B, .payload = CallClear, .max_payload = CallClear.max_size, .doc = "A call its step is done with, its record dropped." },
+    .{ .name = "call.reply", .type_code = 0x7C, .payload = Reply, .max_payload = Reply.max_size, .doc = "A message: the callee's shard's answer to a call's start." },
+    .{ .name = "call.done", .type_code = 0x7D, .payload = Done, .max_payload = Done.max_size, .doc = "A message: a called run ended, and what it returned." },
+    .{ .name = "workflow.child_start", .type_code = 0x55, .payload = ChildStart, .max_payload = ChildStart.max_size, .doc = "A message: a child workflow's start, kept as its parent until it ends." },
+    .{ .name = "workflow.child_refuse", .type_code = 0x56, .payload = ChildRefuse, .max_payload = ChildRefuse.max_size, .doc = "A child its shard couldn't start: its parent told why." },
     .{ .name = "action.abandon_send", .type_code = 0x7E, .payload = Abandon, .max_payload = Abandon.max_size, .doc = "A task its await couldn't give, sent back to its run's shard." },
     .{ .name = "action.abandon", .type_code = 0x7F, .payload = Abandon, .max_payload = Abandon.max_size, .doc = "A message, after its commit: a task handed back, whose lease the run's leader ends." },
 };

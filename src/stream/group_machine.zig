@@ -1194,7 +1194,7 @@ pub const TestGroups = struct {
         const n = cmd.serialize(&buf).?;
         self.index += 1;
         const e = entry_mod.buildEntry(etype, entry_mod.Flags.NONE, self.term, self.index, stamp_ns, buf[0..n]);
-        try machine_mod.observeEntry(&machine, &self.store, &self.scratch, .{ .proj = &self.stream }, &e);
+        try machine_mod.observeEntry(&machine, &self.store, &self.scratch, .{ .proj = &self.stream }, &e, .entry);
     }
 
     /// The default namespace's `stream` trimmed through `up_to`, as the

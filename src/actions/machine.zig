@@ -427,7 +427,7 @@ fn reply(view: *View, p: ae.Invoke.Value, answer: ae.Answer) ApplyError!void {
     const ns: NamespaceId = .of(p.ns);
     var buf: [ae.Reply.max_size]u8 = undefined;
     const bytes = ae.Reply.encodeInto(&buf, .{ .ns = p.ns, .slot = calls.callerSlot(ns, p.caller_workflow.?), .run = p.run, .answer = answer }) catch return error.Halt;
-    try view.send(.user(ns), calls.callerSlot(ns, p.caller_workflow.?), @backingInt(EntryType.action_reply), bytes);
+    try view.send(.user(ns), calls.callerSlot(ns, p.caller_workflow.?), @backingInt(EntryType.call_reply), bytes);
 }
 
 /// A called run that ended tells its caller how, and what it returned.
@@ -443,7 +443,7 @@ fn tellCaller(view: *View, ns: NamespaceId, run_id: []const u8, run: Run.Value) 
     const done = run.status == .completed;
     const buf = view.arena.alloc(u8, ae.Done.max_size) catch return error.OutOfMemory;
     const bytes = ae.Done.encodeInto(buf, .{ .ns = ns.int(), .slot = calls.callerSlot(ns, workflow), .run = run_id, .status = status, .outcome = if (done) run.outcome else "", .result = if (done) run.result else "" }) catch return error.Halt;
-    try view.send(.user(ns), calls.callerSlot(ns, workflow), @backingInt(EntryType.action_done), bytes);
+    try view.send(.user(ns), calls.callerSlot(ns, workflow), @backingInt(EntryType.call_done), bytes);
 }
 
 pub const CALL_HAS_NO_CALLER = "bad request: a call's start names no calling workflow";

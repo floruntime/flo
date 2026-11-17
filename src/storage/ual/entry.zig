@@ -125,6 +125,10 @@ pub const EntryType = enum(u8) {
     /// A run's first step is taken: once, by the leader whose entry this is.
     /// Key "namespace:run", no value.
     workflow_step_started = 0x54,
+    /// A child workflow's start, a message from its parent's call; and a
+    /// child its shard couldn't start.
+    child_start = 0x55,
+    child_refuse = 0x56,
 
     // ── Namespace ──
     namespace_create = 0x60,
@@ -141,13 +145,14 @@ pub const EntryType = enum(u8) {
     action_release = 0x76,
     action_extend = 0x77,
     action_expire = 0x78,
-    /// A workflow step's call of an action, its retry and its clear, on
-    /// the workflow's shard; and the two messages that answer it.
-    action_call = 0x79,
-    action_call_retry = 0x7A,
-    action_call_clear = 0x7B,
-    action_reply = 0x7C,
-    action_done = 0x7D,
+    /// A workflow step's call of an action or a child workflow, its retry
+    /// and its clear, on the workflow's shard; and the two messages that
+    /// answer it.
+    step_call = 0x79,
+    step_call_retry = 0x7A,
+    step_call_clear = 0x7B,
+    call_reply = 0x7C,
+    call_done = 0x7D,
     /// A task its await couldn't give, logged where the await was and sent
     /// to its run's shard, which ends the lease once the message commits.
     action_abandon_send = 0x7E,
@@ -179,7 +184,8 @@ pub const EntryType = enum(u8) {
             .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch => false,
             .namespace_create => false,
             .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => false,
-            .action_call, .action_call_retry, .action_call_clear, .action_reply, .action_done, .action_abandon_send, .action_abandon => false,
+            .step_call, .step_call_retry, .step_call_clear, .call_reply, .call_done, .action_abandon_send, .action_abandon => false,
+            .child_start, .child_refuse => false,
             .stream_append, .stream_trim, .stream_delete, .stream_config => true,
             .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge, .queue_requeue, .queue_drop => false,
             .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean, .group_steal, .group_requeue, .group_drop => false,

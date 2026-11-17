@@ -1563,7 +1563,7 @@ pub const Shard = struct {
     /// counted (`actions/calls_machine.zig` answers 0 for it).
     fn noteAnswerWithoutCall(self: *Shard, m: *const contract_store.AppliedMessage) void {
         const t = m.entry.header.entry_type;
-        if (t != @backingInt(entry_mod.EntryType.action_reply) and t != @backingInt(entry_mod.EntryType.action_done)) return;
+        if (t != @backingInt(entry_mod.EntryType.call_reply) and t != @backingInt(entry_mod.EntryType.call_done)) return;
         if (m.result.refused() != null) return;
         var r = m.result.reader();
         if ((r.int(u8) orelse return) != 0) return;
@@ -8878,7 +8878,7 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
             const had = registry.dispatch(&msg.entry, &msg.result) catch |err| return .{ .applier_failed = err };
             if (!had) return .no_applier;
             // Followed as the same entry applied alone would be.
-            if (msg.result.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, &msg.entry) catch |err| return .{ .applier_failed = err };
+            if (msg.result.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, &msg.entry, .message) catch |err| return .{ .applier_failed = err };
         };
         return .applied;
     }
@@ -8886,7 +8886,7 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
     if (!had) return if (listed(&APPLIES_NOTHING, etype)) .applied else .no_applier;
     // The machines that follow this entry (groups, a trim of their stream),
     // after its owner, unless the owner refused it.
-    if (out.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, entry) catch |err| return .{ .applier_failed = err };
+    if (out.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, entry, .entry) catch |err| return .{ .applier_failed = err };
     return .applied;
 }
 
@@ -27493,12 +27493,20 @@ test "Shard: a workflow step whose child run's start the log is too full to take
     var runs = sh.workflow_handler.runs.valueIterator();
     const run = runs.next().?;
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
-    try std.testing.expect(run.pending_child_run_id_owned == null);
+    try std.testing.expect(run.pending_action_run_id_owned == null);
 
     try resumeAndApply(sh);
     @import("stdx").time.sleep(@as(u64, @intCast(WorkflowHandler.STEP_ROOM_RETRY_MS + 50)) * std.time.ns_per_ms);
     sh.workflow_handler.checkPendingActions(sh);
-    try std.testing.expect(run.pending_child_run_id_owned != null);
+    try std.testing.expect(run.pending_action_run_id_owned != null);
+    // Its call reaches the child's slot, here, and this leader starts it.
+    for (0..4) |_| {
+        _ = sh.applyCommitted();
+        sh.tickChannels();
+        _ = sh.drainInbox();
+        _ = sh.applyCommitted();
+        sh.workflow_handler.checkPendingActions(sh);
+    }
     _ = sh.applyCommitted();
     try std.testing.expectEqual(@as(usize, 2), sh.workflow_handler.runs.count());
 }
@@ -28700,7 +28708,7 @@ fn callNames(two: *TwoShards, action_on: u16, workflow_on: u16, ab: []u8, wb: []
 
 /// A step's call proposed and applied on `s`, as the workflow handler makes it.
 fn proposeCall(s: *Shard, action: []const u8, workflow: []const u8, run: []const u8, can_wait: bool) !void {
-    _ = try proposeAction(s, .action_call, action_entries.Call.Value{ .ns = ns_table.DEFAULT.int(), .caller_run = "wf-run-1", .caller_workflow = workflow, .step = "s", .action = action, .run = run, .input = "{}", .can_wait = can_wait });
+    _ = try proposeAction(s, .step_call, action_entries.Call.Value{ .ns = ns_table.DEFAULT.int(), .kind = .action, .caller_run = "wf-run-1", .caller_workflow = workflow, .step = "s", .target = action, .version = "", .run = run, .input = "{}", .can_wait = can_wait });
 }
 
 fn callIn(s: *Shard, workflow: []const u8, run: []const u8) ?calls_machine.Call.Value {
@@ -28754,7 +28762,7 @@ test "Shard: a step's call of an action on another shard is answered there, and 
     try std.testing.expectEqual(@backingInt(action_entries.DoneStatus.completed), c.status);
     try std.testing.expectEqualStrings("{\"ok\":1}", c.result);
     // Cleared, it goes.
-    _ = try proposeAction(a, .action_call_clear, action_entries.CallClear.Value{ .ns = ns_table.DEFAULT.int(), .slot = calls_machine.callerSlot(.default, n.workflow), .run = rid });
+    _ = try proposeAction(a, .step_call_clear, action_entries.CallClear.Value{ .ns = ns_table.DEFAULT.int(), .slot = calls_machine.callerSlot(.default, n.workflow), .run = rid });
     two.settle();
     try std.testing.expect(callIn(a, n.workflow, rid) == null);
 }
@@ -28781,7 +28789,7 @@ test "Shard: a call cleared before its run ends, as a cancelled workflow's is, t
     try proposeCall(a, n.action, n.workflow, rid, false);
     two.settle();
     pumpChannels(&two);
-    _ = try proposeAction(a, .action_call_clear, action_entries.CallClear.Value{ .ns = ns_table.DEFAULT.int(), .slot = calls_machine.callerSlot(.default, n.workflow), .run = rid });
+    _ = try proposeAction(a, .step_call_clear, action_entries.CallClear.Value{ .ns = ns_table.DEFAULT.int(), .slot = calls_machine.callerSlot(.default, n.workflow), .run = rid });
     two.settle();
     try completeNext(&two, b, n.action, "{}");
     pumpChannels(&two);
@@ -28814,8 +28822,8 @@ test "Shard: a call of an action not registered is answered so, asked again once
     const retry: action_entries.CallRetry.Value = .{ .ns = ns_table.DEFAULT.int(), .slot = calls_machine.callerSlot(.default, n.workflow), .run = rid };
     _ = try proposeAction(b, .action_register, testRegister(n.action));
     two.settle();
-    _ = try proposeAction(a, .action_call_retry, retry);
-    _ = try proposeAction(a, .action_call_retry, retry);
+    _ = try proposeAction(a, .step_call_retry, retry);
+    _ = try proposeAction(a, .step_call_retry, retry);
     two.settle();
     try std.testing.expectEqual(@as(u32, 2), callIn(a, n.workflow, rid).?.attempts);
     pumpChannels(&two);
@@ -28873,9 +28881,9 @@ fn replicaOf(leader: *Shard, pipe_fd: std.posix.fd_t) !Shard {
 }
 
 test "Shard: a workflow run whose action ended just before a leader change finishes on the new leader" {
-    // A run's step state is its leader's memory, so a new leader doesn't
-    // know the run waits on this call: it stays running. Skipped until
-    // workflow step state is on the contract, which turns it green.
+    // A run's step state is held only in its leader's memory, so a new
+    // leader doesn't know the run waits on this call: it stays running.
+    // Skipped while that holds; it passes once the wait is durable.
     if (true) return error.SkipZigTest;
     var t: ClusterActionsTest = undefined;
     try t.init();
@@ -29235,4 +29243,200 @@ test "actions: more held leases than one expire pass looks at don't keep an ordi
     _ = actions.expireDue(&t.shard);
     try std.testing.expectEqual(@as(u64, held_n), metrics.workflow.action_expires_held.load(.monotonic));
     for (&names, 0..) |*b, i| try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(&t.shard, .default, try std.fmt.bufPrint(b, "c{d}", .{i})).?.status);
+}
+
+/// A workflow name in the default namespace whose slot shard `on` owns.
+fn workflowOn(two: *TwoShards, on: u16, prefix: []const u8, buf: []u8) ![]const u8 {
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const n = try std.fmt.bufPrint(buf, "{s}{d}", .{ prefix, i });
+        if (two.shards[0].router.slotToShard(node_router.nsKeySlot(.default, n)) == on) return n;
+    }
+}
+
+/// Every shard's workflow duty and channels, six turns.
+fn turnWorkflows(two: *TwoShards) void {
+    for (0..6) |_| {
+        for (&two.shards) |*s| {
+            s.workflow_handler.advanceStartedRuns(s);
+            s.workflow_handler.checkPendingActions(s);
+        }
+        two.settle();
+        pumpChannels(two);
+    }
+}
+
+fn createWorkflow(two: *TwoShards, s: *Shard, c: TestClient, id: u64, yaml: []const u8, name: []const u8) !void {
+    var out: [512]u8 = undefined;
+    s.runRequest(c.conn, try ParkTest.request(.workflow_create, id, proto.DEFAULT_NAMESPACE, name, yaml, ""), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, s, &out)).header.status);
+}
+
+test "Shard: a channel carries a parent's child workflow to its shard and the child's end back, and the parent resumes" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var pb: [16]u8 = undefined;
+    var kb: [16]u8 = undefined;
+    var ab: [16]u8 = undefined;
+    var wb: [16]u8 = undefined;
+    const parent_wf = try workflowOn(&two, 0, "par", &pb);
+    const kid_wf = try workflowOn(&two, 1, "kid", &kb);
+    const n = try callNames(&two, 1, 1, &ab, &wb);
+    _ = try proposeAction(b, .action_register, testRegister(n.action));
+    two.settle();
+    const ca = try TestClient.open(a);
+    defer _ = std.c.close(ca.pair[1]);
+    const cb = try TestClient.open(b);
+    defer _ = std.c.close(cb.pair[1]);
+    var yb: [512]u8 = undefined;
+    try createWorkflow(&two, b, cb, 1, try std.fmt.bufPrint(&yb, "{{\"kind\":\"Workflow\",\"name\":\"{s}\",\"version\":\"1.0.0\",\"start\":{{\"run\":\"@actions/{s}\",\"transitions\":{{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}}}}", .{ kid_wf, n.action }), kid_wf);
+    try createWorkflow(&two, a, ca, 2, try std.fmt.bufPrint(&yb, "{{\"kind\":\"Workflow\",\"name\":\"{s}\",\"version\":\"1.0.0\",\"start\":{{\"run\":\"@workflow/{s}\",\"transitions\":{{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}}}}", .{ parent_wf, kid_wf }), parent_wf);
+    var out: [512]u8 = undefined;
+    a.runRequest(ca.conn, try ParkTest.request(.workflow_start, 3, proto.DEFAULT_NAMESPACE, parent_wf, "", ""), .client);
+    two.settle();
+    const started = try nextAnswer(ca, a, &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), started.header.status);
+    var rid_buf: [64]u8 = undefined;
+    const parent_run = rid_buf[0..started.data.len];
+    @memcpy(parent_run, started.data);
+    turnWorkflows(&two);
+    // The child runs on b, under the id the parent's call chose; its step's
+    // action waits for a worker there.
+    try std.testing.expectEqual(@as(usize, 1), b.workflow_handler.runs.count());
+    try completeNext(&two, b, n.action, "{}");
+    turnWorkflows(&two);
+    var it = a.workflow_handler.runs.valueIterator();
+    const parent = while (it.next()) |r| {
+        if (std.mem.eql(u8, r.run_id_owned, parent_run)) break r;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, parent.status);
+    var heard = false;
+    for (parent.history.items) |evt| {
+        if (std.mem.eql(u8, evt.event_type_owned, "child_completed")) heard = true;
+    }
+    try std.testing.expect(heard);
+}
+
+test "Shard: a child's end waits while its own parent's outbox is full, and another child's, bound elsewhere, doesn't" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const b = &two.shards[1];
+    var kb: [16]u8 = undefined;
+    const kid_wf = try workflowOn(&two, 1, "kid", &kb);
+    const cb = try TestClient.open(b);
+    defer _ = std.c.close(cb.pair[1]);
+    var yb: [512]u8 = undefined;
+    try createWorkflow(&two, b, cb, 1, try std.fmt.bufPrint(&yb, "{{\"kind\":\"Workflow\",\"name\":\"{s}\",\"version\":\"1.0.0\",\"start\":{{\"wait_for_signal\":{{\"type\":\"go\"}},\"transitions\":{{\"success\":\"flo.Completed\"}}}}}}", .{kid_wf}), kid_wf);
+    // Two children here: one whose parent's workflow is on shard 0, one on
+    // this shard.
+    var p0: [16]u8 = undefined;
+    var p1: [16]u8 = undefined;
+    const far = try workflowOn(&two, 0, "pa", &p0);
+    const near = try workflowOn(&two, 1, "pb", &p1);
+    for ([_][]const u8{ far, near }, [_][]const u8{ "kid-far", "kid-near" }) |parent_wf, kid| {
+        _ = try proposeAction(b, .child_start, action_entries.ChildStart.Value{ .ns = ns_table.DEFAULT.int(), .parent_slot = calls_machine.callerSlot(.default, parent_wf), .parent_run = "p-run", .parent_workflow = parent_wf, .workflow = kid_wf, .version = "", .run = kid, .input = "{}" });
+    }
+    two.settle();
+    b.workflow_handler.checkPendingActions(b);
+    two.settle();
+    try std.testing.expectEqual(@as(usize, 2), b.workflow_handler.runs.count());
+    // Their starts' replies wait in the outboxes: shard 1 takes its own, and
+    // shard 0 never answers, so its outbox stays full at one byte a channel.
+    for (0..4) |_| {
+        b.tickChannels();
+        _ = b.drainInbox();
+        two.shards[1].channel.peers[1].last_trim_ms = 0;
+        _ = b.applyCommitted();
+    }
+    b.outbox_caps = .{ .shard = 1 << 30, .channel = 1 };
+    const rd: contract_view.ReadView = .{ .store = &b.defaultPartition().store };
+    try std.testing.expect(channels_mod.metaOf(rd, 0).bytes > 0);
+    try std.testing.expectEqual(@as(u64, 0), channels_mod.metaOf(rd, 1).bytes);
+    const wf = b.workflow_handler;
+    for ([_][]const u8{ "kid-far", "kid-near" }) |kid| {
+        const key = wf.nsKey(.default, kid).?;
+        defer std.testing.allocator.free(key);
+        wf.completeRun(b, key, wf.runs.getPtr(key).?, .completed, "flo.Completed", 3);
+    }
+    _ = b.applyCommitted();
+    for ([_][]const u8{ "kid-far", "kid-near" }, [_]WorkflowHandler.RunStatus{ .running, .completed }) |kid, want| {
+        const key = wf.nsKey(.default, kid).?;
+        defer std.testing.allocator.free(key);
+        try std.testing.expectEqual(want, wf.runs.get(key).?.status);
+    }
+}
+
+test "Shard: a child's call cleared before the child ends takes its end as nothing, and counts it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var metrics = MetricsRegistry.init(std.testing.allocator);
+    defer metrics.deinit();
+    a.setMetricsRegistry(&metrics);
+    var kb: [16]u8 = undefined;
+    var pb: [16]u8 = undefined;
+    const kid_wf = try workflowOn(&two, 1, "kid", &kb);
+    const parent_wf = try workflowOn(&two, 0, "par", &pb);
+    const cb = try TestClient.open(b);
+    defer _ = std.c.close(cb.pair[1]);
+    var yb: [512]u8 = undefined;
+    try createWorkflow(&two, b, cb, 1, try std.fmt.bufPrint(&yb, "{{\"kind\":\"Workflow\",\"name\":\"{s}\",\"version\":\"1.0.0\",\"start\":{{\"wait_for_signal\":{{\"type\":\"go\"}},\"transitions\":{{\"success\":\"flo.Completed\"}}}}}}", .{kid_wf}), kid_wf);
+    var rb: [32]u8 = undefined;
+    const rid = a.run_id_gen.next(.workflow, node_router.nsKeySlot(.default, kid_wf), &rb);
+    const slot = calls_machine.callerSlot(.default, parent_wf);
+    _ = try proposeAction(a, .step_call, action_entries.Call.Value{ .ns = ns_table.DEFAULT.int(), .kind = .workflow, .caller_run = "p-run", .caller_workflow = parent_wf, .step = "s", .target = kid_wf, .version = "", .run = rid, .input = "{}", .can_wait = false });
+    two.settle();
+    pumpChannels(&two);
+    b.workflow_handler.checkPendingActions(b);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(calls_machine.State.started, callIn(a, parent_wf, rid).?.state);
+    // The parent's step resolved otherwise (its run was cancelled, say).
+    _ = try proposeAction(a, .step_call_clear, action_entries.CallClear.Value{ .ns = ns_table.DEFAULT.int(), .slot = slot, .run = rid });
+    two.settle();
+    const wf = b.workflow_handler;
+    const key = wf.nsKey(.default, rid).?;
+    defer std.testing.allocator.free(key);
+    wf.completeRun(b, key, wf.runs.getPtr(key).?, .completed, "flo.Completed", 3);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expect(callIn(a, parent_wf, rid) == null);
+    try std.testing.expect(@import("../workflow/children_machine.zig").parentOf(.{ .store = &b.defaultPartition().store }, .default, rid) == null);
+    try std.testing.expectEqual(@as(u64, 1), metrics.workflow.action_answers_without_call_total.load(.monotonic));
+    // Not the sender's bug: nothing was refused.
+    for (a.channel.sender_bugs) |row| for (row) |bugs| try std.testing.expectEqual(@as(u64, 0), bugs);
+}
+
+test "Shard: a second caller's start of a child run another caller started is answered so, and the first stands" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var metrics = MetricsRegistry.init(std.testing.allocator);
+    defer metrics.deinit();
+    a.setMetricsRegistry(&metrics);
+    var kb: [16]u8 = undefined;
+    var pb: [16]u8 = undefined;
+    const kid_wf = try workflowOn(&two, 1, "kid", &kb);
+    const parent_wf = try workflowOn(&two, 0, "par", &pb);
+    for ([_][]const u8{ "first-run", "second-run" }) |parent_run| {
+        _ = try proposeAction(b, .child_start, action_entries.ChildStart.Value{ .ns = ns_table.DEFAULT.int(), .parent_slot = calls_machine.callerSlot(.default, parent_wf), .parent_run = parent_run, .parent_workflow = parent_wf, .workflow = kid_wf, .version = "", .run = "kid-same", .input = "{}" });
+    }
+    two.settle();
+    try std.testing.expectEqualStrings("first-run", @import("../workflow/children_machine.zig").parentOf(.{ .store = &b.defaultPartition().store }, .default, "kid-same").?.parent_run);
+    // The second caller hears (here no call waits on it, so it's counted).
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 1), metrics.workflow.action_answers_without_call_total.load(.monotonic));
 }

@@ -497,7 +497,7 @@ pub const ConsumerGroups = struct {
                 if (cmd.value.len != 4) return error.Halt;
                 const n = std.mem.readInt(u32, cmd.value[0..4], .big);
                 _ = self.stream.appendToStreamAt(gm.streamOf(NS, STREAMS[s]), e.header.index, 0, 0, e.header.timestamp_ns / std.time.ns_per_ms, n, n * RECORD_BYTES) catch return error.Halt;
-                if (r.mutant != .stream_append_unrecorded) try machine_mod.observeEntry(&sm.machine, store, &self.scratch, self.streams(), e);
+                if (r.mutant != .stream_append_unrecorded) try machine_mod.observeEntry(&sm.machine, store, &self.scratch, self.streams(), e, .entry);
             },
             .trim => {
                 if (cmd.key.len != 16 or cmd.value.len != 8) return error.Halt;
@@ -507,7 +507,7 @@ pub const ConsumerGroups = struct {
                 const up_to: StreamID = .{ .timestamp_ms = std.mem.readInt(u64, cmd.key[0..8], .big), .sequence = std.mem.readInt(u64, cmd.key[8..16], .big) };
                 const sk = gm.streamOf(NS, STREAMS[s]);
                 _ = self.stream.trimStream(sk, up_to);
-                if (r.mutant != .group_trim_misses_floor) try machine_mod.observeEntry(&gm.machine, store, &self.scratch, self.streams(), e);
+                if (r.mutant != .group_trim_misses_floor) try machine_mod.observeEntry(&gm.machine, store, &self.scratch, self.streams(), e, .entry);
                 // A stream with groups moves its floor to what the stream lost.
                 if (self.ledger.streams[s]) |*st| {
                     const cut = self.stream.streamRemovedThrough(sk);
@@ -518,8 +518,8 @@ pub const ConsumerGroups = struct {
                 const s = streamIndex(cmd.key) orelse return error.Halt;
                 _ = self.stream.deleteStream(gm.streamOf(NS, STREAMS[s]));
                 // Both followers of a delete, in the shard's order.
-                try machine_mod.observeEntry(&gm.machine, store, &self.scratch, self.streams(), e);
-                try machine_mod.observeEntry(&sm.machine, store, &self.scratch, self.streams(), e);
+                try machine_mod.observeEntry(&gm.machine, store, &self.scratch, self.streams(), e, .entry);
+                try machine_mod.observeEntry(&sm.machine, store, &self.scratch, self.streams(), e, .entry);
                 // Its groups are of the old generation now: gone.
                 if (self.ledger.streams[s]) |*st| {
                     st.gen += 1;

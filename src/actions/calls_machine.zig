@@ -1,15 +1,15 @@
-//! Calls: a workflow step's action run, asked for over a channel and
-//! recorded on the workflow's shard.
+//! Calls: a workflow step's run of an action or a child workflow, asked for
+//! over a channel and recorded on the workflow's shard.
 //!
-//! - `action_call` records the call and sends the run's start
+//! - `step_call` records the call and sends the run's start
 //!   (`action_invoke`) to the action's slot.
 //! - The action's shard answers in the entry that applied the start
-//!   (`action_reply`): the run exists, or no such action is registered.
-//! - When the run ends, its shard sends `action_done` with what it
+//!   (`call_reply`): the run exists, or no such action is registered.
+//! - When the run ends, its shard sends `call_done` with what it
 //!   returned.
 //! - A call whose action wasn't registered is asked for again
-//!   (`action_call_retry`), and one its step is done with goes
-//!   (`action_call_clear`).
+//!   (`step_call_retry`), and one its step is done with goes
+//!   (`step_call_clear`).
 //!
 //! A call is keyed (ns, caller slot, run): the slot is the calling
 //! workflow's, so a call is the slot's state and moves with it. An answer
@@ -53,11 +53,16 @@ pub const State = enum(u8) {
     refused = 5,
 };
 
+/// A step's call of an action's run or a child workflow's, kept under the
+/// calling workflow's slot until the step is done with it. One record for
+/// both kinds.
 pub const Call = Record(&.{
+    .{ .name = "kind", .T = schema.Enum(ae.CallKind) },
     .{ .name = "caller_run", .T = Bytes(limits.MAX_QUALIFIED_KEY) },
     .{ .name = "caller_workflow", .T = ae.CallerWorkflow },
     .{ .name = "step", .T = ae.StepName },
-    .{ .name = "action", .T = ae.ActionName },
+    .{ .name = "target", .T = ae.TargetName },
+    .{ .name = "version", .T = ae.Version },
     .{ .name = "input", .T = Bytes(ae.MAX_INPUT) },
     .{ .name = "can_wait", .T = schema.Bool },
     .{ .name = "state", .T = schema.Enum(State) },
@@ -71,7 +76,7 @@ pub const Call = Record(&.{
     .{ .name = "result", .T = Bytes(action_ops.MAX_OUTPUT) },
 });
 
-pub const Calls = view_mod.Family(25, "action.calls", .id, delivery.Stored(Call));
+pub const Calls = view_mod.Family(25, "step.calls", .id, delivery.Stored(Call));
 
 /// The slot a workflow's runs are placed on, which its calls' answers go
 /// back to: by its name, since a client may choose a run's id.
@@ -113,23 +118,23 @@ const Named = struct { ns: NamespaceId, slot: u16, run: []const u8 };
 fn named(e: *const Entry) ?Named {
     var diag: schema.Diagnostic = .{};
     return switch (typeOf(e) orelse return null) {
-        .action_call => blk: {
+        .step_call => blk: {
             const p = ae.Call.decodeAll(e.payload, &diag) catch return null;
             break :blk .{ .ns = .of(p.ns), .slot = callerSlot(.of(p.ns), p.caller_workflow), .run = p.run };
         },
-        .action_call_retry => blk: {
+        .step_call_retry => blk: {
             const p = ae.CallRetry.decodeAll(e.payload, &diag) catch return null;
             break :blk .{ .ns = .of(p.ns), .slot = p.slot, .run = p.run };
         },
-        .action_call_clear => blk: {
+        .step_call_clear => blk: {
             const p = ae.CallClear.decodeAll(e.payload, &diag) catch return null;
             break :blk .{ .ns = .of(p.ns), .slot = p.slot, .run = p.run };
         },
-        .action_reply => blk: {
+        .call_reply => blk: {
             const p = ae.Reply.decodeAll(e.payload, &diag) catch return null;
             break :blk .{ .ns = .of(p.ns), .slot = p.slot, .run = p.run };
         },
-        .action_done => blk: {
+        .call_done => blk: {
             const p = ae.Done.decodeAll(e.payload, &diag) catch return null;
             break :blk .{ .ns = .of(p.ns), .slot = p.slot, .run = p.run };
         },
@@ -150,20 +155,40 @@ fn namespaceOf(e: *const Entry) ?u32 {
     return n.ns.int();
 }
 
-/// Sends the run's start for `call` to the action's slot.
-fn sendStart(view: *View, ns: NamespaceId, run: []const u8, c: Call.Value) ApplyError!void {
-    const buf = view.arena.alloc(u8, ae.Invoke.max_size) catch return error.OutOfMemory;
-    const start = ae.Invoke.encodeInto(buf, .{
-        .ns = ns.int(),
-        .action = c.action,
-        .run = run,
-        .input = c.input,
-        .labels = null,
-        .source = .workflow,
-        .caller_run = c.caller_run,
-        .caller_workflow = c.caller_workflow,
-    }) catch return error.Halt;
-    try view.send(.user(ns), @intCast(router.nsKeySlot(ns, c.action)), @backingInt(EntryType.action_invoke), start);
+/// Sends the call's start to its target's slot: an action's run's invoke,
+/// or a child workflow's start, which carries where the child's end goes.
+fn sendStart(view: *View, ns: NamespaceId, slot: u16, run: []const u8, c: Call.Value) ApplyError!void {
+    const to: u16 = @intCast(router.nsKeySlot(ns, c.target));
+    switch (c.kind) {
+        .action => {
+            const buf = view.arena.alloc(u8, ae.Invoke.max_size) catch return error.OutOfMemory;
+            const start = ae.Invoke.encodeInto(buf, .{
+                .ns = ns.int(),
+                .action = c.target,
+                .run = run,
+                .input = c.input,
+                .labels = null,
+                .source = .workflow,
+                .caller_run = c.caller_run,
+                .caller_workflow = c.caller_workflow,
+            }) catch return error.Halt;
+            try view.send(.user(ns), to, @backingInt(EntryType.action_invoke), start);
+        },
+        .workflow => {
+            const buf = view.arena.alloc(u8, ae.ChildStart.max_size) catch return error.OutOfMemory;
+            const start = ae.ChildStart.encodeInto(buf, .{
+                .ns = ns.int(),
+                .parent_slot = slot,
+                .parent_run = c.caller_run,
+                .parent_workflow = c.caller_workflow,
+                .workflow = c.target,
+                .version = c.version,
+                .run = run,
+                .input = c.input,
+            }) catch return error.Halt;
+            try view.send(.user(ns), to, @backingInt(EntryType.child_start), start);
+        },
+    }
 }
 
 /// Answers: a reply or a done, 1 when it changed a call and 0 when it
@@ -179,15 +204,17 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     const k = callKey(&kb, n.ns, n.slot, n.run) orelse return error.Halt;
     const found = try view.get(Calls, k);
     switch (typeOf(e).?) {
-        .action_call => {
+        .step_call => {
             const p = ae.Call.decodeAll(e.payload, &diag) catch return error.Halt;
             // Proposed twice before it applied: the first stands.
             if (found != null) return;
             const c: Call.Value = .{
+                .kind = p.kind,
                 .caller_run = p.caller_run,
                 .caller_workflow = p.caller_workflow,
                 .step = p.step,
-                .action = p.action,
+                .target = p.target,
+                .version = p.version,
                 .input = p.input,
                 .can_wait = p.can_wait,
                 .state = .sent,
@@ -199,9 +226,9 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 .result = "",
             };
             try view.put(Calls, k, .{ .v = c });
-            try sendStart(view, n.ns, n.run, c);
+            try sendStart(view, n.ns, n.slot, n.run, c);
         },
-        .action_call_retry => {
+        .step_call_retry => {
             var c = (found orelse return).v;
             // Answered since the retry was proposed, or proposed twice.
             if (c.state != .no_action) return;
@@ -209,10 +236,10 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             c.attempts +|= 1;
             c.last_ns = stamp;
             try view.put(Calls, k, .{ .v = c });
-            try sendStart(view, n.ns, n.run, c);
+            try sendStart(view, n.ns, n.slot, n.run, c);
         },
-        .action_call_clear => if (found != null) try view.delete(Calls, k),
-        .action_reply => {
+        .step_call_clear => if (found != null) try view.delete(Calls, k),
+        .call_reply => {
             const p = ae.Reply.decodeAll(e.payload, &diag) catch return error.Halt;
             // Reserved for when slots move: until then, a sender's bug.
             if (p.answer == .moved) return out.refuse(.bad_request, .malformed, MOVED_NOT_YET);
@@ -230,7 +257,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             c.last_ns = stamp;
             try view.put(Calls, k, .{ .v = c });
         },
-        .action_done => {
+        .call_done => {
             const p = ae.Done.decodeAll(e.payload, &diag) catch return error.Halt;
             var c = (found orelse return out.putInt(u8, 0)).v;
             out.putInt(u8, 1);
@@ -250,7 +277,7 @@ pub const MOVED_NOT_YET = "bad request: a call's start answered moved, which not
 
 pub const machine: machine_mod.Machine = .{
     .name = "calls",
-    .entry_types = &.{ .action_call, .action_call_retry, .action_call_clear, .action_reply, .action_done },
+    .entry_types = &.{ .step_call, .step_call_retry, .step_call_clear, .call_reply, .call_done },
     .families = &.{machine_mod.info(Calls)},
     .keys = keys,
     .apply = apply,
