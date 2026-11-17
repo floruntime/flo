@@ -135,6 +135,9 @@ test "e2e/shutdown: SIGTERM under load stops the server promptly, and every ackn
     for (&acked, 0..) |*a, c| if (a.items.len == 0) {
         for (traces, 0..) |t, i| std.debug.print("TRACE client {d}: connect {d} ms, first ack {d} ms, answered {d}, not ok {d} ({s}), ended '{s}' at {d} ms, acked {d}\n", .{ i, t.connect_ms, t.first_ack_ms, t.answered, t.bad, t.first_bad[0..t.first_bad_len], t.end, t.end_ms, acked[i].items.len });
         std.debug.print("TRACE client {d} acked nothing\n", .{c});
+        // Surface the per-shard TRACE-SRV lines the server logged at SIGTERM, so
+        // a failing CI run shows which shard held the requests and why.
+        ctx.server.dumpLogs();
         break;
     };
     try ctx.restartServer();

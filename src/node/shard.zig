@@ -6488,6 +6488,29 @@ pub const Shard = struct {
     /// once every shard has answered what it holds, requests sent to other
     /// shards whose answer never came.
     fn answerAtShutdown(self: *Shard) void {
+        // TRACE (throwaway, shutdown-flake step 1): each shard's raft + forward
+        // state as it stops, so a run that stalls shows which shard held the
+        // requests and why (no leader, apply behind commit, or forwards stuck).
+        {
+            var fwd_sent: u32 = 0;
+            var fwd_unsent: u32 = 0;
+            for (self.forwards) |*f| if (f.active) {
+                if (f.sent_to != 0) fwd_sent += 1 else fwd_unsent += 1;
+            };
+            log.warn("TRACE-SRV shard={d} role={s} leader={d} ready={} term={d} commit={d} applied={d} blocking_fwd={d} fwd_sent={d} fwd_unsent={d} edge_waits_active={d}", .{
+                self.id,                      @tagName(self.raft_node.role), self.raft_node.leader_id,
+                self.raft_node.leaderReady(), self.raft_node.current_term,   self.raft_node.commit_index,
+                self.raft_node.last_applied,  self.blocking_forwards,        fwd_sent,
+                fwd_unsent,
+                blk: {
+                    var n: u32 = 0;
+                    for (&self.edge.waits) |*w| if (w.active) {
+                        n += 1;
+                    };
+                    break :blk n;
+                },
+            });
+        }
         self.resolvePending(SHUTTING_DOWN);
         for (&self.edge.waits) |*w| if (w.active) {
             self.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, proto.notRun(SHUTTING_DOWN_NOT_RUN));
