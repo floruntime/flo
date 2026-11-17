@@ -8,8 +8,8 @@
 //! LEAF MODULE, shared with src/vopr/simulator.zig: it must NOT import shard.zig
 //! or anything that pulls in the server stack (networking, protocol handlers,
 //! sinks, channels, processing). Its imports stay leaves (raft/log, ual/entry,
-//! repair, silent_loss, plant, stdx) so the vopr binary, which never links
-//! shard.zig, can compile it.
+//! repair, silent_loss, plant, stdx, durable_log for its read-error class) so
+//! the vopr binary, which never links shard.zig, can compile it.
 
 const std = @import("std");
 const log = @import("stdx").log;
@@ -18,6 +18,7 @@ const silent_loss = @import("silent_loss.zig");
 const repair = @import("repair.zig");
 const plant = @import("../plant.zig");
 const RaftLog = @import("../raft/log.zig").RaftLog;
+const DurableLog = @import("../storage/durable_log.zig").DurableLog;
 
 /// An entry every replica fails the same way, and why. A shard halted at
 /// it applies nothing from it on until a repair.
@@ -76,19 +77,48 @@ pub const BlockedRead = struct { name: []const u8, err: anyerror };
 
 /// Every durable entry is part of the Raft log; restore it there. A later
 /// copy of an index the log already holds is ignored; a gap is damage.
-pub fn restoreRaftEntry(shard_id: u16, raft_log: *RaftLog, e: *const entry_mod.Entry) ?silent_loss.Damage {
+/// The outcome of restoring one durable entry into the Raft log.
+pub const Restore = union(enum) {
+    /// Restored, or a duplicate the log already holds (ignored).
+    ok,
+    /// This node could not restore it, and no restart will change that: a hole,
+    /// or a segment entry the log cannot represent. The boot stops, damaged.
+    damage: silent_loss.Damage,
+    /// This node ran out of a resource restoring it (memory, file handles).
+    /// Another try, once the resource is free, will succeed, so the boot is
+    /// refused rather than booted over a lost entry.
+    blocked: BlockedRead,
+};
+
+pub fn restoreRaftEntry(shard_id: u16, raft_log: *RaftLog, e: *const entry_mod.Entry) Restore {
     _ = raft_log.append(e) catch |err| switch (err) {
+        // A non-increasing index (a truncation recorded in a later segment, or an
+        // entry re-recorded after a term change) fails `append`'s index check
+        // (src/raft/log.zig:126) before `ual.append`, so it lands here, not as
+        // the ual's IndexNotIncreasing: a copy the log already holds is ignored,
+        // a true gap is damage.
         error.IndexGap => {
             const tip = raft_log.lastIndex();
             if (e.header.index <= tip) {
                 log.err("shard {d}: segments hold index {d} twice (log tip {d}); the later copy is ignored", .{ shard_id, e.header.index, tip });
-                return null;
+                return .ok;
             }
-            return silent_loss.Damage.init(.index_hole, "no segment holds entries {d}..{d}", .{ tip + 1, e.header.index - 1 });
+            return .{ .damage = silent_loss.Damage.init(.index_hole, "no segment holds entries {d}..{d}", .{ tip + 1, e.header.index - 1 }) };
         },
-        else => log.err("shard {d}: cannot restore index {d}: {s}", .{ shard_id, e.header.index, @errorName(err) }),
+        // Any other append failure: a resource shortage (out of memory) is
+        // retryable, so refuse the boot — the same resource-vs-fault split the
+        // segment reads use (bootRefuses). A deterministic failure (an entry too
+        // large for the ring, or a RaftLog/ual index inconsistency) is damage.
+        else => {
+            if (DurableLog.readBlockClass(err) == .resource) {
+                log.err("shard {d}: out of resources restoring index {d} ({s}); refusing the boot to retry", .{ shard_id, e.header.index, @errorName(err) });
+                return .{ .blocked = .{ .name = "raft-log restore", .err = err } };
+            }
+            log.err("shard {d}: cannot restore index {d}: {s}", .{ shard_id, e.header.index, @errorName(err) });
+            return .{ .damage = silent_loss.Damage.init(.segment_unreadable, "index {d} will not restore ({s})", .{ e.header.index, @errorName(err) }) };
+        },
     };
-    return null;
+    return .ok;
 }
 
 /// Whether a committed repair skips `e` on this shard. A skip entry itself
@@ -135,9 +165,16 @@ pub const ReplayCtx = struct {
 /// on a clean apply. The file (or the sim's disk) reading stays with the caller.
 pub fn replayOneEntry(ctx: ReplayCtx, entry: *const entry_mod.Entry, out: *ReplayOutcome) void {
     // Every durable entry is part of the Raft log.
-    if (restoreRaftEntry(ctx.shard_id, ctx.raft_log, entry)) |damage| {
-        out.damage = damage;
-        return;
+    switch (restoreRaftEntry(ctx.shard_id, ctx.raft_log, entry)) {
+        .ok => {},
+        .damage => |d| {
+            out.damage = d;
+            return;
+        },
+        .blocked => |b| {
+            out.blocked = b;
+            return;
+        },
     }
     // Above the watermark: in the log, not yet in the projections. Past a halt:
     // in the log, and nothing of it applies until a repair.
@@ -235,4 +272,43 @@ test "replay: a boot replay halts at an entry stamped no later than the one befo
     try std.testing.expect(out.halt != null);
     try std.testing.expect(std.mem.indexOf(u8, out.halt.?.reason(), "is not after the last applied entry") != null);
     try std.testing.expectEqual(@as(u64, 2), out.applied_through);
+}
+
+test "replay: an out-of-memory restore refuses the boot instead of dropping the entry" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var raft_log = try RaftLog.init(failing.allocator(), 4096);
+    defer raft_log.deinit();
+    // Let deinit free cleanly after the induced failure (runs before deinit).
+    defer failing.fail_index = std.math.maxInt(usize);
+
+    // Fail the next allocation — the append's term-run growth — so the restore
+    // hits OutOfMemory, a resource shortage.
+    failing.fail_index = failing.alloc_index;
+    var e = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 100, "");
+    e.header.crc32c = e.computeCrc();
+
+    // It must refuse the boot (blocked), not drop the entry: a restart with
+    // memory free retries. The log still holds nothing — the entry is not lost.
+    const result = restoreRaftEntry(0, &raft_log, &e);
+    try std.testing.expect(result == .blocked);
+    try std.testing.expectEqual(@as(anyerror, error.OutOfMemory), result.blocked.err);
+    try std.testing.expectEqual(@as(u64, 0), raft_log.lastIndex());
+
+    // The retry (memory now free) restores it.
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expect(restoreRaftEntry(0, &raft_log, &e) == .ok);
+    try std.testing.expectEqual(@as(u64, 1), raft_log.lastIndex());
+}
+
+test "replay: an entry too large for the ring is damage, not a silent skip" {
+    var raft_log = try RaftLog.init(std.testing.allocator, 512);
+    defer raft_log.deinit();
+
+    // Payload past the ring capacity → ual.append returns EntryTooLarge, a
+    // deterministic fault no restart fixes: damage, so the boot stops rather
+    // than continuing over a dropped entry.
+    var payload: [1024]u8 = undefined;
+    var e = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 100, &payload);
+    e.header.crc32c = e.computeCrc();
+    try std.testing.expect(restoreRaftEntry(0, &raft_log, &e) == .damage);
 }
