@@ -96,11 +96,13 @@ pub const DEFAULT_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A node's running view of its budget, held on shard 0 and refreshed at each
 /// settings-or-membership apply. It feeds `/status` and metrics only and
-/// records nothing in applied state. The shown budget holds through a
-/// provisional spell (a data-holder with no row yet) at its last clean value,
-/// so a missing small joiner never inflates it.
+/// records nothing itself. Through a provisional spell (a data-holder with no
+/// row yet) it shows the last committed record, not an in-memory derive, so a
+/// missing small joiner never inflates it and every replica shows the same
+/// value across a restart.
 pub const Observation = struct {
-    /// The budget shown: the last clean min over data-holders, in bytes.
+    /// The budget shown: the clean min over data-holders, or the last committed
+    /// record while provisional, in bytes.
     budget_bytes: u64 = 0,
     /// The node that set the shown budget — named by a refusal and raised to
     /// lift the budget. Null before the first clean derive.
@@ -109,7 +111,11 @@ pub const Observation = struct {
     pool_use_bytes: u64 = 0,
     /// The data-holder with no row yet that froze the budget, or null when none.
     provisional_node: ?u32 = null,
-    /// When the current freeze began, for the provisional-duration gauge.
+    /// When the current freeze began, for the provisional-duration gauge. This
+    /// is node-local wall-clock, not applied state: nothing decides on it (only
+    /// the gauge and `/status` read it), so a restart resetting the *duration*
+    /// shown — while the *budget* is recovered from the log — is correct. Keep
+    /// it off any path that admits or refuses a write.
     provisional_since_ms: ?u64 = null,
     /// True once a clean budget has been derived at least once.
     seen: bool = false,
@@ -117,15 +123,13 @@ pub const Observation = struct {
     /// A clean budget that fell, for the loud log.
     pub const Drop = struct { before: u64, after: u64, governing: ?u32 };
 
-    /// Fold a fresh derivation in at `now_ms`. While provisional, the shown
-    /// budget is held and only the freeze is marked; once clean, it recomputes
-    /// to the min. Returns the drop when a clean budget fell, else null.
-    pub fn update(self: *Observation, b: Budget, now_ms: u64) ?Drop {
-        if (b.provisional_node) |n| {
-            self.provisional_node = n;
-            if (self.provisional_since_ms == null) self.provisional_since_ms = now_ms;
-            return null;
-        }
+    /// The committed clean-budget record a provisional spell shows.
+    pub const Clean = struct { budget_bytes: u64, governing_node: ?u32 = null };
+
+    /// A clean (non-provisional) derivation: its value is a pure function of
+    /// applied state, so show it and clear any freeze. Returns the drop when a
+    /// clean budget fell, for the loud log.
+    pub fn showClean(self: *Observation, b: Budget) ?Drop {
         self.provisional_node = null;
         self.provisional_since_ms = null;
         const before = self.budget_bytes;
@@ -135,6 +139,24 @@ pub const Observation = struct {
         self.seen = true;
         if (had and b.bytes < before) return .{ .before = before, .after = b.bytes, .governing = b.governing_node };
         return null;
+    }
+
+    /// A provisional spell: `node` is the data-holder that hasn't reported. The
+    /// shown budget is the last committed clean record `rec`, so it depends only
+    /// on applied state — a restarted node shows the same value as one that
+    /// stayed up, never an in-memory derive that no record carries. `rec` is
+    /// null until a clean budget has been recorded, when nothing is shown yet.
+    pub fn showProvisional(self: *Observation, node: u32, rec: ?Clean, now_ms: u64) void {
+        if (self.provisional_since_ms == null) self.provisional_since_ms = now_ms;
+        self.provisional_node = node;
+        if (rec) |r| {
+            self.budget_bytes = r.budget_bytes;
+            self.governing_node = r.governing_node;
+            self.seen = true;
+        } else {
+            self.budget_bytes = 0;
+            self.governing_node = null;
+        }
     }
 
     /// How long the budget has been frozen for an unreported data-holder, in
@@ -207,31 +229,38 @@ fn gib(n: u64) u64 {
     return n * 1024 * 1024 * 1024;
 }
 
-test "observation: a provisional derive holds the last clean budget" {
+test "observation: a provisional spell shows the committed record, not an in-memory hold" {
     var o: Observation = .{};
     const clean = [_]Holder{.{ .node_id = 1, .mem = .{ .ram_bytes = gib(2), .reserve = 100 * 1024 * 1024 } }};
-    _ = o.update(derive(700, &clean), 1000);
+    _ = o.showClean(derive(700, &clean));
     const shown = o.budget_bytes;
     try testing.expect(shown > 0);
     try testing.expectEqual(@as(?u32, null), o.provisional_node);
 
-    // A joiner with no row yet: budget is held, not lowered, and the freeze is marked.
-    const joined = [_]Holder{ clean[0], .{ .node_id = 2, .mem = null } };
-    try testing.expectEqual(@as(?Observation.Drop, null), o.update(derive(700, &joined), 2000));
+    // A joiner with no row yet freezes the budget. The shown value is the
+    // committed record — not whatever this node last derived — so it is the same
+    // on a node that stayed up and one that restarted. The freeze is marked.
+    o.showProvisional(2, .{ .budget_bytes = shown, .governing_node = 1 }, 2000);
     try testing.expectEqual(shown, o.budget_bytes);
     try testing.expectEqual(@as(?u32, 2), o.provisional_node);
     try testing.expectEqual(@as(u64, 500), o.provisionalMs(2500));
+
+    // A provisional spell with no record yet shows nothing, never a stale derive.
+    var fresh: Observation = .{};
+    fresh.showProvisional(2, null, 2000);
+    try testing.expectEqual(@as(u64, 0), fresh.budget_bytes);
+    try testing.expectEqual(@as(?u32, 2), fresh.provisional_node);
 }
 
-test "observation: recomputes to the clean min and logs the drop" {
+test "observation: a clean derive recomputes to the min and logs the drop" {
     var o: Observation = .{};
     const one = [_]Holder{.{ .node_id = 1, .mem = .{ .ram_bytes = gib(8), .reserve = 100 * 1024 * 1024 } }};
-    _ = o.update(derive(700, &one), 1000);
+    _ = o.showClean(derive(700, &one));
     const big = o.budget_bytes;
 
     // A smaller data-holder reports: the budget recomputes down and the drop is returned.
     const two = [_]Holder{ one[0], .{ .node_id = 2, .mem = .{ .ram_bytes = gib(2), .reserve = 100 * 1024 * 1024 } } };
-    const drop = o.update(derive(700, &two), 2000);
+    const drop = o.showClean(derive(700, &two));
     try testing.expect(drop != null);
     try testing.expectEqual(big, drop.?.before);
     try testing.expectEqual(o.budget_bytes, drop.?.after);
@@ -240,8 +269,8 @@ test "observation: recomputes to the clean min and logs the drop" {
     try testing.expectEqual(@as(u64, 0), o.provisionalMs(9999)); // not provisional
 }
 
-test "observation: the first derive never logs a drop" {
+test "observation: the first clean derive never logs a drop" {
     var o: Observation = .{};
     const one = [_]Holder{.{ .node_id = 1, .mem = .{ .ram_bytes = gib(2), .reserve = 100 * 1024 * 1024 } }};
-    try testing.expectEqual(@as(?Observation.Drop, null), o.update(derive(700, &one), 1000));
+    try testing.expectEqual(@as(?Observation.Drop, null), o.showClean(derive(700, &one)));
 }

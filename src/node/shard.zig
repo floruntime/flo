@@ -6054,7 +6054,7 @@ pub const Shard = struct {
         // metrics show. Every replica applies the same entries, so each derives
         // the same budget.
         if (self.id == 0) switch (@as(entry_mod.EntryType, @fromBackingInt(@intCast(entry.header.entry_type)))) {
-            .settings_pool_share, .settings_node_mem, .settings_node_del, .raft_config => self.refreshBudget(),
+            .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean, .raft_config => self.refreshBudget(),
             else => {},
         };
     }
@@ -6100,7 +6100,13 @@ pub const Shard = struct {
 
         const was_provisional = self.budget.provisional_node;
         const budget = memory_budget.derive(share, holders[0..n]);
-        if (self.budget.update(budget, nowMs())) |drop| {
+        if (budget.provisional_node) |pn| {
+            // Frozen: show the last committed clean record, a pure function of
+            // applied state, so a node that restarts mid-freeze shows the same
+            // value as one that stayed up. The record can briefly lag a clean
+            // derive the leader hasn't recorded yet, but never diverges.
+            self.budget.showProvisional(pn, self.readCleanBudget(read), nowMs());
+        } else if (self.budget.showClean(budget)) |drop| {
             log.warn("shard 0: memory budget fell {d} -> {d} bytes, now set by node {?d} — new creates are refused once use passes the line", .{ drop.before, drop.after, drop.governing });
         }
         // Log the freeze once, when it starts or moves to a different node, not
@@ -6172,20 +6178,46 @@ pub const Shard = struct {
             return;
         }
 
-        // This node couldn't read its RAM: propose nothing (refuse-to-start is
-        // a later change), leaving the budget provisional rather than a 0 row.
-        if (self.self_ram_bytes == 0) return;
-        var kb: [1 + 4]u8 = undefined;
-        if (read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, self.cluster_node_id)) catch null) |row| {
-            if (row.v.ram_bytes == self.self_ram_bytes and row.v.reserve == self.self_reserve_bytes) return;
+        // This node's own row, when it is missing or its figures changed. A node
+        // that couldn't read its RAM proposes none (refuse-to-start is a later
+        // change), leaving the budget provisional rather than a 0 row — but the
+        // clean record below still holds the last good budget across a restart.
+        if (self.self_ram_bytes != 0) {
+            var kb: [1 + 4]u8 = undefined;
+            const current = (read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, self.cluster_node_id)) catch null);
+            const fresh = if (current) |row| !(row.v.ram_bytes == self.self_ram_bytes and row.v.reserve == self.self_reserve_bytes) else true;
+            if (fresh) {
+                var buf: [settings_machine.SetNodeMem.max_size]u8 = undefined;
+                const bytes = settings_machine.SetNodeMem.encodeInto(&buf, .{
+                    .node_id = self.cluster_node_id,
+                    .ram_bytes = self.self_ram_bytes,
+                    .reserve = self.self_reserve_bytes,
+                }) catch return;
+                self.budget_propose_pending = proposeOrNull(raft, .settings_node_mem, bytes);
+                return;
+            }
         }
-        var buf: [settings_machine.SetNodeMem.max_size]u8 = undefined;
-        const bytes = settings_machine.SetNodeMem.encodeInto(&buf, .{
-            .node_id = self.cluster_node_id,
-            .ram_bytes = self.self_ram_bytes,
-            .reserve = self.self_reserve_bytes,
+
+        // The rows are settled: record the clean budget if it has moved.
+        self.proposeCleanBudget(read);
+    }
+
+    /// Record the clean budget when it has changed, so a restart mid-freeze
+    /// recovers the held value. Only a clean (non-provisional) `Observation` is
+    /// written: a provisional spell holds the previous record. Runs after the
+    /// row proposals above, so it reflects settled rows; one entry per tick.
+    fn proposeCleanBudget(self: *Shard, read: contract_view.ReadView) void {
+        if (!self.budget.seen or self.budget.provisional_node != null) return;
+        const governing = self.budget.governing_node orelse 0;
+        if (self.readCleanBudget(read)) |rec| {
+            if (rec.budget_bytes == self.budget.budget_bytes and (rec.governing_node orelse 0) == governing) return;
+        }
+        var buf: [settings_machine.SetBudgetClean.max_size]u8 = undefined;
+        const bytes = settings_machine.SetBudgetClean.encodeInto(&buf, .{
+            .budget_bytes = self.budget.budget_bytes,
+            .governing_node = governing,
         }) catch return;
-        self.budget_propose_pending = proposeOrNull(raft, .settings_node_mem, bytes);
+        self.budget_propose_pending = proposeOrNull(self.raft_node, .settings_budget_clean, bytes);
     }
 
     /// Propose a settings entry; return its term and index to mark it in
@@ -6194,6 +6226,18 @@ pub const Shard = struct {
     fn proposeOrNull(raft: *RaftNode, etype: entry_mod.EntryType, bytes: []const u8) ?BudgetPropose {
         const r = raft.propose(etype, entry_mod.Flags.NONE, bytes) catch return null;
         return .{ .term = r.term, .index = r.index };
+    }
+
+    /// The committed clean-budget record, or null when none is written yet.
+    /// `governing_node` is decoded back to null from the 0 sentinel.
+    fn readCleanBudget(_: *Shard, read: contract_view.ReadView) ?memory_budget.Observation.Clean {
+        var kb: [1 + settings_machine.BUDGET_KEY.len]u8 = undefined;
+        const key = contract_view.key(&kb, "", settings_machine.BUDGET_KEY) catch return null;
+        const rec = (read.get(settings_machine.BudgetFam, key) catch null) orelse return null;
+        return .{
+            .budget_bytes = rec.v.budget_bytes,
+            .governing_node = if (rec.v.governing_node == 0) null else rec.v.governing_node,
+        };
     }
 
     /// A node-row whose id the applied membership no longer names, or null.
@@ -9098,8 +9142,10 @@ fn replaySegmentFile(
         // decisions — the ones the simulator also drives.
         replay.replayOneEntry(ctx, &seg_entry, out);
         // A halt restores the rest of the log but applies nothing more, so the
-        // loop goes on; damage stops it.
-        if (out.damage != null) return;
+        // loop goes on; damage or a resource block stops it. Reading on past a
+        // blocked entry would hit IndexGap on the next one and record a
+        // misleading index_hole alongside the block.
+        if (out.damage != null or out.blocked != null) return;
     }
 }
 
@@ -9320,6 +9366,138 @@ test "memory budget: the leader deletes a row whose node left the membership" {
     _ = shard.applyCommitted();
 
     try std.testing.expect((read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, 2)) catch null) == null); // and gone
+}
+
+test "memory budget: the leader records the clean budget once it has moved, and not again" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    try std.testing.expect(shard.raft_node.role == .leader);
+
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    var bk: [1 + settings_machine.BUDGET_KEY.len]u8 = undefined;
+    const bkey = try contract_view.key(&bk, "", settings_machine.BUDGET_KEY);
+
+    // The leader settles the genesis share and its own row, then records the
+    // clean budget; each proposal applies at once on a single node.
+    var guard: usize = 0;
+    while ((read.get(settings_machine.BudgetFam, bkey) catch null) == null and guard < 8) : (guard += 1) {
+        shard.proposeBudgetRows();
+        _ = shard.applyCommitted();
+    }
+    const rec = (read.get(settings_machine.BudgetFam, bkey) catch null) orelse return error.TestNoCleanRecord;
+    try std.testing.expect(shard.budget.seen);
+    try std.testing.expectEqual(shard.budget.budget_bytes, rec.v.budget_bytes); // the record is the derived budget
+    try std.testing.expectEqual(@as(u32, 1), rec.v.governing_node); // node 1 governs, and names itself
+
+    // Steady state: the record matches the budget, so nothing more is proposed.
+    const before = shard.raft_node.log.lastIndex();
+    shard.proposeBudgetRows();
+    try std.testing.expectEqual(before, shard.raft_node.log.lastIndex());
+}
+
+test "memory budget: a node that restarts mid-freeze shows the same budget as one that stayed up" {
+    // The window the review named: a clean budget is recorded (X), a clean
+    // change derives a new value (Y) the leader hasn't recorded yet, and then a
+    // join freezes the budget. A node that stayed up must not keep showing its
+    // in-memory Y while a restarted node — which only has the committed record —
+    // shows X. Both show the record, so the budget is a pure function of the log.
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const r = shard.raft_node;
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    var bk: [1 + settings_machine.BUDGET_KEY.len]u8 = undefined;
+    const bkey = try contract_view.key(&bk, "", settings_machine.BUDGET_KEY);
+
+    // Drive everything through the leader's own proposer with a controlled RAM.
+    const reserve: u64 = 100 * 1024 * 1024;
+    shard.self_reserve_bytes = reserve;
+    shard.self_ram_bytes = 2 * 1024 * 1024 * 1024; // R1
+    const x: u64 = (shard.self_ram_bytes - reserve) * 700 / 1000;
+
+    // Settle the share and node 1's row, and record the clean budget X.
+    var guard: usize = 0;
+    while ((read.get(settings_machine.BudgetFam, bkey) catch null) == null and guard < 8) : (guard += 1) {
+        shard.proposeBudgetRows();
+        _ = shard.applyCommitted();
+    }
+    const rec_x = (read.get(settings_machine.BudgetFam, bkey) catch null) orelse return error.TestNoCleanRecord;
+    try std.testing.expectEqual(x, rec_x.v.budget_bytes);
+
+    // A clean change: node 1's RAM grows to R2, so the budget derives Y. Propose
+    // just the row (one entry per call) and apply it — the leader has NOT recorded
+    // Y, so the committed record still says X.
+    shard.self_ram_bytes = 4 * 1024 * 1024 * 1024; // R2
+    const y: u64 = (shard.self_ram_bytes - reserve) * 700 / 1000;
+    shard.proposeBudgetRows();
+    _ = shard.applyCommitted();
+    try std.testing.expectEqual(y, shard.budget.budget_bytes); // the node that stays up derived Y
+    const rec_still = (read.get(settings_machine.BudgetFam, bkey) catch null) orelse return error.TestNoCleanRecord;
+    try std.testing.expectEqual(x, rec_still.v.budget_bytes); // record still X
+
+    // A join freezes the budget before Y is recorded.
+    r.applied_config = membership.Config.ofVoters(&.{ 1, 2 });
+    shard.refreshBudget();
+    const stayed_up = shard.budget.budget_bytes;
+    try std.testing.expectEqual(@as(?u32, 2), shard.budget.provisional_node);
+    try std.testing.expectEqual(x, stayed_up); // not the unrecorded Y
+    try std.testing.expect(stayed_up != y);
+
+    // A node restarting here boots from the same committed state: a fresh
+    // Observation, then the boot-time derive. It shows the record too.
+    shard.budget = .{};
+    shard.refreshBudgetOnBoot();
+    try std.testing.expectEqual(stayed_up, shard.budget.budget_bytes); // they agree across the restart
+    try std.testing.expectEqual(x, shard.budget.budget_bytes);
+    try std.testing.expectEqual(@as(?u32, 2), shard.budget.provisional_node);
+}
+
+test "memory budget: the leader records no clean budget while it is provisional" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const r = shard.raft_node;
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    var bk: [1 + settings_machine.BUDGET_KEY.len]u8 = undefined;
+    const bkey = try contract_view.key(&bk, "", settings_machine.BUDGET_KEY);
+
+    // Settle the share and node 1's row, but FREEZE before the clean budget is
+    // recorded: the first two proposer calls append the share and the row; the
+    // third would record the budget. Stop after two and freeze, so no record
+    // exists yet and the budget is derived clean (`seen`) but then shows 0.
+    shard.proposeBudgetRows(); // share
+    _ = shard.applyCommitted();
+    shard.proposeBudgetRows(); // node 1's row
+    _ = shard.applyCommitted();
+    try std.testing.expect(shard.budget.seen);
+    try std.testing.expect((read.get(settings_machine.BudgetFam, bkey) catch null) == null); // nothing recorded yet
+
+    // A join freezes the budget with no record to show: the shown value is 0.
+    r.applied_config = membership.Config.ofVoters(&.{ 1, 2 });
+    shard.refreshBudget();
+    try std.testing.expectEqual(@as(?u32, 2), shard.budget.provisional_node);
+    try std.testing.expectEqual(@as(u64, 0), shard.budget.budget_bytes);
+
+    // The provisional gate is what stops a record here: without it the leader
+    // would record {0, 0} off the held-at-0 budget. Nothing is proposed, and no
+    // record is written.
+    const before = r.log.lastIndex();
+    shard.proposeBudgetRows();
+    try std.testing.expectEqual(before, r.log.lastIndex());
+    try std.testing.expect((read.get(settings_machine.BudgetFam, bkey) catch null) == null);
 }
 
 test "settings: a pool share over 1000 per-mille is refused at apply, writing no row" {
@@ -22491,6 +22669,66 @@ test "a segment boot cannot read for a resource failure refuses the boot, and is
     try std.testing.expectError(error.BootReadBlocked, Shard.init(refusing.allocator(), 0, 4, t.pipe_fds[0], t.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{}, .{}));
     try std.testing.expect(refusing.refused > 0);
     // Once it reads, the log is whole: every enqueue is there.
+    var shard = try t.open();
+    defer shard.deinit();
+    try std.testing.expect(shard.offline == null);
+    try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES), DamageTest.queued(&shard));
+}
+
+/// The testing allocator, refusing the raft log's term-run array growth — the
+/// first allocation `RaftLog.append` makes while restoring an entry, so the
+/// restore hits OutOfMemory, a resource failure that must refuse the boot rather
+/// than drop the entry. A term-run growth always calls the allocator from the
+/// same `ensureTotalCapacity` (not inlined in a debug/test build), so its return
+/// address pins it exactly, with no fragile size or ordering guess; `record`
+/// captures that address from a probe growth of the same array type first.
+const RefuseTermRunAllocator = struct {
+    recorded_ra: usize = 0,
+    recording: bool = false,
+    refused: usize = 0,
+    fn allocator(self: *RefuseTermRunAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    /// Capture the return address of a growth of an `ArrayListUnmanaged(TermRun)`.
+    fn record(self: *RefuseTermRunAllocator) !void {
+        self.recording = true;
+        var probe: std.ArrayListUnmanaged(raft_log_mod.TermRun) = .empty;
+        defer probe.deinit(self.allocator());
+        try probe.append(self.allocator(), .{ .first_index = 1, .term = 1 });
+        self.recording = false;
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *RefuseTermRunAllocator = @ptrCast(@alignCast(ctx));
+        if (self.recording) self.recorded_ra = ra;
+        if (self.refused == 0 and !self.recording and ra == self.recorded_ra) {
+            self.refused += 1;
+            return null;
+        }
+        return std.testing.allocator.rawAlloc(len, a, ra);
+    }
+    fn resize(_: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        return std.testing.allocator.rawResize(m, a, n, ra);
+    }
+    fn remap(_: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        return std.testing.allocator.rawRemap(m, a, n, ra);
+    }
+    fn free(_: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        std.testing.allocator.rawFree(m, a, ra);
+    }
+};
+
+test "a boot that runs out of memory restoring an entry refuses the boot, and does not drop it" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var refusing: RefuseTermRunAllocator = .{};
+    try refusing.record();
+    try std.testing.expect(refusing.recorded_ra != 0);
+    // The restore's term-run allocation fails, so an entry cannot be appended to
+    // the raft log during replay: the boot is refused, not booted over a hole.
+    try std.testing.expectError(error.BootReadBlocked, Shard.init(refusing.allocator(), 0, 4, t.pipe_fds[0], t.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{}, .{}));
+    try std.testing.expect(refusing.refused > 0);
+    // A retry with memory free reads the whole log: the entry was not lost.
     var shard = try t.open();
     defer shard.deinit();
     try std.testing.expect(shard.offline == null);

@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 38;
+pub const CURRENT: u32 = 39;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -130,12 +130,15 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // (`stream.meta`, `stream.retention`), kept in snapshots; the log is
     // unchanged.
     .{ .format = 37, .segment_version = 25, .entries = 0x6f01d8b343532827 },
+    // The last non-provisional memory budget is logged (`settings_budget_clean`),
+    // so a replica restarted while the budget is frozen recovers the held value.
+    .{ .format = 38, .segment_version = 26, .entries = 0x2e7fd9793d6057d1 },
     // A step's call (`step_call`, its retry and clear, and the `call_reply`
     // and `call_done` that answer it) is one record for an action or a child
     // workflow (`step.calls`). A child's start goes to its workflow's shard
     // as `child_start`, kept there as the child's parent (`workflow.parents`)
     // until the child ends; a start that can't be made is `child_refuse`.
-    .{ .format = 38, .segment_version = 26, .entries = 0xce5f9e58c21aa217 },
+    .{ .format = 39, .segment_version = 27, .entries = 0xe1b18d5f8a4830c7 },
 };
 
 comptime {

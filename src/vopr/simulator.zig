@@ -1482,6 +1482,10 @@ pub const Simulator = struct {
             // Damage is a restore failure over a hole; the sim writes its durable
             // log in index order, so it never leaves one — a gap is a sim bug.
             if (out.damage != null) @panic("sim boot replay hit a durable-log gap");
+            // Blocked is a resource shortage restoring an entry (production refuses
+            // the boot to retry). The sim restores from an in-memory log that never
+            // runs short, so it is unreachable here.
+            if (out.blocked != null) @panic("sim boot replay hit a resource block");
             // The configs the log holds set the membership for routing, as
             // production's boot reads the latest config from the restored log.
             if (e.entry_type == @backingInt(entry_mod.EntryType.raft_config)) {

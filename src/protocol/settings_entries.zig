@@ -29,10 +29,20 @@ pub const DelNode = Record(&.{
     .{ .name = "node_id", .T = Int(u32) },
 });
 
+/// `settings_budget_clean`: the last non-provisional budget, committed so that
+/// a replica restarted while the budget is frozen (a data-holder unreported)
+/// reconstructs the same held value from the log instead of deriving 0.
+/// `governing_node` is the node whose share set it, or 0 for none (ids are ≥1).
+pub const BudgetClean = Record(&.{
+    .{ .name = "budget_bytes", .T = Int(u64) },
+    .{ .name = "governing_node", .T = Int(u32) },
+});
+
 pub const table = [_]entries.Entry{
     .{ .name = "settings.pool_share", .type_code = 0x90, .payload = Share, .max_payload = Share.max_size, .doc = "The memory-budget pool share, per-mille of each node's RAM after its reserve." },
     .{ .name = "settings.node_mem", .type_code = 0x91, .payload = NodeMem, .max_payload = NodeMem.max_size, .doc = "A node's reported RAM and reserve for the memory budget." },
     .{ .name = "settings.node_del", .type_code = 0x92, .payload = DelNode, .max_payload = DelNode.max_size, .doc = "A node's memory row removed when it leaves the membership." },
+    .{ .name = "settings.budget_clean", .type_code = 0x93, .payload = BudgetClean, .max_payload = BudgetClean.max_size, .doc = "The last non-provisional memory budget, so a restart mid-freeze recovers the held value." },
 };
 
 /// The payload schema of entry type `code`.
