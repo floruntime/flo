@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 37;
+pub const CURRENT: u32 = 38;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -130,6 +130,9 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // (`stream.meta`, `stream.retention`), kept in snapshots; the log is
     // unchanged.
     .{ .format = 37, .segment_version = 25, .entries = 0x6f01d8b343532827 },
+    // The last non-provisional memory budget is logged (`settings_budget_clean`),
+    // so a replica restarted while the budget is frozen recovers the held value.
+    .{ .format = 38, .segment_version = 26, .entries = 0x2e7fd9793d6057d1 },
 };
 
 comptime {

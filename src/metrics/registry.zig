@@ -491,7 +491,7 @@ pub const ReplicationMetrics = struct {
 /// reported its memory, so the budget is frozen until it does or is removed;
 /// the exposed `provisional_ms` grows with wall time until then.
 pub const MemoryBudgetMetrics = struct {
-    /// The budget shown now, held at its last clean value while provisional.
+    /// The budget shown now: the last committed record while provisional.
     budget_bytes: Atomic(u64) = Atomic(u64).init(0),
     /// The pool's use. Nothing is charged yet, so always 0.
     pool_use_bytes: Atomic(u64) = Atomic(u64).init(0),
@@ -1908,7 +1908,7 @@ fn writeReplicationMetrics(writer: anytype, snapshot: ReplicationMetrics.Snapsho
 }
 
 fn writeMemoryBudgetMetrics(writer: anytype, snapshot: MemoryBudgetMetrics.Snapshot, now_ms: u64) !void {
-    try writer.print("\n# HELP flo_memory_budget_bytes The node's per-node memory budget, held at its last clean value while provisional\n", .{});
+    try writer.print("\n# HELP flo_memory_budget_bytes The node's per-node memory budget, the last committed record while provisional\n", .{});
     try writer.print("# TYPE flo_memory_budget_bytes gauge\n", .{});
     try writer.print("flo_memory_budget_bytes {d}\n", .{snapshot.budget_bytes});
 

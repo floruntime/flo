@@ -42,11 +42,22 @@ pub const NodeMem = Record(&.{
     .{ .name = "reserve", .T = Int(u64) },
 });
 
+/// The last non-provisional budget, committed so a replica restarted while the
+/// budget is frozen reconstructs the held value from the log. One record, under
+/// `BUDGET_KEY`. `governing_node` is 0 for none (node ids are ≥ 1).
+pub const BudgetClean = Record(&.{
+    .{ .name = "budget_bytes", .T = Int(u64) },
+    .{ .name = "governing_node", .T = Int(u32) },
+});
+
 pub const PolicyFam = view_mod.Family(50, "settings.policy", .shard, Stored(Policy));
 pub const NodeFam = view_mod.Family(51, "settings.node", .shard, Stored(NodeMem));
+pub const BudgetFam = view_mod.Family(52, "settings.budget", .shard, Stored(BudgetClean));
 
 /// The single key the policy record lives under.
 pub const POLICY_KEY = "share";
+/// The single key the clean-budget record lives under.
+pub const BUDGET_KEY = "clean";
 
 // ─── Wire payloads (the entry values a proposer encodes) ───────────────────
 // The logged layouts live in `protocol/settings_entries.zig`, where they are
@@ -55,6 +66,7 @@ pub const POLICY_KEY = "share";
 pub const SetShare = settings_entries.Share;
 pub const SetNodeMem = settings_entries.NodeMem;
 pub const DelNode = settings_entries.DelNode;
+pub const SetBudgetClean = settings_entries.BudgetClean;
 
 // ─── Keys ──────────────────────────────────────────────────────────────────
 
@@ -67,6 +79,10 @@ pub fn nodeKey(buf: *[1 + 4]u8, id: u32) []const u8 {
 
 fn policyKey(buf: *[1 + POLICY_KEY.len]u8) []const u8 {
     return view_mod.key(buf, "", POLICY_KEY) catch unreachable;
+}
+
+fn budgetKey(buf: *[1 + BUDGET_KEY.len]u8) []const u8 {
+    return view_mod.key(buf, "", BUDGET_KEY) catch unreachable;
 }
 
 fn typeOf(e: *const Entry) EntryType {
@@ -90,6 +106,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             std.mem.writeInt(u32, &idb, p.node_id, .little);
             try out.add(NodeFam.ID, "", &idb);
         },
+        .settings_budget_clean => try out.add(BudgetFam.ID, "", BUDGET_KEY),
         else => {},
     }
 }
@@ -118,14 +135,19 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             var kb: [1 + 4]u8 = undefined;
             try view.delete(NodeFam, nodeKey(&kb, p.node_id));
         },
+        .settings_budget_clean => {
+            const p = SetBudgetClean.decodeAll(e.payload, &diag) catch return out.refuse(.bad_request, .malformed, BAD);
+            var kb: [1 + BUDGET_KEY.len]u8 = undefined;
+            try view.put(BudgetFam, budgetKey(&kb), .{ .v = .{ .budget_bytes = p.budget_bytes, .governing_node = p.governing_node } });
+        },
         else => {},
     }
 }
 
 pub const machine: machine_mod.Machine = .{
     .name = "settings",
-    .entry_types = &.{ .settings_pool_share, .settings_node_mem, .settings_node_del },
-    .families = &.{ machine_mod.info(PolicyFam), machine_mod.info(NodeFam) },
+    .entry_types = &.{ .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean },
+    .families = &.{ machine_mod.info(PolicyFam), machine_mod.info(NodeFam), machine_mod.info(BudgetFam) },
     .keys = keys,
     .apply = apply,
 };
