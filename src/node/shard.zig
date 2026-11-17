@@ -2007,6 +2007,10 @@ pub const Shard = struct {
 
     /// Remove connection, unregister from reactor, and close the fd.
     pub fn closeConnection(self: *Shard, fd: i32) void {
+        // Idempotent: with no live connection for this fd, this call does not own
+        // the number — closing it could hit a different client that has since
+        // reused it. A stale or duplicate close is then a no-op.
+        if (self.connections.get(fd) == null) return;
         log.debug("Shard {d} closing connection: fd={d}", .{ self.id, fd });
         if (self.connections.get(fd)) |conn| self.waiter_pool.removeByConnection(@intCast(self.id), fd, conn.id, null, @ptrCast(self));
         if (self.forward_count > 0) {
@@ -5290,6 +5294,7 @@ pub const Shard = struct {
             // Writable/interest arm drops this shard closed plus the reactor's
             // dropped multishot re-arms, as one back-pressure signal.
             sm.arm_failures.store(self.arm_failures + self.reactor.rearm_failures, .monotonic);
+            sm.stale_events_dropped.store(self.reactor.stale_events_dropped, .monotonic);
             sm.snapshot_skipped_leader_not_ready.store(self.snapshot_skips_leader_not_ready, .monotonic);
             sm.ts_points.store(self.ts_handler.ts.pointCount(), .monotonic);
             sm.ts_point_bytes.store(self.ts_handler.ts.pointBytes(), .monotonic);
@@ -9507,6 +9512,25 @@ test "Shard: a poll arm that keeps failing closes the connection instead of leav
         try std.testing.expect(conn.closing);
         try std.testing.expectEqual(@as(u64, 2), shard.arm_failures);
     } else return error.SkipZigTest;
+}
+
+test "Shard: closeConnection on an fd with no connection is a no-op, not a close of a possibly-reused fd" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{});
+    defer shard.deinit();
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[0]);
+    defer _ = std.c.close(pair[1]);
+
+    // No connection was ever registered for pair[0]; a stale or duplicate close
+    // must leave the fd alone (closing it could hit a client that reused the
+    // number). It stays open, so a write still succeeds.
+    shard.closeConnection(pair[0]);
+    try std.testing.expectEqual(@as(isize, 1), std.c.write(pair[0], "x", 1));
 }
 
 test "Shard: a node with a stale config takes a promoted voter's append and vote request, and drops only a write it would forward" {
