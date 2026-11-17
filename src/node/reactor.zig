@@ -168,6 +168,14 @@ pub const Reactor = struct {
     /// happening (and being caught).
     stale_events_dropped: u64 = 0,
 
+    /// Internal ops (poll_remove, poll_update) rejected for an unexpected reason.
+    /// Their CQEs carry INTERNAL_FLAG and are otherwise skipped, so a failing one
+    /// would be invisible — a miscoded poll_update hid here once. The expected
+    /// ends are excluded: -ECANCELED (a remove cancelling a live poll) and
+    /// -ENOENT (remove/update of a poll the kernel already ended). The owner
+    /// reads this for a metric; the first is logged at warn.
+    internal_op_failures: u64 = 0,
+
     /// Monotonic ms of the last deferred-re-arm log, so a burst under load logs
     /// at most once an interval rather than per fd.
     arm_log_ms: u64 = 0,
@@ -591,12 +599,15 @@ pub const Reactor = struct {
                 return e;
             }
         }
-        const flags = linux.IORING_POLL_UPDATE_EVENTS | linux.IORING_POLL_ADD_MULTI;
         var tries: u8 = 0;
         while (true) : (tries += 1) {
-            // Find the poll by `target` (fd + gen); its own CQE carries
-            // INTERNAL_FLAG so it is skipped. The user_data is unchanged.
-            if (self.ring.poll_update(target | INTERNAL_FLAG, target, target, mask, flags)) |_| {
+            // Find the poll by `target` (fd + gen) and change only its events.
+            // new_user_data MUST be 0 without IORING_POLL_UPDATE_USER_DATA: the
+            // kernel (7.0) rejects a nonzero one as -EINVAL, and that failure
+            // arrives as a CQE carrying INTERNAL_FLAG, so it is silently skipped
+            // — passing `target` here left the arm a no-op. The existing poll
+            // keeps its user_data and its multishot arming; only the mask moves.
+            if (self.ring.poll_update(target | INTERNAL_FLAG, target, 0, mask, linux.IORING_POLL_UPDATE_EVENTS)) |_| {
                 return;
             } else |err| {
                 if (tries + 1 >= ARM_TRIES) return err;
@@ -693,8 +704,22 @@ pub const Reactor = struct {
             // Skip timeout sentinel CQEs
             if (cqe.user_data == TIMEOUT_SENTINEL) continue;
 
-            // Skip internal CQEs (poll_update/poll_remove results)
-            if (cqe.user_data & INTERNAL_FLAG != 0) continue;
+            // Internal CQEs (poll_update/poll_remove results) carry no event, but
+            // a real failure must not vanish: count it and log the first, then
+            // skip it. Two negatives are expected, not failures: -ECANCELED (a
+            // remove that cancels a live poll) and -ENOENT (remove or update of a
+            // poll the kernel has already ended — a terminal CQE reaped next tick,
+            // a dropped poll still on the deferred list, or a given-up fd being
+            // closed). What is left is a rejected op, e.g. a bad SQE encoding.
+            if (cqe.user_data & INTERNAL_FLAG != 0) {
+                const expected = cqe.res == -@as(i32, @backingInt(linux.E.CANCELED)) or
+                    cqe.res == -@as(i32, @backingInt(linux.E.NOENT));
+                if (cqe.res < 0 and !expected) {
+                    self.internal_op_failures += 1;
+                    if (self.internal_op_failures == 1) log.warn("reactor: an internal poll op was rejected ({d}); a poll_remove or poll_update failed", .{cqe.res});
+                }
+                continue;
+            }
 
             const fd: i32 = @bitCast(@as(u32, @intCast(cqe.user_data & 0xFFFFFFFF)));
             const source = self.sources.getPtr(fd) orelse continue;
@@ -1379,4 +1404,71 @@ test "Reactor: kqueue drops a stale event whose generation no longer matches" {
     }
     // On Linux this falls through to a passing no-op (not a skip — the Linux
     // job asserts zero skips); the io_uring real-ring test covers that backend.
+}
+
+test "Reactor: armWritable arms POLLOUT on a live readable poll via poll_update (real ring)" {
+    // poll_update on our kernel (7.0) returns -EINVAL unless new_user_data is 0
+    // when the user_data is not being changed; its failure CQE carries
+    // INTERNAL_FLAG and is skipped, so a miscoded update was a silent no-op and
+    // armWritable never armed POLLOUT — a client whose send buffer filled got no
+    // writable wake and could stall. This drives a real ring to prove the update
+    // arms OUT and keeps the one multishot poll serving IN too.
+    if (is_linux) {
+        var pair: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+        defer {
+            _ = std.c.close(pair[0]);
+            _ = std.c.close(pair[1]);
+        }
+        var reactor = try Reactor.init(std.testing.allocator);
+        defer reactor.deinit();
+        try reactor.addSource(.{ .fd = pair[0], .tag = .client_read, .interests = .{ .readable = true } });
+        _ = try reactor.poll(0);
+
+        try reactor.armWritable(pair[0]);
+
+        // Socket is writable (empty send buffer), so a writable event fires.
+        var saw_writable = false;
+        for (try reactor.poll(100)) |ev| {
+            if (ev.fd == pair[0] and ev.writable) saw_writable = true;
+        }
+        try std.testing.expect(saw_writable);
+
+        // The same poll still reports readable (the update kept POLLIN).
+        _ = std.c.write(pair[1], "X", 1);
+        var saw_readable = false;
+        for (try reactor.poll(100)) |ev| {
+            if (ev.fd == pair[0] and ev.readable) saw_readable = true;
+        }
+        try std.testing.expect(saw_readable);
+    } else return error.SkipZigTest;
+}
+
+test "Reactor: a failed internal poll op is counted, but ECANCELED, ENOENT and success are not" {
+    if (is_linux) {
+        var reactor = try Reactor.init(std.testing.allocator);
+        defer reactor.deinit();
+        const iud: u64 = INTERNAL_FLAG | 0x5;
+
+        // A rejected internal op (poll_remove/poll_update) must not vanish.
+        reactor.cqe_buf[0] = .{ .user_data = iud, .res = -22, .flags = 0 };
+        _ = try reactor.iouringProcessCqes(0, 1);
+        try std.testing.expectEqual(@as(u64, 1), reactor.internal_op_failures);
+
+        // -ECANCELED is the expected end of a remove's target: not a failure.
+        reactor.cqe_buf[0] = .{ .user_data = iud, .res = -@as(i32, @backingInt(linux.E.CANCELED)), .flags = 0 };
+        _ = try reactor.iouringProcessCqes(0, 1);
+        try std.testing.expectEqual(@as(u64, 1), reactor.internal_op_failures);
+
+        // -ENOENT is the expected result of removing or updating a poll the
+        // kernel has already ended (a race, not a failure): not counted.
+        reactor.cqe_buf[0] = .{ .user_data = iud, .res = -@as(i32, @backingInt(linux.E.NOENT)), .flags = 0 };
+        _ = try reactor.iouringProcessCqes(0, 1);
+        try std.testing.expectEqual(@as(u64, 1), reactor.internal_op_failures);
+
+        // A successful internal op is not counted.
+        reactor.cqe_buf[0] = .{ .user_data = iud, .res = 0, .flags = 0 };
+        _ = try reactor.iouringProcessCqes(0, 1);
+        try std.testing.expectEqual(@as(u64, 1), reactor.internal_op_failures);
+    } else return error.SkipZigTest;
 }
