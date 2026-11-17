@@ -285,11 +285,13 @@ pub const ChildStart = Record(&.{
     .{ .name = "input", .T = Bytes(MAX_INPUT) },
 });
 
-/// A child the child's shard couldn't start (no such workflow, or no
-/// such version): its parent is told, and its record goes.
+/// A child the child's shard couldn't start, and the answer its parent
+/// gets: `no_action` for no such workflow or version, `conflict` for a run
+/// id another run already holds. Its record goes.
 pub const ChildRefuse = Record(&.{
     .{ .name = "ns", .T = NamespaceId },
     .{ .name = "run", .T = RunId },
+    .{ .name = "answer", .T = schema.Enum(Answer) },
 });
 
 /// A called run ended: sent to the caller's slot from the entry that

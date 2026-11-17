@@ -137,8 +137,14 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     switch (typeOf(e).?) {
         .child_start => {
             const p = ae.ChildStart.decodeAll(e.payload, &diag) catch return error.Halt;
-            // Sent once, so a second is another call's: the first stands.
-            if (found != null) return;
+            if (found) |f| {
+                // Sent again for the same call: the first stands. Another
+                // caller's start naming the same run (an id repeated across
+                // leaders) is answered so, and its step fails.
+                if (f.v.parent_slot == p.parent_slot and std.mem.eql(u8, f.v.parent_run, p.parent_run)) return;
+                const other: Parent.Value = .{ .parent_slot = p.parent_slot, .parent_run = p.parent_run, .parent_workflow = p.parent_workflow, .workflow = p.workflow, .version = p.version, .input = "", .state = .pending };
+                return reply(view, n.ns, n.run, other, .conflict);
+            }
             try view.put(Parents, k, .{ .v = .{
                 .parent_slot = p.parent_slot,
                 .parent_run = p.parent_run,
@@ -150,10 +156,11 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             } });
         },
         .child_refuse => {
+            const p = ae.ChildRefuse.decodeAll(e.payload, &diag) catch return error.Halt;
             // Refused by an earlier leader already, or started meanwhile.
             const f = found orelse return;
             if (f.v.state != .pending) return;
-            try reply(view, n.ns, n.run, f.v, .no_action);
+            try reply(view, n.ns, n.run, f.v, p.answer);
             try view.delete(Parents, k);
         },
         else => return error.Halt,

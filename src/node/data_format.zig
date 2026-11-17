@@ -138,7 +138,7 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // workflow (`step.calls`). A child's start goes to its workflow's shard
     // as `child_start`, kept there as the child's parent (`workflow.parents`)
     // until the child ends; a start that can't be made is `child_refuse`.
-    .{ .format = 39, .segment_version = 27, .entries = 0xe1b18d5f8a4830c7 },
+    .{ .format = 39, .segment_version = 27, .entries = 0x63d104871f8a2730 },
 };
 
 comptime {

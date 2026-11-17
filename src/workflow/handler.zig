@@ -2342,11 +2342,17 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(def_key);
         const def = self.definitions.get(def_key);
         const held = if (def) |d| p.version.len == 0 or std.mem.eql(u8, d.version_owned, p.version) else false;
-        if (!held) {
+        // A run already holding its id is another's: a start of ours, once
+        // applied, would have marked the record started. Proposing it would
+        // be refused, unobserved, for ever; the parent is told instead.
+        const run_key = self.nsKey(ns, run_id) orelse return error.OutOfMemory;
+        defer self.allocator.free(run_key);
+        const taken = self.runs.contains(run_key);
+        if (!held or taken) {
             // A refusal is told to the parent: not past its outbox's room.
             if (shard.sendWait(shard.router.slotToShard(p.parent_slot), ns) != null) return error.Overloaded;
             var buf: [ae.ChildRefuse.max_size]u8 = undefined;
-            const payload = try ae.ChildRefuse.encodeInto(&buf, .{ .ns = ns.int(), .run = run_id });
+            const payload = try ae.ChildRefuse.encodeInto(&buf, .{ .ns = ns.int(), .run = run_id, .answer = if (taken) .conflict else .no_action });
             return shard.raft_node.propose(.child_refuse, entry_mod.Flags.NONE, payload);
         }
         return self.proposeStart(shard, ns, run_id, p.workflow, if (p.version.len > 0) p.version else "latest", p.input, null, "child_started");
