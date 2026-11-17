@@ -1210,8 +1210,7 @@ pub const TestGroups = struct {
 
     pub fn deleteStream(self: *TestGroups, stream: []const u8, stamp_ns: u64) !void {
         try self.log.append(self.store.allocator, .{ .op = .{ .delete = .{ .stream = stream, .stamp = stamp_ns } } });
-        var nb: [stream_proj.MAX_NAME_KEY]u8 = undefined;
-        _ = self.stream.deleteStream(streamOf(.default, stream), stream_proj.nameKey(&nb, .default, stream).?);
+        _ = self.stream.deleteStream(streamOf(.default, stream));
         try self.observed(.stream_delete, stream, "", stamp_ns);
     }
 

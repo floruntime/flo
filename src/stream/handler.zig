@@ -47,6 +47,9 @@ const stream_ops = @import("../protocol/stream_ops.zig");
 const schema = @import("../protocol/schema.zig");
 const group_handler = @import("group_handler.zig");
 const group_machine = @import("group_machine.zig");
+const stream_machine = @import("machine.zig");
+const contract_machine = @import("../contract/machine.zig");
+const ReadView = @import("../contract/view.zig").ReadView;
 const group_entries = @import("../protocol/group_entries.zig");
 const GroupListResponse = table_run.op("stream.group.list").response;
 const GroupMembersResponse = table_run.op("stream.group.members").response;
@@ -338,7 +341,7 @@ pub const StreamHandler = struct {
     // ── Shard Walker: Local Scan ────────────────────────────────────────
 
     /// ShardWalker LocalScanFn for stream_list — the names of one
-    /// namespace's streams in one shard's StreamProjection.
+    /// namespace's streams on this shard (`stream.meta`).
     pub fn localScanStreams(
         ctx: *anyopaque,
         ns: dispatcher_mod.WalkNamespace,
@@ -346,10 +349,32 @@ pub const StreamHandler = struct {
         _: ?[]const u8,
         _: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
-        const stream: *StreamProjection = @ptrCast(@alignCast(ctx));
-        const name_buf = dispatcher_mod.scanScratch(stream.stream_names.count());
-        const count = stream.scanStreamNames(ns.id, name_buf);
+        const self: *StreamHandler = @ptrCast(@alignCast(ctx));
+        const prefix = ns.id.bytes();
+        var n: usize = 0;
+        var counting = self.readView().range(stream_machine.Metas, &prefix);
+        while (counting.next() catch null) |_| n += 1;
+        const name_buf = dispatcher_mod.scanScratch(n);
+        var count: usize = 0;
+        var it = self.readView().range(stream_machine.Metas, &prefix);
+        while (it.next() catch null) |item| {
+            if (count == name_buf.len) break;
+            name_buf[count] = item.value.v.name;
+            count += 1;
+        }
         return .{ .items = name_buf[0..count], .next_cursor = null };
+    }
+
+    /// `name`'s entry as a stream list shows it: its name, partition count
+    /// and retention, 0 for no limit; nothing for a stream that doesn't
+    /// exist.
+    pub fn writeListEntry(self: *const StreamHandler, ns: router.NamespaceId, name: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const m = stream_machine.metaOf(self.readView(), ns, name) orelse return;
+        try w.writeInt(u32, @intCast(name.len), .little);
+        try w.writeAll(name);
+        try w.writeInt(u32, m.partition_count, .little);
+        try w.writeInt(u64, m.retention_age_s, .little);
+        try w.writeInt(u64, m.retention_count, .little);
     }
 
     // ── Dispatch Wrappers ───────────────────────────────────────────────
@@ -572,8 +597,7 @@ pub const StreamHandler = struct {
             // Hash the partition key and map to a partition index
             const pk_bytes = opt.data;
             if (pk_bytes.len > 0) {
-                var qbuf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-                const pc = self.stream.getPartitionCount(nameKey(&qbuf, req) orelse return NAME_TOO_LONG);
+                const pc = stream_machine.partitionCount(self.readView(), req.ns_id, req.key);
                 partition_index = @intCast(std.hash.Wyhash.hash(0, pk_bytes) % pc);
             }
         }
@@ -606,9 +630,6 @@ pub const StreamHandler = struct {
             };
             return .{ .parked = proposed };
         }
-        // Named before anything is written: a stream that holds records but
-        // no name would be missing from lists and answer info "not found".
-        self.registerStreamName(req) catch return .{ .err = .{ .code = .internal_error, .message = "stream append not run (out of memory)" } };
         const stream_id = self.applyLocalStreamAppend(req, payload_value, partition_index) catch {
             return .{ .err = .{ .code = .internal_error, .message = "stream apply failed" } };
         };
@@ -622,12 +643,6 @@ pub const StreamHandler = struct {
         } };
     }
 
-    /// Register the stream's name key so it is listed and found.
-    fn registerStreamName(self: *StreamHandler, req: Request) error{OutOfMemory}!void {
-        var buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        try self.stream.registerStream(nameKey(&buf, req) orelse return);
-    }
-
     // ── READ ────────────────────────────────────────────────────────────
 
     fn handleRead(self: *StreamHandler, req: Request) CommandResult {
@@ -637,9 +652,8 @@ pub const StreamHandler = struct {
         // A stream that was never created (by create or a first append), or
         // was deleted. One that exists with nothing in the window answers
         // empty.
-        var name_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const name = nameKey(&name_buf, req) orelse return NAME_TOO_LONG;
-        if (!self.stream.stream_names.contains(name)) return .{ .err = .{ .code = .not_found, .message = NO_STREAM } };
+        if (req.key.len > ns_keys.MAX_QUALIFIED_KEY) return NAME_TOO_LONG;
+        if (self.metaOf(req) == null) return .{ .err = .{ .code = .not_found, .message = NO_STREAM } };
 
         var window = self.readWindow(req);
         var buf: [MAX_READ_BATCH]StreamRecord = undefined;
@@ -691,9 +705,7 @@ pub const StreamHandler = struct {
         } else if (req.findOption(.partition_key)) |opt| {
             const pk_bytes = opt.data;
             if (pk_bytes.len > 0) {
-                var qbuf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-                // handleCommand refused a name too long for a key.
-                const pc = if (nameKey(&qbuf, req)) |k| self.stream.getPartitionCount(k) else 1;
+                const pc = stream_machine.partitionCount(self.readView(), req.ns_id, req.key);
                 window.partition = @intCast(std.hash.Wyhash.hash(0, pk_bytes) % pc);
             }
         }
@@ -897,9 +909,10 @@ pub const StreamHandler = struct {
 
     // ── DELETE ──────────────────────────────────────────────────────────
 
-    /// Delete a stream entirely (records + metadata + name registry + metrics)
-    /// and its consumer groups, which belong to exactly one stream and would
-    /// otherwise outlive it. Idempotent: deleting a missing stream returns ok.
+    /// Delete a stream, logged: its records go with the entry's apply, its
+    /// `stream.meta` record and retention with the streams machine's, its
+    /// metrics series after apply, and its groups by their generation
+    /// moving on (`group_machine`). Deleting a missing stream is ok.
     /// Refuses a non-empty stream unless `force` (option 0x2C) is set.
     fn handleDelete(self: *StreamHandler, req: Request) CommandResult {
         if (req.key.len == 0) {
@@ -920,8 +933,9 @@ pub const StreamHandler = struct {
         if (!force and self.stream.streamRecordCount(key) > 0) {
             return .{ .err = .{ .code = .conflict, .message = NOT_EMPTY_MESSAGE } };
         }
-        var buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        _ = self.stream.deleteStream(key, nameKey(&buf, req) orelse return NAME_TOO_LONG);
+        if (req.key.len > ns_keys.MAX_QUALIFIED_KEY) return NAME_TOO_LONG;
+        _ = self.stream.deleteStream(key);
+        self.followLocal(.stream_delete, req.ns_id, req.key) catch return .{ .err = .{ .code = .internal_error, .message = "stream delete not applied" } };
         return .ok;
     }
 
@@ -929,19 +943,15 @@ pub const StreamHandler = struct {
 
     fn handleInfo(self: *StreamHandler, req: Request) CommandResult {
         const key = stream_mod.streamKey(req.ns_id, req.key);
-        var meta_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const meta_key = nameKey(&meta_buf, req) orelse return NAME_TOO_LONG;
+        if (req.key.len > ns_keys.MAX_QUALIFIED_KEY) return NAME_TOO_LONG;
         // An unknown stream is not an empty one.
-        if (!self.stream.stream_names.contains(meta_key)) return .{ .err = .{ .code = .not_found, .message = "stream not found" } };
-        const pc = self.stream.getPartitionCount(meta_key);
+        const meta = self.metaOf(req) orelse return .{ .err = .{ .code = .not_found, .message = NO_STREAM } };
 
         const first_id = self.stream.streamFirstId(key);
         const last_id = self.stream.streamLastId(key);
         // Logical records (batch contents), not append entries.
         const count = self.stream.streamLogicalCount(key);
         const bytes = self.stream.streamByteSize(key);
-
-        const meta = self.stream.stream_metadata.get(meta_key);
 
         return .{ .stream_info = .{
             .first_timestamp_ms = if (count > 0) first_id.timestamp_ms else 0,
@@ -950,10 +960,10 @@ pub const StreamHandler = struct {
             .last_seq = if (count > 0) last_id.sequence else 0,
             .count = count,
             .bytes = bytes,
-            .partition_count = pc,
-            .retention_age_s = if (meta) |m| m.retention_age_s else 0,
-            .retention_count = if (meta) |m| m.retention_count else 0,
-            .retention_bytes = if (meta) |m| m.retention_bytes else 0,
+            .partition_count = @max(1, meta.partition_count),
+            .retention_age_s = meta.retention_age_s,
+            .retention_count = meta.retention_count,
+            .retention_bytes = 0,
         } };
     }
 
@@ -997,25 +1007,24 @@ pub const StreamHandler = struct {
     /// them. The applier decides; the client is answered when it applies.
     fn proposeConfig(self: *StreamHandler, req: Request, config: StreamConfig) CommandResult {
         if (req.key.len > ns_keys.MAX_QUALIFIED_KEY) return NAME_TOO_LONG;
-        // An alter of a stream this shard has no settings for would be
-        // refused at apply: refused here, without the commit.
-        if (config.op == .alter) {
-            var key_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-            const key = nameKey(&key_buf, req) orelse return NAME_TOO_LONG;
-            if (!self.stream.stream_metadata.contains(key)) return .{ .err = .{ .code = .not_found, .message = NO_STREAM } };
-        }
+        // An alter of a stream that doesn't exist would be refused at
+        // apply: refused here, without the commit.
+        if (config.op == .alter and self.metaOf(req) == null) return .{ .err = .{ .code = .not_found, .message = NO_STREAM } };
         var value: [StreamConfig.SIZE]u8 = undefined;
         config.encode(&value);
         const sptr = self.shard_ptr orelse {
-            // Without a shard (unit tests), the applier runs here.
-            return switch (self.applyConfig(req.ns_id, req.key, config)) {
-                .ok => .ok,
-                .refused => |r| .{ .err = .{ .code = switch (r.status) {
-                    .not_found => .not_found,
-                    .conflict => .already_exists,
-                    else => .invalid_request,
-                }, .message = r.message } },
-            };
+            // Without a shard (unit tests), the machine applies it here.
+            var payload_buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
+            const entry = entry_mod.buildCommandEntry(.stream_config, entry_mod.Flags.NONE, 0, self.partition.committed_index + 1, 0, req.ns_id, req.key, &value, &payload_buf) orelse return NAME_TOO_LONG;
+            var out = Result.start(&entry);
+            contract_machine.applyEntry(&stream_machine.machine, &self.partition.store, &self.partition.apply_scratch, &entry, &out) catch
+                return .{ .err = .{ .code = .internal_error, .message = "the stream's settings were not applied" } };
+            const r = out.refused() orelse return .ok;
+            return .{ .err = .{ .code = switch (r.status) {
+                .not_found => .not_found,
+                .conflict => .already_exists,
+                else => .invalid_request,
+            }, .message = r.refusal.message } };
         };
         const proposed = persistence_mod.proposeEntry(shardFromPtr(sptr), .stream_config, entry_mod.Flags.NONE, req.namespace, req.key, &value) catch |err| {
             return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "the stream's settings were not persisted") } };
@@ -1023,73 +1032,26 @@ pub const StreamHandler = struct {
         return .{ .parked = proposed };
     }
 
-    const NO_STREAM = "stream not found";
+    const NO_STREAM = stream_machine.NO_STREAM;
 
-    /// A stream_config entry's value.
-    pub const StreamConfig = struct {
-        op: enum(u8) { create, alter },
-        /// 0 in an alter: kept.
-        partition_count: u32,
-        /// 0 in an alter: kept. In a create: none.
-        retention_age_s: u64,
-        retention_count: u64,
+    pub const StreamConfig = stream_machine.StreamConfig;
 
-        pub const SIZE = 1 + 4 + 8 + 8;
+    /// What this shard has applied of its streams' metadata.
+    fn readView(self: *const StreamHandler) ReadView {
+        return .{ .store = &self.partition.store };
+    }
 
-        fn encode(c: StreamConfig, out: *[SIZE]u8) void {
-            out[0] = @backingInt(c.op);
-            std.mem.writeInt(u32, out[1..5], c.partition_count, .little);
-            std.mem.writeInt(u64, out[5..13], c.retention_age_s, .little);
-            std.mem.writeInt(u64, out[13..21], c.retention_count, .little);
-        }
+    /// Without a shard (unit tests): what the streams machine follows of an
+    /// entry applied here, as the shard's apply runs it.
+    fn followLocal(self: *StreamHandler, etype: EntryType, ns: router.NamespaceId, name: []const u8) !void {
+        var payload_buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
+        const entry = entry_mod.buildCommandEntry(etype, entry_mod.Flags.NONE, 0, self.partition.committed_index + 1, 0, ns, name, "", &payload_buf) orelse return error.NameTooLong;
+        try contract_machine.observeEntry(&stream_machine.machine, &self.partition.store, &self.partition.apply_scratch, null, &entry);
+    }
 
-        fn decode(bytes: []const u8) ?StreamConfig {
-            if (bytes.len != SIZE or bytes[0] > 1) return null;
-            return .{
-                .op = @fromBackingInt(@intCast(bytes[0])),
-                .partition_count = std.mem.readInt(u32, bytes[1..5], .little),
-                .retention_age_s = std.mem.readInt(u64, bytes[5..13], .little),
-                .retention_count = std.mem.readInt(u64, bytes[13..21], .little),
-            };
-        }
-    };
-
-    const ConfigOutcome = union(enum) { ok, refused: struct { status: proto.StatusCode, message: []const u8 } };
-
-    /// What a stream_config applies, on every replica alike. A create of a
-    /// stream that has settings is answered ok if it asks for the same ones,
-    /// as a retry does, and refused if not: changing them is `alter`'s.
-    fn applyConfig(self: *StreamHandler, ns_id: router.NamespaceId, name: []const u8, c: StreamConfig) ConfigOutcome {
-        var key_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const key = stream_mod.nameKey(&key_buf, ns_id, name) orelse return .{ .refused = .{ .status = .bad_request, .message = "stream name too long" } };
-        const existing = self.stream.stream_metadata.get(key);
-        const meta: stream_mod.StreamMetadata = switch (c.op) {
-            .create => blk: {
-                const wanted: stream_mod.StreamMetadata = .{ .partition_count = c.partition_count, .retention_age_s = c.retention_age_s, .retention_count = c.retention_count };
-                if (existing) |e| {
-                    if (e.partition_count == wanted.partition_count and e.retention_age_s == wanted.retention_age_s and e.retention_count == wanted.retention_count) return .ok;
-                    return .{ .refused = .{ .status = .conflict, .message = "conflict: the stream exists with other settings; change them with stream alter" } };
-                }
-                break :blk wanted;
-            },
-            .alter => blk: {
-                const e = existing orelse return .{ .refused = .{ .status = .not_found, .message = NO_STREAM } };
-                break :blk .{
-                    .partition_count = e.partition_count,
-                    .retention_age_s = if (c.retention_age_s > 0) c.retention_age_s else e.retention_age_s,
-                    .retention_count = if (c.retention_count > 0) c.retention_count else e.retention_count,
-                };
-            },
-        };
-        // Validated: from here it changes state, or is out of memory.
-        self.stream.registerStream(key) catch return .{ .refused = .{ .status = .internal_error, .message = "out of memory" } };
-        self.stream.registerStreamMetadata(key, meta) catch return .{ .refused = .{ .status = .internal_error, .message = "out of memory" } };
-        // Metrics name the namespace; one the node's table doesn't have yet
-        // is registered by the stream's first read instead.
-        if (c.op == .create) if (self.metrics_registry) |mr| if (self.namespaceName(ns_id)) |namespace| {
-            _ = mr.registerStream(namespace, name, 0) catch {};
-        };
-        return .ok;
+    /// The request's stream, if it exists.
+    fn metaOf(self: *const StreamHandler, req: Request) ?stream_machine.Meta.Value {
+        return stream_machine.metaOf(self.readView(), req.ns_id, req.key);
     }
 
     /// Retention enforces age and count only; a byte bound would be stored
@@ -1564,6 +1526,7 @@ pub const StreamHandler = struct {
         _ = try self.partition.apply(&entry);
         var out = Result.start(&entry);
         replayEntry(@ptrCast(self), &entry, &out) catch return error.AppendNotApplied;
+        contract_machine.observeEntry(&stream_machine.machine, &self.partition.store, &self.partition.apply_scratch, null, &entry) catch return error.AppendNotApplied;
         const answer = appendedFrom(&out).stream_append_ok;
         return .{ .sequence = answer.sequence, .timestamp_ms = @intCast(answer.timestamp_ms) };
     }
@@ -1577,7 +1540,6 @@ pub const StreamHandler = struct {
         registry.register(.stream_append, @ptrCast(self), replayEntry);
         registry.register(.stream_trim, @ptrCast(self), replayEntry);
         registry.register(.stream_delete, @ptrCast(self), replayEntry);
-        registry.register(.stream_config, @ptrCast(self), replayEntry);
     }
 
     /// The stream applier: offset tracking, name registration, trims, deletes
@@ -1610,17 +1572,6 @@ pub const StreamHandler = struct {
                     log.err("stream '{s}': append at index {d} not applied: {s}", .{ cmd.key, entry.header.index, @errorName(err) });
                     return if (err == error.OutOfMemory) error.OutOfMemory else error.Halt;
                 };
-                // Listed under its namespace's id: `stream list` and `stream
-                // info` find it by the same key, on every replica and after
-                // a restart. A name too long for a key was refused before it
-                // was proposed.
-                var name_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-                if (stream_mod.nameKey(&name_buf, cmd.namespace_id, cmd.key)) |name_key| {
-                    self.stream.registerStream(name_key) catch |err| {
-                        log.err("stream '{s}': name not registered, so lists miss it: {s}", .{ cmd.key, @errorName(err) });
-                        return error.OutOfMemory;
-                    };
-                }
                 out.putInt(u64, id.sequence);
                 out.putInt(u64, id.timestamp_ms);
             },
@@ -1637,31 +1588,19 @@ pub const StreamHandler = struct {
                 out.putInt(u64, deleted);
                 out.putInt(u64, if (!first_id.eql(StreamID.MIN)) first_id.sequence else 0);
             },
-            .stream_config => {
-                const config = StreamConfig.decode(cmd.value) orelse return error.Halt;
-                switch (self.applyConfig(cmd.namespace_id, cmd.key, config)) {
-                    .ok => {},
-                    .refused => |r| {
-                        if (r.status == .internal_error) return error.OutOfMemory;
-                        out.refuse(r.status, if (r.status == .not_found) .not_found else .unclassified, r.message);
-                    },
-                }
-            },
             // Stream delete: key = the stream's name, in the entry's
             // namespace. Applied from the committed log everywhere, like
             // stream_trim.
             .stream_delete => {
                 if (cmd.key.len == 0) return error.Halt;
                 const key = stream_mod.streamKey(cmd.namespace_id, cmd.key);
-                var name_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-                const name_key = stream_mod.nameKey(&name_buf, cmd.namespace_id, cmd.key) orelse return error.Halt;
                 // In log order, so an append committed before the delete counts
                 // on every replica, whatever its proposer had applied.
                 if (entry.header.flags & entry_mod.Flags.FORCE == 0 and self.stream.streamRecordCount(key) > 0) {
                     out.refuse(.conflict, .unclassified, NOT_EMPTY_MESSAGE);
                     return;
                 }
-                _ = self.stream.deleteStream(key, name_key);
+                _ = self.stream.deleteStream(key);
             },
             else => return error.Halt,
         }
@@ -1869,15 +1808,22 @@ fn readPartitionCount(handler: *StreamHandler, stream: []const u8, partition_ind
     };
 }
 
+/// `e` applied as the shard applies it: the streams machine's own, or the
+/// handler's applier and then what the streams machine follows of it.
 fn applyLogged(h: *StreamHandler, e: *const entry_mod.Entry) persistence_mod.ApplyError!Result {
     var out = Result.start(e);
+    if (@as(EntryType, @fromBackingInt(@intCast(e.header.entry_type))) == .stream_config) {
+        try contract_machine.applyEntry(&stream_machine.machine, &h.partition.store, &h.partition.apply_scratch, e, &out);
+        return out;
+    }
     try StreamHandler.replayEntry(h, e, &out);
+    if (out.refused() == null) try contract_machine.observeAll(&.{stream_machine.machine}, &h.partition.store, &h.partition.apply_scratch, null, e);
     return out;
 }
 
-/// A stream's name key in the default namespace (id 1).
-fn defaultKey(comptime name: []const u8) []const u8 {
-    return "\x00\x00\x00\x01" ++ name;
+/// The stream `name` in the default namespace, as the handler reads it.
+fn metaFor(h: *const StreamHandler, name: []const u8) ?stream_machine.Meta.Value {
+    return stream_machine.metaOf(h.readView(), .default, name);
 }
 
 test "stream handler: a create of an existing stream is ok when it asks for the same settings, refused when not; an alter needs the stream" {
@@ -1909,7 +1855,7 @@ test "stream handler: a create of an existing stream is ok when it asks for the 
     var b2 = OptionsBuilder.init(&ob2);
     try b2.addU64(.retention_count, 9);
     try testing.expectEqual(CommandResult.ok, handler.handleCommand(makeRequest(.stream_alter, "c", "", b2.getOptions())));
-    const meta = handler.stream.stream_metadata.get(defaultKey("c")).?;
+    const meta = metaFor(&handler, "c").?;
     try testing.expectEqual(@as(u32, 4), meta.partition_count);
     try testing.expectEqual(@as(u64, 9), meta.retention_count);
 }
@@ -1929,7 +1875,7 @@ test "stream handler: stream_config entries give every replica a stream's settin
     const create = entry_mod.buildCommandEntry(.stream_config, entry_mod.Flags.NONE, 1, 1, 0, ns, "r", &value, &pbuf).?;
     var out = try applyLogged(&handler, &create);
     try testing.expect(out.refused() == null);
-    const meta = handler.stream.stream_metadata.get(defaultKey("r")).?;
+    const meta = metaFor(&handler, "r").?;
     try testing.expectEqual(@as(u32, 3), meta.partition_count);
     try testing.expectEqual(@as(u64, 60), meta.retention_age_s);
 
@@ -1940,7 +1886,7 @@ test "stream handler: stream_config entries give every replica a stream's settin
     const again = entry_mod.buildCommandEntry(.stream_config, entry_mod.Flags.NONE, 1, 2, 0, ns, "r", &value, &pbuf2).?;
     out = try applyLogged(&handler, &again);
     try testing.expectEqual(proto.StatusCode.conflict, out.refused().?.status);
-    try testing.expectEqual(@as(u32, 3), handler.stream.stream_metadata.get(defaultKey("r")).?.partition_count);
+    try testing.expectEqual(@as(u32, 3), metaFor(&handler, "r").?.partition_count);
 
     // An alter merges: what it names changes, the rest stays.
     (StreamHandler.StreamConfig{ .op = .alter, .partition_count = 0, .retention_age_s = 0, .retention_count = 7 }).encode(&value);
@@ -1948,7 +1894,7 @@ test "stream handler: stream_config entries give every replica a stream's settin
     const alter = entry_mod.buildCommandEntry(.stream_config, entry_mod.Flags.NONE, 1, 3, 0, ns, "r", &value, &pbuf3).?;
     out = try applyLogged(&handler, &alter);
     try testing.expect(out.refused() == null);
-    const merged = handler.stream.stream_metadata.get(defaultKey("r")).?;
+    const merged = metaFor(&handler, "r").?;
     try testing.expectEqual(@as(u32, 3), merged.partition_count);
     try testing.expectEqual(@as(u64, 60), merged.retention_age_s);
     try testing.expectEqual(@as(u64, 7), merged.retention_count);
@@ -2400,7 +2346,7 @@ test "stream handler: an append that runs out of memory fails, rather than apply
         handler.stream.reset();
         fa.fail_index = fa.alloc_index + fail_at;
         const outcome = applyLogged(&handler, &entry);
-        if (outcome) |_| try testing.expect(handler.stream.stream_names.contains(defaultKey("s1"))) else |err| try testing.expectEqual(error.OutOfMemory, err);
+        if (outcome) |_| try testing.expect((metaFor(&handler, "s1") != null)) else |err| try testing.expectEqual(error.OutOfMemory, err);
         if (!fa.has_induced_failure) {
             _ = try outcome;
             break;
@@ -2816,7 +2762,7 @@ test "stream handler: byte retention is refused, and a refused create registers 
         .err => |e| try testing.expectEqualStrings("stream retention by bytes is not supported; use retention_age or retention_count", e.message),
         else => return error.TestUnexpectedResult,
     }
-    try testing.expect(handler.stream.stream_metadata.get(defaultKey("sized")) == null);
+    try testing.expect(metaFor(&handler, "sized") == null);
 
     _ = handler.handleCommand(makeRequest(.stream_create, "sized", "", ""));
     switch (handler.handleCommand(makeRequest(.stream_alter, "sized", "", b.getOptions()))) {
@@ -2854,4 +2800,38 @@ test "stream handler: a stream name is refused when empty, holding a NUL, or too
     try testing.expectEqualStrings("stream name too long", StreamHandler.nameRefusal(.stream_append, makeRequest(.stream_append, &long, "", "")).?);
     try testing.expect(StreamHandler.nameRefusal(.stream_append, makeRequest(.stream_append, long[0..ns_keys.MAX_QUALIFIED_KEY], "", "")) == null);
     try testing.expect(StreamHandler.nameRefusal(.stream_list, makeRequest(.stream_list, "a\x00b", "", "")) == null);
+}
+
+test "stream handler: a stream's existence and settings live in the contract's state, so rebuilding the stream projection from nothing keeps a created stream with no records and its retention" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    var ob: [32]u8 = undefined;
+    var b = OptionsBuilder.init(&ob);
+    try b.addU64(.retention_count, 3);
+    var pc: [4]u8 = undefined;
+    std.mem.writeInt(u32, &pc, 2, .little);
+    try testing.expectEqual(CommandResult.ok, handler.handleCommand(makeRequest(.stream_create, "empty", &pc, b.getOptions())));
+    // What a snapshot encodes is the contract's families: the stream is in them.
+    try testing.expect(partition.store.family(stream_machine.Metas.ID).count == 1);
+    try testing.expect(partition.store.family(stream_machine.Retained.ID).count == 1);
+
+    // The projection rebuilt from nothing, as from a snapshot with no log
+    // to replay: the stream still exists, empty, with its settings.
+    handler.stream.reset();
+    switch (handler.handleCommand(makeRequest(.stream_info, "empty", "", ""))) {
+        .stream_info => |i| {
+            try testing.expectEqual(@as(u64, 0), i.count);
+            try testing.expectEqual(@as(u32, 2), i.partition_count);
+            try testing.expectEqual(@as(u64, 3), i.retention_count);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const names = StreamHandler.localScanStreams(@ptrCast(&handler), .{ .id = .default, .name = "default" }, "", null, 10);
+    try testing.expectEqual(@as(usize, 1), names.items.len);
+    try testing.expectEqualStrings("empty", names.items[0]);
 }

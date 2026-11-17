@@ -5,7 +5,9 @@
 //! held-bytes record. The machine reads its streams through the real
 //! `Streams` reader; stream appends, trims and deletes apply to the real
 //! projection, and trims and deletes reach the machine through its
-//! observer, as the stream applier hands them on.
+//! observer, as the stream applier hands them on. Appends and deletes
+//! reach the streams machine (`stream/machine.zig`) the same way, in the
+//! shard's order, so a stream's metadata is checked beside its groups.
 //!
 //! The oracle is a ledger of its own: each group's records (state, holder,
 //! token, counts, error length), its settings, cursor and counters, and
@@ -31,6 +33,7 @@ const schema = @import("../protocol/schema.zig");
 const ge = @import("../protocol/group_entries.zig");
 const ae = @import("../protocol/action_entries.zig");
 const gm = @import("../stream/group_machine.zig");
+const sm = @import("../stream/machine.zig");
 const qm = @import("../queue/machine.zig");
 const stream_proj = @import("../projection/stream.zig");
 const streams_mod = @import("../contract/streams.zig");
@@ -57,8 +60,8 @@ pub const STREAMS = [_][]const u8{ "s0", "s1" };
 pub const GROUPS = [_][]const u8{ "g0", "g1", "g2" };
 
 /// The group machine's families, as the checksum walks them.
-pub const FAMILIES = [_]u16{ gm.Metas.ID, gm.Items.ID, gm.Dead.ID, gm.Ready.ID, gm.Deadlines.ID, gm.Streams_.ID };
-pub const NAMES = [_][]const u8{ "group.meta", "group.item", "group.dead", "group.ready", "group.deadline", "group.stream", "stream.index" };
+pub const FAMILIES = [_]u16{ gm.Metas.ID, gm.Items.ID, gm.Dead.ID, gm.Ready.ID, gm.Deadlines.ID, gm.Streams_.ID, sm.Metas.ID, sm.Retained.ID };
+pub const NAMES = [_][]const u8{ "group.meta", "group.item", "group.dead", "group.ready", "group.deadline", "group.stream", "stream.meta", "stream.retention", "stream.index" };
 /// The families' checksums, then the stream projection's.
 pub const SUMS = FAMILIES.len + 1;
 
@@ -390,7 +393,10 @@ pub const ConsumerGroups = struct {
         const kind = kindOf(e.header.entry_type);
         var effect: Effect = .{ .kind = kind, .refused = false };
         switch (kind) {
-            .append, .trim, .stream_delete => try self.applyStream(store, e, kind, r),
+            .append, .trim, .stream_delete => {
+                try self.applyStream(store, e, kind, r);
+                effect.broke = self.streamRule(store);
+            },
             else => {
                 // What the ledger says the answer must be, worked out before
                 // the machine runs, from the ledger and the stream alone.
@@ -491,6 +497,7 @@ pub const ConsumerGroups = struct {
                 if (cmd.value.len != 4) return error.Halt;
                 const n = std.mem.readInt(u32, cmd.value[0..4], .big);
                 _ = self.stream.appendToStreamAt(gm.streamOf(NS, STREAMS[s]), e.header.index, 0, 0, e.header.timestamp_ns / std.time.ns_per_ms, n, n * RECORD_BYTES) catch return error.Halt;
+                if (r.mutant != .stream_append_unrecorded) try machine_mod.observeEntry(&sm.machine, store, &self.scratch, self.streams(), e);
             },
             .trim => {
                 if (cmd.key.len != 16 or cmd.value.len != 8) return error.Halt;
@@ -509,9 +516,10 @@ pub const ConsumerGroups = struct {
             },
             else => {
                 const s = streamIndex(cmd.key) orelse return error.Halt;
-                var nb: [stream_proj.MAX_NAME_KEY]u8 = undefined;
-                _ = self.stream.deleteStream(gm.streamOf(NS, STREAMS[s]), stream_proj.nameKey(&nb, NS, STREAMS[s]).?);
+                _ = self.stream.deleteStream(gm.streamOf(NS, STREAMS[s]));
+                // Both followers of a delete, in the shard's order.
                 try machine_mod.observeEntry(&gm.machine, store, &self.scratch, self.streams(), e);
+                try machine_mod.observeEntry(&sm.machine, store, &self.scratch, self.streams(), e);
                 // Its groups are of the old generation now: gone.
                 if (self.ledger.streams[s]) |*st| {
                     st.gen += 1;
@@ -1326,6 +1334,19 @@ pub const ConsumerGroups = struct {
                 while (it.next() catch null) |_| n += 1;
                 if (n != grp.items.count()) return "a group holds a record the ledger doesn't";
             }
+        }
+        return null;
+    }
+
+    /// A stream exists, as the streams machine keeps it, exactly while the
+    /// projection holds it: an append made it, and only a delete ends it.
+    fn streamRule(self: *ConsumerGroups, store: *Store) ?[]const u8 {
+        const rv: view_mod.ReadView = .{ .store = store };
+        for (STREAMS) |name| {
+            const held = self.stream.streams.contains(gm.streamOf(NS, name));
+            const recorded = sm.metaOf(rv, NS, name) != null;
+            if (held and !recorded) return "a stream with records has no stream.meta record";
+            if (!held and recorded) return "a deleted stream keeps its stream.meta record";
         }
         return null;
     }

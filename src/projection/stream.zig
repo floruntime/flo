@@ -593,22 +593,6 @@ pub const StreamState = struct {
     }
 };
 
-/// Stream metadata — partition count, retention policy, and other per-stream config.
-pub const StreamMetadata = struct {
-    partition_count: u32 = 1,
-    /// Retention: max age in seconds (0 = forever).
-    retention_age_s: u64 = 0,
-    /// Retention: max record count (0 = unlimited).
-    retention_count: u64 = 0,
-    /// Retention: max bytes (0 = unlimited).
-    retention_bytes: u64 = 0,
-
-    /// Returns true if any retention policy is configured.
-    pub fn hasRetention(self: StreamMetadata) bool {
-        return self.retention_age_s > 0 or self.retention_count > 0 or self.retention_bytes > 0;
-    }
-};
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Stream Projection
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -616,11 +600,8 @@ pub const StreamMetadata = struct {
 pub const StreamProjection = struct {
     allocator: Allocator,
 
-    /// Registered streams, by `nameKey` (for listing).
-    stream_names: std.StringHashMap(void),
-
-    /// Stream metadata (partition count, etc.), by `nameKey`.
-    stream_metadata: std.StringHashMap(StreamMetadata),
+    // Which streams exist, their names and settings: the streams machine's
+    // (`stream/machine.zig`), not this.
 
     /// Per-stream state — each stream has its own StreamID space.
     streams: std.AutoHashMap(StreamKey, StreamState),
@@ -642,8 +623,6 @@ pub const StreamProjection = struct {
     pub fn init(allocator: Allocator) StreamProjection {
         return .{
             .allocator = allocator,
-            .stream_names = std.StringHashMap(void).init(allocator),
-            .stream_metadata = std.StringHashMap(StreamMetadata).init(allocator),
             .streams = std.AutoHashMap(StreamKey, StreamState).init(allocator),
             .stats = .{},
         };
@@ -656,18 +635,6 @@ pub const StreamProjection = struct {
             kv.value_ptr.deinit(self.allocator);
         }
         self.streams.deinit();
-        // Free stream name keys
-        var nit = self.stream_names.keyIterator();
-        while (nit.next()) |key| {
-            self.allocator.free(@constCast(key.*));
-        }
-        self.stream_names.deinit();
-        // Free stream metadata keys
-        var mit = self.stream_metadata.keyIterator();
-        while (mit.next()) |key| {
-            self.allocator.free(@constCast(key.*));
-        }
-        self.stream_metadata.deinit();
     }
 
     /// Reset the stream projection to empty state.
@@ -679,18 +646,6 @@ pub const StreamProjection = struct {
             kv.value_ptr.deinit(self.allocator);
         }
         self.streams.clearAndFree();
-        // Free stream name keys
-        var nit = self.stream_names.keyIterator();
-        while (nit.next()) |key| {
-            self.allocator.free(@constCast(key.*));
-        }
-        self.stream_names.clearAndFree();
-        // Free stream metadata keys
-        var mit = self.stream_metadata.keyIterator();
-        while (mit.next()) |key| {
-            self.allocator.free(@constCast(key.*));
-        }
-        self.stream_metadata.clearAndFree();
         self.stats = .{};
     }
 
@@ -839,83 +794,12 @@ pub const StreamProjection = struct {
         return cut;
     }
 
-    /// Delete a stream entirely: drop its records (by `key`) plus its name
-    /// registry and metadata entries (by `name_key`, its `nameKey`). Mirror
-    /// of `registerStream` / `trimStream`. Returns true if the stream existed.
-    pub fn deleteStream(self: *StreamProjection, key: StreamKey, name_key: []const u8) bool {
-        var existed = false;
-        if (self.streams.fetchRemove(key)) |kv| {
-            var ss = kv.value;
-            ss.deinit(self.allocator);
-            existed = true;
-        }
-        if (self.stream_names.fetchRemove(name_key)) |kv| {
-            self.allocator.free(@constCast(kv.key));
-            existed = true;
-        }
-        if (self.stream_metadata.fetchRemove(name_key)) |kv| {
-            self.allocator.free(@constCast(kv.key));
-            existed = true;
-        }
-
-        return existed;
-    }
-
-    // ─── Stream Name Registry ──────────────────────────────────────────────
-
-    /// Register a stream by its `nameKey`. No-op if already registered.
-    pub fn registerStream(self: *StreamProjection, name: []const u8) !void {
-        if (name.len == 0) return;
-        const gop = try self.stream_names.getOrPut(name);
-        if (!gop.found_existing) {
-            // The new slot's key is the caller's slice until the copy lands.
-            errdefer self.stream_names.removeByPtr(gop.key_ptr);
-            gop.key_ptr.* = try self.allocator.dupe(u8, name);
-        }
-    }
-
-    /// Register (or update) metadata for a stream.
-    pub fn registerStreamMetadata(self: *StreamProjection, name: []const u8, meta: StreamMetadata) !void {
-        if (name.len == 0) return;
-        const gop = try self.stream_metadata.getOrPut(name);
-        if (!gop.found_existing) {
-            // The new slot's key is the caller's slice until the copy lands.
-            errdefer self.stream_metadata.removeByPtr(gop.key_ptr);
-            gop.key_ptr.* = try self.allocator.dupe(u8, name);
-        }
-        gop.value_ptr.* = .{
-            .partition_count = @max(1, meta.partition_count),
-            .retention_age_s = meta.retention_age_s,
-            .retention_count = meta.retention_count,
-            .retention_bytes = meta.retention_bytes,
-        };
-    }
-
-    /// Get the partition count for a stream (defaults to 1).
-    pub fn getPartitionCount(self: *const StreamProjection, name: []const u8) u32 {
-        if (self.stream_metadata.get(name)) |meta| return meta.partition_count;
-        return 1;
-    }
-
-    /// Namespace `ns`'s stream names into a buffer, past the id that leads
-    /// their keys. Returns the count written. Borrowed from the map (valid
-    /// until it changes).
-    pub fn scanStreamNames(self: *const StreamProjection, ns: NamespaceId, buf: [][]const u8) usize {
-        const prefix = ns.bytes();
-        var count: usize = 0;
-        var it = self.stream_names.keyIterator();
-        while (it.next()) |key| {
-            if (count >= buf.len) break;
-            if (!std.mem.startsWith(u8, key.*, &prefix)) continue;
-            buf[count] = key.*[prefix.len..];
-            count += 1;
-        }
-        return count;
-    }
-
-    /// Number of registered stream names.
-    pub fn streamCount(self: *const StreamProjection) usize {
-        return self.stream_names.count();
+    /// Delete a stream's records. Returns true if it held any state.
+    pub fn deleteStream(self: *StreamProjection, key: StreamKey) bool {
+        const kv = self.streams.fetchRemove(key) orelse return false;
+        var ss = kv.value;
+        ss.deinit(self.allocator);
+        return true;
     }
 
     pub fn memoryUsage(self: *const StreamProjection) usize {
@@ -925,12 +809,6 @@ pub const StreamProjection = struct {
         var sit = self.streams.iterator();
         while (sit.next()) |kv| {
             mem += kv.value_ptr.records.items.len * @sizeOf(StreamRecord);
-        }
-
-        // Stream names
-        var nit = self.stream_names.keyIterator();
-        while (nit.next()) |key| {
-            mem += key.len;
         }
 
         return mem;
@@ -967,22 +845,9 @@ test "stream: same-named streams in two namespaces share no state, even when the
     try testing.expectEqual(@as(u64, 3), s.streamLogicalCount(a));
     try testing.expectEqual(@as(u64, 1), s.streamLogicalCount(b));
 
-    // The same stream name in both: two names.
-    var na: [MAX_NAME_KEY]u8 = undefined;
-    var nb: [MAX_NAME_KEY]u8 = undefined;
-    try s.registerStream(nameKey(&na, one, "orders").?);
-    try s.registerStream(nameKey(&nb, two, "orders").?);
-
-    // Each namespace lists its own name, past the id.
-    var names: [4][]const u8 = undefined;
-    try testing.expectEqual(@as(usize, 1), s.scanStreamNames(one, &names));
-    try testing.expectEqualStrings("orders", names[0]);
-    try testing.expectEqual(@as(usize, 0), s.scanStreamNames(.default, &names));
-
-    // Deleting one namespace's stream leaves the other's records and name.
-    try testing.expect(s.deleteStream(a, nameKey(&na, one, "orders").?));
+    // Deleting one namespace's stream leaves the other's records.
+    try testing.expect(s.deleteStream(a));
     try testing.expectEqual(@as(u64, 1), s.streamLogicalCount(b));
-    try testing.expect(s.stream_names.contains(nameKey(&nb, two, "orders").?));
 }
 
 test "stream: stats tracking" {

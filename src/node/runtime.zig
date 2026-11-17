@@ -1143,7 +1143,7 @@ pub const Runtime = struct {
         for (shards) |*s| {
             s.dispatcher.setWalkContext(.ts_list, @ptrCast(&s.defaultPartition().ts));
             s.dispatcher.setWalkContext(.kv_scan, @ptrCast(&s.defaultPartition().kv));
-            s.dispatcher.setWalkContext(.stream_list, @ptrCast(&s.defaultPartition().stream));
+            s.dispatcher.setWalkContext(.stream_list, @ptrCast(s.stream_handler));
             s.dispatcher.setWalkContext(.action_list, @ptrCast(s));
             s.dispatcher.setWalkContext(.queue_list, @ptrCast(s.queue_handler));
             s.dispatcher.setWalkContext(.processing_list, @ptrCast(s.processing_handler));

@@ -444,3 +444,78 @@ test "contract: a view reads an entry's last write to a key, and commits only th
         }
     }
 }
+
+// ── Several observers of one entry type ──────────────────────────────────
+
+const Seen = view_mod.Family(2, "test.seen", .shard, Count);
+const Echo = view_mod.Family(3, "test.echo", .shard, Count);
+const SEEN_KEY = "\x00seen";
+const ECHO_KEY = "\x00echo";
+
+/// Two observers of `stream_delete`: the first counts them; the second,
+/// after it in the list, copies the count it reads, so it shows the first
+/// ran before it. A third writes the first's family, which it doesn't own.
+const Observers = struct {
+    fn none(_: *const Entry, _: *view_mod.KeySet) error{OutOfMemory}!void {}
+    fn apply(_: *View, _: *const Entry, _: *persistence.Result) persistence.ApplyError!void {}
+    fn seenKeys(_: *const Entry, out: *view_mod.KeySet) error{OutOfMemory}!void {
+        try out.add(Seen.ID, "", SEEN_KEY[1..]);
+    }
+    fn seen(view: *View, _: *const Entry) persistence.ApplyError!void {
+        const n = if (try view.get(Seen, SEEN_KEY)) |c| c.n else 0;
+        try view.put(Seen, SEEN_KEY, .{ .n = n + 1 });
+    }
+    fn echoKeys(_: *const Entry, out: *view_mod.KeySet) error{OutOfMemory}!void {
+        try out.add(Seen.ID, "", SEEN_KEY[1..]);
+        try out.add(Echo.ID, "", ECHO_KEY[1..]);
+    }
+    fn echo(view: *View, _: *const Entry) persistence.ApplyError!void {
+        const n = if (try view.get(Seen, SEEN_KEY)) |c| c.n else 0;
+        try view.put(Echo, ECHO_KEY, .{ .n = n });
+    }
+    fn trespass(view: *View, _: *const Entry) persistence.ApplyError!void {
+        try view.put(Seen, SEEN_KEY, .{ .n = 99 });
+    }
+
+    const first: machine_mod.Machine = .{ .name = "first", .entry_types = &.{}, .families = &.{machine_mod.info(Seen)}, .keys = none, .apply = apply, .observes = &.{.stream_delete}, .observe_keys = seenKeys, .observe = seen };
+    const second: machine_mod.Machine = .{ .name = "second", .entry_types = &.{}, .families = &.{machine_mod.info(Echo)}, .keys = none, .apply = apply, .observes = &.{.stream_delete}, .observe_keys = echoKeys, .observe = echo };
+    const intruder: machine_mod.Machine = .{ .name = "intruder", .entry_types = &.{}, .families = &.{machine_mod.info(Echo)}, .keys = none, .apply = apply, .observes = &.{.stream_delete}, .observe_keys = seenKeys, .observe = trespass };
+    const list = [_]machine_mod.Machine{ first, second };
+};
+
+fn countOf(store: *Store, comptime F: type, k: []const u8) ?u64 {
+    const bytes = store.get(F.ID, k) orelse return null;
+    return (Count.decode(bytes) catch unreachable).n;
+}
+
+test "observers: every machine that follows a type runs, in list order, and a replay of the same entries holds the same state" {
+    comptime machine_mod.check(&Observers.list);
+    var stores: [2]Store = .{ Store.init(testing.allocator), Store.init(testing.allocator) };
+    defer for (&stores) |*s| s.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    for (&stores) |*store| for (1..4) |i| {
+        const e = entry_mod.buildEntry(.stream_delete, entry_mod.Flags.NONE, 1, i, i, "");
+        try machine_mod.observeAll(&Observers.list, store, &scratch, null, &e);
+    };
+    for (&stores) |*store| {
+        try testing.expectEqual(@as(?u64, 3), countOf(store, Seen, SEEN_KEY));
+        // The second read the first's count after the first wrote it.
+        try testing.expectEqual(@as(?u64, 3), countOf(store, Echo, ECHO_KEY));
+    }
+    for ([_]u16{ Seen.ID, Echo.ID }) |fam| try testing.expectEqual(store_mod.checksum(&stores[0], fam), store_mod.checksum(&stores[1], fam));
+    // An entry no machine follows changes nothing.
+    const other = entry_mod.buildEntry(.stream_trim, entry_mod.Flags.NONE, 1, 9, 9, "");
+    try machine_mod.observeAll(&Observers.list, &stores[0], &scratch, null, &other);
+    try testing.expectEqual(@as(?u64, 3), countOf(&stores[0], Seen, SEEN_KEY));
+}
+
+test "observers: one that writes a family it doesn't own halts, and writes nothing" {
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    const e = entry_mod.buildEntry(.stream_delete, entry_mod.Flags.NONE, 1, 1, 1, "");
+    try testing.expectError(error.Halt, machine_mod.observeEntry(&Observers.intruder, &store, &scratch, null, &e));
+    try testing.expect(countOf(&store, Seen, SEEN_KEY) == null);
+}

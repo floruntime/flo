@@ -2229,19 +2229,21 @@ test "e2e/stream: alter non-existent stream returns error" {
     try testing.expect(result.stderrContains("stream not found"));
 }
 
-test "e2e/stream: alter auto-created stream (via append) returns error" {
+test "e2e/stream: alter gives a stream its first append made a retention, and info shows it" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Auto-create via append — no explicit create, so no stream_metadata entry
+    // No create: the append makes the stream.
     try ctx.exec(&.{ "stream", "append", "auto-alter-test", "msg" });
 
-    // Alter should fail because auto-create via append doesn't register metadata
     var result = try ctx.cli.run(&.{ "stream", "alter", "auto-alter-test", "--retention", "24" });
     defer result.deinit();
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
 
-    try testing.expectEqual(@as(u8, 1), result.exit_code);
-    try testing.expect(result.stderrContains("stream not found"));
+    var info = try ctx.cli.run(&.{ "stream", "info", "auto-alter-test", "-o", "json" });
+    defer info.deinit();
+    try testing.expectEqual(@as(u8, 0), info.exit_code);
+    try testing.expect(info.stdoutContains("\"age_s\":86400"));
 }
 
 test "e2e/stream: alter updates retention (create then alter then verify)" {
