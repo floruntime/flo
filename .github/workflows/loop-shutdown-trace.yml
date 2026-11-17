@@ -25,22 +25,23 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with: { version: "${{ env.ZIG_VERSION }}" }
       - run: mkdir -p src/node/dashboard/dist && touch src/node/dashboard/dist/.keep
-      - name: Build the e2e test binary once
-        run: zig build test-e2e -Dtest-filter="__warm_build_only__" --test-timeout 60s 2>&1 | tail -3 || true
-      - name: Loop the shutdown test 50x, capturing both traces on a stall
+      - name: Build the e2e binary (filtered to the shutdown test) and flo
+        run: zig build test-e2e -Dtest-filter="SIGTERM under load" --test-timeout 120s 2>&1 | tail -3
+      - name: Loop the compiled binary 50x (defeats zig run-step caching)
         run: |
           set +e
+          BIN=$(ls -t .zig-cache/o/*/test 2>/dev/null | head -1)
+          echo "e2e binary: $BIN"
+          [ -x "$BIN" ] || { echo "::error::no e2e test binary"; exit 1; }
           fails=0
           for i in $(seq 1 50); do
-            out=$(zig build test-e2e -Dtest-filter="SIGTERM under load" --test-timeout 120s 2>&1)
+            out=$(timeout 120 "$BIN" 2>&1)
             rc=$?
-            if [ $rc -ne 0 ]; then
+            if [ $rc -ne 0 ] || printf '%s' "$out" | grep -qa "acked nothing"; then
               fails=$((fails+1))
               echo "::group::RUN $i FAILED (rc=$rc)"
               printf '%s\n' "$out" | grep -aE "TRACE|TRACE-SRV|acked nothing|SIGTERM|missing after|server still running" | head -60
               echo "::endgroup::"
-            else
-              echo "run $i ok"
             fi
           done
           echo "=== shutdown loop: $fails/50 runs failed ==="
