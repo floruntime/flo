@@ -2020,11 +2020,13 @@ pub const Shard = struct {
         }
         self.reactor.removeSource(fd);
         self.removeConnection(fd);
-        // Shut the socket down before closing it: a client parked in recv (one
-        // we are dropping because its poll could not be re-armed, say) then
-        // wakes on the FIN at once and reconnects, instead of waiting out a
-        // timeout on a connection that will never answer. close() alone need
-        // not send a FIN promptly while bytes are queued.
+        // Shut the socket down before closing it. removeSource cancels the fd's
+        // io_uring poll asynchronously; if that cancel was dropped or has not
+        // completed, the still-armed poll holds a reference to the open file, so
+        // close() here does not drop the last reference and no FIN is sent — a
+        // client parked in recv (one we are dropping because its poll could not
+        // be re-armed, say) then waits out a timeout. shutdown(SHUT_RDWR) sends
+        // the FIN now, so it wakes and reconnects at once.
         _ = std.c.shutdown(fd, std.c.SHUT.RDWR);
         _ = std.c.close(fd);
     }
@@ -7504,8 +7506,8 @@ pub const Shard = struct {
         conn.shrinkWriteBuffer();
         conn.pacing_off = false;
         if (conn.reads_paused) return self.resumeReads(fd, conn);
-        // A failed disarm is benign: readable stays armed, so the next poll
-        // still reads the fd; at worst one spurious writable wake with an empty
+        // A failed disarm is benign: writable simply stays armed, so the fd is
+        // still polled and at worst gets a spurious writable wake with an empty
         // buffer, which flushToClient ignores. Nothing to close over.
         self.reactor.disarmWritable(fd) catch {};
     }
@@ -9504,7 +9506,7 @@ test "Shard: a poll arm that keeps failing closes the connection instead of leav
         shard.resumeReads(conn.fd, conn);
         try std.testing.expect(conn.closing);
         try std.testing.expectEqual(@as(u64, 2), shard.arm_failures);
-    }
+    } else return error.SkipZigTest;
 }
 
 test "Shard: a node with a stale config takes a promoted voter's append and vote request, and drops only a write it would forward" {
