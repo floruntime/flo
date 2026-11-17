@@ -101,10 +101,10 @@ pub const EventSource = struct {
     interests: Interests,
     /// Opaque user data (e.g., pointer to Connection)
     user_data: usize = 0,
-    /// Consecutive multishot poll ends that came back as an immediate kernel
-    /// error (a negative CQE, not `-ECANCELED`). A good completion resets it; a
-    /// run of them means re-arming would hot-loop, so the reactor gives up.
-    /// Reset whenever the source is re-registered.
+    /// Multishot poll ends that came back as a kernel error (a negative CQE, not
+    /// `-ECANCELED`), with no good completion in between. A good completion
+    /// resets it; a long enough run means re-arming only spins, so the reactor
+    /// gives up. Reset whenever the source is re-registered.
     neg_ends: u8 = 0,
 };
 
@@ -584,6 +584,10 @@ pub const Reactor = struct {
             try self.pollRemove(fd_u64);
         } else if (from == 0) {
             try self.pollAdd(fd_u64, fd, to);
+            // This fd now has a live poll again. If a dropped multishot left it on
+            // the deferred list (it went to no interests and back within a tick),
+            // drop that entry, or the next drain would arm a second poll on it.
+            _ = self.deferred_rearm.swapRemove(fd);
         } else {
             try self.pollUpdate(fd_u64, to);
         }
@@ -1098,6 +1102,35 @@ test "Reactor: a deferred re-arm is dropped when its fd is removed, so a reused 
         // Removing the fd (the connection closed) drops its deferred entry, so a
         // later connection that reuses the number is not armed a second time.
         reactor.removeSource(pair[0]);
+        try std.testing.expectEqual(@as(usize, 0), reactor.deferred_rearm.count());
+        try std.testing.expectEqual(@as(usize, 0), reactor.drainDeferredRearm());
+    } else return error.SkipZigTest;
+}
+
+test "Reactor: re-adding a deferred fd's poll (interests to none and back) clears its deferred entry" {
+    if (is_linux) {
+        var pair: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+        defer {
+            _ = std.c.close(pair[0]);
+            _ = std.c.close(pair[1]);
+        }
+        var reactor = try Reactor.init(std.testing.allocator);
+        defer reactor.deinit();
+        try reactor.addSource(.{ .fd = pair[0], .tag = .client_read, .interests = .{ .readable = true } });
+
+        // Defer a re-arm for the fd.
+        reactor.test_arm_error = error.SubmissionQueueFull;
+        reactor.cqe_buf[0] = .{ .user_data = @intCast(@as(u32, @bitCast(pair[0]))), .res = @intCast(linux.POLL.IN), .flags = 0 };
+        _ = try reactor.iouringProcessCqes(0, 1);
+        try std.testing.expectEqual(@as(usize, 1), reactor.deferred_rearm.count());
+
+        // The connection drops to no interests (a pollRemove, -ENOENT on the
+        // already-dropped poll) and comes back, which arms a fresh live poll via
+        // the from==0 branch. That must clear the deferred entry, or the next
+        // drain arms a second multishot poll on the same fd.
+        try reactor.modifyInterests(pair[0], .{ .readable = false, .writable = false });
+        try reactor.modifyInterests(pair[0], .{ .readable = true, .writable = false });
         try std.testing.expectEqual(@as(usize, 0), reactor.deferred_rearm.count());
         try std.testing.expectEqual(@as(usize, 0), reactor.drainDeferredRearm());
     } else return error.SkipZigTest;
