@@ -777,9 +777,11 @@ pub const ShardMetrics = struct {
     /// nonzero value means fd-reuse races are happening and being caught before
     /// they misroute to the wrong connection.
     stale_events_dropped: Atomic(u64) = Atomic(u64).init(0),
-    /// Reactor internal poll ops (poll_remove/poll_update) that failed. Their
-    /// CQEs are otherwise skipped, so this is the only sign; a nonzero value means
-    /// a reactor op was rejected (a kernel ABI or encoding mismatch).
+    /// Reactor internal poll ops (poll_remove/poll_update) rejected for an
+    /// unexpected reason. Their CQEs are otherwise skipped, so this is the only
+    /// sign. The expected ends — -ECANCELED and -ENOENT (removing or updating a
+    /// poll the kernel already ended) — are not counted, so a nonzero value is a
+    /// real reactor-op rejection, e.g. a kernel ABI or SQE encoding mismatch.
     reactor_internal_op_failures: Atomic(u64) = Atomic(u64).init(0),
     /// Snapshot bars passed without a snapshot by a leader still applying
     /// earlier terms (cumulative).

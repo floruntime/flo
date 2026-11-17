@@ -168,11 +168,12 @@ pub const Reactor = struct {
     /// happening (and being caught).
     stale_events_dropped: u64 = 0,
 
-    /// Internal ops (poll_remove, poll_update) that completed with an error. Their
-    /// CQEs carry INTERNAL_FLAG and are otherwise skipped, so a failing one would
-    /// be invisible — a miscoded poll_update hid here once. -ECANCELED is excluded
-    /// (the expected end of a remove's target). The owner reads this for a metric;
-    /// the first is logged at warn.
+    /// Internal ops (poll_remove, poll_update) rejected for an unexpected reason.
+    /// Their CQEs carry INTERNAL_FLAG and are otherwise skipped, so a failing one
+    /// would be invisible — a miscoded poll_update hid here once. The expected
+    /// ends are excluded: -ECANCELED (a remove cancelling a live poll) and
+    /// -ENOENT (remove/update of a poll the kernel already ended). The owner
+    /// reads this for a metric; the first is logged at warn.
     internal_op_failures: u64 = 0,
 
     /// Monotonic ms of the last deferred-re-arm log, so a burst under load logs
@@ -704,12 +705,18 @@ pub const Reactor = struct {
             if (cqe.user_data == TIMEOUT_SENTINEL) continue;
 
             // Internal CQEs (poll_update/poll_remove results) carry no event, but
-            // a failing one must not vanish: count it (ECANCELED is the expected
-            // end of a remove's target) and log the first, then skip it.
+            // a real failure must not vanish: count it and log the first, then
+            // skip it. Two negatives are expected, not failures: -ECANCELED (a
+            // remove that cancels a live poll) and -ENOENT (remove or update of a
+            // poll the kernel has already ended — a terminal CQE reaped next tick,
+            // a dropped poll still on the deferred list, or a given-up fd being
+            // closed). What is left is a rejected op, e.g. a bad SQE encoding.
             if (cqe.user_data & INTERNAL_FLAG != 0) {
-                if (cqe.res < 0 and cqe.res != -@as(i32, @backingInt(linux.E.CANCELED))) {
+                const expected = cqe.res == -@as(i32, @backingInt(linux.E.CANCELED)) or
+                    cqe.res == -@as(i32, @backingInt(linux.E.NOENT));
+                if (cqe.res < 0 and !expected) {
                     self.internal_op_failures += 1;
-                    if (self.internal_op_failures == 1) log.warn("reactor: an internal poll op failed ({d}); a poll_remove or poll_update was rejected", .{cqe.res});
+                    if (self.internal_op_failures == 1) log.warn("reactor: an internal poll op was rejected ({d}); a poll_remove or poll_update failed", .{cqe.res});
                 }
                 continue;
             }
@@ -1437,7 +1444,7 @@ test "Reactor: armWritable arms POLLOUT on a live readable poll via poll_update 
     } else return error.SkipZigTest;
 }
 
-test "Reactor: a failed internal poll op is counted, ECANCELED and success are not" {
+test "Reactor: a failed internal poll op is counted, but ECANCELED, ENOENT and success are not" {
     if (is_linux) {
         var reactor = try Reactor.init(std.testing.allocator);
         defer reactor.deinit();
@@ -1450,6 +1457,12 @@ test "Reactor: a failed internal poll op is counted, ECANCELED and success are n
 
         // -ECANCELED is the expected end of a remove's target: not a failure.
         reactor.cqe_buf[0] = .{ .user_data = iud, .res = -@as(i32, @backingInt(linux.E.CANCELED)), .flags = 0 };
+        _ = try reactor.iouringProcessCqes(0, 1);
+        try std.testing.expectEqual(@as(u64, 1), reactor.internal_op_failures);
+
+        // -ENOENT is the expected result of removing or updating a poll the
+        // kernel has already ended (a race, not a failure): not counted.
+        reactor.cqe_buf[0] = .{ .user_data = iud, .res = -@as(i32, @backingInt(linux.E.NOENT)), .flags = 0 };
         _ = try reactor.iouringProcessCqes(0, 1);
         try std.testing.expectEqual(@as(u64, 1), reactor.internal_op_failures);
 
