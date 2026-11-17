@@ -39,9 +39,32 @@ const Run = struct {
     }
 };
 
+/// The body a client sends for `op`: kv.set's request, a stream append's
+/// one-record batch, an enqueue's payload.
+fn bodyOf(buf: []u8, op: proto.OpCode, value: []const u8) ![]const u8 {
+    return switch (op) {
+        .kv_put => try src.protocol.kv_ops.op("kv.set").request.encodeInto(buf, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null }),
+        // [count:u32][len:u32][payload][header_count:u16]
+        .stream_append => blk: {
+            std.mem.writeInt(u32, buf[0..4], 1, .little);
+            std.mem.writeInt(u32, buf[4..8], @intCast(value.len), .little);
+            @memcpy(buf[8..][0..value.len], value);
+            std.mem.writeInt(u16, buf[8 + value.len ..][0..2], 0, .little);
+            break :blk buf[0 .. 10 + value.len];
+        },
+        else => value,
+    };
+}
+
+/// `iters` requests, each answered before the next: the shard applies what
+/// committed as its loop would, so its answer is queued. Any answer but ok
+/// fails the bench: one that refused every request would otherwise time
+/// the refusal.
 fn drive(shard: *Shard, conn: *src.node.connection.Connection, op: proto.OpCode, key_prefix: []const u8, iters: usize, start_id: u64) !u64 {
     var kbuf: [48]u8 = undefined;
     var vbuf: [128]u8 = undefined;
+    var bbuf: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
     const t0 = stdx.time.nanoTimestamp();
     for (0..iters) |i| {
         const id = start_id + i;
@@ -49,10 +72,19 @@ fn drive(shard: *Shard, conn: *src.node.connection.Connection, op: proto.OpCode,
         // measurement is the write path, not hash-map growth.
         const key = try std.fmt.bufPrint(&kbuf, "{s}-{d:0>4}", .{ key_prefix, i % 1024 });
         const value = try std.fmt.bufPrint(&vbuf, "value-{d:0>8}-padding-padding-padding-padding-padding-padding-padding", .{id});
-        shard.runRequest(conn, request(op, id, "", key, value), .client);
-        // Drop the queued response so the connection buffer never fills.
+        shard.runRequest(conn, request(op, id, "", key, try bodyOf(&bbuf, op, value)), .client);
+        _ = shard.applyCommitted();
         const pending = conn.write_buf.readable();
-        if (pending > 0) conn.write_buf.consume(pending);
+        if (pending == 0) return error.NotAnswered;
+        const n = conn.write_buf.read(answer[0..@min(answer.len, pending)]);
+        const r = try proto.Response.parse(answer[0..n]);
+        if (r.header.status != @backingInt(proto.StatusCode.ok)) {
+            std.debug.print("  {s}: refused, status {d}: {s}\n", .{ @tagName(op), r.header.status, r.data[0..@min(r.data.len, 160)] });
+            return error.Refused;
+        }
+        // Drop the rest so the connection buffer never fills.
+        const rest = conn.write_buf.readable();
+        if (rest > 0) conn.write_buf.consume(rest);
     }
     return @intCast(stdx.time.nanoTimestamp() - t0);
 }
@@ -98,35 +130,51 @@ pub fn main() !void {
     std.debug.print("\n", .{});
 }
 
-/// `n` entries of `ops` puts each proposed with nothing applied, as a cold
-/// boot or a follower far behind meets its log, then drained one pass at a
-/// time. The worst pass is what the shard's other work waits on.
+/// A pass that applied nothing stopped at a snapshot bar, whose window ends
+/// over the shard's ticks, which this bench doesn't run: it measures apply,
+/// not snapshots, so the window closes and apply goes on. Anything else
+/// that stops apply fails the bench rather than spinning.
+fn passBar(shard: *Shard) !void {
+    if (shard.snapshot_window == null) return error.ApplyStopped;
+    shard.snapshot_window = null;
+}
+
+/// `n` entries of `ops` puts each in the log with nothing applied, as a
+/// cold boot or a follower far behind meets its log, then drained one pass
+/// at a time. The worst pass is what the shard's other work waits on.
 fn backlog(shard: *Shard, name: []const u8, n: usize, ops: u16) !void {
     const kv_entries = src.protocol.kv_entries;
     const raft = shard.raft_node;
     var payload: [64 * 1024]u8 = undefined;
     var kbuf: [256][16]u8 = undefined;
     var items: [256]kv_entries.BatchOp.Value = undefined;
+    // Stamps rise from now, as a leader's do.
+    const stamp0 = raft.now();
     for (0..n) |i| {
         const body = if (ops == 1) try kv_entries.Put.encodeInto(&payload, .{ .key = try std.fmt.bufPrint(&kbuf[0], "bl-{d:0>6}", .{i % 4096}), .value = "value-padding-padding", .ttl_ms = null, .condition = .always, .cas_version = null }) else b: {
             for (items[0..ops], 0..) |*it, k| it.* = .{ .kind = .put, .key = try std.fmt.bufPrint(&kbuf[k], "bl-{d:0>6}", .{(i * ops + k) % 4096}), .value = "value-padding-padding", .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null };
             var w = src.protocol.schema.Writer{ .buf = &payload };
-            try kv_entries.BatchOps.encodeSlice(&w, items[0..ops]);
+            // In the default namespace, id 1.
+            try kv_entries.encodeBatch(&w, 1, items[0..ops]);
             break :b w.written();
         };
-        // Into the log only: the apply below is the one being measured.
-        shard.applying = true;
-        _ = try raft.propose(if (ops == 1) .kv_put else .kv_batch, 0, body);
-        shard.applying = false;
+        // Into the log only, as replication hands a follower its log: a
+        // proposal would stop at the cap on entries not yet applied. The
+        // apply below is the one being measured.
+        var e = src.storage.ual.entry.buildEntry(if (ops == 1) .kv_put else .kv_batch, 0, raft.current_term, raft.log.lastIndex() + 1, stamp0 + i, body);
+        e.header.crc32c = e.computeCrc();
+        _ = try raft.log.append(&e);
     }
     raft.commit_index = raft.log.lastIndex();
     var passes: u64 = 0;
     var worst: u64 = 0;
     const t0 = stdx.time.nanoTimestamp();
     while (raft.last_applied < raft.commit_index) : (passes += 1) {
+        const before = raft.last_applied;
         const p0 = stdx.time.nanoTimestamp();
         _ = shard.applyCommitted();
         worst = @max(worst, @as(u64, @intCast(stdx.time.nanoTimestamp() - p0)));
+        if (raft.last_applied == before) try passBar(shard);
     }
     const total: u64 = @intCast(stdx.time.nanoTimestamp() - t0);
     std.debug.print("  {s:<16} {d:>6} entries  {d:>4} passes   worst pass {d:>6} µs   total {d:>6} µs\n", .{ name, n, passes, worst / 1000, total / 1000 });
