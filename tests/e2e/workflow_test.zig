@@ -3592,7 +3592,9 @@ test "e2e/workflow: a step waits for its action to be registered, then runs it, 
         try expectRunStatus(ctx, run_id, "waiting");
 
         try ctx.exec(&.{ "action", "register", action });
-        var taken = try ctx.cli.run(&.{ "worker", "await", action, "--worker-id", "late-w", "--block", "5000" });
+        // Its step asks again on its own backoff, the first 5 s after it
+        // was answered, so the run may start up to that long after.
+        var taken = try ctx.cli.run(&.{ "worker", "await", action, "--worker-id", "late-w", "--block", "12000" });
         defer taken.deinit();
         try testing.expectEqual(@as(u8, 0), taken.exit_code);
         const id = extractTaskId(std.mem.trim(u8, taken.stdout, &std.ascii.whitespace)) orelse return error.AssertionFailed;
@@ -3673,7 +3675,8 @@ test "e2e/workflow: a plan moves past an executor whose action isn't registered 
         try awaitHistory(ctx, run_id, "action_not_registered", 7000);
         try expectRunStatus(ctx, run_id, "waiting");
         try ctx.exec(&.{ "action", "register", last });
-        try takeAndComplete(ctx, last, "5000");
+        // Asked for again on the step's backoff: up to 5 s after the answer.
+        try takeAndComplete(ctx, last, "12000");
         try awaitRunStatus(ctx, run_id, "completed", 7000);
     }
 }

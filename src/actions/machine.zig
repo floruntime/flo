@@ -44,6 +44,7 @@ const limits = @import("../protocol/limits.zig");
 const view_mod = @import("../contract/view.zig");
 const machine_mod = @import("../contract/machine.zig");
 const delivery = @import("../contract/delivery.zig");
+const calls = @import("calls_machine.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -251,9 +252,20 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         },
         .action_invoke => {
             const p = ae.Invoke.decodeAll(e.payload, &diag) catch return error.Halt;
-            const def = (try view.get(Defs, try idKey(view, .of(p.ns), p.action))) orelse return out.refuse(.not_found, .not_found, NO_ACTION);
+            // A workflow step's start, sent by its call: answered to the
+            // caller's slot from this entry, so a missing action is an
+            // answer, not a refusal.
+            const call = view.message != null;
+            if (call and p.caller_workflow == null) return out.refuse(.bad_request, .malformed, CALL_HAS_NO_CALLER);
+            const def = (try view.get(Defs, try idKey(view, .of(p.ns), p.action))) orelse {
+                if (call) return reply(view, p, .no_action);
+                return out.refuse(.not_found, .not_found, NO_ACTION);
+            };
             const rk = try idKey(view, .of(p.ns), p.run);
-            if (try view.get(Runs, rk) != null) return out.refuse(.conflict, .unclassified, RUN_EXISTS);
+            if (try view.get(Runs, rk) != null) {
+                if (call) return reply(view, p, .started);
+                return out.refuse(.conflict, .unclassified, RUN_EXISTS);
+            }
             try view.put(Runs, rk, .{ .v = .{
                 .action = p.action,
                 .status = .ready,
@@ -282,6 +294,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             } });
             var b: KeyBuf = undefined;
             try view.put(Ready, try idKey(view, .of(p.ns), readyKey(&b, p.action, {}, stamp, p.run)), .{});
+            if (call) try reply(view, p, .started);
             out.putBytes(p.run);
         },
         .action_deliver => {
@@ -318,6 +331,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             run.v.@"error" = "";
             run.v.completed_ns = stamp;
             try view.put(Runs, rk, run);
+            try tellCaller(view, .of(p.ns), p.run, run.v);
         },
         .action_release => {
             const p = ae.Release.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -342,6 +356,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 } else try M.readyAgain(view, .of(p.ns), p.run, &run.v, after(stamp, p.delay_ms));
             }
             try view.put(Runs, rk, run);
+            try tellCaller(view, .of(p.ns), p.run, run.v);
         },
         .action_extend => {
             const p = ae.Extend.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -354,6 +369,13 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             const to = (try M.extend(view, .of(p.ns), p.run, &run.v, p.expiry_ns, stamp)) orelse return out.putInt(u64, run.v.expiry_ns);
             try view.put(Runs, rk, run);
             out.putInt(u64, to);
+        },
+        .action_abandon_send => {
+            // Only an await's shard makes these, from a task it holds.
+            const p = ae.Abandon.decodeAll(e.payload, &diag) catch return error.Halt;
+            const ns: NamespaceId = .of(p.ns);
+            if (ns == .invalid) return error.Halt;
+            try view.send(.user(ns), @intCast(@import("../node/router.zig").nsKeySlot(ns, p.action)), @backingInt(EntryType.action_abandon), e.payload);
         },
         .action_expire => {
             const p = ae.Expire.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -388,8 +410,35 @@ fn expireOne(view: *View, item: ae.ExpireItem.Value, stamp: u64) ApplyError!bool
         run.v.completed_ns = stamp;
     } else try M.readyAgain(view, .of(item.ns), item.run, &run.v, stamp);
     try view.put(Runs, rk, run);
+    try tellCaller(view, .of(item.ns), item.run, run.v);
     return true;
 }
+
+/// The answer to a call's start, to the calling workflow's slot.
+fn reply(view: *View, p: ae.Invoke.Value, answer: ae.Answer) ApplyError!void {
+    const ns: NamespaceId = .of(p.ns);
+    var buf: [ae.Reply.max_size]u8 = undefined;
+    const bytes = ae.Reply.encodeInto(&buf, .{ .ns = p.ns, .slot = calls.callerSlot(ns, p.caller_workflow.?), .run = p.run, .answer = answer }) catch return error.Halt;
+    try view.send(.user(ns), calls.callerSlot(ns, p.caller_workflow.?), @backingInt(EntryType.action_reply), bytes);
+}
+
+/// A called run that ended tells its caller how, and what it returned.
+fn tellCaller(view: *View, ns: NamespaceId, run_id: []const u8, run: Run.Value) ApplyError!void {
+    if (run.source != .workflow) return;
+    const workflow = run.caller_workflow orelse return;
+    const status: ae.DoneStatus = switch (run.status) {
+        .completed => .completed,
+        .failed => .failed,
+        .timed_out => .timed_out,
+        .ready, .leased => return,
+    };
+    const done = run.status == .completed;
+    const buf = view.arena.alloc(u8, ae.Done.max_size) catch return error.OutOfMemory;
+    const bytes = ae.Done.encodeInto(buf, .{ .ns = ns.int(), .slot = calls.callerSlot(ns, workflow), .run = run_id, .status = status, .outcome = if (done) run.outcome else "", .result = if (done) run.result else "" }) catch return error.Halt;
+    try view.send(.user(ns), calls.callerSlot(ns, workflow), @backingInt(EntryType.action_done), bytes);
+}
+
+pub const CALL_HAS_NO_CALLER = "bad request: a call's start names no calling workflow";
 
 /// The run at `rk`, if it is `action`'s.
 fn inScope(view: *View, rk: []const u8, action: []const u8) ApplyError!?Stored(Run) {
@@ -408,7 +457,7 @@ const idKey = M.inNs;
 
 pub const machine: machine_mod.Machine = .{
     .name = "actions",
-    .entry_types = &.{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire },
+    .entry_types = &.{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_abandon_send },
     .families = &.{ machine_mod.info(Defs), machine_mod.info(Runs), machine_mod.info(Ready), machine_mod.info(Deadlines), machine_mod.info(Requests) },
     .keys = keys,
     .apply = apply,

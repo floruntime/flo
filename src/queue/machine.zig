@@ -181,7 +181,7 @@ pub fn pastLevelInto(buf: *[PAST_LEVEL_LEN]u8, key: []const u8) []const u8 {
 }
 
 /// A deadline key's prefix: its expiry, its namespace's id, its queue.
-fn deadlinePrefix(buf: *[20]u8, expiry_ns: u64, ns: NamespaceId, hash: [8]u8) []const u8 {
+pub fn deadlinePrefix(buf: *[20]u8, expiry_ns: u64, ns: NamespaceId, hash: [8]u8) []const u8 {
     std.mem.writeInt(u64, buf[0..8], expiry_ns, .big);
     buf[8..12].* = ns.bytes();
     buf[12..20].* = hash;

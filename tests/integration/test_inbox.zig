@@ -91,7 +91,7 @@ test "integration: inbox tag filtering" {
     // Send mixed tags
     _ = inbox.send(makeMsg(.forward_request, 0, 1));
     _ = inbox.send(makeMsg(.reply, 1, 2));
-    _ = inbox.send(makeMsg(.action_start, 2, 3));
+    _ = inbox.send(makeMsg(.worker_report, 2, 3));
     _ = inbox.send(makeMsg(.shutdown, 3, 4));
     _ = inbox.send(makeMsg(.shutdown, 0, 5));
     _ = inbox.send(makeMsg(.shutdown, 0, 6));
@@ -114,7 +114,7 @@ test "integration: inbox tag filtering" {
     try testing.expectEqual(@as(u64, 2), batch[1].sequence);
     try testing.expectEqual(@as(u8, 1), batch[1].src_shard);
 
-    try testing.expectEqual(Tag.action_start, batch[2].tag);
+    try testing.expectEqual(Tag.worker_report, batch[2].tag);
     try testing.expectEqual(@as(u64, 3), batch[2].sequence);
     try testing.expectEqual(@as(u8, 2), batch[2].src_shard);
 

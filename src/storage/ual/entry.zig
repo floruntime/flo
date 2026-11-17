@@ -136,6 +136,17 @@ pub const EntryType = enum(u8) {
     action_release = 0x76,
     action_extend = 0x77,
     action_expire = 0x78,
+    /// A workflow step's call of an action, its retry and its clear, on
+    /// the workflow's shard; and the two messages that answer it.
+    action_call = 0x79,
+    action_call_retry = 0x7A,
+    action_call_clear = 0x7B,
+    action_reply = 0x7C,
+    action_done = 0x7D,
+    /// A task its await couldn't give, logged where the await was and sent
+    /// to its run's shard, which ends the lease once the message commits.
+    action_abandon_send = 0x7E,
+    action_abandon = 0x7F,
 
     // ── Processing ──
     processing_submit = 0x80,
@@ -162,6 +173,7 @@ pub const EntryType = enum(u8) {
             .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch => false,
             .namespace_create => false,
             .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => false,
+            .action_call, .action_call_retry, .action_call_clear, .action_reply, .action_done, .action_abandon_send, .action_abandon => false,
             .stream_append, .stream_trim, .stream_delete, .stream_config => true,
             .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge => false,
             .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean => false,

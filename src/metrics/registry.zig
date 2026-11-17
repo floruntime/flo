@@ -187,6 +187,11 @@ pub const WorkflowMetrics = struct {
     timers_fired_total: Atomic(u64) = Atomic(u64).init(0),
     /// Total steps executed
     steps_executed_total: Atomic(u64) = Atomic(u64).init(0),
+    /// A step's call of an action not registered yet, asked for again.
+    action_call_retries_total: Atomic(u64) = Atomic(u64).init(0),
+    /// An action's answer or end for a call already gone: its workflow
+    /// cancelled or ended, or its step resolved.
+    action_answers_without_call_total: Atomic(u64) = Atomic(u64).init(0),
     /// Active scheduled workflows (cron/interval)
     active_schedules: Atomic(u64) = Atomic(u64).init(0),
 
@@ -235,6 +240,14 @@ pub const WorkflowMetrics = struct {
         _ = self.steps_executed_total.fetchAdd(1, .monotonic);
     }
 
+    pub fn recordActionCallRetry(self: *WorkflowMetrics) void {
+        _ = self.action_call_retries_total.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordAnswerWithoutCall(self: *WorkflowMetrics) void {
+        _ = self.action_answers_without_call_total.fetchAdd(1, .monotonic);
+    }
+
     pub fn scheduleAdded(self: *WorkflowMetrics) void {
         _ = self.active_schedules.fetchAdd(1, .monotonic);
     }
@@ -254,6 +267,8 @@ pub const WorkflowMetrics = struct {
         signals_delivered_total: u64,
         timers_fired_total: u64,
         steps_executed_total: u64,
+        action_call_retries_total: u64,
+        action_answers_without_call_total: u64,
         active_schedules: u64,
     };
 
@@ -268,6 +283,8 @@ pub const WorkflowMetrics = struct {
             .signals_delivered_total = self.signals_delivered_total.load(.monotonic),
             .timers_fired_total = self.timers_fired_total.load(.monotonic),
             .steps_executed_total = self.steps_executed_total.load(.monotonic),
+            .action_call_retries_total = self.action_call_retries_total.load(.monotonic),
+            .action_answers_without_call_total = self.action_answers_without_call_total.load(.monotonic),
             .active_schedules = self.active_schedules.load(.monotonic),
         };
     }
@@ -1770,6 +1787,12 @@ fn writeWorkflowMetrics(writer: anytype, snapshot: WorkflowMetrics.Snapshot) !vo
     try writer.print("# HELP flo_workflow_steps_executed_total Total workflow steps executed\n", .{});
     try writer.print("# TYPE flo_workflow_steps_executed_total counter\n", .{});
     try writer.print("flo_workflow_steps_executed_total {d}\n", .{snapshot.steps_executed_total});
+    try writer.print("# HELP flo_workflow_action_call_retries_total Calls of an action not registered yet, asked for again\n", .{});
+    try writer.print("# TYPE flo_workflow_action_call_retries_total counter\n", .{});
+    try writer.print("flo_workflow_action_call_retries_total {d}\n", .{snapshot.action_call_retries_total});
+    try writer.print("# HELP flo_workflow_action_answers_without_call_total Action answers or ends for a call already gone\n", .{});
+    try writer.print("# TYPE flo_workflow_action_answers_without_call_total counter\n", .{});
+    try writer.print("flo_workflow_action_answers_without_call_total {d}\n", .{snapshot.action_answers_without_call_total});
 
     try writer.print("# HELP flo_workflow_active_schedules Current active scheduled workflows\n", .{});
     try writer.print("# TYPE flo_workflow_active_schedules gauge\n", .{});

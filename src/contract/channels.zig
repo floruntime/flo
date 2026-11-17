@@ -1740,3 +1740,37 @@ test "channels: an after-commit append naming a namespace not its origin's is re
 /// A test message's origin: the default namespace's user.
 const TEST_USER: u8 = @backingInt(@import("view.zig").Origin.Kind.user);
 const TEST_DEFAULT_NS: u32 = @import("../namespace/table.zig").DEFAULT.int();
+
+/// A test machine whose one entry declares only a range of the queue's
+/// deadlines, in the namespace its payload's first four bytes name: no
+/// `.id` key refuses it first.
+fn deadlineOnlyKeys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
+    const queue_mod = @import("../queue/machine.zig");
+    var b: [20]u8 = undefined;
+    const ns: ns_table.Id = .of(std.mem.readInt(u32, e.payload[0..4], .big));
+    out.addRangeNaming(queue_mod.Deadlines.ID, 8, queue_mod.deadlinePrefix(&b, 12345, ns, queue_mod.hashOf("q"))) catch |err| switch (err) {
+        error.NoNamespace => return,
+        else => |o| return o,
+    };
+}
+fn deadlineOnlyApply(_: *View, _: *const Entry, _: *Result) ApplyError!void {}
+const deadline_only: machine_mod.Machine = .{ .name = "deadline-only", .entry_types = &.{.queue_expire}, .families = &.{machine_mod.info(@import("../queue/machine.zig").Deadlines)}, .keys = deadlineOnlyKeys, .apply = deadlineOnlyApply };
+
+test "channels: a message declaring only a deadline in another namespace is refused at that deadline" {
+    const D = Channels(&.{deadline_only});
+    var pbs: [2][4]u8 = undefined;
+    var msgs: [2]TestMessage = undefined;
+    for ([_]ns_table.Id{ .of(17), .of(18) }, &pbs, &msgs) |ns, *pb, *m| {
+        std.mem.writeInt(u32, pb, ns.int(), .big);
+        m.* = .{ .entry_type = .queue_expire, .kind = .user, .ns = .of(17), .payload = pb };
+    }
+    var st = store_mod.Store.init(testing.allocator);
+    defer st.deinit();
+    st.place = .{ .group = 0, .count = 1 };
+    st.strict_keys = true;
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    const reported = try deliverAll(&D.machine, &st, &scratch, &msgs);
+    try testing.expectEqual(@as(?store_mod.SenderBug, null), reported[0].sender_bug);
+    try testing.expectEqual(@as(?store_mod.SenderBug, .wrong_origin), reported[1].sender_bug);
+}

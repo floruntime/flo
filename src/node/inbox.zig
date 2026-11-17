@@ -39,16 +39,10 @@ pub const Tag = enum(u8) {
     forward_request, // request routed to this shard for execution; names the reply slot
     reply, // the answer to a request this shard sent, on its reply ring; names the slot
     shutdown, // Graceful shutdown signal
-    action_start, // Start an action run on the owning shard: payload from ActionsHandler.encodeStartRunMessage
     cancel_reads, // a client of the sender closed: drop its blocking reads parked here, answering each empty; sequence as forward_request
     source_read, // a pipeline on the sender asks for a page of a source this shard owns: payload from processing/source_page.zig Read.encode
     source_page, // the page a source_read asked for, for a pipeline here: payload from processing/source_page.zig Page.Builder
-    action_finished, // how a run a workflow on the receiver waits on ended: payload from ActionsHandler.sendFinished
-    action_result_ask, // a workflow's shard asking a run's shard how it ended: payload [ns_len:u16][ns][run]
-    action_abandon, // a task whose await went away before it was answered, handed back to the run's shard
     worker_report, // a report counted toward its worker's stats, where the worker is registered
-    action_held, // a run a workflow on the receiver waits on is held for want of its action: payload [run_len:u16][run][action]
-    action_unhold, // a workflow run ended while the receiver held the start of its step: payload the action run's id
     channel, // a channel frame, a batch or an answer: payload from contract/channel_driver.zig; its sender is src_shard
 };
 
