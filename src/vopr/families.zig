@@ -133,6 +133,23 @@ pub const Mutant = enum {
     queue_cap_tightened,
     /// A settle leaves the bytes of the messages it removes held.
     queue_settle_keeps_bytes,
+    // Bugs in the consumer-group machine, planted the same way; the
+    // ledger in `group_family.zig` must catch each.
+    /// A deliver ignores the leader's ready choice: it takes the stream's
+    /// records past the cursor first.
+    group_deliver_cursor_first,
+    /// An abandon applies as a nack: it counts a failure.
+    group_abandon_counts_failure,
+    /// An expire applies as late as its latest named live lease: one not
+    /// yet due ends.
+    group_expire_ignores_deadline,
+    /// A settle leaves the bytes of the records it removes held.
+    group_settle_keeps_bytes,
+    /// A trim never reaches the group machine's observer: the stream's
+    /// floor stays where it was.
+    group_trim_misses_floor,
+    /// A group delete leaves its stream's group count one too high.
+    group_delete_keeps_count,
 
     /// Whether the bug is in a node's transaction limit: a run with none
     /// never reaches it.
@@ -147,6 +164,7 @@ pub const Mutant = enum {
             .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_condition_local, .kv_if_absent_holds, .kv_batch_conditions_ignored, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .kv_stops_batch_short, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
             .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
             .queue_settle_ignores_token, .queue_release_removes, .queue_expire_ignores_deadline, .queue_deliver_wrong_order, .queue_deliver_short, .queue_expire_first_only, .queue_report_changes_unnamed, .queue_node_clock, .queue_cap_unchecked, .queue_cap_tightened, .queue_settle_keeps_bytes => false,
+            .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .group_trim_misses_floor, .group_delete_keeps_count => false,
         };
     }
 
@@ -155,6 +173,15 @@ pub const Mutant = enum {
     pub fn inQueues(m: Mutant) bool {
         return switch (m) {
             .queue_settle_ignores_token, .queue_release_removes, .queue_expire_ignores_deadline, .queue_deliver_wrong_order, .queue_deliver_short, .queue_expire_first_only, .queue_report_changes_unnamed, .queue_node_clock, .queue_cap_unchecked, .queue_cap_tightened, .queue_settle_keeps_bytes => true,
+            else => false,
+        };
+    }
+
+    /// Whether the bug is in the consumer-group machine: a run with no
+    /// group entries never reaches it.
+    pub fn inGroups(m: Mutant) bool {
+        return switch (m) {
+            .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .group_trim_misses_floor, .group_delete_keeps_count => true,
             else => false,
         };
     }

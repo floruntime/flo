@@ -1,0 +1,1103 @@
+//! Consumer groups, as `queue_family.Queues` is for queues: every replica
+//! applies the same entries through the server's own group machine
+//! (`stream/group_machine.zig`) and stream projection, on the queue
+//! family's store, as a shard keeps queues and groups in one store and one
+//! held-bytes record. The machine reads its streams through the real
+//! `Streams` reader; stream appends, trims and deletes apply to the real
+//! projection, and trims and deletes reach the machine through its
+//! observer, as the stream applier hands them on.
+//!
+//! The oracle is a ledger of its own: each group's records (state, holder,
+//! token, counts, error length), its settings, cursor and counters, and
+//! each stream's floor, generation and group count, kept from the entries
+//! by rules written here, not by the machine's helpers. Each entry's
+//! answer is checked against what the ledger says it must be, and after it
+//! applies every group's store state is checked against the ledger, so a
+//! machine that picks, ends, counts or cleans otherwise is caught at the
+//! entry that did it. What must hold of any store (each record's keys, the
+//! counts, the held bytes, the shard's held bytes across queues and
+//! groups) is read from the store itself.
+
+const std = @import("std");
+const entry_mod = @import("../storage/ual/entry.zig");
+const persistence = @import("../storage/persistence.zig");
+const store_mod = @import("../contract/store.zig");
+const machine_mod = @import("../contract/machine.zig");
+const view_mod = @import("../contract/view.zig");
+const schema = @import("../protocol/schema.zig");
+const ge = @import("../protocol/group_entries.zig");
+const ae = @import("../protocol/action_entries.zig");
+const gm = @import("../stream/group_machine.zig");
+const qm = @import("../queue/machine.zig");
+const stream_proj = @import("../projection/stream.zig");
+const streams_mod = @import("../contract/streams.zig");
+const families = @import("families.zig");
+const delivery = @import("../contract/delivery.zig");
+
+const Allocator = std.mem.Allocator;
+const Entry = entry_mod.Entry;
+const EntryType = entry_mod.EntryType;
+const StreamID = gm.StreamID;
+const StreamKey = gm.StreamKey;
+const NamespaceId = gm.NamespaceId;
+const Store = store_mod.Store;
+const Replica = families.Replica;
+const Status = gm.Status;
+const Ended = gm.Ended;
+const Why = gm.Why;
+/// Room for any key the group machine's key builders write: a scope, its
+/// separator and a due time, or an expiry and a namespace, then a record id.
+const KeyBuf = [gm.SCOPE_LEN + 1 + 8 + gm.ID_LEN]u8;
+
+pub const NS: NamespaceId = .default;
+pub const STREAMS = [_][]const u8{ "s0", "s1" };
+pub const GROUPS = [_][]const u8{ "g0", "g1", "g2" };
+
+/// The group machine's families, as the checksum walks them.
+pub const FAMILIES = [_]u16{ gm.Metas.ID, gm.Items.ID, gm.Dead.ID, gm.Ready.ID, gm.Deadlines.ID, gm.Streams_.ID };
+pub const NAMES = [_][]const u8{ "group.meta", "group.item", "group.dead", "group.ready", "group.deadline", "group.stream", "stream.index" };
+/// The families' checksums, then the stream projection's.
+pub const SUMS = FAMILIES.len + 1;
+
+/// A stream entry in the simulator's log: an append of `[records:u32]`
+/// under the stream's name; a trim through the id the key carries
+/// (`[ms:u64 BE][seq:u64 BE]`), its value the stream's name hash as the
+/// observer reads it; a delete under the stream's name. The projection and
+/// the observer see each as a shard's stream applier hands them on.
+pub fn streamEntry(buf: []u8, key: []const u8, value: []const u8) ?[]const u8 {
+    const cmd: entry_mod.CommandPayload = .{ .namespace_id = NS, .key_length = @intCast(key.len), .value_length = @intCast(value.len), .key = key, .value = value };
+    const n = cmd.serialize(buf) orelse return null;
+    return buf[0..n];
+}
+
+pub fn trimKey(up_to: StreamID) [16]u8 {
+    var k: [16]u8 = undefined;
+    std.mem.writeInt(u64, k[0..8], up_to.timestamp_ms, .big);
+    std.mem.writeInt(u64, k[8..16], up_to.sequence, .big);
+    return k;
+}
+
+pub fn streamHash(name: []const u8) [8]u8 {
+    return gm.streamOf(NS, name)[4..12].*;
+}
+
+/// Bytes one append's records take, as the projection counts them.
+const RECORD_BYTES: u32 = 24;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The ledger
+// ═══════════════════════════════════════════════════════════════════════════
+
+const LItem = struct {
+    status: Status,
+    due_ns: u64 = 0,
+    deliveries: u32 = 0,
+    failures: u32 = 0,
+    holder: []const u8 = "",
+    token: ae.Token.Value = .{ .term = 0, .index = 0 },
+    lease_ms: u64 = 0,
+    delivered_ns: u64 = 0,
+    expiry_ns: u64 = 0,
+    ended: Ended = .none,
+    started_ns: u64 = 0,
+    err_len: usize = 0,
+    dead_ns: u64 = 0,
+};
+
+fn recKey(r: StreamID) u128 {
+    return (@as(u128, r.timestamp_ms) << 64) | r.sequence;
+}
+
+fn keyRec(k: u128) StreamID {
+    return .{ .timestamp_ms = @truncate(k >> 64), .sequence = @truncate(k) };
+}
+
+const LGroup = struct {
+    stream: usize,
+    lease_ms: u64,
+    max_attempts: u32,
+    created_ns: u64,
+    gen: u64,
+    cursor: StreamID = StreamID.MIN,
+    delivered: u64 = 0,
+    settled: u64 = 0,
+    released: u64 = 0,
+    dead_lettered: u64 = 0,
+    expired: u64 = 0,
+    trimmed: u64 = 0,
+    /// By record id.
+    items: std.AutoArrayHashMapUnmanaged(u128, LItem) = .empty,
+
+    fn heldBytes(g: *const LGroup) u64 {
+        var sum: u64 = 0;
+        for (g.items.values()) |v| sum += gm.heldBy(v.err_len);
+        return sum;
+    }
+
+    fn count(g: *const LGroup, s: Status) u64 {
+        var n: u64 = 0;
+        for (g.items.values()) |v| n += @intFromBool(v.status == s);
+        return n;
+    }
+};
+
+/// A stream's record as its groups read it: kept while any group of it is.
+const LStream = struct { floor: StreamID = StreamID.MIN, gen: u64 = 0, groups: u64 = 0 };
+
+const Ledger = struct {
+    arena: std.heap.ArenaAllocator,
+    /// [stream][group]: null while no meta exists.
+    groups: [STREAMS.len][GROUPS.len]?LGroup = @splat(@splat(null)),
+    streams: [STREAMS.len]?LStream = @splat(null),
+
+    fn init(a: Allocator) Ledger {
+        return .{ .arena = std.heap.ArenaAllocator.init(a) };
+    }
+
+    fn deinit(self: *Ledger) void {
+        self.arena.deinit();
+    }
+
+    fn reset(self: *Ledger) void {
+        _ = self.arena.reset(.free_all);
+        self.groups = @splat(@splat(null));
+        self.streams = @splat(null);
+    }
+
+    fn alloc(self: *Ledger) Allocator {
+        return self.arena.allocator();
+    }
+
+    fn live(self: *Ledger, s: usize, g: usize) bool {
+        const grp = self.groups[s][g] orelse return false;
+        const st = self.streams[s] orelse return false;
+        return grp.gen == st.gen;
+    }
+
+    fn addGroup(self: *Ledger, s: usize, removed_through: StreamID) *LStream {
+        if (self.streams[s] == null) self.streams[s] = .{ .floor = removed_through };
+        const st = &self.streams[s].?;
+        st.groups += 1;
+        return st;
+    }
+
+    fn dropGroup(self: *Ledger, s: usize) void {
+        const st = &self.streams[s].?;
+        st.groups -= 1;
+        if (st.groups == 0) self.streams[s] = null;
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The family
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub const ConsumerGroups = struct {
+    /// The machine's: it resets this on every apply.
+    scratch: std.heap.ArenaAllocator,
+    /// The ledger's prediction for the entry applying.
+    oracle: std.heap.ArenaAllocator,
+    stream: stream_proj.StreamProjection,
+    ledger: Ledger,
+    allocator: Allocator,
+
+    pub const Kind = enum { append, trim, stream_delete, create, delete, deliver, settle, release, extend, expire, clean };
+
+    pub const Effect = struct {
+        kind: Kind,
+        refused: bool,
+        applied: u32 = 0,
+        refused_items: u32 = 0,
+        cross_term: bool = false,
+        broke: ?[]const u8 = null,
+    };
+
+    pub const Counts = struct {
+        applied: [std.enums.values(Kind).len]u64 = @splat(0),
+        refused: [std.enums.values(Kind).len]u64 = @splat(0),
+        items_applied: u64 = 0,
+        items_refused: u64 = 0,
+        cross_term_settles: u64 = 0,
+        cross_term_expires: u64 = 0,
+
+        pub fn count(self: *Counts, o: Effect) void {
+            const k = @backingInt(o.kind);
+            if (o.refused) self.refused[k] += 1 else self.applied[k] += 1;
+            self.items_applied += o.applied;
+            self.items_refused += o.refused_items;
+            if (o.cross_term) switch (o.kind) {
+                .settle => self.cross_term_settles += 1,
+                .expire => self.cross_term_expires += 1,
+                else => {},
+            };
+        }
+
+        pub fn add(self: *Counts, other: Counts) void {
+            for (&self.applied, other.applied) |*a, b| a.* += b;
+            for (&self.refused, other.refused) |*a, b| a.* += b;
+            self.items_applied += other.items_applied;
+            self.items_refused += other.items_refused;
+            self.cross_term_settles += other.cross_term_settles;
+            self.cross_term_expires += other.cross_term_expires;
+        }
+    };
+
+    pub fn init(allocator: Allocator) ConsumerGroups {
+        return .{ .scratch = std.heap.ArenaAllocator.init(allocator), .oracle = std.heap.ArenaAllocator.init(allocator), .stream = stream_proj.StreamProjection.init(allocator), .ledger = Ledger.init(allocator), .allocator = allocator };
+    }
+
+    pub fn deinit(self: *ConsumerGroups) void {
+        self.scratch.deinit();
+        self.oracle.deinit();
+        self.stream.deinit();
+        self.ledger.deinit();
+    }
+
+    /// Replay re-applies from the start: the projection and the ledger go
+    /// with the store the queue family clears.
+    pub fn reset(self: *ConsumerGroups) void {
+        self.stream.deinit();
+        self.stream = stream_proj.StreamProjection.init(self.allocator);
+        self.ledger.reset();
+    }
+
+    pub fn owns(entry_type: u8) bool {
+        for (gm.machine.entry_types) |t| if (@backingInt(t) == entry_type) return true;
+        return entry_type == @backingInt(EntryType.stream_trim) or entry_type == @backingInt(EntryType.stream_delete);
+    }
+
+    /// The synthesized workload's appends share the type; this family's
+    /// carry one of its streams' names and a record count. A synthesized
+    /// payload leads with its op id, whose key-length bytes are zero.
+    pub fn ownsEntry(entry_type: u8, payload: []const u8) bool {
+        if (owns(entry_type)) return true;
+        if (entry_type != @backingInt(EntryType.stream_append)) return false;
+        const cmd = entry_mod.CommandPayload.deserialize(payload) orelse return false;
+        return cmd.namespace_id == NS and streamIndex(cmd.key) != null and cmd.value.len == 4 and cmd.serializedSize() == payload.len;
+    }
+
+    pub fn streams(self: *const ConsumerGroups) streams_mod.Streams {
+        return .{ .proj = &self.stream };
+    }
+
+    fn kindOf(t: u8) Kind {
+        return switch (@as(EntryType, @fromBackingInt(t))) {
+            .stream_append => .append,
+            .stream_trim => .trim,
+            .stream_delete => .stream_delete,
+            .group_create => .create,
+            .group_delete => .delete,
+            .group_deliver => .deliver,
+            .group_settle => .settle,
+            .group_release => .release,
+            .group_extend => .extend,
+            .group_expire => .expire,
+            else => .clean,
+        };
+    }
+
+    fn streamIndex(name: []const u8) ?usize {
+        for (STREAMS, 0..) |s, i| if (std.mem.eql(u8, s, name)) return i;
+        return null;
+    }
+
+    fn groupIndex(name: []const u8) ?usize {
+        for (GROUPS, 0..) |g, i| if (std.mem.eql(u8, g, name)) return i;
+        return null;
+    }
+
+    /// The (stream, group) a scope names, of the workload's.
+    fn ofScope(scope: []const u8) ?[2]usize {
+        for (STREAMS, 0..) |s, si| for (GROUPS, 0..) |g, gi| {
+            if (std.mem.eql(u8, &gm.scopeOf(NS, s, g), scope)) return .{ si, gi };
+        };
+        return null;
+    }
+
+    // ── Store reads ─────────────────────────────────────────────────────
+
+    pub fn meta(store: *Store, stream: []const u8, group: []const u8) ?gm.Meta.Value {
+        var b: [4 + gm.SCOPE_LEN]u8 = undefined;
+        const scope = gm.scopeOf(NS, stream, group);
+        const got = (view_mod.ReadView{ .store = store }).get(gm.Metas, gm.storeKey(&b, NS, &scope)) catch return null;
+        return if (got) |m| m.v else null;
+    }
+
+    pub fn item(store: *Store, stream: []const u8, group: []const u8, record: StreamID) ?gm.Item.Value {
+        var b: [4 + gm.ID_LEN]u8 = undefined;
+        const id = gm.idOf(gm.scopeOf(NS, stream, group), record);
+        const got = (view_mod.ReadView{ .store = store }).get(gm.Items, gm.storeKey(&b, NS, &id)) catch return null;
+        return if (got) |m| m.v else null;
+    }
+
+    pub fn streamRec(store: *Store, stream: []const u8) ?gm.StreamRec.Value {
+        var b: [13]u8 = undefined;
+        const k = gm.recKey(&b, gm.streamOf(NS, stream));
+        const bytes = store.get(gm.Streams_.ID, k) orelse return null;
+        return (gm.Streams_.Value.decode(bytes) catch return null).v;
+    }
+
+    fn shardHeld(store: *Store) u64 {
+        const bytes = store.get(qm.Helds.ID, qm.HELD_KEY) orelse return 0;
+        return (qm.Helds.Value.decode(bytes) catch return 0).v.bytes;
+    }
+
+    // ── Apply ───────────────────────────────────────────────────────────
+
+    /// Apply `e` as the shard does, then check its answer and every group
+    /// against the ledger, and the store's own rules. A refusal must leave
+    /// every family as it was.
+    pub fn apply(self: *ConsumerGroups, store: *Store, e: *const Entry, r: Replica) (persistence.ApplyError || error{RefusalChangedState})!Effect {
+        _ = self.oracle.reset(.retain_capacity);
+        const kind = kindOf(e.header.entry_type);
+        var effect: Effect = .{ .kind = kind, .refused = false };
+        switch (kind) {
+            .append, .trim, .stream_delete => try self.applyStream(store, e, kind, r),
+            else => {
+                // What the ledger says the answer must be, worked out before
+                // the machine runs, from the ledger and the stream alone.
+                const want = try self.predict(store, e, kind);
+                const before = commits(store);
+                // A mutant applies its own entry in the ledger's place.
+                const applied = try self.rewritten(e, kind, r);
+                var out: persistence.Result = .{};
+                out.reset(&applied);
+                try machine_mod.applyEntryWith(&gm.machine, store, &self.scratch, self.streams(), &applied, &out);
+                if (out.refused()) |refused| {
+                    if (!std.mem.eql(u64, &before, &commits(store))) return error.RefusalChangedState;
+                    effect.refused = true;
+                    if (want != .refused) {
+                        effect.broke = "the group machine refused an entry the ledger applies";
+                    } else if (want.refused != refused.status) effect.broke = "the group machine refused an entry with another status than the ledger's";
+                } else if (want == .refused) {
+                    effect.broke = "the group machine applied an entry the ledger refuses";
+                } else {
+                    effect.broke = self.answerBroke(want, &out, &effect);
+                    self.commit(e, kind, want);
+                    try plantAfter(store, e, kind, want, r);
+                }
+            },
+        }
+        // Only the groups the entry could change are walked: every group at
+        // every apply would cost the run its length squared.
+        const touched = try touchedBy(e, kind);
+        if (effect.broke == null) effect.broke = self.matchesLedger(store, touched);
+        if (effect.broke == null) effect.broke = rulesOfStore(store, touched);
+        return effect;
+    }
+
+    const Touched = [STREAMS.len][GROUPS.len]bool;
+
+    /// The groups an entry names, or every group of the stream it names.
+    fn touchedBy(e: *const Entry, kind: Kind) persistence.ApplyError!Touched {
+        var t: Touched = @splat(@splat(false));
+        var diag: schema.Diagnostic = .{};
+        switch (kind) {
+            .append, .trim, .stream_delete => {
+                const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return error.Halt;
+                const s = if (kind == .trim) for (STREAMS, 0..) |name, i| {
+                    if (std.mem.eql(u8, &streamHash(name), cmd.value)) break i;
+                } else return error.Halt else streamIndex(cmd.key) orelse return error.Halt;
+                t[s] = @splat(true);
+            },
+            .expire => {
+                const p = ge.Expire.decodeAll(e.payload, &diag) catch return error.Halt;
+                var it = p.items.iterator();
+                while (it.next() catch return error.Halt) |named| if (named.id.len == gm.ID_LEN) if (ofScope(named.id[0..gm.SCOPE_LEN])) |sg| {
+                    t[sg[0]][sg[1]] = true;
+                };
+            },
+            .clean => {
+                const p = ge.Clean.decodeAll(e.payload, &diag) catch return error.Halt;
+                var it = p.items.iterator();
+                while (it.next() catch return error.Halt) |named| if (ofScope(named.scope)) |sg| {
+                    t[sg[0]][sg[1]] = true;
+                };
+            },
+            inline else => |k| {
+                const P = switch (k) {
+                    .create => ge.Create,
+                    .delete => ge.Delete,
+                    .deliver => ge.Deliver,
+                    .settle => ge.Settle,
+                    .release => ge.Release,
+                    .extend => ge.Extend,
+                    else => unreachable,
+                };
+                const p = P.decodeAll(e.payload, &diag) catch return error.Halt;
+                t[streamIndex(p.stream) orelse return error.Halt][groupIndex(p.group) orelse return error.Halt] = true;
+            },
+        }
+        return t;
+    }
+
+    fn commits(store: *const Store) [FAMILIES.len + 1]u64 {
+        var out: [FAMILIES.len + 1]u64 = undefined;
+        for (FAMILIES, out[0..FAMILIES.len]) |fam, *c| c.* = store.families[fam].commits;
+        out[FAMILIES.len] = store.families[qm.Helds.ID].commits;
+        return out;
+    }
+
+    fn applyStream(self: *ConsumerGroups, store: *Store, e: *const Entry, kind: Kind, r: Replica) persistence.ApplyError!void {
+        const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return error.Halt;
+        switch (kind) {
+            .append => {
+                const s = streamIndex(cmd.key) orelse return error.Halt;
+                if (cmd.value.len != 4) return error.Halt;
+                const n = std.mem.readInt(u32, cmd.value[0..4], .big);
+                _ = self.stream.appendToStreamAt(gm.streamOf(NS, STREAMS[s]), e.header.index, 0, 0, e.header.timestamp_ns / std.time.ns_per_ms, n, n * RECORD_BYTES) catch return error.Halt;
+            },
+            .trim => {
+                if (cmd.key.len != 16 or cmd.value.len != 8) return error.Halt;
+                const s = for (STREAMS, 0..) |name, i| {
+                    if (std.mem.eql(u8, &streamHash(name), cmd.value)) break i;
+                } else return error.Halt;
+                const up_to: StreamID = .{ .timestamp_ms = std.mem.readInt(u64, cmd.key[0..8], .big), .sequence = std.mem.readInt(u64, cmd.key[8..16], .big) };
+                const sk = gm.streamOf(NS, STREAMS[s]);
+                _ = self.stream.trimStream(sk, up_to);
+                if (r.mutant != .group_trim_misses_floor) try machine_mod.observeEntry(&gm.machine, store, &self.scratch, self.streams(), e);
+                // A stream with groups moves its floor to what the stream lost.
+                if (self.ledger.streams[s]) |*st| {
+                    const cut = self.stream.streamRemovedThrough(sk);
+                    if (cut.greaterThan(st.floor)) st.floor = cut;
+                }
+            },
+            else => {
+                const s = streamIndex(cmd.key) orelse return error.Halt;
+                var nb: [stream_proj.MAX_NAME_KEY]u8 = undefined;
+                _ = self.stream.deleteStream(gm.streamOf(NS, STREAMS[s]), stream_proj.nameKey(&nb, NS, STREAMS[s]).?);
+                try machine_mod.observeEntry(&gm.machine, store, &self.scratch, self.streams(), e);
+                // Its groups are of the old generation now: gone.
+                if (self.ledger.streams[s]) |*st| {
+                    st.gen += 1;
+                    st.floor = StreamID.MIN;
+                }
+            },
+        }
+    }
+
+    // ── What the ledger says an entry does ──────────────────────────────
+
+    const Want = union(enum) {
+        refused: @import("../protocol/proto.zig").StatusCode,
+        create: struct { s: usize, g: usize, made: bool, lease_ms: u64, max_attempts: u32 },
+        delete: struct { s: usize, g: usize, held: u64 },
+        deliver: struct { s: usize, g: usize, made: bool, chosen: []const StreamID, fresh: usize },
+        report: struct { s: usize, g: usize, applied: []const StreamID, refused: []const Refused },
+        expire: []const [3]u128,
+        clean: []const Cleaned,
+    };
+    const Refused = struct { record: StreamID, why: Why };
+    /// A group's cleaned records, by (stream, group), and whether its meta goes.
+    const Cleaned = struct { s: usize, g: usize, records: []const StreamID, drops_meta: bool };
+
+    fn predict(self: *ConsumerGroups, store: *Store, e: *const Entry, kind: Kind) persistence.ApplyError!Want {
+        var diag: schema.Diagnostic = .{};
+        const L = &self.ledger;
+        const a = self.oracle.allocator();
+        const stamp = e.header.timestamp_ns;
+        switch (kind) {
+            .create => {
+                const p = ge.Create.decodeAll(e.payload, &diag) catch return error.Halt;
+                const s = streamIndex(p.stream) orelse return error.Halt;
+                const g = groupIndex(p.group) orelse return error.Halt;
+                if (L.groups[s][g]) |grp| {
+                    if (!L.live(s, g)) return .{ .refused = .unavailable };
+                    if (grp.lease_ms != p.lease_ms or grp.max_attempts != p.max_attempts) return .{ .refused = .conflict };
+                    return .{ .create = .{ .s = s, .g = g, .made = false, .lease_ms = p.lease_ms, .max_attempts = p.max_attempts } };
+                }
+                return .{ .create = .{ .s = s, .g = g, .made = true, .lease_ms = p.lease_ms, .max_attempts = p.max_attempts } };
+            },
+            .delete => {
+                const p = ge.Delete.decodeAll(e.payload, &diag) catch return error.Halt;
+                const s = streamIndex(p.stream) orelse return error.Halt;
+                const g = groupIndex(p.group) orelse return error.Halt;
+                const grp = L.groups[s][g] orelse return .{ .refused = .not_found };
+                if (!L.live(s, g)) return .{ .refused = .not_found };
+                return .{ .delete = .{ .s = s, .g = g, .held = grp.items.count() } };
+            },
+            .deliver => return self.predictDeliver(store, e),
+            .settle, .release, .extend => return self.predictReport(e, kind),
+            .expire => {
+                const p = ge.Expire.decodeAll(e.payload, &diag) catch return error.Halt;
+                var ended: std.ArrayListUnmanaged([3]u128) = .empty;
+                var it = p.items.iterator();
+                while (it.next() catch return error.Halt) |named| {
+                    if (named.expiry_ns > stamp or named.id.len != gm.ID_LEN) continue;
+                    const sg = ofScope(named.id[0..gm.SCOPE_LEN]) orelse continue;
+                    const grp = &(L.groups[sg[0]][sg[1]] orelse continue);
+                    const rec = gm.recordOf(named.id);
+                    const v = grp.items.get(recKey(rec)) orelse continue;
+                    if (v.status != .leased or v.expiry_ns != named.expiry_ns) continue;
+                    // One lease ends once, however often it is named.
+                    if (for (ended.items) |x| {
+                        if (x[0] == sg[0] and x[1] == sg[1] and x[2] == recKey(rec)) break true;
+                    } else false) continue;
+                    try ended.append(a, .{ sg[0], sg[1], recKey(rec) });
+                }
+                return .{ .expire = ended.items };
+            },
+            .clean => {
+                const p = ge.Clean.decodeAll(e.payload, &diag) catch return error.Halt;
+                var cleaned: std.ArrayListUnmanaged(Cleaned) = .empty;
+                var it = p.items.iterator();
+                while (it.next() catch return error.Halt) |named| {
+                    if (named.scope.len != gm.SCOPE_LEN) continue;
+                    const sg = ofScope(named.scope) orelse continue;
+                    const grp = L.groups[sg[0]][sg[1]] orelse continue;
+                    // A scope named twice cleans what the first left.
+                    var done: std.AutoHashMapUnmanaged(u128, void) = .empty;
+                    var dropped = false;
+                    for (cleaned.items) |c| if (c.s == sg[0] and c.g == sg[1]) {
+                        for (c.records) |x| try done.put(a, recKey(x), {});
+                        dropped = dropped or c.drops_meta;
+                    };
+                    if (dropped) continue;
+                    const gone = !L.live(sg[0], sg[1]);
+                    const floor = if (L.streams[sg[0]]) |st| st.floor else StreamID.MIN;
+                    var keys: std.ArrayListUnmanaged(u128) = .empty;
+                    for (grp.items.keys()) |k| if (!done.contains(k)) try keys.append(a, k);
+                    std.mem.sort(u128, keys.items, {}, std.sort.asc(u128));
+                    var out: std.ArrayListUnmanaged(StreamID) = .empty;
+                    var more = false;
+                    for (keys.items) |k| {
+                        if (out.items.len == ge.CLEAN_RECORDS) {
+                            more = true;
+                            break;
+                        }
+                        const rec = keyRec(k);
+                        if (!gone and rec.greaterThan(floor)) break;
+                        try out.append(a, rec);
+                    }
+                    try cleaned.append(a, .{ .s = sg[0], .g = sg[1], .records = out.items, .drops_meta = gone and !more });
+                }
+                return .{ .clean = cleaned.items };
+            },
+            else => unreachable,
+        }
+    }
+
+    fn predictDeliver(self: *ConsumerGroups, store: *Store, e: *const Entry) persistence.ApplyError!Want {
+        var diag: schema.Diagnostic = .{};
+        const L = &self.ledger;
+        const a = self.oracle.allocator();
+        const stamp = e.header.timestamp_ns;
+        const p = ge.Deliver.decodeAll(e.payload, &diag) catch return error.Halt;
+        const s = streamIndex(p.stream) orelse return error.Halt;
+        const g = groupIndex(p.group) orelse return error.Halt;
+        const sk = gm.streamOf(NS, p.stream);
+        const made = L.groups[s][g] == null;
+        if (made and !p.create) return .{ .refused = .not_found };
+        if (!made and !L.live(s, g)) return .{ .refused = .unavailable };
+        const floor = if (L.streams[s]) |st| st.floor else self.stream.streamRemovedThrough(sk);
+        const grp: ?*LGroup = if (L.groups[s][g]) |*x| x else null;
+        const cursor = if (grp) |x| x.cursor else StreamID.MIN;
+
+        var chosen: std.ArrayListUnmanaged(StreamID) = .empty;
+        // An answer counts each append once, at its bound; the first record
+        // always fits.
+        var seen: std.ArrayListUnmanaged(StreamID) = .empty;
+        var used: u64 = 0;
+        const Fit = enum { fits, full, gone };
+        const fit = struct {
+            fn f(proj: *const stream_proj.StreamProjection, key: StreamKey, record: StreamID, first: bool, sn: *std.ArrayListUnmanaged(StreamID), u: *u64, max: u64, al: Allocator) !Fit {
+                const ap = proj.streamAppendOf(key, record) orelse return .gone;
+                for (sn.items) |x| if (x.eql(ap.id)) return .fits;
+                const bytes = stream_proj.answerBound(ap);
+                if (!first and u.* + bytes > max) return .full;
+                u.* += bytes;
+                try sn.append(al, ap.id);
+                return .fits;
+            }
+        }.f;
+
+        // The leader's chosen ready records, still ready and due, above the
+        // floor, each once.
+        var it = p.ready.iterator();
+        while (it.next() catch return error.Halt) |named| {
+            if (chosen.items.len == p.count) break;
+            const rec: StreamID = .{ .timestamp_ms = named.ms, .sequence = named.seq };
+            if (!rec.greaterThan(floor)) continue;
+            if (for (chosen.items) |c| {
+                if (c.eql(rec)) break true;
+            } else false) continue;
+            const x = grp orelse continue;
+            const v = x.items.get(recKey(rec)) orelse continue;
+            if (v.status != .ready or v.due_ns > stamp) continue;
+            switch (try fit(&self.stream, sk, rec, chosen.items.len == 0, &seen, &used, p.max_bytes, a)) {
+                .gone => continue,
+                .full => break,
+                .fits => try chosen.append(a, rec),
+            }
+        }
+        // Then the stream's records past the cursor, up to the bound, while
+        // the caps hold. A budget the ready ones filled still takes a fresh
+        // record of an append already counted.
+        var fresh: usize = 0;
+        var capped = false;
+        {
+            const from = if (floor.greaterThan(cursor)) floor else cursor;
+            const ids = try a.alloc(StreamID, p.count - chosen.items.len);
+            const got = self.stream.streamIdsAfter(sk, from, ids);
+            const held: u64 = if (grp) |x| x.items.count() else 0;
+            const held_bytes: u64 = if (grp) |x| x.heldBytes() else 0;
+            const shard = shardHeld(store);
+            const each = gm.heldBy(0);
+            const through: StreamID = .{ .timestamp_ms = p.through_ms, .sequence = p.through_seq };
+            for (ids[0..got]) |rec| {
+                if (rec.greaterThan(through)) break;
+                if (held + fresh + 1 > p.max_held or held_bytes + each * (fresh + 1) > p.max_held_bytes or shard + each * (fresh + 1) > p.shard_held_bytes) {
+                    capped = true;
+                    break;
+                }
+                switch (try fit(&self.stream, sk, rec, chosen.items.len == 0, &seen, &used, p.max_bytes, a)) {
+                    .gone, .full => break,
+                    .fits => {},
+                }
+                try chosen.append(a, rec);
+                fresh += 1;
+            }
+        }
+        if (chosen.items.len == 0 and capped) return .{ .refused = .overloaded };
+        return .{ .deliver = .{ .s = s, .g = g, .made = made, .chosen = chosen.items, .fresh = fresh } };
+    }
+
+    const ReportOf = struct { stream: []const u8, group: []const u8, holder: []const u8, token: ae.Token.Value, items: ge.Items.Value };
+
+    fn reportOf(e: *const Entry, kind: Kind) persistence.ApplyError!ReportOf {
+        var diag: schema.Diagnostic = .{};
+        return switch (kind) {
+            inline .settle, .release, .extend => |k| blk: {
+                const P = switch (k) {
+                    .settle => ge.Settle,
+                    .release => ge.Release,
+                    else => ge.Extend,
+                };
+                const p = P.decodeAll(e.payload, &diag) catch return error.Halt;
+                break :blk .{ .stream = p.stream, .group = p.group, .holder = p.holder, .token = p.token, .items = p.items };
+            },
+            else => unreachable,
+        };
+    }
+
+    fn holds(v: LItem, holder: []const u8, deliveries: u32, token: ae.Token.Value) bool {
+        return v.status == .leased and same(v, holder, deliveries, token);
+    }
+
+    fn same(v: LItem, holder: []const u8, deliveries: u32, token: ae.Token.Value) bool {
+        return v.deliveries == deliveries and v.token.term == token.term and v.token.index == token.index and std.mem.eql(u8, v.holder, holder);
+    }
+
+    fn whyNot(v: LItem, holder: []const u8, deliveries: u32, token: ae.Token.Value) Why {
+        if (v.deliveries != deliveries or v.token.term != token.term or v.token.index != token.index) return .delivered_again;
+        if (!std.mem.eql(u8, v.holder, holder)) return .other_holder;
+        return switch (v.ended) {
+            .expired => .expired,
+            .released, .abandoned => .released,
+            else => .not_held,
+        };
+    }
+
+    fn predictReport(self: *ConsumerGroups, e: *const Entry, kind: Kind) persistence.ApplyError!Want {
+        var diag: schema.Diagnostic = .{};
+        const L = &self.ledger;
+        const a = self.oracle.allocator();
+        const c = try reportOf(e, kind);
+        const s = streamIndex(c.stream) orelse return error.Halt;
+        const g = groupIndex(c.group) orelse return error.Halt;
+        if (kind == .release) {
+            const p = ge.Release.decodeAll(e.payload, &diag) catch return error.Halt;
+            if (p.ended != .failed and (p.dead or p.delay_ms > 0 or p.@"error".len > 0)) return .{ .refused = .bad_request };
+        }
+        if (!L.live(s, g)) return .{ .refused = .not_found };
+        const grp = &L.groups[s][g].?;
+        var applied: std.ArrayListUnmanaged(StreamID) = .empty;
+        var refused: std.ArrayListUnmanaged(Refused) = .empty;
+        var it = c.items.iterator();
+        while (it.next() catch return error.Halt) |named| {
+            const rec: StreamID = .{ .timestamp_ms = named.ms, .sequence = named.seq };
+            const v = grp.items.get(recKey(rec)) orelse {
+                try refused.append(a, .{ .record = rec, .why = .gone });
+                continue;
+            };
+            // A record named twice in one report: its second finds what the
+            // first left, which the ledger has not applied yet; the
+            // workload names each once, so this stays simple.
+            if (!holds(v, c.holder, named.deliveries, c.token)) {
+                const repeat = kind == .release and same(v, c.holder, named.deliveries, c.token) and blk: {
+                    const p = ge.Release.decodeAll(e.payload, &diag) catch return error.Halt;
+                    break :blk v.ended == (if (p.ended == .failed) Ended.released else Ended.abandoned);
+                };
+                if (repeat) {
+                    try applied.append(a, rec);
+                    continue;
+                }
+                try refused.append(a, .{ .record = rec, .why = whyNot(v, c.holder, named.deliveries, c.token) });
+                continue;
+            }
+            if (kind == .extend) {
+                const p = ge.Extend.decodeAll(e.payload, &diag) catch return error.Halt;
+                if (p.lease_ms != v.lease_ms or p.held_since_ns != v.delivered_ns) {
+                    try refused.append(a, .{ .record = rec, .why = .delivered_again });
+                    continue;
+                }
+            }
+            try applied.append(a, rec);
+        }
+        return .{ .report = .{ .s = s, .g = g, .applied = applied.items, .refused = refused.items } };
+    }
+
+    /// Whether the machine's answer is the ledger's.
+    fn answerBroke(self: *ConsumerGroups, want: Want, out: *const persistence.Result, effect: *Effect) ?[]const u8 {
+        _ = self;
+        var rd = out.reader();
+        switch (want) {
+            .refused => unreachable,
+            .create => |w| {
+                const made = rd.int(u8) orelse return "a create answered nothing";
+                if ((made == 1) != w.made) return "a create answered made where the ledger has the group, or the reverse";
+            },
+            .delete => |w| {
+                const held = rd.int(u64) orelse return "a delete answered nothing";
+                if (held != w.held) return "a delete answered another count of held records than the ledger's";
+            },
+            .deliver => |w| {
+                const n = rd.int(u32) orelse return "a deliver answered nothing";
+                if (n != w.chosen.len) return "a deliver leased another number of records than the ledger's choice";
+                for (w.chosen) |c| {
+                    const ms = rd.int(u64) orelse return "a deliver's answer is short";
+                    const seq = rd.int(u64) orelse return "a deliver's answer is short";
+                    _ = rd.int(u32) orelse return "a deliver's answer is short";
+                    if (ms != c.timestamp_ms or seq != c.sequence) return "a deliver leased other records than the ledger's choice, or in another order";
+                }
+                effect.applied = n;
+            },
+            .report => |w| {
+                const n = rd.int(u32) orelse return "a report answered nothing";
+                if (n != w.applied.len) return "a report applied to another number of records than the ledger's";
+                if (effect.kind == .extend) _ = rd.int(u64) orelse return "an extend answered no expiry";
+                for (w.refused) |x| {
+                    const ms = rd.int(u64) orelse return "a report refused fewer records than the ledger";
+                    const seq = rd.int(u64) orelse return "a report refused fewer records than the ledger";
+                    const why: Why = @fromBackingInt(rd.int(u8) orelse return "a report refused fewer records than the ledger");
+                    if (ms != x.record.timestamp_ms or seq != x.record.sequence) return "a report refused other records than the ledger";
+                    if (why != x.why) return "a report refused a record with another reason than the ledger's";
+                }
+                if (rd.int(u64) != null) return "a report refused more records than the ledger";
+                effect.applied = n;
+                effect.refused_items = @intCast(w.refused.len);
+            },
+            .expire => |w| {
+                const n = rd.int(u32) orelse return "an expire answered nothing";
+                if (n != w.len) return "an expire ended another number of leases than the ledger's";
+                effect.applied = n;
+            },
+            .clean => |w| {
+                const n = rd.int(u64) orelse return "a clean answered nothing";
+                var sum: u64 = 0;
+                for (w) |c| sum += c.records.len;
+                if (n != sum) return "a clean removed another number of records than the ledger's";
+            },
+        }
+        return null;
+    }
+
+    /// The ledger moves as the entry says, by its own rules.
+    fn commit(self: *ConsumerGroups, e: *const Entry, kind: Kind, want: Want) void {
+        var diag: schema.Diagnostic = .{};
+        const L = &self.ledger;
+        const la = L.alloc();
+        const stamp = e.header.timestamp_ns;
+        const token: ae.Token.Value = .{ .term = e.header.term, .index = e.header.index };
+        switch (want) {
+            .refused => unreachable,
+            .create => |w| if (w.made) {
+                const st = L.addGroup(w.s, self.stream.streamRemovedThrough(gm.streamOf(NS, STREAMS[w.s])));
+                L.groups[w.s][w.g] = .{ .stream = w.s, .lease_ms = w.lease_ms, .max_attempts = w.max_attempts, .created_ns = stamp, .gen = st.gen };
+            },
+            .delete => |w| {
+                const grp = &L.groups[w.s][w.g].?;
+                if (w.held == 0) {
+                    L.groups[w.s][w.g] = null;
+                    L.dropGroup(w.s);
+                } else grp.gen = gm.GONE;
+            },
+            .deliver => |w| {
+                const p = ge.Deliver.decodeAll(e.payload, &diag) catch unreachable;
+                if (w.made) {
+                    const st = L.addGroup(w.s, self.stream.streamRemovedThrough(gm.streamOf(NS, STREAMS[w.s])));
+                    L.groups[w.s][w.g] = .{ .stream = w.s, .lease_ms = ge.DEFAULT_LEASE_MS, .max_attempts = ge.DEFAULT_MAX_ATTEMPTS, .created_ns = stamp, .gen = st.gen };
+                }
+                const grp = &L.groups[w.s][w.g].?;
+                const holder = la.dupe(u8, p.holder) catch @panic("sim OOM");
+                for (w.chosen, 0..) |rec, i| {
+                    const fresh = i >= w.chosen.len - w.fresh;
+                    const gop = grp.items.getOrPut(la, recKey(rec)) catch @panic("sim OOM");
+                    if (fresh) gop.value_ptr.* = .{ .status = .ready, .due_ns = stamp };
+                    const v = gop.value_ptr;
+                    v.status = .leased;
+                    v.deliveries +|= 1;
+                    v.holder = holder;
+                    v.token = token;
+                    v.lease_ms = p.lease_ms;
+                    v.delivered_ns = stamp;
+                    v.expiry_ns = delivery.after(stamp, p.lease_ms);
+                    v.ended = .none;
+                    if (v.started_ns == 0) v.started_ns = stamp;
+                }
+                if (w.fresh > 0) grp.cursor = w.chosen[w.chosen.len - 1];
+                grp.delivered += w.chosen.len;
+            },
+            .report => |w| {
+                const grp = &L.groups[w.s][w.g].?;
+                const c = reportOf(e, kind) catch unreachable;
+                for (w.applied) |rec| {
+                    const v = grp.items.getPtr(recKey(rec)).?;
+                    // A resent release changes nothing.
+                    if (!holds(v.*, c.holder, v.deliveries, c.token) or v.status != .leased) continue;
+                    switch (kind) {
+                        .settle => {
+                            _ = grp.items.orderedRemove(recKey(rec));
+                            grp.settled += 1;
+                        },
+                        .release => {
+                            const p = ge.Release.decodeAll(e.payload, &diag) catch unreachable;
+                            if (p.ended != .failed) {
+                                v.ended = .abandoned;
+                                if (p.ended == .unread) v.deliveries -= 1;
+                                v.status = .ready;
+                                v.due_ns = stamp;
+                                continue;
+                            }
+                            v.ended = .released;
+                            v.failures +|= 1;
+                            v.err_len = p.@"error".len;
+                            grp.released += 1;
+                            if (p.dead or v.failures >= grp.max_attempts) {
+                                die(grp, v, stamp);
+                            } else {
+                                v.status = .ready;
+                                v.due_ns = delivery.after(stamp, p.delay_ms);
+                            }
+                        },
+                        else => {
+                            if (v.expiry_ns -| stamp > (v.lease_ms *| std.time.ns_per_ms) / 2) continue;
+                            const to = @min(delivery.after(stamp, v.lease_ms), delivery.after(v.delivered_ns, ae.MAX_HOLD_MS));
+                            if (to > v.expiry_ns) v.expiry_ns = to;
+                        },
+                    }
+                }
+            },
+            .expire => |w| for (w) |x| {
+                const grp = &L.groups[@intCast(x[0])][@intCast(x[1])].?;
+                const v = grp.items.getPtr(x[2]).?;
+                v.ended = .expired;
+                v.failures +|= 1;
+                v.err_len = "lease expired".len;
+                grp.expired += 1;
+                if (v.failures >= grp.max_attempts) die(grp, v, stamp) else {
+                    v.status = .ready;
+                    v.due_ns = stamp;
+                }
+            },
+            .clean => |w| for (w) |c| {
+                const grp = &L.groups[c.s][c.g].?;
+                const gone = !L.live(c.s, c.g);
+                for (c.records) |rec| _ = grp.items.orderedRemove(recKey(rec));
+                if (!gone) grp.trimmed += c.records.len;
+                if (c.drops_meta) {
+                    L.groups[c.s][c.g] = null;
+                    L.dropGroup(c.s);
+                }
+            },
+        }
+    }
+
+    // ── Mutants ─────────────────────────────────────────────────────────
+
+    /// The entry a mutant applies in place of `e`; `e` itself otherwise.
+    fn rewritten(self: *ConsumerGroups, e: *const Entry, kind: Kind, r: Replica) persistence.ApplyError!Entry {
+        var out = e.*;
+        var diag: schema.Diagnostic = .{};
+        const a = self.oracle.allocator();
+        switch (r.mutant) {
+            .group_deliver_cursor_first => if (kind == .deliver) {
+                var p = ge.Deliver.decodeAll(e.payload, &diag) catch return error.Halt;
+                p.ready = .{ .bytes = "", .count = 0 };
+                const buf = try a.alloc(u8, ge.Deliver.encodedSize(p) catch return error.Halt);
+                out.payload = ge.Deliver.encodeInto(buf, p) catch return error.Halt;
+            },
+            .group_abandon_counts_failure => if (kind == .release) {
+                var p = ge.Release.decodeAll(e.payload, &diag) catch return error.Halt;
+                if (p.ended != .abandoned) return out;
+                p.ended = .failed;
+                const buf = try a.alloc(u8, ge.Release.encodedSize(p) catch return error.Halt);
+                out.payload = ge.Release.encodeInto(buf, p) catch return error.Halt;
+            },
+            .group_expire_ignores_deadline => if (kind == .expire) {
+                // As late as its latest named live lease: one not yet due
+                // then ends.
+                const p = ge.Expire.decodeAll(e.payload, &diag) catch return error.Halt;
+                var it = p.items.iterator();
+                while (it.next() catch return error.Halt) |named| {
+                    if (named.id.len != gm.ID_LEN) continue;
+                    const sg = ofScope(named.id[0..gm.SCOPE_LEN]) orelse continue;
+                    const grp = self.ledger.groups[sg[0]][sg[1]] orelse continue;
+                    const v = grp.items.get(recKey(gm.recordOf(named.id))) orelse continue;
+                    if (v.status == .leased and v.expiry_ns == named.expiry_ns) out.header.timestamp_ns = @max(out.header.timestamp_ns, named.expiry_ns);
+                }
+            },
+            else => {},
+        }
+        return out;
+    }
+
+    /// A mutant's change to the state an applied entry left.
+    fn plantAfter(store: *Store, e: *const Entry, kind: Kind, want: Want, r: Replica) persistence.ApplyError!void {
+        switch (r.mutant) {
+            .group_settle_keeps_bytes => if (kind == .settle) {
+                const w = want.report;
+                if (w.applied.len == 0) return;
+                var b: [4 + gm.SCOPE_LEN]u8 = undefined;
+                const scope = gm.scopeOf(NS, STREAMS[w.s], GROUPS[w.g]);
+                const key = gm.storeKey(&b, NS, &scope);
+                const node = store.find(gm.Metas.ID, key) orelse return;
+                var m = (gm.Metas.Value.decode(store_mod.Record.of(node).value) catch return error.Halt).v;
+                m.held_bytes += gm.heldBy(0) * w.applied.len;
+                const bytes = try store.allocator.alloc(u8, gm.Meta.encodedSize(m) catch return error.Halt);
+                _ = gm.Meta.encodeInto(bytes, m) catch return error.Halt;
+                store.replace(gm.Metas.ID, node, bytes);
+            },
+            .group_delete_keeps_count => if (kind == .delete) {
+                var b: [13]u8 = undefined;
+                const key = gm.recKey(&b, gm.streamOf(NS, STREAMS[want.delete.s]));
+                const node = store.find(gm.Streams_.ID, key) orelse return;
+                var rec = (gm.Streams_.Value.decode(store_mod.Record.of(node).value) catch return error.Halt).v;
+                rec.groups += 1;
+                const bytes = try store.allocator.alloc(u8, gm.StreamRec.encodedSize(rec) catch return error.Halt);
+                _ = gm.StreamRec.encodeInto(bytes, rec) catch return error.Halt;
+                store.replace(gm.Streams_.ID, node, bytes);
+            },
+            else => {},
+        }
+        _ = e;
+    }
+
+    fn die(grp: *LGroup, v: *LItem, stamp: u64) void {
+        v.status = .dead;
+        v.dead_ns = stamp;
+        grp.dead_lettered += 1;
+    }
+
+    // ── The ledger against the store ────────────────────────────────────
+
+    fn matchesLedger(self: *ConsumerGroups, store: *Store, touched: Touched) ?[]const u8 {
+        const L = &self.ledger;
+        for (STREAMS, 0..) |sname, s| {
+            if (std.mem.indexOfScalar(bool, &touched[s], true) == null) continue;
+            const rec = streamRec(store, sname);
+            if (L.streams[s]) |st| {
+                const got = rec orelse return "a stream's record is gone where the ledger keeps it";
+                if (got.gen != st.gen or got.groups != st.groups) return "a stream's record has another generation or group count than the ledger's";
+                if (got.floor_ms != st.floor.timestamp_ms or got.floor_seq != st.floor.sequence) return "a stream's floor is not the last record it lost";
+            } else if (rec != null) return "a stream's record stays where no group of it is";
+            for (GROUPS, 0..) |gname, g| {
+                if (!touched[s][g]) continue;
+                const m = meta(store, sname, gname);
+                const grp = L.groups[s][g] orelse {
+                    if (m != null) return "a group's meta stays where the ledger has none";
+                    continue;
+                };
+                const got = m orelse return "a group's meta is gone where the ledger keeps it";
+                if ((got.gen == gm.GONE) != (grp.gen == gm.GONE)) return "a group is gone where the ledger keeps it live, or the reverse";
+                if (grp.gen != gm.GONE and got.gen != grp.gen) return "a group's generation is not its stream's at its create";
+                if (got.lease_ms != grp.lease_ms or got.max_attempts != grp.max_attempts) return "a group's settings are not those it was made with";
+                if (got.cursor_ms != grp.cursor.timestamp_ms or got.cursor_seq != grp.cursor.sequence) return "a group's cursor is not the last fresh record it delivered";
+                if (got.ready != grp.count(.ready) or got.leased != grp.count(.leased) or got.dead != grp.count(.dead)) return "a group's counts are not the ledger's";
+                if (got.held_bytes != grp.heldBytes()) return "a group's held bytes are not what the ledger's records hold";
+                if (got.delivered != grp.delivered or got.settled != grp.settled or got.released != grp.released or got.dead_lettered != grp.dead_lettered or got.expired != grp.expired or got.trimmed != grp.trimmed)
+                    return "a group's counters are not the ledger's";
+                // Each of the ledger's records, as the store holds it.
+                for (grp.items.keys(), grp.items.values()) |k, v| {
+                    const it = item(store, sname, gname, keyRec(k)) orelse return "a record the ledger holds is gone from its group";
+                    if (it.status != v.status) return "a record's state is not the ledger's";
+                    if (it.deliveries != v.deliveries or it.failures != v.failures) return "a record's deliveries or failures are not the ledger's";
+                    if (it.ended != v.ended or it.@"error".len != v.err_len) return "a record's ending is not the ledger's";
+                    switch (v.status) {
+                        .ready => if (it.due_ns != v.due_ns) return "a ready record is due at another time than the ledger's",
+                        .leased => if (!std.mem.eql(u8, it.holder, v.holder) or it.token.term != v.token.term or it.token.index != v.token.index or it.expiry_ns != v.expiry_ns or it.lease_ms != v.lease_ms or it.delivered_ns != v.delivered_ns)
+                            return "a leased record's delivery is not the ledger's",
+                        .dead => if (it.dead_ns != v.dead_ns) return "a dead record died at another time than the ledger's",
+                    }
+                }
+                // And no record the ledger doesn't hold.
+                var n: u64 = 0;
+                var pb: [4 + gm.SCOPE_LEN]u8 = undefined;
+                const scope = gm.scopeOf(NS, sname, gname);
+                var it = (view_mod.ReadView{ .store = store }).range(gm.Items, gm.storeKey(&pb, NS, &scope));
+                while (it.next() catch null) |_| n += 1;
+                if (n != grp.items.count()) return "a group holds a record the ledger doesn't";
+            }
+        }
+        return null;
+    }
+
+    /// What any store of groups must be: each record has the key its state
+    /// says, no ready or dead key is left over, and the shard's held bytes
+    /// are every queue's and every group's.
+    fn rulesOfStore(store: *Store, touched: Touched) ?[]const u8 {
+        const rv: view_mod.ReadView = .{ .store = store };
+        for (STREAMS, 0..) |sname, si| for (GROUPS, 0..) |gname, gi| {
+            if (!touched[si][gi]) continue;
+            const scope = gm.scopeOf(NS, sname, gname);
+            var pb: [4 + gm.SCOPE_LEN]u8 = undefined;
+            var counts: [3]u64 = .{ 0, 0, 0 };
+            var it = rv.range(gm.Items, gm.storeKey(&pb, NS, &scope));
+            while (it.next() catch null) |entry| {
+                const v = entry.value.v;
+                const id = entry.key[4..];
+                counts[@backingInt(v.status)] += 1;
+                var b: KeyBuf = undefined;
+                var kb: [4 + @sizeOf(KeyBuf)]u8 = undefined;
+                switch (v.status) {
+                    .ready => if (store.get(gm.Ready.ID, gm.storeKey(&kb, NS, gm.readyKeyOf(&b, v, v.due_ns, id))) == null) return "a ready record has no ready key at its due time",
+                    .leased => if (store.get(gm.Deadlines.ID, view_mod.key(&kb, "", gm.deadlineKey(&b, v.expiry_ns, NS, id)) catch return null) == null) return "a leased record has no deadline key at its expiry",
+                    .dead => {
+                        const dk = gm.deadKey(scope, v.dead_ns, gm.recordOf(id));
+                        if (store.get(gm.Dead.ID, gm.storeKey(&kb, NS, &dk)) == null) return "a dead record has no dead key";
+                    },
+                }
+            }
+            var rb: [gm.SCOPE_LEN + 1]u8 = undefined;
+            var rk: [4 + gm.SCOPE_LEN + 1]u8 = undefined;
+            var ready_keys: u64 = 0;
+            var ri = rv.range(gm.Ready, gm.storeKey(&rk, NS, gm.readyPrefix(&rb, &scope)));
+            while (ri.next() catch null) |_| ready_keys += 1;
+            if (ready_keys != counts[0]) return "a group has a ready key no ready record holds";
+            var dead_keys: u64 = 0;
+            var di = rv.range(gm.Dead, gm.storeKey(&pb, NS, &scope));
+            while (di.next() catch null) |_| dead_keys += 1;
+            if (dead_keys != counts[2]) return "a group has a dead key no dead record holds";
+        };
+        var sum: u64 = 0;
+        var qi = rv.range(qm.Metas, "");
+        while (qi.next() catch null) |m| sum += m.value.v.held_bytes;
+        var gi = rv.range(gm.Metas, "");
+        while (gi.next() catch null) |m| sum += m.value.v.held_bytes;
+        if (sum != shardHeld(store)) return "the shard's held bytes aren't its queues' and groups' held bytes";
+        return null;
+    }
+
+    pub fn checksums(self: *ConsumerGroups, store: *Store) [SUMS]u64 {
+        var sums: [SUMS]u64 = undefined;
+        for (FAMILIES, sums[0..FAMILIES.len]) |fam, *sum| sum.* = store_mod.checksum(store, fam);
+        // The projection's view of each stream, as the machine reads it.
+        var h = std.hash.Wyhash.init(0x57);
+        for (STREAMS) |name| {
+            const sk = gm.streamOf(NS, name);
+            for ([_]StreamID{ self.stream.streamFirstId(sk), self.stream.streamLastId(sk), self.stream.streamRemovedThrough(sk) }) |id| h.update(std.mem.asBytes(&id));
+        }
+        sums[FAMILIES.len] = h.final();
+        return sums;
+    }
+};

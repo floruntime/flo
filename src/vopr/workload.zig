@@ -111,6 +111,10 @@ pub const Op = struct {
     proposer: u32,
     term: u64,
     index: u64,
+    /// Made by its leader from applied state (`nextActionOp`): found by
+    /// where it was proposed, not by its payload. A stream append a group
+    /// workload made shares its type with the synthesized ones.
+    made: bool = false,
 };
 
 pub const Workload = struct {
@@ -575,6 +579,7 @@ pub const Workload = struct {
             .proposer = 0,
             .term = 0,
             .index = 0,
+            .made = true,
         });
         return id;
     }
@@ -589,11 +594,11 @@ pub const Workload = struct {
         op.proposer = proposer;
         op.term = term;
         op.index = index;
-        if (isAction(@backingInt(op.entry_type))) self.action_slots.put(self.allocator, .{ term, index }, op_id) catch @panic("sim OOM");
+        if (op.made) self.action_slots.put(self.allocator, .{ term, index }, op_id) catch @panic("sim OOM");
     }
 
     fn isAction(entry_type: u8) bool {
-        for ([_]EntryType{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge }) |t| {
+        for ([_]EntryType{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge, .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean, .stream_trim, .stream_delete }) |t| {
             if (entry_type == @backingInt(t)) return true;
         }
         return false;
@@ -605,7 +610,8 @@ pub const Workload = struct {
     /// acked, is still matched against what was proposed there; one with
     /// no op is checked by the log alone.
     pub fn opIdAt(self: *const Workload, term: u64, index: u64, entry_type: u8, payload: []const u8) ?u64 {
-        if (isAction(entry_type)) return self.action_slots.get(.{ term, index });
+        if (self.action_slots.get(.{ term, index })) |id| return id;
+        if (isAction(entry_type)) return null;
         return opIdFromPayload(entry_type, payload);
     }
 

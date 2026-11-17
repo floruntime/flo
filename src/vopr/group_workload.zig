@@ -1,0 +1,317 @@
+//! Consumer-group entries for the VOPR workload, made as the leader's
+//! handlers make them: from the proposing leader's own applied state, so a
+//! deliver names the ready records its leader sees and a report names a
+//! live delivery. Reports are spoiled now and then (a stale token, another
+//! holder, a wrong delivery count, a record gone) so the machine's
+//! per-record refusals run too. Streams grow by appends, are trimmed and
+//! now and then deleted, so floors move, generations turn and cleanup runs.
+
+const std = @import("std");
+const entry_mod = @import("../storage/ual/entry.zig");
+const ge = @import("../protocol/group_entries.zig");
+const ae = @import("../protocol/action_entries.zig");
+const qe = @import("../protocol/queue_entries.zig");
+const gm = @import("../stream/group_machine.zig");
+const store_mod = @import("../contract/store.zig");
+const view_mod = @import("../contract/view.zig");
+const schema = @import("../protocol/schema.zig");
+const gf = @import("group_family.zig");
+const Leader = @import("action_workload.zig").Leader;
+
+const EntryType = entry_mod.EntryType;
+const StreamID = gm.StreamID;
+const ConsumerGroups = gf.ConsumerGroups;
+const NS = gf.NS;
+const STREAMS = gf.STREAMS;
+const GROUPS = gf.GROUPS;
+
+pub const Made = struct { entry_type: EntryType, payload: []const u8 };
+
+/// Holders whose name starts so never report: their leases expire.
+const DEAD = "x";
+const HOLDERS = [_][]const u8{ "c0", "c1", "c2", "x0" };
+/// A stream stops growing past this many records: appends wait for trims.
+const MAX_RECORDS: u64 = 64;
+const LEASES = [_]u64{ ae.MIN_LEASE_MS, 2 * ae.MIN_LEASE_MS, ge.DEFAULT_LEASE_MS };
+
+const Kind = enum { append, deliver, settle, release, extend, expire, clean, trim, create, delete, stream_delete };
+/// Out of 100.
+const WEIGHTS = [_]u8{ 20, 24, 13, 12, 4, 10, 7, 3, 4, 2, 1 };
+/// Percent of reports spoiled.
+const SPOIL: u8 = 15;
+
+/// A group entry for op `op_id`, in `buf`, at most `max_len` bytes, from
+/// the leader's applied state (`g` and its `store`); null when the leader
+/// has nothing of the kind drawn to propose.
+pub fn make(g: *ConsumerGroups, store: *store_mod.Store, l: Leader, r: std.Random, buf: []u8, max_len: usize) ?Made {
+    const out = buf[0..@min(buf.len, max_len)];
+    var roll = r.uintLessThan(u8, 100);
+    const kind: Kind = for (WEIGHTS, 0..) |w, i| {
+        if (roll < w) break @fromBackingInt(@intCast(i));
+        roll -= w;
+    } else .append;
+    const s = r.uintLessThan(usize, STREAMS.len);
+    const grp = r.uintLessThan(usize, GROUPS.len);
+    return switch (kind) {
+        .append => append(g, out, r, s),
+        .deliver => deliver(g, store, out, l, r, s, grp),
+        .settle, .release, .extend => report(store, out, kind, l, r, s, grp),
+        .expire => expire(store, out, l, r),
+        .clean => clean(out),
+        .trim => trim(g, out, r, s),
+        .create => create(store, out, r, s, grp),
+        .delete => delete(out, s, grp),
+        .stream_delete => if (r.uintLessThan(u8, 8) == 0) streamDelete(out, s) else null,
+    } catch null;
+}
+
+fn recordsOf(g: *ConsumerGroups, s: usize) u64 {
+    const sk = gm.streamOf(NS, STREAMS[s]);
+    const first = g.stream.streamFirstId(sk);
+    if (first.eql(StreamID.MIN)) return 0;
+    var ids: [MAX_RECORDS + 1]StreamID = undefined;
+    return g.stream.streamIdsAfter(sk, g.stream.streamRemovedThrough(sk), &ids);
+}
+
+fn append(g: *ConsumerGroups, out: []u8, r: std.Random, s: usize) !?Made {
+    if (recordsOf(g, s) >= MAX_RECORDS) return null;
+    var v: [4]u8 = undefined;
+    std.mem.writeInt(u32, &v, 1 + r.uintLessThan(u32, 3), .big);
+    return .{ .entry_type = .stream_append, .payload = gf.streamEntry(out, STREAMS[s], &v) orelse return null };
+}
+
+fn trim(g: *ConsumerGroups, out: []u8, r: std.Random, s: usize) !?Made {
+    const sk = gm.streamOf(NS, STREAMS[s]);
+    var ids: [MAX_RECORDS + 1]StreamID = undefined;
+    const n = g.stream.streamIdsAfter(sk, g.stream.streamRemovedThrough(sk), &ids);
+    if (n == 0) return null;
+    // Through some record, the oldest half most often.
+    const at = r.uintLessThan(usize, @max(1, n / 2 + @intFromBool(r.boolean()) * (n / 2)));
+    const key = gf.trimKey(ids[@min(at, n - 1)]);
+    const hash = gf.streamHash(STREAMS[s]);
+    return .{ .entry_type = .stream_trim, .payload = gf.streamEntry(out, &key, &hash) orelse return null };
+}
+
+fn streamDelete(out: []u8, s: usize) !?Made {
+    return .{ .entry_type = .stream_delete, .payload = gf.streamEntry(out, STREAMS[s], "") orelse return null };
+}
+
+fn create(store: *store_mod.Store, out: []u8, r: std.Random, s: usize, grp: usize) !?Made {
+    // Mostly the settings it has, so a create of a group there changes
+    // nothing; now and then others, refused.
+    var lease = LEASES[r.uintLessThan(usize, LEASES.len)];
+    var attempts: u32 = 1 + r.uintLessThan(u32, 4);
+    if (ConsumerGroups.meta(store, STREAMS[s], GROUPS[grp])) |m| if (r.uintLessThan(u8, 4) != 0) {
+        lease = m.lease_ms;
+        attempts = m.max_attempts;
+    };
+    const p = try ge.Create.encodeInto(out, .{ .ns = NS.int(), .stream = STREAMS[s], .group = GROUPS[grp], .lease_ms = lease, .max_attempts = attempts });
+    return .{ .entry_type = .group_create, .payload = p };
+}
+
+fn delete(out: []u8, s: usize, grp: usize) !?Made {
+    const p = try ge.Delete.encodeInto(out, .{ .ns = NS.int(), .stream = STREAMS[s], .group = GROUPS[grp] });
+    return .{ .entry_type = .group_delete, .payload = p };
+}
+
+/// The group's ready records due by the leader's clock, in its ready keys'
+/// order, as the handler chooses them.
+fn readyDue(store: *store_mod.Store, s: usize, grp: usize, now: u64, out: []StreamID) usize {
+    const scope = gm.scopeOf(NS, STREAMS[s], GROUPS[grp]);
+    var pb: [gm.SCOPE_LEN + 1]u8 = undefined;
+    var kb: [4 + gm.SCOPE_LEN + 1]u8 = undefined;
+    var it = (view_mod.ReadView{ .store = store }).range(gm.Ready, gm.storeKey(&kb, NS, gm.readyPrefix(&pb, &scope)));
+    var n: usize = 0;
+    while (it.next() catch null) |entry| {
+        if (n == out.len) break;
+        const k = gm.parseReadyKey(entry.key[4..], gm.SCOPE_LEN) orelse continue;
+        if (k.due_ns > now) break;
+        out[n] = gm.recordOf(k.id);
+        n += 1;
+    }
+    return n;
+}
+
+fn deliver(g: *ConsumerGroups, store: *store_mod.Store, out: []u8, l: Leader, r: std.Random, s: usize, grp: usize) !?Made {
+    const sk = gm.streamOf(NS, STREAMS[s]);
+    var ready: [8]StreamID = undefined;
+    const n = readyDue(store, s, grp, l.now_ns, &ready);
+    var rb: [8 * ge.RecordId.max_size]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &rb };
+    for (ready[0..n]) |rec| try ge.RecordId.encode(&w, .{ .ms = rec.timestamp_ms, .seq = rec.sequence });
+    // The bound is the stream's last record the leader holds; now and then
+    // one short, so a deliver leaves the newest for the next.
+    var through = g.stream.streamLastId(sk);
+    if (r.uintLessThan(u8, 5) == 0 and through.sequence > 0) through.sequence -= 1;
+    const holder = HOLDERS[r.uintLessThan(usize, HOLDERS.len)];
+    // Mostly the default caps; now and then the group's or the shard's
+    // exactly at its edge, by the leader's state.
+    var max_held: u32 = qe.DEFAULT_MAX_MESSAGES;
+    var max_held_bytes: u64 = qe.DEFAULT_MAX_BYTES;
+    var shard_held: u64 = qe.DEFAULT_SHARD_HELD_BYTES;
+    const m = ConsumerGroups.meta(store, STREAMS[s], GROUPS[grp]);
+    switch (r.uintLessThan(u8, 12)) {
+        0 => max_held = @intCast(if (m) |x| x.ready + x.leased + x.dead + r.uintLessThan(u64, 2) else 1),
+        1 => max_held_bytes = (if (m) |x| x.held_bytes else 0) + gm.heldBy(0) * r.uintLessThan(u64, 2),
+        2 => shard_held = shardHeld(store) + gm.heldBy(0) * r.uintLessThan(u64, 2),
+        else => {},
+    }
+    const p = try ge.Deliver.encodeInto(out, .{
+        .ns = NS.int(),
+        .stream = STREAMS[s],
+        .group = GROUPS[grp],
+        .count = 1 + r.uintLessThan(u32, 4),
+        // Some small, so the answer's budget stops a deliver short.
+        .max_bytes = if (r.uintLessThan(u8, 4) == 0) 64 else 1 << 20,
+        .holder = holder,
+        .lease_ms = LEASES[r.uintLessThan(usize, LEASES.len)],
+        .create = r.uintLessThan(u8, 8) != 0,
+        .ready = .{ .bytes = rb[0..w.pos], .count = @intCast(n) },
+        .through_ms = through.timestamp_ms,
+        .through_seq = through.sequence,
+        .max_held = max_held,
+        .max_held_bytes = max_held_bytes,
+        .shard_held_bytes = shard_held,
+    });
+    return .{ .entry_type = .group_deliver, .payload = p };
+}
+
+fn shardHeld(store: *store_mod.Store) u64 {
+    const qm = @import("../queue/machine.zig");
+    const bytes = store.get(qm.Helds.ID, qm.HELD_KEY) orelse return 0;
+    return (qm.Helds.Value.decode(bytes) catch return 0).v.bytes;
+}
+
+/// One delivery the leader sees live, by a holder that reports.
+const Delivery = struct {
+    holder: [8]u8 = undefined,
+    holder_len: usize = 0,
+    token: ae.Token.Value = .{ .term = 0, .index = 0 },
+    expiry_ns: u64 = 0,
+    lease_ms: u64 = 0,
+    delivered_ns: u64 = 0,
+    records: [8]StreamID = undefined,
+    deliveries: [8]u32 = undefined,
+    n: usize = 0,
+
+    fn holderName(d: *const Delivery) []const u8 {
+        return d.holder[0..d.holder_len];
+    }
+};
+
+/// The live delivery of the group's first leased record whose holder
+/// reports, and its other records under the same lease.
+fn liveDelivery(store: *store_mod.Store, s: usize, grp: usize, r: std.Random) ?Delivery {
+    const scope = gm.scopeOf(NS, STREAMS[s], GROUPS[grp]);
+    var kb: [4 + gm.SCOPE_LEN]u8 = undefined;
+    var it = (view_mod.ReadView{ .store = store }).range(gm.Items, gm.storeKey(&kb, NS, &scope));
+    var d: ?Delivery = null;
+    // Not always the first: a later delivery is sometimes the one reported.
+    var skip = r.uintLessThan(u8, 3);
+    while (it.next() catch null) |entry| {
+        const v = entry.value.v;
+        if (v.status != .leased or std.mem.startsWith(u8, v.holder, DEAD) or v.holder.len > 8) continue;
+        if (d == null) {
+            if (skip > 0) {
+                skip -= 1;
+                continue;
+            }
+            var x: Delivery = .{ .token = v.token, .expiry_ns = v.expiry_ns, .lease_ms = v.lease_ms, .delivered_ns = v.delivered_ns, .holder_len = v.holder.len };
+            @memcpy(x.holder[0..v.holder.len], v.holder);
+            d = x;
+        }
+        const x = &d.?;
+        if (x.n == x.records.len) break;
+        if (v.token.term != x.token.term or v.token.index != x.token.index or !std.mem.eql(u8, v.holder, x.holderName())) continue;
+        x.records[x.n] = gm.recordOf(entry.key[4..]);
+        x.deliveries[x.n] = v.deliveries;
+        x.n += 1;
+    }
+    return d;
+}
+
+fn report(store: *store_mod.Store, out: []u8, kind: Kind, l: Leader, r: std.Random, s: usize, grp: usize) !?Made {
+    _ = l;
+    var d = liveDelivery(store, s, grp, r) orelse return null;
+    var holder = d.holderName();
+    if (r.uintLessThan(u8, 100) < SPOIL) switch (r.uintLessThan(u8, 4)) {
+        0 => d.token.index +%= 1,
+        1 => holder = "c9",
+        2 => d.deliveries[0] +%= 1,
+        // A record the group never held.
+        else => d.records[0] = .{ .timestamp_ms = 1, .sequence = 1 << 40 },
+    };
+    // A few of the delivery's records, the first always.
+    const n = 1 + r.uintLessThan(usize, d.n);
+    var ib: [8 * ge.Item.max_size]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &ib };
+    for (d.records[0..n], d.deliveries[0..n]) |rec, dv| try ge.Item.encode(&w, .{ .ms = rec.timestamp_ms, .seq = rec.sequence, .deliveries = dv });
+    const items: ge.Items.Value = .{ .bytes = ib[0..w.pos], .count = @intCast(n) };
+    const common: ge.Settle.Value = .{ .ns = NS.int(), .stream = STREAMS[s], .group = GROUPS[grp], .holder = holder, .token = d.token, .expiry_ns = d.expiry_ns, .items = items };
+    switch (kind) {
+        .settle => return .{ .entry_type = .group_settle, .payload = try ge.Settle.encodeInto(out, common) },
+        .extend => return .{ .entry_type = .group_extend, .payload = try ge.Extend.encodeInto(out, .{ .ns = common.ns, .stream = common.stream, .group = common.group, .holder = common.holder, .token = common.token, .expiry_ns = common.expiry_ns, .items = common.items, .held_since_ns = d.delivered_ns, .lease_ms = d.lease_ms }) },
+        else => {
+            // A nack mostly, plain, delayed, with an error or dead; an
+            // abandon or the leader's unread now and then.
+            const roll = r.uintLessThan(u8, 10);
+            const ended: ge.HandBack = if (roll < 7) .failed else if (roll < 9) .abandoned else .unread;
+            const failed = ended == .failed;
+            return .{ .entry_type = .group_release, .payload = try ge.Release.encodeInto(out, .{
+                .ns = common.ns,
+                .stream = common.stream,
+                .group = common.group,
+                .holder = common.holder,
+                .token = common.token,
+                .expiry_ns = common.expiry_ns,
+                .items = common.items,
+                .delay_ms = if (failed and r.uintLessThan(u8, 3) == 0) r.uintLessThan(u64, 3_000) else 0,
+                .dead = failed and r.uintLessThan(u8, 10) == 0,
+                .@"error" = if (failed and r.boolean()) "boom" else "",
+                .ended = ended,
+            }) };
+        },
+    }
+}
+
+fn expire(store: *store_mod.Store, out: []u8, l: Leader, r: std.Random) !?Made {
+    var ib: [17 * ge.ExpireItem.max_size]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &ib };
+    var n: u32 = 0;
+    // As many as the entry's room holds, a spoiled one's too.
+    const room: u32 = @intCast(@min(16, (out.len -| 64) / ge.ExpireItem.max_size));
+    if (room < 2) return null;
+    var it = gm.pastDue(.{ .store = store }, l.now_ns);
+    while (it.next()) |d| {
+        if (n == room - 1) break;
+        try ge.ExpireItem.encode(&w, .{ .ns = d.key.ns.int(), .id = d.key.id, .expiry_ns = d.key.expiry_ns });
+        n += 1;
+    }
+    // Now and then a live lease not yet due as well, as a leader whose
+    // clock ran ahead names it: the machine must leave it.
+    if (r.uintLessThan(u8, 100) < SPOIL) {
+        var all = (view_mod.ReadView{ .store = store }).range(gm.Deadlines, "");
+        while (all.next() catch null) |item| {
+            const k = gm.parseDeadlineKey(item.key[1..]) orelse continue;
+            if (k.expiry_ns <= l.now_ns) continue;
+            try ge.ExpireItem.encode(&w, .{ .ns = k.ns.int(), .id = k.id, .expiry_ns = k.expiry_ns });
+            n += 1;
+            break;
+        }
+    }
+    if (n == 0) return null;
+    return .{ .entry_type = .group_expire, .payload = try ge.Expire.encodeInto(out, .{ .items = .{ .bytes = ib[0..w.pos], .count = n } }) };
+}
+
+fn clean(out: []u8) !?Made {
+    // Every group's scope: the machine cleans what a gone group, or a
+    // trim, left, and nothing else.
+    var ib: [STREAMS.len * GROUPS.len * ge.CleanItem.max_size]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &ib };
+    var n: u32 = 0;
+    for (STREAMS) |s| for (GROUPS) |grp| {
+        try ge.CleanItem.encode(&w, .{ .ns = NS.int(), .scope = &gm.scopeOf(NS, s, grp) });
+        n += 1;
+    };
+    return .{ .entry_type = .group_clean, .payload = try ge.Clean.encodeInto(out, .{ .items = .{ .bytes = ib[0..w.pos], .count = n } }) };
+}

@@ -30,6 +30,7 @@ const schema = @import("../protocol/schema.zig");
 const qe = @import("../protocol/queue_entries.zig");
 const ae = @import("../protocol/action_entries.zig");
 const qm = @import("../queue/machine.zig");
+const gm = @import("../stream/group_machine.zig");
 const families = @import("families.zig");
 
 const Allocator = std.mem.Allocator;
@@ -546,12 +547,15 @@ pub const Queues = struct {
         return null;
     }
 
-    /// The shard's held bytes are every queue's.
+    /// The shard's held bytes are every queue's and every consumer group's:
+    /// groups keep theirs in this store, as a shard does.
     fn ruleOfShard(self: *Queues) ?[]const u8 {
         var sum: u64 = 0;
         var it = self.read().range(qm.Metas, "");
         while (it.next() catch null) |item| sum += item.value.v.held_bytes;
-        if (sum != self.shardHeld()) return "the shard's held bytes aren't its queues' held bytes";
+        var gi = self.read().range(gm.Metas, "");
+        while (gi.next() catch null) |item| sum += item.value.v.held_bytes;
+        if (sum != self.shardHeld()) return "the shard's held bytes aren't its queues' and groups' held bytes";
         return null;
     }
 

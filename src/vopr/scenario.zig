@@ -168,6 +168,8 @@ pub const Scenario = struct {
     action_percent: u8 = 0,
     /// The same for queue entries.
     queue_percent: u8 = 0,
+    /// Percent of ops that are consumer-group and stream entries.
+    group_percent: u8 = 0,
     /// About one workload op in sixteen creates a namespace, through shard
     /// 0's own create path. Off, the workload is what it was before
     /// creates existed.
@@ -384,6 +386,20 @@ pub const Scenario = struct {
         return s;
     }
 
+    /// The consumer-groups slice: as the queues slice, with a share of the
+    /// ops group and stream entries, and queue entries beside them so the
+    /// shard's held bytes are shared for real.
+    pub fn consumerGroups(seed: u64) Scenario {
+        var s = queues(seed);
+        var prng = PRNG.init(std.hash.Wyhash.hash(0xC6, std.mem.asBytes(&seed)));
+        s.queue_percent = prng.random().intRangeAtMost(u8, 5, 15);
+        s.group_percent = prng.random().intRangeAtMost(u8, 40, 70);
+        // Room for a group entry's items: a deliver's ready list, a
+        // report's records, an expire's leases.
+        s.payload_max = @max(s.payload_max, 1024);
+        return s;
+    }
+
     /// The actions slice: same sampling as `fromSeed`, with a share of the
     /// ops action entries, and a run long enough for leases to expire after
     /// a new leader's grace.
@@ -504,6 +520,7 @@ pub const Scenario = struct {
             \\  "repair_halt": {},
             \\  "action_percent": {d},
             \\  "queue_percent": {d},
+            \\  "group_percent": {d},
             \\  "namespace_creates": {},
             \\  "apply_lag_permille": {d},
             \\  "apply_lag_max_ms": {d},
@@ -512,7 +529,7 @@ pub const Scenario = struct {
             \\  "txn_limits": [{d}, {d}, {d}, {d}, {d}, {d}, {d}, {d}]
             \\}}
             \\
-        , .{ self.repair_halt, self.action_percent, self.queue_percent, self.namespace_creates, self.apply_lag_permille, self.apply_lag_max_ms, self.pending_read_permille, self.pending_read_max_ticks, self.txn_limits[0], self.txn_limits[1], self.txn_limits[2], self.txn_limits[3], self.txn_limits[4], self.txn_limits[5], self.txn_limits[6], self.txn_limits[7] });
+        , .{ self.repair_halt, self.action_percent, self.queue_percent, self.group_percent, self.namespace_creates, self.apply_lag_permille, self.apply_lag_max_ms, self.pending_read_permille, self.pending_read_max_ticks, self.txn_limits[0], self.txn_limits[1], self.txn_limits[2], self.txn_limits[3], self.txn_limits[4], self.txn_limits[5], self.txn_limits[6], self.txn_limits[7] });
     }
 
     /// Parse a scenario back from `writeJson` output — the pin format.
@@ -567,6 +584,7 @@ pub const Scenario = struct {
             } else false,
             .action_percent = if (obj.get("action_percent") == null) 0 else try jsonInt(u8, obj, "action_percent"),
             .queue_percent = if (obj.get("queue_percent") == null) 0 else try jsonInt(u8, obj, "queue_percent"),
+            .group_percent = if (obj.get("group_percent") == null) 0 else try jsonInt(u8, obj, "group_percent"),
             .namespace_creates = if (obj.get("namespace_creates")) |v| switch (v) {
                 .bool => |b| b,
                 else => return error.InvalidField,
@@ -799,11 +817,12 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 41), obj.count());
+    try testing.expectEqual(@as(usize, 42), obj.count());
     try testing.expectEqual(@as(usize, MAX_NODES), obj.get("txn_limits").?.array.items.len);
     try testing.expectEqual(s.repair_halt, obj.get("repair_halt").?.bool);
     try testing.expectEqual(@as(i64, s.action_percent), obj.get("action_percent").?.integer);
     try testing.expectEqual(@as(i64, s.queue_percent), obj.get("queue_percent").?.integer);
+    try testing.expectEqual(@as(i64, s.group_percent), obj.get("group_percent").?.integer);
     try testing.expectEqual(s.namespace_creates, obj.get("namespace_creates").?.bool);
     try testing.expectEqual(@as(i64, s.apply_lag_permille), obj.get("apply_lag_permille").?.integer);
     try testing.expectEqual(@as(i64, s.apply_lag_max_ms), obj.get("apply_lag_max_ms").?.integer);
@@ -829,6 +848,17 @@ test "vopr scenario: the queues slice has queue entries and round-trips its shar
     try testing.expect(s.queue_percent >= 25 and s.action_percent == 0);
     try s.writeJson(&w);
     const back = try Scenario.fromJsonSlice(testing.allocator, w.buffered());
+    try testing.expectEqual(s.queue_percent, back.queue_percent);
+}
+
+test "vopr scenario: the consumer-groups slice has group and queue entries and round-trips its shares" {
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const s = Scenario.consumerGroups(9);
+    try testing.expect(s.group_percent >= 40 and s.queue_percent >= 5 and s.action_percent == 0);
+    try s.writeJson(&w);
+    const back = try Scenario.fromJsonSlice(testing.allocator, w.buffered());
+    try testing.expectEqual(s.group_percent, back.group_percent);
     try testing.expectEqual(s.queue_percent, back.queue_percent);
 }
 
