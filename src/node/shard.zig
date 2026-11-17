@@ -28148,3 +28148,86 @@ test "Shard: a task an await on another shard couldn't give goes back to its run
     try std.testing.expectEqual(action_machine.Ended.abandoned, back.ended);
     try std.testing.expectEqual(@as(u32, 0), back.failures);
 }
+
+/// A replica of `leader`: its log applied, with none of its leader's
+/// memory, as a node taking over holds it.
+fn replicaOf(leader: *Shard, pipe_fd: std.posix.fd_t) !Shard {
+    var r = try Shard.init(std.testing.allocator, 0, 1, pipe_fd, null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    errdefer r.deinit();
+    r.wireHandlerShardPtrs();
+    var i: u64 = r.raft_node.last_applied + 1;
+    while (i <= leader.raft_node.last_applied) : (i += 1) {
+        const e = leader.raft_node.log.getEntry(i).?;
+        var out = persistence_mod.Result.start(&e);
+        try std.testing.expect(r.applyEntry(&e, &out));
+    }
+    return r;
+}
+
+test "Shard: a workflow run whose action ended just before a leader change finishes on the new leader" {
+    // A run's step state is its leader's memory, so a new leader doesn't
+    // know the run waits on this call: it stays running. Skipped until
+    // workflow step state is on the contract, which turns it green.
+    if (true) return error.SkipZigTest;
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const shard = &t.shard;
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [1024]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    _ = try proposeAction(shard, .action_register, testRegister("act"));
+    try ParkTest.ack(shard);
+    const def =
+        \\{"kind":"Workflow","name":"flow","version":"1.0.0",
+        \\"start":{"run":"@actions/act","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+    ;
+    try ParkTest.send(shard, conn, .workflow_create, 20, "flow", def);
+    try ParkTest.ack(shard);
+    try ParkTest.responses(shard, conn, pair[1], &buf, &one);
+    try ParkTest.send(shard, conn, .workflow_start, 21, "flow", "");
+    try ParkTest.ack(shard);
+    try ParkTest.responses(shard, conn, pair[1], &buf, &one);
+    var id_buf: [32]u8 = undefined;
+    const run_id = id_buf[0..one[0].data.len];
+    @memcpy(run_id, one[0].data);
+    // Its first step calls the action, whose run starts.
+    shard.workflow_handler.advanceStartedRuns(shard);
+    try ParkTest.ack(shard);
+    shard.workflow_handler.advanceStartedRuns(shard);
+    try ParkTest.deliverOwn(shard);
+    var rid_buf: [64]u8 = undefined;
+    const rid = blk: {
+        var rit = shard.defaultPartition().store.range(action_machine.Runs.ID, "");
+        const k = rit.next().?.key();
+        @memcpy(rid_buf[0 .. k.len - 4], k[4..]);
+        break :blk rid_buf[0 .. k.len - 4];
+    };
+    // The action's run is taken and completed, and its end reaches the
+    // call: all logged. The step hasn't resumed when the leader changes.
+    const ready = ActionsHandler.for_tests.run(shard, .default, rid).?;
+    _ = try proposeAction(shard, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = rid, .due_ns = ready.due_ns, .holder = "w", .request_key = null, .lease_ms = 300_000 });
+    try ParkTest.ack(shard);
+    const held = ActionsHandler.for_tests.run(shard, .default, rid).?;
+    _ = try proposeAction(shard, .action_settle, action_entries.Settle.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = rid, .holder = "w", .request_key = null, .deliveries = held.deliveries, .token = held.token, .expiry_ns = held.expiry_ns, .outcome = "", .result = "" });
+    try ParkTest.ack(shard);
+    try ParkTest.deliverOwn(shard);
+    try std.testing.expectEqual(calls_machine.State.done, callIn(shard, "flow", rid).?.state);
+
+    // Another node leads now: the same log, none of the old leader's memory.
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var r = try replicaOf(shard, pipe_fds[0]);
+    defer r.deinit();
+    try std.testing.expectEqual(calls_machine.State.done, callIn(&r, "flow", rid).?.state);
+    r.workflow_handler.checkPendingActions(&r);
+    var it = r.workflow_handler.runs.valueIterator();
+    const run = while (it.next()) |x| {
+        if (std.mem.eql(u8, x.run_id_owned, run_id)) break x;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
+}
