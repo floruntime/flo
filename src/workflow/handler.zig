@@ -5123,6 +5123,43 @@ test "a child pinned to a version starts that version, and one pinned to a versi
     }
 }
 
+test "a child whose run id another run already holds is refused, not proposed for ever, and its parent fails" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
+    registerTestAction(&shard, "step-a");
+    createTestDef(&handler, testKey(.default, "par-wf"), "par-wf", test_parent_json);
+    createTestDef(&handler, testKey(.default, "kid-wf"), "kid-wf", test_kid_json);
+    createTestRun(&handler, testKey(.default, "par"), "par", "par-wf");
+    handler.advanceWorkflow(&shard, testKey(.default, "par"));
+    settleTest(&shard);
+    // Before its start, a run already holds the child's id.
+    const kid_id = try allocator.dupe(u8, handler.runs.get(testKey(.default, "par")).?.pending_action_run_id_owned.?);
+    defer allocator.free(kid_id);
+    const kid_key = handler.nsKey(.default, kid_id).?;
+    defer allocator.free(kid_key);
+    createTestRun(&handler, kid_key, kid_id, "kid-wf");
+    const raft = shard.raft_node;
+    const before = raft.log.lastIndex();
+    startTestChildren(&handler, &shard);
+    var i = before + 1;
+    while (i <= raft.log.lastIndex()) : (i += 1) try testing.expect(raft.log.getEntry(i).?.header.entry_type != @backingInt(entry_mod.EntryType.workflow_start));
+    try testing.expect(children_mod.parentOf(.{ .store = &shard.defaultPartition().store }, .default, kid_id) == null);
+    const parent = handler.runs.get(testKey(.default, "par")).?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, parent.status);
+    var refused = false;
+    for (parent.history.items) |evt| {
+        if (std.mem.eql(u8, evt.event_type_owned, "child_refused")) refused = true;
+    }
+    try testing.expect(refused);
+}
+
 test "a pending child's start is proposed once while it may apply, and a second start of its run applies nothing" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);

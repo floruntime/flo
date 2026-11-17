@@ -29372,3 +29372,27 @@ test "Shard: a child's end waits while its own parent's outbox is full, and anot
         try std.testing.expectEqual(want, wf.runs.get(key).?.status);
     }
 }
+
+test "Shard: a second caller's start of a child run another caller started is answered so, and the first stands" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var metrics = MetricsRegistry.init(std.testing.allocator);
+    defer metrics.deinit();
+    a.setMetricsRegistry(&metrics);
+    var kb: [16]u8 = undefined;
+    var pb: [16]u8 = undefined;
+    const kid_wf = try workflowOn(&two, 1, "kid", &kb);
+    const parent_wf = try workflowOn(&two, 0, "par", &pb);
+    for ([_][]const u8{ "first-run", "second-run" }) |parent_run| {
+        _ = try proposeAction(b, .child_start, action_entries.ChildStart.Value{ .ns = ns_table.DEFAULT.int(), .parent_slot = calls_machine.callerSlot(.default, parent_wf), .parent_run = parent_run, .parent_workflow = parent_wf, .workflow = kid_wf, .version = "", .run = "kid-same", .input = "{}" });
+    }
+    two.settle();
+    try std.testing.expectEqualStrings("first-run", @import("../workflow/children_machine.zig").parentOf(.{ .store = &b.defaultPartition().store }, .default, "kid-same").?.parent_run);
+    // The second caller hears (here no call waits on it, so it's counted).
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 1), metrics.workflow.action_answers_without_call_total.load(.monotonic));
+}
