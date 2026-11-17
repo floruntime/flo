@@ -10,6 +10,7 @@ const Int = schema.Int;
 const Bytes = schema.Bytes;
 const Record = schema.Record;
 const Defaulted = schema.Defaulted;
+const Optional = schema.Optional;
 
 /// The most messages one peek asks for.
 pub const MAX_PEEK: u32 = 100;
@@ -93,7 +94,7 @@ pub const Why = enum(u8) {
             .expired => "stale report: the lease expired and the message moved on",
             .released => "stale report: the message was released",
             .not_held => "stale report: the message isn't held",
-            .not_dead => "not dead: only a dead letter is requeued or dropped",
+            .not_dead => "not dead: only a dead letter is requeued or deleted",
             .not_idle => "not idle: its holder moved its lease within the idle time named",
         };
     }
@@ -116,6 +117,45 @@ const report_fields = [_]schema.Field{
 const report_answer = [_]schema.Field{
     .{ .name = "applied", .T = Int(u32), .doc = "How many it applied to" },
     .{ .name = "refused", .T = schema.List(Refused, MAX_BATCH), .doc = "The rest, and why" },
+};
+
+/// The most dead letters one list answers, and of each one's payload and
+/// error.
+pub const MAX_DLQ_PAGE: u32 = 100;
+pub const MAX_DLQ_PAYLOAD: u32 = 4096;
+pub const MAX_DLQ_ERROR: u32 = 256;
+
+pub const DeadMessage = Record(&.{
+    .{ .name = "seq", .T = Int(u64), .doc = "Its seq, in its queue" },
+    .{ .name = "priority", .T = Int(u32), .doc = "Its priority" },
+    .{ .name = "deliveries", .T = Int(u32), .doc = "Times it was delivered" },
+    .{ .name = "failures", .T = Int(u32), .doc = "Times it failed: failed by its consumer or its lease ran out" },
+    .{ .name = "enqueued_at_ms", .T = Int(i64), .doc = "When it was enqueued, in Unix milliseconds" },
+    .{ .name = "dead_at_ms", .T = Int(i64), .doc = "When it died, in Unix milliseconds" },
+    .{ .name = "size", .T = Int(u32), .doc = "Its payload's whole length" },
+    .{ .name = "payload", .T = Bytes(MAX_DLQ_PAYLOAD), .doc = "Its payload, its first 4 KiB" },
+    .{ .name = "error", .T = Bytes(MAX_DLQ_ERROR), .doc = "Its last error, its first 256 bytes" },
+});
+
+/// Where a dead-letter list goes on: past this dead letter, in the order
+/// they died.
+pub const DeadCursor = Record(&.{
+    .{ .name = "dead_ns", .T = Int(u64), .doc = "When the last one listed died, in ns" },
+    .{ .name = "seq", .T = Int(u64), .doc = "Its seq" },
+});
+
+pub const DeadPage = schema.BoundedList(DeadMessage, MAX_DLQ_PAGE, @intCast(ops.MAX_RESPONSE_BODY - @sizeOf(u32) - Optional(DeadCursor).max_size));
+
+const dead_request = [_]schema.Field{
+    .{ .name = "messages", .T = Optional(schema.List(Int(u64), MAX_BATCH)), .doc = "The dead letters, by seq; none with all" },
+    .{ .name = "all", .T = Defaulted(schema.Bool, false), .doc = "The oldest dead letters instead, a batch of up to `limit`: `more` says whether others remain" },
+    .{ .name = "limit", .T = Defaulted(schema.Range(u32, 1, MAX_BATCH), MAX_BATCH), .doc = "With all, the most this batch takes" },
+};
+
+const dead_answer = [_]schema.Field{
+    .{ .name = "applied", .T = Int(u32), .doc = "How many it applied to" },
+    .{ .name = "refused", .T = schema.List(Refused, MAX_BATCH), .doc = "The rest, and why" },
+    .{ .name = "more", .T = schema.Bool, .doc = "With all: dead letters remain past this batch" },
 };
 
 pub const table = [_]ops.Op{
@@ -195,6 +235,47 @@ pub const table = [_]ops.Op{
         .cli = .{ .expose = .hand, .key = .{ .name = "queue", .doc = "The queue's name" } },
         .doc = "Keep dequeued messages: with half their lease or less left, it runs a full lease from now, up to 12 h from their dequeue.",
     },
+    .{
+        .name = "queue.dlq_list",
+        .code = 0x185,
+        .class = .read,
+        // As its leader has applied them, so a failed message is listed as
+        // soon as its fail is answered.
+        .at_leader = true,
+        .route = .key,
+        .request = Record(&.{
+            .{ .name = "limit", .T = Defaulted(schema.Range(u32, 1, MAX_DLQ_PAGE), 20), .doc = "Most dead letters to show" },
+            .{ .name = "after", .T = Optional(DeadCursor), .doc = "Go on past this one, as the last answer's cursor named it" },
+        }),
+        .response = Record(&.{
+            .{ .name = "dead", .T = DeadPage, .doc = "The queue's dead letters, oldest dead first" },
+            .{ .name = "cursor", .T = Optional(DeadCursor), .doc = "Where the next page starts; none on the last page" },
+        }),
+        .cli = .{ .expose = .hand, .key = .{ .name = "queue", .doc = "The queue's name" } },
+        .doc = "A queue's dead letters, oldest dead first, a page at a time, each with its deliveries, failures, when it died, its last error and up to 4 KiB of its payload.",
+    },
+    .{
+        .name = "queue.dlq_requeue",
+        .code = 0x186,
+        .class = .write,
+        .route = .key,
+        .request = Record(&dead_request),
+        .response = Record(&dead_answer),
+        .cli = .{ .expose = .hand, .key = .{ .name = "queue", .doc = "The queue's name" } },
+        .doc = "Make dead letters ready again at once, at their priority, with their attempts reset: their failures go to 0, their deliveries and last error stay.",
+    },
+    .{
+        .name = "queue.dlq_delete",
+        .code = 0x187,
+        .class = .write,
+        .route = .key,
+        .request = Record(&(dead_request ++ [_]schema.Field{
+            .{ .name = "dry_run", .T = Defaulted(schema.Bool, false), .doc = "Say what it would delete, and delete nothing" },
+        })),
+        .response = Record(&dead_answer),
+        .cli = .{ .expose = .hand, .key = .{ .name = "queue", .doc = "The queue's name" } },
+        .doc = "Delete dead letters for good. With dry_run, `applied` is how many it would delete, and nothing is logged.",
+    },
 };
 
 /// The op in this table named `name`; a name not there fails the build.
@@ -210,6 +291,10 @@ comptime {
 test "a peek's answer fits one response body, though a full page of the largest payloads doesn't" {
     try std.testing.expect(op("queue.peek").response.max_size <= ops.MAX_RESPONSE_BODY);
     try std.testing.expect(MAX_PEEK * Peeked.max_size > PeekedList.byte_bound.?);
+}
+
+test "the dead-letter ops' answers fit one response body" {
+    inline for (.{ "queue.dlq_list", "queue.dlq_requeue", "queue.dlq_delete" }) |name| try std.testing.expect(op(name).response.max_size <= ops.MAX_RESPONSE_BODY);
 }
 
 test "a dequeue's answer fits one response body, and holds one message of the largest" {

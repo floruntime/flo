@@ -83,6 +83,8 @@ pub const EntryType = enum(u8) {
     queue_extend = 0x24,
     queue_expire = 0x25,
     queue_purge = 0x26,
+    queue_requeue = 0x27,
+    queue_drop = 0x28,
 
     // ── TimeSeries ──
     ts_write = 0x30,
@@ -166,7 +168,7 @@ pub const EntryType = enum(u8) {
             .namespace_create => false,
             .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => false,
             .stream_append, .stream_trim, .stream_delete, .stream_config => true,
-            .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge => false,
+            .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge, .queue_requeue, .queue_drop => false,
             .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean, .group_steal, .group_requeue, .group_drop => false,
             .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,
             .cg_create => true,

@@ -155,6 +155,17 @@ pub const Purge = Record(&.{
     .{ .name = "queue", .T = QueueName },
 });
 
+/// Dead messages, by seq: requeued, ready again at once with their
+/// failures reset (their deliveries and last error kept), or dropped for
+/// good.
+pub const DeadItems = Record(&.{
+    .{ .name = "ns", .T = NamespaceId },
+    .{ .name = "queue", .T = QueueName },
+    .{ .name = "items", .T = schema.List(Int(u64), MAX_BATCH) },
+});
+pub const Requeue = DeadItems;
+pub const Drop = DeadItems;
+
 pub const table = [_]entries.Entry{
     .{ .name = "queue.enqueue", .type_code = 0x20, .payload = Enqueue, .max_payload = Enqueue.max_size, .doc = "A message added to a queue, ready once its delay passes." },
     .{ .name = "queue.deliver", .type_code = 0x21, .payload = Deliver, .max_payload = Deliver.max_size, .doc = "A queue's next ready messages leased to a consumer under a new token." },
@@ -163,6 +174,8 @@ pub const table = [_]entries.Entry{
     .{ .name = "queue.extend", .type_code = 0x24, .payload = Extend, .max_payload = Extend.max_size, .doc = "A delivery's lease moved out by its holder." },
     .{ .name = "queue.expire", .type_code = 0x25, .payload = Expire, .max_payload = Expire.max_size, .doc = "Leases past their deadline ended, as failures." },
     .{ .name = "queue.purge", .type_code = 0x26, .payload = Purge, .max_payload = Purge.max_size, .doc = "Every message of a queue removed." },
+    .{ .name = "queue.requeue", .type_code = 0x27, .payload = Requeue, .max_payload = Requeue.max_size, .doc = "Dead messages ready again at once, their failures reset." },
+    .{ .name = "queue.drop", .type_code = 0x28, .payload = Drop, .max_payload = Drop.max_size, .doc = "Dead messages removed for good." },
 };
 
 /// The payload schema of entry type `code`.

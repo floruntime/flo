@@ -14,6 +14,9 @@
 //! - every ready, leased and dead message has its key, and a queue's
 //!   counts are what its families hold;
 //! - a purge leaves its queue empty;
+//! - a requeue readies each dead message it names at once, failures reset,
+//!   deliveries and error kept; a drop removes each; any other message
+//!   either names is left as it was;
 //! - an enqueue is refused exactly when its queue's messages or payload
 //!   bytes, or its shard's, would pass the caps the entry carries, and
 //!   one that applies leaves them within those caps;
@@ -47,7 +50,7 @@ pub const Queues = struct {
     pub const FAMILIES = [_]u16{ qm.Metas.ID, qm.Msgs.ID, qm.Dead.ID, qm.Ready.ID, qm.Deadlines.ID, qm.Helds.ID };
     pub const NAMES = [_][]const u8{ "queue.meta", "queue.msg", "queue.dead", "queue.ready", "queue.deadline", "queue.held" };
 
-    pub const Kind = enum { enqueue, deliver, settle, release, extend, expire, purge };
+    pub const Kind = enum { enqueue, deliver, settle, release, extend, expire, purge, requeue, drop };
 
     pub const Effect = struct {
         kind: Kind,
@@ -146,6 +149,8 @@ pub const Queues = struct {
             .queue_release => .release,
             .queue_extend => .extend,
             .queue_expire => .expire,
+            .queue_requeue => .requeue,
+            .queue_drop => .drop,
             else => .purge,
         };
     }
@@ -160,6 +165,7 @@ pub const Queues = struct {
         /// Each message's error text length: what it holds counts it.
         errors: std.AutoArrayHashMapUnmanaged(u64, usize) = .empty,
         dead_lettered: u64 = 0,
+        has_meta: bool = false,
         held: u64 = 0,
         held_bytes: u64 = 0,
         shard_held: u64 = 0,
@@ -168,6 +174,7 @@ pub const Queues = struct {
     fn snapshot(self: *Queues, a: Allocator, ns: NamespaceId, hash: [8]u8) Allocator.Error!Snapshot {
         var s: Snapshot = .{ .ns = ns, .hash = hash, .shard_held = self.shardHeld() };
         if (self.meta(ns, hash)) |m| {
+            s.has_meta = true;
             s.dead_lettered = m.dead_lettered;
             s.held = m.ready + m.leased + m.dead;
             s.held_bytes = m.held_bytes;
@@ -215,6 +222,7 @@ pub const Queues = struct {
                     .release => qe.Release,
                     .extend => qe.Extend,
                     .purge => qe.Purge,
+                    .requeue, .drop => qe.DeadItems,
                     else => unreachable,
                 };
                 const p = P.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -238,9 +246,13 @@ pub const Queues = struct {
                 if (over(p, s)) return .{ .kind = kind, .refused = true };
                 return .{ .kind = kind, .refused = true, .broke = "an enqueue within its caps was refused" };
             }
+            // A requeue or drop of a queue never written to.
+            if ((kind == .requeue or kind == .drop) and !snaps.items[0].has_meta) return .{ .kind = kind, .refused = true };
             return .{ .kind = kind, .refused = true, .broke = "the queue machine refused a workload entry" };
         }
-        if (r.mutant == .queue_settle_keeps_bytes and kind == .settle) try self.keepSettledBytes(snaps.items[0]);
+        if (r.mutant == .queue_settle_keeps_bytes and kind == .settle) try self.keepRemovedBytes(snaps.items[0]);
+        if (r.mutant == .queue_drop_keeps_bytes and kind == .drop) try self.keepRemovedBytes(snaps.items[0]);
+        if (r.mutant == .queue_requeue_keeps_failures and kind == .requeue) try self.keepFailures(snaps.items[0]);
         var effect: Effect = .{ .kind = kind, .refused = false };
         effect.broke = self.check(e, snaps.items, &effect) catch "the queue check ran out of memory";
         if (effect.broke == null) for (snaps.items) |s| if (self.ruleOfQueue(s.ns, s.hash)) |why| {
@@ -334,13 +346,16 @@ pub const Queues = struct {
                 var it = self.read().range(qm.Msgs, qm.storeKey(&pb, s.ns, &s.hash));
                 if ((it.next() catch null) != null) return "a purge left a message in its queue";
             },
+            .requeue, .drop => if (try self.checkDead(e, s, effect)) |why| return why,
         }
         // Every message the entry didn't end: counters never go down.
         for (snaps) |sn| {
             var it = sn.msgs.iterator();
             while (it.next()) |kv| {
                 const post = self.msg(sn.ns, sn.hash, kv.key_ptr.*) orelse continue;
-                if (post.deliveries < kv.value_ptr.deliveries or post.failures < kv.value_ptr.failures) return "a message's deliveries or failures went down";
+                // A requeue resets a dead message's failures, by design.
+                const requeued = effect.kind == .requeue and kv.value_ptr.status == .dead and post.status == .ready;
+                if (post.deliveries < kv.value_ptr.deliveries or (!requeued and post.failures < kv.value_ptr.failures)) return "a message's deliveries or failures went down";
             }
         }
         return null;
@@ -502,6 +517,49 @@ pub const Queues = struct {
             if (named.contains(kv.key_ptr.*)) continue;
             const post = self.msg(s.ns, s.hash, kv.key_ptr.*) orelse return "a report changed a message it didn't name";
             if (moved(kv.value_ptr.*, post)) return "a report changed a message it didn't name";
+        }
+        return null;
+    }
+
+    /// A requeue or drop: each message it names that was dead is ready at
+    /// the entry's stamp with its failures reset and its deliveries and
+    /// error kept, or gone; every other message is as it was.
+    fn checkDead(self: *Queues, e: *const entry_mod.Entry, s: Snapshot, effect: *Effect) Allocator.Error!?[]const u8 {
+        var diag: schema.Diagnostic = .{};
+        const p = qe.DeadItems.decodeAll(e.payload, &diag) catch unreachable;
+        const requeue = effect.kind == .requeue;
+        var named: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
+        defer named.deinit(self.store.allocator);
+        var items = p.items.iterator();
+        while (items.next() catch null) |seq| {
+            try named.put(self.store.allocator, seq, {});
+            const post = self.msg(s.ns, s.hash, seq);
+            const pre = s.msgs.get(seq) orelse {
+                if (post != null) return "a requeue or drop made a message that wasn't there";
+                effect.refused_items += 1;
+                continue;
+            };
+            if (pre.status != .dead) {
+                effect.refused_items += 1;
+                continue;
+            }
+            effect.applied += 1;
+            if (!requeue) {
+                if (post != null) return "a drop left a dead message it named";
+                continue;
+            }
+            const v = post orelse return "a requeue removed a message";
+            if (v.status != .ready or v.due_ns != e.header.timestamp_ns) return "a requeued message isn't ready at once";
+            if (v.failures != 0) return "a requeued message's failures weren't reset";
+            if (v.deliveries != pre.deliveries or v.@"error".len != (s.errors.get(seq) orelse 0)) return "a requeued message lost its deliveries or its error";
+        }
+        var it = s.msgs.iterator();
+        while (it.next()) |kv| {
+            const pre = kv.value_ptr.*;
+            const named_dead = named.contains(kv.key_ptr.*) and pre.status == .dead;
+            if (named_dead) continue;
+            const post = self.msg(s.ns, s.hash, kv.key_ptr.*) orelse return "a requeue or drop removed a message it didn't take";
+            if (moved(pre, post)) return "a requeue or drop changed a message it didn't take";
         }
         return null;
     }
@@ -680,9 +738,9 @@ pub const Queues = struct {
         return out;
     }
 
-    /// `queue_settle_keeps_bytes`: the messages a settle removed still
-    /// count in their queue's held bytes.
-    fn keepSettledBytes(self: *Queues, s: Snapshot) persistence.ApplyError!void {
+    /// `queue_settle_keeps_bytes`, `queue_drop_keeps_bytes`: the messages
+    /// a settle or drop removed still count in their queue's held bytes.
+    fn keepRemovedBytes(self: *Queues, s: Snapshot) persistence.ApplyError!void {
         var kept: u64 = 0;
         var it = s.msgs.iterator();
         while (it.next()) |kv| if (self.msg(s.ns, s.hash, kv.key_ptr.*) == null) {
@@ -696,6 +754,24 @@ pub const Queues = struct {
         const bytes = try self.store.allocator.alloc(u8, qm.Meta.encodedSize(m) catch return error.Halt);
         _ = qm.Meta.encodeInto(bytes, m) catch return error.Halt;
         self.store.replace(qm.Metas.ID, node, bytes);
+    }
+
+    /// `queue_requeue_keeps_failures`: each message a requeue readied keeps
+    /// the failures it died with.
+    fn keepFailures(self: *Queues, s: Snapshot) persistence.ApplyError!void {
+        var it = s.msgs.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.status != .dead) continue;
+            const id = qm.idOf(s.hash, kv.key_ptr.*);
+            var mb: [4 + qe.ID_LEN]u8 = undefined;
+            const node = self.store.find(qm.Msgs.ID, qm.storeKey(&mb, s.ns, &id)) orelse continue;
+            var v = (qm.Msgs.Value.decode(store_mod.Record.of(node).value) catch return error.Halt).v;
+            if (v.status != .ready) continue;
+            v.failures = kv.value_ptr.failures;
+            const bytes = try self.store.allocator.alloc(u8, qm.Msg.encodedSize(v) catch return error.Halt);
+            _ = qm.Msg.encodeInto(bytes, v) catch return error.Halt;
+            self.store.replace(qm.Msgs.ID, node, bytes);
+        }
     }
 
     /// Give a ready message the lowest priority, in place, key and record:
