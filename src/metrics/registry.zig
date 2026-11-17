@@ -756,9 +756,9 @@ pub const ShardMetrics = struct {
     /// A sink's channel messages refused here for good by their target,
     /// by reason, summed over the shards that sent them.
     channel_sink_refusals: std.EnumArray(Reason, Atomic(u64)) = .initFill(Atomic(u64).init(0)),
-    /// Channel messages this shard sent that their receivers haven't
-    /// acked, over every channel (gauge).
-    channel_unacked_messages: Atomic(u64) = Atomic(u64).init(0),
+    /// Payload bytes of the channel messages this shard sent and hasn't
+    /// trimmed yet, over every channel (gauge).
+    channel_outbox_bytes: Atomic(u64) = Atomic(u64).init(0),
     /// Channel messages parked here for a full target (gauges), the targets
     /// they wait on, and how long the longest-waiting target has waited.
     channel_parked_messages: Atomic(u64) = Atomic(u64).init(0),
@@ -992,7 +992,7 @@ pub const ShardMetrics = struct {
         ts_late: [TS_LATE_EDGES.len]u64,
         channel_sender_bugs: [2]u64,
         channel_sink_refusals: std.EnumArray(Reason, u64),
-        channel_unacked_messages: u64,
+        channel_outbox_bytes: u64,
         channel_parked_messages: u64,
         channel_parked_bytes: u64,
         channel_parked_targets: u64,
@@ -1059,7 +1059,7 @@ pub const ShardMetrics = struct {
                 break :blk v;
             },
             .channel_sender_bugs = .{ self.channel_sender_bugs[0].load(.monotonic), self.channel_sender_bugs[1].load(.monotonic) },
-            .channel_unacked_messages = self.channel_unacked_messages.load(.monotonic),
+            .channel_outbox_bytes = self.channel_outbox_bytes.load(.monotonic),
             .channel_sink_refusals = blk: {
                 var r: std.EnumArray(Reason, u64) = .initFill(0);
                 for (std.enums.values(Reason)) |k| r.set(k, self.channel_sink_refusals.getPtrConst(k).load(.monotonic));
@@ -1811,7 +1811,7 @@ fn writeProcessingMetrics(writer: anytype, snapshot: ProcessingMetrics.Snapshot)
     try writer.print("# TYPE flo_processing_errors_total counter\n", .{});
     try writer.print("flo_processing_errors_total {d}\n", .{snapshot.errors_total});
 
-    try writer.print("# HELP flo_processing_ticks_held_total Pipeline ticks that waited for room on a sink's shard or in the log\n", .{});
+    try writer.print("# HELP flo_processing_ticks_held_total Pipeline ticks that waited: for a namespace, a halted sink shard, a full outbox, writes queued behind a shard that is halted, can't flush or has a full target, or room in the log\n", .{});
     try writer.print("# TYPE flo_processing_ticks_held_total counter\n", .{});
     try writer.print("flo_processing_ticks_held_total {d}\n", .{snapshot.ticks_held_total});
     try writer.print("# HELP flo_processing_pipelines_waiting_namespace Pipelines waiting for a sink's namespace to be created\n", .{});
@@ -1918,7 +1918,7 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     for (TS_LATE_EDGES, snap.ts_late) |edge, n| try writer.print("flo_ts_late_points_total{{shard_id=\"{d}\",behind=\"{s}\"}} {d}\n", .{ snap.shard_id, edge, n });
     try writer.print("flo_shard_channel_sender_bugs_total{{shard_id=\"{d}\",reason=\"wrong_slot\"}} {d}\n", .{ snap.shard_id, snap.channel_sender_bugs[0] });
     try writer.print("flo_shard_channel_sender_bugs_total{{shard_id=\"{d}\",reason=\"bad_payload\"}} {d}\n", .{ snap.shard_id, snap.channel_sender_bugs[1] });
-    try writer.print("flo_shard_channel_unacked_messages{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.channel_unacked_messages });
+    try writer.print("flo_shard_channel_outbox_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.channel_outbox_bytes });
     // Only reasons seen: most targets refuse a sink's write for few
     // reasons.
     for (std.enums.values(Reason)) |k| {

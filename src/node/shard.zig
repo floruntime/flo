@@ -593,6 +593,9 @@ pub const Shard = struct {
     flushed_index: u64 = 0,
     /// This shard's side of its channels, while it leads.
     channel: channel_driver.Driver,
+    /// What its channel outboxes may hold before its pipelines stop adding
+    /// to them, sized by the runtime from the node's memory.
+    outbox_caps: channel_driver.OutboxCaps = .{},
     /// When `noteSenderBug` last logged.
     sender_bug_warn_ms: u64 = 0,
     /// When `noteSinkRefusal` last logged, and how many it has counted.
@@ -1392,6 +1395,9 @@ pub const Shard = struct {
     /// Wire shard back-pointers into handlers that need Raft access.
     /// Must be called after shards are at their final heap addresses.
     pub fn wireHandlerShardPtrs(self: *Shard) void {
+        // A sink's enqueue another shard sends takes this node's queue caps.
+        self.channel.stamp = queue_handler_mod.stampSinkCaps;
+        self.channel.stamp_ctx = @ptrCast(&self.queue_handler.caps);
         self.raft_node.log_flush_sink = .{ .ctx = @ptrCast(self), .flush = flushForConfig };
         self.raft_node.repaired = .{ .ctx = @ptrCast(self), .check = repairedOpaque };
         self.stream_handler.shard_ptr = @ptrCast(self);
@@ -1473,15 +1479,12 @@ pub const Shard = struct {
         log.err("shard {d}: a channel message from shard {d} was refused as that shard's bug ({s}): {s}; this is a bug in this build, not in the data", .{ self.id, m.from, @tagName(bug), why });
     }
 
-    /// Messages this shard has sent and its receivers haven't acked, over
-    /// every channel.
-    fn channelUnacked(self: *Shard) u64 {
+    /// Payload bytes this shard's channel outboxes hold, over every
+    /// channel: what `outbox_caps.shard` bounds.
+    pub fn outboxBytes(self: *Shard) u64 {
         const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
         var n: u64 = 0;
-        for (0..self.channel.count) |to| {
-            const meta = channels_mod.metaOf(read, @intCast(to));
-            n += meta.next_seq - 1 - meta.acked;
-        }
+        for (0..self.channel.count) |to| n += channels_mod.metaOf(read, @intCast(to)).bytes;
         return n;
     }
 
@@ -1508,6 +1511,14 @@ pub const Shard = struct {
         return label(e, buf);
     }
 
+    /// Why writes through this shard are queued by its own state, for the
+    /// pressure its answers carry.
+    fn channelCause(self: *const Shard) ?channel_driver.Cause {
+        if (self.halted != null) return .halted;
+        if (self.flushes_failing_since_ms != 0) return .cannot_flush;
+        return null;
+    }
+
     /// The channel driver's memory is a term's: a new one starts over.
     fn channelTerm(self: *Shard) void {
         if (self.channel.term != self.raft_node.current_term) self.channel.reset(self.raft_node.current_term);
@@ -1519,9 +1530,13 @@ pub const Shard = struct {
     fn tickChannels(self: *Shard) void {
         const st = &self.defaultPartition().store;
         const fams = &st.families;
-        if (fams[channels_mod.OutFam.ID].count == 0 and fams[channels_mod.InFam.ID].count == 0 and fams[channels_mod.ParkFam.ID].count == 0) return;
+        // Live pressure keeps it ticking with nothing left to send, so it
+        // probes, and the pressure expires.
+        const now = nowMs();
+        if (fams[channels_mod.OutFam.ID].count == 0 and fams[channels_mod.InFam.ID].count == 0 and fams[channels_mod.ParkFam.ID].count == 0 and !self.channel.pressured(now)) return;
         self.channelTerm();
-        self.channel.tick(nowMs(), .{ .store = st }, self.channelDurable(), ChannelIo{ .shard = self });
+        self.channel.own_cause = self.channelCause();
+        self.channel.tick(now, .{ .store = st }, self.channelDurable(), ChannelIo{ .shard = self });
         self.tickUnpark(st);
     }
 
@@ -1580,6 +1595,7 @@ pub const Shard = struct {
         const leads = self.raft_node.role == .leader and self.offline == null and (self.raft_node.leaderReady() or self.halted != null);
         if (!leads) return;
         self.channelTerm();
+        self.channel.own_cause = self.channelCause();
         self.channel.onFrame(msg.src_shard, bytes, nowMs(), .{ .store = &self.defaultPartition().store }, self.channelDurable(), self.halted != null, ChannelIo{ .shard = self });
     }
 
@@ -5260,7 +5276,7 @@ pub const Shard = struct {
                 for (self.channel.sender_bugs) |by_reason| n += by_reason[reason];
                 total.store(n, .monotonic);
             }
-            sm.channel_unacked_messages.store(self.channelUnacked(), .monotonic);
+            sm.channel_outbox_bytes.store(self.outboxBytes(), .monotonic);
             for (std.enums.values(proto.Reason)) |k| {
                 var n: u64 = 0;
                 for (self.channel.sink_refusals) |by_reason| n += by_reason.get(k);
@@ -11453,8 +11469,9 @@ test "Shard: a pipeline's writes to another shard's queue that fills park there,
         _ = try a.stream_handler.appendPayloadToStream(source, "default", try std.fmt.bufPrint(&rb, "r{d}", .{i}));
     }
     two.settle();
-    // The queue holds two at most: the sender's caps go with each write.
-    a.queue_handler.caps.max_messages = 2;
+    // The queue holds two at most: the receiver's caps are what a sink's
+    // write applies under, whatever its sender's are.
+    b.queue_handler.caps.max_messages = 2;
     const c = try TestClient.open(a);
     defer _ = std.c.close(c.pair[1]);
     var yb: [128]u8 = undefined;
@@ -11673,6 +11690,137 @@ test "Shard: operators that can't be rebuilt for a new term make the pipeline wa
     two.settle();
     try std.testing.expect(pipe.wait == .none);
     try std.testing.expectEqual(raft.current_term, pipe.ops_term);
+}
+
+test "Shard: a pipeline waits while its outbox to a sink's shard, or all its outboxes, hold their cap, and reads on once they're taken" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    var qb: [16]u8 = undefined;
+    const q = try queueOwnedBy(&two, 1, &qb);
+    var rb: [8]u8 = undefined;
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "r0");
+    two.settle();
+    // One byte a channel: the first batch fills it.
+    a.outbox_caps = .{ .shard = 1 << 30, .channel = 1 };
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var yb: [128]u8 = undefined;
+    const pipe = try sinkJob(&two, c, source, try std.fmt.bufPrint(&yb, "  - name: out\n    queue: {{ name: {s} }}", .{q.name}));
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
+    const read: contract_view.ReadView = .{ .store = &a.defaultPartition().store };
+    const held = channels_mod.metaOf(read, 1).bytes;
+    try std.testing.expect(held > 0);
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", try std.fmt.bufPrint(&rb, "r{d}", .{1}));
+    two.settle();
+    tickNow(a, pipe);
+    try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
+    try std.testing.expectEqual(@as(?u16, 1), pipe.wait.outbox.to);
+    try std.testing.expectEqual(held, pipe.wait.outbox.bytes);
+    {
+        // A replica of shard 0, as a restart or a new leader holds it: the
+        // same log, applied, holds the same outbox bytes.
+        const pipe_fds = try @import("stdx").io.pipe();
+        defer _ = std.c.close(pipe_fds[0]);
+        defer _ = std.c.close(pipe_fds[1]);
+        var r = try Shard.init(std.testing.allocator, 0, 2, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{ .namespaces = two.namespaces });
+        defer r.deinit();
+        r.wireHandlerShardPtrs();
+        var i: u64 = r.raft_node.last_applied + 1;
+        while (i <= a.raft_node.last_applied) : (i += 1) {
+            const e = a.raft_node.log.getEntry(i).?;
+            var out = persistence_mod.Result.start(&e);
+            try std.testing.expect(r.applyEntry(&e, &out));
+        }
+        try std.testing.expectEqual(held, channels_mod.metaOf(.{ .store = &r.defaultPartition().store }, 1).bytes);
+        try std.testing.expectEqual(held, r.outboxBytes());
+    }
+    var jobs = a.processing_handler.jobs.valueIterator();
+    var lb: [512]u8 = undefined;
+    try std.testing.expectEqualStrings("waiting: the outbox to shard 1 is full (46 B of 1 B)", a.processing_handler.liveNote(jobs.next().?, &lb).?);
+    // Delivered, acked and trimmed: room again, and the next record goes.
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 0), channels_mod.metaOf(read, 1).bytes);
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expect(pipe.wait == .none);
+    try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
+    // The shard's cap, over all its outboxes, holds it the same way.
+    a.outbox_caps = .{ .shard = 1, .channel = 1 << 30 };
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", try std.fmt.bufPrint(&rb, "r{d}", .{2}));
+    two.settle();
+    tickNow(a, pipe);
+    try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
+    try std.testing.expectEqual(@as(?u16, null), pipe.wait.outbox.to);
+    // Trims are spaced 100 ms apart; this one is due now.
+    a.channel.peers[1].last_trim_ms = 0;
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 0), a.outboxBytes());
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+    pumpChannels(&two);
+    var bodies: [8][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), queueBodies(b, q.name, &bodies));
+}
+
+test "Shard: pressure that arrived as a send-only shard's outbox emptied still expires, and its pipeline reads on" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    var qb: [16]u8 = undefined;
+    const q = try queueOwnedBy(&two, 1, &qb);
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "r0");
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var yb: [128]u8 = undefined;
+    const pipe = try sinkJob(&two, c, source, try std.fmt.bufPrint(&yb, "  - name: out\n    queue: {{ name: {s} }}", .{q.name}));
+    tickNow(a, pipe);
+    two.settle();
+    a.channel.peers[1].last_trim_ms = 0;
+    pumpChannels(&two);
+    // Everything sent is taken and trimmed: nothing left for a's channels.
+    const fams = &a.defaultPartition().store.families;
+    try std.testing.expectEqual(@as(usize, 0), fams[channels_mod.OutFam.ID].count + fams[channels_mod.InFam.ID].count + fams[channels_mod.ParkFam.ID].count);
+    // The last answer before the trim said shard 1 is halted.
+    // Time is set, not waited for: each phase stamps the pressure as of
+    // the clock it is read against.
+    if (Shard.nowMs() <= 2 * channel_driver.PRESSURE_EXPIRY_MS) return error.SkipZigTest;
+    const p = &a.channel.peers[1];
+    p.pressure[0] = .{ .shard = 1, .cause = @backingInt(channel_driver.Cause.halted) };
+    p.pressure_len = 1;
+    p.probe_ms = 0;
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "r1");
+    two.settle();
+    p.pressure_ms = Shard.nowMs();
+    tickNow(a, pipe);
+    try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
+    try std.testing.expect(pipe.wait == .pressure);
+    // Its channels keep ticking while the pressure is live: it probes.
+    p.pressure_ms = Shard.nowMs();
+    a.tickChannels();
+    try std.testing.expect(p.probe_ms > 0);
+    // The last answer carrying it was long ago, and the driver's own clock
+    // stopped then: it is gone by the time now, and the pipeline reads on.
+    p.pressure_ms = 1;
+    a.channel.now_ms = 1;
+    a.tickChannels();
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expect(pipe.wait == .none);
+    try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
 }
 
 test "Shard: records whose operators emit nothing aren't read again while their cursor waits to be logged" {
@@ -27322,6 +27470,8 @@ fn queueOwnedBy(two: *TwoShards, owner: u16, buf: []u8) !struct { name: []const 
 }
 
 /// A sink's enqueue of `body` to `queue`, which holds one message at most.
+/// A receiver stamps its own caps over these, so a test across shards sets
+/// them there too.
 fn oneSlotEnqueue(buf: []u8, queue: []const u8, body: []const u8) ![]const u8 {
     return qe_caps.Enqueue.encodeInto(buf, .{ .ns = ns_table.DEFAULT.int(), .queue = queue, .priority = 0, .delay_ms = 0, .payload = body, .max_messages = 1, .max_bytes = 1 << 20, .shard_held_bytes = 1 << 30 });
 }
@@ -27367,6 +27517,9 @@ test "Shard: a sink's enqueues to a full queue on another shard park, a KV write
     const b = &two.shards[1];
     for (&two.shards) |*s| s.wireHandlerShardPtrs();
     two.settle();
+    // The receiver's caps are what a sink's enqueue applies under: one
+    // message at most.
+    b.queue_handler.caps.max_messages = 1;
     var qb: [16]u8 = undefined;
     const q = try queueOwnedBy(&two, 1, &qb);
     var eb: [3][256]u8 = undefined;
@@ -27430,6 +27583,9 @@ test "Shard: an unpark that took a whole entry's worth is followed at once, not 
     const b = &two.shards[1];
     for (&two.shards) |*s| s.wireHandlerShardPtrs();
     two.settle();
+    // Each enqueue keeps the caps it was sent with: no receiver's caps
+    // stamped over them.
+    b.channel.stamp = null;
     var qb: [16]u8 = undefined;
     const q = try queueOwnedBy(&two, 1, &qb);
     // One fills the queue; the next, capped at one, parks; the rest, which
@@ -27465,6 +27621,9 @@ test "Shard: a leader in a new term unparks again past an unpark its last term l
     const b = &two.shards[1];
     for (&two.shards) |*s| s.wireHandlerShardPtrs();
     two.settle();
+    // Each enqueue keeps the caps it was sent with, to fill the queue
+    // for the first two only: no receiver's caps stamped over them.
+    b.channel.stamp = null;
     var qb: [16]u8 = undefined;
     const q = try queueOwnedBy(&two, 1, &qb);
     var eb: [3][256]u8 = undefined;
@@ -27505,6 +27664,9 @@ test "Shard: parked messages are the same on a replica that applies the same log
     const b = &two.shards[1];
     for (&two.shards) |*s| s.wireHandlerShardPtrs();
     two.settle();
+    // The receiver's caps are what a sink's enqueue applies under: one
+    // message at most.
+    b.queue_handler.caps.max_messages = 1;
     var qb: [16]u8 = undefined;
     const q = try queueOwnedBy(&two, 1, &qb);
     var eb: [3][256]u8 = undefined;

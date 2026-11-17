@@ -74,6 +74,9 @@ pub const Out = Record(&.{
 pub const Meta = Record(&.{
     .{ .name = "next_seq", .T = Int(u64) },
     .{ .name = "acked", .T = Int(u64) },
+    // Payload bytes sent and not yet trimmed: what the outbox to this peer
+    // holds, against its cap at the edge.
+    .{ .name = "bytes", .T = Int(u64) },
 });
 
 pub const Point = Record(&.{
@@ -294,7 +297,7 @@ pub fn writeSends(view: *View, index: u64) ApplyError!void {
         const to = ownerOf(place, s.slot);
         var mk: [GROUP_KEY]u8 = undefined;
         const meta_key = groupKey(&mk, to);
-        var meta: Meta.Value = if (try view.getOwn(MetaFam, meta_key)) |m| m.v else .{ .next_seq = 1, .acked = 0 };
+        var meta: Meta.Value = if (try view.getOwn(MetaFam, meta_key)) |m| m.v else .{ .next_seq = 1, .acked = 0, .bytes = 0 };
         var ok: [OUT_KEY]u8 = undefined;
         try view.putOwn(OutFam, outKey(&ok, to, meta.next_seq), .{ .v = .{
             .slot = s.slot,
@@ -305,6 +308,7 @@ pub fn writeSends(view: *View, index: u64) ApplyError!void {
             .payload = s.payload,
         } });
         meta.next_seq += 1;
+        meta.bytes += s.payload.len;
         try view.putOwn(MetaFam, meta_key, .{ .v = meta });
     }
     view.sends.clearRetainingCapacity();
@@ -315,7 +319,7 @@ pub fn writeSends(view: *View, index: u64) ApplyError!void {
 pub fn metaOf(read: ReadView, to: u16) Meta.Value {
     var mk: [GROUP_KEY]u8 = undefined;
     const m = read.get(MetaFam, groupKey(&mk, to)) catch null;
-    return if (m) |v| v.v else .{ .next_seq = 1, .acked = 0 };
+    return if (m) |v| v.v else .{ .next_seq = 1, .acked = 0, .bytes = 0 };
 }
 
 pub fn inOf(read: ReadView, from: u16) ?In.Value {
@@ -769,7 +773,7 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
             const p = ce.Trim.decodeAll(e.payload, &diag) catch return error.Halt;
             var mk: [GROUP_KEY]u8 = undefined;
             const meta_key = groupKey(&mk, p.to);
-            var meta: Meta.Value = if (try view.get(MetaFam, meta_key)) |m| m.v else .{ .next_seq = 1, .acked = 0 };
+            var meta: Meta.Value = if (try view.get(MetaFam, meta_key)) |m| m.v else .{ .next_seq = 1, .acked = 0, .bytes = 0 };
             // A trim an earlier leader proposed may be stale: a no-op.
             if (p.through <= meta.acked) return;
             if (p.through >= meta.next_seq or p.through < p.first or p.through - p.first >= ce.MAX_TRIM_SPAN) return error.Halt;
@@ -778,7 +782,10 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
             var seq = meta.acked + 1;
             while (seq <= p.through) : (seq += 1) {
                 var ok: [OUT_KEY]u8 = undefined;
-                try view.delete(OutFam, outKey(&ok, p.to, seq));
+                const key = outKey(&ok, p.to, seq);
+                const out = (try view.get(OutFam, key)) orelse return error.Halt;
+                meta.bytes -= out.v.payload.len;
+                try view.delete(OutFam, key);
             }
             meta.acked = p.through;
             try view.put(MetaFam, meta_key, .{ .v = meta });
@@ -1377,6 +1384,21 @@ test "channels: a trim drops what was acked; a stale one is a no-op, and one pas
     _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 1, .through = 1 }));
     try testing.expectEqual(@as(u64, 2), metaOf(a.read(), 1).acked);
     try testing.expectError(error.Halt, a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 3, .through = 4 })));
+}
+
+test "channels: an outbox counts the payload bytes it holds, from its sends to its trims" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    try a.probeTo(1, "message-one-0001");
+    const one = a.outRecord(1, 1).?.payload.len;
+    try a.probeTo(1, "message-two-0002");
+    try a.probeTo(1, "message-thr-0003");
+    try testing.expectEqual(3 * one, metaOf(a.read(), 1).bytes);
+    var buf: [64]u8 = undefined;
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 1, .through = 2 }));
+    try testing.expectEqual(one, metaOf(a.read(), 1).bytes);
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 3, .through = 3 }));
+    try testing.expectEqual(@as(u64, 0), metaOf(a.read(), 1).bytes);
 }
 
 test "channels: an apply that sends too much is refused, and sends nothing" {

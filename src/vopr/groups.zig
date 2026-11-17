@@ -382,6 +382,10 @@ pub const Summary = struct {
     probes_proposed: u64,
     /// Unparks the groups' leaders proposed: each a full target with room again.
     unparks: u64,
+    /// Batches refused for a full target, and answers that named a stall:
+    /// above 0, the caps were reached.
+    busy: u64,
+    pressured: u64,
     frames_refused: u64,
     flush_stalls: u64,
     held_by_halts: u64,
@@ -554,6 +558,9 @@ pub const GroupChannel = struct {
         c.unparks += 1;
     }
 
+    /// What a target may park before more to it is refused.
+    pub const PARKED_TARGET_CAP = 8 << 10;
+
     /// Slots most probes go to, so a target is written again while it is
     /// full, and parks.
     const POOL = [_]u16{ 7, 101, 202, 303, 404, 505, 606, 707, 808, 909, 1111, 1212, 1313, 1414, 1515, 1616 };
@@ -574,19 +581,20 @@ pub const GroupChannel = struct {
     }
 
     /// The test machine's send to a random slot: a 16-byte name unique to
-    /// the group, and some bytes more.
+    /// the group, and up to 512 bytes in all, so the outbox and parked
+    /// caps `Groups` sets are reached.
     fn proposeProbe(c: *GroupChannel, r: std.Random) void {
         if (!c.leads()) return;
-        var body: [16 + 48]u8 = undefined;
+        var body: [512]u8 = undefined;
         _ = std.fmt.bufPrint(body[0..16], "g{d:0>2}-{d:0>12}", .{ c.g, c.probes_proposed }) catch return;
-        const extra = r.uintAtMost(usize, 48);
+        const extra = r.uintAtMost(usize, body.len - 16);
         r.bytes(body[16..][0..extra]);
         // Now and then a pool slot fills, and more often drains.
         const roll = r.uintLessThan(u8, 100);
         if (roll < 3) return c.proposeMark("fill", POOL[r.uintLessThan(usize, POOL.len)]);
         if (roll < 8) return c.proposeMark("drai", POOL[r.uintLessThan(usize, POOL.len)]);
         const slot = if (r.uintLessThan(u8, 4) == 0) r.uintLessThan(u16, 4096) else POOL[r.uintLessThan(usize, POOL.len)];
-        var buf: [128]u8 = undefined;
+        var buf: [body.len + 64]u8 = undefined;
         const payload = ce.Probe.encodeInto(&buf, .{ .slot = slot, .body = body[0 .. 16 + extra] }) catch return;
         if (c.groups.sims[c.g].proposeOn(NODE, .channel_probe, payload)) c.probes_proposed += 1;
     }
@@ -741,10 +749,7 @@ pub const Groups = struct {
         if (up and self.probe_every > 0 and self.converging and self.now() % 1_000 == 0) for (GroupChannel.POOL) |slot| {
             const owner = &self.chans[slot % self.chans.len];
             if (!probe.slotFull(owner.read(), slot)) continue;
-            for (self.chans) |*c| if (c.leads()) {
-                c.proposeMark("drai", slot);
-                break;
-            };
+            if (owner.leads()) owner.proposeMark("drai", slot);
         };
         self.delivery.clearRetainingCapacity();
         try self.mailbox.deliverDue(self.now(), &self.delivery);
@@ -755,6 +760,22 @@ pub const Groups = struct {
             if (self.on_frame) |handle| try handle(self, f) else self.chans[f.to].take(f);
         }
         if (up) for (self.chans) |*c| c.tick();
+    }
+
+    /// Each outbox's recorded bytes are the payload bytes of the records
+    /// it holds: a count every replica gets wrong the same way agrees with
+    /// itself, so it is checked against what it counts.
+    fn checkOutboxBytes(self: *Groups) void {
+        for (self.chans) |*c| for (0..self.chans.len) |to_| {
+            const to: u16 = @intCast(to_);
+            const read = c.read();
+            const meta = channels_mod.metaOf(read, to);
+            var pb: [channels_mod.GROUP_KEY]u8 = undefined;
+            var it = read.range(channels_mod.OutFam, channels_mod.outPrefix(&pb, to));
+            var held: u64 = 0;
+            while (it.next() catch null) |rec| held += rec.value.v.payload.len;
+            if (held != meta.bytes) self.oracle.fail(c.g, @intCast(to), meta.acked + 1, "an outbox's recorded bytes are not what it holds");
+        };
     }
 
     pub fn run(self: *Groups) !Summary {
@@ -793,6 +814,7 @@ pub const Groups = struct {
             if (!self.failed()) {
                 var buf: [MAX_GROUPS]bool = undefined;
                 self.oracle.finish(self.haltedGroups(&buf));
+                self.checkOutboxBytes();
             }
         }
         const summaries = try self.allocator.alloc(simulator.Summary, self.sims.len);
@@ -818,6 +840,16 @@ pub const Groups = struct {
             .flush_stalls = self.flush_stalls,
             .held_by_halts = self.oracle.held_by_halts,
             .left_in_mailbox = self.mailbox.queue.items.len,
+            .busy = busy: {
+                var n: u64 = 0;
+                for (self.chans) |*c| n += c.driver.counts.busy;
+                break :busy n;
+            },
+            .pressured = pressured: {
+                var n: u64 = 0;
+                for (self.chans) |*c| n += c.driver.counts.pressured;
+                break :pressured n;
+            },
             .unparks = unparks: {
                 var n: u64 = 0;
                 for (self.chans) |*c| n += c.unparks;

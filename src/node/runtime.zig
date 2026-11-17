@@ -1108,9 +1108,17 @@ pub const Runtime = struct {
             mailboxes[i] = shards[i].mailbox;
         }
         self.peer_mailboxes_slice = mailboxes;
+        const memory = @import("host_memory.zig").detect();
+        const caps = @import("../contract/channel_driver.zig").OutboxCaps.of(memory.bytes, @intCast(n));
+        var mb: [96]u8 = undefined;
+        var sb: [16]u8 = undefined;
+        var cb: [16]u8 = undefined;
+        const driver = @import("../contract/channel_driver.zig");
+        log.info("channel outboxes: {s} a shard, {s} a channel, from {s} over {d} shards", .{ driver.bytesText(&sb, caps.shard), driver.bytesText(&cb, caps.channel), memory.describe(&mb), n });
         for (0..n) |i| {
             shards[i].peer_mailboxes = mailboxes;
             shards[i].stopping = &self.stopping;
+            shards[i].outbox_caps = caps;
         }
     }
 
