@@ -652,7 +652,7 @@ fn report(shard: *Shard, conn: *Connection, req: Request, kind: Report) void {
             break :blk propose(shard, .group_release, ge.Release.Value{ .ns = req.ns_id.int(), .stream = req.key, .group = n.group, .holder = consumer, .token = token, .expiry_ns = expiry, .items = parsed.items, .delay_ms = delay, .dead = dead, .@"error" = text, .ended = if (abandon) .abandoned else .failed });
         },
         .touch => blk: {
-            const l = parsed.lease orelse Item{ .scope = "", .status = .ready, .due_ns = 0, .deliveries = 0, .failures = 0, .holder = "", .request_key = null, .token = token, .lease_ms = ae.MIN_LEASE_MS, .delivered_ns = 0, .expiry_ns = 0, .ended = .none, .started_ns = 0, .@"error" = "", .dead_ns = 0 };
+            const l = parsed.lease orelse Item{ .scope = "", .status = .ready, .due_ns = 0, .deliveries = 0, .failures = 0, .holder = "", .request_key = null, .token = token, .lease_ms = ae.MIN_LEASE_MS, .delivered_ns = 0, .expiry_ns = 0, .ended = .none, .started_ns = 0, .touched_ns = 0, .@"error" = "", .dead_ns = 0 };
             break :blk propose(shard, .group_extend, ge.Extend.Value{ .ns = req.ns_id.int(), .stream = req.key, .group = n.group, .holder = consumer, .token = token, .expiry_ns = l.expiry_ns, .items = parsed.items, .held_since_ns = l.delivered_ns, .lease_ms = std.math.clamp(l.lease_ms, ae.MIN_LEASE_MS, ae.MAX_LEASE_MS) });
         },
     } catch |err| return shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "report not persisted"));
@@ -919,3 +919,246 @@ pub fn stoppedLeading(shard: *Shard) void {
     self.cleaning = null;
     self.duty_term = 0;
 }
+
+// ── Operator commands: steal, and the dead letters ────────────────────
+
+const stream_ops = @import("../protocol/stream_ops.zig");
+const table_run = @import("../node/table_run.zig");
+
+pub const Operator = struct {
+    pub const Error = error{ OutOfMemory, NotLeading, NoStream, NoGroupName, NameTooLong };
+
+    pub fn refusal(err: Error) table_run.Refused {
+        return switch (err) {
+            error.OutOfMemory => .{ .status = .overloaded, .refusal = proto.notRun("overloaded: no memory for this; retry") },
+            error.NotLeading => .{ .status = .unavailable, .refusal = NOT_LEADING },
+            error.NoStream => .{ .status = .bad_request, .refusal = proto.notRun("bad request: a stream name is required") },
+            error.NoGroupName => .{ .status = .bad_request, .refusal = proto.notRun("bad request: a group name is required") },
+            error.NameTooLong => .{ .status = .bad_request, .refusal = proto.notRun("bad request: stream or group name too long") },
+        };
+    }
+
+    const NO_GROUP_REFUSAL: table_run.Refused = .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = machine.NO_GROUP } };
+
+    /// The checks every operator command makes before it reads the group.
+    fn opChecks(shard: *Shard, req: Request, group: []const u8) Error!?table_run.Refused {
+        if (req.key.len == 0) return error.NoStream;
+        if (group.len == 0) return error.NoGroupName;
+        if (req.key.len > ge.StreamName.max_size or group.len > ge.MAX_GROUP_NAME) return error.NameTooLong;
+        if (!shard.raft_node.leaderReady()) return error.NotLeading;
+        if (req.ns_id == .invalid) return .{ .status = persistence_mod.failureStatus(error.NamespaceUnknown), .refusal = persistence_mod.failureRefusal(error.NamespaceUnknown, "not run") };
+        if (metaOf(shard, req.ns_id, req.key, group) == null) return NO_GROUP_REFUSAL;
+        return null;
+    }
+
+    const StealResponse = table_run.op("stream.group.steal").response;
+    const DeadResponse = table_run.op("stream.group.dlq_requeue").response;
+    const ListResponse = table_run.op("stream.group.dlq_list").response;
+    const Leased = schema.List(stream_ops.Leased, ge.MAX_BATCH);
+    const Refused = schema.List(stream_ops.Refused, ge.MAX_BATCH);
+    const Refs = schema.List(stream_ops.RecordRef, ge.MAX_BATCH);
+
+    /// Take an idle holder's records: logged, and answered when it applies.
+    pub fn runSteal(shard: *Shard, _: *Connection, req: Request, group: []const u8, consumer: []const u8, min_idle_ms: u64, lease_ms: ?u64, records: Leased.Value) Error!table_run.Outcome(StealResponse) {
+        if (try opChecks(shard, req, group)) |r| return .{ .refused = r };
+        if (consumer.len == 0) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: a steal names the consumer that takes the records") } };
+        const meta = metaOf(shard, req.ns_id, req.key, group).?;
+        // The group's lease when none is named, within a lease's bounds.
+        const lease = std.math.clamp(lease_ms orelse meta.lease_ms, ae.MIN_LEASE_MS, ae.MAX_LEASE_MS);
+        var ib: [ge.Items.max_size]u8 = undefined;
+        var w: schema.Writer = .{ .buf = &ib };
+        var it = records.iterator();
+        while (it.next() catch null) |r| ge.Item.encode(&w, .{ .ms = r.ms, .seq = r.seq, .deliveries = r.deliveries }) catch return error.OutOfMemory;
+        const proposed = propose(shard, .group_steal, ge.Steal.Value{ .ns = req.ns_id.int(), .stream = req.key, .group = group, .holder = consumer, .lease_ms = lease, .min_idle_ms = min_idle_ms, .items = .{ .bytes = ib[0..w.pos], .count = records.count } }) catch |err|
+            return .{ .refused = .{ .status = persistence_mod.failureStatus(err), .refusal = persistence_mod.failureRefusal(err, "steal not persisted") } };
+        return .{ .park = .{ .proposed = proposed, .answer = answerSteal } };
+    }
+
+    fn answerSteal(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        if (result.refused()) |r| return shard.sendRefusal(conn, request_id, r.status, r.refusal);
+        var rd = result.reader();
+        const term = rd.int(u64) orelse 0;
+        const expiry = rd.int(u64) orelse 0;
+        const n = rd.int(u32) orelse 0;
+        var sb: [Leased.max_size]u8 = undefined;
+        var stolen = Leased.Builder.init(&sb);
+        for (0..n) |_| {
+            const ms = rd.int(u64) orelse break;
+            const seq = rd.int(u64) orelse break;
+            const d = rd.int(u32) orelse break;
+            _ = stolen.add(.{ .ms = ms, .seq = seq, .deliveries = d }) catch break;
+        }
+        var fb: [Refused.max_size]u8 = undefined;
+        const refused = refusedOf(&rd, &fb);
+        table_run.answer(StealResponse, shard, conn, request_id, .{
+            .term = term,
+            .index = result.index,
+            .expires_at_ms = if (n == 0) 0 else @intCast(expiry / std.time.ns_per_ms),
+            .stolen = stolen.value(),
+            .refused = refused,
+        });
+    }
+
+    /// The rest of an answer: each refused record's id and why.
+    fn refusedOf(rd: anytype, buf: []u8) Refused.Value {
+        var b = Refused.Builder.init(buf);
+        while (rd.int(u64)) |ms| {
+            const seq = rd.int(u64) orelse break;
+            const why: machine.Why = std.enums.fromInt(machine.Why, rd.int(u8) orelse break) orelse break;
+            _ = b.add(.{ .ms = ms, .seq = seq, .why = why, .reason = why.text() }) catch break;
+        }
+        return b.value();
+    }
+
+    /// The group's dead letters from `after` on, oldest dead first.
+    const DeadIter = struct {
+        shard: *Shard,
+        /// The range's prefix and where it resumes, here so the range never
+        /// outlives them: the range opens on the first `next`, once the
+        /// iterator stays put.
+        prefix: [4 + machine.SCOPE_LEN]u8,
+        after: ?[4 + machine.SCOPE_LEN + 24]u8,
+        it: ?view_mod.ReadRange(machine.Dead) = null,
+
+        fn init(shard: *Shard, ns: NamespaceId, scope: Scope, after: ?stream_ops.DeadCursor.Value) DeadIter {
+            var d: DeadIter = .{ .shard = shard, .prefix = undefined, .after = null };
+            _ = machine.storeKey(&d.prefix, ns, &scope);
+            if (after) |c| {
+                var k: [4 + machine.SCOPE_LEN + 24]u8 = undefined;
+                _ = machine.storeKey(&k, ns, &machine.deadKey(scope, c.dead_ns, .{ .timestamp_ms = c.ms, .sequence = c.seq }));
+                d.after = k;
+            }
+            return d;
+        }
+
+        /// The next one: its dead time and record.
+        fn next(self: *DeadIter) ?struct { dead_ns: u64, record: StreamID } {
+            if (self.it == null) self.it = if (self.after) |*a| readOf(self.shard).rangeAfter(machine.Dead, &self.prefix, a) else readOf(self.shard).range(machine.Dead, &self.prefix);
+            while (self.it.?.next() catch null) |entry| {
+                const k = entry.key[4..];
+                if (k.len != machine.SCOPE_LEN + 24) continue;
+                return .{ .dead_ns = std.mem.readInt(u64, k[16..24], .big), .record = .{ .timestamp_ms = std.mem.readInt(u64, k[24..32], .big), .sequence = std.mem.readInt(u64, k[32..40], .big) } };
+            }
+            return null;
+        }
+    };
+
+    pub fn runDlqList(shard: *Shard, _: *Connection, req: Request, group: []const u8, limit: u32, after: ?stream_ops.DeadCursor.Value) Error!table_run.Outcome(ListResponse) {
+        if (try opChecks(shard, req, group)) |r| return .{ .refused = r };
+        const scope = machine.scopeOf(req.ns_id, req.key, group);
+        // Answered as soon as this returns: the handler's buffer holds it.
+        var page = stream_ops.DeadPage.Builder.init(try shard.stream_handler.opAnswerBuf());
+        // The dead keys first, then each one's record: a read of the store
+        // inside the range would end it.
+        var found: [stream_ops.MAX_DLQ_PAGE + 1]struct { dead_ns: u64, record: StreamID } = undefined;
+        var nf: usize = 0;
+        var it = DeadIter.init(shard, req.ns_id, scope, after);
+        while (nf <= limit) {
+            const d = it.next() orelse break;
+            found[nf] = .{ .dead_ns = d.dead_ns, .record = d.record };
+            nf += 1;
+        }
+        var last: ?stream_ops.DeadCursor.Value = null;
+        var more = false;
+        for (found[0..nf]) |d| {
+            if (page.count == limit) {
+                more = true;
+                break;
+            }
+            const item = itemOf(shard, req.ns_id, scope, d.record) orelse continue;
+            const err_text = item.@"error"[0..@min(item.@"error".len, stream_ops.MAX_DLQ_ERROR)];
+            const added = page.add(.{ .ms = d.record.timestamp_ms, .seq = d.record.sequence, .deliveries = item.deliveries, .failures = item.failures, .dead_at_ms = @intCast(d.dead_ns / std.time.ns_per_ms), .@"error" = err_text }) catch false;
+            if (!added) {
+                more = true;
+                break;
+            }
+            last = .{ .dead_ns = d.dead_ns, .ms = d.record.timestamp_ms, .seq = d.record.sequence };
+        }
+        return .{ .answer = .{ .dead = page.value(), .cursor = if (more) last else null } };
+    }
+
+    /// The records a requeue or delete names, or with `all` the group's
+    /// oldest dead letters, at most a batch: a requeue passes over those a
+    /// trim cut, which cleanup takes, so a run of them never stops it.
+    fn deadBatch(shard: *Shard, req: Request, group: []const u8, records: ?Refs.Value, all: bool, limit: u32, requeue: bool, buf: []u8) Error!struct { items: ge.RecordIds.Value, more: bool } {
+        var w: schema.Writer = .{ .buf = buf };
+        var n: u32 = 0;
+        var more = false;
+        if (all) {
+            const scope = machine.scopeOf(req.ns_id, req.key, group);
+            const floor = machine.floorOf(streamRecOf(shard, machine.streamOf(req.ns_id, req.key)));
+            var it = DeadIter.init(shard, req.ns_id, scope, null);
+            while (it.next()) |d| {
+                if (requeue and !d.record.greaterThan(floor)) continue;
+                if (n == limit) {
+                    more = true;
+                    break;
+                }
+                ge.RecordId.encode(&w, .{ .ms = d.record.timestamp_ms, .seq = d.record.sequence }) catch return error.OutOfMemory;
+                n += 1;
+            }
+        } else if (records) |given| {
+            var it = given.iterator();
+            while (it.next() catch null) |r| {
+                ge.RecordId.encode(&w, .{ .ms = r.ms, .seq = r.seq }) catch return error.OutOfMemory;
+                n += 1;
+            }
+        }
+        return .{ .items = .{ .bytes = buf[0..w.pos], .count = n }, .more = more };
+    }
+
+    pub fn runRequeue(shard: *Shard, _: *Connection, req: Request, group: []const u8, records: ?Refs.Value, all: bool, limit: u32) Error!table_run.Outcome(DeadResponse) {
+        return runDead(shard, req, group, records, all, limit, true, false);
+    }
+
+    pub fn runDelete(shard: *Shard, _: *Connection, req: Request, group: []const u8, records: ?Refs.Value, all: bool, limit: u32, dry_run: bool) Error!table_run.Outcome(DeadResponse) {
+        return runDead(shard, req, group, records, all, limit, false, dry_run);
+    }
+
+    fn runDead(shard: *Shard, req: Request, group: []const u8, records: ?Refs.Value, all: bool, limit: u32, requeue: bool, dry_run: bool) Error!table_run.Outcome(DeadResponse) {
+        if (try opChecks(shard, req, group)) |r| return .{ .refused = r };
+        const named_some = records != null and records.?.count > 0;
+        if (all == named_some) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(if (all) "bad request: name the dead letters or give all, not both" else "bad request: name the dead letters, or all") } };
+        var ib: [ge.RecordIds.max_size]u8 = undefined;
+        const batch = try deadBatch(shard, req, group, records, all, limit, requeue, &ib);
+        if (dry_run) {
+            // What a delete would take: each named record that is dead now.
+            const scope = machine.scopeOf(req.ns_id, req.key, group);
+            var refused = Refused.Builder.init(try shard.stream_handler.opAnswerBuf());
+            var would: u32 = 0;
+            var it = batch.items.iterator();
+            while (it.next() catch null) |r| {
+                const record: StreamID = .{ .timestamp_ms = r.ms, .sequence = r.seq };
+                const item = itemOf(shard, req.ns_id, scope, record);
+                if (item != null and item.?.status == .dead) {
+                    would += 1;
+                    continue;
+                }
+                const why: machine.Why = if (item == null) .gone else .not_dead;
+                _ = refused.add(.{ .ms = r.ms, .seq = r.seq, .why = why, .reason = why.text() }) catch break;
+            }
+            return .{ .answer = .{ .applied = would, .refused = refused.value(), .more = batch.more } };
+        }
+        if (batch.items.count == 0) return .{ .answer = .{ .applied = 0, .refused = .{ .bytes = "", .count = 0 }, .more = false } };
+        const body: ge.DeadItems.Value = .{ .ns = req.ns_id.int(), .stream = req.key, .group = group, .items = batch.items };
+        const proposed = (if (requeue) propose(shard, .group_requeue, body) else propose(shard, .group_drop, body)) catch |err|
+            return .{ .refused = .{ .status = persistence_mod.failureStatus(err), .refusal = persistence_mod.failureRefusal(err, "not persisted") } };
+        return .{ .park = .{ .proposed = proposed, .answer = if (batch.more) answerDeadMore else answerDead } };
+    }
+
+    fn answerDead(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        deadAnswer(shard, conn, request_id, result, false);
+    }
+
+    fn answerDeadMore(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        deadAnswer(shard, conn, request_id, result, true);
+    }
+
+    fn deadAnswer(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result, more: bool) void {
+        if (result.refused()) |r| return shard.sendRefusal(conn, request_id, r.status, r.refusal);
+        var rd = result.reader();
+        const applied = rd.int(u32) orelse 0;
+        var fb: [Refused.max_size]u8 = undefined;
+        table_run.answer(DeadResponse, shard, conn, request_id, .{ .applied = applied, .refused = refusedOf(&rd, &fb), .more = more });
+    }
+};

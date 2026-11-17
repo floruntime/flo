@@ -44,6 +44,7 @@ const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 const table_run = @import("../node/table_run.zig");
 const stream_ops = @import("../protocol/stream_ops.zig");
+const schema = @import("../protocol/schema.zig");
 const group_handler = @import("group_handler.zig");
 const group_machine = @import("group_machine.zig");
 const group_entries = @import("../protocol/group_entries.zig");
@@ -126,6 +127,8 @@ pub const StreamHandler = struct {
     err_buf: [128]u8 = undefined,
     /// A group list or members answer, encoded after the handler returns.
     list_buf: ?[]u8 = null,
+    /// A group operator command's answer, built as it is answered.
+    op_buf: ?[]u8 = null,
     /// Consumer groups' reads in flight and expire duty (`group_handler.zig`).
     groups: group_handler.Groups,
 
@@ -151,6 +154,7 @@ pub const StreamHandler = struct {
 
     pub fn deinit(self: *StreamHandler) void {
         if (self.list_buf) |b| self.allocator.free(b);
+        if (self.op_buf) |b| self.allocator.free(b);
         self.groups.deinit();
     }
 
@@ -181,6 +185,11 @@ pub const StreamHandler = struct {
             dispatcher.registerWithRoute(op, group_handler.dispatchRemoved, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_list, table_run.handler("stream.group.list", StreamHandler, runGroupList), preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_members, table_run.handler("stream.group.members", StreamHandler, runGroupMembers), preRouteByStream);
+        const Op = group_handler.Operator;
+        dispatcher.registerWithRoute(.stream_group_steal, table_run.handler("stream.group.steal", Op, Op.runSteal), preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_dlq_list, table_run.handler("stream.group.dlq_list", Op, Op.runDlqList), preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_dlq_requeue, table_run.handler("stream.group.dlq_requeue", Op, Op.runRequeue), preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_dlq_delete, table_run.handler("stream.group.dlq_delete", Op, Op.runDelete), preRouteByStream);
     }
 
     // ── Group list and members ──────────────────────────────────────────
@@ -192,6 +201,13 @@ pub const StreamHandler = struct {
             error.OutOfMemory => .{ .status = .overloaded, .refusal = proto.notRun("overloaded: no memory to list this; retry") },
             error.NameTooLong => .{ .status = .bad_request, .refusal = proto.notRun("bad request: stream or group name too long") },
         };
+    }
+
+    pub fn opAnswerBuf(self: *StreamHandler) error{OutOfMemory}![]u8 {
+        if (self.op_buf) |b| return b;
+        const b = try self.allocator.alloc(u8, @max(stream_ops.DeadPage.byte_bound.?, schema.List(stream_ops.Refused, @import("../protocol/group_entries.zig").MAX_BATCH).max_size));
+        self.op_buf = b;
+        return b;
     }
 
     fn answerBuf(self: *StreamHandler) Error![]u8 {
@@ -1965,7 +1981,7 @@ test "stream handler: dispatcher registration" {
     try testing.expect(dispatcher.hasHandler(OpCode.stream_group_list));
     try testing.expect(dispatcher.hasHandler(OpCode.stream_group_members));
 
-    try testing.expectEqual(@as(u16, 22), dispatcher.handler_count);
+    try testing.expectEqual(@as(u16, 26), dispatcher.handler_count);
 }
 
 test "stream handler: append" {

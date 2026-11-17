@@ -88,7 +88,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge => .none,
 
         // Consumer groups: their contract machine (stream/group_machine.zig).
-        .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean => .none,
+        .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean, .group_steal, .group_requeue, .group_drop => .none,
 
         // Time series: their contract machine (ts/machine.zig).
         .ts_write, .ts_write_batch, .ts_delete, .ts_retention => .none,

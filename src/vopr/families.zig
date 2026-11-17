@@ -153,6 +153,12 @@ pub const Mutant = enum {
     /// An extend applies as if half a lease later: a lease with more than
     /// half left moves.
     group_extend_clock_ahead,
+    /// A steal takes a record idle a millisecond, whatever idle time it names.
+    group_steal_ignores_idle,
+    /// A requeued record keeps a failure: its attempts aren't reset.
+    group_requeue_keeps_failures,
+    /// A drop leaves the bytes of the records it removes held.
+    group_drop_keeps_bytes,
 
     /// Whether the bug is in a node's transaction limit: a run with none
     /// never reaches it.
@@ -167,7 +173,7 @@ pub const Mutant = enum {
             .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_condition_local, .kv_if_absent_holds, .kv_batch_conditions_ignored, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .kv_stops_batch_short, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
             .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
             .queue_settle_ignores_token, .queue_release_removes, .queue_expire_ignores_deadline, .queue_deliver_wrong_order, .queue_deliver_short, .queue_expire_first_only, .queue_report_changes_unnamed, .queue_node_clock, .queue_cap_unchecked, .queue_cap_tightened, .queue_settle_keeps_bytes => false,
-            .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .group_trim_misses_floor, .group_delete_keeps_count, .group_extend_clock_ahead => false,
+            .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .group_trim_misses_floor, .group_delete_keeps_count, .group_extend_clock_ahead, .group_steal_ignores_idle, .group_requeue_keeps_failures, .group_drop_keeps_bytes => false,
         };
     }
 
@@ -184,7 +190,7 @@ pub const Mutant = enum {
     /// group entries never reaches it.
     pub fn inGroups(m: Mutant) bool {
         return switch (m) {
-            .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .group_trim_misses_floor, .group_delete_keeps_count, .group_extend_clock_ahead => true,
+            .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .group_trim_misses_floor, .group_delete_keeps_count, .group_extend_clock_ahead, .group_steal_ignores_idle, .group_requeue_keeps_failures, .group_drop_keeps_bytes => true,
             else => false,
         };
     }

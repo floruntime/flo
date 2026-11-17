@@ -102,6 +102,9 @@ pub const EntryType = enum(u8) {
     group_extend = 0x48,
     group_expire = 0x49,
     group_clean = 0x4A,
+    group_steal = 0x4B,
+    group_requeue = 0x4C,
+    group_drop = 0x4D,
 
     // ── Raft Control ──
     raft_config = 0xF0,
@@ -176,7 +179,7 @@ pub const EntryType = enum(u8) {
             .action_call, .action_call_retry, .action_call_clear, .action_reply, .action_done, .action_abandon_send, .action_abandon => false,
             .stream_append, .stream_trim, .stream_delete, .stream_config => true,
             .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge => false,
-            .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean => false,
+            .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean, .group_steal, .group_requeue, .group_drop => false,
             .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,
             .cg_create => true,
             .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step_started => true,

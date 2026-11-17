@@ -79,6 +79,11 @@ pub const Why = enum(u8) {
     released = 4,
     /// It isn't leased.
     not_held = 5,
+    /// A requeue or drop named it, and it isn't dead.
+    not_dead = 6,
+    /// A steal named it, and its holder kept its lease moving within the
+    /// idle time named.
+    not_idle = 7,
 
     pub fn text(w: Why) []const u8 {
         return switch (w) {
@@ -88,6 +93,8 @@ pub const Why = enum(u8) {
             .expired => "stale report: the lease expired and the message moved on",
             .released => "stale report: the message was released",
             .not_held => "stale report: the message isn't held",
+            .not_dead => "not dead: only a dead letter is requeued or dropped",
+            .not_idle => "not idle: its holder moved its lease within the idle time named",
         };
     }
 };
@@ -95,7 +102,7 @@ pub const Why = enum(u8) {
 /// A message a report applied nothing to, and why.
 pub const Refused = Record(&.{
     .{ .name = "seq", .T = Int(u64), .doc = "The message's seq" },
-    .{ .name = "why", .T = schema.Enum(Why), .doc = "Why: gone (for a complete, already done), delivered_again, other_holder, expired, released or not_held" },
+    .{ .name = "why", .T = schema.Enum(Why), .doc = "Why: gone (for a complete, already done), delivered_again, other_holder, expired, released, not_held, or for a group's operator commands not_dead or not_idle" },
     .{ .name = "reason", .T = Bytes(128), .doc = "The same, said for a person" },
 });
 
