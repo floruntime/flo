@@ -515,6 +515,8 @@ pub const CommandResult = union(enum) {
         running = 1,
         completed = 2,
         failed = 3,
+        // Nothing reports it since a step's start can't be lost: kept for
+        // the next SDK round to drop with the clients that read it.
         cancelled = 4,
         timed_out = 5,
     };

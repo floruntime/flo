@@ -180,6 +180,97 @@ pub const Expire = Record(&.{
     .{ .name = "items", .T = BoundedList(ExpireItem, MAX_EXPIRE_ITEMS, MAX_EXPIRE_BYTES) },
 });
 
+// ─── Hand-backs: a task its await couldn't give, back to the run's shard ──
+
+/// A delivery its worker never got (its await went away), handed back to
+/// the run's shard: logged where the await was, and sent from there. The
+/// run's shard ends the lease from its own record of it, as a worker's
+/// abandon would.
+pub const Abandon = Record(&.{
+    .{ .name = "ns", .T = NamespaceId },
+    .{ .name = "action", .T = ActionName },
+    .{ .name = "run", .T = RunId },
+    // Whom the task was for, when the await's shard knew; else the run says.
+    .{ .name = "holder", .T = Holder },
+    .{ .name = "deliveries", .T = Int(u32) },
+    .{ .name = "token", .T = Token },
+});
+
+// ─── Calls: a workflow step's action run, asked for over a channel ───────
+
+/// The calling workflow's name: its runs are placed by it, so it names the
+/// slot a call's answers go back to.
+pub const CallerWorkflow = Bytes(limits.MAX_QUALIFIED_KEY);
+pub const StepName = Bytes(limits.MAX_QUALIFIED_KEY);
+
+/// A step asking for a run of `action`, logged on the workflow's shard:
+/// its call is recorded there and the run's start sent to the action's
+/// slot. `run` is chosen here, so asking again names the same run.
+pub const Call = Record(&.{
+    .{ .name = "ns", .T = NamespaceId },
+    .{ .name = "caller_run", .T = Bytes(limits.MAX_QUALIFIED_KEY) },
+    .{ .name = "caller_workflow", .T = CallerWorkflow },
+    .{ .name = "step", .T = StepName },
+    .{ .name = "action", .T = ActionName },
+    .{ .name = "run", .T = RunId },
+    .{ .name = "input", .T = Bytes(MAX_INPUT) },
+    // Whether the step waits for an action not registered yet.
+    .{ .name = "can_wait", .T = schema.Bool },
+});
+
+/// A call whose action wasn't registered, asked for again: its start is
+/// sent again from the recorded call.
+pub const CallRetry = Record(&.{
+    .{ .name = "ns", .T = NamespaceId },
+    .{ .name = "slot", .T = Int(u16) },
+    .{ .name = "run", .T = RunId },
+});
+
+/// A call its step is done with: resolved, given up on, or its workflow
+/// cancelled. Its record goes.
+pub const CallClear = Record(&.{
+    .{ .name = "ns", .T = NamespaceId },
+    .{ .name = "slot", .T = Int(u16) },
+    .{ .name = "run", .T = RunId },
+});
+
+/// How the action's shard took a call's start.
+pub const Answer = enum(u8) {
+    /// The run exists: it was created, or was already.
+    started = 1,
+    /// No such action is registered.
+    no_action = 2,
+    /// Reserved: the action's slot moved to another shard, to be asked
+    /// there. Nothing answers it until slots move.
+    moved = 3,
+    /// Its run id names another caller's run (a clock stepped back): this
+    /// call has no run, and won't.
+    conflict = 4,
+};
+
+/// The action's shard's answer to a call's start, sent back to the
+/// caller's slot from the entry that applied the start.
+pub const Reply = Record(&.{
+    .{ .name = "ns", .T = NamespaceId },
+    .{ .name = "slot", .T = Int(u16) },
+    .{ .name = "run", .T = RunId },
+    .{ .name = "answer", .T = schema.Enum(Answer) },
+});
+
+/// How a called run ended.
+pub const DoneStatus = enum(u8) { completed = 1, failed = 2, timed_out = 3 };
+
+/// A called run ended: sent to the caller's slot from the entry that
+/// ended it, with what it returned.
+pub const Done = Record(&.{
+    .{ .name = "ns", .T = NamespaceId },
+    .{ .name = "slot", .T = Int(u16) },
+    .{ .name = "run", .T = RunId },
+    .{ .name = "status", .T = schema.Enum(DoneStatus) },
+    .{ .name = "outcome", .T = Outcome },
+    .{ .name = "result", .T = Bytes(action_ops.MAX_OUTPUT) },
+});
+
 pub const table = [_]entries.Entry{
     .{ .name = "action.register", .type_code = 0x70, .payload = Register, .max_payload = Register.max_size, .doc = "An action registered, or its definition replaced." },
     .{ .name = "action.delete", .type_code = 0x71, .payload = Delete, .max_payload = Delete.max_size, .doc = "An action deleted." },
@@ -189,6 +280,13 @@ pub const table = [_]entries.Entry{
     .{ .name = "action.release", .type_code = 0x76, .payload = Release, .max_payload = Release.max_size, .doc = "A delivery failed or abandoned by its holder." },
     .{ .name = "action.extend", .type_code = 0x77, .payload = Extend, .max_payload = Extend.max_size, .doc = "A delivery's lease moved out by its holder." },
     .{ .name = "action.expire", .type_code = 0x78, .payload = Expire, .max_payload = Expire.max_size, .doc = "Leases past their deadline ended, as failures." },
+    .{ .name = "action.call", .type_code = 0x79, .payload = Call, .max_payload = Call.max_size, .doc = "A workflow step's call recorded, and its run's start sent." },
+    .{ .name = "action.call_retry", .type_code = 0x7A, .payload = CallRetry, .max_payload = CallRetry.max_size, .doc = "A call whose action wasn't registered, its start sent again." },
+    .{ .name = "action.call_clear", .type_code = 0x7B, .payload = CallClear, .max_payload = CallClear.max_size, .doc = "A call its step is done with, its record dropped." },
+    .{ .name = "action.reply", .type_code = 0x7C, .payload = Reply, .max_payload = Reply.max_size, .doc = "A message: the action's shard's answer to a call's start." },
+    .{ .name = "action.done", .type_code = 0x7D, .payload = Done, .max_payload = Done.max_size, .doc = "A message: a called run ended, and what it returned." },
+    .{ .name = "action.abandon_send", .type_code = 0x7E, .payload = Abandon, .max_payload = Abandon.max_size, .doc = "A task its await couldn't give, sent back to its run's shard." },
+    .{ .name = "action.abandon", .type_code = 0x7F, .payload = Abandon, .max_payload = Abandon.max_size, .doc = "A message, after its commit: a task handed back, whose lease the run's leader ends." },
 };
 
 /// The payload schema of entry type `code`.

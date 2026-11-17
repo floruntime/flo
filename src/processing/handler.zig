@@ -1646,15 +1646,6 @@ pub const ProcessingHandler = struct {
     /// every sink of the job, and every job sending to that shard, until it
     /// has room. Below its parked cap a full target parks what it can't
     /// take, so this waits only past it.
-    /// What namespace `ns`'s messages hold of this shard's outboxes, over
-    /// every peer.
-    fn nsOutboxBytes(self: *const ProcessingHandler, read: view_mod.ReadView, ns: router.NamespaceId) u64 {
-        var n: u64 = 0;
-        var to: u16 = 0;
-        while (to < @max(self.peer_shard_count, 1)) : (to += 1) n += channels_mod.nsBytesOf(read, to, ns);
-        return n;
-    }
-
     fn waitOf(self: *const ProcessingHandler, shard: *Shard, ns: NamespaceId, pipe: *const PipelineState) Wait {
         for (pipe.sinks) |snk| if (self.namespaceIdOf(snk.namespace) == .invalid) return .{ .namespace = snk.namespace };
         if (self.haltedSinkShard(shard, pipe)) |to| return .{ .halted = to };
@@ -1672,7 +1663,7 @@ pub const ProcessingHandler = struct {
         // One namespace's sinks may send to every shard, so its share of
         // the shard's cap is over all its outboxes together.
         for (pipe.sinks) |snk| {
-            const held = self.nsOutboxBytes(read, self.namespaceIdOf(snk.namespace));
+            const held = shard.nsOutboxBytes(self.namespaceIdOf(snk.namespace));
             if (raft_node_mod.shareHeld(held, total, caps.shard)) return .{ .share = .{ .to = null, .namespace = snk.namespace, .bytes = held, .cap = caps.shard } };
         }
         var to: u16 = 0;

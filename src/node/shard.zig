@@ -1044,6 +1044,7 @@ pub const Shard = struct {
         namespace_handler.registerReplay(&replay_registry);
         processing_handler.registerReplay(&replay_registry);
         stream_handler.registerReplay(&replay_registry);
+        replay_registry.register(.action_abandon, @ptrCast(actions_handler), ActionsHandler.applyAbandonMessage);
         try checkAppliers(shard_id, &replay_registry);
 
         const apply_buf = try large_buffer.alloc(allocator, u8, limits.MAX_LOG_ENTRY_PAYLOAD);
@@ -1488,6 +1489,64 @@ pub const Shard = struct {
         log.err("shard {d}: a channel message from shard {d} was refused as that shard's bug ({s}): {s}; this is a bug in this build, not in the data", .{ self.id, m.from, @tagName(bug), why });
     }
 
+    /// What namespace `ns`'s messages hold of this shard's outboxes, over
+    /// every peer.
+    pub fn nsOutboxBytes(self: *Shard, ns: node_router.NamespaceId) u64 {
+        const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
+        var n: u64 = 0;
+        for (0..self.channel.count) |to| n += channels_mod.nsBytesOf(read, @intCast(to), ns);
+        return n;
+    }
+
+    /// Why a write for namespace `ns` that sends to shard `to` waits at this
+    /// leader's edge: pressure from `to`, its outbox's cap or the shard's,
+    /// or `ns`'s share of either. Writes are never refused at apply for an
+    /// outbox's sake, so each edge that sends checks this first, as a
+    /// pipeline does.
+    pub const SendWait = union(enum) {
+        pressure: channel_driver.Stall.Value,
+        outbox: struct { to: ?u16, bytes: u64, cap: u64, cause: ?channel_driver.Cause = null },
+        share: struct { to: ?u16, bytes: u64, cap: u64 },
+    };
+
+    pub fn sendWait(self: *Shard, to: u16, ns: node_router.NamespaceId) ?SendWait {
+        const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
+        const caps = self.outbox_caps;
+        const now_ms = @import("stdx").time.monotonicMs();
+        const total = self.outboxBytes();
+        if (total >= caps.shard) return .{ .outbox = .{ .to = null, .bytes = total, .cap = caps.shard } };
+        const ns_total = self.nsOutboxBytes(ns);
+        if (raft_node_mod.shareHeld(ns_total, total, caps.shard)) return .{ .share = .{ .to = null, .bytes = ns_total, .cap = caps.shard } };
+        if (self.channel.pressureOf(to, now_ms)) |stall| return .{ .pressure = stall };
+        const meta = channels_mod.metaOf(read, to);
+        if (meta.bytes >= caps.channel) return .{ .outbox = .{ .to = to, .bytes = meta.bytes, .cap = caps.channel, .cause = self.channel.causeOf(to, now_ms) } };
+        const held = channels_mod.nsBytesOf(read, to, ns);
+        if (raft_node_mod.shareHeld(held, meta.bytes, caps.channel)) return .{ .share = .{ .to = to, .bytes = held, .cap = caps.channel } };
+        return null;
+    }
+
+    /// A client's write refused for `w`, in §3.5's words: which shard its
+    /// writes are queued for, and why, never another tenant's namespace.
+    pub fn sendWaitText(w: SendWait, buf: []u8) []const u8 {
+        const tail = "; this request was not run — retry later";
+        var hb: [16]u8 = undefined;
+        var cb: [16]u8 = undefined;
+        return switch (w) {
+            .pressure => |st| if (std.enums.fromInt(channel_driver.Cause, st.cause)) |c|
+                std.fmt.bufPrint(buf, "overloaded: writes to shard {d} are queued because it {s}" ++ tail, .{ st.shard, channel_driver.causeWords(c) }) catch "overloaded" ++ tail
+            else
+                std.fmt.bufPrint(buf, "overloaded: writes to shard {d} are queued" ++ tail, .{st.shard}) catch "overloaded" ++ tail,
+            .outbox => |o| if (o.to) |to| (if (o.cause) |c|
+                std.fmt.bufPrint(buf, "overloaded: writes to shard {d} are queued ({s} of {s}) because it {s}" ++ tail, .{ to, channel_driver.bytesText(&hb, o.bytes), channel_driver.bytesText(&cb, o.cap), channel_driver.causeWords(c) }) catch "overloaded" ++ tail
+            else
+                std.fmt.bufPrint(buf, "overloaded: writes to shard {d} are queued ({s} of {s})" ++ tail, .{ to, channel_driver.bytesText(&hb, o.bytes), channel_driver.bytesText(&cb, o.cap) }) catch "overloaded" ++ tail) else std.fmt.bufPrint(buf, "overloaded: this shard's writes to other shards are queued ({s} of {s})" ++ tail, .{ channel_driver.bytesText(&hb, o.bytes), channel_driver.bytesText(&cb, o.cap) }) catch "overloaded" ++ tail,
+            .share => |sh| if (sh.to) |to|
+                std.fmt.bufPrint(buf, "overloaded: this namespace's share of the writes queued to shard {d} is used ({s} of {s})" ++ tail, .{ to, channel_driver.bytesText(&hb, sh.bytes), channel_driver.bytesText(&cb, sh.cap) }) catch "overloaded" ++ tail
+            else
+                std.fmt.bufPrint(buf, "overloaded: this namespace's share of this shard's queued writes is used ({s} of {s})" ++ tail, .{ channel_driver.bytesText(&hb, sh.bytes), channel_driver.bytesText(&cb, sh.cap) }) catch "overloaded" ++ tail,
+        };
+    }
+
     /// Payload bytes this shard's channel outboxes hold, over every
     /// channel: what `outbox_caps.shard` bounds.
     pub fn outboxBytes(self: *Shard) u64 {
@@ -1495,6 +1554,18 @@ pub const Shard = struct {
         var n: u64 = 0;
         for (0..self.channel.count) |to| n += channels_mod.metaOf(read, @intCast(to)).bytes;
         return n;
+    }
+
+    /// An action's answer or end that found no call: its workflow was
+    /// cancelled or ended, or its step resolved. It changed nothing, and is
+    /// counted (`actions/calls_machine.zig` answers 0 for it).
+    fn noteAnswerWithoutCall(self: *Shard, m: *const contract_store.AppliedMessage) void {
+        const t = m.entry.header.entry_type;
+        if (t != @backingInt(entry_mod.EntryType.action_reply) and t != @backingInt(entry_mod.EntryType.action_done)) return;
+        if (m.result.refused() != null) return;
+        var r = m.result.reader();
+        if ((r.int(u8) orelse return) != 0) return;
+        if (self.metrics_registry) |mr| mr.workflow.recordAnswerWithoutCall();
     }
 
     /// A sink's write its target refused for good: its record is lost to
@@ -3219,8 +3290,7 @@ pub const Shard = struct {
     fn handleInboxMessage(self: *Shard, msg: InboxMessage) void {
         switch (msg.tag) {
             .shutdown => self.shutdown(),
-            .action_start => self.startActionRun(msg),
-            .action_finished, .action_result_ask, .action_abandon, .worker_report, .action_held, .action_unhold => self.actionMessage(msg),
+            .worker_report => self.actionMessage(msg),
             .source_read => {
                 const bytes = inboxPayload(msg);
                 defer if (bytes.len > 0) self.allocator.free(bytes);
@@ -3382,32 +3452,16 @@ pub const Shard = struct {
         self.handback_unsaid = 0;
     }
 
-    /// How a run a workflow here waits on ended, or a workflow's shard
-    /// asking how one here ended; the bytes are ours to free.
+    /// A worker's report; the bytes are ours to free.
     fn actionMessage(self: *Shard, msg: InboxMessage) void {
         const ptr = msg.payload_ptr orelse return;
         const data: [*]u8 = @ptrCast(ptr);
         defer if (msg.payload_len > 0) self.allocator.free(data[0..msg.payload_len]);
         const bytes = data[0..msg.payload_len];
         switch (msg.tag) {
-            .action_finished => self.actions_handler.finishedFromInbox(bytes),
-            .action_result_ask => self.actions_handler.resultAskFromInbox(self, msg.src_shard, bytes),
-            .action_abandon => self.actions_handler.abandonFromInbox(self, bytes),
             .worker_report => ActionsHandler.reportFromInbox(self, bytes),
-            .action_held => self.actions_handler.heldFromInbox(bytes),
-            .action_unhold => self.actions_handler.cancelHeld(self, self.id, bytes),
             else => unreachable,
         }
-    }
-
-    /// A workflow on another shard needs a run created here; its bytes are
-    /// ours to free.
-    fn startActionRun(self: *Shard, msg: InboxMessage) void {
-        const ptr = msg.payload_ptr orelse return;
-        const data: [*]u8 = @ptrCast(ptr);
-        defer if (msg.payload_len > 0) self.allocator.free(data[0..msg.payload_len]);
-        if (msg.payload_len == 0) return;
-        self.actions_handler.startRunFromInbox(self, msg.src_shard, data[0..msg.payload_len]);
     }
 
     /// Drive a request that another shard forwarded to us. The request bytes
@@ -5982,6 +6036,7 @@ pub const Shard = struct {
         {
             for (self.defaultPartition().store.messages.items) |*m| {
                 if (m.sender_bug) |bug| self.noteSenderBug(m, bug) else if (m.entry.header.flags & entry_mod.Flags.SINK != 0) if (m.result.refused()) |r| self.noteSinkRefusal(m, r);
+                self.noteAnswerWithoutCall(m);
                 self.afterApply(&m.entry, &m.result);
             }
         }
@@ -6590,7 +6645,7 @@ pub const Shard = struct {
                     self.deliverDeferredRefusal(reply_to, request_id, .unavailable, proto.notRun(SHUTTING_DOWN_NOT_RUN));
                 },
                 .reply => self.deliverReply(msg),
-                .action_start, .source_read, .source_page, .action_finished, .action_result_ask, .action_abandon, .worker_report, .action_held, .action_unhold, .channel => {
+                .source_read, .source_page, .worker_report, .channel => {
                     const bytes = inboxPayload(msg);
                     if (bytes.len > 0) self.allocator.free(bytes);
                 },
@@ -9039,6 +9094,7 @@ fn applyLoggedTo(handler: anytype, e: *const entry_mod.Entry) !void {
 }
 
 const action_machine = @import("../actions/machine.zig");
+const calls_machine = @import("../actions/calls_machine.zig");
 
 /// An action entry applied to `shard`'s store, as its log applies it.
 fn applyActionEntry(shard: *Shard, comptime etype: entry_mod.EntryType, body: anytype, index: u64, stamp_ns: u64) !persistence_mod.Result {
@@ -14180,7 +14236,7 @@ test "Shard: the inbox gauges follow the drain" {
     var sm = ShardMetrics{ .shard_id = 0 };
     shard.shard_metrics = &sm;
     var i: usize = 0;
-    while (i < 3) : (i += 1) try std.testing.expect(shard.mailbox.inbox.send(.{ .tag = .action_start }));
+    while (i < 3) : (i += 1) try std.testing.expect(shard.mailbox.inbox.send(.{ .tag = .worker_report }));
     try std.testing.expectEqual(@as(usize, 3), shard.drainInbox());
     try std.testing.expectEqual(@as(u64, 3), sm.inbox_processed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), sm.inbox_pending.load(.monotonic));
@@ -14188,8 +14244,8 @@ test "Shard: the inbox gauges follow the drain" {
     // Read at scrape time from the inbox itself: what waits for a shard
     // that has stopped draining still shows.
     sm.live_pending = .{ .ctx = shard.mailbox, .read = Shard.inboxPending };
-    try std.testing.expect(shard.mailbox.inbox.send(.{ .tag = .action_start }));
-    try std.testing.expect(shard.mailbox.inbox.send(.{ .tag = .action_start }));
+    try std.testing.expect(shard.mailbox.inbox.send(.{ .tag = .worker_report }));
+    try std.testing.expect(shard.mailbox.inbox.send(.{ .tag = .worker_report }));
     try std.testing.expectEqual(@as(u64, 2), sm.snapshot().inbox_pending);
     _ = shard.drainInbox();
     try std.testing.expectEqual(@as(u64, 0), sm.snapshot().inbox_pending);
@@ -15781,6 +15837,17 @@ const ParkTest = struct {
         try std.testing.expect(sh.applyCommitted());
     }
 
+    /// What the shard sent itself, taken in: its channel ticked and each
+    /// inbound committed, until nothing more is sent.
+    fn deliverOwn(sh: *Shard) !void {
+        for (0..4) |_| {
+            sh.tickChannels();
+            // Its frames to itself come through its own inbox.
+            _ = sh.drainInbox();
+            try ack(sh);
+        }
+    }
+
     fn request(op: proto.OpCode, id: u64, ns: []const u8, key: []const u8, value: []const u8, options: []const u8) !proto.Request {
         return testReq(op, id, ns, key, value, options);
     }
@@ -16675,6 +16742,8 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 22), one[0].header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    // The call's start goes to the action's slot, here, as its own entry.
+    try ParkTest.deliverOwn(&shard);
     try std.testing.expectEqual(action_machine.Status.ready, ActionsHandler.for_tests.run(&shard, .default, action_run).?.status);
     wf.advanceStartedRuns(&shard);
     try ParkTest.ack(&shard);
@@ -16701,6 +16770,8 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 24), one[0].header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    // The run's end comes back to the step's call.
+    try ParkTest.deliverOwn(&shard);
     wf.checkPendingActions(&shard);
     // Its completion is logged; the run ends when that commits, and is
     // held until then.
@@ -20846,23 +20917,6 @@ test "actions: a report counts toward its worker's stats on the worker's own sha
     try std.testing.expectEqual(@as(u64, 1), here.worker_handler.find(.default, t.worker).?.tasks_completed);
 }
 
-test "actions: a run its shard has no record of is answered as lost, and a workflow asks about a run at most once a while" {
-    var t: TwoShardActions = undefined;
-    try t.init();
-    defer t.deinit();
-    const here = &t.two.shards[0];
-    const actions = here.actions_handler;
-    actions.askResult(here, 1, .default, "act-nothing");
-    actions.askResult(here, 1, .default, "act-nothing");
-    try std.testing.expectEqual(@as(usize, 1), t.two.shards[1].mailbox.inbox.pending());
-    t.two.settle();
-    try std.testing.expectEqual(result_mod.CommandResult.ActionRunStatus.cancelled, actions.finished.get("act-nothing").?.status);
-    // Untaken, it is dropped in time. Time is moved on, not the stamp
-    // back: the monotonic clock is uptime, which may be short.
-    actions.pruneAt(@import("stdx").time.monotonicMs() + 10 * 60 * 1000 + 1);
-    try std.testing.expect(actions.finished.get("act-nothing") == null);
-}
-
 test "actions: an await asking another shard whose wait ran out meanwhile answers no task, and isn't asked again" {
     var t: TwoShardActions = undefined;
     try t.init();
@@ -20894,42 +20948,6 @@ test "actions: an await asking another shard parks, not asks again, after a wake
     try std.testing.expectEqual(@as(usize, 0), here.gathers.inUse());
 }
 
-test "actions: a shard asked about a run says nothing until its leader is ready, nothing while the run is starting, and lost only after" {
-    var t: TwoShardActions = undefined;
-    try t.init();
-    defer t.deinit();
-    const there = &t.two.shards[1];
-    const actions = there.actions_handler;
-    var ask: [64]u8 = undefined;
-    std.mem.writeInt(u32, ask[0..4], ns_table.DEFAULT.int(), .little);
-    @memcpy(ask[4..10], "run-xy");
-    const bytes = ask[0..10];
-    const raft = there.raft_node;
-    const ready = raft.ready_index;
-    raft.ready_index = raft.last_applied + 1000;
-    actions.resultAskFromInbox(there, 0, bytes);
-    raft.ready_index = ready;
-    try std.testing.expectEqual(@as(usize, 0), t.two.shards[0].mailbox.inbox.pending());
-    // Asked to start it, its action not registered: held, not lost. The
-    // workflow's shard is told why it waits, and asking gets no answer.
-    var start_buf: [256]u8 = undefined;
-    const start = ActionsHandler.encodeStartRunMessage(std.testing.allocator, .default, "run-xy", "nope", "{}", "wf-run", "wf", true) orelse return error.OutOfMemory;
-    defer std.testing.allocator.free(start);
-    _ = &start_buf;
-    actions.startRunFromInbox(there, 0, start);
-    try std.testing.expectEqual(@as(usize, 1), t.two.shards[0].mailbox.inbox.pending());
-    t.two.settle();
-    actions.resultAskFromInbox(there, 0, bytes);
-    try std.testing.expectEqual(@as(usize, 0), t.two.shards[0].mailbox.inbox.pending());
-    // Never started, and not starting: lost.
-    var other: [64]u8 = undefined;
-    @memcpy(other[0..10], bytes);
-    @memcpy(other[4..10], "run-zz");
-    actions.resultAskFromInbox(there, 0, other[0..10]);
-    try std.testing.expectEqual(@as(usize, 1), t.two.shards[0].mailbox.inbox.pending());
-    t.two.settle();
-}
-
 test "actions: a task taken by an await whose client, on another shard, closed before the answer came is handed back" {
     var t: TwoShardActions = undefined;
     try t.init();
@@ -20949,6 +20967,8 @@ test "actions: a task taken by an await whose client, on another shard, closed b
     _ = feedClient(t.ca.pair[1], &t.two.shards[0], t.ca.conn.fd, frame);
     t.two.shards[0].removeConnection(t.ca.conn.fd);
     t.two.settle();
+    // Handed back over the channel: logged here, sent to the run's shard.
+    pumpChannels(&t.two);
     const run = ActionsHandler.for_tests.anyRun(there).?;
     try std.testing.expectEqual(action_machine.Status.ready, run.status);
     try std.testing.expectEqual(action_machine.Ended.abandoned, run.ended);
@@ -20969,6 +20989,8 @@ test "actions: a task taken by an await asking another shard, whose client close
     _ = t.two.shards[0].drainInbox();
     t.two.shards[0].removeConnection(t.ca.conn.fd);
     t.two.settle();
+    // Handed back over the channel: logged here, sent to the run's shard.
+    pumpChannels(&t.two);
     const run = ActionsHandler.for_tests.anyRun(there).?;
     try std.testing.expectEqual(action_machine.Status.ready, run.status);
     try std.testing.expectEqual(action_machine.Ended.abandoned, run.ended);
@@ -20999,6 +21021,8 @@ test "actions: a task taken for an await another shard forwarded, whose client w
     here.expireReplySlots();
     try t.invoke(1, "\x00job");
     t.two.settle();
+    // Handed back over the channel: logged here, sent to the run's shard.
+    pumpChannels(&t.two);
     const run = ActionsHandler.for_tests.anyRun(there).?;
     try std.testing.expectEqual(action_machine.Status.ready, run.status);
     try std.testing.expectEqual(action_machine.Ended.abandoned, run.ended);
@@ -21021,6 +21045,8 @@ test "actions: a task in the answer to a gather already ended is handed back" {
     } else return error.NoPart;
     here.endGather(here.gathers.get(.{ .index = part.index, .gen = part.gen }).?);
     t.two.settle();
+    // Handed back over the channel: logged here, sent to the run's shard.
+    pumpChannels(&t.two);
     const run = ActionsHandler.for_tests.anyRun(there).?;
     try std.testing.expectEqual(action_machine.Status.ready, run.status);
     try std.testing.expectEqual(action_machine.Ended.abandoned, run.ended);
@@ -21313,25 +21339,6 @@ test "actions: however awaits, invokes, refusals, step-downs and commits interle
         errdefer std.debug.print("at most {d} in flight, {d} refused, {d} given again\n", .{ most, refused, agains });
         try std.testing.expect(most >= 3 and refused > 0 and agains > 0);
     }
-}
-
-test "actions: what a shard keeps of runs asked about, and runs it was asked to start, goes in time" {
-    var t: TwoShardActions = undefined;
-    try t.init();
-    defer t.deinit();
-    const here = &t.two.shards[0];
-    const actions = here.actions_handler;
-    actions.askResult(here, 1, .default, "act-old");
-    const there = &t.two.shards[1];
-    const start = ActionsHandler.encodeStartRunMessage(std.testing.allocator, .default, "run-old", t.name, "{}", "wf-run", "wf", true) orelse return error.OutOfMemory;
-    defer std.testing.allocator.free(start);
-    there.actions_handler.startRunFromInbox(there, 0, start);
-    try std.testing.expect(there.actions_handler.starting.get("run-old") != null);
-    actions.pruneAt(@import("stdx").time.monotonicMs() + 10 * 60 * 1000 + 1);
-    there.actions_handler.pruneAt(@import("stdx").time.monotonicMs() + 10 * 60 * 1000 + 1);
-    try std.testing.expect(actions.asked.get("act-old") == null);
-    try std.testing.expect(there.actions_handler.starting.get("run-old") == null);
-    t.two.settle();
 }
 
 test "actions: a waiting await's key holds every name the request gave, and as many of its worker's as fit" {
@@ -27185,81 +27192,6 @@ test "Shard: a workflow step whose child run's start the log is too full to take
     try std.testing.expectEqual(@as(usize, 2), sh.workflow_handler.runs.count());
 }
 
-test "Shard: an action start another shard asks for while this one is full is held, and proposed once there's room" {
-    var t: AsyncAlone = undefined;
-    try t.init();
-    defer t.deinit();
-    const sh = &t.shard;
-    _ = try proposeAction(sh, .action_register, testRegister("act"));
-    _ = sh.applyCommitted();
-    try fillCapSuspended(&t);
-    const message = ActionsHandler.encodeStartRunMessage(sh.allocator, .default, "act-run-1", "act", "{}", "wf-run-1", "flow", false).?;
-    defer sh.allocator.free(message);
-    sh.actions_handler.startRunFromInbox(sh, 1, message);
-    try std.testing.expect(sh.actions_handler.startPending("act-run-1"));
-    const last = sh.raft_node.log.lastIndex();
-
-    try resumeAndApply(sh);
-    _ = sh.actions_handler.expireDue(sh);
-    try std.testing.expect(sh.raft_node.log.lastIndex() > last);
-    _ = sh.applyCommitted();
-    try std.testing.expect(ActionsHandler.for_tests.run(sh, .default, "act-run-1") != null);
-}
-
-test "Shard: an action start held for room whose action is deleted meanwhile fails saying so, not that it waited for its action" {
-    var t: AsyncAlone = undefined;
-    try t.init();
-    defer t.deinit();
-    const sh = &t.shard;
-    const ah = sh.actions_handler;
-    _ = try proposeAction(sh, .action_register, testRegister("act"));
-    _ = sh.applyCommitted();
-    try fillCapSuspended(&t);
-    const m = ActionsHandler.encodeStartRunMessage(sh.allocator, .default, "act-run-1", "act", "{}", "wf-run-1", "flow", false).?;
-    defer sh.allocator.free(m);
-    ah.startRunFromInbox(sh, @intCast(sh.id), m);
-    try std.testing.expect(ah.held.get("act-run-1").?.for_room);
-
-    try resumeAndApply(sh);
-    _ = try proposeAction(sh, .action_delete, action_entries.Delete.Value{ .ns = ns_table.DEFAULT.int(), .name = "act" });
-    var passes: u32 = 0;
-    while (sh.raft_node.last_applied < sh.raft_node.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
-    try std.testing.expect(!ActionsHandler.actionExists(sh, .default, "act"));
-    ah.held.getPtr("act-run-1").?.until_ms = 0;
-    _ = ah.expireDue(sh);
-    try std.testing.expect(!ah.startPending("act-run-1"));
-    try std.testing.expectEqual(@as(usize, 0), ah.held_for_room);
-    const f = ah.takeFinished("act-run-1").?;
-    defer ah.freeFinished(f);
-    try std.testing.expect(std.mem.indexOf(u8, f.output, "removed while its start waited for room") != null);
-}
-
-test "Shard: action starts held for room have a bound of their own, which leaves starts waiting for their action room to wait" {
-    var t: AsyncAlone = undefined;
-    try t.init();
-    defer t.deinit();
-    const sh = &t.shard;
-    const ah = sh.actions_handler;
-    _ = try proposeAction(sh, .action_register, testRegister("act"));
-    _ = sh.applyCommitted();
-    try fillCapSuspended(&t);
-    var rbuf: [32]u8 = undefined;
-    for (0..ActionsHandler.MAX_HELD + 1) |i| {
-        const run = try std.fmt.bufPrint(&rbuf, "room-{d}", .{i});
-        const m = ActionsHandler.encodeStartRunMessage(sh.allocator, .default, run, "act", "{}", "wf", "flow", false).?;
-        defer sh.allocator.free(m);
-        ah.startRunFromInbox(sh, 1, m);
-    }
-    try std.testing.expectEqual(ActionsHandler.MAX_HELD, ah.held_for_room);
-    try std.testing.expect(!ah.startPending("room-1024"));
-    // One waiting for an action not yet registered is still held.
-    const m = ActionsHandler.encodeStartRunMessage(sh.allocator, .default, "missing-1", "nope", "{}", "wf", "flow", true).?;
-    defer sh.allocator.free(m);
-    ah.startRunFromInbox(sh, 1, m);
-    try std.testing.expect(ah.startPending("missing-1"));
-    try std.testing.expectEqual(ActionsHandler.MAX_HELD + 1, ah.held.count());
-}
-
 test "Shard: two replicas applying the same log find the same bars, the state a snapshot would encode moving between them" {
     Partition.test_bar_min_bytes = 600;
     defer Partition.test_bar_min_bytes = null;
@@ -28154,23 +28086,12 @@ test "Shard: a run whose taker went away, handed back while the log is full, is 
     const run = ActionsHandler.for_tests.run(&t.shard, .default, "r1").?;
     try std.testing.expectEqual(action_machine.Status.leased, run.status);
 
-    // The abandon an orphaned answer sends the run's shard.
-    var bytes: [64]u8 = undefined;
-    var w: usize = 0;
-    std.mem.writeInt(u32, bytes[0..4], ns_table.DEFAULT.int(), .little);
-    w = 4;
-    for ([_][]const u8{ "w1", "act", "r1" }) |part| {
-        std.mem.writeInt(u16, bytes[w..][0..2], @intCast(part.len), .little);
-        @memcpy(bytes[w + 2 ..][0..part.len], part);
-        w += 2 + part.len;
-    }
-    std.mem.writeInt(u32, bytes[w..][0..4], run.deliveries, .little);
-    std.mem.writeInt(u64, bytes[w + 4 ..][0..8], run.token.term, .little);
-    std.mem.writeInt(u64, bytes[w + 12 ..][0..8], run.token.index, .little);
-    w += 20;
-
+    // The task an orphaned answer handed back, its message committed here.
+    var eb: [256]u8 = undefined;
+    const e = try ActionsHandler.for_tests.entry(.action_abandon, action_entries.Abandon.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = "r1", .holder = "w1", .deliveries = run.deliveries, .token = run.token }, 1, 1, 1, &eb);
+    var applied = persistence_mod.Result.start(&e);
     try fillLog(&t.shard, 0);
-    t.shard.actions_handler.abandonFromInbox(&t.shard, bytes[0..w]);
+    t.shard.actions_handler.afterApply(&t.shard, &e, &applied);
     try std.testing.expectEqual(@as(usize, 1), t.shard.handbacks.items.len);
 
     // Room again: proposed on the next pass, and it applies.
@@ -28415,4 +28336,560 @@ test "Shard: stream.group.dlq_list pages a group's dead letters by limit and aft
     try std.testing.expect(!del.more);
     const empty = try groupOpAnswer("stream.group.dlq_list", &t, .stream_group_dlq_list, 7, try List.request.encodeInto(&lb, .{ .group = "g", .limit = 20, .after = null }));
     try std.testing.expectEqual(@as(u32, 0), empty.dead.count);
+}
+
+/// An action name and a workflow name in the default namespace whose slots
+/// shards `action_on` and `workflow_on` own.
+fn callNames(two: *TwoShards, action_on: u16, workflow_on: u16, ab: []u8, wb: []u8) !struct { action: []const u8, workflow: []const u8 } {
+    const r = &two.shards[0].router;
+    var i: usize = 0;
+    const action = while (true) : (i += 1) {
+        const n = try std.fmt.bufPrint(ab, "act{d}", .{i});
+        if (r.slotToShard(node_router.nsKeySlot(.default, n)) == action_on) break n;
+    };
+    i = 0;
+    const workflow = while (true) : (i += 1) {
+        const n = try std.fmt.bufPrint(wb, "wf{d}", .{i});
+        if (r.slotToShard(node_router.nsKeySlot(.default, n)) == workflow_on) break n;
+    };
+    return .{ .action = action, .workflow = workflow };
+}
+
+/// A step's call proposed and applied on `s`, as the workflow handler makes it.
+fn proposeCall(s: *Shard, action: []const u8, workflow: []const u8, run: []const u8, can_wait: bool) !void {
+    _ = try proposeAction(s, .action_call, action_entries.Call.Value{ .ns = ns_table.DEFAULT.int(), .caller_run = "wf-run-1", .caller_workflow = workflow, .step = "s", .action = action, .run = run, .input = "{}", .can_wait = can_wait });
+}
+
+fn callIn(s: *Shard, workflow: []const u8, run: []const u8) ?calls_machine.Call.Value {
+    return calls_machine.callOf(.{ .store = &s.defaultPartition().store }, .default, calls_machine.callerSlot(.default, workflow), run);
+}
+
+/// A worker on `b` takes `action`'s next run and completes it with `result`.
+fn completeNext(two: *TwoShards, b: *Shard, action: []const u8, result: []const u8) !void {
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var aw: [64]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    b.runRequest(c.conn, try ParkTest.request(.action_await, 31, proto.DEFAULT_NAMESPACE, "w", try ActionsHandler.for_tests.awaitBody(&aw, &.{action}, 0, null), ""), .client);
+    two.settle();
+    const task = (try ActionsHandler.for_tests.task((try nextAnswer(c, b, &out)).data)).?;
+    var done: [512]u8 = undefined;
+    b.runRequest(c.conn, try ParkTest.request(.action_complete, 32, proto.DEFAULT_NAMESPACE, task.run, try ActionsHandler.for_tests.completeBody(&done, task, "w", "", result), ""), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, b, &out)).header.status);
+}
+
+test "Shard: a step's call of an action on another shard is answered there, and its run's end comes back to the call" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var ab: [16]u8 = undefined;
+    var wb: [16]u8 = undefined;
+    const n = try callNames(&two, 1, 0, &ab, &wb);
+    // Chosen as a step chooses it: in the action's slot, so the run's
+    // reports route to its shard.
+    var rb: [32]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), &rb);
+    _ = try proposeAction(b, .action_register, testRegister(n.action));
+    two.settle();
+    try proposeCall(a, n.action, n.workflow, rid, false);
+    two.settle();
+    try std.testing.expectEqual(calls_machine.State.sent, callIn(a, n.workflow, rid).?.state);
+    pumpChannels(&two);
+    // Started there, under the call's run id, naming its caller; answered here.
+    const run = ActionsHandler.for_tests.run(b, .default, rid).?;
+    try std.testing.expectEqualStrings(n.workflow, run.caller_workflow.?);
+    try std.testing.expectEqual(calls_machine.State.started, callIn(a, n.workflow, rid).?.state);
+    // Its end comes back with what it returned.
+    try completeNext(&two, b, n.action, "{\"ok\":1}");
+    pumpChannels(&two);
+    const c = callIn(a, n.workflow, rid).?;
+    try std.testing.expectEqual(calls_machine.State.done, c.state);
+    try std.testing.expectEqual(@backingInt(action_entries.DoneStatus.completed), c.status);
+    try std.testing.expectEqualStrings("{\"ok\":1}", c.result);
+    // Cleared, it goes.
+    _ = try proposeAction(a, .action_call_clear, action_entries.CallClear.Value{ .ns = ns_table.DEFAULT.int(), .slot = calls_machine.callerSlot(.default, n.workflow), .run = rid });
+    two.settle();
+    try std.testing.expect(callIn(a, n.workflow, rid) == null);
+}
+
+test "Shard: a call cleared before its run ends, as a cancelled workflow's is, takes the run's end as nothing, and counts it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var metrics = MetricsRegistry.init(std.testing.allocator);
+    defer metrics.deinit();
+    a.setMetricsRegistry(&metrics);
+    var ab: [16]u8 = undefined;
+    var wb: [16]u8 = undefined;
+    const n = try callNames(&two, 1, 0, &ab, &wb);
+    // Chosen as a step chooses it: in the action's slot, so the run's
+    // reports route to its shard.
+    var rb: [32]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), &rb);
+    _ = try proposeAction(b, .action_register, testRegister(n.action));
+    two.settle();
+    try proposeCall(a, n.action, n.workflow, rid, false);
+    two.settle();
+    pumpChannels(&two);
+    _ = try proposeAction(a, .action_call_clear, action_entries.CallClear.Value{ .ns = ns_table.DEFAULT.int(), .slot = calls_machine.callerSlot(.default, n.workflow), .run = rid });
+    two.settle();
+    try completeNext(&two, b, n.action, "{}");
+    pumpChannels(&two);
+    try std.testing.expect(callIn(a, n.workflow, rid) == null);
+    try std.testing.expectEqual(@as(u64, 1), metrics.workflow.action_answers_without_call_total.load(.monotonic));
+    // Not the sender's bug: nothing was refused.
+    for (a.channel.sender_bugs) |row| for (row) |bugs| try std.testing.expectEqual(@as(u64, 0), bugs);
+}
+
+test "Shard: a call of an action not registered is answered so, asked again once it is, and starts" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var ab: [16]u8 = undefined;
+    var wb: [16]u8 = undefined;
+    const n = try callNames(&two, 1, 0, &ab, &wb);
+    // Chosen as a step chooses it: in the action's slot, so the run's
+    // reports route to its shard.
+    var rb: [32]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), &rb);
+    try proposeCall(a, n.action, n.workflow, rid, true);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(calls_machine.State.no_action, callIn(a, n.workflow, rid).?.state);
+    try std.testing.expect(ActionsHandler.for_tests.run(b, .default, rid) == null);
+    // A retry before an answer, or twice, sends nothing more.
+    const retry: action_entries.CallRetry.Value = .{ .ns = ns_table.DEFAULT.int(), .slot = calls_machine.callerSlot(.default, n.workflow), .run = rid };
+    _ = try proposeAction(b, .action_register, testRegister(n.action));
+    two.settle();
+    _ = try proposeAction(a, .action_call_retry, retry);
+    _ = try proposeAction(a, .action_call_retry, retry);
+    two.settle();
+    try std.testing.expectEqual(@as(u32, 2), callIn(a, n.workflow, rid).?.attempts);
+    pumpChannels(&two);
+    try std.testing.expectEqual(calls_machine.State.started, callIn(a, n.workflow, rid).?.state);
+    try std.testing.expect(ActionsHandler.for_tests.run(b, .default, rid) != null);
+}
+
+test "Shard: a task an await on another shard couldn't give goes back to its run's shard over the channel, and its lease ends as abandoned" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var ab: [16]u8 = undefined;
+    var wb: [16]u8 = undefined;
+    const n = try callNames(&two, 1, 0, &ab, &wb);
+    _ = try proposeAction(b, .action_register, testRegister(n.action));
+    var rb: [32]u8 = undefined;
+    const rid = b.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), &rb);
+    _ = try proposeAction(b, .action_invoke, testInvoke(n.action, rid));
+    two.settle();
+    // A worker on b takes it.
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var aw: [64]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    b.runRequest(c.conn, try ParkTest.request(.action_await, 31, proto.DEFAULT_NAMESPACE, "w", try ActionsHandler.for_tests.awaitBody(&aw, &.{n.action}, 0, null), ""), .client);
+    two.settle();
+    const task = (try ActionsHandler.for_tests.task((try nextAnswer(c, b, &out)).data)).?;
+    try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(b, .default, rid).?.status);
+    // An await on a that went away hands it back: logged there, sent to b.
+    _ = try proposeAction(a, .action_abandon_send, action_entries.Abandon.Value{ .ns = ns_table.DEFAULT.int(), .action = n.action, .run = rid, .holder = "", .deliveries = task.deliveries, .token = .{ .term = task.term, .index = task.index } });
+    two.settle();
+    pumpChannels(&two);
+    const back = ActionsHandler.for_tests.run(b, .default, rid).?;
+    try std.testing.expectEqual(action_machine.Status.ready, back.status);
+    try std.testing.expectEqual(action_machine.Ended.abandoned, back.ended);
+    try std.testing.expectEqual(@as(u32, 0), back.failures);
+}
+
+/// A replica of `leader`: its log applied, with none of its leader's
+/// memory, as a node taking over holds it.
+fn replicaOf(leader: *Shard, pipe_fd: std.posix.fd_t) !Shard {
+    var r = try Shard.init(std.testing.allocator, 0, 1, pipe_fd, null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    errdefer r.deinit();
+    r.wireHandlerShardPtrs();
+    var i: u64 = r.raft_node.last_applied + 1;
+    while (i <= leader.raft_node.last_applied) : (i += 1) {
+        const e = leader.raft_node.log.getEntry(i).?;
+        var out = persistence_mod.Result.start(&e);
+        try std.testing.expect(r.applyEntry(&e, &out));
+    }
+    return r;
+}
+
+test "Shard: a workflow run whose action ended just before a leader change finishes on the new leader" {
+    // A run's step state is its leader's memory, so a new leader doesn't
+    // know the run waits on this call: it stays running. Skipped until
+    // workflow step state is on the contract, which turns it green.
+    if (true) return error.SkipZigTest;
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const shard = &t.shard;
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [1024]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    _ = try proposeAction(shard, .action_register, testRegister("act"));
+    try ParkTest.ack(shard);
+    const def =
+        \\{"kind":"Workflow","name":"flow","version":"1.0.0",
+        \\"start":{"run":"@actions/act","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+    ;
+    try ParkTest.send(shard, conn, .workflow_create, 20, "flow", def);
+    try ParkTest.ack(shard);
+    try ParkTest.responses(shard, conn, pair[1], &buf, &one);
+    try ParkTest.send(shard, conn, .workflow_start, 21, "flow", "");
+    try ParkTest.ack(shard);
+    try ParkTest.responses(shard, conn, pair[1], &buf, &one);
+    var id_buf: [32]u8 = undefined;
+    const run_id = id_buf[0..one[0].data.len];
+    @memcpy(run_id, one[0].data);
+    // Its first step calls the action, whose run starts.
+    shard.workflow_handler.advanceStartedRuns(shard);
+    try ParkTest.ack(shard);
+    shard.workflow_handler.advanceStartedRuns(shard);
+    try ParkTest.deliverOwn(shard);
+    var rid_buf: [64]u8 = undefined;
+    const rid = blk: {
+        var rit = shard.defaultPartition().store.range(action_machine.Runs.ID, "");
+        const k = rit.next().?.key();
+        @memcpy(rid_buf[0 .. k.len - 4], k[4..]);
+        break :blk rid_buf[0 .. k.len - 4];
+    };
+    // The action's run is taken and completed, and its end reaches the
+    // call: all logged. The step hasn't resumed when the leader changes.
+    const ready = ActionsHandler.for_tests.run(shard, .default, rid).?;
+    _ = try proposeAction(shard, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = rid, .due_ns = ready.due_ns, .holder = "w", .request_key = null, .lease_ms = 300_000 });
+    try ParkTest.ack(shard);
+    const held = ActionsHandler.for_tests.run(shard, .default, rid).?;
+    _ = try proposeAction(shard, .action_settle, action_entries.Settle.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = rid, .holder = "w", .request_key = null, .deliveries = held.deliveries, .token = held.token, .expiry_ns = held.expiry_ns, .outcome = "", .result = "" });
+    try ParkTest.ack(shard);
+    try ParkTest.deliverOwn(shard);
+    try std.testing.expectEqual(calls_machine.State.done, callIn(shard, "flow", rid).?.state);
+
+    // Another node leads now: the same log, none of the old leader's memory.
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var r = try replicaOf(shard, pipe_fds[0]);
+    defer r.deinit();
+    try std.testing.expectEqual(calls_machine.State.done, callIn(&r, "flow", rid).?.state);
+    r.workflow_handler.checkPendingActions(&r);
+    var it = r.workflow_handler.runs.valueIterator();
+    const run = while (it.next()) |x| {
+        if (std.mem.eql(u8, x.run_id_owned, run_id)) break x;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
+}
+
+test "Shard: a worker's complete of a run a step called is refused while the caller's outbox has no room, saying so, and goes through once it has" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var ab: [16]u8 = undefined;
+    var wb: [16]u8 = undefined;
+    const n = try callNames(&two, 1, 0, &ab, &wb);
+    var rb: [32]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), &rb);
+    _ = try proposeAction(b, .action_register, testRegister(n.action));
+    two.settle();
+    try proposeCall(a, n.action, n.workflow, rid, false);
+    two.settle();
+    pumpChannels(&two);
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var aw: [64]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    b.runRequest(c.conn, try ParkTest.request(.action_await, 31, proto.DEFAULT_NAMESPACE, "w", try ActionsHandler.for_tests.awaitBody(&aw, &.{n.action}, 0, null), ""), .client);
+    two.settle();
+    const task = (try ActionsHandler.for_tests.task((try nextAnswer(c, b, &out)).data)).?;
+    // No room on b's outboxes: its end can't be sent, so it isn't made.
+    b.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    var done: [512]u8 = undefined;
+    const body = try ActionsHandler.for_tests.completeBody(&done, task, "w", "", "{}");
+    b.runRequest(c.conn, try ParkTest.request(.action_complete, 32, proto.DEFAULT_NAMESPACE, task.run, body, ""), .client);
+    two.settle();
+    // Answers read apart from `out`, which the task points into.
+    var out2: [4096]u8 = undefined;
+    const refused = try nextAnswer(c, b, &out2);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), refused.header.status);
+    try std.testing.expect(std.mem.startsWith(u8, (try refused.refused()).message, "overloaded: this shard's writes to other shards are queued"));
+    try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(b, .default, rid).?.status);
+    // Room again: it completes, and the call hears.
+    b.outbox_caps = .{};
+    b.runRequest(c.conn, try ParkTest.request(.action_complete, 33, proto.DEFAULT_NAMESPACE, task.run, body, ""), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, b, &out2)).header.status);
+    pumpChannels(&two);
+    try std.testing.expectEqual(calls_machine.State.done, callIn(a, n.workflow, rid).?.state);
+}
+
+test "actions: an expire that would end a run a step called waits while the caller's outbox has no room, and others go on" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    // One attempt each: the lease's end ends the run. r1 a step called; r2 a client's.
+    var reg = testRegister("act");
+    reg.max_attempts = 1;
+    _ = try applyActionEntry(&t.shard, .action_register, reg, 1, 1);
+    var called = testInvoke("act", "r1");
+    called.source = .workflow;
+    called.caller_run = "wf-run";
+    called.caller_workflow = "wf";
+    _ = try applyActionEntry(&t.shard, .action_invoke, called, 2, 1);
+    _ = try applyActionEntry(&t.shard, .action_invoke, testInvoke("act", "r2"), 3, 1);
+    for ([_][]const u8{ "r1", "r2" }, 0..) |r, i| _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = r, .due_ns = 1, .holder = "w1", .request_key = null, .lease_ms = 5000 }, 10 + i, 2);
+    const actions = t.shard.actions_handler;
+    _ = actions.expireDue(&t.shard);
+    actions.duty_since_ns = 0;
+    // No room: only the client's run's lease is ended.
+    t.shard.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    try std.testing.expectEqual(@as(u64, 1), actions.expireDue(&t.shard));
+    try ParkTest.ack(&t.shard);
+    try std.testing.expectEqual(action_machine.Status.timed_out, ActionsHandler.for_tests.run(&t.shard, .default, "r2").?.status);
+    try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(&t.shard, .default, "r1").?.status);
+    // Room again: the called run's is.
+    t.shard.outbox_caps = .{};
+    try std.testing.expectEqual(@as(u64, 1), actions.expireDue(&t.shard));
+    try ParkTest.ack(&t.shard);
+    try std.testing.expectEqual(action_machine.Status.timed_out, ActionsHandler.for_tests.run(&t.shard, .default, "r1").?.status);
+}
+
+test "Shard: a call's start whose run id another caller's run holds is answered so, and that run is left alone" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var ab: [16]u8 = undefined;
+    var wb: [16]u8 = undefined;
+    const n = try callNames(&two, 1, 0, &ab, &wb);
+    var rb: [32]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), &rb);
+    _ = try proposeAction(b, .action_register, testRegister(n.action));
+    // A client's run already holds the id.
+    _ = try proposeAction(b, .action_invoke, testInvoke(n.action, rid));
+    two.settle();
+    try proposeCall(a, n.action, n.workflow, rid, false);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expect(ActionsHandler.for_tests.run(b, .default, rid).?.caller_workflow == null);
+    // Answered so: the call has no run, and its step fails.
+    try std.testing.expectEqual(calls_machine.State.refused, callIn(a, n.workflow, rid).?.state);
+}
+
+test "Shard: a workflow run cancelled while its step waits on its action drops the step's call" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const shard = &t.shard;
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [1024]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    _ = try proposeAction(shard, .action_register, testRegister("act"));
+    try ParkTest.ack(shard);
+    const def =
+        \\{"kind":"Workflow","name":"flow","version":"1.0.0",
+        \\"start":{"run":"@actions/act","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+    ;
+    try ParkTest.send(shard, conn, .workflow_create, 20, "flow", def);
+    try ParkTest.ack(shard);
+    try ParkTest.responses(shard, conn, pair[1], &buf, &one);
+    try ParkTest.send(shard, conn, .workflow_start, 21, "flow", "");
+    try ParkTest.ack(shard);
+    try ParkTest.responses(shard, conn, pair[1], &buf, &one);
+    var id_buf: [32]u8 = undefined;
+    const run_id = id_buf[0..one[0].data.len];
+    @memcpy(run_id, one[0].data);
+    shard.workflow_handler.advanceStartedRuns(shard);
+    try ParkTest.ack(shard);
+    shard.workflow_handler.advanceStartedRuns(shard);
+    try ParkTest.deliverOwn(shard);
+    var rid_buf: [64]u8 = undefined;
+    const rid = blk: {
+        var rit = shard.defaultPartition().store.range(action_machine.Runs.ID, "");
+        const k = rit.next().?.key();
+        @memcpy(rid_buf[0 .. k.len - 4], k[4..]);
+        break :blk rid_buf[0 .. k.len - 4];
+    };
+    try std.testing.expect(callIn(shard, "flow", rid) != null);
+    try ParkTest.send(shard, conn, .workflow_cancel, 22, run_id, "");
+    try ParkTest.ack(shard);
+    try ParkTest.responses(shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    try ParkTest.ack(shard);
+    try std.testing.expect(callIn(shard, "flow", rid) == null);
+}
+
+test "Shard: a worker's fail that ends a run a step called is refused while the caller's outbox has no room; one that retries isn't" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var ab: [16]u8 = undefined;
+    var wb: [16]u8 = undefined;
+    const n = try callNames(&two, 1, 0, &ab, &wb);
+    var rb: [32]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), &rb);
+    _ = try proposeAction(b, .action_register, testRegister(n.action));
+    two.settle();
+    try proposeCall(a, n.action, n.workflow, rid, false);
+    two.settle();
+    pumpChannels(&two);
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var aw: [64]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    var out2: [4096]u8 = undefined;
+    b.runRequest(c.conn, try ParkTest.request(.action_await, 31, proto.DEFAULT_NAMESPACE, "w", try ActionsHandler.for_tests.awaitBody(&aw, &.{n.action}, 0, null), ""), .client);
+    two.settle();
+    const task = (try ActionsHandler.for_tests.task((try nextAnswer(c, b, &out)).data)).?;
+    b.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    var fb: [512]u8 = undefined;
+    // A fail with no retry ends the run: refused.
+    b.runRequest(c.conn, try ParkTest.request(.action_fail, 32, proto.DEFAULT_NAMESPACE, task.run, try ActionsHandler.for_tests.failBody(&fb, task, "w", false, "boom"), ""), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), (try nextAnswer(c, b, &out2)).header.status);
+    try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(b, .default, rid).?.status);
+    // One that retries sends nothing: it goes through.
+    b.runRequest(c.conn, try ParkTest.request(.action_fail, 33, proto.DEFAULT_NAMESPACE, task.run, try ActionsHandler.for_tests.failBody(&fb, task, "w", true, "again"), ""), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, b, &out2)).header.status);
+    try std.testing.expectEqual(action_machine.Status.ready, ActionsHandler.for_tests.run(b, .default, rid).?.status);
+}
+
+test "Shard: a task handed back to another shard's run past the outbox caps is dropped and counted, and its lease ends it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    var sm = ShardMetrics{ .shard_id = 0 };
+    a.shard_metrics = &sm;
+    defer a.shard_metrics = null;
+    var ab: [16]u8 = undefined;
+    var wb: [16]u8 = undefined;
+    const n = try callNames(&two, 1, 0, &ab, &wb);
+    const task: action_ops_mod.Task.Value = .{ .run = "r-x", .namespace = "default", .deliveries = 1, .term = 1, .index = 5, .action = n.action, .created_at_ms = 0, .attempt = 1, .lease_ms = 5000, .caller_run = null, .caller_workflow = null, .input = "" };
+    a.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    const before = a.raft_node.log.lastIndex();
+    a.actions_handler.handBack(a, .default, "", task);
+    try std.testing.expectEqual(before, a.raft_node.log.lastIndex());
+    try std.testing.expectEqual(@as(u64, 1), handBacks(&sm, .action, .dropped));
+    // With room it is logged and sent.
+    a.outbox_caps = .{};
+    a.actions_handler.handBack(a, .default, "", task);
+    try std.testing.expectEqual(before + 1, a.raft_node.log.lastIndex());
+}
+
+test "actions: a called run's lease isn't ended on any attempt while its end has no room, and status says which shard it waits on" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    // Three attempts: the first lease's end would run it again.
+    _ = try applyActionEntry(&t.shard, .action_register, testRegister("act"), 1, 1);
+    var called = testInvoke("act", "r1");
+    called.source = .workflow;
+    called.caller_run = "wf-run";
+    called.caller_workflow = "wf";
+    _ = try applyActionEntry(&t.shard, .action_invoke, called, 2, 1);
+    _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = "r1", .due_ns = 1, .holder = "w1", .request_key = null, .lease_ms = 5000 }, 10, 2);
+    var metrics = MetricsRegistry.init(std.testing.allocator);
+    defer metrics.deinit();
+    t.shard.setMetricsRegistry(&metrics);
+    const actions = t.shard.actions_handler;
+    _ = actions.expireDue(&t.shard);
+    actions.duty_since_ns = 0;
+    t.shard.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    try std.testing.expectEqual(@as(u64, 0), actions.expireDue(&t.shard));
+    try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(&t.shard, .default, "r1").?.status);
+    try std.testing.expectEqual(@as(u64, 1), metrics.workflow.action_expires_held.load(.monotonic));
+    try std.testing.expect(actions.held_expires.count() == 1);
+    // A client asking about it is told why.
+    t.shard.runRequest(t.c.conn, .{ .header = proto.RequestHeader.init(.action_status, 40), .namespace = "", .key = "r1", .value = "" }, .client);
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.c.conn, t.c.pair[1], &t.buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    var diag: schema.Diagnostic = .{};
+    const st = try table_run.op("action.status").response.decodeAll(one[0].data, &diag);
+    try std.testing.expectEqualStrings("its end waits for room on shard 0", st.held.?);
+    // Room: its first lease ends, and it is ready again.
+    t.shard.outbox_caps = .{};
+    try std.testing.expectEqual(@as(u64, 1), actions.expireDue(&t.shard));
+    try ParkTest.ack(&t.shard);
+    const back = ActionsHandler.for_tests.run(&t.shard, .default, "r1").?;
+    try std.testing.expectEqual(action_machine.Status.ready, back.status);
+    try std.testing.expectEqual(@as(u32, 1), back.failures);
+    try std.testing.expectEqual(@as(u64, 0), metrics.workflow.action_expires_held.load(.monotonic));
+}
+
+test "actions: more held leases than one expire pass looks at don't keep an ordinary lease behind them from ending" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var reg = testRegister("act");
+    reg.max_attempts = 1;
+    _ = try applyActionEntry(&t.shard, .action_register, reg, 1, 1);
+    // More called runs than a pass looks at, their leases due first; then
+    // a client's, due after them all.
+    const held_n = ActionsHandler.EXPIRE_SCAN_MAX + 4;
+    var idx: u64 = 2;
+    var names: [held_n][8]u8 = undefined;
+    for (&names, 0..) |*b, i| {
+        const r = try std.fmt.bufPrint(b, "c{d}", .{i});
+        var called = testInvoke("act", r);
+        called.source = .workflow;
+        called.caller_run = "wf-run";
+        called.caller_workflow = "wf";
+        _ = try applyActionEntry(&t.shard, .action_invoke, called, idx, 1);
+        idx += 1;
+        _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = r, .due_ns = 1, .holder = "w1", .request_key = null, .lease_ms = 5000 }, idx, 2);
+        idx += 1;
+    }
+    _ = try applyActionEntry(&t.shard, .action_invoke, testInvoke("act", "plain"), idx, 1);
+    idx += 1;
+    _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = "plain", .due_ns = 1, .holder = "w2", .request_key = null, .lease_ms = 5000 }, idx, 3);
+    var metrics = MetricsRegistry.init(std.testing.allocator);
+    defer metrics.deinit();
+    t.shard.setMetricsRegistry(&metrics);
+    const actions = t.shard.actions_handler;
+    _ = actions.expireDue(&t.shard);
+    actions.duty_since_ns = 0;
+    // No room for any called run's end.
+    t.shard.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    var passes: usize = 0;
+    while (passes < 4 and ActionsHandler.for_tests.run(&t.shard, .default, "plain").?.status == .leased) : (passes += 1) {
+        _ = actions.expireDue(&t.shard);
+        try ParkTest.ack(&t.shard);
+    }
+    try std.testing.expectEqual(action_machine.Status.timed_out, ActionsHandler.for_tests.run(&t.shard, .default, "plain").?.status);
+    // Every held one is still leased, and, once the walk has gone round,
+    // counted.
+    _ = actions.expireDue(&t.shard);
+    try std.testing.expectEqual(@as(u64, held_n), metrics.workflow.action_expires_held.load(.monotonic));
+    for (&names, 0..) |*b, i| try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(&t.shard, .default, try std.fmt.bufPrint(b, "c{d}", .{i})).?.status);
 }

@@ -108,6 +108,11 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .namespace_create => .none,
         // Actions: their contract machine (actions/machine.zig).
         .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => .none,
+        // Calls: their contract machine (actions/calls_machine.zig).
+        .action_call, .action_call_retry, .action_call_clear, .action_reply, .action_done => .none,
+        // A hand-back: sent by the actions machine; applied, after its
+        // commit, by the actions handler.
+        .action_abandon_send, .action_abandon => .none,
         .processing_submit, .processing_stop, .processing_cancel, .processing_remove => .none,
         // Its contract machine (processing/sinks_machine.zig).
         .processing_sink_batch => .none,

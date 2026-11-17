@@ -62,7 +62,8 @@ pub const WorkersConfig = struct {
 /// Workflow settings an operator sets.
 pub const WorkflowsConfig = struct {
     /// How long a step waits for its action to be registered, on the node
-    /// leading the action's shard; 0 fails it at once.
+    /// leading the workflow's shard, which asks again 5 s after the answer,
+    /// doubling to a minute; 0 fails it at once.
     missing_action_wait_ms: u64 = 600_000,
 };
 
@@ -792,7 +793,8 @@ pub fn generateDefaultConfig() []const u8 {
     \\
     \\[workflows]
     \\# How long a workflow step waits for its action to be registered before
-    \\# it takes its target_not_found outcome. 0 fails it at once.
+    \\# it takes its target_not_found outcome. It asks again 5 s after it is
+    \\# told the action isn't there, doubling to a minute. 0 fails it at once.
     \\# missing_action_wait_ms = 600000
     \\
     \\[kv]

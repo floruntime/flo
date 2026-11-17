@@ -309,6 +309,8 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
         if (s.worker_id) |v| ctx.print("{f}", .{cli_output.jsonString(v)}) else ctx.print("null", .{});
         ctx.print(",\"outcome\":", .{});
         if (s.outcome) |v| ctx.print("{f}", .{cli_output.jsonString(v)}) else ctx.print("null", .{});
+        ctx.print(",\"held\":", .{});
+        if (s.held) |v| ctx.print("{f}", .{cli_output.jsonString(v)}) else ctx.print("null", .{});
         ctx.print("}}\n", .{});
         return;
     }
@@ -320,6 +322,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     if (s.outcome) |v| ctx.print("outcome: {s}\n", .{v});
     if (s.output) |v| ctx.print("output: {s}\n", .{v});
     if (s.error_message) |v| ctx.print("error: {s}\n", .{v});
+    if (s.held) |v| ctx.print("held: {s}\n", .{v});
 }
 
 fn runList(ctx: *commander.Context) commander.Error!void {
