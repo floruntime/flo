@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 33;
+pub const CURRENT: u32 = 34;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -114,6 +114,9 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // namespace, in the inbound, a sink batch and the sender's outbox
     // record; and an outbox keeps each namespace's share (`channel.out_ns`).
     .{ .format = 33, .segment_version = 22, .entries = 0xa7b17987ff316599 },
+    // A consumer group's operator entries: a steal, a requeue and a drop;
+    // and a group's record keeps its holder's last touch (`touched_ns`).
+    .{ .format = 34, .segment_version = 23, .entries = 0x95cded206a3cc3cc },
 };
 
 comptime {
