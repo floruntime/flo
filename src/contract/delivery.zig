@@ -188,13 +188,19 @@ pub fn Model(comptime cfg: Config) type {
             return .{ .expiry_ns = std.mem.readInt(u64, k[0..8], .big), .ns = ns, .id = k[12..] };
         }
 
-        /// A lease past its deadline, as the expire duty reads it.
-        pub const PastDue = struct { key: DeadlineKey, scope: []const u8 };
+        /// A lease past its deadline, as the expire duty reads it, and its
+        /// key as stored, which a walk can resume after.
+        pub const PastDue = struct { key: DeadlineKey, scope: []const u8, raw: []const u8 };
 
         /// Walk the deadlines earliest first, as the expire duty does: each
         /// due at or before `now`, until the first that isn't.
         pub fn pastDue(read: view_mod.ReadView, now: u64) PastDueIter {
             return .{ .it = read.range(Deadlines, ""), .now = now };
+        }
+
+        /// `pastDue`, from the first deadline after the stored key `from`.
+        pub fn pastDueAfter(read: view_mod.ReadView, now: u64, from: []const u8) PastDueIter {
+            return .{ .it = read.rangeAfter(Deadlines, "", from), .now = now };
         }
 
         pub const PastDueIter = struct {
@@ -206,7 +212,7 @@ pub fn Model(comptime cfg: Config) type {
                     // Past the family's empty namespace: the key itself.
                     const k = parseDeadlineKey(item.key[1..]) orelse continue;
                     if (k.expiry_ns > self.now) return null;
-                    return .{ .key = k, .scope = item.value.v.scope };
+                    return .{ .key = k, .scope = item.value.v.scope, .raw = item.key };
                 }
                 return null;
             }

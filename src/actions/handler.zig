@@ -208,10 +208,15 @@ pub const ActionsHandler = struct {
     /// A report refused for its caller's outbox says why here: the answer
     /// is encoded after the handler returns.
     refusal_buf: [256]u8 = undefined,
-    /// Past-due leases of called runs the last expire pass left running,
-    /// since their end had no room to be sent: run key → the shard it
-    /// waits on. Leader memory, rebuilt each pass; `action.status` says it.
-    held_expires: std.StringHashMapUnmanaged(u16) = .empty,
+    /// Past-due leases of called runs the expire passes leave running,
+    /// since their end has no room to be sent: run key → the shard it waits
+    /// on, and the sweep that last saw it held. Leader memory; a note not
+    /// seen held through a whole sweep goes. `action.status` says it.
+    held_expires: std.StringHashMapUnmanaged(Held) = .empty,
+    /// Where the next expire pass resumes, past the last deadline key the
+    /// last one looked at, and how many times the walk has wrapped.
+    expire_after: std.ArrayListUnmanaged(u8) = .empty,
+    expire_sweep: u64 = 0,
     held_buf: [action_ops.MAX_HELD_NOTE]u8 = undefined,
 
     const Pending = struct {
@@ -222,6 +227,8 @@ pub const ActionsHandler = struct {
     };
 
     const Rerun = struct { reply_to: ReplyTo, request_id: u64, bytes: []u8 };
+
+    const Held = struct { to: u16, sweep: u64 };
 
     /// Delayed retries the duty keeps a due time for; past it, every tick
     /// wakes.
@@ -239,6 +246,7 @@ pub const ActionsHandler = struct {
     pub fn deinit(self: *ActionsHandler) void {
         self.forgetLeading();
         self.held_expires.deinit(self.allocator);
+        self.expire_after.deinit(self.allocator);
         self.reserved.deinit(self.allocator);
         self.pending.deinit(self.allocator);
         self.extending.deinit(self.allocator);
@@ -559,8 +567,8 @@ pub const ActionsHandler = struct {
         const worker_id: ?[]const u8 = if (run.holder.len == 0) null else try copyInto(buf, &used, run.holder, action_ops.MAX_WORKER_ID);
         const named_outcome: ?[]const u8 = if (run.status != .completed or run.outcome.len == 0) null else try copyInto(buf, &used, run.outcome, action_ops.MAX_OUTCOME);
         var kb: [KEY_BUF]u8 = undefined;
-        const held: ?[]const u8 = if (run.status != .leased) null else if (storeKey(&kb, req.ns_id, req.key)) |k| (if (self.held_expires.get(k)) |to|
-            std.fmt.bufPrint(&self.held_buf, "its end waits for room on shard {d}", .{to}) catch null
+        const held: ?[]const u8 = if (run.status != .leased) null else if (storeKey(&kb, req.ns_id, req.key)) |k| (if (self.held_expires.get(k)) |h|
+            std.fmt.bufPrint(&self.held_buf, "its end waits for room on shard {d}", .{h.to}) catch null
         else
             null) else null;
         return .{
@@ -1653,15 +1661,23 @@ pub const ActionsHandler = struct {
         var items: std.ArrayListUnmanaged(u8) = .empty;
         defer items.deinit(self.allocator);
         var n: u32 = 0;
-        // Held leases stay past due, so the scan is capped: those it doesn't
-        // reach wait for a pass that does.
+        // Held leases stay past due at the front, so a pass looks at no more
+        // than `EXPIRE_SCAN_MAX` keys, and the next resumes after the last
+        // it looked at: every past-due lease is reached in turn, however
+        // many are held ahead of it. At the end the walk wraps to the start.
         var looked: usize = 0;
-        freeKeys(self.allocator, &self.held_expires);
+        var reached_end = true;
         defer if (shard.metrics_registry) |m| m.workflow.action_expires_held.store(self.held_expires.count(), .monotonic);
-        var it = machine.pastDue(readOf(shard), now);
+        const read = readOf(shard);
+        var it = if (self.expire_after.items.len > 0) machine.pastDueAfter(read, now, self.expire_after.items) else machine.pastDue(read, now);
         while (it.next()) |due| {
-            if (n == ae.MAX_EXPIRE_ITEMS or looked == EXPIRE_SCAN_MAX) break;
+            if (n == ae.MAX_EXPIRE_ITEMS or looked == EXPIRE_SCAN_MAX) {
+                reached_end = false;
+                break;
+            }
             looked += 1;
+            self.expire_after.clearRetainingCapacity();
+            self.expire_after.appendSlice(self.allocator, due.raw) catch {};
             const k = due.key;
             var holder: []const u8 = "";
             var request_key: ?[]const u8 = null;
@@ -1684,8 +1700,10 @@ pub const ActionsHandler = struct {
             const bytes = ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns.int(), .action = due.scope, .run = k.id, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key }) catch continue;
             if (items.items.len + bytes.len > ae.MAX_EXPIRE_BYTES) break;
             items.appendSlice(self.allocator, bytes) catch break;
+            self.dropHeld(k.ns, k.id);
             n += 1;
         }
+        if (reached_end) self.wrapExpires();
         if (n == 0) return 0;
         const proposed = propose(shard, .action_expire, ae.Expire.Value{ .items = .{ .bytes = items.items, .count = n } }) catch |err| {
             if (!shard.quietHalted(err)) log.warn("shard {d}: leases past their deadline not ended: {s}", .{ shard.id, @errorName(err) });
@@ -1702,16 +1720,41 @@ pub const ActionsHandler = struct {
     const HELD_NOTES_MAX: usize = 4096;
 
     /// A held lease, for `action.status` to say which shard its end waits
-    /// on. Past the cap it is held all the same, unnamed.
+    /// on, and for the gauge. Past the cap it is held all the same, unnamed.
     fn noteHeld(self: *ActionsHandler, shard: *Shard, ns: NamespaceId, run_id: []const u8, r: table_run.Refused) void {
         _ = r;
-        if (self.held_expires.count() >= HELD_NOTES_MAX) return;
         const run = getRun(shard, ns, run_id) orelse return;
         const workflow = run.caller_workflow orelse return;
         var kb: [KEY_BUF]u8 = undefined;
         const k = storeKey(&kb, ns, run_id) orelse return;
+        const held: Held = .{ .to = shard.router.slotToShard(calls_machine.callerSlot(ns, workflow)), .sweep = self.expire_sweep };
+        if (self.held_expires.getPtr(k)) |h| {
+            h.* = held;
+            return;
+        }
+        if (self.held_expires.count() >= HELD_NOTES_MAX) return;
         const owned = self.allocator.dupe(u8, k) catch return;
-        self.held_expires.put(self.allocator, owned, shard.router.slotToShard(calls_machine.callerSlot(ns, workflow))) catch self.allocator.free(owned);
+        self.held_expires.put(self.allocator, owned, held) catch self.allocator.free(owned);
+    }
+
+    /// A lease the pass is ending is held no longer.
+    fn dropHeld(self: *ActionsHandler, ns: NamespaceId, run_id: []const u8) void {
+        var kb: [KEY_BUF]u8 = undefined;
+        const k = storeKey(&kb, ns, run_id) orelse return;
+        if (self.held_expires.fetchRemove(k)) |kv| self.allocator.free(kv.key);
+    }
+
+    /// The walk reached the last past-due lease: the next pass starts over,
+    /// and a note no pass saw held through the sweep just ended goes (its
+    /// run settled, or its lease was ended).
+    fn wrapExpires(self: *ActionsHandler) void {
+        self.expire_after.clearRetainingCapacity();
+        var stale: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer stale.deinit(self.allocator);
+        var it = self.held_expires.iterator();
+        while (it.next()) |e| if (e.value_ptr.sweep < self.expire_sweep) stale.append(self.allocator, e.key_ptr.*) catch break;
+        for (stale.items) |k| if (self.held_expires.fetchRemove(k)) |kv| self.allocator.free(kv.key);
+        self.expire_sweep += 1;
     }
 
     /// Wake awaits once a delayed retry is due. With some dropped, the
@@ -1761,6 +1804,7 @@ pub const ActionsHandler = struct {
 
     fn forgetLeading(self: *ActionsHandler) void {
         freeKeys(self.allocator, &self.held_expires);
+        self.expire_after.clearRetainingCapacity();
         freeKeys(self.allocator, &self.reserved);
         freeKeys(self.allocator, &self.extending);
         self.due.clearRetainingCapacity();

@@ -141,6 +141,7 @@ pub const deadlineKey = M.deadlineKey;
 pub const DeadlineKey = M.DeadlineKey;
 pub const parseDeadlineKey = M.parseDeadlineKey;
 pub const pastDue = M.pastDue;
+pub const pastDueAfter = M.pastDueAfter;
 pub const requestKey = M.requestKey;
 const after = delivery.after;
 const extendedTo = delivery.extendedTo;

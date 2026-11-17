@@ -28749,6 +28749,14 @@ test "actions: a called run's lease isn't ended on any attempt while its end has
     try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(&t.shard, .default, "r1").?.status);
     try std.testing.expectEqual(@as(u64, 1), metrics.workflow.action_expires_held.load(.monotonic));
     try std.testing.expect(actions.held_expires.count() == 1);
+    // A client asking about it is told why.
+    t.shard.runRequest(t.c.conn, .{ .header = proto.RequestHeader.init(.action_status, 40), .namespace = "", .key = "r1", .value = "" }, .client);
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.c.conn, t.c.pair[1], &t.buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    var diag: schema.Diagnostic = .{};
+    const st = try table_run.op("action.status").response.decodeAll(one[0].data, &diag);
+    try std.testing.expectEqualStrings("its end waits for room on shard 0", st.held.?);
     // Room: its first lease ends, and it is ready again.
     t.shard.outbox_caps = .{};
     try std.testing.expectEqual(@as(u64, 1), actions.expireDue(&t.shard));
@@ -28757,4 +28765,51 @@ test "actions: a called run's lease isn't ended on any attempt while its end has
     try std.testing.expectEqual(action_machine.Status.ready, back.status);
     try std.testing.expectEqual(@as(u32, 1), back.failures);
     try std.testing.expectEqual(@as(u64, 0), metrics.workflow.action_expires_held.load(.monotonic));
+}
+
+test "actions: more held leases than one expire pass looks at don't keep an ordinary lease behind them from ending" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var reg = testRegister("act");
+    reg.max_attempts = 1;
+    _ = try applyActionEntry(&t.shard, .action_register, reg, 1, 1);
+    // More called runs than a pass looks at, their leases due first; then
+    // a client's, due after them all.
+    const held_n = ActionsHandler.EXPIRE_SCAN_MAX + 4;
+    var idx: u64 = 2;
+    var names: [held_n][8]u8 = undefined;
+    for (&names, 0..) |*b, i| {
+        const r = try std.fmt.bufPrint(b, "c{d}", .{i});
+        var called = testInvoke("act", r);
+        called.source = .workflow;
+        called.caller_run = "wf-run";
+        called.caller_workflow = "wf";
+        _ = try applyActionEntry(&t.shard, .action_invoke, called, idx, 1);
+        idx += 1;
+        _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = r, .due_ns = 1, .holder = "w1", .request_key = null, .lease_ms = 5000 }, idx, 2);
+        idx += 1;
+    }
+    _ = try applyActionEntry(&t.shard, .action_invoke, testInvoke("act", "plain"), idx, 1);
+    idx += 1;
+    _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = "plain", .due_ns = 1, .holder = "w2", .request_key = null, .lease_ms = 5000 }, idx, 3);
+    var metrics = MetricsRegistry.init(std.testing.allocator);
+    defer metrics.deinit();
+    t.shard.setMetricsRegistry(&metrics);
+    const actions = t.shard.actions_handler;
+    _ = actions.expireDue(&t.shard);
+    actions.duty_since_ns = 0;
+    // No room for any called run's end.
+    t.shard.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    var passes: usize = 0;
+    while (passes < 4 and ActionsHandler.for_tests.run(&t.shard, .default, "plain").?.status == .leased) : (passes += 1) {
+        _ = actions.expireDue(&t.shard);
+        try ParkTest.ack(&t.shard);
+    }
+    try std.testing.expectEqual(action_machine.Status.timed_out, ActionsHandler.for_tests.run(&t.shard, .default, "plain").?.status);
+    // Every held one is still leased, and, once the walk has gone round,
+    // counted.
+    _ = actions.expireDue(&t.shard);
+    try std.testing.expectEqual(@as(u64, held_n), metrics.workflow.action_expires_held.load(.monotonic));
+    for (&names, 0..) |*b, i| try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(&t.shard, .default, try std.fmt.bufPrint(b, "c{d}", .{i})).?.status);
 }
