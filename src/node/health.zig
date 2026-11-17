@@ -352,7 +352,8 @@ pub const NodeHealth = struct {
             if (sm) |m| {
                 const wrong_slot = m.channel_sender_bugs[0].load(.monotonic);
                 const bad_payload = m.channel_sender_bugs[1].load(.monotonic);
-                if (wrong_slot + bad_payload > 0) try w.print(",\"channel_sender_bugs\":{{\"wrong_slot\":{d},\"bad_payload\":{d}}}", .{ wrong_slot, bad_payload });
+                const wrong_origin = m.channel_sender_bugs[2].load(.monotonic);
+                if (wrong_slot + bad_payload + wrong_origin > 0) try w.print(",\"channel_sender_bugs\":{{\"wrong_slot\":{d},\"bad_payload\":{d},\"wrong_origin\":{d}}}", .{ wrong_slot, bad_payload, wrong_origin });
             }
             // Shown once a sink's write sent here was refused for good by
             // its target, by reason: records lost to that sink.

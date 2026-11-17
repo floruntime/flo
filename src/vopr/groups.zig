@@ -773,8 +773,35 @@ pub const Groups = struct {
             var pb: [channels_mod.GROUP_KEY]u8 = undefined;
             var it = read.range(channels_mod.OutFam, channels_mod.outPrefix(&pb, to));
             var held: u64 = 0;
-            while (it.next() catch null) |rec| held += rec.value.v.payload.len;
+            // And by namespace: the few the run's messages are for.
+            var nss: [16]u32 = undefined;
+            var by_ns: [16]u64 = @splat(0);
+            var n: usize = 0;
+            while (it.next() catch null) |rec| {
+                held += rec.value.v.payload.len;
+                const ns = rec.value.v.origin_ns;
+                const i = for (nss[0..n], 0..) |x, j| {
+                    if (x == ns) break j;
+                } else if (n < nss.len) blk: {
+                    nss[n] = ns;
+                    n += 1;
+                    break :blk n - 1;
+                } else continue;
+                by_ns[i] += rec.value.v.payload.len;
+            }
             if (held != meta.bytes) self.oracle.fail(c.g, @intCast(to), meta.acked + 1, "an outbox's recorded bytes are not what it holds");
+            for (nss[0..n], by_ns[0..n]) |ns, bytes| if (channels_mod.nsBytesOf(read, to, .of(ns)) != bytes)
+                self.oracle.fail(c.g, @intCast(to), meta.acked + 1, "a namespace's recorded share of an outbox is not what it holds");
+            // And no namespace keeps a share of what it no longer holds.
+            var nb: [1 + channels_mod.OUT_NS.len + 4]u8 = undefined;
+            var nit = read.range(channels_mod.OutNsFam, channels_mod.outNsPrefix(&nb, to));
+            while (nit.next() catch null) |rec| {
+                const ns = std.mem.readInt(u32, rec.key[rec.key.len - 4 ..][0..4], .big);
+                const holds = for (nss[0..n], by_ns[0..n]) |x, bytes| {
+                    if (x == ns) break bytes;
+                } else 0;
+                if (rec.value.v.bytes != holds) self.oracle.fail(c.g, @intCast(to), meta.acked + 1, "a namespace's recorded share of an outbox is not what it holds");
+            }
         };
     }
 

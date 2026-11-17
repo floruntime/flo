@@ -41,6 +41,10 @@ pub const Message = Record(&.{
     // The entry flags it applies with (a sink's write is `Flags.SINK`), as
     // the sending apply set them: never the inbound's.
     .{ .name = "flags", .T = Int(u16) },
+    // Who it was sent for (`View.Origin`): a user's or the system's, and
+    // the namespace whose keys alone it may touch.
+    .{ .name = "origin_kind", .T = Int(u8) },
+    .{ .name = "origin_ns", .T = Int(u32) },
     .{ .name = "payload", .T = Bytes(MAX_MESSAGE_PAYLOAD) },
 });
 

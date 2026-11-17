@@ -30,7 +30,7 @@ pub const Cursor = Record(&.{
 
 /// The last family id below `store.MAX_FAMILIES`: the next machine's
 /// family needs that raised.
-pub const CursorFam = view_mod.Family(63, "processing.cursor", delivery.Stored(Cursor));
+pub const CursorFam = view_mod.Family(63, "processing.cursor", .id, delivery.Stored(Cursor));
 
 pub const At = struct { a: u64 = 0, b: u64 = 0 };
 
@@ -69,7 +69,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     var it = p.messages.iterator();
     while (it.next() catch return error.Halt) |m| {
         if (m.flags != entry_mod.Flags.SINK) return error.Halt;
-        try view.sendFlagged(m.slot, m.entry_type, m.flags, m.payload);
+        try view.sendFlagged(.user(.of(m.ns)), m.slot, m.entry_type, m.flags, m.payload);
     }
 }
 
@@ -147,7 +147,7 @@ const T = struct {
     fn batch(t: *T, from: At, to: At, bodies: []const []const u8) !void {
         var mb: [1024]u8 = undefined;
         var w: schema_w = .{ .buf = &mb };
-        for (bodies) |b| try pe.SinkMessage.encode(&w, .{ .slot = 1, .entry_type = @backingInt(EntryType.kv_put), .flags = entry_mod.Flags.SINK, .payload = b });
+        for (bodies) |b| try pe.SinkMessage.encode(&w, .{ .slot = 1, .entry_type = @backingInt(EntryType.kv_put), .flags = entry_mod.Flags.SINK, .ns = 1, .payload = b });
         var buf: [2048]u8 = undefined;
         const payload = try pe.SinkBatch.encodeInto(&buf, .{ .ns = 21, .pipeline = "job", .from_a = from.a, .from_b = from.b, .to_a = to.a, .to_b = to.b, .messages = .{ .bytes = w.written(), .count = @intCast(bodies.len) } });
         const e = t.entry(.processing_sink_batch, payload);
@@ -210,7 +210,7 @@ test "sinks: a batch whose write carries a flag other than the sink's halts: onl
     defer t.deinit();
     var mb: [256]u8 = undefined;
     var w: schema_w = .{ .buf = &mb };
-    try pe.SinkMessage.encode(&w, .{ .slot = 1, .entry_type = @backingInt(EntryType.kv_put), .flags = 0, .payload = "x" });
+    try pe.SinkMessage.encode(&w, .{ .slot = 1, .entry_type = @backingInt(EntryType.kv_put), .flags = 0, .ns = 1, .payload = "x" });
     var buf: [512]u8 = undefined;
     const payload = try pe.SinkBatch.encodeInto(&buf, .{ .ns = 21, .pipeline = "job", .from_a = 0, .from_b = 0, .to_a = 1, .to_b = 0, .messages = .{ .bytes = w.written(), .count = 1 } });
     const e = t.entry(.processing_sink_batch, payload);

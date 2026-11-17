@@ -31,6 +31,9 @@ pub const SinkMessage = Record(&.{
     .{ .name = "slot", .T = Int(u16) },
     .{ .name = "entry_type", .T = Int(u8) },
     .{ .name = "flags", .T = Int(u16) },
+    // The sink's namespace: the message is its user's, and touches only
+    // its keys.
+    .{ .name = "ns", .T = Int(u32) },
     .{ .name = "payload", .T = Bytes(MAX_SINK_PAYLOAD) },
 });
 

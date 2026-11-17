@@ -32,7 +32,12 @@ pub const SenderBug = enum(u8) {
     /// A message applied after the commit that wouldn't apply, or that its
     /// client path refuses (`channels.AfterCommit`).
     bad_payload,
+    /// Sent for no namespace, for a reserved one by a user, or touching
+    /// keys outside its origin's namespace.
+    wrong_origin,
 };
+
+pub const SENDER_BUGS = std.enums.values(SenderBug).len;
 
 /// Family ids are below this; a family's state is a slot of its own.
 pub const MAX_FAMILIES = 64;

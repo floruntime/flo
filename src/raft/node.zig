@@ -371,7 +371,24 @@ fn channelEntry(t: EntryType) bool {
     };
 }
 
-const Proposed = struct { index: u64, bytes: u64 };
+/// One proposal this leader counts: its index and payload bytes, and the
+/// namespace it was charged to (0 for none: a duty's, or a channel's).
+const Proposed = struct { index: u64, bytes: u64, ns: u32 = 0 };
+
+/// Whether a namespace holding `held` of something shared, holding `total`
+/// of `cap`, may take no more: past three quarters of the cap, or, once it
+/// is three quarters full, past the quarter each is guaranteed. Under
+/// contention the heaviest stop first, and the last quarter is left to the
+/// namespaces below their share. The same rule holds a namespace to its
+/// share of a channel outbox and of this cap.
+pub fn shareHeld(held: u64, total: u64, cap: u64) bool {
+    // A namespace holding nothing never waits on others; and unrounded, so a
+    // tiny cap's quarters aren't zero.
+    if (held == 0) return false;
+    const c: u128 = cap;
+    if (@as(u128, held) * 4 >= c * 3) return true;
+    return @as(u128, total) * 4 >= c * 3 and @as(u128, held) * 4 > c;
+}
 /// Room for every proposal the entry cap lets be outstanding, and the
 /// repairs it exempts.
 const PROPOSED_RING = MAX_OUTSTANDING + 64;
@@ -592,6 +609,12 @@ pub const RaftNode = struct {
     proposed_len: usize = 0,
     proposed_bytes: u64 = 0,
     proposed_term: u64 = 0,
+    /// The same, by the namespace each was charged to: room for the most
+    /// the ring holds, allocated once, so a proposal never allocates.
+    ns_pending: std.AutoHashMapUnmanaged(u32, u64) = .empty,
+    /// The namespace this leader charges what it proposes to, set by its
+    /// shard while it runs a client's request: 0 outside one.
+    charge_ns: u32 = 0,
 
     // ── Stats ──────────────────────────────────────────────────────────
     elections_started: u64,
@@ -609,8 +632,12 @@ pub const RaftNode = struct {
     ) !RaftNode {
         var raft_log_inst = try RaftLog.init(allocator, log_capacity);
         errdefer raft_log_inst.deinit();
+        var ns_pending: std.AutoHashMapUnmanaged(u32, u64) = .empty;
+        try ns_pending.ensureTotalCapacity(allocator, PROPOSED_RING);
+        errdefer ns_pending.deinit(allocator);
 
         return .{
+            .ns_pending = ns_pending,
             .id = node_id,
             .group_id = group_id,
             .current_term = 0,
@@ -647,6 +674,7 @@ pub const RaftNode = struct {
     }
 
     pub fn deinit(self: *RaftNode) void {
+        self.ns_pending.deinit(self.allocator);
         self.log.deinit();
     }
 
@@ -1643,28 +1671,45 @@ pub const RaftNode = struct {
         if (self.role != .leader or self.proposed_term != self.current_term) {
             self.proposed_len = 0;
             self.proposed_bytes = 0;
+            self.ns_pending.clearRetainingCapacity();
             self.proposed_term = self.current_term;
             return 0;
         }
-        while (self.proposed_len > 0 and self.proposed[self.proposed_head].index <= self.last_applied) {
-            self.proposed_bytes -= self.proposed[self.proposed_head].bytes;
-            self.proposed_head = (self.proposed_head + 1) % PROPOSED_RING;
-            self.proposed_len -= 1;
-        }
+        while (self.proposed_len > 0 and self.proposed[self.proposed_head].index <= self.last_applied) self.retireOldest();
         return self.proposed_bytes;
+    }
+
+    /// Payload bytes this leader proposed for namespace `ns` and hasn't
+    /// applied (`pendingBytes`, by namespace).
+    pub fn pendingBytesIn(self: *RaftNode, ns: u32) u64 {
+        _ = self.pendingBytes();
+        return self.ns_pending.get(ns) orelse 0;
+    }
+
+    fn retireOldest(self: *RaftNode) void {
+        const p = self.proposed[self.proposed_head];
+        self.proposed_bytes -= p.bytes;
+        if (p.ns != 0) if (self.ns_pending.getPtr(p.ns)) |held| {
+            held.* -= p.bytes;
+            if (held.* == 0) _ = self.ns_pending.remove(p.ns);
+        };
+        self.proposed_head = (self.proposed_head + 1) % PROPOSED_RING;
+        self.proposed_len -= 1;
     }
 
     fn noteProposed(self: *RaftNode, index: u64, bytes: u64) void {
         _ = self.pendingBytes();
         // Full only past the entry cap's room: the oldest goes uncounted.
-        if (self.proposed_len == PROPOSED_RING) {
-            self.proposed_bytes -= self.proposed[self.proposed_head].bytes;
-            self.proposed_head = (self.proposed_head + 1) % PROPOSED_RING;
-            self.proposed_len -= 1;
-        }
-        self.proposed[(self.proposed_head + self.proposed_len) % PROPOSED_RING] = .{ .index = index, .bytes = bytes };
+        if (self.proposed_len == PROPOSED_RING) self.retireOldest();
+        const ns = self.charge_ns;
+        self.proposed[(self.proposed_head + self.proposed_len) % PROPOSED_RING] = .{ .index = index, .bytes = bytes, .ns = ns };
         self.proposed_len += 1;
         self.proposed_bytes += bytes;
+        // At most one entry per ring slot, so never past its capacity.
+        if (ns != 0) {
+            const held = self.ns_pending.getOrPutAssumeCapacity(ns);
+            held.value_ptr.* = (if (held.found_existing) held.value_ptr.* else 0) + bytes;
+        }
     }
 
     /// Propose an entry (leader only), with `flags` in its header (e.g.
@@ -1700,6 +1745,13 @@ pub const RaftNode = struct {
             const limit = if (channelEntry(entry_type)) PROPOSAL_BYTES else PROPOSAL_BYTES - PROPOSAL_RESERVE;
             const pending = self.pendingBytes();
             if (pending > 0 and pending + payload.len > limit) return error.Overloaded;
+            // A client's namespace is held to its share of what's left after
+            // the reserve, so one tenant's writes are refused before another's
+            // and before a channel hears `busy`. One alone always goes.
+            if (!channelEntry(entry_type) and self.charge_ns != 0) {
+                const held = self.ns_pending.get(self.charge_ns) orelse 0;
+                if (held > 0 and shareHeld(held + payload.len, pending + payload.len, limit)) return error.Overloaded;
+            }
         }
 
         var e = entry_mod.buildEntry(
@@ -5311,6 +5363,35 @@ test "raft node: a leader counts a voter halted at an entry only on this leaders
     node.handleAppendResponse(.{ .term = node.current_term, .success = true, .match_index = 0, .from = 2, .halt = h });
     node.handleAppendResponse(.{ .term = node.current_term, .success = true, .match_index = 0, .from = 3, .halt = h });
     try testing.expectEqualSlices(NodeId, &.{ 1, 2, 3 }, node.votersHaltedAt(h, &ids));
+}
+
+test "raft node: a client's namespace takes at most three quarters of the room clients have, and past a quarter waits once it's three quarters full" {
+    var node = try RaftNode.init(testing.allocator, 1, 1000, 64 << 20, .{});
+    defer node.deinit();
+    node.addPeer(2);
+    _ = candidacy(&node).?;
+    _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
+    const big = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    const room = PROPOSAL_BYTES - PROPOSAL_RESERVE;
+    // Namespace 7 alone: up to three quarters of the room.
+    node.charge_ns = 7;
+    for (0..room / 4 * 3 / big.len - 1) |_| _ = try node.propose(.kv_put, 0, big);
+    try testing.expectError(error.Overloaded, node.propose(.kv_put, 0, big));
+    try testing.expectEqual(@as(u64, room / 4 * 3 - big.len), node.pendingBytesIn(7));
+    // Namespace 8 still has its quarter, and what's past three quarters.
+    node.charge_ns = 8;
+    for (0..room / 4 / big.len) |_| _ = try node.propose(.kv_put, 0, big);
+    try testing.expectError(error.Overloaded, node.propose(.kv_put, 0, big));
+    try testing.expectEqual(@as(u64, room / 4), node.pendingBytesIn(8));
+    // A duty is charged to none, and goes on within the cap.
+    node.charge_ns = 0;
+    _ = try node.propose(.kv_put, 0, big);
+    // Applied, both namespaces' counts go.
+    node.last_applied = node.log.lastIndex();
+    try testing.expectEqual(@as(u64, 0), node.pendingBytesIn(7));
+    try testing.expectEqual(@as(usize, 0), node.ns_pending.count());
 }
 
 test "raft node: proposals are capped by payload bytes, a quarter kept for channel entries; the count is 0 once the log applies and when the node stops leading" {

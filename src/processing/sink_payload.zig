@@ -21,6 +21,8 @@ const NamespaceId = router.NamespaceId;
 
 /// A write ready to send: the slot its target routes to, and its entry.
 pub const Built = struct {
+    /// The namespace its keys are in: who the write is sent for.
+    ns: NamespaceId,
     slot: u16,
     entry_type: EntryType,
     payload: []const u8,
@@ -46,7 +48,7 @@ pub fn kv(buf: []u8, ns: NamespaceId, key: []const u8, value: []const u8, ttl_ms
     const stored = kv_machine.Key.init(&kb, ns, key).stored;
     const payload = kv_entries.Put.encodeInto(buf, .{ .key = stored, .value = value, .ttl_ms = ttl_ms, .condition = .always, .cas_version = null }) catch
         return .{ .refused = .{ .why = "the value is too large for one write" } };
-    return .{ .built = .{ .slot = slotOf(ns, key), .entry_type = .kv_put, .payload = payload } };
+    return .{ .built = .{ .ns = ns, .slot = slotOf(ns, key), .entry_type = .kv_put, .payload = payload } };
 }
 
 /// An enqueue of `value` to queue `name`, at this node's caps.
@@ -56,7 +58,7 @@ pub fn queue(buf: []u8, caps: queue_handler.Caps, ns: NamespaceId, name: []const
     if (value.len > qe.MAX_MESSAGE) return .{ .refused = .{ .why = "message too large: a queue message holds at most 64 KiB" } };
     const payload = qe.Enqueue.encodeInto(buf, queue_handler.enqueueValue(caps, ns, name, priority, 0, value)) catch
         return .{ .refused = .{ .why = "the message is too large for one write" } };
-    return .{ .built = .{ .slot = slotOf(ns, name), .entry_type = .queue_enqueue, .payload = payload } };
+    return .{ .built = .{ .ns = ns, .slot = slotOf(ns, name), .entry_type = .queue_enqueue, .payload = payload } };
 }
 
 /// An append of `value` to stream `name`, as one record of partition 0.
@@ -74,7 +76,7 @@ pub fn stream(buf: []u8, scratch: std.mem.Allocator, ns: NamespaceId, name: []co
     const e = entry_mod.buildCommandEntry(.stream_append, entry_mod.Flags.SINK, 0, 0, 0, ns, name, stored, buf) orelse
         return .{ .refused = .{ .why = "the record is too large for one write" } };
     if (stream_mod.appendRefusal(e.payload)) |why| return .{ .refused = .{ .why = why } };
-    return .{ .built = .{ .slot = slotOf(ns, name), .entry_type = .stream_append, .payload = e.payload } };
+    return .{ .built = .{ .ns = ns, .slot = slotOf(ns, name), .entry_type = .stream_append, .payload = e.payload } };
 }
 
 /// A point of `measurement`'s `field` at `timestamp_ns` (0: its entry's
@@ -87,7 +89,7 @@ pub fn ts(buf: []u8, ns: NamespaceId, measurement: []const u8, field: []const u8
         return .{ .refused = .{ .why = "ts write: field/tags too large" } };
     const e = entry_mod.buildCommandEntry(.ts_write, entry_mod.Flags.SINK, 0, 0, 0, ns, measurement, encoded, buf) orelse
         return .{ .refused = .{ .why = "the point is too large for one write" } };
-    return .{ .built = .{ .slot = slotOf(ns, measurement), .entry_type = .ts_write, .payload = e.payload } };
+    return .{ .built = .{ .ns = ns, .slot = slotOf(ns, measurement), .entry_type = .ts_write, .payload = e.payload } };
 }
 
 const testing = std.testing;

@@ -27,7 +27,7 @@ const Count = struct {
     }
 };
 
-const Counters = view_mod.Family(1, "test.counters", Count);
+const Counters = view_mod.Family(1, "test.counters", .shard, Count);
 const NS = "t";
 
 /// An entry's payload: `[op u8]` then names separated by ','. `incr` adds
@@ -251,17 +251,17 @@ test "contract: a range names its namespace, and a key the entry didn't declare 
 }
 
 test "contract: a machine list with a shared entry type, family id or family name is refused" {
-    const other = machine_mod.Machine{ .name = "other", .entry_types = &.{.kv_delete}, .families = &.{.{ .id = 2, .name = "test.other" }}, .keys = counterKeys, .apply = counterApply };
+    const other = machine_mod.Machine{ .name = "other", .entry_types = &.{.kv_delete}, .families = &.{.{ .id = 2, .name = "test.other", .scope = .shard }}, .keys = counterKeys, .apply = counterApply };
     try testing.expectEqual(@as(?[]const u8, null), comptime machine_mod.listRule(&.{ counter_machine, other }));
     const same_type = machine_mod.Machine{ .name = "x", .entry_types = &.{.kv_put}, .families = &.{}, .keys = counterKeys, .apply = counterApply };
     try testing.expect(comptime machine_mod.listRule(&.{ counter_machine, same_type }) != null);
-    const same_id = machine_mod.Machine{ .name = "y", .entry_types = &.{}, .families = &.{.{ .id = 1, .name = "test.y" }}, .keys = counterKeys, .apply = counterApply };
+    const same_id = machine_mod.Machine{ .name = "y", .entry_types = &.{}, .families = &.{.{ .id = 1, .name = "test.y", .scope = .shard }}, .keys = counterKeys, .apply = counterApply };
     try testing.expect(comptime machine_mod.listRule(&.{ counter_machine, same_id }) != null);
-    const same_name = machine_mod.Machine{ .name = "z", .entry_types = &.{}, .families = &.{.{ .id = 3, .name = "test.counters" }}, .keys = counterKeys, .apply = counterApply };
+    const same_name = machine_mod.Machine{ .name = "z", .entry_types = &.{}, .families = &.{.{ .id = 3, .name = "test.counters", .scope = .shard }}, .keys = counterKeys, .apply = counterApply };
     try testing.expect(comptime machine_mod.listRule(&.{ counter_machine, same_name }) != null);
     const twice = machine_mod.Machine{ .name = "w", .entry_types = &.{ .kv_batch, .kv_batch }, .families = &.{}, .keys = counterKeys, .apply = counterApply };
     try testing.expectEqualStrings("w lists entry type kv_batch twice", comptime machine_mod.listRule(&.{ counter_machine, twice }).?);
-    const past = machine_mod.Machine{ .name = "v", .entry_types = &.{}, .families = &.{.{ .id = store_mod.MAX_FAMILIES, .name = "test.past" }}, .keys = counterKeys, .apply = counterApply };
+    const past = machine_mod.Machine{ .name = "v", .entry_types = &.{}, .families = &.{.{ .id = store_mod.MAX_FAMILIES, .name = "test.past", .scope = .shard }}, .keys = counterKeys, .apply = counterApply };
     try testing.expect(std.mem.startsWith(u8, comptime machine_mod.listRule(&.{ counter_machine, past }).?, "family test.past has id "));
     try testing.expectEqualStrings("other", machine_mod.ownerOf(&.{ counter_machine, other }, .kv_delete).?.name);
     try testing.expectEqual(null, machine_mod.ownerOf(&.{ counter_machine, other }, .kv_batch));

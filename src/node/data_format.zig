@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 32;
+pub const CURRENT: u32 = 33;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -110,6 +110,10 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // A channel's outbox record counts the payload bytes it holds
     // (`channel.out_meta`), so a snapshot holds them; the log is unchanged.
     .{ .format = 32, .segment_version = 21, .entries = 0xf3bbabb586de9d4c },
+    // A message carries who it was sent for (`origin`): its kind and its
+    // namespace, in the inbound, a sink batch and the sender's outbox
+    // record; and an outbox keeps each namespace's share (`channel.out_ns`).
+    .{ .format = 33, .segment_version = 22, .entries = 0xa7b17987ff316599 },
 };
 
 comptime {

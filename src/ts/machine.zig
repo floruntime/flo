@@ -132,9 +132,9 @@ pub const FieldValue = struct {
     }
 };
 
-pub const Series = view_mod.Family(60, "ts.series", SeriesValue);
-pub const Points = view_mod.Family(61, "ts.point", PointValue);
-pub const Fields = view_mod.Family(62, "ts.field", FieldValue);
+pub const Series = view_mod.Family(60, "ts.series", .id, SeriesValue);
+pub const Points = view_mod.Family(61, "ts.point", .id, PointValue);
+pub const Fields = view_mod.Family(62, "ts.field", .id, FieldValue);
 
 comptime {
     std.debug.assert(@typeInfo(@FieldType(@import("../contract/store.zig").Store, "ts_late_points")).array.len == LATE_EDGES_NS.len);
@@ -630,7 +630,7 @@ test "time series: two writes at one timestamp in one channel inbound are two po
     const schema = @import("../protocol/schema.zig");
     var mb: [4096]u8 = undefined;
     var w: schema.Writer = .{ .buf = &mb };
-    for (log.entries.items) |e| try ce.Message.encode(&w, .{ .slot = 0, .entry_type = e.header.entry_type, .layout_epoch = 0, .flags = 0, .payload = e.payload });
+    for (log.entries.items) |e| try ce.Message.encode(&w, .{ .slot = 0, .entry_type = e.header.entry_type, .layout_epoch = 0, .flags = 0, .origin_kind = 1, .origin_ns = 7, .payload = e.payload });
     var ib: [8192]u8 = undefined;
     const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
     var h = std.mem.zeroes(entry_mod.Header);
