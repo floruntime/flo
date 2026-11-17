@@ -265,7 +265,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             if (try view.get(Runs, rk)) |old| {
                 // Asked again for the run it started; one a run id repeated
                 // across callers (a clock stepped back) names is another's.
-                if (call and eqlOpt(old.v.caller_run, p.caller_run) and eqlOpt(old.v.caller_workflow, p.caller_workflow)) return reply(view, p, .started);
+                if (call) return reply(view, p, if (eqlOpt(old.v.caller_run, p.caller_run) and eqlOpt(old.v.caller_workflow, p.caller_workflow)) .started else .conflict);
                 return out.refuse(.conflict, .unclassified, RUN_EXISTS);
             }
             try view.put(Runs, rk, .{ .v = .{

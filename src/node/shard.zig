@@ -28477,7 +28477,7 @@ test "actions: an expire that would end a run a step called waits while the call
     try std.testing.expectEqual(action_machine.Status.timed_out, ActionsHandler.for_tests.run(&t.shard, .default, "r1").?.status);
 }
 
-test "Shard: a call's start whose run id another caller's run holds is refused, and that run is left alone" {
+test "Shard: a call's start whose run id another caller's run holds is answered so, and that run is left alone" {
     var two: TwoShards = undefined;
     try two.init();
     defer two.deinit();
@@ -28497,8 +28497,8 @@ test "Shard: a call's start whose run id another caller's run holds is refused, 
     two.settle();
     pumpChannels(&two);
     try std.testing.expect(ActionsHandler.for_tests.run(b, .default, rid).?.caller_workflow == null);
-    // Unanswered: the call stays sent.
-    try std.testing.expectEqual(calls_machine.State.sent, callIn(a, n.workflow, rid).?.state);
+    // Answered so: the call has no run, and its step fails.
+    try std.testing.expectEqual(calls_machine.State.refused, callIn(a, n.workflow, rid).?.state);
 }
 
 test "Shard: a workflow run cancelled while its step waits on its action drops the step's call" {
@@ -28545,4 +28545,100 @@ test "Shard: a workflow run cancelled while its step waits on its action drops t
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
     try ParkTest.ack(shard);
     try std.testing.expect(callIn(shard, "flow", rid) == null);
+}
+
+test "Shard: a worker's fail that ends a run a step called is refused while the caller's outbox has no room; one that retries isn't" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var ab: [16]u8 = undefined;
+    var wb: [16]u8 = undefined;
+    const n = try callNames(&two, 1, 0, &ab, &wb);
+    var rb: [32]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), &rb);
+    _ = try proposeAction(b, .action_register, testRegister(n.action));
+    two.settle();
+    try proposeCall(a, n.action, n.workflow, rid, false);
+    two.settle();
+    pumpChannels(&two);
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var aw: [64]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    var out2: [4096]u8 = undefined;
+    b.runRequest(c.conn, try ParkTest.request(.action_await, 31, proto.DEFAULT_NAMESPACE, "w", try ActionsHandler.for_tests.awaitBody(&aw, &.{n.action}, 0, null), ""), .client);
+    two.settle();
+    const task = (try ActionsHandler.for_tests.task((try nextAnswer(c, b, &out)).data)).?;
+    b.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    var fb: [512]u8 = undefined;
+    // A fail with no retry ends the run: refused.
+    b.runRequest(c.conn, try ParkTest.request(.action_fail, 32, proto.DEFAULT_NAMESPACE, task.run, try ActionsHandler.for_tests.failBody(&fb, task, "w", false, "boom"), ""), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), (try nextAnswer(c, b, &out2)).header.status);
+    try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(b, .default, rid).?.status);
+    // One that retries sends nothing: it goes through.
+    b.runRequest(c.conn, try ParkTest.request(.action_fail, 33, proto.DEFAULT_NAMESPACE, task.run, try ActionsHandler.for_tests.failBody(&fb, task, "w", true, "again"), ""), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, b, &out2)).header.status);
+    try std.testing.expectEqual(action_machine.Status.ready, ActionsHandler.for_tests.run(b, .default, rid).?.status);
+}
+
+test "Shard: a task handed back to another shard's run past the outbox caps is dropped and counted, and its lease ends it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    var sm = ShardMetrics{ .shard_id = 0 };
+    a.shard_metrics = &sm;
+    defer a.shard_metrics = null;
+    var ab: [16]u8 = undefined;
+    var wb: [16]u8 = undefined;
+    const n = try callNames(&two, 1, 0, &ab, &wb);
+    const task: action_ops_mod.Task.Value = .{ .run = "r-x", .namespace = "default", .deliveries = 1, .term = 1, .index = 5, .action = n.action, .created_at_ms = 0, .attempt = 1, .lease_ms = 5000, .caller_run = null, .caller_workflow = null, .input = "" };
+    a.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    const before = a.raft_node.log.lastIndex();
+    a.actions_handler.handBack(a, .default, "", task);
+    try std.testing.expectEqual(before, a.raft_node.log.lastIndex());
+    try std.testing.expectEqual(@as(u64, 1), handBacks(&sm, .action, .dropped));
+    // With room it is logged and sent.
+    a.outbox_caps = .{};
+    a.actions_handler.handBack(a, .default, "", task);
+    try std.testing.expectEqual(before + 1, a.raft_node.log.lastIndex());
+}
+
+test "actions: a called run's lease isn't ended on any attempt while its end has no room, and status says which shard it waits on" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    // Three attempts: the first lease's end would run it again.
+    _ = try applyActionEntry(&t.shard, .action_register, testRegister("act"), 1, 1);
+    var called = testInvoke("act", "r1");
+    called.source = .workflow;
+    called.caller_run = "wf-run";
+    called.caller_workflow = "wf";
+    _ = try applyActionEntry(&t.shard, .action_invoke, called, 2, 1);
+    _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = "r1", .due_ns = 1, .holder = "w1", .request_key = null, .lease_ms = 5000 }, 10, 2);
+    var metrics = MetricsRegistry.init(std.testing.allocator);
+    defer metrics.deinit();
+    t.shard.setMetricsRegistry(&metrics);
+    const actions = t.shard.actions_handler;
+    _ = actions.expireDue(&t.shard);
+    actions.duty_since_ns = 0;
+    t.shard.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    try std.testing.expectEqual(@as(u64, 0), actions.expireDue(&t.shard));
+    try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(&t.shard, .default, "r1").?.status);
+    try std.testing.expectEqual(@as(u64, 1), metrics.workflow.action_expires_held.load(.monotonic));
+    try std.testing.expect(actions.held_expires.count() == 1);
+    // Room: its first lease ends, and it is ready again.
+    t.shard.outbox_caps = .{};
+    try std.testing.expectEqual(@as(u64, 1), actions.expireDue(&t.shard));
+    try ParkTest.ack(&t.shard);
+    const back = ActionsHandler.for_tests.run(&t.shard, .default, "r1").?;
+    try std.testing.expectEqual(action_machine.Status.ready, back.status);
+    try std.testing.expectEqual(@as(u32, 1), back.failures);
+    try std.testing.expectEqual(@as(u64, 0), metrics.workflow.action_expires_held.load(.monotonic));
 }

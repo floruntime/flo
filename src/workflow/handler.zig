@@ -2318,7 +2318,7 @@ pub const WorkflowHandler = struct {
         const c = callOf(shard, run, action_rid) orelse return shard.raft_node.last_applied >= run.pending_index;
         switch (c.state) {
             .sent, .started => return false,
-            .done => return true,
+            .done, .refused => return true,
             .no_action => {
                 // With no wait set it fails at once, saying nothing of a wait.
                 if (!c.can_wait or shard.actions_handler.missing_action_wait_ms == 0) return true;
@@ -2756,7 +2756,7 @@ pub const WorkflowHandler = struct {
             if (shard.raft_node.last_applied < run.pending_index) return;
             log.warn("workflow run {f}: the call of action run {s} its step waits for was never made (its entry was dropped); the step fails", .{ shown(run_ns_key), action_rid });
         }
-        const Settled = enum { completed, failed, timed_out, no_action, lost };
+        const Settled = enum { completed, failed, timed_out, no_action, refused, lost };
         const settled: Settled = if (call) |c| switch (c.state) {
             .done => switch (std.enums.fromInt(ae.DoneStatus, c.status) orelse .failed) {
                 .completed => .completed,
@@ -2764,6 +2764,7 @@ pub const WorkflowHandler = struct {
                 .timed_out => .timed_out,
             },
             .no_action => .no_action,
+            .refused => .refused,
             // Not settled: `callSettled` resumes only a settled one.
             .sent, .started => return,
         } else .lost;
@@ -2783,7 +2784,7 @@ pub const WorkflowHandler = struct {
                 break :blk definition.StepOutcome.failure;
             },
             .no_action => definition.StepOutcome.target_not_found,
-            .timed_out, .lost => definition.StepOutcome.execution_failure,
+            .timed_out, .refused, .lost => definition.StepOutcome.execution_failure,
         };
 
         // Record completion before clearing state (step_label points into pending_step_name_owned)
@@ -2804,6 +2805,7 @@ pub const WorkflowHandler = struct {
                 self.addHistoryEvent(run, "action_not_found", detail, now_ms);
             },
             .lost => self.addHistoryEvent(run, "action_lost", outcome, now_ms),
+            .refused => self.addHistoryEvent(run, "action_refused", "its run id names another caller's run", now_ms),
             else => self.addHistoryEvent(run, "action_completed", outcome, now_ms),
         }
         self.addHistoryEvent(run, "step_completed", step_label, now_ms);
@@ -5517,17 +5519,48 @@ test "step executor: a step whose action isn't registered doesn't give up while 
     handler.advanceWorkflow(&shard, testKey(.default, "run-r"));
     settleTest(&shard);
     @import("stdx").time.sleep(2 * std.time.ns_per_ms);
-    // A retry proposed and not applied: the start may yet go out, so the
-    // step waits for it rather than give up under it.
+    // It asks again, and the retry isn't applied yet: the start may still
+    // go out, so the step waits for it rather than give up under it.
     const run = handler.runs.getPtr(testKey(.default, "run-r")).?;
-    run.call_retry_index = shard.raft_node.last_applied + 1;
+    const rid = run.pending_action_run_id_owned.?;
+    handler.retryCall(&shard, run, rid, WorkflowHandler.callOf(&shard, run, rid).?, @import("stdx").time.milliTimestamp());
+    try testing.expect(run.call_retry_index > shard.raft_node.last_applied);
     handler.checkPendingActions(&shard);
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.runs.getPtr(testKey(.default, "run-r")).?.status);
-    // Applied (and answered, no action): now it gives up.
-    handler.runs.getPtr(testKey(.default, "run-r")).?.call_retry_index = 0;
+    // Applied, and answered again (no action): now it gives up.
+    settleTest(&shard);
     handler.checkPendingActions(&shard);
     settleTest(&shard);
     try testing.expectEqual(WorkflowHandler.RunStatus.failed, handler.runs.getPtr(testKey(.default, "run-r")).?.status);
+}
+
+test "step executor: a call asked for again waits while its action's outbox has no room" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    createTestRun(&handler, testKey(.default, "run-q"), "run-q", "test-wf");
+    handler.advanceWorkflow(&shard, testKey(.default, "run-q"));
+    settleTest(&shard);
+    const run = handler.runs.getPtr(testKey(.default, "run-q")).?;
+    const rid = run.pending_action_run_id_owned.?;
+    try testing.expectEqual(calls_mod.State.no_action, WorkflowHandler.callOf(&shard, run, rid).?.state);
+    // No room: nothing is proposed.
+    shard.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    const before = shard.raft_node.log.lastIndex();
+    handler.retryCall(&shard, run, rid, WorkflowHandler.callOf(&shard, run, rid).?, @import("stdx").time.milliTimestamp());
+    try testing.expectEqual(before, shard.raft_node.log.lastIndex());
+    try testing.expectEqual(@as(u64, 0), run.call_retry_index);
+    // Room: it is.
+    shard.outbox_caps = .{};
+    handler.retryCall(&shard, run, rid, WorkflowHandler.callOf(&shard, run, rid).?, @import("stdx").time.milliTimestamp());
+    try testing.expectEqual(before + 1, shard.raft_node.log.lastIndex());
 }
 
 test "step executor: missing action yields target_not_found" {

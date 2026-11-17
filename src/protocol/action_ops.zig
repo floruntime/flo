@@ -46,6 +46,7 @@ pub const MAX_AWAIT_ACTIONS: u32 = 64;
 pub const MAX_AWAIT_MS: u64 = 300_000;
 /// A named outcome a workflow step follows: "success" when none is named.
 pub const MAX_OUTCOME: u32 = 256;
+pub const MAX_HELD_NOTE: u32 = 128;
 /// The longest input a task carries: an invoke is one log entry.
 pub const MAX_INPUT: u32 = 64 * 1024;
 /// A retried await's key: the same key gets the same task while its lease
@@ -102,6 +103,7 @@ pub const table = [_]ops.Op{
             .{ .name = "error_message", .T = Optional(Bytes(MAX_ERROR)), .doc = "The error its last attempt failed with" },
             .{ .name = "worker_id", .T = Optional(Bytes(MAX_WORKER_ID)), .doc = "The worker that holds the run, or last held it" },
             .{ .name = "outcome", .T = Optional(Bytes(MAX_OUTCOME)), .doc = "The outcome a completed run's worker named, which a workflow step follows; none for success" },
+            .{ .name = "held", .T = Optional(Bytes(MAX_HELD_NOTE)), .doc = "Why its lease, past due, isn't ended: its end waits for room on the calling workflow's shard" },
         }),
         .cli = .{ .expose = .hand, .render = .record, .examples = &.{"flo action status act-1a2b3c4d5e6f00-3"} },
         .doc = "A run's status, timestamps, attempts, worker, and its output or last error.",

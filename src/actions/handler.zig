@@ -208,6 +208,11 @@ pub const ActionsHandler = struct {
     /// A report refused for its caller's outbox says why here: the answer
     /// is encoded after the handler returns.
     refusal_buf: [256]u8 = undefined,
+    /// Past-due leases of called runs the last expire pass left running,
+    /// since their end had no room to be sent: run key → the shard it
+    /// waits on. Leader memory, rebuilt each pass; `action.status` says it.
+    held_expires: std.StringHashMapUnmanaged(u16) = .empty,
+    held_buf: [action_ops.MAX_HELD_NOTE]u8 = undefined,
 
     const Pending = struct {
         index: u64,
@@ -233,6 +238,7 @@ pub const ActionsHandler = struct {
 
     pub fn deinit(self: *ActionsHandler) void {
         self.forgetLeading();
+        self.held_expires.deinit(self.allocator);
         self.reserved.deinit(self.allocator);
         self.pending.deinit(self.allocator);
         self.extending.deinit(self.allocator);
@@ -552,6 +558,11 @@ pub const ActionsHandler = struct {
         const error_message: ?[]const u8 = if (run.@"error".len == 0) null else try copyInto(buf, &used, run.@"error", action_ops.MAX_ERROR);
         const worker_id: ?[]const u8 = if (run.holder.len == 0) null else try copyInto(buf, &used, run.holder, action_ops.MAX_WORKER_ID);
         const named_outcome: ?[]const u8 = if (run.status != .completed or run.outcome.len == 0) null else try copyInto(buf, &used, run.outcome, action_ops.MAX_OUTCOME);
+        var kb: [KEY_BUF]u8 = undefined;
+        const held: ?[]const u8 = if (run.status != .leased) null else if (storeKey(&kb, req.ns_id, req.key)) |k| (if (self.held_expires.get(k)) |to|
+            std.fmt.bufPrint(&self.held_buf, "its end waits for room on shard {d}", .{to}) catch null
+        else
+            null) else null;
         return .{
             .answer = .{
                 .status = @fromBackingInt(@backingInt(statusOf(run))),
@@ -565,6 +576,7 @@ pub const ActionsHandler = struct {
                 .error_message = error_message,
                 .worker_id = worker_id,
                 .outcome = named_outcome,
+                .held = held,
             },
         };
     }
@@ -1174,7 +1186,7 @@ pub const ActionsHandler = struct {
     /// once when that is this one, else logged here and sent, so it is
     /// neither lost nor applied twice. Not logged (a busy log, a
     /// step-down), its lease ends it.
-    fn handBack(self: *ActionsHandler, shard: *Shard, ns: NamespaceId, holder: []const u8, t: Task) void {
+    pub fn handBack(self: *ActionsHandler, shard: *Shard, ns: NamespaceId, holder: []const u8, t: Task) void {
         if (ns == .invalid) return shard.dropHandBack(.action, "it names no namespace");
         if (ownerOf(shard, ns, t.action) == shard.id) {
             const run = getRun(shard, ns, t.run) orelse return;
@@ -1641,18 +1653,30 @@ pub const ActionsHandler = struct {
         var items: std.ArrayListUnmanaged(u8) = .empty;
         defer items.deinit(self.allocator);
         var n: u32 = 0;
+        // Held leases stay past due, so the scan is capped: those it doesn't
+        // reach wait for a pass that does.
+        var looked: usize = 0;
+        freeKeys(self.allocator, &self.held_expires);
+        defer if (shard.metrics_registry) |m| m.workflow.action_expires_held.store(self.held_expires.count(), .monotonic);
         var it = machine.pastDue(readOf(shard), now);
         while (it.next()) |due| {
-            if (n == ae.MAX_EXPIRE_ITEMS) break;
+            if (n == ae.MAX_EXPIRE_ITEMS or looked == EXPIRE_SCAN_MAX) break;
+            looked += 1;
             const k = due.key;
             var holder: []const u8 = "";
             var request_key: ?[]const u8 = null;
             if (getRun(shard, k.ns, k.id)) |run| if (run.status == .leased and run.expiry_ns == k.expiry_ns) {
                 const grace = @as(u64, @min(run.lease_ms, MAX_GRACE_MS)) *| std.time.ns_per_ms;
                 if (now < self.duty_since_ns +| grace) continue;
-                // One that ends a run a step called sends its end: left for
-                // a later tick while the caller's outbox has no room.
-                if (run.failures +| 1 >= run.max_attempts and endWait(shard, k.ns, run) != null) continue;
+                // A called run's lease isn't ended while its end couldn't be
+                // sent: not on its last attempt, nor on an earlier one, which
+                // would run it again while its worker, refused for room,
+                // still holds it. Its worker's report gets in once there's
+                // room, and a lease nobody reports on ends then.
+                if (endWait(shard, k.ns, run)) |r| {
+                    self.noteHeld(shard, k.ns, k.id, r);
+                    continue;
+                }
                 holder = run.holder;
                 request_key = run.request_key;
             };
@@ -1670,6 +1694,24 @@ pub const ActionsHandler = struct {
         self.expiring = proposed.index;
         self.expiring_full = n == ae.MAX_EXPIRE_ITEMS;
         return n;
+    }
+
+    /// Past-due keys one expire pass looks at, at most.
+    pub const EXPIRE_SCAN_MAX: usize = 256;
+    /// Held leases one pass keeps a note of, at most.
+    const HELD_NOTES_MAX: usize = 4096;
+
+    /// A held lease, for `action.status` to say which shard its end waits
+    /// on. Past the cap it is held all the same, unnamed.
+    fn noteHeld(self: *ActionsHandler, shard: *Shard, ns: NamespaceId, run_id: []const u8, r: table_run.Refused) void {
+        _ = r;
+        if (self.held_expires.count() >= HELD_NOTES_MAX) return;
+        const run = getRun(shard, ns, run_id) orelse return;
+        const workflow = run.caller_workflow orelse return;
+        var kb: [KEY_BUF]u8 = undefined;
+        const k = storeKey(&kb, ns, run_id) orelse return;
+        const owned = self.allocator.dupe(u8, k) catch return;
+        self.held_expires.put(self.allocator, owned, shard.router.slotToShard(calls_machine.callerSlot(ns, workflow))) catch self.allocator.free(owned);
     }
 
     /// Wake awaits once a delayed retry is due. With some dropped, the
@@ -1718,6 +1760,7 @@ pub const ActionsHandler = struct {
     }
 
     fn forgetLeading(self: *ActionsHandler) void {
+        freeKeys(self.allocator, &self.held_expires);
         freeKeys(self.allocator, &self.reserved);
         freeKeys(self.allocator, &self.extending);
         self.due.clearRetainingCapacity();

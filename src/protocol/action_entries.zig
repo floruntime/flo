@@ -243,6 +243,9 @@ pub const Answer = enum(u8) {
     /// Reserved: the action's slot moved to another shard, to be asked
     /// there. Nothing answers it until slots move.
     moved = 3,
+    /// Its run id names another caller's run (a clock stepped back): this
+    /// call has no run, and won't.
+    conflict = 4,
 };
 
 /// The action's shard's answer to a call's start, sent back to the

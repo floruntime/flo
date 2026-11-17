@@ -49,6 +49,8 @@ pub const State = enum(u8) {
     no_action = 3,
     /// Its run ended.
     done = 4,
+    /// Its start named another caller's run: it has no run, and won't.
+    refused = 5,
 };
 
 pub const Call = Record(&.{
@@ -222,6 +224,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             c.state = switch (p.answer) {
                 .started => .started,
                 .no_action => .no_action,
+                .conflict => .refused,
                 .moved => unreachable,
             };
             c.last_ns = stamp;
