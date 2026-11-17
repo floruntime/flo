@@ -465,6 +465,13 @@ pub const Shard = struct {
     /// signal: how long the current run has lasted.
     persist_failures: u64,
 
+    /// An fd's poll could not be armed — a writable arm to flush, or a
+    /// readable/writable interest change — even after the reactor's retries, so
+    /// its connection was closed rather than left hung (`noteArmFailure`). The
+    /// reactor counts dropped multishot re-arms in `rearm_failures`.
+    arm_failures: u64 = 0,
+    arm_failure_log_ms: u64 = 0,
+
     /// Storage durability — controls segment flush timing.
     durability: Durability,
 
@@ -5272,6 +5279,9 @@ pub const Shard = struct {
             sm.setVouch(self.replica.strangers_dropped, self.replica.vouch_asks, self.replica.vouches_taken, self.replica.vouchedIndex());
             sm.setReadBlocked(self.read_blocked);
             sm.persist_failures.store(self.persist_failures, .monotonic);
+            // Writable/interest arm drops this shard closed plus the reactor's
+            // dropped multishot re-arms, as one back-pressure signal.
+            sm.arm_failures.store(self.arm_failures + self.reactor.rearm_failures, .monotonic);
             sm.snapshot_skipped_leader_not_ready.store(self.snapshot_skips_leader_not_ready, .monotonic);
             sm.ts_points.store(self.ts_handler.ts.pointCount(), .monotonic);
             sm.ts_point_bytes.store(self.ts_handler.ts.pointBytes(), .monotonic);
@@ -6921,7 +6931,13 @@ pub const Shard = struct {
             }) catch {
                 self.removeConnection(client_fd);
                 _ = std.c.close(client_fd);
+                continue;
             };
+            // The acceptor peeked this fd's first bytes to route it, so a whole
+            // request may already be in the socket. A readable event does not
+            // re-announce data that arrived before the poll was armed, so drain
+            // it now instead of waiting for one that may never come.
+            self.readFromClient(client_fd);
         }
     }
 
@@ -7138,14 +7154,14 @@ pub const Shard = struct {
         conn.reads_held = false; // interest is this pause's now
         conn.paused_progress_ms = @import("stdx").time.monotonicMs();
         self.paused_count += 1;
-        self.reactor.modifyInterests(fd, .{ .readable = false, .writable = true }) catch {};
+        self.reactor.modifyInterests(fd, .{ .readable = false, .writable = true }) catch self.noteArmFailure("interest", fd);
     }
 
     fn resumeReads(self: *Shard, fd: i32, conn: *Connection) void {
         conn.reads_paused = false;
         conn.reads_held = false;
         self.paused_count -= 1;
-        self.reactor.modifyInterests(fd, .{ .readable = true, .writable = conn.hasPendingWrites() }) catch {};
+        self.reactor.modifyInterests(fd, .{ .readable = true, .writable = conn.hasPendingWrites() }) catch self.noteArmFailure("interest", fd);
         // What it had already sent runs at the end of the tick, not inside
         // whoever resumed it; its socket may hold more that announces
         // nothing, so it is queued even with nothing buffered.
@@ -7398,6 +7414,20 @@ pub const Shard = struct {
         self.closing_fds.appendAssumeCapacity(fd);
     }
 
+    /// A poll arm failed after the reactor retried it, so the fd would never be
+    /// read or flushed again: close it loudly instead of leaving it hung. The
+    /// client sees a disconnect and reconnects. `kind` names which arm; a
+    /// rate-limited line records the shard and fd. If the shutdown stall fires
+    /// again with this counter nonzero, a dropped arm was the cause.
+    fn noteArmFailure(self: *Shard, kind: []const u8, fd: i32) void {
+        self.arm_failures += 1;
+        self.markClosing(fd);
+        const now = nowMs();
+        if (now -| self.arm_failure_log_ms < WARN_INTERVAL_MS) return;
+        self.arm_failure_log_ms = now;
+        log.err("shard {d}: could not arm the {s} poll for fd {d} even after retries; closed it so the client reconnects (arm_failures={d})", .{ self.id, kind, fd, self.arm_failures });
+    }
+
     /// End of tick: close what was marked closing; run what a paused
     /// connection had buffered once its answers drained or it stalled.
     fn settleConnections(self: *Shard) void {
@@ -7449,8 +7479,10 @@ pub const Shard = struct {
             const data = conn.pendingWriteData();
             const written = @import("stdx").io.tryWriteFd(fd, data) catch |err| {
                 if (err == error.WouldBlock) {
-                    // Socket buffer full — arm writable and return
-                    self.reactor.armWritable(fd) catch {};
+                    // Socket buffer full — arm writable and return. If the arm
+                    // can't be placed, the pending answers would never flush, so
+                    // close the connection loudly instead of hanging it.
+                    self.reactor.armWritable(fd) catch self.noteArmFailure("writable", fd);
                     return;
                 }
                 // Write error — close connection
@@ -9427,6 +9459,31 @@ test "Shard: a write on a node that does not lead waits for a leader, then is an
     try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
     try std.testing.expectEqual(@as(u64, 5), resp.header.request_id);
     try std.testing.expect(std.mem.indexOf(u8, resp.data, "electing a leader") != null);
+}
+
+test "Shard: a poll arm that keeps failing closes the connection instead of leaving it hung" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 8, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    // Pausing reads arms a reactor interest change. With the next arm forced to
+    // fail the way a wedged ring would, the shard must close the connection, not
+    // swallow the error and leave the fd un-armed — the hung-connection bug this
+    // fixes. Before the fix the catch was empty and the connection stayed open.
+    shard.reactor.test_arm_error = error.SubmissionQueueFull;
+    shard.pauseReads(conn.fd, conn);
+    try std.testing.expect(conn.closing);
+    try std.testing.expectEqual(@as(u64, 1), shard.arm_failures);
 }
 
 test "Shard: a node with a stale config takes a promoted voter's append and vote request, and drops only a write it would forward" {
