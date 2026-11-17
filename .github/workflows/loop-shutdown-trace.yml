@@ -27,21 +27,29 @@ jobs:
       - run: mkdir -p src/node/dashboard/dist && touch src/node/dashboard/dist/.keep
       - name: Build the e2e binary (filtered to the shutdown test) and flo
         run: zig build test-e2e -Dtest-filter="SIGTERM under load" --test-timeout 120s 2>&1 | tail -3
-      - name: Loop the compiled binary 50x (defeats zig run-step caching)
+      - name: Loop the binary under LOAD (parallel) to widen the timing race
         run: |
+          # The flake fires under the full e2e's CPU/scheduling pressure, not in
+          # isolation (50 isolated runs = 0 failures). Recreate the load by
+          # running several copies at once on the 2-4 core runner.
           set +e
           BIN=$(ls -t .zig-cache/o/*/test 2>/dev/null | head -1)
           echo "e2e binary: $BIN"
           [ -x "$BIN" ] || { echo "::error::no e2e test binary"; exit 1; }
-          fails=0
-          for i in $(seq 1 50); do
-            out=$(timeout 120 "$BIN" 2>&1)
-            rc=$?
-            if [ $rc -ne 0 ] || printf '%s' "$out" | grep -qa "acked nothing"; then
-              fails=$((fails+1))
-              echo "::group::RUN $i FAILED (rc=$rc)"
-              printf '%s\n' "$out" | grep -aE "TRACE|TRACE-SRV|acked nothing|SIGTERM|missing after|server still running" | head -60
-              echo "::endgroup::"
-            fi
+          PAR=6; ROUNDS=14; fails=0
+          for round in $(seq 1 $ROUNDS); do
+            for p in $(seq 1 $PAR); do
+              ( timeout 150 "$BIN" > "/tmp/r_${round}_${p}.log" 2>&1; echo $? > "/tmp/rc_${round}_${p}" ) &
+            done
+            wait
+            for p in $(seq 1 $PAR); do
+              rc=$(cat "/tmp/rc_${round}_${p}" 2>/dev/null || echo 99)
+              if [ "$rc" != "0" ] || grep -qa "acked nothing" "/tmp/r_${round}_${p}.log"; then
+                fails=$((fails+1))
+                echo "::group::round $round proc $p FAILED (rc=$rc)"
+                grep -aE "TRACE|TRACE-SRV|acked nothing|SIGTERM|missing after|server still running" "/tmp/r_${round}_${p}.log" | head -70
+                echo "::endgroup::"
+              fi
+            done
           done
-          echo "=== shutdown loop: $fails/50 runs failed ==="
+          echo "=== shutdown loop (load): $fails/$((PAR*ROUNDS)) runs failed ==="
