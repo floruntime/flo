@@ -216,15 +216,19 @@ export interface QueueMessagesResponse {
   messages: QueueMessage[]
   more: boolean
 }
+/** A dead letter: `moved_at` is when it died, `error` its last error (first 256 bytes). */
 export interface QueueDLQEntry extends QueueMessage {
   moved_at: number
+  failures: number
+  error: string
 }
-/** GET /queues/:name/dlq: oldest first, a page at a time; `count` is every dead letter. */
+/** GET /queues/:name/dlq: oldest dead first, a page at a time; `count` is every
+    dead letter. `next_after` is the cursor (`dead_ns.seq`) the next page starts past. */
 export interface QueueDLQResponse {
   entries: QueueDLQEntry[]
   count: number
   has_more: boolean
-  next_after: number | null
+  next_after: string | null
   queue: string
 }
 
