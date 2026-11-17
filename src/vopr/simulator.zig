@@ -35,6 +35,8 @@ const replica_mod = @import("../replica/replica.zig");
 const families = @import("families.zig");
 const action_workload = @import("action_workload.zig");
 const queue_workload = @import("queue_workload.zig");
+const group_family = @import("group_family.zig");
+const group_workload = @import("group_workload.zig");
 const namespace_entries = @import("../protocol/namespace_entries.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
 const limits = @import("../protocol/limits.zig");
@@ -95,6 +97,10 @@ pub const Invariant = enum {
     /// out of order, ended by a stale report or key, a failure uncounted,
     /// counts that aren't what the queue holds.
     queue_rule,
+    /// An applied consumer-group entry did otherwise than the ledger: it
+    /// leased other records, ended or counted a delivery otherwise, left a
+    /// record, a key, a count or a floor the ledger doesn't hold.
+    group_rule,
     /// A leader proposed a KV batch above its own transaction limit.
     txn_gate,
     /// More messages than a run has any reason to send: replication is going
@@ -418,6 +424,11 @@ const SimNode = struct {
     queues: families.Queues,
     queues_term: u64 = 0,
     queues_term_since_ns: u64 = 0,
+    /// The server's group machine and stream projection, on the queues'
+    /// store as a shard keeps them, and its leader's term.
+    groups: group_family.ConsumerGroups,
+    groups_term: u64 = 0,
+    groups_term_since_ns: u64 = 0,
     /// Shard 0's namespace handler, on this replica's own table.
     ns: families.Namespaces,
     /// It applies nothing before this tick (`apply_lag_permille`).
@@ -581,8 +592,8 @@ const SimIo = struct {
 
 const Canon = struct { term: u64, hash: u64, op_id: ?u64, recorded_at: u64 };
 /// The server machines' families compared: KV's, then actions', then
-/// queues', then the namespaces.
-const SAMPLED = families.Kv.FAMILIES.len + families.Actions.FAMILIES.len + families.Queues.FAMILIES.len + 1;
+/// queues', groups', then the namespaces.
+const SAMPLED = families.Kv.FAMILIES.len + families.Actions.FAMILIES.len + families.Queues.FAMILIES.len + group_family.SUMS + 1;
 const Sums = [SAMPLED]u64;
 const StateCanon = struct { history: u64, checksum: u64, rebuilt: bool, sums: ?Sums };
 
@@ -596,7 +607,7 @@ const APPLY_BUF_FLOOR = 64 * 1024;
 
 /// What a checksum mismatch names, by family.
 const MISMATCH = blk: {
-    const names = [_][]const u8{ "kv.value", "kv.history", "kv.ns_counts" } ++ families.Actions.NAMES ++ families.Queues.NAMES ++ [_][]const u8{"namespaces"};
+    const names = [_][]const u8{ "kv.value", "kv.history", "kv.ns_counts" } ++ families.Actions.NAMES ++ families.Queues.NAMES ++ group_family.NAMES ++ [_][]const u8{"namespaces"};
     var out: [SAMPLED][2][]const u8 = undefined;
     for (names, &out) |name, *m| m.* = .{
         "two replicas hold different " ++ name ++ " after the same history",
@@ -942,6 +953,8 @@ pub const Summary = struct {
     actions: families.Actions.Counts,
     /// And the queue machine.
     queues: families.Queues.Counts,
+    /// And the group machine.
+    groups: group_family.ConsumerGroups.Counts,
     /// How far KV batches went past the nodes' own limits.
     txn: families.TxnCounts,
     /// What the workload's namespace creates came to: at submit, and at
@@ -1027,6 +1040,7 @@ pub const Simulator = struct {
     /// Action entries likewise.
     action_counts: families.Actions.Counts = .{},
     queue_counts: families.Queues.Counts = .{},
+    group_counts: group_family.ConsumerGroups.Counts = .{},
     /// Action entries draw from their own stream, so a scenario without
     /// them replays as it did before they existed.
     action_prng: PRNG,
@@ -1120,6 +1134,7 @@ pub const Simulator = struct {
                 .kv = families.Kv.init(allocator),
                 .actions = families.Actions.init(allocator),
                 .queues = families.Queues.init(allocator),
+                .groups = group_family.ConsumerGroups.init(allocator),
                 .ns = families.Namespaces.init(allocator),
             };
             // Drawn only with drift on, so a run without it replays as before.
@@ -1153,6 +1168,7 @@ pub const Simulator = struct {
             node.kv.deinit();
             node.actions.deinit();
             node.queues.deinit();
+            node.groups.deinit();
             node.ns.deinit();
             self.allocator.free(node.replica.rpc_entries);
             self.allocator.free(node.replica.rpc_arena);
@@ -1422,6 +1438,7 @@ pub const Simulator = struct {
         node.kv.reset();
         node.actions.reset();
         node.queues.reset();
+        node.groups.reset();
         node.ns.reset();
         if (self.extension) |x| x.reset(x.ctx, node.id);
         node.apply_paused_until = 0;
@@ -2000,6 +2017,7 @@ pub const Simulator = struct {
         const target = self.node_(leaders[r.uintLessThan(usize, n)]);
         if (self.scenario.action_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.action_percent) return self.submitActionOp(target);
         if (self.scenario.queue_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.queue_percent) return self.submitQueueOp(target);
+        if (self.scenario.group_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.group_percent) return self.submitGroupOp(target);
         const op = try self.workload.nextOp();
         if (op.entry_type == .namespace_create) return self.submitCreate(target, op.id, op.payload);
         // Production refuses a client write on a leader still applying earlier
@@ -2072,6 +2090,29 @@ pub const Simulator = struct {
         const made = queue_workload.make(&target.queues, leader, self.action_prng.random(), op_id, self.action_buf, self.scenario.payload_max) orelse return;
         const id = try self.workload.nextActionOp(made.entry_type, made.payload);
         std.debug.assert(id == op_id);
+        std.debug.assert(target.raft.leaderReady());
+        const res = target.raft.propose(made.entry_type, 0, made.payload) catch return;
+        self.workload.recordProposal(id, target.id, res.term, res.index);
+        try self.pending_ops.append(self.allocator, id);
+    }
+
+    /// A consumer-group or stream entry, made from the leader's own applied
+    /// group state and stream as its handlers would make it.
+    fn submitGroupOp(self: *Simulator, target: *SimNode) !void {
+        if (!target.raft.leaderReady()) {
+            self.leader_not_ready_refused += 1;
+            return;
+        }
+        // The log's clock, which stamps the entry: a lease past half by it is
+        // past half where it applies, whatever the leader's wall clock says.
+        const now = target.raft.now();
+        if (target.groups_term != target.raft.current_term) {
+            target.groups_term = target.raft.current_term;
+            target.groups_term_since_ns = now;
+        }
+        const leader: action_workload.Leader = .{ .now_ns = now, .term_since_ns = target.groups_term_since_ns, .term = target.raft.current_term };
+        const made = group_workload.make(&target.groups, &target.queues.store, leader, self.action_prng.random(), self.action_buf, self.scenario.payload_max) orelse return;
+        const id = try self.workload.nextActionOp(made.entry_type, made.payload);
         std.debug.assert(target.raft.leaderReady());
         const res = target.raft.propose(made.entry_type, 0, made.payload) catch return;
         self.workload.recordProposal(id, target.id, res.term, res.index);
@@ -2436,6 +2477,25 @@ pub const Simulator = struct {
                 .index = idx,
                 .tick = self.now,
                 .detail = "the queue machine failed a workload entry it should apply",
+            },
+        });
+        if (is_op and group_family.ConsumerGroups.ownsEntry(e.header.entry_type, e.payload)) if (node.groups.apply(&node.queues.store, e, replica)) |effect| {
+            if (first) self.group_counts.count(effect);
+            if (effect.broke) |why| self.checker.fail(.{ .invariant = .group_rule, .node = node.id, .index = idx, .tick = self.now, .detail = why });
+        } else |err| self.checker.fail(switch (err) {
+            error.RefusalChangedState => .{
+                .invariant = .refusal_wrote,
+                .node = node.id,
+                .index = idx,
+                .tick = self.now,
+                .detail = "a group entry the machine refused changed a family",
+            },
+            else => .{
+                .invariant = .applied_integrity,
+                .node = node.id,
+                .index = idx,
+                .tick = self.now,
+                .detail = "the group machine failed a workload entry it should apply",
             },
         });
         if (is_op and families.Namespaces.owns(e.header.entry_type)) if (node.ns.apply(e)) |effect| {
@@ -2870,7 +2930,7 @@ pub const Simulator = struct {
     }
 
     fn sumsOf(node: *SimNode) Sums {
-        return node.kv.checksums() ++ node.actions.checksums() ++ node.queues.checksums() ++ [1]u64{node.ns.checksum()};
+        return node.kv.checksums() ++ node.actions.checksums() ++ node.queues.checksums() ++ node.groups.checksums(&node.queues.store) ++ [1]u64{node.ns.checksum()};
     }
 
     fn summary(self: *Simulator) Summary {
@@ -2930,6 +2990,7 @@ pub const Simulator = struct {
             .kv = self.kv_counts,
             .actions = self.action_counts,
             .queues = self.queue_counts,
+            .groups = self.group_counts,
             .txn = self.txn_counts,
             .ns_submits = self.ns_submits,
             .ns = self.ns_counts,
@@ -3262,7 +3323,7 @@ test "vopr sim: KV's families are compared at a run's last index even when sampl
     checker.onState(1, idx, 42, 7, null, false, 0);
     checker.onState(2, idx, 42, 7, null, false, 0);
     // The first final records them, the next compares.
-    const same: Sums = .{ 1, 2, 3 } ++ @as([families.Actions.FAMILIES.len]u64, @splat(4)) ++ @as([families.Queues.FAMILIES.len]u64, @splat(6)) ++ [1]u64{5};
+    const same: Sums = .{ 1, 2, 3 } ++ @as([families.Actions.FAMILIES.len]u64, @splat(4)) ++ @as([families.Queues.FAMILIES.len]u64, @splat(6)) ++ @as([group_family.SUMS]u64, @splat(7)) ++ [1]u64{5};
     var other = same;
     other[1] = 9;
     checker.onFinalSums(1, idx, 42, same, false, 0);
@@ -3409,6 +3470,52 @@ test "vopr sim: a queues run keeps every message rule, and its replicas agree on
     try testing.expect(s.queues.items_applied > 0 and s.queues.items_refused > 0);
     try testing.expect(s.family_checks > 0);
     for (sim.nodes) |*node| try testing.expect(node.queues.store.strict_keys);
+}
+
+/// The same for consumer groups, with queue entries beside them.
+fn groupsTestScenario(seed: u64) Scenario {
+    var scenario = actionsTestScenario(seed);
+    scenario.action_percent = 0;
+    scenario.queue_percent = 10;
+    scenario.group_percent = 70;
+    // As the slice sets it: room for a group entry's items.
+    scenario.payload_max = @max(scenario.payload_max, 1024);
+    return scenario;
+}
+
+test "vopr sim: a consumer-groups run matches the ledger at every entry, and its replicas agree on group state" {
+    var sim = try Simulator.init(testing.allocator, groupsTestScenario(1), .{});
+    defer sim.deinit();
+    const s = try sim.run();
+    if (!s.ok) {
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        sim.printViolations(&w) catch {};
+        std.debug.print("{s}\n", .{w.buffered()});
+    }
+    try testing.expect(s.ok);
+    // Every kind ran, and reports were refused record by record as well
+    // as applied.
+    errdefer std.debug.print("{any}\n", .{s.groups});
+    for (std.enums.values(group_family.ConsumerGroups.Kind)) |k| {
+        if (k == .stream_delete) continue;
+        try testing.expect(s.groups.applied[@backingInt(k)] > 0);
+    }
+    try testing.expect(s.groups.items_applied > 0 and s.groups.items_refused > 0);
+    try testing.expect(s.family_checks > 0);
+}
+
+test "vopr sim: a group deliver that takes the cursor's records before the ready ones fails group_rule" {
+    var sim = try Simulator.init(testing.allocator, groupsTestScenario(1), .{ .family_mutant = .group_deliver_cursor_first });
+    defer sim.deinit();
+    const s = try sim.run();
+    try testing.expect(!s.ok);
+    var caught = false;
+    // Whether it shows as other records leased or as a refusal the
+    // ledger doesn't make depends on the caps the run meets; the mutants'
+    // pinned scenario holds the words.
+    for (sim.checker.violations.items) |v| caught = caught or v.invariant == .group_rule;
+    try testing.expect(caught);
 }
 
 test "vopr sim: a deliver that passes over the first due message fails queue_rule" {

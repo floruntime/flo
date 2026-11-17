@@ -25,6 +25,13 @@ means the check stopped catching its bug.
 | `queues.json` | `queue_cap_unchecked` | `queue_rule` | `an enqueue past its caps applied` |
 | `queues.json` | `queue_cap_tightened` | `queue_rule` | `an enqueue within its caps was refused` |
 | `queues.json` | `queue_settle_keeps_bytes` | `queue_rule` | `a queue's held bytes aren't what its messages hold` |
+| `consumer-groups.json` | `group_deliver_cursor_first` | `group_rule` | `a deliver leased` |
+| `consumer-groups.json` | `group_abandon_counts_failure` | `group_rule` | `a group's counters are not the ledger's` |
+| `consumer-groups.json` | `group_expire_ignores_deadline` | `group_rule` | `an expire ended another number of leases than the ledger's` |
+| `consumer-groups.json` | `group_settle_keeps_bytes` | `group_rule` | `a group's held bytes are not what the ledger's records hold` |
+| `consumer-groups.json` | `group_trim_misses_floor` | `group_rule` | `a stream's floor is not the last record it lost` |
+| `consumer-groups.json` | `group_delete_keeps_count` | `group_rule` | `a stream's record has another generation or group count than the ledger's` |
+| `consumer-groups.json` | `group_extend_clock_ahead` | `group_rule` | `an extend answered another expiry than the ledger's` |
 | `txn-limits.json` | `kv_if_absent_holds` | `applied_integrity` | `decided a put's condition` |
 | `txn-limits.json` | `kv_batch_conditions_ignored` | `applied_integrity` | `a condition that can't hold` |
 | `txn-limits.json` | `kv_refuses_over_own_limit` | `state_checksum` | `kv.value` |
@@ -69,7 +76,28 @@ out here.
 | An enqueue is refused exactly when its queue's messages or held bytes, or its shard's, would pass the caps it carries; one that applies leaves them within those caps | `queue_cap_unchecked` (applies past them), `queue_cap_tightened` (refused within them) |
 | A queue's held bytes are what its messages hold (payload, error text and the per-message overhead), and the shard's are every queue's | `queue_settle_keeps_bytes`; machine tests "the shard's held bytes count every queue, and a settle or purge gives them back", "a message's error text is held, replaced as it fails again, and given back with it" |
 
+## Group rules and what proves them
+
+`group_family.zig` keeps a ledger of its own (each group's records, their
+holder, token, counts and error length, its settings, cursor and counters,
+and each stream's floor, generation and group count) from the entries, by
+rules written there rather than the machine's helpers. Each entry's answer
+is checked against the ledger's, and after it applies the groups it named
+are checked against the ledger, record by record.
+
+| Rule | Proved by |
+|---|---|
+| A deliver leases the leader's ready choice before the stream's records past the cursor | `group_deliver_cursor_first` |
+| An abandon counts no failure | `group_abandon_counts_failure` |
+| An expire ends only a lease past its deadline | `group_expire_ignores_deadline` |
+| A group's held bytes are what its records hold | `group_settle_keeps_bytes` |
+| A trim moves the stream's floor to the last record it lost | `group_trim_misses_floor` |
+| A stream's record counts its groups exactly | `group_delete_keeps_count` |
+| An extend moves a lease only with half of it or less left, and answers where it ends | `group_extend_clock_ahead` |
+| A report applies only to the delivery it names; the same hand-back resent counts as applied, any other is answered by what became of the record | machine tests "a nack after an abandon of the same delivery, or the reverse, is answered released, not applied", "a report to a group that isn't there is refused not_found" |
+| Every ready, leased and dead record has its key, and no ready or dead key is left over | checked by the family from the store itself, after every applied group entry |
+
 A scenario is re-recorded from a fresh swarm (`vopr --iterations=N --actions
---family-mutant=M`, `--queues` for the queue mutants, `--catching-up` for the namespace mutants, or
-`--txn-limits` for the limit mutants) when a
+--family-mutant=M`, `--queues` for the queue mutants, `--consumer-groups` for the group mutants,
+`--catching-up` for the namespace mutants, or `--txn-limits` for the limit mutants) when a
 change to the workload stops it reaching a bug.
