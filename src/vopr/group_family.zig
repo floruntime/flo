@@ -235,11 +235,11 @@ pub const ConsumerGroups = struct {
     ledger: Ledger,
     allocator: Allocator,
 
-    pub const Kind = enum { append, trim, stream_delete, create, delete, deliver, settle, release, extend, expire, clean };
+    pub const Kind = enum { append, trim, stream_delete, create, delete, deliver, settle, release, extend, expire, clean, steal, requeue, drop };
 
     /// What an applied entry did, beyond applying: the swarm fails if one
     /// never happens, since a rule it never met was never checked.
-    pub const Mark = enum { deliver_leased, extend_moved, abandon, unread, nack_dead, nack_delay, nack_error, mixed_abandon_refused, cross_term_settle, cross_term_expire };
+    pub const Mark = enum { deliver_leased, extend_moved, abandon, unread, nack_dead, nack_delay, nack_error, mixed_abandon_refused, cross_term_settle, cross_term_expire, steal_applied, requeue_applied, drop_applied, clean_gone, delete_refused };
 
     pub const Effect = struct {
         kind: Kind,
@@ -325,6 +325,9 @@ pub const ConsumerGroups = struct {
             .group_release => .release,
             .group_extend => .extend,
             .group_expire => .expire,
+            .group_steal => .steal,
+            .group_requeue => .requeue,
+            .group_drop => .drop,
             else => .clean,
         };
     }
@@ -403,11 +406,13 @@ pub const ConsumerGroups = struct {
                         effect.broke = "the group machine refused an entry the ledger applies";
                     } else if (want.refused != refused.status) {
                         effect.broke = "the group machine refused an entry with another status than the ledger's";
-                    } else if (kind == .release and refused.status == .bad_request) effect.marks.insert(.mixed_abandon_refused);
+                    } else if (kind == .release and refused.status == .bad_request) {
+                        effect.marks.insert(.mixed_abandon_refused);
+                    } else if (kind == .delete) effect.marks.insert(.delete_refused);
                 } else if (want == .refused) {
                     effect.broke = "the group machine applied an entry the ledger refuses";
                 } else {
-                    effect.broke = self.answerBroke(want, &out, &effect);
+                    effect.broke = self.answerBroke(want, &out, &effect, e.header.term);
                     markOf(e, kind, want, &effect);
                     self.commit(e, kind, want);
                     try plantAfter(store, e, kind, want, r);
@@ -458,6 +463,8 @@ pub const ConsumerGroups = struct {
                     .settle => ge.Settle,
                     .release => ge.Release,
                     .extend => ge.Extend,
+                    .steal => ge.Steal,
+                    .requeue, .drop => ge.DeadItems,
                     else => unreachable,
                 };
                 const p = P.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -524,10 +531,12 @@ pub const ConsumerGroups = struct {
         report: struct { s: usize, g: usize, applied: []const StreamID, refused: []const Refused, extend_to: u64 = 0, moved: bool = false, held: u32 = 0, cross_term: bool = false },
         expire: struct { ended: []const [3]u128, cross_term: bool },
         clean: []const Cleaned,
+        steal: struct { s: usize, g: usize, taken: []const StreamID, deliveries: []const u32, refused: []const Refused, expiry_ns: u64 },
+        dead: struct { s: usize, g: usize, applied: []const StreamID, refused: []const Refused },
     };
     const Refused = struct { record: StreamID, why: Why };
     /// A group's cleaned records, by (stream, group), and whether its meta goes.
-    const Cleaned = struct { s: usize, g: usize, records: []const StreamID, drops_meta: bool };
+    const Cleaned = struct { s: usize, g: usize, records: []const StreamID, drops_meta: bool, gone: bool };
 
     fn predict(self: *ConsumerGroups, store: *Store, e: *const Entry, kind: Kind) persistence.ApplyError!Want {
         var diag: schema.Diagnostic = .{};
@@ -556,6 +565,72 @@ pub const ConsumerGroups = struct {
             },
             .deliver => return self.predictDeliver(store, e),
             .settle, .release, .extend => return self.predictReport(e, kind),
+            .steal => {
+                const p = ge.Steal.decodeAll(e.payload, &diag) catch return error.Halt;
+                const s = streamIndex(p.stream) orelse return error.Halt;
+                const g = groupIndex(p.group) orelse return error.Halt;
+                if (!L.live(s, g)) return .{ .refused = .not_found };
+                const grp = &L.groups[s][g].?;
+                var taken: std.ArrayListUnmanaged(StreamID) = .empty;
+                var deliveries: std.ArrayListUnmanaged(u32) = .empty;
+                var refused: std.ArrayListUnmanaged(Refused) = .empty;
+                var it = p.items.iterator();
+                while (it.next() catch return error.Halt) |named| {
+                    const rec: StreamID = .{ .timestamp_ms = named.ms, .sequence = named.seq };
+                    const v = grp.items.get(recKey(rec)) orelse {
+                        try refused.append(a, .{ .record = rec, .why = .gone });
+                        continue;
+                    };
+                    // A record named twice: the workload names each once.
+                    if (v.status != .leased or v.deliveries != named.deliveries) {
+                        try refused.append(a, .{ .record = rec, .why = if (v.deliveries != named.deliveries) .delivered_again else switch (v.ended) {
+                            .expired => .expired,
+                            .released, .abandoned => .released,
+                            else => .not_held,
+                        } });
+                        continue;
+                    }
+                    // Idle since the lease last moved: its deliver or its last extend.
+                    const moved_at = v.expiry_ns -| (v.lease_ms *| std.time.ns_per_ms);
+                    if (stamp -| moved_at < p.min_idle_ms *| std.time.ns_per_ms) {
+                        try refused.append(a, .{ .record = rec, .why = .not_idle });
+                        continue;
+                    }
+                    try taken.append(a, rec);
+                    try deliveries.append(a, v.deliveries +| 1);
+                }
+                return .{ .steal = .{ .s = s, .g = g, .taken = taken.items, .deliveries = deliveries.items, .refused = refused.items, .expiry_ns = afterMs(stamp, p.lease_ms) } };
+            },
+            .requeue, .drop => {
+                const p = ge.DeadItems.decodeAll(e.payload, &diag) catch return error.Halt;
+                const s = streamIndex(p.stream) orelse return error.Halt;
+                const g = groupIndex(p.group) orelse return error.Halt;
+                if (!L.live(s, g)) return .{ .refused = .not_found };
+                const grp = &L.groups[s][g].?;
+                const floor = if (L.streams[s]) |st| st.floor else StreamID.MIN;
+                const sk = gm.streamOf(NS, p.stream);
+                var applied: std.ArrayListUnmanaged(StreamID) = .empty;
+                var refused: std.ArrayListUnmanaged(Refused) = .empty;
+                var it = p.items.iterator();
+                while (it.next() catch return error.Halt) |named| {
+                    const rec: StreamID = .{ .timestamp_ms = named.ms, .sequence = named.seq };
+                    const v = grp.items.get(recKey(rec)) orelse {
+                        try refused.append(a, .{ .record = rec, .why = .gone });
+                        continue;
+                    };
+                    if (v.status != .dead) {
+                        try refused.append(a, .{ .record = rec, .why = .not_dead });
+                        continue;
+                    }
+                    // A trimmed record can't be read again: gone to a requeue.
+                    if (kind == .requeue and (!rec.greaterThan(floor) or self.stream.streamAppendOf(sk, rec) == null)) {
+                        try refused.append(a, .{ .record = rec, .why = .gone });
+                        continue;
+                    }
+                    try applied.append(a, rec);
+                }
+                return .{ .dead = .{ .s = s, .g = g, .applied = applied.items, .refused = refused.items } };
+            },
             .expire => {
                 const p = ge.Expire.decodeAll(e.payload, &diag) catch return error.Halt;
                 var ended: std.ArrayListUnmanaged([3]u128) = .empty;
@@ -609,7 +684,7 @@ pub const ConsumerGroups = struct {
                         if (!gone and rec.greaterThan(floor)) break;
                         try out.append(a, rec);
                     }
-                    try cleaned.append(a, .{ .s = sg[0], .g = sg[1], .records = out.items, .drops_meta = gone and !more });
+                    try cleaned.append(a, .{ .s = sg[0], .g = sg[1], .records = out.items, .drops_meta = gone and !more, .gone = gone });
                 }
                 return .{ .clean = cleaned.items };
             },
@@ -809,7 +884,20 @@ pub const ConsumerGroups = struct {
     }
 
     /// Whether the machine's answer is the ledger's.
-    fn answerBroke(self: *ConsumerGroups, want: Want, out: *const persistence.Result, effect: *Effect) ?[]const u8 {
+    /// Each refused record's id and reason, then nothing more.
+    fn refusedBroke(rd: anytype, refused: []const Refused) ?[]const u8 {
+        for (refused) |x| {
+            const ms = rd.int(u64) orelse return "an entry refused fewer records than the ledger";
+            const seq = rd.int(u64) orelse return "an entry refused fewer records than the ledger";
+            const why: Why = @fromBackingInt(rd.int(u8) orelse return "an entry refused fewer records than the ledger");
+            if (ms != x.record.timestamp_ms or seq != x.record.sequence) return "an entry refused other records than the ledger";
+            if (why != x.why) return "an entry refused a record with another reason than the ledger's";
+        }
+        if (rd.int(u64) != null) return "an entry refused more records than the ledger";
+        return null;
+    }
+
+    fn answerBroke(self: *ConsumerGroups, want: Want, out: *const persistence.Result, effect: *Effect, term: u64) ?[]const u8 {
         _ = self;
         var rd = out.reader();
         switch (want) {
@@ -856,6 +944,31 @@ pub const ConsumerGroups = struct {
                 const n = rd.int(u32) orelse return "an expire answered nothing";
                 if (n != w.ended.len) return "an expire ended another number of leases than the ledger's";
                 effect.applied = n;
+            },
+            .steal => |w| {
+                const term_answered = rd.int(u64) orelse return "a steal answered nothing";
+                const expiry = rd.int(u64) orelse return "a steal answered nothing";
+                const n = rd.int(u32) orelse return "a steal answered nothing";
+                if (term_answered != term) return "a steal answered another term than its entry's";
+                if (expiry != w.expiry_ns) return "a steal answered another expiry than the ledger's";
+                if (n != w.taken.len) return "a steal took another number of records than the ledger";
+                for (w.taken, w.deliveries) |c, d| {
+                    const ms = rd.int(u64) orelse return "a steal's answer is short";
+                    const seq = rd.int(u64) orelse return "a steal's answer is short";
+                    const got = rd.int(u32) orelse return "a steal's answer is short";
+                    if (ms != c.timestamp_ms or seq != c.sequence) return "a steal took other records than the ledger";
+                    if (got != d) return "a steal answered a record's deliveries otherwise than the ledger";
+                }
+                if (refusedBroke(&rd, w.refused)) |why| return why;
+                effect.applied = n;
+                effect.refused_items = @intCast(w.refused.len);
+            },
+            .dead => |w| {
+                const n = rd.int(u32) orelse return "a requeue or drop answered nothing";
+                if (n != w.applied.len) return "a requeue or drop applied to another number of records than the ledger";
+                if (refusedBroke(&rd, w.refused)) |why| return why;
+                effect.applied = n;
+                effect.refused_items = @intCast(w.refused.len);
             },
             .clean => |w| {
                 const n = rd.int(u64) orelse return "a clean answered nothing";
@@ -965,6 +1078,36 @@ pub const ConsumerGroups = struct {
                     v.due_ns = stamp;
                 }
             },
+            .steal => |w| {
+                const p = ge.Steal.decodeAll(e.payload, &diag) catch unreachable;
+                const grp = &L.groups[w.s][w.g].?;
+                const holder = la.dupe(u8, p.holder) catch @panic("sim OOM");
+                for (w.taken) |rec| {
+                    const v = grp.items.getPtr(recKey(rec)).?;
+                    v.deliveries +|= 1;
+                    v.holder = holder;
+                    v.token = token;
+                    v.lease_ms = p.lease_ms;
+                    v.delivered_ns = stamp;
+                    v.expiry_ns = afterMs(stamp, p.lease_ms);
+                    v.ended = .none;
+                }
+                grp.delivered += w.taken.len;
+            },
+            .dead => |w| {
+                const grp = &L.groups[w.s][w.g].?;
+                for (w.applied) |rec| {
+                    if (kind == .drop) {
+                        _ = grp.items.orderedRemove(recKey(rec));
+                        continue;
+                    }
+                    const v = grp.items.getPtr(recKey(rec)).?;
+                    v.status = .ready;
+                    v.due_ns = stamp;
+                    v.failures = 0;
+                    v.dead_ns = 0;
+                }
+            },
             .clean => |w| for (w) |c| {
                 const grp = &L.groups[c.s][c.g].?;
                 const gone = !L.live(c.s, c.g);
@@ -998,6 +1141,13 @@ pub const ConsumerGroups = struct {
                 p.ended = .failed;
                 const buf = try a.alloc(u8, ge.Release.encodedSize(p) catch return error.Halt);
                 out.payload = ge.Release.encodeInto(buf, p) catch return error.Halt;
+            },
+            .group_steal_ignores_idle => if (kind == .steal) {
+                // Idle a millisecond is idle enough: a busy holder is robbed.
+                var p = ge.Steal.decodeAll(e.payload, &diag) catch return error.Halt;
+                p.min_idle_ms = 1;
+                const buf = try a.alloc(u8, ge.Steal.encodedSize(p) catch return error.Halt);
+                out.payload = ge.Steal.encodeInto(buf, p) catch return error.Halt;
             },
             .group_extend_clock_ahead => if (kind == .extend) {
                 const p = ge.Extend.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -1037,6 +1187,33 @@ pub const ConsumerGroups = struct {
                 _ = gm.Meta.encodeInto(bytes, m) catch return error.Halt;
                 store.replace(gm.Metas.ID, node, bytes);
             },
+            .group_requeue_keeps_failures => if (kind == .requeue) {
+                // A requeued record keeps one failure: its attempts aren't reset.
+                const w = want.dead;
+                for (w.applied) |rec| {
+                    var b: [4 + gm.ID_LEN]u8 = undefined;
+                    const id = gm.idOf(gm.scopeOf(NS, STREAMS[w.s], GROUPS[w.g]), rec);
+                    const key = gm.storeKey(&b, NS, &id);
+                    const node = store.find(gm.Items.ID, key) orelse continue;
+                    var v = (gm.Items.Value.decode(store_mod.Record.of(node).value) catch return error.Halt).v;
+                    v.failures = 1;
+                    const bytes = try store.allocator.alloc(u8, gm.Item.encodedSize(v) catch return error.Halt);
+                    _ = gm.Item.encodeInto(bytes, v) catch return error.Halt;
+                    store.replace(gm.Items.ID, node, bytes);
+                }
+            },
+            .group_drop_keeps_bytes => if (kind == .drop) {
+                const w = want.dead;
+                if (w.applied.len == 0) return;
+                var b: [4 + gm.SCOPE_LEN]u8 = undefined;
+                const scope = gm.scopeOf(NS, STREAMS[w.s], GROUPS[w.g]);
+                const node = store.find(gm.Metas.ID, gm.storeKey(&b, NS, &scope)) orelse return;
+                var m = (gm.Metas.Value.decode(store_mod.Record.of(node).value) catch return error.Halt).v;
+                m.held_bytes += heldOf(0) * w.applied.len;
+                const bytes = try store.allocator.alloc(u8, gm.Meta.encodedSize(m) catch return error.Halt);
+                _ = gm.Meta.encodeInto(bytes, m) catch return error.Halt;
+                store.replace(gm.Metas.ID, node, bytes);
+            },
             .group_delete_keeps_count => if (kind == .delete) {
                 var b: [13]u8 = undefined;
                 const key = gm.recKey(&b, gm.streamOf(NS, STREAMS[want.delete.s]));
@@ -1057,6 +1234,9 @@ pub const ConsumerGroups = struct {
         var diag: schema.Diagnostic = .{};
         switch (want) {
             .deliver => |w| if (w.chosen.len > 0) effect.marks.insert(.deliver_leased),
+            .steal => |w| if (w.taken.len > 0) effect.marks.insert(.steal_applied),
+            .dead => |w| if (w.applied.len > 0) effect.marks.insert(if (kind == .requeue) .requeue_applied else .drop_applied),
+            .clean => |w| for (w) |c| if (c.drops_meta or (c.gone and c.records.len > 0)) effect.marks.insert(.clean_gone),
             .expire => |w| if (w.cross_term) effect.marks.insert(.cross_term_expire),
             .report => |w| {
                 if (w.held == 0) return;

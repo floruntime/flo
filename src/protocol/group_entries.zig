@@ -40,6 +40,7 @@ pub const MAX_ERROR: u32 = 1024;
 pub const Holder = ae.Holder;
 pub const Token = ae.Token;
 pub const LeaseMs = ae.LeaseMs;
+pub const MAX_LEASE_MS = ae.MAX_LEASE_MS;
 
 /// A group of a stream, with its lease and attempts. A create of a group
 /// that exists with these settings changes nothing; with others it is
@@ -146,6 +147,33 @@ pub const Extend = Record(&(report ++ [_]schema.Field{
     .{ .name = "lease_ms", .T = LeaseMs },
 }));
 
+/// Records leased to another holder taken by `holder`: each still leased at
+/// the delivery count named, and idle at least `min_idle_ms` by the entry's
+/// stamp, idle being the time since its lease last moved (a deliver or an
+/// extend). Each gets a new delivery, this entry's token and a lease of
+/// `lease_ms` from the stamp; its failures stand. An operator's: a read
+/// redelivers expired records by itself.
+pub const Steal = Record(&.{
+    .{ .name = "ns", .T = NamespaceId },
+    .{ .name = "stream", .T = StreamName },
+    .{ .name = "group", .T = GroupName },
+    .{ .name = "holder", .T = Holder },
+    .{ .name = "lease_ms", .T = LeaseMs },
+    .{ .name = "min_idle_ms", .T = schema.Range(u64, 1, MAX_LEASE_MS) },
+    .{ .name = "items", .T = Items },
+});
+
+/// Dead records, by id: requeued, ready again at once with their failures
+/// reset (their deliveries and last error kept), or dropped for good.
+pub const DeadItems = Record(&.{
+    .{ .name = "ns", .T = NamespaceId },
+    .{ .name = "stream", .T = StreamName },
+    .{ .name = "group", .T = GroupName },
+    .{ .name = "items", .T = RecordIds },
+});
+pub const Requeue = DeadItems;
+pub const Drop = DeadItems;
+
 /// An item's id in its namespace: its group's scope (its stream's name
 /// hash, then its group's), then the record's id, all big-endian.
 pub const SCOPE_LEN = 16;
@@ -188,6 +216,9 @@ pub const table = [_]entries.Entry{
     .{ .name = "group.extend", .type_code = 0x48, .payload = Extend, .max_payload = Extend.max_size, .doc = "A delivery's lease moved out by its holder." },
     .{ .name = "group.expire", .type_code = 0x49, .payload = Expire, .max_payload = Expire.max_size, .doc = "Leases past their deadline ended, as failures." },
     .{ .name = "group.clean", .type_code = 0x4A, .payload = Clean, .max_payload = Clean.max_size, .doc = "Records a group no longer holds removed, a bounded number at a time." },
+    .{ .name = "group.steal", .type_code = 0x4B, .payload = Steal, .max_payload = Steal.max_size, .doc = "Leased records an idle holder kept taken by another: a new delivery and lease each, failures kept." },
+    .{ .name = "group.requeue", .type_code = 0x4C, .payload = Requeue, .max_payload = Requeue.max_size, .doc = "Dead records ready again at once, their failures reset." },
+    .{ .name = "group.drop", .type_code = 0x4D, .payload = Drop, .max_payload = Drop.max_size, .doc = "Dead records removed for good." },
 };
 
 /// The payload schema of entry type `code`.

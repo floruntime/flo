@@ -311,7 +311,7 @@ fn reholdError(view: *View, meta: *Meta.Value, old_len: usize, new_len: usize) A
     return unhold(view, meta, old_len - new_len);
 }
 
-pub const FULL = "overloaded: group '{s}' on stream '{s}' is full: it holds {d} records (at most {d}) and {d} held bytes (at most {d}), leased, ready and dead; ack or nack the leased ones, and delete the group or trim the stream to clear dead ones";
+pub const FULL = "overloaded: group '{s}' on stream '{s}' is full: it holds {d} records (at most {d}) and {d} held bytes (at most {d}), leased, ready and dead; ack or nack the leased ones, and requeue or delete the dead ones (dlq)";
 pub const SHARD_FULL = "overloaded: this shard's queues and groups hold {d} held bytes, at most {d}; ack, consume or purge some";
 
 pub const BEING_REMOVED = "unavailable: this group's records from before it was deleted, or its stream was, are still being removed; retry";
@@ -392,6 +392,20 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             const p = ge.Clean.decodeAll(e.payload, &diag) catch return;
             var it = p.items.iterator();
             while (it.next() catch return) |item| if (item.scope.len == SCOPE_LEN) try groupKeys(out, .of(item.ns), item.scope);
+        },
+        .group_steal => {
+            const p = ge.Steal.decodeAll(e.payload, &diag) catch return;
+            const ns: NamespaceId = .of(p.ns);
+            const scope = scopeOf(ns, p.stream, p.group);
+            try groupKeys(out, ns, &scope);
+            // The new leases' deadline; the old ones are the expire duty's
+            // to drop, as an extend leaves them.
+            try leaseKeys(out, ns, &scope, after(stamp, p.lease_ms));
+        },
+        inline .group_requeue, .group_drop => |t| {
+            const p = ge.Payload(@backingInt(t)).decodeAll(e.payload, &diag) catch return;
+            const ns: NamespaceId = .of(p.ns);
+            try groupKeys(out, ns, &scopeOf(ns, p.stream, p.group));
         },
         else => {},
     }
@@ -518,6 +532,8 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             }
             out.putInt(u32, ended);
         },
+        .group_steal => try stealApply(view, e, out),
+        .group_requeue, .group_drop => try deadApply(view, e, out, typeOf(e) == .group_requeue),
         .group_clean => {
             const p = ge.Clean.decodeAll(e.payload, &diag) catch return error.Halt;
             var it = p.items.iterator();
@@ -839,6 +855,159 @@ fn die(view: *View, ns: NamespaceId, scope: *const Scope, record: StreamID, item
     meta.dead_lettered += 1;
 }
 
+/// The group a steal, requeue or drop names, live: null, and the entry
+/// refused, when it isn't there.
+fn liveMeta(view: *View, out: *Result, ns: NamespaceId, stream: []const u8, group: []const u8) ApplyError!?struct { key: []const u8, meta: Meta.Value } {
+    const scope = scopeOf(ns, stream, group);
+    const mk = try M.inNs(view, ns, &scope);
+    const found = try view.get(Metas, mk);
+    const rec = try streamRec(view, streamOf(ns, stream));
+    const m = if (found) |f| (if (live(f.v, rec) and std.mem.eql(u8, f.v.stream, stream) and std.mem.eql(u8, f.v.group, group)) f.v else null) else null;
+    if (m == null) {
+        out.refuse(.not_found, .not_found, NO_GROUP);
+        return null;
+    }
+    return .{ .key = mk, .meta = m.? };
+}
+
+/// How long a lease has gone without moving, by `stamp`: since its deliver
+/// or its last extend, so a holder that keeps touching it isn't idle.
+pub fn idleOf(item: Item.Value, stamp: u64) u64 {
+    const moved = item.expiry_ns -| (item.lease_ms *| std.time.ns_per_ms);
+    return stamp -| moved;
+}
+
+/// Answers the new delivery's term (u64; its index is the entry's) and
+/// expiry (u64), how many it took (u32), each one's id (ms u64, seq u64)
+/// and new deliveries (u32), then each refused (ms u64, seq u64, `Why` u8).
+fn stealApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
+    var diag: schema.Diagnostic = .{};
+    const stamp = e.header.timestamp_ns;
+    const p = ge.Steal.decodeAll(e.payload, &diag) catch return error.Halt;
+    const ns: NamespaceId = .of(p.ns);
+    if (ns == .invalid) return error.Halt;
+    const scope = scopeOf(ns, p.stream, p.group);
+    const g = (try liveMeta(view, out, ns, p.stream, p.group)) orelse return;
+    var meta = g.meta;
+    const token: ae.Token.Value = .{ .term = e.header.term, .index = e.header.index };
+    var taken: [ge.MAX_BATCH]struct { record: StreamID, deliveries: u32 } = undefined;
+    var nt: usize = 0;
+    var refused: [ge.MAX_BATCH]struct { record: StreamID, why: Why } = undefined;
+    var nr: usize = 0;
+    var it = p.items.iterator();
+    while (it.next() catch return error.Halt) |named| {
+        const record: StreamID = .{ .timestamp_ms = named.ms, .sequence = named.seq };
+        const id = idOf(scope, record);
+        const key = try M.inNs(view, ns, &id);
+        var item = (try view.get(Items, key)) orelse {
+            refused[nr] = .{ .record = record, .why = .gone };
+            nr += 1;
+            continue;
+        };
+        if (item.v.status != .leased or item.v.deliveries != named.deliveries) {
+            refused[nr] = .{ .record = record, .why = if (item.v.deliveries != named.deliveries) .delivered_again else switch (item.v.ended) {
+                .expired => .expired,
+                .released, .abandoned => .released,
+                else => .not_held,
+            } };
+            nr += 1;
+            continue;
+        }
+        if (idleOf(item.v, stamp) < p.min_idle_ms *| std.time.ns_per_ms) {
+            refused[nr] = .{ .record = record, .why = .not_idle };
+            nr += 1;
+            continue;
+        }
+        try M.deliver(view, ns, &id, &item.v, p.holder, null, token, p.lease_ms, stamp);
+        try view.put(Items, key, item);
+        taken[nt] = .{ .record = record, .deliveries = item.v.deliveries };
+        nt += 1;
+    }
+    if (nt > 0) {
+        meta.delivered += nt;
+        try view.put(Metas, g.key, .{ .v = meta });
+    }
+    out.putInt(u64, e.header.term);
+    out.putInt(u64, after(stamp, p.lease_ms));
+    out.putInt(u32, @intCast(nt));
+    for (taken[0..nt]) |t| {
+        out.putInt(u64, t.record.timestamp_ms);
+        out.putInt(u64, t.record.sequence);
+        out.putInt(u32, t.deliveries);
+    }
+    for (refused[0..nr]) |r| {
+        out.putInt(u64, r.record.timestamp_ms);
+        out.putInt(u64, r.record.sequence);
+        out.putInt(u8, @backingInt(r.why));
+    }
+}
+
+/// A requeue readies its dead records at once, failures reset (deliveries
+/// and the last error kept), if they are still above the floor and in the
+/// stream; a drop removes them. Answers how many it applied to (u32), then
+/// each refused (ms u64, seq u64, `Why` u8).
+fn deadApply(view: *View, e: *const Entry, out: *Result, requeue: bool) ApplyError!void {
+    var diag: schema.Diagnostic = .{};
+    const stamp = e.header.timestamp_ns;
+    const p = ge.DeadItems.decodeAll(e.payload, &diag) catch return error.Halt;
+    const ns: NamespaceId = .of(p.ns);
+    if (ns == .invalid) return error.Halt;
+    const scope = scopeOf(ns, p.stream, p.group);
+    const g = (try liveMeta(view, out, ns, p.stream, p.group)) orelse return;
+    var meta = g.meta;
+    const sk = streamOf(ns, p.stream);
+    const rec = try streamRec(view, sk);
+    const floor = floorOf(rec);
+    const streams = try view.streams();
+    var applied: u32 = 0;
+    var refused: [ge.MAX_BATCH]struct { record: StreamID, why: Why } = undefined;
+    var nr: usize = 0;
+    var it = p.items.iterator();
+    while (it.next() catch return error.Halt) |named| {
+        const record: StreamID = .{ .timestamp_ms = named.ms, .sequence = named.seq };
+        const id = idOf(scope, record);
+        const key = try M.inNs(view, ns, &id);
+        var item = (try view.get(Items, key)) orelse {
+            refused[nr] = .{ .record = record, .why = .gone };
+            nr += 1;
+            continue;
+        };
+        if (item.v.status != .dead) {
+            refused[nr] = .{ .record = record, .why = .not_dead };
+            nr += 1;
+            continue;
+        }
+        // A trimmed record is cleanup's, not the reader's: it can't be
+        // delivered again.
+        if (requeue and (!record.greaterThan(floor) or streams.appendOf(sk, record) == null)) {
+            refused[nr] = .{ .record = record, .why = .gone };
+            nr += 1;
+            continue;
+        }
+        const dk = deadKey(scope, item.v.dead_ns, record);
+        try view.delete(Dead, try M.inNs(view, ns, &dk));
+        try less(&meta.dead);
+        if (requeue) {
+            item.v.failures = 0;
+            item.v.dead_ns = 0;
+            try M.readyAgain(view, ns, &id, &item.v, stamp);
+            meta.ready += 1;
+            try view.put(Items, key, item);
+        } else {
+            try view.delete(Items, key);
+            try unhold(view, &meta, heldBy(item.v.@"error".len));
+        }
+        applied += 1;
+    }
+    if (applied > 0) try view.put(Metas, g.key, .{ .v = meta });
+    out.putInt(u32, applied);
+    for (refused[0..nr]) |r| {
+        out.putInt(u64, r.record.timestamp_ms);
+        out.putInt(u64, r.record.sequence);
+        out.putInt(u8, @backingInt(r.why));
+    }
+}
+
 const EXPIRED = "lease expired";
 
 pub const ABANDON_ALONE = "bad request: abandon hands records back unstarted, so it takes no dead, delay_ms or error";
@@ -922,7 +1091,7 @@ fn observe(view: *View, e: *const Entry) ApplyError!void {
 
 pub const machine: machine_mod.Machine = .{
     .name = "groups",
-    .entry_types = &.{ .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean },
+    .entry_types = &.{ .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean, .group_steal, .group_requeue, .group_drop },
     .families = &.{ machine_mod.info(Metas), machine_mod.info(Items), machine_mod.info(Dead), machine_mod.info(Ready), machine_mod.info(Deadlines), machine_mod.info(Streams_) },
     .keys = keys,
     .apply = apply,
@@ -1693,4 +1862,137 @@ test "group machine: every record's slot follows from what it stores, joined to 
     // A group delivery takes no request key (`M.deliver(.., null, ..)`), so
     // `group.request` holds nothing to place.
     try testing.expectEqual(@as(usize, 0), t.count(M.Requests));
+}
+
+fn stealOf(t: *TestGroups, records: []const StreamID, deliveries: u32, holder: []const u8, min_idle_ms: u64, stamp: u64) !Result {
+    var buf: [512]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &buf };
+    for (records) |r| try ge.Item.encode(&w, .{ .ms = r.timestamp_ms, .seq = r.sequence, .deliveries = deliveries });
+    return t.apply(.group_steal, ge.Steal.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = holder, .lease_ms = LEASE_MS, .min_idle_ms = min_idle_ms, .items = .{ .bytes = buf[0..w.pos], .count = @intCast(records.len) } }, stamp);
+}
+
+fn deadOf(t: *TestGroups, comptime etype: EntryType, records: []const StreamID, stamp: u64) !Result {
+    var buf: [512]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &buf };
+    for (records) |r| try ge.RecordId.encode(&w, .{ .ms = r.timestamp_ms, .seq = r.sequence });
+    return t.apply(etype, ge.DeadItems.Value{ .ns = NS.int(), .stream = "s", .group = "g", .items = .{ .bytes = buf[0..w.pos], .count = @intCast(records.len) } }, stamp);
+}
+
+/// A steal's answer after its term and expiry: what it took, then why not.
+fn stealAnswer(r: Result) struct { term: u64, taken: u32, why: ?Why } {
+    var rd = r.reader();
+    const term = rd.int(u64).?;
+    _ = rd.int(u64).?;
+    const taken = rd.int(u32).?;
+    for (0..taken) |_| {
+        _ = rd.int(u64).?;
+        _ = rd.int(u64).?;
+        _ = rd.int(u32).?;
+    }
+    _ = rd.int(u64);
+    _ = rd.int(u64);
+    const first: ?Why = if (rd.int(u8)) |b| @fromBackingInt(b) else null;
+    return .{ .term = term, .taken = taken, .why = first };
+}
+
+test "group machine: a steal takes only a record idle long enough, by the time since its lease last moved, under a new delivery; failures kept" {
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 1);
+    _ = try deliver(&t, 1, 1 << 20, "c1", 10 * ms);
+    const rec = sid(100, 0);
+    // Delivered at 10 ms: at 1 s it has been idle 990 ms.
+    const sums = t.sums();
+    const early = stealAnswer(try stealOf(&t, &.{rec}, 1, "rescue", 1_000, 1_000 * ms));
+    try testing.expectEqual(@as(u32, 0), early.taken);
+    try testing.expectEqual(Why.not_idle, early.why.?);
+    try testing.expectEqual(sums, t.sums());
+    // A stale delivery count is refused, whatever the idle time.
+    try testing.expectEqual(Why.delivered_again, stealAnswer(try stealOf(&t, &.{rec}, 2, "rescue", 1_000, 2_000 * ms)).why.?);
+
+    const got = stealAnswer(try stealOf(&t, &.{rec}, 1, "rescue", 1_000, 2_000 * ms));
+    try testing.expectEqual(@as(u32, 1), got.taken);
+    const it = t.item("s", "g", rec).?;
+    try testing.expectEqual(Status.leased, it.status);
+    try testing.expectEqualStrings("rescue", it.holder);
+    try testing.expectEqual(@as(u32, 2), it.deliveries);
+    try testing.expectEqual(@as(u32, 0), it.failures);
+    try testing.expectEqual(t.index, it.token.index);
+    try testing.expectEqual(@as(u64, 2_000 * ms + LEASE_MS * ms), it.expiry_ns);
+    try testing.expectEqual(@as(u64, 1), t.meta("s", "g").?.leased);
+    // The old holder's report is stale now.
+    try testing.expectEqual(@as(u64, 2), t.meta("s", "g").?.delivered);
+}
+
+test "group machine: a touch resets a lease's idle time, so a holder that keeps touching isn't stolen from" {
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 1);
+    const d = try deliver(&t, 1, 1 << 20, "c1", 10 * ms);
+    const rec = sid(100, 0);
+    // Past half the lease, the holder touches: its lease moves at 3 s.
+    var buf: [512]u8 = undefined;
+    const items = try itemsOf(&buf, &t, &.{rec});
+    const held = t.item("s", "g", rec).?;
+    _ = try t.apply(.group_extend, ge.Extend.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = d.token, .expiry_ns = held.expiry_ns, .items = items, .held_since_ns = held.delivered_ns, .lease_ms = LEASE_MS }, 3_000 * ms);
+    // Idle 2 s since the touch, though 3.99 s since the read.
+    try testing.expectEqual(Why.not_idle, stealAnswer(try stealOf(&t, &.{rec}, 1, "rescue", 3_000, 5_000 * ms)).why.?);
+    try testing.expectEqual(@as(u32, 1), stealAnswer(try stealOf(&t, &.{rec}, 1, "rescue", 2_000, 5_000 * ms)).taken);
+}
+
+test "group machine: a requeue readies a dead letter at once with its failures reset, its deliveries and last error kept; a drop removes it and its bytes" {
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 2);
+    const d = try deliver(&t, 2, 1 << 20, "c1", 10 * ms);
+    const a = sid(100, 0);
+    const b = sid(100, 1);
+    _ = try handBack(&t, d, &.{ a, b }, 11 * ms, .{ .ended = .failed, .dead = true, .@"error" = "boom" });
+    try testing.expectEqual(@as(u64, 2), t.meta("s", "g").?.dead);
+    const held = t.meta("s", "g").?.held_bytes;
+
+    const rq = try deadOf(&t, .group_requeue, &.{a}, 20 * ms);
+    try testing.expectEqual(@as(u32, 1), Answer.of(rq, false).applied);
+    const it = t.item("s", "g", a).?;
+    try testing.expectEqual(Status.ready, it.status);
+    try testing.expectEqual(@as(u64, 20 * ms), it.due_ns);
+    try testing.expectEqual(@as(u32, 0), it.failures);
+    try testing.expectEqual(@as(u32, 1), it.deliveries);
+    try testing.expectEqualStrings("boom", it.@"error");
+    try testing.expectEqual(@as(u64, 1), t.meta("s", "g").?.ready);
+    try testing.expectEqual(@as(u64, 1), t.meta("s", "g").?.dead);
+    // Not dead any more: a second requeue, or a drop, is refused and moves nothing.
+    const sums = t.sums();
+    try testing.expectEqual(Why.not_dead, Answer.of(try deadOf(&t, .group_requeue, &.{a}, 21 * ms), false).refused[0].why);
+    try testing.expectEqual(Why.not_dead, Answer.of(try deadOf(&t, .group_drop, &.{a}, 21 * ms), false).refused[0].why);
+    try testing.expectEqual(sums, t.sums());
+
+    const dr = try deadOf(&t, .group_drop, &.{b}, 22 * ms);
+    try testing.expectEqual(@as(u32, 1), Answer.of(dr, false).applied);
+    try testing.expect(t.item("s", "g", b) == null);
+    try testing.expectEqual(@as(u64, 0), t.meta("s", "g").?.dead);
+    try testing.expectEqual(held - heldBy("boom".len), t.meta("s", "g").?.held_bytes);
+    try testing.expectEqual(Why.gone, Answer.of(try deadOf(&t, .group_drop, &.{b}, 23 * ms), false).refused[0].why);
+}
+
+test "group machine: a dead letter a trim cut is gone to a requeue, and a drop still removes it" {
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 1);
+    const d = try deliver(&t, 1, 1 << 20, "c1", 10 * ms);
+    const rec = sid(100, 0);
+    _ = try handBack(&t, d, &.{rec}, 11 * ms, .{ .ended = .failed, .dead = true });
+    try t.trim("s", rec, 12 * ms);
+    try testing.expectEqual(Why.gone, Answer.of(try deadOf(&t, .group_requeue, &.{rec}, 13 * ms), false).refused[0].why);
+    try testing.expectEqual(@as(u32, 1), Answer.of(try deadOf(&t, .group_drop, &.{rec}, 14 * ms), false).applied);
+}
+
+test "group machine: a steal, requeue or drop to a group that isn't there is refused not_found" {
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 1);
+    const rec = sid(100, 0);
+    try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, (try stealOf(&t, &.{rec}, 1, "rescue", 1, 10 * ms)).refused().?.status);
+    try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, (try deadOf(&t, .group_requeue, &.{rec}, 10 * ms)).refused().?.status);
+    try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, (try deadOf(&t, .group_drop, &.{rec}, 10 * ms)).refused().?.status);
 }

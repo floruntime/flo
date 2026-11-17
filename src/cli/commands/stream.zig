@@ -181,6 +181,72 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .subcommand(gen.command(allocator, stream_ops.op("stream.group.members")))
                 .subcommand(
                     commander.newBuilder(allocator)
+                        .name("steal")
+                        .about("Take records another consumer holds and has left idle")
+                        .longAbout(
+                            \\Take records another consumer holds: each gets a new delivery and a
+                            \\lease for --consumer, its failures kept. Only a record idle at least
+                            \\--min-idle is taken. Idle is the time since its lease last moved:
+                            \\its read, or its holder's last touch, so a holder that keeps
+                            \\touching is never stolen from. An operator's command: a read takes
+                            \\expired records by itself.
+                        )
+                        .examples(&.{
+                            "flo stream group steal events --group mygroup --consumer rescue --min-idle 300000 --ids 3.42.1703350800000-0.1",
+                        })
+                        .arg("stream", "Stream name")
+                        .stringFlag("group", 'g', "", "Consumer group name (required)")
+                        .stringFlag("consumer", 'c', "", "Who takes them (required)")
+                        .uintFlag("min-idle", 0, 0, "Take only records idle at least this long (ms, required)")
+                        .uintFlag("lease", 0, 0, "Their new lease (ms; the group's lease when omitted)")
+                        .stringFlag("ids", 'i', "", "Comma-separated deliveries, as a read printed them: term.index.id.deliveries")
+                        .action(wrapHandler(runGroupSteal)),
+                )
+                .subcommand(
+                    commander.newBuilder(allocator)
+                        .name("dlq")
+                        .about("A group's dead letters: list, requeue or delete them")
+                        .subcommand(
+                            commander.newBuilder(allocator)
+                                .name("list")
+                                .about("List a group's dead letters, oldest dead first")
+                                .arg("stream", "Stream name")
+                                .stringFlag("group", 'g', "", "Consumer group name (required)")
+                                .uintFlag("limit", 'l', 20, "Most to show (at most 100)")
+                                .stringFlag("after", 0, "", "Go on past this one: the cursor a list printed")
+                                .action(wrapHandler(runGroupDlqList)),
+                        )
+                        .subcommand(
+                            commander.newBuilder(allocator)
+                                .name("requeue")
+                                .about("Make dead letters ready again, their attempts reset")
+                                .longAbout(
+                                    \\Make dead letters ready again at once. A requeued record gets its full
+                                    \\attempts again: its failures go to 0, while its deliveries and last
+                                    \\error stay, so its history still shows. One a trim cut since is gone.
+                                )
+                                .arg("stream", "Stream name")
+                                .stringFlag("group", 'g', "", "Consumer group name (required)")
+                                .stringFlag("ids", 'i', "", "Comma-separated record ids (ms-seq)")
+                                .boolFlag("all", 0, "Every dead letter, oldest first, a batch of up to 100 at a time")
+                                .uintFlag("max", 0, 0, "With --all, stop after this many (0 for none)")
+                                .action(wrapHandler(runGroupDlqRequeue)),
+                        )
+                        .subcommand(
+                        commander.newBuilder(allocator)
+                            .name("delete")
+                            .about("Delete dead letters for good")
+                            .arg("stream", "Stream name")
+                            .stringFlag("group", 'g', "", "Consumer group name (required)")
+                            .stringFlag("ids", 'i', "", "Comma-separated record ids (ms-seq)")
+                            .boolFlag("all", 0, "Every dead letter, oldest first, a batch of up to 100 at a time")
+                            .uintFlag("max", 0, 0, "With --all, stop after this many (0 for none)")
+                            .boolFlag("dry-run", 0, "Say what it would delete, and delete nothing")
+                            .action(wrapHandler(runGroupDlqDelete)),
+                    ),
+                )
+                .subcommand(
+                    commander.newBuilder(allocator)
                         .name("read")
                         .about("Read from consumer group")
                         .examples(&.{
@@ -1155,6 +1221,8 @@ fn groupWhy(w: queue_ops.Why) []const u8 {
         .expired => "stale: the lease ran out and the record moved on",
         .released => "stale: the record was nacked",
         .not_held => "stale: the record isn't held",
+        .not_dead => "not dead: only a dead letter is requeued or deleted",
+        .not_idle => "not idle: its holder moved its lease within the idle time named",
     };
 }
 
@@ -1454,4 +1522,165 @@ test "stream group read: records cut short are Truncated before anything prints"
     const answer = @as([24]u8, @splat(0)) ++ [_]u8{ 2, 0, 0, 0 } ++ record ++ record;
     try printGroupRecords(null, &answer, "s", false);
     for (1..answer.len) |n| try std.testing.expectError(error.Truncated, printGroupRecords(null, answer[0..n], "s", false));
+}
+
+// ── Steal and the dead letters ──────────────────────────────────────────
+
+fn groupFlag(ctx: *commander.Context) commander.Error![]const u8 {
+    const group = ctx.getString("group") orelse "";
+    if (group.len == 0) return outcome.usage(ctx, "--group is required", .{});
+    return group;
+}
+
+/// A refused record, as the operator commands print it.
+fn printRefused(ctx: *commander.Context, r: stream_ops.Refused.Value) void {
+    ctx.printErr("  {d}-{d}: {s}\n", .{ r.ms, r.seq, groupWhy(r.why) });
+}
+
+fn runGroupSteal(ctx: *commander.Context) commander.Error!void {
+    const stream = ctx.getPositional("stream").?;
+    const group = try groupFlag(ctx);
+    const consumer = ctx.getString("consumer") orelse "";
+    if (consumer.len == 0) return outcome.usage(ctx, "--consumer is required: who takes the records", .{});
+    const min_idle = ctx.getUint("min-idle") orelse 0;
+    if (min_idle == 0) return outcome.usage(ctx, "--min-idle is required, and more than 0: a steal takes only idle records", .{});
+    const lease = ctx.getUint("lease") orelse 0;
+    const ids_str = ctx.getString("ids") orelse "";
+    if (ids_str.len == 0) return outcome.usage(ctx, "--ids is required", .{});
+    var buf: [stream_ops.Leased.max_size * 100]u8 = undefined;
+    var w: @import("../../protocol/schema.zig").Writer = .{ .buf = &buf };
+    var n: u32 = 0;
+    var iter = std.mem.splitScalar(u8, ids_str, ',');
+    while (iter.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " ");
+        if (trimmed.len == 0) continue;
+        const d = parseDelivery(trimmed) orelse
+            return outcome.usage(ctx, "'{s}' isn't a delivery: give term.index.id.deliveries, as a read printed it (e.g. 3.42.1703350800000-0.1)", .{trimmed});
+        if (n == 100) return outcome.usage(ctx, "--ids names at most 100 records", .{});
+        stream_ops.Leased.encode(&w, .{ .ms = d.id.timestamp_ms, .seq = d.id.sequence, .deliveries = d.deliveries }) catch return outcome.usage(ctx, "--ids is too long", .{});
+        n += 1;
+    }
+    const op = stream_ops.op("stream.group.steal");
+    var client = Client.init(ctx.allocator, cli_config.getEndpoint(ctx));
+    defer client.deinit();
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
+    var response = client.call(op, cli_config.getNamespace(ctx), stream, .{ .group = group, .consumer = consumer, .min_idle_ms = min_idle, .lease_ms = if (lease == 0) null else lease, .records = .{ .bytes = buf[0..w.pos], .count = n } }) catch |err| return outcome.requestFailed(ctx, err);
+    defer response.deinit();
+    try outcome.check(ctx, response);
+    var diag: @import("../../protocol/schema.zig").Diagnostic = .{};
+    const a = op.response.decodeAll(response.data, &diag) catch return outcome.malformed(ctx, "stream.group.steal answer");
+    var it = a.stolen.iterator();
+    while (it.next() catch null) |r| ctx.print("{d}.{d}.{d}-{d}.{d}\n", .{ a.term, a.index, r.ms, r.seq, r.deliveries });
+    var rit = a.refused.iterator();
+    while (rit.next() catch null) |r| printRefused(ctx, r);
+    if (a.refused.count > 0) {
+        ctx.printErr("Error: {d} of {d} record(s) not taken\n", .{ a.refused.count, n });
+        return error.Refused;
+    }
+}
+
+fn runGroupDlqList(ctx: *commander.Context) commander.Error!void {
+    const stream = ctx.getPositional("stream").?;
+    const group = try groupFlag(ctx);
+    const limit = ctx.getUint("limit") orelse 20;
+    if (limit == 0 or limit > stream_ops.MAX_DLQ_PAGE) return outcome.usage(ctx, "--limit is 1 to {d}", .{stream_ops.MAX_DLQ_PAGE});
+    const after_str = ctx.getString("after") orelse "";
+    const after: ?stream_ops.DeadCursor.Value = if (after_str.len == 0) null else parseCursor(after_str) orelse
+        return outcome.usage(ctx, "--after '{s}' isn't a cursor: give dead_ns.ms-seq, as a list printed it", .{after_str});
+    const op = stream_ops.op("stream.group.dlq_list");
+    var client = Client.init(ctx.allocator, cli_config.getEndpoint(ctx));
+    defer client.deinit();
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
+    var response = client.call(op, cli_config.getNamespace(ctx), stream, .{ .group = group, .limit = @intCast(limit), .after = after }) catch |err| return outcome.requestFailed(ctx, err);
+    defer response.deinit();
+    try outcome.check(ctx, response);
+    var diag: @import("../../protocol/schema.zig").Diagnostic = .{};
+    const a = op.response.decodeAll(response.data, &diag) catch return outcome.malformed(ctx, "stream.group.dlq_list answer");
+    const json_output = output.getFormat(ctx) == .json;
+    if (json_output) ctx.print("{{\"dead\":[", .{});
+    var it = a.dead.iterator();
+    var i: usize = 0;
+    while (it.next() catch null) |d| : (i += 1) {
+        if (json_output) {
+            ctx.print("{s}{{\"id\":\"{d}-{d}\",\"deliveries\":{d},\"failures\":{d},\"dead_at_ms\":{d},\"error\":{f}}}", .{ if (i == 0) "" else ",", d.ms, d.seq, d.deliveries, d.failures, d.dead_at_ms, output.jsonString(d.@"error") });
+        } else ctx.print("{d}-{d}\tdeliveries={d} failures={d} dead_at_ms={d}\t{s}\n", .{ d.ms, d.seq, d.deliveries, d.failures, d.dead_at_ms, d.@"error" });
+    }
+    if (json_output) {
+        if (a.cursor) |c| ctx.print("],\"cursor\":\"{d}.{d}-{d}\"}}\n", .{ c.dead_ns, c.ms, c.seq }) else ctx.print("],\"cursor\":null}}\n", .{});
+    } else if (a.cursor) |c| ctx.printErr("Note: more dead letters follow: --after {d}.{d}-{d}\n", .{ c.dead_ns, c.ms, c.seq });
+    if (!json_output and a.dead.count == 0) ctx.print("No dead letters\n", .{});
+}
+
+fn parseCursor(text: []const u8) ?stream_ops.DeadCursor.Value {
+    const dot = std.mem.indexOfScalar(u8, text, '.') orelse return null;
+    const dead_ns = std.fmt.parseInt(u64, text[0..dot], 10) catch return null;
+    const id = StreamID.parse(text[dot + 1 ..]) catch return null;
+    return .{ .dead_ns = dead_ns, .ms = id.timestamp_ms, .seq = id.sequence };
+}
+
+fn runGroupDlqRequeue(ctx: *commander.Context) commander.Error!void {
+    return runGroupDlq(ctx, .requeue);
+}
+
+fn runGroupDlqDelete(ctx: *commander.Context) commander.Error!void {
+    return runGroupDlq(ctx, .delete);
+}
+
+/// Each batch is said as it is answered: how many it applied to, and each
+/// record it refused, so a run cut short shows how far it got.
+fn runGroupDlq(ctx: *commander.Context, comptime kind: enum { requeue, delete }) commander.Error!void {
+    const stream = ctx.getPositional("stream").?;
+    const group = try groupFlag(ctx);
+    const all = ctx.getBool("all");
+    const max = ctx.getUint("max") orelse 0;
+    const dry_run = kind == .delete and ctx.getBool("dry-run");
+    const ids_str = ctx.getString("ids") orelse "";
+    if (all == (ids_str.len > 0)) return outcome.usage(ctx, "name the dead letters with --ids, or give --all", .{});
+    if (max > 0 and !all) return outcome.usage(ctx, "--max goes with --all", .{});
+    var buf: [stream_ops.RecordRef.max_size * 100]u8 = undefined;
+    var w: @import("../../protocol/schema.zig").Writer = .{ .buf = &buf };
+    var n: u32 = 0;
+    var iter = std.mem.splitScalar(u8, ids_str, ',');
+    while (iter.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " ");
+        if (trimmed.len == 0) continue;
+        const id = StreamID.parse(trimmed) catch return outcome.usage(ctx, "'{s}' isn't a record id: give ms-seq, as a dlq list printed it", .{trimmed});
+        if (n == 100) return outcome.usage(ctx, "--ids names at most 100 records", .{});
+        stream_ops.RecordRef.encode(&w, .{ .ms = id.timestamp_ms, .seq = id.sequence }) catch return outcome.usage(ctx, "--ids is too long", .{});
+        n += 1;
+    }
+    var client = Client.init(ctx.allocator, cli_config.getEndpoint(ctx));
+    defer client.deinit();
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
+    const namespace = cli_config.getNamespace(ctx);
+    const verb = if (kind == .requeue) "Requeued" else if (dry_run) "Would delete" else "Deleted";
+    var total: u64 = 0;
+    var refused_total: u64 = 0;
+    var batch: u32 = 0;
+    while (true) : (batch += 1) {
+        const records: ?@import("../../protocol/schema.zig").List(stream_ops.RecordRef, 100).Value = if (all) null else .{ .bytes = buf[0..w.pos], .count = n };
+        var response = switch (kind) {
+            .requeue => client.call(stream_ops.op("stream.group.dlq_requeue"), namespace, stream, .{ .group = group, .records = records, .all = all }),
+            .delete => client.call(stream_ops.op("stream.group.dlq_delete"), namespace, stream, .{ .group = group, .records = records, .all = all, .dry_run = dry_run }),
+        } catch |err| return outcome.requestFailed(ctx, err);
+        defer response.deinit();
+        try outcome.check(ctx, response);
+        var diag: @import("../../protocol/schema.zig").Diagnostic = .{};
+        const a = stream_ops.op("stream.group.dlq_requeue").response.decodeAll(response.data, &diag) catch return outcome.malformed(ctx, "dead-letter answer");
+        if (all) ctx.print("batch {d}: ", .{batch + 1});
+        ctx.print("{s} {d} record(s)\n", .{ verb, a.applied });
+        var rit = a.refused.iterator();
+        while (rit.next() catch null) |r| printRefused(ctx, r);
+        total += a.applied;
+        refused_total += a.refused.count;
+        // A dry run changes nothing, so its first batch is the whole answer;
+        // a batch that applied to none would come back the same.
+        if (!all or !a.more or dry_run or a.applied == 0) break;
+        if (max > 0 and total >= max) break;
+    }
+    if (all and batch > 0) ctx.print("{s} {d} record(s) in {d} batches\n", .{ verb, total, batch + 1 });
+    if (refused_total > 0) {
+        ctx.printErr("Error: {d} record(s) not {s}\n", .{ refused_total, if (kind == .requeue) "requeued" else "deleted" });
+        return error.Refused;
+    }
 }

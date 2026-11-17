@@ -37,9 +37,9 @@ const HOLDERS = [_][]const u8{ "c0", "c1", "s0", "x0" };
 const MAX_RECORDS: u64 = 64;
 const LEASES = [_]u64{ ae.MIN_LEASE_MS, 2 * ae.MIN_LEASE_MS, ge.DEFAULT_LEASE_MS };
 
-const Kind = enum { append, deliver, settle, release, extend, expire, clean, trim, create, delete, stream_delete };
+const Kind = enum { append, deliver, settle, release, extend, expire, clean, trim, create, delete, stream_delete, steal, requeue, drop };
 /// Out of 100.
-const WEIGHTS = [_]u8{ 20, 20, 12, 11, 10, 10, 7, 3, 4, 2, 1 };
+const WEIGHTS = [_]u8{ 18, 18, 11, 11, 9, 9, 7, 3, 4, 2, 1, 2, 3, 2 };
 /// Percent of reports spoiled.
 const SPOIL: u8 = 15;
 
@@ -66,6 +66,8 @@ pub fn make(g: *ConsumerGroups, store: *store_mod.Store, l: Leader, r: std.Rando
         // A delete takes every record its group holds, so it is rare.
         .delete => if (r.uintLessThan(u8, 4) == 0) delete(out, s, grp) else null,
         .stream_delete => if (r.uintLessThan(u8, 8) == 0) streamDelete(out, s) else null,
+        .steal => steal(store, out, l, r, s, grp),
+        .requeue, .drop => dead(store, out, kind, r, s, grp),
     } catch null;
 }
 
@@ -349,4 +351,59 @@ fn clean(out: []u8) !?Made {
         n += 1;
     };
     return .{ .entry_type = .group_clean, .payload = try ge.Clean.encodeInto(out, .{ .items = .{ .bytes = ib[0..w.pos], .count = n } }) };
+}
+
+/// An operator's steal of a leased record: mostly one idle long enough,
+/// now and then too short an idle time to take it, or a stale count.
+fn steal(store: *store_mod.Store, out: []u8, l: Leader, r: std.Random, s: usize, grp: usize) !?Made {
+    const scope = gm.scopeOf(NS, STREAMS[s], GROUPS[grp]);
+    var kb: [4 + gm.SCOPE_LEN]u8 = undefined;
+    var it = (view_mod.ReadView{ .store = store }).range(gm.Items, gm.storeKey(&kb, NS, &scope));
+    var rec: ?StreamID = null;
+    var deliveries: u32 = 0;
+    var idle_ns: u64 = 0;
+    while (it.next() catch null) |entry| {
+        const v = entry.value.v;
+        if (v.status != .leased) continue;
+        rec = gm.recordOf(entry.key[4..]);
+        deliveries = v.deliveries;
+        idle_ns = l.now_ns -| (v.expiry_ns -| v.lease_ms *| std.time.ns_per_ms);
+        if (r.boolean()) break;
+    }
+    const target = rec orelse return null;
+    const idle_ms = idle_ns / std.time.ns_per_ms;
+    const min_idle: u64 = if (r.uintLessThan(u8, 4) == 0) idle_ms + 1 + r.uintLessThan(u64, 1_000) else @max(1, idle_ms / 2);
+    if (r.uintLessThan(u8, 100) < SPOIL) deliveries +%= 1;
+    var ib: [ge.Item.max_size]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &ib };
+    try ge.Item.encode(&w, .{ .ms = target.timestamp_ms, .seq = target.sequence, .deliveries = deliveries });
+    const p = try ge.Steal.encodeInto(out, .{ .ns = NS.int(), .stream = STREAMS[s], .group = GROUPS[grp], .holder = "c1", .lease_ms = LEASES[r.uintLessThan(usize, LEASES.len)], .min_idle_ms = @min(min_idle, ae.MAX_LEASE_MS), .items = .{ .bytes = ib[0..w.pos], .count = 1 } });
+    return .{ .entry_type = .group_steal, .payload = p };
+}
+
+/// An operator's requeue or drop of a group's dead letters, now and then
+/// naming a live record as well: refused, not dead.
+fn dead(store: *store_mod.Store, out: []u8, kind: Kind, r: std.Random, s: usize, grp: usize) !?Made {
+    const scope = gm.scopeOf(NS, STREAMS[s], GROUPS[grp]);
+    var kb: [4 + gm.SCOPE_LEN]u8 = undefined;
+    var it = (view_mod.ReadView{ .store = store }).range(gm.Items, gm.storeKey(&kb, NS, &scope));
+    var ib: [4 * ge.RecordId.max_size]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &ib };
+    var n: u32 = 0;
+    // Room for one live record, now and then.
+    var live_room = r.uintLessThan(u8, 100) < SPOIL;
+    while (it.next() catch null) |entry| {
+        if (n == 3) break;
+        const v = entry.value.v;
+        if (v.status != .dead) {
+            if (!live_room) continue;
+            live_room = false;
+        }
+        const rec = gm.recordOf(entry.key[4..]);
+        try ge.RecordId.encode(&w, .{ .ms = rec.timestamp_ms, .seq = rec.sequence });
+        n += 1;
+    }
+    if (n == 0) return null;
+    const p = try ge.DeadItems.encodeInto(out, .{ .ns = NS.int(), .stream = STREAMS[s], .group = GROUPS[grp], .items = .{ .bytes = ib[0..w.pos], .count = n } });
+    return .{ .entry_type = if (kind == .requeue) .group_requeue else .group_drop, .payload = p };
 }

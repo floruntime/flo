@@ -471,3 +471,122 @@ test "e2e/group: an abandoned record goes again at once and spends no attempt; a
     }
     try testing.expect(try infoHas(ctx, "s", "\"ready\":1,\"leased\":0,\"dead\":0"));
 }
+
+/// The record id inside a delivery `term.index.id.deliveries`.
+fn idOf(delivery: []const u8) []const u8 {
+    var it = std.mem.splitScalar(u8, delivery, '.');
+    _ = it.next();
+    _ = it.next();
+    return it.next().?;
+}
+
+test "e2e/group: a steal takes only an idle holder's record, under a new delivery, and the old holder's ack is stale" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "stream", "append", "s", "job" });
+    var r = try read(ctx, "s", "w", "1");
+    defer r.deinit();
+    var db: [256]u8 = undefined;
+    const ds = try deliveries(&db, r.stdout);
+    // Read moments ago: not idle a minute.
+    var busy = try ctx.cli.run(&.{ "stream", "group", "steal", "s", "--group", "g", "--consumer", "rescue", "--min-idle", "60000", "--ids", ds });
+    defer busy.deinit();
+    try testing.expectEqual(@as(u8, 3), busy.exit_code);
+    try testing.expect(busy.stderrContains("not idle: its holder moved its lease within the idle time named"));
+    // A steal with no idle time named is refused before it is sent.
+    var none = try ctx.cli.run(&.{ "stream", "group", "steal", "s", "--group", "g", "--consumer", "rescue", "--ids", ds });
+    defer none.deinit();
+    try testing.expectEqual(@as(u8, 2), none.exit_code);
+
+    var took = try ctx.cli.run(&.{ "stream", "group", "steal", "s", "--group", "g", "--consumer", "rescue", "--min-idle", "1", "--ids", ds });
+    defer took.deinit();
+    try testing.expectEqual(@as(u8, 0), took.exit_code);
+    // Its new delivery: the steal's own term and index, one more delivery.
+    const stolen = std.mem.trim(u8, took.stdout, "\n ");
+    try testing.expect(std.mem.endsWith(u8, stolen, ".2"));
+    try testing.expectEqualStrings(idOf(ds), idOf(stolen));
+    var old = try ctx.cli.run(&.{ "stream", "group", "ack", "s", "--group", "g", "--consumer", "w", "--ids", ds });
+    defer old.deinit();
+    try testing.expectEqual(@as(u8, 3), old.exit_code);
+    var new = try ctx.cli.run(&.{ "stream", "group", "ack", "s", "--group", "g", "--consumer", "rescue", "--ids", stolen });
+    defer new.deinit();
+    try testing.expectEqual(@as(u8, 0), new.exit_code);
+    try testing.expect(try infoHas(ctx, "s", "\"ready\":0,\"leased\":0,\"dead\":0"));
+}
+
+test "e2e/group: dead letters are listed oldest first a page at a time, requeued with their attempts reset, and deleted, a dry run first" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "stream", "group", "create", "s", "--group", "g", "--max-deliver", "1" });
+    try ctx.exec(&.{ "stream", "append", "s", "a", "b", "c" });
+    var r = try read(ctx, "s", "w", "3");
+    defer r.deinit();
+    var db: [512]u8 = undefined;
+    const ds = try deliveries(&db, r.stdout);
+    var nack = try ctx.cli.run(&.{ "stream", "group", "nack", "s", "--group", "g", "--consumer", "w", "--ids", ds, "--error=boom" });
+    defer nack.deinit();
+    try testing.expectEqual(@as(u8, 0), nack.exit_code);
+
+    var all = try ctx.cli.run(&.{ "stream", "group", "dlq", "list", "s", "--group", "g", "-o", "json" });
+    defer all.deinit();
+    try testing.expectEqual(@as(u8, 0), all.exit_code);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, all.stdout, "\"failures\":1"));
+    try testing.expect(all.stdoutContains("\"error\":\"boom\""));
+    try testing.expect(all.stdoutContains("\"cursor\":null"));
+    // A page of two, then the rest after its cursor.
+    var first = try ctx.cli.run(&.{ "stream", "group", "dlq", "list", "s", "--group", "g", "--limit", "2", "-o", "json" });
+    defer first.deinit();
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, first.stdout, "\"id\":"));
+    const at = std.mem.indexOf(u8, first.stdout, "\"cursor\":\"").? + "\"cursor\":\"".len;
+    const cursor = first.stdout[at..][0..std.mem.indexOfScalar(u8, first.stdout[at..], '"').?];
+    var rest = try ctx.cli.run(&.{ "stream", "group", "dlq", "list", "s", "--group", "g", "--after", cursor, "-o", "json" });
+    defer rest.deinit();
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, rest.stdout, "\"id\":"));
+    try testing.expect(rest.stdoutContains(idOf(nth(ds, 2))));
+
+    // A requeued record is ready again with its attempts reset: read again.
+    var rq = try ctx.cli.run(&.{ "stream", "group", "dlq", "requeue", "s", "--group", "g", "--ids", idOf(nth(ds, 0)) });
+    defer rq.deinit();
+    try testing.expectEqual(@as(u8, 0), rq.exit_code);
+    try testing.expect(rq.stdoutContains("Requeued 1 record(s)"));
+    var again = try read(ctx, "s", "w2", "1");
+    defer again.deinit();
+    try testing.expect(again.stdoutContains("\"data\":\"a\""));
+    try testing.expect(again.stdoutContains("\"deliveries\":2"));
+    // Not dead any more: a requeue of it is refused, naming why.
+    var twice = try ctx.cli.run(&.{ "stream", "group", "dlq", "requeue", "s", "--group", "g", "--ids", idOf(nth(ds, 0)) });
+    defer twice.deinit();
+    try testing.expectEqual(@as(u8, 3), twice.exit_code);
+    try testing.expect(twice.stderrContains("not dead"));
+
+    var dry = try ctx.cli.run(&.{ "stream", "group", "dlq", "delete", "s", "--group", "g", "--all", "--dry-run" });
+    defer dry.deinit();
+    try testing.expectEqual(@as(u8, 0), dry.exit_code);
+    try testing.expect(dry.stdoutContains("Would delete 2 record(s)"));
+    try testing.expect(try infoHas(ctx, "s", "\"dead\":2"));
+    var del = try ctx.cli.run(&.{ "stream", "group", "dlq", "delete", "s", "--group", "g", "--all" });
+    defer del.deinit();
+    try testing.expectEqual(@as(u8, 0), del.exit_code);
+    try testing.expect(del.stdoutContains("Deleted 2 record(s)"));
+    var empty = try ctx.cli.run(&.{ "stream", "group", "dlq", "list", "s", "--group", "g" });
+    defer empty.deinit();
+    try testing.expect(empty.stdoutContains("No dead letters"));
+    try testing.expect(try infoHas(ctx, "s", "\"dead\":0"));
+}
+
+test "e2e/group: a steal or dead-letter command to a group that isn't there is refused not found" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "stream", "append", "s", "a" });
+    for ([_][]const []const u8{
+        &.{ "stream", "group", "dlq", "list", "s", "--group", "nope" },
+        &.{ "stream", "group", "dlq", "requeue", "s", "--group", "nope", "--all" },
+        &.{ "stream", "group", "dlq", "delete", "s", "--group", "nope", "--ids", "1-0" },
+        &.{ "stream", "group", "steal", "s", "--group", "nope", "--consumer", "c", "--min-idle", "1", "--ids", "1.1.1-0.1" },
+    }) |argv| {
+        var out = try ctx.cli.run(argv);
+        defer out.deinit();
+        try testing.expectEqual(@as(u8, 1), out.exit_code);
+        try testing.expect(out.stderrContains("consumer group not found"));
+    }
+}

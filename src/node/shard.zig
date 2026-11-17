@@ -78,6 +78,8 @@ const apply_marker = @import("apply_marker.zig");
 const offline_mod = @import("offline.zig");
 const qe_caps = @import("../protocol/queue_entries.zig");
 const ge_mod = @import("../protocol/group_entries.zig");
+const queue_ops = @import("../protocol/queue_ops.zig");
+const stream_ops = @import("../protocol/stream_ops.zig");
 const action_entries = @import("../protocol/action_entries.zig");
 const action_ops_mod = @import("../protocol/action_ops.zig");
 const group_handler = @import("../stream/group_handler.zig");
@@ -28109,3 +28111,103 @@ test "Shard: a hand-back refused for good is given up at once, not kept" {
 /// A test message's origin: the default namespace's user.
 const TEST_USER: u8 = @backingInt(@import("../contract/view.zig").Origin.Kind.user);
 const TEST_DEFAULT_NS: u32 = @import("../namespace/table.zig").DEFAULT.int();
+
+/// A group's records applied straight to the shard's store, as their
+/// entries would leave them: `n` records of "s", delivered to "w" at `stamp`.
+fn groupDelivered(sh: *Shard, n: u64, stamp: u64) !void {
+    const p = sh.defaultPartition();
+    for (0..n) |i| _ = try p.stream.appendToStreamAt(stream_mod.streamKey(.default, "s"), i + 1, 0, 0, 1, 1, 10);
+    var pb: [ge_mod.Deliver.max_size]u8 = undefined;
+    const body = try ge_mod.Deliver.encodeInto(&pb, .{ .ns = 1, .stream = "s", .group = "g", .count = @intCast(n), .max_bytes = 1 << 20, .holder = "w", .lease_ms = 30_000, .create = true, .ready = .{ .bytes = "", .count = 0 }, .through_ms = std.math.maxInt(u64), .through_seq = std.math.maxInt(u64), .max_held = qe_caps.DEFAULT_MAX_MESSAGES, .max_held_bytes = qe_caps.DEFAULT_MAX_BYTES, .shard_held_bytes = qe_caps.DEFAULT_SHARD_HELD_BYTES });
+    try applyGroupEntry(sh, .group_deliver, body, 50, stamp);
+}
+
+fn applyGroupEntry(sh: *Shard, etype: entry_mod.EntryType, body: []const u8, index: u64, stamp: u64) !void {
+    const p = sh.defaultPartition();
+    const e = entry_mod.buildEntry(etype, entry_mod.Flags.NONE, 1, index, stamp, body);
+    var out: persistence_mod.Result = .{};
+    out.reset(&e);
+    try contract_machine.applyEntryWith(&@import("../stream/group_machine.zig").machine, &p.store, &p.apply_scratch, .{ .proj = &p.stream }, &e, &out);
+    try std.testing.expect(out.refused() == null);
+}
+
+/// The one answer a group operator request got, decoded by its op.
+fn groupOpAnswer(comptime name: []const u8, t: *ClusterActionsTest, code: proto.OpCode, id: u64, body: []const u8) !table_run.op(name).response.Value {
+    t.shard.runRequest(t.c.conn, .{ .header = proto.RequestHeader.init(code, id), .namespace = "default", .key = "s", .value = body }, .client);
+    if (table_run.op(name).class == .write) try ParkTest.ack(&t.shard);
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.c.conn, t.c.pair[1], &t.buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    var diag: schema.Diagnostic = .{};
+    return table_run.op(name).response.decodeAll(one[0].data, &diag);
+}
+
+test "Shard: stream.group.steal takes a record idle at least min_idle_ms for its consumer, for lease_ms or the group's lease, and refuses one not idle" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    // Delivered five seconds ago, by the log's clock.
+    try groupDelivered(&t.shard, 2, t.shard.raft_node.now() - 5 * std.time.ns_per_s);
+    const Steal = table_run.op("stream.group.steal");
+    var rb: [256]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &rb };
+    // Appended at the same instant: ids 1-0 and 1-1.
+    for (0..2) |seq| try stream_ops.Leased.encode(&w, .{ .ms = 1, .seq = seq, .deliveries = 1 });
+    var body_buf: [Steal.request.max_size]u8 = undefined;
+    // Read moments ago: not idle a minute.
+    const busy = try groupOpAnswer("stream.group.steal", &t, .stream_group_steal, 1, try Steal.request.encodeInto(&body_buf, .{ .group = "g", .consumer = "rescue", .min_idle_ms = 60_000, .lease_ms = null, .records = .{ .bytes = rb[0..w.pos], .count = 2 } }));
+    try std.testing.expectEqual(@as(u32, 0), busy.stolen.count);
+    try std.testing.expectEqual(@as(u32, 2), busy.refused.count);
+    var rit = busy.refused.iterator();
+    try std.testing.expectEqual(queue_ops.Why.not_idle, (try rit.next()).?.why);
+
+    const took = try groupOpAnswer("stream.group.steal", &t, .stream_group_steal, 2, try Steal.request.encodeInto(&body_buf, .{ .group = "g", .consumer = "rescue", .min_idle_ms = 1, .lease_ms = 10_000, .records = .{ .bytes = rb[0..w.pos], .count = 2 } }));
+    try std.testing.expectEqual(@as(u32, 2), took.stolen.count);
+    var sit = took.stolen.iterator();
+    try std.testing.expectEqual(@as(u32, 2), (try sit.next()).?.deliveries);
+    try std.testing.expectEqual(t.shard.raft_node.current_term, took.term);
+    // For the lease it named, from its entry's stamp.
+    const left = took.expires_at_ms - @as(i64, @intCast(t.shard.raft_node.now() / std.time.ns_per_ms));
+    try std.testing.expect(left > 9_000 and left <= 10_000);
+}
+
+test "Shard: stream.group.dlq_list pages a group's dead letters by limit and after; dlq_requeue and dlq_delete take records or all, and a dry_run deletes nothing" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const now = t.shard.raft_node.now();
+    try groupDelivered(&t.shard, 3, now);
+    // All three nacked dead.
+    var ib: [256]u8 = undefined;
+    var iw: schema.Writer = .{ .buf = &ib };
+    for (0..3) |seq| try ge_mod.Item.encode(&iw, .{ .ms = 1, .seq = seq, .deliveries = 1 });
+    var rel: [ge_mod.Release.max_size]u8 = undefined;
+    const body = try ge_mod.Release.encodeInto(&rel, .{ .ns = 1, .stream = "s", .group = "g", .holder = "w", .token = .{ .term = 1, .index = 50 }, .expiry_ns = now + 30 * std.time.ns_per_s, .items = .{ .bytes = ib[0..iw.pos], .count = 3 }, .delay_ms = 0, .dead = true, .@"error" = "boom", .ended = .failed });
+    try applyGroupEntry(&t.shard, .group_release, body, 51, now + 1);
+
+    const List = table_run.op("stream.group.dlq_list");
+    var lb: [List.request.max_size]u8 = undefined;
+    const first = try groupOpAnswer("stream.group.dlq_list", &t, .stream_group_dlq_list, 1, try List.request.encodeInto(&lb, .{ .group = "g", .limit = 2, .after = null }));
+    try std.testing.expectEqual(@as(u32, 2), first.dead.count);
+    const rest = try groupOpAnswer("stream.group.dlq_list", &t, .stream_group_dlq_list, 2, try List.request.encodeInto(&lb, .{ .group = "g", .limit = 2, .after = first.cursor.? }));
+    try std.testing.expectEqual(@as(u32, 1), rest.dead.count);
+    try std.testing.expect(rest.cursor == null);
+
+    const Requeue = table_run.op("stream.group.dlq_requeue");
+    var qb: [Requeue.request.max_size]u8 = undefined;
+    var rr: [64]u8 = undefined;
+    var rw: schema.Writer = .{ .buf = &rr };
+    try stream_ops.RecordRef.encode(&rw, .{ .ms = 1, .seq = 0 });
+    const rq = try groupOpAnswer("stream.group.dlq_requeue", &t, .stream_group_dlq_requeue, 3, try Requeue.request.encodeInto(&qb, .{ .group = "g", .records = .{ .bytes = rr[0..rw.pos], .count = 1 }, .all = false }));
+    try std.testing.expectEqual(@as(u32, 1), rq.applied);
+
+    const Delete = table_run.op("stream.group.dlq_delete");
+    var db: [Delete.request.max_size]u8 = undefined;
+    const dry = try groupOpAnswer("stream.group.dlq_delete", &t, .stream_group_dlq_delete, 4, try Delete.request.encodeInto(&db, .{ .group = "g", .records = null, .all = true, .dry_run = true }));
+    try std.testing.expectEqual(@as(u32, 2), dry.applied);
+    const del = try groupOpAnswer("stream.group.dlq_delete", &t, .stream_group_dlq_delete, 5, try Delete.request.encodeInto(&db, .{ .group = "g", .records = null, .all = true, .dry_run = false }));
+    try std.testing.expectEqual(@as(u32, 2), del.applied);
+    try std.testing.expect(!del.more);
+    const empty = try groupOpAnswer("stream.group.dlq_list", &t, .stream_group_dlq_list, 6, try List.request.encodeInto(&lb, .{ .group = "g", .limit = 20, .after = null }));
+    try std.testing.expectEqual(@as(u32, 0), empty.dead.count);
+}

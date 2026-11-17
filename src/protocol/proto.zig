@@ -146,6 +146,10 @@ pub const OpCode = enum(u16) {
     stream_group_delete = 0x15C,
     stream_group_list = 0x15D,
     stream_group_members = 0x15E,
+    stream_group_steal = 0x15F,
+    stream_group_dlq_list = 0x160,
+    stream_group_dlq_requeue = 0x161,
+    stream_group_dlq_delete = 0x162,
 
     // ── Queues (0x170 – 0x19F) ───────────────────────────────────────────────
     queue_enqueue = 0x170,

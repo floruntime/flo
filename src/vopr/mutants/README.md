@@ -32,6 +32,9 @@ means the check stopped catching its bug.
 | `consumer-groups.json` | `group_trim_misses_floor` | `group_rule` | `a stream's floor is not the last record it lost` |
 | `consumer-groups.json` | `group_delete_keeps_count` | `group_rule` | `a stream's record has another generation or group count than the ledger's` |
 | `consumer-groups.json` | `group_extend_clock_ahead` | `group_rule` | `an extend answered another expiry than the ledger's` |
+| `consumer-groups.json` | `group_steal_ignores_idle` | `group_rule` | `a steal took` |
+| `consumer-groups.json` | `group_requeue_keeps_failures` | `group_rule` | `a record's deliveries or failures are not the ledger's` |
+| `consumer-groups.json` | `group_drop_keeps_bytes` | `group_rule` | `a group's held bytes are not what the ledger's records hold` |
 | `txn-limits.json` | `kv_if_absent_holds` | `applied_integrity` | `decided a put's condition` |
 | `txn-limits.json` | `kv_batch_conditions_ignored` | `applied_integrity` | `a condition that can't hold` |
 | `txn-limits.json` | `kv_refuses_over_own_limit` | `state_checksum` | `kv.value` |
@@ -94,6 +97,9 @@ are checked against the ledger, record by record.
 | A trim moves the stream's floor to the last record it lost | `group_trim_misses_floor` |
 | A stream's record counts its groups exactly | `group_delete_keeps_count` |
 | An extend moves a lease only with half of it or less left, and answers where it ends | `group_extend_clock_ahead` |
+| A steal takes only a record idle at least its idle time, idle since the lease last moved | `group_steal_ignores_idle` |
+| A requeue resets a dead letter's failures | `group_requeue_keeps_failures` |
+| A drop gives back the bytes of the records it removes | `group_drop_keeps_bytes` |
 | A report applies only to the delivery it names; the same hand-back resent counts as applied, any other is answered by what became of the record | machine tests "a nack after an abandon of the same delivery, or the reverse, is answered released, not applied", "a report to a group that isn't there is refused not_found" |
 | Every ready, leased and dead record has its key, and no ready or dead key is left over | checked by the family from the store itself, after every applied group entry |
 
