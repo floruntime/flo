@@ -131,10 +131,9 @@ pub fn observeAll(comptime machines: []const Machine, store: *store_mod.Store, s
 /// state with it, and what it sends leaves with them. A write to another
 /// machine's family halts: an observer keeps only its own.
 ///
-/// An observer sends only on observing an edge entry (a client's write, or
-/// a leader's own proposal: a completion, a refusal), never because of a
-/// message it applied. So a chain of applies never sends, and needs no fuel
-/// or `hops` to bound it.
+/// An observer sends only on observing an edge entry (a client's write or a
+/// leader's own proposal), never a message it applied, so an observed entry
+/// can't start a chain of sends.
 pub fn observeEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, streams: ?Streams, e: *const Entry, from: ObservedFrom) ApplyError!void {
     if (m.observe_needed) |needed| if (!needed(.{ .store = store }, e)) return;
     _ = scratch.reset(.retain_capacity);

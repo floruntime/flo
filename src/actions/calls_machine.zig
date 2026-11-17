@@ -1,5 +1,5 @@
-//! Calls: a workflow step's action run, asked for over a channel and
-//! recorded on the workflow's shard.
+//! Calls: a workflow step's run of an action or a child workflow, asked for
+//! over a channel and recorded on the workflow's shard.
 //!
 //! - `step_call` records the call and sends the run's start
 //!   (`action_invoke`) to the action's slot.
@@ -55,7 +55,7 @@ pub const State = enum(u8) {
 
 /// A step's call of an action's run or a child workflow's, kept under the
 /// calling workflow's slot until the step is done with it. One record for
-/// both kinds, and the one a workflow on the contract keeps as its own.
+/// both kinds.
 pub const Call = Record(&.{
     .{ .name = "kind", .T = schema.Enum(ae.CallKind) },
     .{ .name = "caller_run", .T = Bytes(limits.MAX_QUALIFIED_KEY) },
@@ -155,7 +155,6 @@ fn namespaceOf(e: *const Entry) ?u32 {
     return n.ns.int();
 }
 
-/// Sends the run's start for `call` to the action's slot.
 /// Sends the call's start to its target's slot: an action's run's invoke,
 /// or a child workflow's start, which carries where the child's end goes.
 fn sendStart(view: *View, ns: NamespaceId, slot: u16, run: []const u8, c: Call.Value) ApplyError!void {

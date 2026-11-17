@@ -4290,9 +4290,8 @@ test "e2e/workflow: a channel carries a child's start to its shard across a rest
     try ctx.exec(&.{ "workflow", "start", "chan-par-b", "{}", "--run-id", "chan-run-b" });
     try ctx.restartServer();
     // The child started on its shard once the start arrived: its step's
-    // action has a task. (The parent's wait is its old leader's memory, so
-    // it doesn't resume across the restart: a known limitation, until
-    // workflows are on the contract.)
+    // action has a task. The parent's wait is held only in its leader's
+    // memory, so the parent doesn't resume after a restart.
     const id = try takeTask(ctx, c.action, "15000");
     defer testing.allocator.free(id);
 }

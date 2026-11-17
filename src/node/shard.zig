@@ -28881,9 +28881,9 @@ fn replicaOf(leader: *Shard, pipe_fd: std.posix.fd_t) !Shard {
 }
 
 test "Shard: a workflow run whose action ended just before a leader change finishes on the new leader" {
-    // A run's step state is its leader's memory, so a new leader doesn't
-    // know the run waits on this call: it stays running. Skipped until
-    // workflow step state is on the contract, which turns it green.
+    // A run's step state is held only in its leader's memory, so a new
+    // leader doesn't know the run waits on this call: it stays running.
+    // Skipped while that holds; it passes once the wait is durable.
     if (true) return error.SkipZigTest;
     var t: ClusterActionsTest = undefined;
     try t.init();
@@ -29254,7 +29254,7 @@ fn workflowOn(two: *TwoShards, on: u16, prefix: []const u8, buf: []u8) ![]const 
     }
 }
 
-/// Every shard's workflow duty and channels, until nothing moves.
+/// Every shard's workflow duty and channels, six turns.
 fn turnWorkflows(two: *TwoShards) void {
     for (0..6) |_| {
         for (&two.shards) |*s| {
@@ -29371,6 +29371,50 @@ test "Shard: a child's end waits while its own parent's outbox is full, and anot
         defer std.testing.allocator.free(key);
         try std.testing.expectEqual(want, wf.runs.get(key).?.status);
     }
+}
+
+test "Shard: a child's call cleared before the child ends takes its end as nothing, and counts it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var metrics = MetricsRegistry.init(std.testing.allocator);
+    defer metrics.deinit();
+    a.setMetricsRegistry(&metrics);
+    var kb: [16]u8 = undefined;
+    var pb: [16]u8 = undefined;
+    const kid_wf = try workflowOn(&two, 1, "kid", &kb);
+    const parent_wf = try workflowOn(&two, 0, "par", &pb);
+    const cb = try TestClient.open(b);
+    defer _ = std.c.close(cb.pair[1]);
+    var yb: [512]u8 = undefined;
+    try createWorkflow(&two, b, cb, 1, try std.fmt.bufPrint(&yb, "{{\"kind\":\"Workflow\",\"name\":\"{s}\",\"version\":\"1.0.0\",\"start\":{{\"wait_for_signal\":{{\"type\":\"go\"}},\"transitions\":{{\"success\":\"flo.Completed\"}}}}}}", .{kid_wf}), kid_wf);
+    var rb: [32]u8 = undefined;
+    const rid = a.run_id_gen.next(.workflow, node_router.nsKeySlot(.default, kid_wf), &rb);
+    const slot = calls_machine.callerSlot(.default, parent_wf);
+    _ = try proposeAction(a, .step_call, action_entries.Call.Value{ .ns = ns_table.DEFAULT.int(), .kind = .workflow, .caller_run = "p-run", .caller_workflow = parent_wf, .step = "s", .target = kid_wf, .version = "", .run = rid, .input = "{}", .can_wait = false });
+    two.settle();
+    pumpChannels(&two);
+    b.workflow_handler.checkPendingActions(b);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(calls_machine.State.started, callIn(a, parent_wf, rid).?.state);
+    // The parent's step resolved otherwise (its run was cancelled, say).
+    _ = try proposeAction(a, .step_call_clear, action_entries.CallClear.Value{ .ns = ns_table.DEFAULT.int(), .slot = slot, .run = rid });
+    two.settle();
+    const wf = b.workflow_handler;
+    const key = wf.nsKey(.default, rid).?;
+    defer std.testing.allocator.free(key);
+    wf.completeRun(b, key, wf.runs.getPtr(key).?, .completed, "flo.Completed", 3);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expect(callIn(a, parent_wf, rid) == null);
+    try std.testing.expect(@import("../workflow/children_machine.zig").parentOf(.{ .store = &b.defaultPartition().store }, .default, rid) == null);
+    try std.testing.expectEqual(@as(u64, 1), metrics.workflow.action_answers_without_call_total.load(.monotonic));
+    // Not the sender's bug: nothing was refused.
+    for (a.channel.sender_bugs) |row| for (row) |bugs| try std.testing.expectEqual(@as(u64, 0), bugs);
 }
 
 test "Shard: a second caller's start of a child run another caller started is answered so, and the first stands" {

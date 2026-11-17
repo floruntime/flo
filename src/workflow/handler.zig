@@ -299,7 +299,7 @@ pub const WorkflowHandler = struct {
         /// Per-step outputs for JSONPath resolution ($.steps.*).
         step_outputs: ?StepOutputMap = null,
 
-        /// Action run ID when parked waiting for async action completion.
+        /// The callee's run id while the step waits on its call.
         pending_action_run_id_owned: ?[]const u8 = null,
 
         /// Step name that triggered the pending action.
@@ -2336,7 +2336,8 @@ pub const WorkflowHandler = struct {
     }
 
     /// A child's start, as its parent asked: the workflow and version this
-    /// shard holds, or a refusal when it holds neither.
+    /// shard holds; or a refusal when it holds no such workflow, or not that
+    /// version, or a run already holds the child's id.
     fn startChild(self: *WorkflowHandler, shard: *Shard, ns: NamespaceId, run_id: []const u8, p: children_mod.Parent.Value) !persistence_mod.ProposeResult {
         const def_key = self.nsKey(ns, p.workflow) orelse return error.OutOfMemory;
         defer self.allocator.free(def_key);
@@ -2395,7 +2396,8 @@ pub const WorkflowHandler = struct {
         if (at_end) self.calls_sweep_after.clearRetainingCapacity();
     }
 
-    /// Park a workflow run waiting for an async action to complete.
+    /// Park a workflow run waiting for a step's call: an action's run or a
+    /// child's.
     fn parkForCall(self: *WorkflowHandler, run: *RunRecord, kind: ae.CallKind, action_run_id: []const u8, step_label: []const u8, action_name: []const u8, slot: u32, now_ms: i64, index: u64) void {
         run.pending_call_kind = kind;
         run.status = .waiting;
@@ -2585,7 +2587,7 @@ pub const WorkflowHandler = struct {
         self.rewatch_at_ms = now_ms +| 1000;
     }
 
-    /// Resume a workflow run after its async action completed.
+    /// Resume a workflow run once its step's call has settled.
     fn resumeFromAction(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8, now_ms: i64) void {
         const run = self.runs.getPtr(run_ns_key) orelse return;
         const action_rid = run.pending_action_run_id_owned orelse return;
@@ -2615,8 +2617,10 @@ pub const WorkflowHandler = struct {
         } else .lost;
 
         // A child that failed, was cancelled or timed out takes the step's
-        // failure transition with its output, as a failed action does; an
-        // action whose lease ran out is an execution failure.
+        // failure transition, as a failed action does; an action whose lease
+        // ran out is an execution failure. Only a completed run has an output
+        // (its definition's mapping is for completion), so a failed one
+        // gives "{}".
         const child = run.pending_call_kind == .workflow;
         const outcome: []const u8 = switch (settled) {
             .completed => blk: {
@@ -2629,8 +2633,7 @@ pub const WorkflowHandler = struct {
                 break :blk action_outcome;
             },
             .failed => blk: {
-                const out = if (child and call.?.result.len > 0) call.?.result else "{}";
-                if (run.step_outputs) |*so| so.put(self.allocator, step_label, out, definition.StepOutcome.failure) catch {};
+                if (run.step_outputs) |*so| so.put(self.allocator, step_label, "{}", definition.StepOutcome.failure) catch {};
                 break :blk definition.StepOutcome.failure;
             },
             .timed_out => if (child) blk: {

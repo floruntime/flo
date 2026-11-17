@@ -1819,7 +1819,7 @@ fn writeWorkflowMetrics(writer: anytype, snapshot: WorkflowMetrics.Snapshot) !vo
     try writer.print("# HELP flo_workflow_action_call_retries_total Calls of an action not registered yet, asked for again\n", .{});
     try writer.print("# TYPE flo_workflow_action_call_retries_total counter\n", .{});
     try writer.print("flo_workflow_action_call_retries_total {d}\n", .{snapshot.action_call_retries_total});
-    try writer.print("# HELP flo_workflow_action_answers_without_call_total Action answers or ends for a call already gone\n", .{});
+    try writer.print("# HELP flo_workflow_action_answers_without_call_total A call's answers or ends (an action run's or a child workflow's) for a call already gone\n", .{});
     try writer.print("# TYPE flo_workflow_action_answers_without_call_total counter\n", .{});
     try writer.print("flo_workflow_action_answers_without_call_total {d}\n", .{snapshot.action_answers_without_call_total});
 

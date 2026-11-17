@@ -8,14 +8,14 @@
 //! it (`child_refuse`). The parent's call hears from this machine:
 //!
 //! - `call_reply` `started`, on observing the child's `workflow_start`;
-//! - `call_reply` `no_action`, from a `child_refuse`;
+//! - `call_reply` `no_action` or `conflict`, from a `child_refuse` this
+//!   shard's leader proposed, or `conflict` to a second caller's
+//!   `child_start` for a run another caller started;
 //! - `call_done`, on observing the child's `workflow_complete`, with how it
 //!   ended and its output. The parent record goes.
 //!
-//! An observer here sends only on observing an edge entry, never because of
-//! a message it applied: a start and a completion are the child's leader's
-//! own proposals. So no chain of applies sends, and none needs fuel or
-//! `hops`. `child_start` itself sends nothing.
+//! The start and the completion it observes are this shard's leader's own
+//! proposals, never messages.
 
 const std = @import("std");
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -47,8 +47,7 @@ pub const State = enum(u8) {
 };
 
 /// A child run's parent: where its end goes, and what to start it with.
-/// Per-run state keyed like the run, which a workflow on the contract folds
-/// into the run's own record as its parent link.
+/// Per-run state, keyed like the run.
 pub const Parent = Record(&.{
     .{ .name = "parent_slot", .T = Int(u16) },
     .{ .name = "parent_run", .T = Bytes(limits.MAX_QUALIFIED_KEY) },

@@ -145,8 +145,9 @@ pub const EntryType = enum(u8) {
     action_release = 0x76,
     action_extend = 0x77,
     action_expire = 0x78,
-    /// A workflow step's call of an action, its retry and its clear, on
-    /// the workflow's shard; and the two messages that answer it.
+    /// A workflow step's call of an action or a child workflow, its retry
+    /// and its clear, on the workflow's shard; and the two messages that
+    /// answer it.
     step_call = 0x79,
     step_call_retry = 0x7A,
     step_call_clear = 0x7B,
