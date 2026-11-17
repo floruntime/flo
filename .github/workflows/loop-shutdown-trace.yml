@@ -27,29 +27,27 @@ jobs:
       - run: mkdir -p src/node/dashboard/dist && touch src/node/dashboard/dist/.keep
       - name: Build the e2e binary (filtered to the shutdown test) and flo
         run: zig build test-e2e -Dtest-filter="SIGTERM under load" --test-timeout 120s 2>&1 | tail -3
-      - name: Loop the binary under LOAD (parallel) to widen the timing race
+      - name: Loop sequentially under background CPU load
         run: |
           # The flake fires under the full e2e's CPU/scheduling pressure, not in
-          # isolation (50 isolated runs = 0 failures). Recreate the load by
-          # running several copies at once on the 2-4 core runner.
+          # isolation (50 isolated runs = 0 failures). The e2e harness locks the
+          # checkout, so runs must be sequential; the load comes from busy loops
+          # saturating the cores, which widens the acceptor/reactor timing race.
           set +e
           BIN=$(ls -t .zig-cache/o/*/test 2>/dev/null | head -1)
           echo "e2e binary: $BIN"
           [ -x "$BIN" ] || { echo "::error::no e2e test binary"; exit 1; }
-          PAR=6; ROUNDS=14; fails=0
-          for round in $(seq 1 $ROUNDS); do
-            for p in $(seq 1 $PAR); do
-              ( timeout 150 "$BIN" > "/tmp/r_${round}_${p}.log" 2>&1; echo $? > "/tmp/rc_${round}_${p}" ) &
-            done
-            wait
-            for p in $(seq 1 $PAR); do
-              rc=$(cat "/tmp/rc_${round}_${p}" 2>/dev/null || echo 99)
-              if [ "$rc" != "0" ] || grep -qa "acked nothing" "/tmp/r_${round}_${p}.log"; then
-                fails=$((fails+1))
-                echo "::group::round $round proc $p FAILED (rc=$rc)"
-                grep -aE "TRACE|TRACE-SRV|acked nothing|SIGTERM|missing after|server still running" "/tmp/r_${round}_${p}.log" | head -70
-                echo "::endgroup::"
-              fi
-            done
+          N=$(nproc); echo "cores: $N"; hogs=""
+          for c in $(seq 1 "$N"); do ( timeout 900 bash -c 'while :; do :; done' ) & hogs="$hogs $!"; done
+          fails=0; RUNS=80
+          for i in $(seq 1 $RUNS); do
+            out=$(timeout 150 "$BIN" 2>&1); rc=$?
+            if [ $rc -ne 0 ] || printf '%s' "$out" | grep -qa "acked nothing"; then
+              fails=$((fails+1))
+              echo "::group::RUN $i FAILED (rc=$rc)"
+              printf '%s\n' "$out" | grep -aE "TRACE|TRACE-SRV|acked nothing|SIGTERM|missing after|server still running|another e2e run holds" | head -70
+              echo "::endgroup::"
+            fi
           done
-          echo "=== shutdown loop (load): $fails/$((PAR*ROUNDS)) runs failed ==="
+          for h in $hogs; do kill "$h" 2>/dev/null; done
+          echo "=== shutdown loop (cpu load): $fails/$RUNS runs failed ==="
