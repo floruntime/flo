@@ -19,7 +19,7 @@ const Bytes = struct {
         return .{ .b = bytes };
     }
 };
-const Fam = view_mod.Family(3, "probe.bytes", Bytes);
+const Fam = view_mod.Family(3, "probe.bytes", .shard, Bytes);
 const NS = "n";
 
 fn k(buf: []u8, name: []const u8) []const u8 {

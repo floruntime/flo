@@ -2550,6 +2550,10 @@ pub const Shard = struct {
         // as one, so nothing tells the two apart.
         const internal_from_client = run_mod.internalFromClient(req.header.op_code, auth.origin);
         const writes = !internal_from_client and requestWrites(req);
+        // What a client's write proposes counts against its namespace's
+        // share of the log's room; a duty's never does.
+        self.raft_node.charge_ns = if (writes and req.ns_id != .invalid) req.ns_id.int() else 0;
+        defer self.raft_node.charge_ns = 0;
         const at_leader = !internal_from_client and !writes and requestAtLeader(req);
         const status_op = req.header.op_code == @backingInt(proto.OpCode.cluster_status) or req.header.op_code == @backingInt(proto.OpCode.cluster_members);
         if (self.removed_at_ms != null and !status_op) {
@@ -10956,6 +10960,134 @@ fn entriesOf(shard: *Shard, t: entry_mod.EntryType, from: u64) usize {
     return n;
 }
 
+test "Shard: a job whose sink writes to the system namespace, named or as the job's own, is refused at submit and logs nothing" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [512]u8 = undefined;
+    const from = a.raft_node.log.lastIndex();
+    const named =
+        \\kind: Processing
+        \\name: sys
+        \\sources:
+        \\  - name: src
+        \\    stream: { name: s }
+        \\sinks:
+        \\  - name: out
+        \\    stream: { name: t, namespace: _flo }
+    ;
+    const home =
+        \\kind: Processing
+        \\name: sys
+        \\namespace: _flo
+        \\sources:
+        \\  - name: src
+        \\    stream: { name: s, namespace: default }
+        \\sinks:
+        \\  - name: out
+        \\    stream: { name: t }
+    ;
+    for ([_][]const u8{ named, home }, [_][]const u8{ "", "_flo" }, 0..) |yaml, ns, i| {
+        a.runRequest(c.conn, try ParkTest.request(.processing_submit, 20 + i, ns, "", yaml, ""), .client);
+        two.settle();
+        const r = try nextAnswer(c, a, &out);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.header.status);
+        try std.testing.expect(std.mem.indexOf(u8, (try r.refused()).message, "reserved namespace name") != null);
+    }
+    try std.testing.expectEqual(from, a.raft_node.log.lastIndex());
+    try std.testing.expectEqual(@as(u32, 0), a.processing_handler.jobs.count());
+}
+
+/// Client writes of `value` to `key` in the default namespace, from request
+/// id 10, until one is refused: its id. The shard's log must not commit.
+fn fillShare(a: *Shard, c: TestClient, key: []const u8, value: []const u8) !u64 {
+    var id: u64 = 10;
+    while (id < 200) : (id += 1) {
+        const before = a.raft_node.pendingBytesIn(ns_table.DEFAULT.int());
+        a.runRequest(c.conn, try ParkTest.request(.kv_put, id, proto.DEFAULT_NAMESPACE, key, value, ""), .client);
+        if (a.raft_node.pendingBytesIn(ns_table.DEFAULT.int()) == before) return id;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "Shard: a job's sink batches are charged to its namespace's share of the log's room, and it waits once its namespace holds that share" {
+    const value = try std.testing.allocator.alloc(u8, 128 << 10);
+    defer std.testing.allocator.free(value);
+    @memset(value, 'x');
+    {
+        var two: TwoShards = undefined;
+        try two.init();
+        defer two.deinit();
+        const a = &two.shards[0];
+        for (&two.shards) |*s| s.wireHandlerShardPtrs();
+        const c = try TestClient.open(a);
+        defer _ = std.c.close(c.pair[1]);
+        var qb: [16]u8 = undefined;
+        const pipe = try localQueueSinkJob(&two, c, try localQueue(a, &qb), 4, 1);
+        a.raft_node.addPeer(99);
+        tickNow(a, pipe);
+        try std.testing.expect(pipe.batch_index > a.raft_node.last_applied);
+        try std.testing.expect(a.raft_node.pendingBytesIn(ns_table.DEFAULT.int()) > 0);
+    }
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var qb: [16]u8 = undefined;
+    const pipe = try localQueueSinkJob(&two, c, try localQueue(a, &qb), 4, 1);
+    a.raft_node.addPeer(99);
+    var kb: [16]u8 = undefined;
+    _ = try fillShare(a, c, try keyOn(a, .default, 0, &kb), value);
+    const held = a.raft_node.pendingBytesIn(ns_table.DEFAULT.int());
+    tickNow(a, pipe);
+    try std.testing.expect(pipe.wait == .log);
+    try std.testing.expectEqual(held, a.raft_node.pendingBytesIn(ns_table.DEFAULT.int()));
+    try std.testing.expectEqual(@as(u64, 0), pipe.records_in);
+}
+
+test "Shard: a client's writes to one namespace are refused overloaded past its share of the log's room, and another namespace's still go" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [512]u8 = undefined;
+    var obuf: [16]u8 = undefined;
+    const other_key = try keyOn(a, nextNamespaceId(a), 0, &obuf);
+    a.runRequest(c.conn, try ParkTest.request(.kv_put, 1, "other", other_key, "v", ""), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, a, &out)).header.status);
+    const other = two.namespaces.lookup("other").?;
+    var dbuf: [16]u8 = undefined;
+    const key = try keyOn(a, .default, 0, &dbuf);
+    const value = try std.testing.allocator.alloc(u8, 128 << 10);
+    defer std.testing.allocator.free(value);
+    @memset(value, 'x');
+    // Proposed, not applied: each holds its bytes of the room until it
+    // commits, which a second voter that never answers holds back.
+    a.raft_node.addPeer(99);
+    const refused = try fillShare(a, c, key, value);
+    const held = a.raft_node.pendingBytesIn(ns_table.DEFAULT.int());
+    const room = raft_node_mod.PROPOSAL_BYTES - raft_node_mod.PROPOSAL_RESERVE;
+    // Refused at the put that would take it to three quarters.
+    try std.testing.expect(held * 4 < room * 3 and (held + value.len) * 4 >= room * 3);
+    const answer = try nextAnswer(c, a, &out);
+    try std.testing.expectEqual(refused, answer.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), answer.header.status);
+    // The other namespace has its quarter yet.
+    a.runRequest(c.conn, try ParkTest.request(.kv_put, 100, "other", other_key, value, ""), .client);
+    try std.testing.expect(a.raft_node.pendingBytesIn(other.int()) > value.len);
+    two.settle();
+}
+
 test "Shard: a write on shard 1 to a namespace nobody created is answered once, and shard 1 logs only the write" {
     var two: TwoShards = undefined;
     try two.init();
@@ -11769,6 +11901,105 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
     pumpChannels(&two);
     var bodies: [8][]const u8 = undefined;
     try std.testing.expectEqual(@as(usize, 3), queueBodies(b, q.name, &bodies));
+}
+
+test "Shard: a pipeline whose namespace holds three quarters of a channel's outbox waits for its share, though the outbox has room" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    var qb: [16]u8 = undefined;
+    const q = try queueOwnedBy(&two, 1, &qb);
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "r0");
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var yb: [128]u8 = undefined;
+    const pipe = try sinkJob(&two, c, source, try std.fmt.bufPrint(&yb, "  - name: out\n    queue: {{ name: {s} }}", .{q.name}));
+    tickNow(a, pipe);
+    two.settle();
+    const read: contract_view.ReadView = .{ .store = &a.defaultPartition().store };
+    const held = channels_mod.nsBytesOf(read, 1, .default);
+    try std.testing.expectEqual(channels_mod.metaOf(read, 1).bytes, held);
+    // A cap the outbox is under, but whose three quarters the namespace holds.
+    a.outbox_caps = .{ .shard = 1 << 30, .channel = held + held / 4 + 1 };
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "r1");
+    two.settle();
+    tickNow(a, pipe);
+    try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
+    try std.testing.expectEqual(@as(?u16, 1), pipe.wait.share.to);
+    try std.testing.expectEqual(held, pipe.wait.share.bytes);
+    // Taken and trimmed: its share is free, and it reads on.
+    a.channel.peers[1].last_trim_ms = 0;
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 0), channels_mod.nsBytesOf(read, 1, .default));
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expect(pipe.wait == .none);
+    try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
+}
+
+/// The pipeline whose first sink writes into `namespace`.
+fn pipelineOf(a: *Shard, namespace: []const u8) *ProcessingHandler.PipelineState {
+    var it = a.processing_handler.pipelines.valueIterator();
+    while (it.next()) |p| if (std.mem.eql(u8, p.sinks[0].namespace, namespace)) return p;
+    unreachable;
+}
+
+test "Shard: a namespace holding three quarters of all this shard's outboxes waits for its share, and another namespace's pipeline reads on" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    var qb: [16]u8 = undefined;
+    const q = try queueOwnedBy(&two, 1, &qb);
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "r0");
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var yb: [128]u8 = undefined;
+    _ = try sinkJob(&two, c, source, try std.fmt.bufPrint(&yb, "  - name: out\n    queue: {{ name: {s} }}", .{q.name}));
+    tickNow(a, pipelineOf(a, "default"));
+    two.settle();
+    const read: contract_view.ReadView = .{ .store = &a.defaultPartition().store };
+    const held = channels_mod.nsBytesOf(read, 1, .default);
+    try std.testing.expect(held > 0);
+    // A second job, in its own namespace, reading the same stream.
+    var ybuf: [256]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: other
+        \\namespace: pns
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s}, namespace: default }}
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: copy }}
+    , .{source});
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 6, "pns", "", yaml, ""), .client);
+    two.settle();
+    // Each channel has room, and so do the outboxes together; but the
+    // default namespace holds three quarters of the shard's cap.
+    a.outbox_caps = .{ .shard = held + held / 4 + 1, .channel = 1 << 30 };
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "r1");
+    two.settle();
+    tickNow(a, pipelineOf(a, "default"));
+    tickNow(a, pipelineOf(a, "pns"));
+    two.settle();
+    const mine = pipelineOf(a, "default");
+    try std.testing.expectEqual(@as(u64, 1), mine.records_in);
+    try std.testing.expectEqual(@as(?u16, null), mine.wait.share.to);
+    try std.testing.expectEqual(held, mine.wait.share.bytes);
+    const other = pipelineOf(a, "pns");
+    try std.testing.expect(other.wait == .none);
+    try std.testing.expectEqual(@as(u64, 2), other.records_in);
 }
 
 test "Shard: pressure that arrived as a send-only shard's outbox emptied still expires, and its pipeline reads on" {
@@ -19666,7 +19897,7 @@ test "queues: a dequeue waiting on a queue is answered when a sink's enqueue par
     var eb: [256]u8 = undefined;
     var mb: [512]u8 = undefined;
     var w: schema.Writer = .{ .buf = &mb };
-    try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, "q"))), .entry_type = @backingInt(entry_mod.EntryType.queue_enqueue), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .payload = try oneSlotEnqueue(&eb, "q", "parked") });
+    try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, "q"))), .entry_type = @backingInt(entry_mod.EntryType.queue_enqueue), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = try oneSlotEnqueue(&eb, "q", "parked") });
     var ib: [1024]u8 = undefined;
     _ = try s.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } }));
     try std.testing.expect(s.applyCommitted());
@@ -26957,7 +27188,7 @@ fn sendFromApply(a: *Shard, slot: u16, etype: entry_mod.EntryType, payload: []co
     defer arena.deinit();
     var keys = contract_view.KeySet.init(arena.allocator());
     var view = contract_view.View.init(&p.store, arena.allocator(), &keys);
-    try view.send(slot, @backingInt(etype), payload);
+    try view.send(.user(.default), slot, @backingInt(etype), payload);
     try channels_mod.writeSends(&view, a.raft_node.last_applied);
     try view.commit();
 }
@@ -27338,7 +27569,7 @@ test "Shard: a channel message refused as its sender's bug is counted by sender 
     // From shard 0: a put for slot 0, which is shard 0's own, not b's.
     var mb: [256]u8 = undefined;
     var w: schema.Writer = .{ .buf = &mb };
-    try @import("../protocol/channel_entries.zig").Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.kv_put), .layout_epoch = 0, .flags = 0, .payload = "x" });
+    try @import("../protocol/channel_entries.zig").Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.kv_put), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = "x" });
     var ib: [512]u8 = undefined;
     const inbound = try @import("../protocol/channel_entries.zig").Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } });
     const e = entry_mod.buildEntry(.channel_inbound, 0, b.raft_node.current_term, b.raft_node.last_applied + 1, 1, inbound);
@@ -27364,7 +27595,7 @@ test "Shard: a sink's enqueue naming a namespace id none could have is refused a
     for ([_]u32{ ns_table.INVALID.int(), ns_table.CAPACITY }) |ns| {
         var eb: [256]u8 = undefined;
         const enq = try qe_caps.Enqueue.encodeInto(&eb, .{ .ns = ns, .queue = q.name, .priority = 0, .delay_ms = 0, .payload = "x", .max_messages = 8, .max_bytes = 1 << 20, .shard_held_bytes = 1 << 30 });
-        try ce.Message.encode(&w, .{ .slot = q.slot, .entry_type = @backingInt(entry_mod.EntryType.queue_enqueue), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .payload = enq });
+        try ce.Message.encode(&w, .{ .slot = q.slot, .entry_type = @backingInt(entry_mod.EntryType.queue_enqueue), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = enq });
     }
     var ib: [2048]u8 = undefined;
     const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
@@ -27399,7 +27630,7 @@ test "Shard: a sink's write its target refuses for good is counted by the shard 
     var pb: [2][128]u8 = undefined;
     for ([_]@import("../protocol/kv_ops.zig").Condition{ .always, .if_absent }, 0..) |cond, i| {
         const put = try kv_entries.Put.encodeInto(&pb[i], .{ .key = stored, .value = "v", .ttl_ms = null, .condition = cond, .cas_version = null });
-        try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, key))), .entry_type = @backingInt(entry_mod.EntryType.kv_put), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .payload = put });
+        try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, key))), .entry_type = @backingInt(entry_mod.EntryType.kv_put), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = put });
     }
     var ib: [2048]u8 = undefined;
     const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
@@ -27425,10 +27656,10 @@ test "Shard: a carried stream append its client path would refuse is refused as 
     var mb: [1024]u8 = undefined;
     var w: schema.Writer = .{ .buf = &mb };
     // Slot 1 is shard 1's: not a command, then a command naming no stream.
-    try ce.Message.encode(&w, .{ .slot = 1, .entry_type = @backingInt(entry_mod.EntryType.stream_append), .layout_epoch = 0, .flags = 0, .payload = "\x28\x00\x00\x00garbage" });
+    try ce.Message.encode(&w, .{ .slot = 1, .entry_type = @backingInt(entry_mod.EntryType.stream_append), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = "\x28\x00\x00\x00garbage" });
     var cb: [128]u8 = undefined;
     const unnamed = entry_mod.buildCommandEntry(.stream_append, 0, 1, 1, 0, .default, "", "\x00\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00x\x00\x00", &cb).?.payload;
-    try ce.Message.encode(&w, .{ .slot = 1, .entry_type = @backingInt(entry_mod.EntryType.stream_append), .layout_epoch = 0, .flags = 0, .payload = unnamed });
+    try ce.Message.encode(&w, .{ .slot = 1, .entry_type = @backingInt(entry_mod.EntryType.stream_append), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = unnamed });
     var ib: [2048]u8 = undefined;
     const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
     const highest = b.defaultPartition().highest_namespace;
@@ -27453,7 +27684,7 @@ fn sendFromApplyFlagged(a: *Shard, slot: u16, etype: entry_mod.EntryType, flags:
     defer arena.deinit();
     var keys = contract_view.KeySet.init(arena.allocator());
     var view = contract_view.View.init(&p.store, arena.allocator(), &keys);
-    try view.sendFlagged(slot, @backingInt(etype), flags, payload);
+    try view.sendFlagged(.user(.default), slot, @backingInt(etype), flags, payload);
     try channels_mod.writeSends(&view, a.raft_node.last_applied);
     try view.commit();
 }
@@ -27546,6 +27777,9 @@ test "Shard: a sink's enqueues to a full queue on another shard park, a KV write
     var bodies: [8][]const u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), queueBodies(b, q.name, &bodies));
     try std.testing.expectEqualStrings("first", bodies[0]);
+    // Each is a user's, from its queue's namespace: the origin check passes
+    // them, and the channel's own parking touches the shard's records.
+    for (b.channel.sender_bugs) |by_reason| for (by_reason) |n| try std.testing.expectEqual(@as(u64, 0), n);
     // Seen: counted for the shard, in /status and its metrics.
     var sm: @import("../metrics/registry.zig").ShardMetrics = .{ .shard_id = 1 };
     b.shard_metrics = &sm;
@@ -27871,3 +28105,7 @@ test "Shard: a hand-back refused for good is given up at once, not kept" {
     try std.testing.expectEqual(@as(usize, 0), t.shard.handbacks.items.len);
     try std.testing.expectEqual(@as(u64, 1), handBacks(&sm, .action, .dropped));
 }
+
+/// A test message's origin: the default namespace's user.
+const TEST_USER: u8 = @backingInt(@import("../contract/view.zig").Origin.Kind.user);
+const TEST_DEFAULT_NS: u32 = @import("../namespace/table.zig").DEFAULT.int();

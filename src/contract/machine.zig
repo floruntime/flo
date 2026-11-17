@@ -16,10 +16,10 @@ const EntryType = entry_mod.EntryType;
 const Entry = entry_mod.Entry;
 const ApplyError = persistence.ApplyError;
 
-pub const FamilyInfo = struct { id: u16, name: []const u8 };
+pub const FamilyInfo = struct { id: u16, name: []const u8, scope: view_mod.Scope };
 
 pub fn info(comptime F: type) FamilyInfo {
-    return .{ .id = F.ID, .name = F.NAME };
+    return .{ .id = F.ID, .name = F.NAME, .scope = F.SCOPE };
 }
 
 pub const Machine = struct {

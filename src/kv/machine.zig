@@ -174,9 +174,9 @@ comptime {
     }
 }
 
-pub const Values = view_mod.Family(10, "kv.value", Current);
-pub const History = view_mod.Family(11, "kv.history", Version);
-pub const NsCounts = view_mod.Family(12, "kv.ns_counts", Counts);
+pub const Values = view_mod.Family(10, "kv.value", .id, Current);
+pub const History = view_mod.Family(11, "kv.history", .id, Version);
+pub const NsCounts = view_mod.Family(12, "kv.ns_counts", .id, Counts);
 
 // ─── Keys ────────────────────────────────────────────────────────────────
 

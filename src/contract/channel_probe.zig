@@ -33,13 +33,17 @@ const Int = schema.Int;
 
 pub const NAME_LEN = 16;
 
+/// A probe is the system's: the test machine's record of what it took is
+/// the shard's (`Scope.shard`), which only the system may touch.
+pub const PROBE_ORIGIN: view_mod.Origin = .{ .kind = .system, .ns = .default };
+
 pub const Got = schema.Record(&.{
     .{ .name = "from", .T = Int(u16) },
     .{ .name = "seq", .T = Int(u64) },
     .{ .name = "hash", .T = Int(u64) },
 });
 
-pub const GotFam = view_mod.Family(58, "channel.probe_got", delivery.Stored(Got));
+pub const GotFam = view_mod.Family(58, "channel.probe_got", .shard, delivery.Stored(Got));
 
 /// A received probe's record key: its name, under no namespace.
 pub fn gotKey(buf: *[1 + NAME_LEN]u8, name: []const u8) []const u8 {
@@ -113,7 +117,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     if (view.message == null and std.mem.startsWith(u8, p.body, "drai")) if (view.place) |pl| if (@import("channels.zig").ownerOf(pl, p.slot) == pl.group) {
         return view.delete(GotFam, full_key);
     };
-    const m = view.message orelse return view.sendFlagged(p.slot, @backingInt(entry_mod.EntryType.channel_probe), entry_mod.Flags.SINK, e.payload);
+    const m = view.message orelse return view.sendFlagged(PROBE_ORIGIN, p.slot, @backingInt(entry_mod.EntryType.channel_probe), entry_mod.Flags.SINK, e.payload);
     if (std.mem.startsWith(u8, p.body, "fill")) {
         try view.put(GotFam, full_key, .{ .v = .{ .from = 0, .seq = 0, .hash = 0 } });
     } else if (std.mem.startsWith(u8, p.body, "drai")) {
@@ -125,7 +129,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     try view.put(GotFam, gotKey(&kb, p.body[0..NAME_LEN]), .{ .v = .{ .from = m.from, .seq = m.seq, .hash = hashOf(p.body) } });
     if (std.mem.startsWith(u8, p.body, "refuse")) out.refuse(.bad_request, .malformed, "refused, as asked");
     const again: usize = if (std.mem.startsWith(u8, p.body, "relay")) 1 else if (std.mem.startsWith(u8, p.body, "flood")) @import("channels.zig").MAX_SENDS + 1 else 0;
-    for (0..again) |_| try view.sendFlagged(p.slot, @backingInt(entry_mod.EntryType.channel_probe), entry_mod.Flags.SINK, e.payload);
+    for (0..again) |_| try view.sendFlagged(PROBE_ORIGIN, p.slot, @backingInt(entry_mod.EntryType.channel_probe), entry_mod.Flags.SINK, e.payload);
 }
 
 pub const machine: machine_mod.Machine = .{

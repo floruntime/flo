@@ -1630,6 +1630,10 @@ pub const ProcessingHandler = struct {
         /// outboxes together (`to` null), hold their cap: what it sent
         /// isn't taken as fast as it is made.
         outbox: struct { to: ?u16, bytes: u64, cap: u64, cause: ?channel_driver.Cause = null },
+        /// A sink's namespace holds its share of this shard's outbox to
+        /// `to`, or of all its outboxes together (`to` null)
+        /// (`raft_node_mod.shareHeld`): others may still send there.
+        share: struct { to: ?u16, namespace: []const u8, bytes: u64, cap: u64 },
         /// This shard's log has no room for another entry now.
         log,
         /// Its operators couldn't be built anew for this leader term, and
@@ -1642,7 +1646,16 @@ pub const ProcessingHandler = struct {
     /// every sink of the job, and every job sending to that shard, until it
     /// has room. Below its parked cap a full target parks what it can't
     /// take, so this waits only past it.
-    fn waitOf(self: *const ProcessingHandler, shard: *Shard, pipe: *const PipelineState) Wait {
+    /// What namespace `ns`'s messages hold of this shard's outboxes, over
+    /// every peer.
+    fn nsOutboxBytes(self: *const ProcessingHandler, read: view_mod.ReadView, ns: router.NamespaceId) u64 {
+        var n: u64 = 0;
+        var to: u16 = 0;
+        while (to < @max(self.peer_shard_count, 1)) : (to += 1) n += channels_mod.nsBytesOf(read, to, ns);
+        return n;
+    }
+
+    fn waitOf(self: *const ProcessingHandler, shard: *Shard, ns: NamespaceId, pipe: *const PipelineState) Wait {
         for (pipe.sinks) |snk| if (self.namespaceIdOf(snk.namespace) == .invalid) return .{ .namespace = snk.namespace };
         if (self.haltedSinkShard(shard, pipe)) |to| return .{ .halted = to };
         const read: view_mod.ReadView = .{ .store = &shard.defaultPartition().store };
@@ -1656,6 +1669,12 @@ pub const ProcessingHandler = struct {
         const now_ms = @import("stdx").time.monotonicMs();
         const total = shard.outboxBytes();
         if (total >= caps.shard) return .{ .outbox = .{ .to = null, .bytes = total, .cap = caps.shard } };
+        // One namespace's sinks may send to every shard, so its share of
+        // the shard's cap is over all its outboxes together.
+        for (pipe.sinks) |snk| {
+            const held = self.nsOutboxBytes(read, self.namespaceIdOf(snk.namespace));
+            if (raft_node_mod.shareHeld(held, total, caps.shard)) return .{ .share = .{ .to = null, .namespace = snk.namespace, .bytes = held, .cap = caps.shard } };
+        }
         var to: u16 = 0;
         const shards: u16 = @max(self.peer_shard_count, 1);
         while (to < shards) : (to += 1) {
@@ -1664,12 +1683,22 @@ pub const ProcessingHandler = struct {
             if (shard.channel.pressureOf(to, now_ms)) |stall|
                 return .{ .pressure = .{ .shard = to, .stall = stall, .target = self.waitingSink(read, pipe, to, meta.acked + 1) } };
             if (meta.bytes >= caps.channel) return .{ .outbox = .{ .to = to, .bytes = meta.bytes, .cap = caps.channel, .cause = shard.channel.causeOf(to, now_ms) } };
+            for (pipe.sinks) |snk| {
+                if (self.sinkShard(snk)) |s_to| if (s_to != to) continue;
+                const held = channels_mod.nsBytesOf(read, to, self.namespaceIdOf(snk.namespace));
+                if (raft_node_mod.shareHeld(held, meta.bytes, caps.channel)) return .{ .share = .{ .to = to, .namespace = snk.namespace, .bytes = held, .cap = caps.channel } };
+            }
         }
         const raft = shard.raft_node;
         if (raft.log.lastIndex() -| raft.last_applied >= raft_node_mod.MAX_OUTSTANDING) return .log;
         // Room for a whole batch within what the log takes of this shard's
         // own writes, so one isn't built only to be refused.
-        if (raft.pendingBytes() + limits.MAX_LOG_ENTRY_PAYLOAD > raft_node_mod.PROPOSAL_BYTES - raft_node_mod.PROPOSAL_RESERVE) return .log;
+        const room = raft_node_mod.PROPOSAL_BYTES - raft_node_mod.PROPOSAL_RESERVE;
+        if (raft.pendingBytes() + limits.MAX_LOG_ENTRY_PAYLOAD > room) return .log;
+        // And within its namespace's share of that room, which its batches
+        // are charged to as its clients' writes are.
+        const in_ns = raft.pendingBytesIn(ns.int());
+        if (in_ns > 0 and raft_node_mod.shareHeld(in_ns + limits.MAX_LOG_ENTRY_PAYLOAD, raft.pendingBytes() + limits.MAX_LOG_ENTRY_PAYLOAD, room)) return .log;
         return .none;
     }
 
@@ -1762,7 +1791,7 @@ pub const ProcessingHandler = struct {
                 pipe.ops_term = raft.current_term;
             }
             self.loadCursor(shard, job.ns_id, pipeline_key, pipe);
-            pipe.wait = self.waitOf(shard, pipe);
+            pipe.wait = self.waitOf(shard, job.ns_id, pipe);
             if (pipe.wait != .none) {
                 self.reported = true;
                 // Counted once a poll; a poll it was partway through goes
@@ -2115,7 +2144,7 @@ pub const ProcessingHandler = struct {
         if (read.a != page.from_a or read.b != page.from_b) return;
         // As a tick checks before it reads. Asked again next tick, from
         // the same cursor.
-        pipe.wait = self.waitOf(shard, pipe);
+        pipe.wait = self.waitOf(shard, job.ns_id, pipe);
         if (pipe.wait != .none) {
             self.reported = true;
             return;
@@ -2189,7 +2218,7 @@ pub const ProcessingHandler = struct {
                 b.over = true;
                 return;
             }
-            pe.SinkMessage.encode(&b.r, .{ .slot = built.slot, .entry_type = @backingInt(built.entry_type), .flags = Flags.SINK, .payload = built.payload }) catch {
+            pe.SinkMessage.encode(&b.r, .{ .slot = built.slot, .entry_type = @backingInt(built.entry_type), .flags = Flags.SINK, .ns = built.ns.int(), .payload = built.payload }) catch {
                 b.over = true;
                 return;
             };
@@ -2319,6 +2348,10 @@ pub const ProcessingHandler = struct {
             pipe.more = false;
             return self.rewindTo(pipe, pipe.from);
         };
+        // A job's batches take its namespace's share of the log's room, so
+        // one job can't take every namespace's clients' room.
+        shard.raft_node.charge_ns = ns.int();
+        defer shard.raft_node.charge_ns = 0;
         const r = shard.raft_node.propose(.processing_sink_batch, Flags.NONE, entry) catch |err| {
             if (!shard.quietHalted(err)) log.warn("job '{s}': sink batch not proposed: {s}; read again", .{ self.ticking_job, @errorName(err) });
             // Read again at the next poll, not every tick while the log
@@ -2429,6 +2462,15 @@ pub const ProcessingHandler = struct {
                 // Why it is full, as this leader sees the shard it goes to.
                 if (o.cause) |c| break :blk std.fmt.bufPrint(buf, "waiting: the outbox to shard {d} is full ({s} of {s}): it {s}", .{ to, held, cap, channel_driver.causeWords(c) }) catch "waiting: an outbox is full";
                 break :blk std.fmt.bufPrint(buf, "waiting: the outbox to shard {d} is full ({s} of {s})", .{ to, held, cap }) catch "waiting: an outbox is full";
+            },
+            .share => |r| blk: {
+                var hb: [16]u8 = undefined;
+                var cb: [16]u8 = undefined;
+                const ns = if (r.namespace.len == 0) "default" else r.namespace;
+                const held = channel_driver.bytesText(&hb, r.bytes);
+                const cap = channel_driver.bytesText(&cb, r.cap);
+                const to = r.to orelse break :blk std.fmt.bufPrint(buf, "waiting: namespace {s} holds its share of this shard's outboxes ({s} of {s})", .{ ns, held, cap }) catch "waiting: a namespace holds its share of the outboxes";
+                break :blk std.fmt.bufPrint(buf, "waiting: namespace {s} holds its share of the outbox to shard {d} ({s} of {s})", .{ ns, to, held, cap }) catch "waiting: a namespace holds its share of an outbox";
             },
             .log => "waiting for room in this shard's log",
             .operators => |why| std.fmt.bufPrint(buf, "waiting: its operators couldn't be rebuilt: {s}", .{why}) catch "waiting: its operators couldn't be rebuilt",
@@ -2973,6 +3015,8 @@ test "processing: what a pipeline waits for, in words" {
         .{ .w = .{ .outbox = .{ .to = 1, .bytes = 70 << 10, .cap = 64 << 10, .cause = .no_leader } }, .says = "waiting: the outbox to shard 1 is full (70 KiB of 64 KiB): it hasn't answered for 10 s" },
         .{ .w = .{ .outbox = .{ .to = 2, .bytes = 9 << 20, .cap = 8 << 20, .cause = .target_full } }, .says = "waiting: the outbox to shard 2 is full (9 MiB of 8 MiB): it has a full target" },
         .{ .w = .{ .outbox = .{ .to = null, .bytes = 1 << 30, .cap = 1 << 30 } }, .says = "waiting: this shard's outboxes are full (1024 MiB of 1024 MiB)" },
+        .{ .w = .{ .share = .{ .to = 3, .namespace = "orders", .bytes = 48 << 20, .cap = 64 << 20 } }, .says = "waiting: namespace orders holds its share of the outbox to shard 3 (48 MiB of 64 MiB)" },
+        .{ .w = .{ .share = .{ .to = null, .namespace = "orders", .bytes = 192 << 20, .cap = 256 << 20 } }, .says = "waiting: namespace orders holds its share of this shard's outboxes (192 MiB of 256 MiB)" },
         .{ .w = .log, .says = "waiting for room in this shard's log" },
         .{ .w = .{ .operators = "out of memory" }, .says = "waiting: its operators couldn't be rebuilt: out of memory" },
     };
@@ -3605,4 +3649,21 @@ test "processing: a TS source holds back its lateness window until its field has
     try std.testing.expectEqual(@as(u64, 97 * std.time.ns_per_s), ProcessingHandler.throughFor(F{ .newest_ns = 100 * std.time.ns_per_s }, w));
     // Under the window: from time 0, not wrapped.
     try std.testing.expectEqual(@as(u64, 0), ProcessingHandler.throughFor(F{ .newest_ns = std.time.ns_per_s }, w));
+}
+
+test "processing: a namespace may hold three quarters of an outbox, and past a quarter waits once the outbox is three quarters full" {
+    const cap: u64 = 64 << 20;
+    // Alone: up to three quarters.
+    try std.testing.expect(!raft_node_mod.shareHeld(40 << 20, 40 << 20, cap));
+    try std.testing.expect(raft_node_mod.shareHeld(48 << 20, 48 << 20, cap));
+    // Two at 30 MiB and 20 MiB, past three quarters together: the heavier,
+    // past its quarter, waits; the lighter, at its quarter, goes on.
+    try std.testing.expect(raft_node_mod.shareHeld(30 << 20, 50 << 20, cap));
+    try std.testing.expect(!raft_node_mod.shareHeld(16 << 20, 50 << 20, cap));
+    // Below three quarters together, both go on.
+    try std.testing.expect(!raft_node_mod.shareHeld(30 << 20, 40 << 20, cap));
+    // Holding nothing never waits, however small the cap or full the outbox.
+    try std.testing.expect(!raft_node_mod.shareHeld(0, 0, 1));
+    try std.testing.expect(!raft_node_mod.shareHeld(0, 1 << 20, 1));
+    try std.testing.expect(raft_node_mod.shareHeld(1, 1, 1));
 }

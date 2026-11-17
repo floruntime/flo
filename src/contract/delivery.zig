@@ -102,9 +102,10 @@ pub const Config = struct {
 
 pub fn Model(comptime cfg: Config) type {
     return struct {
-        pub const Ready = view_mod.Family(cfg.ready_id, cfg.ready_name, Empty);
-        pub const Deadlines = view_mod.Family(cfg.deadline_id, cfg.deadline_name, Stored(Deadline));
-        pub const Requests = view_mod.Family(cfg.request_id, cfg.request_name, Stored(Request));
+        pub const Ready = view_mod.Family(cfg.ready_id, cfg.ready_name, .id, Empty);
+        // Expiry first, then the namespace's id (`deadlineKey`).
+        pub const Deadlines = view_mod.Family(cfg.deadline_id, cfg.deadline_name, .{ .naming = 8 }, Stored(Deadline));
+        pub const Requests = view_mod.Family(cfg.request_id, cfg.request_name, .id, Stored(Request));
 
         pub const Ns = NamespaceId;
         /// A ready key's ordering prefix: an item's order field, or nothing.

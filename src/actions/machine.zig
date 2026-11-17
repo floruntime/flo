@@ -122,8 +122,8 @@ const M = delivery.Model(.{
     .noun = "run",
 });
 
-pub const Defs = view_mod.Family(20, "action.def", Stored(Def));
-pub const Runs = view_mod.Family(21, "action.run", Stored(Run));
+pub const Defs = view_mod.Family(20, "action.def", .id, Stored(Def));
+pub const Runs = view_mod.Family(21, "action.run", .id, Stored(Run));
 pub const Ready = M.Ready;
 pub const Deadlines = M.Deadlines;
 pub const Requests = M.Requests;

@@ -27,7 +27,7 @@ const Bytes = struct {
         return .{ .b = bytes };
     }
 };
-const Values = contract.view.Family(1, "bench.values", Bytes);
+const Values = contract.view.Family(1, "bench.values", .shard, Bytes);
 
 fn split(e: *const entry_mod.Entry) struct { k: []const u8, v: []const u8 } {
     const at = std.mem.indexOfScalar(u8, e.payload, 0).?;

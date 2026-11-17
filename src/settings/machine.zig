@@ -42,8 +42,8 @@ pub const NodeMem = Record(&.{
     .{ .name = "reserve", .T = Int(u64) },
 });
 
-pub const PolicyFam = view_mod.Family(50, "settings.policy", Stored(Policy));
-pub const NodeFam = view_mod.Family(51, "settings.node", Stored(NodeMem));
+pub const PolicyFam = view_mod.Family(50, "settings.policy", .shard, Stored(Policy));
+pub const NodeFam = view_mod.Family(51, "settings.node", .shard, Stored(NodeMem));
 
 /// The single key the policy record lives under.
 pub const POLICY_KEY = "share";

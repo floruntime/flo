@@ -40,7 +40,7 @@ pub fn idKey(buf: []u8, ns: NamespaceId, k: []const u8) error{NoSpaceLeft}![]u8 
 }
 
 /// A key within its family.
-const FamKey = struct {
+pub const FamKey = struct {
     fam: u16,
     key: []const u8,
 
@@ -150,15 +150,36 @@ pub const KeySet = struct {
     }
 };
 
-/// A family's declaration: its stable id, its name, and its value type,
-/// whose `encode` is the one serializer for that family (staged writes,
-/// state and snapshots alike) and whose `decode` reads it back. A value
-/// may point into the bytes it was decoded from.
-pub fn Family(comptime id: u16, comptime name: []const u8, comptime V: type) type {
+/// Whose a family's keys are, which a message from another group is held
+/// to: a message may touch its own namespace's keys, totals over all of
+/// them, and, the system's alone, the shard's own state.
+pub const Scope = union(enum) {
+    /// Keys lead with their namespace's id (`idKey`).
+    id,
+    /// Keys in no namespace (`key` with "") that name their namespace's id
+    /// at this offset in the key after it: 8 for a deadline index, its
+    /// expiry first so a scan runs across tenants in time order; 0 for a
+    /// stream's group record.
+    naming: u8,
+    /// Totals over every namespace on the shard (queue.held): any
+    /// namespace's message may change one, since the apply checks the
+    /// total itself.
+    aggregate,
+    /// The shard's own state (settings, channels): no user's message may
+    /// touch it.
+    shard,
+};
+
+/// A family's declaration: its stable id, its name, whose its keys are,
+/// and its value type, whose `encode` is the one serializer for that family
+/// (staged writes, state and snapshots alike) and whose `decode` reads it
+/// back. A value may point into the bytes it was decoded from.
+pub fn Family(comptime id: u16, comptime name: []const u8, comptime scope: Scope, comptime V: type) type {
     comptime std.debug.assert(id < store_mod.MAX_FAMILIES);
     return struct {
         pub const ID = id;
         pub const NAME = name;
+        pub const SCOPE = scope;
         pub const Value = V;
     };
 }
@@ -189,7 +210,22 @@ const Op = struct {
 /// that reads one never gets it from another group by accident.
 pub const MESSAGE_FLAGS: u16 = @import("../storage/ual/entry.zig").Flags.SINK;
 
-pub const Send = struct { slot: u16, entry_type: u8, flags: u16 = 0, payload: []const u8 };
+pub const Send = struct { origin: Origin, slot: u16, entry_type: u8, flags: u16 = 0, payload: []const u8 };
+
+/// Who a message is sent for, which its receiver holds it to: the keys it
+/// may touch are its namespace's. A job's sink sends as its namespace's
+/// user. The system kind may also touch the shard's own state, and alone
+/// may send for a reserved namespace.
+pub const Origin = struct {
+    kind: Kind,
+    ns: NamespaceId,
+
+    pub const Kind = enum(u8) { user = 1, system = 2 };
+
+    pub fn user(ns: NamespaceId) Origin {
+        return .{ .kind = .user, .ns = ns };
+    }
+};
 
 /// This group among the groups on the node: a slot's owner is the group
 /// `slot % count`. Fixed for a data directory, so every replica derives
@@ -246,22 +282,24 @@ pub const View = struct {
         return self.streams_read orelse error.Halt;
     }
 
-    /// Sends `payload`, an entry of type `etype`, to the group that owns
-    /// `slot`, which applies it through that type's machine. It leaves with
-    /// this entry's writes, or not at all.
-    pub fn send(self: *View, slot: u16, etype: u8, payload: []const u8) ApplyError!void {
-        return self.sendFlagged(slot, etype, 0, payload);
+    /// Sends `payload`, an entry of type `etype`, for `origin`, to the group
+    /// that owns `slot`, which applies it through that type's machine. It
+    /// leaves with this entry's writes, or not at all.
+    pub fn send(self: *View, origin: Origin, slot: u16, etype: u8, payload: []const u8) ApplyError!void {
+        return self.sendFlagged(origin, slot, etype, 0, payload);
     }
 
     /// `send`, with the entry flags the message applies with at its
     /// receiver (a sink's write is `Flags.SINK`): only `MESSAGE_FLAGS`.
-    pub fn sendFlagged(self: *View, slot: u16, etype: u8, flags: u16, payload: []const u8) ApplyError!void {
+    pub fn sendFlagged(self: *View, origin: Origin, slot: u16, etype: u8, flags: u16, payload: []const u8) ApplyError!void {
         // A send from an apply that isn't wired for one is a Flo bug, and so
         // is one with a flag no message may carry.
         if (self.place == null) return error.Halt;
         std.debug.assert(flags & ~MESSAGE_FLAGS == 0);
         if (flags & ~MESSAGE_FLAGS != 0) return error.Halt;
-        try self.sends.append(self.arena, .{ .slot = slot, .entry_type = etype, .flags = flags, .payload = try self.arena.dupe(u8, payload) });
+        // A send for no namespace is a Flo bug in the sender.
+        if (origin.ns == .invalid) return error.Halt;
+        try self.sends.append(self.arena, .{ .origin = origin, .slot = slot, .entry_type = etype, .flags = flags, .payload = try self.arena.dupe(u8, payload) });
     }
 
     /// A point `rollback` returns the staged writes and sends to.

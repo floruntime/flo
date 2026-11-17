@@ -14,10 +14,16 @@ const targets = [_]machine.Machine{
     @import("../ts/machine.zig").machine,
 };
 
+/// The namespace a command payload names (a stream's append).
+fn commandNamespace(payload: []const u8) ?u32 {
+    const cmd = @import("../storage/ual/entry.zig").CommandPayload.deserialize(payload) orelse return null;
+    return cmd.namespace_id.int();
+}
+
 /// A stream append is the one message type applied outside a view: the
 /// shard runs its applier once the inbound commits.
 pub const Channels = @import("channels.zig").ChannelsWith(&targets, &.{
-    .{ .entry_type = .stream_append, .refusal = @import("../projection/stream.zig").appendRefusal },
+    .{ .entry_type = .stream_append, .refusal = @import("../projection/stream.zig").appendRefusal, .namespace = commandNamespace },
 });
 
 pub const list = targets ++ [_]machine.Machine{ Channels.machine, @import("../processing/sinks_machine.zig").machine };

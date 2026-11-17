@@ -110,10 +110,10 @@ pub const Held = Record(&.{
     .{ .name = "bytes", .T = Int(u64) },
 });
 
-pub const Metas = view_mod.Family(30, "queue.meta", Stored(Meta));
-pub const Msgs = view_mod.Family(31, "queue.msg", Stored(Msg));
-pub const Dead = view_mod.Family(32, "queue.dead", Empty);
-pub const Helds = view_mod.Family(36, "queue.held", Stored(Held));
+pub const Metas = view_mod.Family(30, "queue.meta", .id, Stored(Meta));
+pub const Msgs = view_mod.Family(31, "queue.msg", .id, Stored(Msg));
+pub const Dead = view_mod.Family(32, "queue.dead", .id, Empty);
+pub const Helds = view_mod.Family(36, "queue.held", .aggregate, Stored(Held));
 /// `queue.held`'s one key, in no namespace.
 pub const HELD_KEY = "\x00held";
 pub const Ready = M.Ready;

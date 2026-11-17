@@ -24,6 +24,7 @@ const std = @import("std");
 const schema = @import("../protocol/schema.zig");
 const ce = @import("../protocol/channel_entries.zig");
 const channels = @import("channels.zig");
+const store_mod = @import("store.zig");
 const view_mod = @import("view.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 
@@ -292,7 +293,7 @@ pub const Driver = struct {
     /// Messages each group sent this one that were refused as its own bug,
     /// by reason (`store.SenderBug`). Counted where they apply, on every
     /// replica, and kept across terms, unlike `peers`.
-    sender_bugs: [][2]u64,
+    sender_bugs: [][store_mod.SENDER_BUGS]u64,
     /// A sink's messages each group sent this one that their target refused
     /// for good, by reason: the sink's records lost to that target. Counted
     /// where they apply, on every replica, and kept across terms.
@@ -317,9 +318,9 @@ pub const Driver = struct {
         const peers = try allocator.alloc(Peer, count);
         errdefer allocator.free(peers);
         @memset(peers, .{});
-        const bugs = try allocator.alloc([2]u64, count);
+        const bugs = try allocator.alloc([store_mod.SENDER_BUGS]u64, count);
         errdefer allocator.free(bugs);
-        @memset(bugs, .{ 0, 0 });
+        @memset(bugs, @splat(0));
         const refusals = try allocator.alloc(SinkRefusals, count);
         @memset(refusals, .initFill(0));
         return .{ .allocator = allocator, .group = group, .count = count, .peers = peers, .sender_bugs = bugs, .sink_refusals = refusals };
@@ -560,7 +561,7 @@ pub const Driver = struct {
             const o = (read.get(channels.OutFam, channels.outKey(&k, b, seq)) catch null) orelse break;
             if (o.v.sent_at > ready) break;
             if (n > 0 and bytes + o.v.payload.len > MAX_BATCH_BYTES) break;
-            ce.Message.encode(&list, .{ .slot = o.v.slot, .entry_type = o.v.entry_type, .layout_epoch = o.v.layout_epoch, .flags = o.v.flags, .payload = o.v.payload }) catch break;
+            ce.Message.encode(&list, .{ .slot = o.v.slot, .entry_type = o.v.entry_type, .layout_epoch = o.v.layout_epoch, .flags = o.v.flags, .origin_kind = o.v.origin_kind, .origin_ns = o.v.origin_ns, .payload = o.v.payload }) catch break;
             bytes += o.v.payload.len;
             n += 1;
         }

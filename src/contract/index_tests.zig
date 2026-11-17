@@ -20,8 +20,8 @@ const Count = struct {
         return .{ .n = std.mem.readInt(u64, bytes[0..8], .little) };
     }
 };
-const F1 = view_mod.Family(1, "p.one", Count);
-const F2 = view_mod.Family(2, "p.two", Count);
+const F1 = view_mod.Family(1, "p.one", .shard, Count);
+const F2 = view_mod.Family(2, "p.two", .shard, Count);
 const NSS = [_][]const u8{ "t", "ta", "u" };
 
 const U = struct { fam: u16, ns: []const u8, name: []const u8, full: []const u8 };

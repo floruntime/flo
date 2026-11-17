@@ -6,6 +6,7 @@
 //! Each shard writes only its own slot; HTTP threads read them all.
 
 const std = @import("std");
+const contract_store = @import("../contract/store.zig");
 const Atomic = std.atomic.Value;
 const Role = @import("../raft/node.zig").Role;
 const silent_loss = @import("silent_loss.zig");
@@ -350,9 +351,13 @@ pub const NodeHealth = struct {
             // Shown once another shard has sent this one a message it built
             // wrong: a bug in this build, counted by reason.
             if (sm) |m| {
-                const wrong_slot = m.channel_sender_bugs[0].load(.monotonic);
-                const bad_payload = m.channel_sender_bugs[1].load(.monotonic);
-                if (wrong_slot + bad_payload > 0) try w.print(",\"channel_sender_bugs\":{{\"wrong_slot\":{d},\"bad_payload\":{d}}}", .{ wrong_slot, bad_payload });
+                var any: u64 = 0;
+                for (&m.channel_sender_bugs) |*n| any += n.load(.monotonic);
+                if (any > 0) {
+                    try w.writeAll(",\"channel_sender_bugs\":{");
+                    for (std.enums.values(contract_store.SenderBug), &m.channel_sender_bugs, 0..) |bug, *n, bi| try w.print("{s}\"{s}\":{d}", .{ if (bi == 0) "" else ",", @tagName(bug), n.load(.monotonic) });
+                    try w.writeAll("}");
+                }
             }
             // Shown once a sink's write sent here was refused for good by
             // its target, by reason: records lost to that sink.

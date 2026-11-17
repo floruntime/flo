@@ -142,10 +142,10 @@ const M = delivery.Model(.{
     .noun = "record",
 });
 
-pub const Metas = view_mod.Family(40, "group.meta", Stored(Meta));
-pub const Items = view_mod.Family(41, "group.item", Stored(Item));
-pub const Dead = view_mod.Family(42, "group.dead", Empty);
-pub const Streams_ = view_mod.Family(46, "group.stream", Stored(StreamRec));
+pub const Metas = view_mod.Family(40, "group.meta", .id, Stored(Meta));
+pub const Items = view_mod.Family(41, "group.item", .id, Stored(Item));
+pub const Dead = view_mod.Family(42, "group.dead", .id, Empty);
+pub const Streams_ = view_mod.Family(46, "group.stream", .{ .naming = 0 }, Stored(StreamRec));
 pub const Ready = M.Ready;
 pub const Deadlines = M.Deadlines;
 
