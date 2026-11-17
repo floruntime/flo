@@ -25,6 +25,8 @@ means the check stopped catching its bug.
 | `queues.json` | `queue_cap_unchecked` | `queue_rule` | `an enqueue past its caps applied` |
 | `queues.json` | `queue_cap_tightened` | `queue_rule` | `an enqueue within its caps was refused` |
 | `queues.json` | `queue_settle_keeps_bytes` | `queue_rule` | `a queue's held bytes aren't what its messages hold` |
+| `queues.json` | `queue_requeue_keeps_failures` | `queue_rule` | `a requeued message's failures weren't reset` |
+| `queues.json` | `queue_drop_keeps_bytes` | `queue_rule` | `a queue's held bytes aren't what its messages hold` |
 | `consumer-groups.json` | `group_deliver_cursor_first` | `group_rule` | `a deliver leased` |
 | `consumer-groups.json` | `group_abandon_counts_failure` | `group_rule` | `a group's counters are not the ledger's` |
 | `consumer-groups.json` | `group_expire_ignores_deadline` | `group_rule` | `an expire ended another number of leases than the ledger's` |
@@ -76,6 +78,9 @@ out here.
 | Every ready, leased and dead message has its key, no ready or dead key is left over, and a queue's counts are what it holds | machine tests above, each checking its queue's counts |
 | An extend moves a lease only with half of it or less left, to a full lease from its stamp, never past the hold ceiling | machine test "an extend moves a lease out once half of it is gone, and the old key goes"; the rule restates the delivery model's own (`contract/delivery.zig` `extend`), so it guards the queue machine calling it, not the formula |
 | A purge leaves its queue empty | machine test "the same name in two namespaces is two queues, and a purge empties one" |
+| A requeue readies each dead message it names at once, its failures reset and its deliveries and error kept | `queue_requeue_keeps_failures`; machine test "a requeue makes a dead message ready at once with its failures reset; a drop removes one and gives back what it held" |
+| A drop gives back the bytes of the messages it removes | `queue_drop_keeps_bytes` |
+| A requeue or drop leaves every message it doesn't take as it was | machine test above (a message not dead, or gone, is answered and left) |
 | An enqueue is refused exactly when its queue's messages or held bytes, or its shard's, would pass the caps it carries; one that applies leaves them within those caps | `queue_cap_unchecked` (applies past them), `queue_cap_tightened` (refused within them) |
 | A queue's held bytes are what its messages hold (payload, error text and the per-message overhead), and the shard's are every queue's | `queue_settle_keeps_bytes`; machine tests "the shard's held bytes count every queue, and a settle or purge gives them back", "a message's error text is held, replaced as it fails again, and given back with it" |
 

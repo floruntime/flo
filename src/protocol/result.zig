@@ -140,13 +140,6 @@ pub const CommandResult = union(enum) {
         data: []const u8,
     },
 
-    /// DLQ list response (pre-serialized)
-    /// Wire format: [count:u32] ([seq:u64][payload_len:u32][payload][enqueued_at:i64][delivery_count:u32][priority:u8])* [total_count:u64]
-    queue_dlq_messages: struct {
-        /// Pre-serialized wire data (includes total_count at end)
-        data: []const u8,
-    },
-
     /// Queue purge response — number of messages removed.
     queue_purged: struct {
         count: u32,

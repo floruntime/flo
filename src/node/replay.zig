@@ -182,3 +182,57 @@ pub fn replayOneEntry(ctx: ReplayCtx, entry: *const entry_mod.Entry, out: *Repla
     out.last_stamp = @max(out.last_stamp, entry.header.timestamp_ns);
     out.applied_through = entry.header.index;
 }
+
+test "replay: a boot replay halts at an entry stamped no later than the one before it" {
+    const allocator = std.testing.allocator;
+    var raft_log = try RaftLog.init(allocator, 4096);
+    defer raft_log.deinit();
+    var skips: repair.Skips = .{};
+    defer skips.deinit(allocator);
+
+    // An applier that takes every entry, so only the stamp halt can stop replay.
+    const TakeAll = struct {
+        fn apply(_: *anyopaque, _: *const entry_mod.Entry) Verdict {
+            return .applied;
+        }
+        fn passOver(_: *anyopaque, _: *const entry_mod.Entry) ?silent_loss.Damage {
+            return null;
+        }
+    };
+    var unused: u8 = 0;
+    const ctx: ReplayCtx = .{
+        .raft_log = &raft_log,
+        .watermark = 100,
+        .skips = &skips,
+        .shard_id = 0,
+        .apply = .{ .ctx = &unused, .apply = TakeAll.apply, .pass_over = TakeAll.passOver },
+    };
+    var out: ReplayOutcome = .{};
+
+    const stamp = struct {
+        fn at(index: u64, ts: u64) entry_mod.Entry {
+            var e = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, index, ts, "");
+            e.header.crc32c = e.computeCrc();
+            return e;
+        }
+    }.at;
+
+    // Rising stamps apply cleanly.
+    var e1 = stamp(1, 100);
+    replayOneEntry(ctx, &e1, &out);
+    var e2 = stamp(2, 200);
+    replayOneEntry(ctx, &e2, &out);
+    try std.testing.expect(out.halt == null);
+    try std.testing.expectEqual(@as(u64, 2), out.applied_through);
+    try std.testing.expectEqual(@as(u64, 200), out.last_stamp);
+
+    // An entry stamped at or before the last applied one halts replay there,
+    // and nothing from it on applies. The durable log is monotonic by design
+    // (a cut is made durable before any entry above it is), so this guards a
+    // Flo bug, not a crash this reaches by itself.
+    var e3 = stamp(3, 200);
+    replayOneEntry(ctx, &e3, &out);
+    try std.testing.expect(out.halt != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.halt.?.reason(), "is not after the last applied entry") != null);
+    try std.testing.expectEqual(@as(u64, 2), out.applied_through);
+}

@@ -268,6 +268,11 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             try queueKeys(out, .of(p.ns), hashOf(p.queue));
             try out.add(Helds.ID, "", HELD_KEY[1..]);
         },
+        .queue_requeue, .queue_drop => {
+            const p = qe.DeadItems.decodeAll(e.payload, &diag) catch return;
+            try queueKeys(out, .of(p.ns), hashOf(p.queue));
+            try out.add(Helds.ID, "", HELD_KEY[1..]);
+        },
         else => {},
     }
 }
@@ -473,7 +478,68 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             try view.put(Metas, mk, meta);
             out.putInt(u64, removed);
         },
+        .queue_requeue, .queue_drop => try deadApply(view, e, out, typeOf(e) == .queue_requeue),
         else => return error.Halt,
+    }
+}
+
+/// A requeue or a drop: each named message that is dead is ready again at
+/// once (failures reset, deliveries and last error kept) or removed. A
+/// missing queue refuses the whole entry; a message not dead, or gone, is
+/// answered with why. Answers how many it applied to (u32), then each one
+/// it didn't (seq u64, `Why` u8).
+fn deadApply(view: *View, e: *const Entry, out: *Result, requeue: bool) ApplyError!void {
+    var diag: schema.Diagnostic = .{};
+    const stamp = e.header.timestamp_ns;
+    const p = qe.DeadItems.decodeAll(e.payload, &diag) catch return error.Halt;
+    const ns: NamespaceId = .of(p.ns);
+    if (ns == .invalid) return error.Halt;
+    const hash = hashOf(p.queue);
+    const mk = try M.inNs(view, ns, &hash);
+    var meta = (try view.get(Metas, mk)) orelse return out.refuse(.not_found, .not_found, NO_QUEUE);
+    if (!std.mem.eql(u8, meta.v.name, p.queue)) return out.refuse(.not_found, .not_found, NO_QUEUE);
+    const m = &meta.v;
+    var applied: u32 = 0;
+    var refused: [qe.MAX_BATCH]struct { seq: u64, why: Why } = undefined;
+    var nr: usize = 0;
+    var it = p.items.iterator();
+    while (it.next() catch return error.Halt) |seq| {
+        const id = idOf(hash, seq);
+        const key = try M.inNs(view, ns, &id);
+        var msg = (try view.get(Msgs, key)) orelse {
+            refused[nr] = .{ .seq = seq, .why = .gone };
+            nr += 1;
+            continue;
+        };
+        if (msg.v.status != .dead) {
+            refused[nr] = .{ .seq = seq, .why = .not_dead };
+            nr += 1;
+            continue;
+        }
+        const dk = deadKey(hash, msg.v.dead_ns, seq);
+        try view.delete(Dead, try M.inNs(view, ns, &dk));
+        if (m.dead == 0) return error.Halt;
+        m.dead -= 1;
+        if (requeue) {
+            msg.v.failures = 0;
+            msg.v.dead_ns = 0;
+            try M.readyAgain(view, ns, &id, &msg.v, stamp);
+            m.ready += 1;
+            try view.put(Msgs, key, msg);
+        } else {
+            try view.delete(Msgs, key);
+            const size = heldBy(msg.v.payload.len, msg.v.@"error".len);
+            if (size > m.held_bytes) return error.Halt;
+            m.held_bytes -= size;
+            try unhold(view, size);
+        }
+        applied += 1;
+    }
+    if (applied > 0) try view.put(Metas, mk, meta);
+    out.putInt(u32, applied);
+    for (refused[0..nr]) |r| {
+        out.putInt(u64, r.seq);
+        out.putInt(u8, @backingInt(r.why));
     }
 }
 
@@ -634,7 +700,7 @@ fn expireOne(view: *View, item: qe.ExpireItem.Value, stamp: u64) ApplyError!bool
 
 pub const machine: machine_mod.Machine = .{
     .name = "queues",
-    .entry_types = &.{ .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge },
+    .entry_types = &.{ .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge, .queue_requeue, .queue_drop },
     .families = &.{ machine_mod.info(Metas), machine_mod.info(Msgs), machine_mod.info(Dead), machine_mod.info(Ready), machine_mod.info(Deadlines), machine_mod.info(Helds) },
     .keys = keys,
     .apply = apply,
@@ -994,6 +1060,68 @@ test "queue machine: a release to dead letters skips the attempts left" {
     _ = try deliver(&t, 1, 100, &got);
     _ = try release(&t, &.{a}, true, 200);
     try testing.expectEqual(Status.dead, t.msg(NS, "q", a).?.status);
+}
+
+/// A requeue or drop of `queue`'s `seqs` at `stamp`.
+fn deadOf(t: *TestQueues, comptime kind: EntryType, queue: []const u8, seqs: []const u64, stamp: u64) !Result {
+    var buf: [16 * 8]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &buf };
+    for (seqs) |s| try Int(u64).encode(&w, s);
+    return t.apply(kind, qe.DeadItems.Value{ .ns = NS.int(), .queue = queue, .items = .{ .bytes = buf[0..w.pos], .count = @intCast(seqs.len) } }, stamp);
+}
+
+test "queue machine: a requeue makes a dead message ready at once with its failures reset; a drop removes one and gives back what it held" {
+    var t = TestQueues.init(testing.allocator);
+    defer t.deinit();
+    const a = try enqueue(&t, "q", 3, "abcd", 10);
+    const b = try enqueue(&t, "q", 0, "abcd", 11);
+    const c = try enqueue(&t, "q", 0, "abcd", 12);
+    var got: [2]u64 = undefined;
+    try testing.expectEqual(@as(usize, 2), try deliver(&t, 2, 100, &got));
+    _ = try release(&t, &.{ b, c }, true, 110);
+    try testing.expectEqual(@as(usize, 1), try deliver(&t, 1, 120, &got));
+    _ = try release(&t, &.{a}, true, 130);
+    const held = shardHeldOf(&t);
+    try testing.expectEqual(@as(u64, 3), t.meta(NS, "q").?.dead);
+
+    const rq = Answer.of(try deadOf(&t, .queue_requeue, "q", &.{a}, 200), false);
+    try testing.expectEqual(@as(u32, 1), rq.applied);
+    try testing.expectEqual(@as(usize, 0), rq.n);
+    const m = t.msg(NS, "q", a).?;
+    try testing.expectEqual(Status.ready, m.status);
+    try testing.expectEqual(@as(u32, 0), m.failures);
+    try testing.expectEqual(@as(u32, 1), m.deliveries);
+    try testing.expectEqualStrings("boom", m.@"error");
+    try testing.expectEqual(@as(u64, 200), m.due_ns);
+    try testing.expectEqual(@as(usize, 2), t.count(Dead));
+    try testing.expectEqual(held, shardHeldOf(&t));
+    try testing.expectEqual(@as(usize, 1), try deliver(&t, 2, 200, &got));
+    try testing.expectEqual(a, got[0]);
+
+    const dr = Answer.of(try deadOf(&t, .queue_drop, "q", &.{ b, a, 99 }, 210), false);
+    try testing.expectEqual(@as(u32, 1), dr.applied);
+    try testing.expectEqual(@as(usize, 2), dr.n);
+    try testing.expectEqual(Why.not_dead, dr.refused[0].why);
+    try testing.expectEqual(a, dr.refused[0].seq);
+    try testing.expectEqual(Why.gone, dr.refused[1].why);
+    try testing.expect(t.msg(NS, "q", b) == null);
+    try testing.expectEqual(held - heldBy(4, 4), shardHeldOf(&t));
+    const meta = t.meta(NS, "q").?;
+    try testing.expectEqual(@as(u64, 1), meta.dead);
+    try testing.expectEqual(@as(u64, 1), meta.leased);
+    try testing.expectEqual(@as(u64, 0), meta.ready);
+    try testing.expectEqual(heldBy(4, 4) * 2, meta.held_bytes);
+    try testing.expectEqual(@as(usize, 1), t.count(Dead));
+
+    try testing.expectEqual(Why.not_dead, Answer.of(try deadOf(&t, .queue_requeue, "q", &.{a}, 220), false).refused[0].why);
+    try testing.expectEqual(Why.gone, Answer.of(try deadOf(&t, .queue_requeue, "q", &.{b}, 220), false).refused[0].why);
+}
+
+test "queue machine: a requeue or drop of a queue that doesn't exist is refused not found" {
+    var t = TestQueues.init(testing.allocator);
+    defer t.deinit();
+    try testing.expectEqual(proto_status.not_found, (try deadOf(&t, .queue_requeue, "nope", &.{1}, 10)).refused().?.status);
+    try testing.expectEqual(proto_status.not_found, (try deadOf(&t, .queue_drop, "nope", &.{1}, 10)).refused().?.status);
 }
 
 test "queue machine: a lease past its deadline ends at the duty's expire, and the message goes again" {

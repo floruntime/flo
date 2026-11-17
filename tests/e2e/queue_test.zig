@@ -299,8 +299,8 @@ test "e2e/queue: nack --dlq dead-letters its message at once" {
     var list = try ctx.cli.run(&.{ "queue", "dlq", "list", "dead-q" });
     defer list.deinit();
     try testing.expectEqual(@as(u8, 0), list.exit_code);
-    try testing.expect(list.stdoutContains("Dead-letter queue for: dead-q (1 messages)\n"));
-    try testing.expect(list.stdoutContains("poison"));
+    try testing.expect(list.stdoutContains("1\tdeliveries=1 failures=1 "));
+    try testing.expect(list.stdoutContains("\tpoison\tbad input\n"));
     var none = try ctx.cli.run(&.{ "queue", "dequeue", "dead-q" });
     defer none.deinit();
     try testing.expect(none.stdoutContains("(no messages)"));
@@ -327,16 +327,98 @@ test "e2e/queue: dequeue --ack takes its messages for good, printing payloads on
 // DLQ (Dead Letter Queue) Operations
 // =============================================================================
 
-test "e2e/queue: dlq list empty" {
+test "e2e/queue: a queue with no dead letters lists none, and one never written to is refused not found" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // List DLQ for a queue with no dead letters
+    try ctx.exec(&.{ "queue", "enqueue", "dlq-test", "fine" });
     var result = try ctx.cli.run(&.{ "queue", "dlq", "list", "dlq-test" });
     defer result.deinit();
-
     try testing.expectEqual(@as(u8, 0), result.exit_code);
-    try testing.expect(result.stdoutContains("Dead-letter queue for: dlq-test (0 messages)\n(empty)\n"));
+    try testing.expectEqualStrings("No dead letters\n", result.stdout);
+
+    for ([_][]const []const u8{
+        &.{ "queue", "dlq", "list", "nope" },
+        &.{ "queue", "dlq", "requeue", "nope", "--all" },
+        &.{ "queue", "dlq", "delete", "nope", "--ids", "1" },
+    }) |argv| {
+        var out = try ctx.cli.run(argv);
+        defer out.deinit();
+        try testing.expectEqual(@as(u8, 1), out.exit_code);
+        try testing.expect(out.stderrContains("no such queue"));
+    }
+}
+
+/// The text between `"cursor":"` and its closing quote in a JSON list.
+fn cursorOf(out: []const u8) ?[]const u8 {
+    const at = (std.mem.indexOf(u8, out, "\"cursor\":\"") orelse return null) + "\"cursor\":\"".len;
+    return out[at..][0 .. std.mem.indexOfScalar(u8, out[at..], '"') orelse return null];
+}
+
+test "e2e/queue: dead letters list a page at a time; a requeue readies one with its attempts reset, and a delete takes them for good" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Seqs 1, 2 and 3, each dead-lettered in turn.
+    for ([_][]const u8{ "a", "b", "c" }) |p| {
+        try ctx.exec(&.{ "queue", "enqueue", "dl-q", p });
+        const out = try ctx.execCapture(&.{ "queue", "dequeue", "dl-q" });
+        try ctx.exec(&.{ "queue", "nack", "dl-q", deliveryOf(out) orelse return error.NoDelivery, "--dlq", "--error", "boom" });
+    }
+
+    var all = try ctx.cli.run(&.{ "queue", "dlq", "list", "dl-q", "-o", "json" });
+    defer all.deinit();
+    try testing.expectEqual(@as(u8, 0), all.exit_code);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, all.stdout, "\"failures\":1"));
+    try testing.expect(all.stdoutContains("\"seq\":1,\"priority\":0,\"deliveries\":1"));
+    try testing.expect(all.stdoutContains("\"payload\":\"a\",\"error\":\"boom\""));
+    try testing.expect(all.stdoutContains("\"cursor\":null"));
+    // A page of two, then the rest after its cursor.
+    var first = try ctx.cli.run(&.{ "queue", "dlq", "list", "dl-q", "--limit", "2", "-o", "json" });
+    defer first.deinit();
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, first.stdout, "\"seq\":"));
+    var rest = try ctx.cli.run(&.{ "queue", "dlq", "list", "dl-q", "--after", cursorOf(first.stdout) orelse return error.NoCursor, "-o", "json" });
+    defer rest.deinit();
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, rest.stdout, "\"seq\":"));
+    try testing.expect(rest.stdoutContains("\"seq\":3,"));
+
+    var rq = try ctx.cli.run(&.{ "queue", "dlq", "requeue", "dl-q", "--ids", "1" });
+    defer rq.deinit();
+    try testing.expectEqual(@as(u8, 0), rq.exit_code);
+    try testing.expect(rq.stdoutContains("Requeued 1 message(s)"));
+    // Not dead any more: a requeue of it is refused, naming why.
+    var twice = try ctx.cli.run(&.{ "queue", "dlq", "requeue", "dl-q", "--ids", "1" });
+    defer twice.deinit();
+    try testing.expectEqual(@as(u8, 3), twice.exit_code);
+    try testing.expect(twice.stderrContains("  seq 1: not dead: only a dead letter is requeued or deleted\n"));
+    // Taken again, its second delivery; its attempts were reset, so it
+    // dies again with one failure, not two.
+    const again = try ctx.execCapture(&.{ "queue", "dequeue", "dl-q" });
+    try testing.expect(std.mem.indexOf(u8, again, " a") != null);
+    try testing.expectEqual(@as(u32, 2), try deliveriesOf(deliveryOf(again) orelse return error.NoDelivery));
+    try ctx.exec(&.{ "queue", "nack", "dl-q", deliveryOf(again).?, "--dlq" });
+    var shown = try ctx.cli.run(&.{ "queue", "dlq", "list", "dl-q", "-o", "json" });
+    defer shown.deinit();
+    try testing.expect(shown.stdoutContains("\"seq\":1,\"priority\":0,\"deliveries\":2,\"failures\":1"));
+
+    var dry = try ctx.cli.run(&.{ "queue", "dlq", "delete", "dl-q", "--all", "--dry-run" });
+    defer dry.deinit();
+    try testing.expectEqual(@as(u8, 0), dry.exit_code);
+    try testing.expect(dry.stdoutContains("Would delete 3 message(s)\n"));
+    var dry_one = try ctx.cli.run(&.{ "queue", "dlq", "delete", "dl-q", "--all", "--max", "1", "--dry-run" });
+    defer dry_one.deinit();
+    try testing.expect(dry_one.stdoutContains("Would delete 1 message(s), and more remain\n"));
+    var one = try ctx.cli.run(&.{ "queue", "dlq", "delete", "dl-q", "--all", "--max", "1" });
+    defer one.deinit();
+    try testing.expectEqual(@as(u8, 0), one.exit_code);
+    try testing.expect(one.stdoutContains("Deleted 1 message(s)\n"));
+    var del = try ctx.cli.run(&.{ "queue", "dlq", "delete", "dl-q", "--all" });
+    defer del.deinit();
+    try testing.expectEqual(@as(u8, 0), del.exit_code);
+    try testing.expect(del.stdoutContains("Deleted 2 message(s)"));
+    var empty = try ctx.cli.run(&.{ "queue", "dlq", "list", "dl-q" });
+    defer empty.deinit();
+    try testing.expectEqualStrings("No dead letters\n", empty.stdout);
 }
 
 // =============================================================================

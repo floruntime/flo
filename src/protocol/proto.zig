@@ -155,9 +155,8 @@ pub const OpCode = enum(u16) {
     queue_enqueue = 0x170,
     // 0x171, 0x172 and 0x174 were dequeue, complete and fail before they
     // moved onto the op table at 0x181-0x183.
-    queue_dlq_list = 0x176,
-    queue_dlq_delete = 0x177,
-    queue_dlq_requeue = 0x178,
+    // 0x176-0x178 were the dead-letter list, delete and requeue before they
+    // moved onto the op table at 0x185-0x187.
     queue_stats = 0x17B,
     // 0x17C was queue_peek before it moved onto the op table at 0x180.
     queue_purge = 0x17F,
@@ -167,6 +166,9 @@ pub const OpCode = enum(u16) {
     queue_complete = 0x182,
     queue_fail = 0x183,
     queue_touch = 0x184,
+    queue_dlq_list = 0x185,
+    queue_dlq_requeue = 0x186,
+    queue_dlq_delete = 0x187,
     queue_list = 0x198,
 
     // ── Time-Series (0x1A0 – 0x1BF) ─────────────────────────────────────────

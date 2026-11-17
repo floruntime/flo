@@ -8,12 +8,16 @@
 //!   flo queue ack <queue> <delivery>...
 //!   flo queue nack <queue> <delivery>... [--delay <ms>] [--dlq] [--error <text>]
 //!   flo queue touch <queue> <delivery>...
+//!   flo queue dlq list <queue> [--limit <n>] [--after <cursor>]
+//!   flo queue dlq requeue <queue> (--ids <seq,...> | --all [--max <n>])
+//!   flo queue dlq delete <queue> (--ids <seq,...> | --all [--max <n>]) [--dry-run]
 //!   flo queue purge <queue>             - Remove every message, dead letters too
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const gen = @import("../gen.zig");
 const queue_ops = @import("../../protocol/queue_ops.zig");
+const schema = @import("../../protocol/schema.zig");
 const commander = @import("../commander/mod.zig");
 const outcome = @import("../outcome.zig");
 const client_mod = @import("../client/mod.zig");
@@ -128,19 +132,32 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
                 .subcommand(
                     commander.newBuilder(allocator)
                         .name("list")
-                        .about("List a queue's dead letters, oldest first")
+                        .about("List a queue's dead letters, oldest dead first")
                         .arg("queue", "Queue name")
-                        .uintFlag("limit", 'l', 100, "Most to list (at most 100)")
-                        .uintFlag("after", 0, 0, "Start after this seq: the last one a page listed")
+                        .uintFlag("limit", 'l', 20, "Most to show (at most 100)")
+                        .stringFlag("after", 0, "", "Go on past this one: the cursor a list printed")
                         .action(wrapHandler(runDlqList)),
                 )
                 .subcommand(
+                    commander.newBuilder(allocator)
+                        .name("requeue")
+                        .about("Make dead letters ready again, their attempts reset")
+                        .arg("queue", "Queue name")
+                        .stringFlag("ids", 'i', "", "Comma-separated seqs")
+                        .boolFlag("all", 0, "Every dead letter, oldest first, a batch of up to 100 at a time")
+                        .uintFlag("max", 0, 0, "With --all, stop after this many (0 for none)")
+                        .action(wrapHandler(runDlqRequeue)),
+                )
+                .subcommand(
                 commander.newBuilder(allocator)
-                    .name("requeue")
-                    .about("Requeue DLQ messages")
+                    .name("delete")
+                    .about("Delete dead letters for good")
                     .arg("queue", "Queue name")
-                    .arg("seq", "Sequence number(s)")
-                    .action(wrapHandler(runDlqRequeue)),
+                    .stringFlag("ids", 'i', "", "Comma-separated seqs")
+                    .boolFlag("all", 0, "Every dead letter, oldest first, a batch of up to 100 at a time")
+                    .uintFlag("max", 0, 0, "With --all, stop after this many (0 for none)")
+                    .boolFlag("dry-run", 0, "Say what it would delete, and delete nothing")
+                    .action(wrapHandler(runDlqDelete)),
             ),
         )
         .subcommand(
@@ -364,52 +381,109 @@ fn runTouch(ctx: *commander.Context) commander.Error!void {
 }
 
 fn runDlqList(ctx: *commander.Context) commander.Error!void {
-    const queue = ctx.getPositional("queue").?; // validated by commander
-    const namespace = cli_config.getNamespace(ctx);
-    const endpoint = cli_config.getEndpoint(ctx);
-
-    var client = Client.init(ctx.allocator, endpoint);
+    const queue = ctx.getPositional("queue").?;
+    const limit = ctx.getUint("limit") orelse 20;
+    if (limit == 0 or limit > queue_ops.MAX_DLQ_PAGE) return outcome.usage(ctx, "--limit is 1 to {d}", .{queue_ops.MAX_DLQ_PAGE});
+    const after_str = ctx.getString("after") orelse "";
+    const after: ?queue_ops.DeadCursor.Value = if (after_str.len == 0) null else parseCursor(after_str) orelse
+        return outcome.usage(ctx, "--after '{s}' isn't a cursor: give dead_ns.seq, as a list printed it", .{after_str});
+    var client = Client.init(ctx.allocator, cli_config.getEndpoint(ctx));
     defer client.deinit();
-
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
+    var response = client_mod.queue.dlqList(&client, cli_config.getNamespace(ctx), queue, @intCast(limit), after) catch |err| return outcome.requestFailed(ctx, err);
+    defer response.deinit();
+    try outcome.check(ctx, response);
+    var diag: schema.Diagnostic = .{};
+    const a = queue_ops.op("queue.dlq_list").response.decodeAll(response.data, &diag) catch return outcome.malformed(ctx, "queue.dlq_list answer");
+    const json_output = output.getFormat(ctx) == .json;
+    if (json_output) ctx.print("{{\"dead\":[", .{});
+    var it = a.dead.iterator();
+    var i: usize = 0;
+    while (it.next() catch null) |d| : (i += 1) {
+        if (json_output) {
+            ctx.print("{s}{{\"seq\":{d},\"priority\":{d},\"deliveries\":{d},\"failures\":{d},\"enqueued_at_ms\":{d},\"dead_at_ms\":{d},\"size\":{d},\"payload\":{f},\"error\":{f}}}", .{ if (i == 0) "" else ",", d.seq, d.priority, d.deliveries, d.failures, d.enqueued_at_ms, d.dead_at_ms, d.size, output.jsonString(d.payload), output.jsonString(d.@"error") });
+        } else ctx.print("{d}\tdeliveries={d} failures={d} dead_at_ms={d}\t{s}{s}\t{s}\n", .{ d.seq, d.deliveries, d.failures, d.dead_at_ms, d.payload, if (d.size > d.payload.len) "…" else "", d.@"error" });
+    }
+    if (json_output) {
+        if (a.cursor) |c| ctx.print("],\"cursor\":\"{d}.{d}\"}}\n", .{ c.dead_ns, c.seq }) else ctx.print("],\"cursor\":null}}\n", .{});
+    } else if (a.cursor) |c| ctx.printErr("Note: more dead letters follow: --after {d}.{d}\n", .{ c.dead_ns, c.seq });
+    if (!json_output and a.dead.count == 0) ctx.print("No dead letters\n", .{});
+}
 
-    const limit: u32 = @intCast(@min(ctx.getUint("limit") orelse 100, 100));
-    const after: ?u64 = if (ctx.getUint("after")) |a| (if (a == 0) null else a) else null;
-    var result = client_mod.queue.dlqList(&client, namespace, queue, limit, after) catch |err| return outcome.requestFailed(ctx, err);
-    defer result.deinit();
-
-    try outcome.check(ctx, result);
-
-    const page = client_mod.queue.DlqPage.decode(result.data) orelse return outcome.malformed(ctx, "dead-letter list");
-    ctx.print("Dead-letter queue for: {s} ({d} messages)\n", .{ queue, page.total });
-    if (page.count == 0 and page.total == 0) ctx.print("(empty)\n", .{});
-    var it = page.iterator();
-    while (it.next()) |d| ctx.print("{d}  deliveries={d}  {s}{s}\n", .{ d.seq, d.deliveries, d.payload, if (d.size > d.payload.len) "…" else "" });
-    if (page.more) ctx.print("(more: --after {d})\n", .{page.last_seq});
+fn parseCursor(text: []const u8) ?queue_ops.DeadCursor.Value {
+    const dot = std.mem.indexOfScalar(u8, text, '.') orelse return null;
+    const dead_ns = std.fmt.parseInt(u64, text[0..dot], 10) catch return null;
+    const seq = std.fmt.parseInt(u64, text[dot + 1 ..], 10) catch return null;
+    return .{ .dead_ns = dead_ns, .seq = seq };
 }
 
 fn runDlqRequeue(ctx: *commander.Context) commander.Error!void {
-    const queue = ctx.getPositional("queue").?; // validated by commander
-    const seq_str = ctx.getPositional("seq").?; // validated by commander
+    return runDlq(ctx, .requeue);
+}
 
-    const seq = std.fmt.parseInt(u64, seq_str, 10) catch {
-        return outcome.usage(ctx, "Invalid sequence number", .{});
-    };
+fn runDlqDelete(ctx: *commander.Context) commander.Error!void {
+    return runDlq(ctx, .delete);
+}
 
-    const namespace = cli_config.getNamespace(ctx);
-    const endpoint = cli_config.getEndpoint(ctx);
-
-    var client = Client.init(ctx.allocator, endpoint);
+/// Each batch is said as it is answered: how many it applied to, and each
+/// message it refused, so a run cut short shows how far it got.
+fn runDlq(ctx: *commander.Context, comptime kind: enum { requeue, delete }) commander.Error!void {
+    const queue = ctx.getPositional("queue").?;
+    const all = ctx.getBool("all");
+    const max = ctx.getUint("max") orelse 0;
+    const dry_run = kind == .delete and ctx.getBool("dry-run");
+    const ids_str = ctx.getString("ids") orelse "";
+    if (all == (ids_str.len > 0)) return outcome.usage(ctx, "name the dead letters with --ids, or give --all", .{});
+    if (max > 0 and !all) return outcome.usage(ctx, "--max goes with --all", .{});
+    var buf: [queue_ops.MAX_BATCH * 9]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &buf };
+    var n: u32 = 0;
+    var iter = std.mem.splitScalar(u8, ids_str, ',');
+    while (iter.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " ");
+        if (trimmed.len == 0) continue;
+        const seq = std.fmt.parseInt(u64, trimmed, 10) catch return outcome.usage(ctx, "'{s}' isn't a seq: give one as a dlq list printed it", .{trimmed});
+        if (n == queue_ops.MAX_BATCH) return outcome.usage(ctx, "--ids names at most 100 messages", .{});
+        schema.Int(u64).encode(&w, seq) catch return outcome.usage(ctx, "--ids is too long", .{});
+        n += 1;
+    }
+    var client = Client.init(ctx.allocator, cli_config.getEndpoint(ctx));
     defer client.deinit();
-
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-
-    var result = client_mod.queue.dlqRequeue(&client, namespace, queue, &[_]u64{seq}) catch |err| return outcome.requestFailed(ctx, err);
-    defer result.deinit();
-
-    try outcome.check(ctx, result);
-
-    ctx.print("Requeued: seq={d}\n", .{seq});
+    const namespace = cli_config.getNamespace(ctx);
+    const verb = if (kind == .requeue) "Requeued" else if (dry_run) "Would delete" else "Deleted";
+    var total: u64 = 0;
+    var refused_total: u64 = 0;
+    var batch: u32 = 0;
+    while (true) : (batch += 1) {
+        const messages: ?client_mod.queue.Seqs.Value = if (all) null else .{ .bytes = buf[0..w.pos], .count = n };
+        // No batch takes more than --max leaves.
+        const limit: u32 = if (max > 0) @intCast(@min(queue_ops.MAX_BATCH, max - total)) else queue_ops.MAX_BATCH;
+        var response = switch (kind) {
+            .requeue => client.call(queue_ops.op("queue.dlq_requeue"), namespace, queue, .{ .messages = messages, .all = all, .limit = limit }),
+            .delete => client.call(queue_ops.op("queue.dlq_delete"), namespace, queue, .{ .messages = messages, .all = all, .limit = limit, .dry_run = dry_run }),
+        } catch |err| return outcome.requestFailed(ctx, err);
+        defer response.deinit();
+        try outcome.check(ctx, response);
+        var diag: schema.Diagnostic = .{};
+        const a = queue_ops.op("queue.dlq_requeue").response.decodeAll(response.data, &diag) catch return outcome.malformed(ctx, "dead-letter answer");
+        if (all) ctx.print("batch {d}: ", .{batch + 1});
+        // A dry run looks at one batch: past it, more may remain.
+        ctx.print("{s} {d} message(s){s}\n", .{ verb, a.applied, if (dry_run and a.more) ", and more remain" else "" });
+        var rit = a.refused.iterator();
+        while (rit.next() catch null) |r| ctx.printErr("  seq {d}: {s}\n", .{ r.seq, r.reason });
+        total += a.applied;
+        refused_total += a.refused.count;
+        // A dry run changes nothing, so its first batch is the whole answer;
+        // a batch that applied to none would come back the same.
+        if (!all or !a.more or dry_run or a.applied == 0) break;
+        if (max > 0 and total >= max) break;
+    }
+    if (all and batch > 0) ctx.print("{s} {d} message(s) in {d} batches\n", .{ verb, total, batch + 1 });
+    if (refused_total > 0) {
+        ctx.printErr("Error: {d} message(s) not {s}\n", .{ refused_total, if (kind == .requeue) "requeued" else "deleted" });
+        return error.Refused;
+    }
 }
 
 fn runPurge(ctx: *commander.Context) commander.Error!void {

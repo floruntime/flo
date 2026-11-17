@@ -10017,7 +10017,7 @@ fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8)
             const Wide = schema.Record(&.{ Fields[0], Fields[1], Fields[2], .{ .name = "block_ms", .T = schema.Defaulted(schema.Int(u64), 0) }, Fields[4] });
             return Wide.encodeInto(buf, .{ .consumer = "", .count = count, .lease_ms = null, .block_ms = ms, .ack = false }) catch unreachable;
         },
-        .queue_complete, .queue_fail, .queue_touch => return value,
+        .queue_complete, .queue_fail, .queue_touch, .queue_dlq_list, .queue_dlq_requeue, .queue_dlq_delete => return value,
         else => unreachable,
     }
 }
@@ -20251,6 +20251,122 @@ test "queues: a fail readies a message again after delay_ms with its error kept,
     try std.testing.expectEqual(@as(u32, 0), (try t.dequeue("c1", 1, null, false)).count);
 }
 
+test "queues: queue.dlq_list pages a queue's dead letters by limit and after; dlq_requeue and dlq_delete take messages or all up to a limit, never both, and a dry_run deletes nothing" {
+    var t: QueuesTest = undefined;
+    try t.init();
+    defer t.deinit();
+    for ([_][]const u8{ "a", "b", "c" }) |p| try t.enqueue(p);
+    const got = try t.dequeue("c1", 3, null, false);
+    try std.testing.expectEqual(@as(u32, 3), (try t.fail(got, 0, true)).applied);
+    var diag: schema.Diagnostic = .{};
+
+    const List = table_run.op("queue.dlq_list");
+    var lb: [List.request.max_size]u8 = undefined;
+    const first = try List.response.decodeAll((try t.a.ok(.queue_dlq_list, "q", try List.request.encodeInto(&lb, .{ .limit = 2, .after = null }))).data, &diag);
+    try std.testing.expectEqual(@as(u32, 2), first.dead.count);
+    var it = first.dead.iterator();
+    const d = (try it.next()).?;
+    try std.testing.expectEqual(got.seq[0], d.seq);
+    try std.testing.expectEqual(@as(u32, 1), d.failures);
+    try std.testing.expectEqualStrings("a", d.payload);
+    try std.testing.expectEqualStrings("boom", d.@"error");
+    const cursor = first.cursor.?;
+    const rest = try List.response.decodeAll((try t.a.ok(.queue_dlq_list, "q", try List.request.encodeInto(&lb, .{ .limit = 2, .after = cursor }))).data, &diag);
+    try std.testing.expectEqual(@as(u32, 1), rest.dead.count);
+    try std.testing.expect(rest.cursor == null);
+
+    const Requeue = table_run.op("queue.dlq_requeue");
+    var qb: [Requeue.request.max_size]u8 = undefined;
+    var sb: [64]u8 = undefined;
+    var sw: schema.Writer = .{ .buf = &sb };
+    try schema.Int(u64).encode(&sw, got.seq[0]);
+    const one_seq: schema.List(schema.Int(u64), 100).Value = .{ .bytes = sb[0..sw.pos], .count = 1 };
+    const rq = try Requeue.response.decodeAll((try t.a.ok(.queue_dlq_requeue, "q", try Requeue.request.encodeInto(&qb, .{ .messages = one_seq, .all = false, .limit = 100 }))).data, &diag);
+    try std.testing.expectEqual(@as(u32, 1), rq.applied);
+    try std.testing.expectEqual(queue_machine.Status.ready, t.msg(got.seq[0]).?.status);
+    try std.testing.expectEqual(@as(u32, 0), t.msg(got.seq[0]).?.failures);
+    // Requeued again: no longer dead.
+    const again = try Requeue.response.decodeAll((try t.a.ok(.queue_dlq_requeue, "q", try Requeue.request.encodeInto(&qb, .{ .messages = one_seq, .all = false, .limit = 100 }))).data, &diag);
+    try std.testing.expectEqual(@as(u32, 0), again.applied);
+    var rit = again.refused.iterator();
+    try std.testing.expectEqual(queue_machine.Why.not_dead, (try rit.next()).?.why);
+    // Messages and all at once: refused.
+    const both = try t.a.call(.queue_dlq_requeue, "q", try Requeue.request.encodeInto(&qb, .{ .messages = one_seq, .all = true, .limit = 100 }));
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), both.header.status);
+    // A queue never written to: not found.
+    const none = try t.a.call(.queue_dlq_list, "nope", try List.request.encodeInto(&lb, .{ .limit = 2, .after = null }));
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), none.header.status);
+
+    const Delete = table_run.op("queue.dlq_delete");
+    var db: [Delete.request.max_size]u8 = undefined;
+    const dry = try Delete.response.decodeAll((try t.a.ok(.queue_dlq_delete, "q", try Delete.request.encodeInto(&db, .{ .messages = null, .all = true, .limit = 100, .dry_run = true }))).data, &diag);
+    try std.testing.expectEqual(@as(u32, 2), dry.applied);
+    try std.testing.expect(t.msg(got.seq[1]) != null);
+    // A limit of one takes one, and says more remain.
+    const one = try Delete.response.decodeAll((try t.a.ok(.queue_dlq_delete, "q", try Delete.request.encodeInto(&db, .{ .messages = null, .all = true, .limit = 1, .dry_run = false }))).data, &diag);
+    try std.testing.expectEqual(@as(u32, 1), one.applied);
+    try std.testing.expect(one.more);
+    const del = try Delete.response.decodeAll((try t.a.ok(.queue_dlq_delete, "q", try Delete.request.encodeInto(&db, .{ .messages = null, .all = true, .limit = 100, .dry_run = false }))).data, &diag);
+    try std.testing.expectEqual(@as(u32, 1), del.applied);
+    try std.testing.expect(!del.more);
+    try std.testing.expect(t.msg(got.seq[1]) == null and t.msg(got.seq[2]) == null);
+    const empty = try List.response.decodeAll((try t.a.ok(.queue_dlq_list, "q", try List.request.encodeInto(&lb, .{ .limit = 20, .after = null }))).data, &diag);
+    try std.testing.expectEqual(@as(u32, 0), empty.dead.count);
+    // The requeued one is taken again.
+    try std.testing.expectEqual(got.seq[0], try QueuesTest.first(try t.dequeue("c1", 1, null, false)));
+}
+
+/// The seqs of one `queue.dlq_list` page of "q" past `after`, and its cursor.
+fn dlqPage(t: *QueuesTest, limit: u32, after: ?queue_ops.DeadCursor.Value, seqs: []u64) !struct { n: usize, cursor: ?queue_ops.DeadCursor.Value } {
+    const List = table_run.op("queue.dlq_list");
+    var lb: [List.request.max_size]u8 = undefined;
+    var diag: schema.Diagnostic = .{};
+    const page = try List.response.decodeAll((try t.a.ok(.queue_dlq_list, "q", try List.request.encodeInto(&lb, .{ .limit = limit, .after = after }))).data, &diag);
+    var it = page.dead.iterator();
+    var n: usize = 0;
+    while (try it.next()) |d| : (n += 1) seqs[n] = d.seq;
+    return .{ .n = n, .cursor = page.cursor };
+}
+
+test "queues: a dead-letter list's cursor holds its place when the message it names is requeued and dies again, or is deleted, between pages" {
+    var t: QueuesTest = undefined;
+    try t.init();
+    defer t.deinit();
+    // Seqs 1 to 4, dead in that order.
+    for ([_][]const u8{ "a", "b", "c", "d" }) |p| {
+        try t.enqueue(p);
+        try std.testing.expectEqual(@as(u32, 1), (try t.fail(try t.dequeue("c1", 1, null, false), 0, true)).applied);
+    }
+    const Requeue = table_run.op("queue.dlq_requeue");
+    const Delete = table_run.op("queue.dlq_delete");
+    var qb: [Requeue.request.max_size]u8 = undefined;
+    var sb: [16]u8 = undefined;
+    var seqs: [8]u64 = undefined;
+
+    // A page of one ends at seq 1, which is requeued and dies again: past
+    // the cursor come 2, 3, 4 and then 1 again, as a new death.
+    var page = try dlqPage(&t, 1, null, &seqs);
+    try std.testing.expectEqual(@as(u64, 1), seqs[0]);
+    var sw: schema.Writer = .{ .buf = &sb };
+    try schema.Int(u64).encode(&sw, 1);
+    _ = try t.a.ok(.queue_dlq_requeue, "q", try Requeue.request.encodeInto(&qb, .{ .messages = .{ .bytes = sb[0..sw.pos], .count = 1 }, .all = false, .limit = 100 }));
+    try std.testing.expectEqual(@as(u32, 1), (try t.fail(try t.dequeue("c1", 1, null, false), 0, true)).applied);
+    page = try dlqPage(&t, 10, page.cursor.?, &seqs);
+    try std.testing.expectEqualSlices(u64, &.{ 2, 3, 4, 1 }, seqs[0..page.n]);
+
+    // A page of one ends at seq 2, which is deleted: the next page goes on
+    // at 3, not back to the oldest.
+    page = try dlqPage(&t, 1, null, &seqs);
+    try std.testing.expectEqual(@as(u64, 2), seqs[0]);
+    sw = .{ .buf = &sb };
+    try schema.Int(u64).encode(&sw, 2);
+    var db: [Delete.request.max_size]u8 = undefined;
+    _ = try t.a.ok(.queue_dlq_delete, "q", try Delete.request.encodeInto(&db, .{ .messages = .{ .bytes = sb[0..sw.pos], .count = 1 }, .all = false, .limit = 100, .dry_run = false }));
+    page = try dlqPage(&t, 10, page.cursor.?, &seqs);
+    try std.testing.expectEqualSlices(u64, &.{ 3, 4, 1 }, seqs[0..page.n]);
+    try std.testing.expect(page.cursor == null);
+}
+
 test "actions: a fail with retry readies the run after delay_ms, one without retry fails it with its error, and an abandoned one counts no failure" {
     var t: ActionsTest = undefined;
     try t.init();
@@ -25689,8 +25805,8 @@ test "Shard: a read the leader answers, on a node that does not lead, waits for 
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     try std.testing.expectEqual(@as(usize, 0), conn.write_buf.readable());
     // So are the hand-coded reads of leader memory: a group's info and
-    // pending entries, and the dead letters only the leasing leader makes.
-    for ([_]proto.OpCode{ .stream_group_info, .stream_group_pending, .queue_dlq_list }, 0..) |op, i| {
+    // pending entries.
+    for ([_]proto.OpCode{ .stream_group_info, .stream_group_pending }, 0..) |op, i| {
         shard.runRequest(conn, .{ .header = proto.RequestHeader.init(op, 80 + i), .namespace = "default", .key = "q", .value = "" }, .client);
         try std.testing.expectEqual(@as(u32, @intCast(2 + i)), shard.forward_count);
     }
