@@ -134,6 +134,8 @@ const LItem = struct {
     expiry_ns: u64 = 0,
     ended: Ended = .none,
     started_ns: u64 = 0,
+    /// Its holder's last sign of life: deliver, steal or any applied touch.
+    touched_ns: u64 = 0,
     err_len: usize = 0,
     dead_ns: u64 = 0,
 };
@@ -571,13 +573,16 @@ pub const ConsumerGroups = struct {
                 const g = groupIndex(p.group) orelse return error.Halt;
                 if (!L.live(s, g)) return .{ .refused = .not_found };
                 const grp = &L.groups[s][g].?;
+                const floor = if (L.streams[s]) |st| st.floor else StreamID.MIN;
                 var taken: std.ArrayListUnmanaged(StreamID) = .empty;
                 var deliveries: std.ArrayListUnmanaged(u32) = .empty;
                 var refused: std.ArrayListUnmanaged(Refused) = .empty;
                 var it = p.items.iterator();
                 while (it.next() catch return error.Halt) |named| {
                     const rec: StreamID = .{ .timestamp_ms = named.ms, .sequence = named.seq };
-                    const v = grp.items.get(recKey(rec)) orelse {
+                    // A trimmed record is cleanup's, not a steal's.
+                    const found = if (rec.greaterThan(floor)) grp.items.get(recKey(rec)) else null;
+                    const v = found orelse {
                         try refused.append(a, .{ .record = rec, .why = .gone });
                         continue;
                     };
@@ -590,9 +595,8 @@ pub const ConsumerGroups = struct {
                         } });
                         continue;
                     }
-                    // Idle since the lease last moved: its deliver or its last extend.
-                    const moved_at = v.expiry_ns -| (v.lease_ms *| std.time.ns_per_ms);
-                    if (stamp -| moved_at < p.min_idle_ms *| std.time.ns_per_ms) {
+                    // Idle since its holder's last sign of life.
+                    if (stamp -| v.touched_ns < p.min_idle_ms *| std.time.ns_per_ms) {
                         try refused.append(a, .{ .record = rec, .why = .not_idle });
                         continue;
                     }
@@ -1021,6 +1025,7 @@ pub const ConsumerGroups = struct {
                     v.delivered_ns = stamp;
                     v.expiry_ns = afterMs(stamp, p.lease_ms);
                     v.ended = .none;
+                    v.touched_ns = stamp;
                     if (v.started_ns == 0) v.started_ns = stamp;
                 }
                 if (w.fresh > 0) grp.cursor = w.chosen[w.chosen.len - 1];
@@ -1059,6 +1064,9 @@ pub const ConsumerGroups = struct {
                             }
                         },
                         else => {
+                            // A touch is a sign of life, whether or not it
+                            // moves the lease.
+                            v.touched_ns = stamp;
                             if (v.expiry_ns -| stamp > (v.lease_ms *| std.time.ns_per_ms) / 2) continue;
                             const to = extendTo(stamp, v.lease_ms, v.delivered_ns);
                             if (to > v.expiry_ns) v.expiry_ns = to;
@@ -1091,6 +1099,7 @@ pub const ConsumerGroups = struct {
                     v.delivered_ns = stamp;
                     v.expiry_ns = afterMs(stamp, p.lease_ms);
                     v.ended = .none;
+                    v.touched_ns = stamp;
                 }
                 grp.delivered += w.taken.len;
             },
@@ -1304,7 +1313,7 @@ pub const ConsumerGroups = struct {
                     if (it.ended != v.ended or it.@"error".len != v.err_len) return "a record's ending is not the ledger's";
                     switch (v.status) {
                         .ready => if (it.due_ns != v.due_ns) return "a ready record is due at another time than the ledger's",
-                        .leased => if (!std.mem.eql(u8, it.holder, v.holder) or it.token.term != v.token.term or it.token.index != v.token.index or it.expiry_ns != v.expiry_ns or it.lease_ms != v.lease_ms or it.delivered_ns != v.delivered_ns)
+                        .leased => if (!std.mem.eql(u8, it.holder, v.holder) or it.token.term != v.token.term or it.token.index != v.token.index or it.expiry_ns != v.expiry_ns or it.lease_ms != v.lease_ms or it.delivered_ns != v.delivered_ns or it.touched_ns != v.touched_ns)
                             return "a leased record's delivery is not the ledger's",
                         .dead => if (it.dead_ns != v.dead_ns) return "a dead record died at another time than the ledger's",
                     }

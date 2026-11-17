@@ -28171,7 +28171,7 @@ test "Shard: stream.group.steal takes a record idle at least min_idle_ms for its
     try std.testing.expect(left > 9_000 and left <= 10_000);
 }
 
-test "Shard: stream.group.dlq_list pages a group's dead letters by limit and after; dlq_requeue and dlq_delete take records or all, and a dry_run deletes nothing" {
+test "Shard: stream.group.dlq_list pages a group's dead letters by limit and after; dlq_requeue and dlq_delete take records or all up to a limit, never both, and a dry_run deletes nothing" {
     var t: ClusterActionsTest = undefined;
     try t.init();
     defer t.deinit();
@@ -28198,16 +28198,25 @@ test "Shard: stream.group.dlq_list pages a group's dead letters by limit and aft
     var rr: [64]u8 = undefined;
     var rw: schema.Writer = .{ .buf = &rr };
     try stream_ops.RecordRef.encode(&rw, .{ .ms = 1, .seq = 0 });
-    const rq = try groupOpAnswer("stream.group.dlq_requeue", &t, .stream_group_dlq_requeue, 3, try Requeue.request.encodeInto(&qb, .{ .group = "g", .records = .{ .bytes = rr[0..rw.pos], .count = 1 }, .all = false }));
+    const rq = try groupOpAnswer("stream.group.dlq_requeue", &t, .stream_group_dlq_requeue, 3, try Requeue.request.encodeInto(&qb, .{ .group = "g", .records = .{ .bytes = rr[0..rw.pos], .count = 1 }, .all = false, .limit = 100 }));
     try std.testing.expectEqual(@as(u32, 1), rq.applied);
+    // Records and all at once: refused, neither dropped.
+    t.shard.runRequest(t.c.conn, .{ .header = proto.RequestHeader.init(.stream_group_dlq_requeue, 9), .namespace = "default", .key = "s", .value = try Requeue.request.encodeInto(&qb, .{ .group = "g", .records = .{ .bytes = rr[0..rw.pos], .count = 1 }, .all = true, .limit = 100 }) }, .client);
+    var both: [1]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.c.conn, t.c.pair[1], &t.buf, &both);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), both[0].header.status);
 
     const Delete = table_run.op("stream.group.dlq_delete");
     var db: [Delete.request.max_size]u8 = undefined;
-    const dry = try groupOpAnswer("stream.group.dlq_delete", &t, .stream_group_dlq_delete, 4, try Delete.request.encodeInto(&db, .{ .group = "g", .records = null, .all = true, .dry_run = true }));
+    const dry = try groupOpAnswer("stream.group.dlq_delete", &t, .stream_group_dlq_delete, 4, try Delete.request.encodeInto(&db, .{ .group = "g", .records = null, .all = true, .limit = 100, .dry_run = true }));
     try std.testing.expectEqual(@as(u32, 2), dry.applied);
-    const del = try groupOpAnswer("stream.group.dlq_delete", &t, .stream_group_dlq_delete, 5, try Delete.request.encodeInto(&db, .{ .group = "g", .records = null, .all = true, .dry_run = false }));
-    try std.testing.expectEqual(@as(u32, 2), del.applied);
+    // A limit of one takes one, and says more remain.
+    const one = try groupOpAnswer("stream.group.dlq_delete", &t, .stream_group_dlq_delete, 5, try Delete.request.encodeInto(&db, .{ .group = "g", .records = null, .all = true, .limit = 1, .dry_run = false }));
+    try std.testing.expectEqual(@as(u32, 1), one.applied);
+    try std.testing.expect(one.more);
+    const del = try groupOpAnswer("stream.group.dlq_delete", &t, .stream_group_dlq_delete, 6, try Delete.request.encodeInto(&db, .{ .group = "g", .records = null, .all = true, .limit = 100, .dry_run = false }));
+    try std.testing.expectEqual(@as(u32, 1), del.applied);
     try std.testing.expect(!del.more);
-    const empty = try groupOpAnswer("stream.group.dlq_list", &t, .stream_group_dlq_list, 6, try List.request.encodeInto(&lb, .{ .group = "g", .limit = 20, .after = null }));
+    const empty = try groupOpAnswer("stream.group.dlq_list", &t, .stream_group_dlq_list, 7, try List.request.encodeInto(&lb, .{ .group = "g", .limit = 20, .after = null }));
     try std.testing.expectEqual(@as(u32, 0), empty.dead.count);
 }

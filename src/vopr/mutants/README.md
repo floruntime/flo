@@ -97,7 +97,7 @@ are checked against the ledger, record by record.
 | A trim moves the stream's floor to the last record it lost | `group_trim_misses_floor` |
 | A stream's record counts its groups exactly | `group_delete_keeps_count` |
 | An extend moves a lease only with half of it or less left, and answers where it ends | `group_extend_clock_ahead` |
-| A steal takes only a record idle at least its idle time, idle since the lease last moved | `group_steal_ignores_idle` |
+| A steal takes only a record idle at least its idle time, idle since its holder last touched it | `group_steal_ignores_idle` |
 | A requeue resets a dead letter's failures | `group_requeue_keeps_failures` |
 | A drop gives back the bytes of the records it removes | `group_drop_keeps_bytes` |
 | A report applies only to the delivery it names; the same hand-back resent counts as applied, any other is answered by what became of the record | machine tests "a nack after an abandon of the same delivery, or the reverse, is answered released, not applied", "a report to a group that isn't there is refused not_found" |

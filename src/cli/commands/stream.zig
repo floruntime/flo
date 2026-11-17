@@ -186,10 +186,11 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .longAbout(
                             \\Take records another consumer holds: each gets a new delivery and a
                             \\lease for --consumer, its failures kept. Only a record idle at least
-                            \\--min-idle is taken. Idle is the time since its lease last moved:
-                            \\its read, or its holder's last touch, so a holder that keeps
-                            \\touching is never stolen from. An operator's command: a read takes
-                            \\expired records by itself.
+                            \\--min-idle is taken. Idle is the time since its holder last touched
+                            \\it: its read, a steal, or any touch, even one that leaves the lease as
+                            \\it stands. So a holder that touches more often than --min-idle is never
+                            \\stolen from. An operator's command: a read takes expired records by
+                            \\itself.
                         )
                         .examples(&.{
                             "flo stream group steal events --group mygroup --consumer rescue --min-idle 300000 --ids 3.42.1703350800000-0.1",
@@ -198,7 +199,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
                         .stringFlag("consumer", 'c', "", "Who takes them (required)")
                         .uintFlag("min-idle", 0, 0, "Take only records idle at least this long (ms, required)")
-                        .uintFlag("lease", 0, 0, "Their new lease (ms; the group's lease when omitted)")
+                        .uintFlag("lease", 0, 0, "Their new lease (ms, within 5 s to 12 h; the group's lease when omitted)")
                         .stringFlag("ids", 'i', "", "Comma-separated deliveries, as a read printed them: term.index.id.deliveries")
                         .action(wrapHandler(runGroupSteal)),
                 )
@@ -1659,16 +1660,19 @@ fn runGroupDlq(ctx: *commander.Context, comptime kind: enum { requeue, delete })
     var batch: u32 = 0;
     while (true) : (batch += 1) {
         const records: ?@import("../../protocol/schema.zig").List(stream_ops.RecordRef, 100).Value = if (all) null else .{ .bytes = buf[0..w.pos], .count = n };
+        // No batch takes more than --max leaves.
+        const limit: u32 = if (max > 0) @intCast(@min(100, max - total)) else 100;
         var response = switch (kind) {
-            .requeue => client.call(stream_ops.op("stream.group.dlq_requeue"), namespace, stream, .{ .group = group, .records = records, .all = all }),
-            .delete => client.call(stream_ops.op("stream.group.dlq_delete"), namespace, stream, .{ .group = group, .records = records, .all = all, .dry_run = dry_run }),
+            .requeue => client.call(stream_ops.op("stream.group.dlq_requeue"), namespace, stream, .{ .group = group, .records = records, .all = all, .limit = limit }),
+            .delete => client.call(stream_ops.op("stream.group.dlq_delete"), namespace, stream, .{ .group = group, .records = records, .all = all, .limit = limit, .dry_run = dry_run }),
         } catch |err| return outcome.requestFailed(ctx, err);
         defer response.deinit();
         try outcome.check(ctx, response);
         var diag: @import("../../protocol/schema.zig").Diagnostic = .{};
         const a = stream_ops.op("stream.group.dlq_requeue").response.decodeAll(response.data, &diag) catch return outcome.malformed(ctx, "dead-letter answer");
         if (all) ctx.print("batch {d}: ", .{batch + 1});
-        ctx.print("{s} {d} record(s)\n", .{ verb, a.applied });
+        // A dry run looks at one batch: past it, more may remain.
+        ctx.print("{s} {d} record(s){s}\n", .{ verb, a.applied, if (dry_run and a.more) ", and more remain" else "" });
         var rit = a.refused.iterator();
         while (rit.next() catch null) |r| printRefused(ctx, r);
         total += a.applied;

@@ -549,20 +549,37 @@ test "e2e/group: dead letters are listed oldest first a page at a time, requeued
     defer rq.deinit();
     try testing.expectEqual(@as(u8, 0), rq.exit_code);
     try testing.expect(rq.stdoutContains("Requeued 1 record(s)"));
-    var again = try read(ctx, "s", "w2", "1");
-    defer again.deinit();
-    try testing.expect(again.stdoutContains("\"data\":\"a\""));
-    try testing.expect(again.stdoutContains("\"deliveries\":2"));
     // Not dead any more: a requeue of it is refused, naming why.
     var twice = try ctx.cli.run(&.{ "stream", "group", "dlq", "requeue", "s", "--group", "g", "--ids", idOf(nth(ds, 0)) });
     defer twice.deinit();
     try testing.expectEqual(@as(u8, 3), twice.exit_code);
-    try testing.expect(twice.stderrContains("not dead"));
+    var line_buf: [128]u8 = undefined;
+    try testing.expect(twice.stderrContains(try std.fmt.bufPrint(&line_buf, "  {s}: not dead: only a dead letter is requeued or deleted\n", .{idOf(nth(ds, 0))})));
+    var again = try read(ctx, "s", "w2", "1");
+    defer again.deinit();
+    try testing.expect(again.stdoutContains("\"data\":\"a\""));
+    try testing.expect(again.stdoutContains("\"deliveries\":2"));
+    // Its attempts were reset: with one attempt, one more nack kills it,
+    // and it shows one failure, not two.
+    var adb: [128]u8 = undefined;
+    var renack = try ctx.cli.run(&.{ "stream", "group", "nack", "s", "--group", "g", "--consumer", "w2", "--ids", try deliveries(&adb, again.stdout) });
+    defer renack.deinit();
+    try testing.expectEqual(@as(u8, 0), renack.exit_code);
+    var shown = try ctx.cli.run(&.{ "stream", "group", "dlq", "list", "s", "--group", "g", "-o", "json" });
+    defer shown.deinit();
+    var want_buf: [128]u8 = undefined;
+    try testing.expect(shown.stdoutContains(try std.fmt.bufPrint(&want_buf, "\"id\":\"{s}\",\"deliveries\":2,\"failures\":1", .{idOf(nth(ds, 0))})));
 
     var dry = try ctx.cli.run(&.{ "stream", "group", "dlq", "delete", "s", "--group", "g", "--all", "--dry-run" });
     defer dry.deinit();
     try testing.expectEqual(@as(u8, 0), dry.exit_code);
-    try testing.expect(dry.stdoutContains("Would delete 2 record(s)"));
+    try testing.expect(dry.stdoutContains("Would delete 3 record(s)\n"));
+    try testing.expect(try infoHas(ctx, "s", "\"dead\":3"));
+    // --max stops a run where it says, a batch no larger than what is left.
+    var one = try ctx.cli.run(&.{ "stream", "group", "dlq", "delete", "s", "--group", "g", "--all", "--max", "1" });
+    defer one.deinit();
+    try testing.expectEqual(@as(u8, 0), one.exit_code);
+    try testing.expect(one.stdoutContains("Deleted 1 record(s)\n"));
     try testing.expect(try infoHas(ctx, "s", "\"dead\":2"));
     var del = try ctx.cli.run(&.{ "stream", "group", "dlq", "delete", "s", "--group", "g", "--all" });
     defer del.deinit();
@@ -570,6 +587,7 @@ test "e2e/group: dead letters are listed oldest first a page at a time, requeued
     try testing.expect(del.stdoutContains("Deleted 2 record(s)"));
     var empty = try ctx.cli.run(&.{ "stream", "group", "dlq", "list", "s", "--group", "g" });
     defer empty.deinit();
+    try testing.expectEqual(@as(u8, 0), empty.exit_code);
     try testing.expect(empty.stdoutContains("No dead letters"));
     try testing.expect(try infoHas(ctx, "s", "\"dead\":0"));
 }

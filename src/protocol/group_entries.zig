@@ -149,10 +149,11 @@ pub const Extend = Record(&(report ++ [_]schema.Field{
 
 /// Records leased to another holder taken by `holder`: each still leased at
 /// the delivery count named, and idle at least `min_idle_ms` by the entry's
-/// stamp, idle being the time since its lease last moved (a deliver or an
-/// extend). Each gets a new delivery, this entry's token and a lease of
-/// `lease_ms` from the stamp; its failures stand. An operator's: a read
-/// redelivers expired records by itself.
+/// stamp, idle being the time since its holder last touched it (its deliver
+/// or steal, or any extend, even one that leaves the lease as it stands).
+/// Each gets a new delivery, this entry's token and a lease of `lease_ms`
+/// from the stamp; its failures stand. An operator's: a read redelivers
+/// expired records by itself.
 pub const Steal = Record(&.{
     .{ .name = "ns", .T = NamespaceId },
     .{ .name = "stream", .T = StreamName },

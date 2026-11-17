@@ -99,7 +99,8 @@ pub const DeadPage = schema.BoundedList(DeadRecord, MAX_DLQ_PAGE, @intCast(ops.M
 const dead_request = [_]schema.Field{
     .{ .name = "group", .T = Name, .doc = "The group" },
     .{ .name = "records", .T = Optional(schema.List(RecordRef, ge.MAX_BATCH)), .doc = "The dead letters, by id; none with all" },
-    .{ .name = "all", .T = Defaulted(schema.Bool, false), .doc = "The oldest dead letters instead, a batch of up to 100: `more` says whether others remain" },
+    .{ .name = "all", .T = Defaulted(schema.Bool, false), .doc = "The oldest dead letters instead, a batch of up to `limit`: `more` says whether others remain" },
+    .{ .name = "limit", .T = Defaulted(schema.Range(u32, 1, ge.MAX_BATCH), ge.MAX_BATCH), .doc = "With all, the most this batch takes" },
 };
 
 const dead_answer = [_]schema.Field{
@@ -151,7 +152,7 @@ pub const table = [_]ops.Op{
         .request = Record(&.{
             .{ .name = "group", .T = Name, .doc = "The group" },
             .{ .name = "consumer", .T = ge.Holder, .doc = "Who takes them" },
-            .{ .name = "min_idle_ms", .T = schema.Range(u64, 1, ge.MAX_LEASE_MS), .doc = "Take only records idle this long: idle is the time since the lease last moved, its read or its holder's last touch" },
+            .{ .name = "min_idle_ms", .T = schema.Range(u64, 1, ge.MAX_LEASE_MS), .doc = "Take only records idle this long: idle is the time since the holder last touched it (its read, a steal, or any touch, even one that leaves the lease as it stands)" },
             .{ .name = "lease_ms", .T = Optional(ge.LeaseMs), .doc = "The lease they're taken for; the group's lease when none is named" },
             .{ .name = "records", .T = schema.List(Leased, ge.MAX_BATCH), .doc = "The records, by id and the deliveries their holder has" },
         }),
@@ -163,7 +164,7 @@ pub const table = [_]ops.Op{
             .{ .name = "refused", .T = schema.List(Refused, ge.MAX_BATCH), .doc = "The rest, and why" },
         }),
         .cli = .{ .expose = .hand, .key = .{ .name = "stream", .doc = "The stream's name" } },
-        .doc = "Take records another consumer holds and has left idle: each gets a new delivery and lease, its failures kept. Idle is the time since the lease last moved (its read or its holder's last touch), so a holder that keeps touching isn't stolen from. An operator's command: a read takes expired records by itself.",
+        .doc = "Take records another consumer holds and has left idle: each gets a new delivery and lease, its failures kept. Idle is the time since its holder last touched it (its read, a steal, or any touch, even one that leaves the lease as it stands), so a holder that touches more often than the idle time named is never stolen from. An operator's command: a read takes expired records by itself.",
     },
     .{
         .name = "stream.group.dlq_list",

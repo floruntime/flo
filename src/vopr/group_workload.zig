@@ -367,7 +367,7 @@ fn steal(store: *store_mod.Store, out: []u8, l: Leader, r: std.Random, s: usize,
         if (v.status != .leased) continue;
         rec = gm.recordOf(entry.key[4..]);
         deliveries = v.deliveries;
-        idle_ns = l.now_ns -| (v.expiry_ns -| v.lease_ms *| std.time.ns_per_ms);
+        idle_ns = l.now_ns -| v.touched_ns;
         if (r.boolean()) break;
     }
     const target = rec orelse return null;

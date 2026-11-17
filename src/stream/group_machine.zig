@@ -123,6 +123,10 @@ pub const Item = Record(&.{
     .{ .name = "expiry_ns", .T = Int(u64) },
     .{ .name = "ended", .T = schema.Enum(Ended) },
     .{ .name = "started_ns", .T = Int(u64) },
+    // Its holder's last sign of life, by the log's clock: its deliver or
+    // steal, or a touch, whether or not the touch moved the lease. A steal
+    // measures idle from it.
+    .{ .name = "touched_ns", .T = Int(u64) },
     .{ .name = "error", .T = Bytes(ge.MAX_ERROR) },
     // When it died, while dead: its dead key's time.
     .{ .name = "dead_ns", .T = Int(u64) },
@@ -398,8 +402,9 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             const ns: NamespaceId = .of(p.ns);
             const scope = scopeOf(ns, p.stream, p.group);
             try groupKeys(out, ns, &scope);
-            // The new leases' deadline; the old ones are the expire duty's
-            // to drop, as an extend leaves them.
+            // The new leases' deadline. The old ones can't be declared: the
+            // entry names no record's old expiry, so the expire duty drops
+            // them, finding the record's lease has moved on.
             try leaseKeys(out, ns, &scope, after(stamp, p.lease_ms));
         },
         inline .group_requeue, .group_drop => |t| {
@@ -710,10 +715,12 @@ fn deliverApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             .expiry_ns = 0,
             .ended = .none,
             .started_ns = 0,
+            .touched_ns = 0,
             .@"error" = "",
             .dead_ns = 0,
         };
         try M.deliver(view, ns, &id, &item, p.holder, null, token, p.lease_ms, stamp);
+        item.touched_ns = stamp;
         try view.put(Items, key, .{ .v = item });
         out.putInt(u64, record.timestamp_ms);
         out.putInt(u64, record.sequence);
@@ -827,10 +834,11 @@ fn report(view: *View, out: *Result, p: anytype, kind: Report, stamp: u64) Apply
                     nr += 1;
                     continue;
                 }
-                if (try M.extend(view, ns, &id, &item.v, p.expiry_ns, stamp)) |t| {
-                    to = t;
-                    try view.put(Items, key, item);
-                } else to = item.v.expiry_ns;
+                // A touch is a sign of life whether or not it moves the
+                // lease: a steal's idle time runs from it.
+                item.v.touched_ns = stamp;
+                to = (try M.extend(view, ns, &id, &item.v, p.expiry_ns, stamp)) orelse item.v.expiry_ns;
+                try view.put(Items, key, item);
             },
         }
         applied += 1;
@@ -870,11 +878,12 @@ fn liveMeta(view: *View, out: *Result, ns: NamespaceId, stream: []const u8, grou
     return .{ .key = mk, .meta = m.? };
 }
 
-/// How long a lease has gone without moving, by `stamp`: since its deliver
-/// or its last extend, so a holder that keeps touching it isn't idle.
+/// How long a record's holder has gone without a sign of life, by `stamp`:
+/// since its deliver or steal, or its last touch, whether or not the touch
+/// moved the lease. So a holder that touches more often than a steal's idle
+/// time is never stolen from.
 pub fn idleOf(item: Item.Value, stamp: u64) u64 {
-    const moved = item.expiry_ns -| (item.lease_ms *| std.time.ns_per_ms);
-    return stamp -| moved;
+    return stamp -| item.touched_ns;
 }
 
 /// Answers the new delivery's term (u64; its index is the entry's) and
@@ -889,6 +898,7 @@ fn stealApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     const scope = scopeOf(ns, p.stream, p.group);
     const g = (try liveMeta(view, out, ns, p.stream, p.group)) orelse return;
     var meta = g.meta;
+    const floor = floorOf(try streamRec(view, streamOf(ns, p.stream)));
     const token: ae.Token.Value = .{ .term = e.header.term, .index = e.header.index };
     var taken: [ge.MAX_BATCH]struct { record: StreamID, deliveries: u32 } = undefined;
     var nt: usize = 0;
@@ -899,7 +909,10 @@ fn stealApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         const record: StreamID = .{ .timestamp_ms = named.ms, .sequence = named.seq };
         const id = idOf(scope, record);
         const key = try M.inNs(view, ns, &id);
-        var item = (try view.get(Items, key)) orelse {
+        // A record a trim cut is cleanup's: a deliver passes over it, and
+        // so does a steal.
+        const found = if (record.greaterThan(floor)) try view.get(Items, key) else null;
+        var item = found orelse {
             refused[nr] = .{ .record = record, .why = .gone };
             nr += 1;
             continue;
@@ -919,6 +932,7 @@ fn stealApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             continue;
         }
         try M.deliver(view, ns, &id, &item.v, p.holder, null, token, p.lease_ms, stamp);
+        item.v.touched_ns = stamp;
         try view.put(Items, key, item);
         taken[nt] = .{ .record = record, .deliveries = item.v.deliveries };
         nt += 1;
@@ -1895,7 +1909,7 @@ fn stealAnswer(r: Result) struct { term: u64, taken: u32, why: ?Why } {
     return .{ .term = term, .taken = taken, .why = first };
 }
 
-test "group machine: a steal takes only a record idle long enough, by the time since its lease last moved, under a new delivery; failures kept" {
+test "group machine: a steal takes only a record idle long enough, by the time since its holder last touched it, under a new delivery; failures kept" {
     var t = TestGroups.init(testing.allocator);
     defer t.deinit();
     _ = try t.append("s", 100, 1);
@@ -1995,4 +2009,37 @@ test "group machine: a steal, requeue or drop to a group that isn't there is ref
     try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, (try stealOf(&t, &.{rec}, 1, "rescue", 1, 10 * ms)).refused().?.status);
     try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, (try deadOf(&t, .group_requeue, &.{rec}, 10 * ms)).refused().?.status);
     try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, (try deadOf(&t, .group_drop, &.{rec}, 10 * ms)).refused().?.status);
+}
+
+test "group machine: a holder touching every 2 s on a 30 s lease, though its touches leave the lease as it stands, isn't stolen from with an idle time of 10 s" {
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 1);
+    const r = try t.apply(.group_deliver, ge.Deliver.Value{ .ns = NS.int(), .stream = "s", .group = "g", .count = 1, .max_bytes = 1 << 20, .holder = "c1", .lease_ms = 30_000, .create = true, .ready = .{ .bytes = "", .count = 0 }, .through_ms = std.math.maxInt(u64), .through_seq = std.math.maxInt(u64), .max_held = qe_caps.DEFAULT_MAX_MESSAGES, .max_held_bytes = qe_caps.DEFAULT_MAX_BYTES, .shard_held_bytes = qe_caps.DEFAULT_SHARD_HELD_BYTES }, 0);
+    try testing.expect(r.refused() == null);
+    const token: ae.Token.Value = .{ .term = t.term, .index = t.index };
+    const rec = sid(100, 0);
+    var buf: [512]u8 = undefined;
+    const items = try itemsOf(&buf, &t, &.{rec});
+    var at: u64 = 2_000 * ms;
+    while (at <= 16_000 * ms) : (at += 2_000 * ms) {
+        const held = t.item("s", "g", rec).?;
+        _ = try t.apply(.group_extend, ge.Extend.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = token, .expiry_ns = held.expiry_ns, .items = items, .held_since_ns = held.delivered_ns, .lease_ms = 30_000 }, at);
+    }
+    // The lease never moved before half of it was gone, at 15 s.
+    try testing.expectEqual(@as(u64, 16_000 * ms), t.item("s", "g", rec).?.touched_ns);
+    try testing.expectEqual(Why.not_idle, stealAnswer(try stealOf(&t, &.{rec}, 1, "rescue", 10_000, 17_000 * ms)).why.?);
+    try testing.expectEqualStrings("c1", t.item("s", "g", rec).?.holder);
+}
+
+test "group machine: a steal answers gone for a record a trim cut, as a deliver passes over it" {
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 1);
+    _ = try deliver(&t, 1, 1 << 20, "c1", 10 * ms);
+    const rec = sid(100, 0);
+    try t.trim("s", rec, 20 * ms);
+    const sums = t.sums();
+    try testing.expectEqual(Why.gone, stealAnswer(try stealOf(&t, &.{rec}, 1, "rescue", 1, 5_000 * ms)).why.?);
+    try testing.expectEqual(sums, t.sums());
 }

@@ -652,7 +652,7 @@ fn report(shard: *Shard, conn: *Connection, req: Request, kind: Report) void {
             break :blk propose(shard, .group_release, ge.Release.Value{ .ns = req.ns_id.int(), .stream = req.key, .group = n.group, .holder = consumer, .token = token, .expiry_ns = expiry, .items = parsed.items, .delay_ms = delay, .dead = dead, .@"error" = text, .ended = if (abandon) .abandoned else .failed });
         },
         .touch => blk: {
-            const l = parsed.lease orelse Item{ .scope = "", .status = .ready, .due_ns = 0, .deliveries = 0, .failures = 0, .holder = "", .request_key = null, .token = token, .lease_ms = ae.MIN_LEASE_MS, .delivered_ns = 0, .expiry_ns = 0, .ended = .none, .started_ns = 0, .@"error" = "", .dead_ns = 0 };
+            const l = parsed.lease orelse Item{ .scope = "", .status = .ready, .due_ns = 0, .deliveries = 0, .failures = 0, .holder = "", .request_key = null, .token = token, .lease_ms = ae.MIN_LEASE_MS, .delivered_ns = 0, .expiry_ns = 0, .ended = .none, .started_ns = 0, .touched_ns = 0, .@"error" = "", .dead_ns = 0 };
             break :blk propose(shard, .group_extend, ge.Extend.Value{ .ns = req.ns_id.int(), .stream = req.key, .group = n.group, .holder = consumer, .token = token, .expiry_ns = l.expiry_ns, .items = parsed.items, .held_since_ns = l.delivered_ns, .lease_ms = std.math.clamp(l.lease_ms, ae.MIN_LEASE_MS, ae.MAX_LEASE_MS) });
         },
     } catch |err| return shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "report not persisted"));
@@ -1013,25 +1013,30 @@ pub const Operator = struct {
     /// The group's dead letters from `after` on, oldest dead first.
     const DeadIter = struct {
         shard: *Shard,
-        /// The range's prefix, here so the range never outlives it: the
-        /// range opens on the first `next`, once the iterator stays put.
+        /// The range's prefix and where it resumes, here so the range never
+        /// outlives them: the range opens on the first `next`, once the
+        /// iterator stays put.
         prefix: [4 + machine.SCOPE_LEN]u8,
+        after: ?[4 + machine.SCOPE_LEN + 24]u8,
         it: ?view_mod.ReadRange(machine.Dead) = null,
-        after: ?[machine.SCOPE_LEN + 24]u8,
 
         fn init(shard: *Shard, ns: NamespaceId, scope: Scope, after: ?stream_ops.DeadCursor.Value) DeadIter {
-            var d: DeadIter = .{ .shard = shard, .prefix = undefined, .after = if (after) |c| machine.deadKey(scope, c.dead_ns, .{ .timestamp_ms = c.ms, .sequence = c.seq }) else null };
+            var d: DeadIter = .{ .shard = shard, .prefix = undefined, .after = null };
             _ = machine.storeKey(&d.prefix, ns, &scope);
+            if (after) |c| {
+                var k: [4 + machine.SCOPE_LEN + 24]u8 = undefined;
+                _ = machine.storeKey(&k, ns, &machine.deadKey(scope, c.dead_ns, .{ .timestamp_ms = c.ms, .sequence = c.seq }));
+                d.after = k;
+            }
             return d;
         }
 
         /// The next one: its dead time and record.
         fn next(self: *DeadIter) ?struct { dead_ns: u64, record: StreamID } {
-            if (self.it == null) self.it = readOf(self.shard).range(machine.Dead, &self.prefix);
+            if (self.it == null) self.it = if (self.after) |*a| readOf(self.shard).rangeAfter(machine.Dead, &self.prefix, a) else readOf(self.shard).range(machine.Dead, &self.prefix);
             while (self.it.?.next() catch null) |entry| {
                 const k = entry.key[4..];
                 if (k.len != machine.SCOPE_LEN + 24) continue;
-                if (self.after) |a| if (std.mem.order(u8, k, &a) != .gt) continue;
                 return .{ .dead_ns = std.mem.readInt(u64, k[16..24], .big), .record = .{ .timestamp_ms = std.mem.readInt(u64, k[24..32], .big), .sequence = std.mem.readInt(u64, k[32..40], .big) } };
             }
             return null;
@@ -1075,7 +1080,7 @@ pub const Operator = struct {
     /// The records a requeue or delete names, or with `all` the group's
     /// oldest dead letters, at most a batch: a requeue passes over those a
     /// trim cut, which cleanup takes, so a run of them never stops it.
-    fn deadBatch(shard: *Shard, req: Request, group: []const u8, records: ?Refs.Value, all: bool, requeue: bool, buf: []u8) Error!struct { items: ge.RecordIds.Value, more: bool } {
+    fn deadBatch(shard: *Shard, req: Request, group: []const u8, records: ?Refs.Value, all: bool, limit: u32, requeue: bool, buf: []u8) Error!struct { items: ge.RecordIds.Value, more: bool } {
         var w: schema.Writer = .{ .buf = buf };
         var n: u32 = 0;
         var more = false;
@@ -1085,7 +1090,7 @@ pub const Operator = struct {
             var it = DeadIter.init(shard, req.ns_id, scope, null);
             while (it.next()) |d| {
                 if (requeue and !d.record.greaterThan(floor)) continue;
-                if (n == ge.MAX_BATCH) {
+                if (n == limit) {
                     more = true;
                     break;
                 }
@@ -1102,19 +1107,20 @@ pub const Operator = struct {
         return .{ .items = .{ .bytes = buf[0..w.pos], .count = n }, .more = more };
     }
 
-    pub fn runRequeue(shard: *Shard, _: *Connection, req: Request, group: []const u8, records: ?Refs.Value, all: bool) Error!table_run.Outcome(DeadResponse) {
-        return runDead(shard, req, group, records, all, true, false);
+    pub fn runRequeue(shard: *Shard, _: *Connection, req: Request, group: []const u8, records: ?Refs.Value, all: bool, limit: u32) Error!table_run.Outcome(DeadResponse) {
+        return runDead(shard, req, group, records, all, limit, true, false);
     }
 
-    pub fn runDelete(shard: *Shard, _: *Connection, req: Request, group: []const u8, records: ?Refs.Value, all: bool, dry_run: bool) Error!table_run.Outcome(DeadResponse) {
-        return runDead(shard, req, group, records, all, false, dry_run);
+    pub fn runDelete(shard: *Shard, _: *Connection, req: Request, group: []const u8, records: ?Refs.Value, all: bool, limit: u32, dry_run: bool) Error!table_run.Outcome(DeadResponse) {
+        return runDead(shard, req, group, records, all, limit, false, dry_run);
     }
 
-    fn runDead(shard: *Shard, req: Request, group: []const u8, records: ?Refs.Value, all: bool, requeue: bool, dry_run: bool) Error!table_run.Outcome(DeadResponse) {
+    fn runDead(shard: *Shard, req: Request, group: []const u8, records: ?Refs.Value, all: bool, limit: u32, requeue: bool, dry_run: bool) Error!table_run.Outcome(DeadResponse) {
         if (try opChecks(shard, req, group)) |r| return .{ .refused = r };
-        if (!all and (records == null or records.?.count == 0)) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: name the dead letters, or all") } };
+        const named_some = records != null and records.?.count > 0;
+        if (all == named_some) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(if (all) "bad request: name the dead letters or give all, not both" else "bad request: name the dead letters, or all") } };
         var ib: [ge.RecordIds.max_size]u8 = undefined;
-        const batch = try deadBatch(shard, req, group, records, all, requeue, &ib);
+        const batch = try deadBatch(shard, req, group, records, all, limit, requeue, &ib);
         if (dry_run) {
             // What a delete would take: each named record that is dead now.
             const scope = machine.scopeOf(req.ns_id, req.key, group);
