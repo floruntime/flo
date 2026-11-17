@@ -1676,14 +1676,15 @@ pub const ActionsHandler = struct {
                 break;
             }
             looked += 1;
-            self.expire_after.clearRetainingCapacity();
-            self.expire_after.appendSlice(self.allocator, due.raw) catch {};
             const k = due.key;
             var holder: []const u8 = "";
             var request_key: ?[]const u8 = null;
             if (getRun(shard, k.ns, k.id)) |run| if (run.status == .leased and run.expiry_ns == k.expiry_ns) {
                 const grace = @as(u64, @min(run.lease_ms, MAX_GRACE_MS)) *| std.time.ns_per_ms;
-                if (now < self.duty_since_ns +| grace) continue;
+                if (now < self.duty_since_ns +| grace) {
+                    self.passExpire(due.raw);
+                    continue;
+                }
                 // A called run's lease isn't ended while its end couldn't be
                 // sent: not on its last attempt, nor on an earlier one, which
                 // would run it again while its worker, refused for room,
@@ -1691,15 +1692,27 @@ pub const ActionsHandler = struct {
                 // room, and a lease nobody reports on ends then.
                 if (endWait(shard, k.ns, run)) |r| {
                     self.noteHeld(shard, k.ns, k.id, r);
+                    self.passExpire(due.raw);
                     continue;
                 }
                 holder = run.holder;
                 request_key = run.request_key;
             };
             var ib: [ae.ExpireItem.max_size]u8 = undefined;
-            const bytes = ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns.int(), .action = due.scope, .run = k.id, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key }) catch continue;
-            if (items.items.len + bytes.len > ae.MAX_EXPIRE_BYTES) break;
-            items.appendSlice(self.allocator, bytes) catch break;
+            const bytes = ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns.int(), .action = due.scope, .run = k.id, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key }) catch {
+                self.passExpire(due.raw);
+                continue;
+            };
+            // Full: this one waits for the next pass, which starts at it.
+            if (items.items.len + bytes.len > ae.MAX_EXPIRE_BYTES) {
+                reached_end = false;
+                break;
+            }
+            items.appendSlice(self.allocator, bytes) catch {
+                reached_end = false;
+                break;
+            };
+            self.passExpire(due.raw);
             self.dropHeld(k.ns, k.id);
             n += 1;
         }
@@ -1735,6 +1748,12 @@ pub const ActionsHandler = struct {
         if (self.held_expires.count() >= HELD_NOTES_MAX) return;
         const owned = self.allocator.dupe(u8, k) catch return;
         self.held_expires.put(self.allocator, owned, held) catch self.allocator.free(owned);
+    }
+
+    /// The next pass resumes after `raw`: this one dealt with it.
+    fn passExpire(self: *ActionsHandler, raw: []const u8) void {
+        self.expire_after.clearRetainingCapacity();
+        self.expire_after.appendSlice(self.allocator, raw) catch {};
     }
 
     /// A lease the pass is ending is held no longer.

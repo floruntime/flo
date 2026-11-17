@@ -124,8 +124,13 @@ pub fn observeAll(comptime machines: []const Machine, store: *store_mod.Store, s
 }
 
 /// `m`'s observe of `e`, an entry another applier applied: its writes become
-/// state with it. A write to another machine's family halts: an observer
-/// keeps only its own.
+/// state with it, and what it sends leaves with them. A write to another
+/// machine's family halts: an observer keeps only its own.
+///
+/// An observer sends only on observing an edge entry (a client's write, or
+/// a leader's own proposal: a completion, a refusal), never because of a
+/// message it applied. So a chain of applies never sends, and needs no fuel
+/// or `hops` to bound it.
 pub fn observeEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, streams: ?Streams, e: *const Entry) ApplyError!void {
     if (m.observe_needed) |needed| if (!needed(.{ .store = store }, e)) return;
     _ = scratch.reset(.retain_capacity);
@@ -136,6 +141,12 @@ pub fn observeEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.he
     view.streams_read = streams;
     try m.observe.?(&view, e);
     for (view.ops.items) |op| if (!ownsFamily(m, op.fam)) return error.Halt;
+    if (view.sends.items.len > 0) {
+        // An observed entry is never a message, so it is no channel's.
+        if (e.header.entry_type == @backingInt(EntryType.channel_inbound)) return error.Halt;
+        if (channels.tooMuchSent(view.sends.items) != null) return error.Halt;
+        try channels.writeSends(&view, e.header.index);
+    }
     try view.commit();
 }
 
