@@ -2021,14 +2021,19 @@ test "group machine: a holder touching every 2 s on a 30 s lease, though its tou
     const rec = sid(100, 0);
     var buf: [512]u8 = undefined;
     const items = try itemsOf(&buf, &t, &.{rec});
+    // Touched while more than half the lease remains: each leaves the lease
+    // where it stands, expiring at 30 s.
     var at: u64 = 2_000 * ms;
-    while (at <= 16_000 * ms) : (at += 2_000 * ms) {
+    while (at <= 14_000 * ms) : (at += 2_000 * ms) {
         const held = t.item("s", "g", rec).?;
         _ = try t.apply(.group_extend, ge.Extend.Value{ .ns = NS.int(), .stream = "s", .group = "g", .holder = "c1", .token = token, .expiry_ns = held.expiry_ns, .items = items, .held_since_ns = held.delivered_ns, .lease_ms = 30_000 }, at);
     }
-    // The lease never moved before half of it was gone, at 15 s.
-    try testing.expectEqual(@as(u64, 16_000 * ms), t.item("s", "g", rec).?.touched_ns);
-    try testing.expectEqual(Why.not_idle, stealAnswer(try stealOf(&t, &.{rec}, 1, "rescue", 10_000, 17_000 * ms)).why.?);
+    try testing.expectEqual(@as(u64, 30_000 * ms), t.item("s", "g", rec).?.expiry_ns);
+    try testing.expectEqual(@as(u64, 14_000 * ms), t.item("s", "g", rec).?.touched_ns);
+    // At 20 s: 6 s since its last touch, though 20 s since the lease moved.
+    const kept = stealAnswer(try stealOf(&t, &.{rec}, 1, "rescue", 10_000, 20_000 * ms));
+    try testing.expectEqual(@as(u32, 0), kept.taken);
+    try testing.expectEqual(Why.not_idle, kept.why.?);
     try testing.expectEqualStrings("c1", t.item("s", "g", rec).?.holder);
 }
 

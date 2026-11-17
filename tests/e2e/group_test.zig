@@ -574,6 +574,11 @@ test "e2e/group: dead letters are listed oldest first a page at a time, requeued
     defer dry.deinit();
     try testing.expectEqual(@as(u8, 0), dry.exit_code);
     try testing.expect(dry.stdoutContains("Would delete 3 record(s)\n"));
+    // A dry run looks at one batch, and says when more remain past it.
+    var dry_one = try ctx.cli.run(&.{ "stream", "group", "dlq", "delete", "s", "--group", "g", "--all", "--max", "1", "--dry-run" });
+    defer dry_one.deinit();
+    try testing.expectEqual(@as(u8, 0), dry_one.exit_code);
+    try testing.expect(dry_one.stdoutContains("Would delete 1 record(s), and more remain\n"));
     try testing.expect(try infoHas(ctx, "s", "\"dead\":3"));
     // --max stops a run where it says, a batch no larger than what is left.
     var one = try ctx.cli.run(&.{ "stream", "group", "dlq", "delete", "s", "--group", "g", "--all", "--max", "1" });
