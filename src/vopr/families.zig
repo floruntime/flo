@@ -165,6 +165,12 @@ pub const Mutant = enum {
     /// An append's ids start over at its stream's last: it takes ids
     /// an earlier append holds.
     stream_append_reuses_id,
+    /// A stop or cancel leaves its job running.
+    job_stop_keeps_running,
+    /// A remove leaves its job stored.
+    job_remove_keeps_job,
+    /// A submit past the shard's job limit is stored all the same.
+    job_limit_unchecked,
 
     /// Whether the bug is in a node's transaction limit: a run with none
     /// never reaches it.
@@ -180,6 +186,16 @@ pub const Mutant = enum {
             .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
             .queue_settle_ignores_token, .queue_release_removes, .queue_expire_ignores_deadline, .queue_deliver_wrong_order, .queue_deliver_short, .queue_expire_first_only, .queue_report_changes_unnamed, .queue_node_clock, .queue_cap_unchecked, .queue_cap_tightened, .queue_settle_keeps_bytes, .queue_requeue_keeps_failures, .queue_drop_keeps_bytes => false,
             .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .stream_trim_leaves_floor, .group_delete_keeps_count, .group_extend_clock_ahead, .group_steal_ignores_idle, .group_requeue_keeps_failures, .group_drop_keeps_bytes, .stream_append_reuses_id => false,
+            .job_stop_keeps_running, .job_remove_keeps_job, .job_limit_unchecked => false,
+        };
+    }
+
+    /// Whether the bug is in the processing machine's jobs: a run with no
+    /// job entries never reaches it.
+    pub fn inProcessing(m: Mutant) bool {
+        return switch (m) {
+            .job_stop_keeps_running, .job_remove_keeps_job, .job_limit_unchecked => true,
+            else => false,
         };
     }
 
@@ -1015,6 +1031,7 @@ pub const Actions = struct {
 };
 
 pub const Queues = @import("queue_family.zig").Queues;
+pub const Jobs = @import("processing_family.zig").Jobs;
 
 /// Shard 0's namespace registry: the server's handler, on a table of its
 /// own. The simulator proposes creates through it as shard 0's leader does

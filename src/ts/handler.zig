@@ -222,7 +222,7 @@ pub const TSHandler = struct {
 
     // ── Pre-Route ───────────────────────────────────────────────────────
 
-    fn preRouteByMeasurement(req: Request) ?u64 {
+    pub fn preRouteByMeasurement(req: Request) ?u64 {
         if (req.key.len == 0) return null;
         return router.routeNsKey(req.ns_id, req.key);
     }
