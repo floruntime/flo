@@ -1,6 +1,7 @@
 //! Self-routing Run IDs
 //!
-//! Format: `{prefix}{hex(u64)}-{hex(tag)}`, e.g. `act-1a2b3c4d5e6f00-3`
+//! Format: `{prefix}{hex(u64)}-{hex(shard)}-{hex(term)}`, e.g.
+//! `act-1a2b3c4d5e6f00-3-1c`
 //!
 //! The packed u64 encodes:
 //!   ```
@@ -12,12 +13,17 @@
 //! lookup. The slot is fixed for the name, so the id stays right wherever the
 //! slot later lives.
 //!
-//! The suffix is a uniqueness tag, not a location: the number of the shard
-//! whose generator minted the id. A shard mints ids for slots it doesn't own
-//! (a workflow starting an action on another shard), so two generators share
-//! a slot's id space and only the tag keeps their ids apart. Once a slot
-//! moves, or a group splits, the tag no longer names where the run lives, so
-//! nothing may parse it or route by it.
+//! The suffix is a uniqueness tag, not a location: the shard whose leader
+//! minted the id, and that leader's term. A shard mints ids for slots it
+//! doesn't own (a workflow starting an action on another shard), so two
+//! shards share a slot's id space and the shard keeps their ids apart. A
+//! shard's replicas share its number, so the term keeps one leader's ids
+//! apart from the next's: a new leader's generator starts fresh, and its
+//! clock may be behind the last leader's. Each leadership spends a new term,
+//! made durable before it leads, and only a term's leader proposes, so the
+//! ids that reach the log in a term come from one process, whose generator
+//! never repeats. Once a slot moves, or a group splits, the tag no longer
+//! names where the run lives, so nothing may parse it or route by it.
 //!
 //! ## Constraints
 //!
@@ -25,7 +31,8 @@
 //! - Sequence: 256 per millisecond per shard; past that the id's millisecond
 //!   runs ahead of the clock rather than repeat an id.
 //! - Timestamp range: ~139 years from custom epoch (2024-01-01 → ~2163).
-//! - Max encoded length: prefix (4) + hex (16) + '-' + tag hex (2) = 23 bytes.
+//! - Max encoded length: prefix (4) + hex (16) + '-' + shard hex (4) + '-' +
+//!   term hex (16) = 42 bytes.
 
 const std = @import("std");
 
@@ -35,7 +42,7 @@ const EPOCH_MS: u64 = 1_704_067_200_000;
 const SLOTS = @import("router.zig").SLOTS;
 
 /// Maximum total length of a generated run ID.
-pub const MAX_ID_LEN: usize = 23;
+pub const MAX_ID_LEN: usize = 42;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Prefix
@@ -62,7 +69,7 @@ pub const Prefix = enum {
 /// Per-shard run ID generator. Single-threaded — no atomics needed.
 pub const Generator = struct {
     /// The number of the shard this generator runs on, written into every id
-    /// as its uniqueness tag (see the file comment): never read back.
+    /// as part of its uniqueness tag (see the file comment): never read back.
     shard: u16 = 0,
     last_ms: u64 = 0,
     sequence: u8 = 0,
@@ -73,8 +80,10 @@ pub const Generator = struct {
     /// the wall clock does, and moves on by one when a millisecond's 256 ids
     /// are spent.
     ///
-    /// `slot` is the slot of the run's definition (`router.nsKeySlot`).
-    pub fn next(self: *Generator, prefix: Prefix, slot: u32, buf: []u8) []const u8 {
+    /// `slot` is the slot of the run's definition (`router.nsKeySlot`), and
+    /// `term` the shard's current Raft term, which the leader proposing the
+    /// run leads in.
+    pub fn next(self: *Generator, prefix: Prefix, slot: u32, term: u64, buf: []u8) []const u8 {
         std.debug.assert(buf.len >= MAX_ID_LEN);
         std.debug.assert(slot < SLOTS);
         const now_ms = @max(currentMs(), self.last_ms);
@@ -101,6 +110,9 @@ pub const Generator = struct {
         buf[len] = '-';
         len += 1;
         len += hexEncode(self.shard, buf[len..]);
+        buf[len] = '-';
+        len += 1;
+        len += hexEncode(term, buf[len..]);
         return buf[0..len];
     }
 };
@@ -123,14 +135,17 @@ pub fn extractTimestamp(run_id: []const u8) ?u64 {
 }
 
 /// Whether `run_id` has the form this generator mints for `prefix`
-/// (`{prefix}{hex}-{hex}`). A client may not choose such an id: one the
-/// server mints later could equal it.
+/// (`{prefix}{hex}-{hex}-{hex}`). A client may not choose such an id: one
+/// the server mints later could equal it.
 pub fn looksGenerated(prefix: Prefix, run_id: []const u8) bool {
     const p = prefix.string();
     if (!std.mem.startsWith(u8, run_id, p)) return false;
-    const rest = run_id[p.len..];
-    const dash = std.mem.indexOfScalar(u8, rest, '-') orelse return false;
-    return hexDecode(rest[0..dash]) != null and dash + 1 < rest.len and hexDecode(rest[dash + 1 ..]) != null;
+    var parts = std.mem.splitScalar(u8, run_id[p.len..], '-');
+    var n: usize = 0;
+    while (parts.next()) |part| : (n += 1) {
+        if (n == 3 or hexDecode(part) == null) return false;
+    }
+    return n == 3;
 }
 
 /// Decode the hex payload from a prefixed run ID: what follows the first
@@ -232,8 +247,8 @@ test "run ID encode/decode slot roundtrip" {
     var gen = Generator{};
     const slots = [_]u32{ 0, 1, 42, 1000, SLOTS - 1 };
     for (slots) |s| {
-        var buf: [32]u8 = undefined;
-        const id = gen.next(.workflow, s, &buf);
+        var buf: [MAX_ID_LEN]u8 = undefined;
+        const id = gen.next(.workflow, s, 1, &buf);
         try std.testing.expectEqual(s, extractSlot(id).?);
     }
 }
@@ -242,8 +257,8 @@ test "run IDs are unique" {
     var gen = Generator{};
     var ids: [10]u64 = undefined;
     for (&ids) |*slot| {
-        var buf: [32]u8 = undefined;
-        const id = gen.next(.workflow, 100, &buf);
+        var buf: [MAX_ID_LEN]u8 = undefined;
+        const id = gen.next(.workflow, 100, 1, &buf);
         slot.* = decodePayload(id).?;
     }
     // All IDs should be distinct
@@ -256,15 +271,15 @@ test "run IDs are unique" {
 
 test "prefix strings" {
     var gen = Generator{};
-    var buf: [32]u8 = undefined;
+    var buf: [MAX_ID_LEN]u8 = undefined;
 
-    const wf = gen.next(.workflow, 0, &buf);
+    const wf = gen.next(.workflow, 0, 1, &buf);
     try std.testing.expect(std.mem.startsWith(u8, wf, "wfr-"));
 
-    const act = gen.next(.action, 0, &buf);
+    const act = gen.next(.action, 0, 1, &buf);
     try std.testing.expect(std.mem.startsWith(u8, act, "act-"));
 
-    const job = gen.next(.job, 0, &buf);
+    const job = gen.next(.job, 0, 1, &buf);
     try std.testing.expect(std.mem.startsWith(u8, job, "job-"));
 }
 
@@ -276,8 +291,8 @@ test "extractSlot returns null for invalid IDs" {
 test "preRouteByRunId extracts the slot" {
     const proto = @import("../protocol/proto.zig");
     var gen = Generator{};
-    var buf: [32]u8 = undefined;
-    const id = gen.next(.workflow, 777, &buf);
+    var buf: [MAX_ID_LEN]u8 = undefined;
+    const id = gen.next(.workflow, 777, 1, &buf);
 
     const req = proto.Request{
         .header = proto.RequestHeader.init(.ping, 0),
@@ -293,12 +308,14 @@ test "preRouteByRunId extracts the slot" {
 test "looksGenerated: the generator's own form, and nothing else" {
     var gen = Generator{};
     var buf: [MAX_ID_LEN]u8 = undefined;
-    const minted = gen.next(.workflow, 7, &buf);
+    const minted = gen.next(.workflow, 7, 1, &buf);
     try std.testing.expect(looksGenerated(.workflow, minted));
-    try std.testing.expect(looksGenerated(.workflow, "wfr-1a2b-3"));
+    try std.testing.expect(looksGenerated(.workflow, "wfr-1a2b-3-1c"));
     // A client's own numbering never collides with the minted form.
     try std.testing.expect(!looksGenerated(.workflow, "wfr-2025"));
-    try std.testing.expect(!looksGenerated(.workflow, "wfr-1a2b-"));
+    try std.testing.expect(!looksGenerated(.workflow, "wfr-1a2b-3"));
+    try std.testing.expect(!looksGenerated(.workflow, "wfr-1a2b-3-"));
+    try std.testing.expect(!looksGenerated(.workflow, "wfr-1a2b-3-1c-4"));
     try std.testing.expect(!looksGenerated(.workflow, "wfr-"));
     try std.testing.expect(!looksGenerated(.workflow, "wfr-order-17"));
     try std.testing.expect(!looksGenerated(.workflow, "order-123"));
@@ -313,8 +330,8 @@ test "two shards minting for one slot in one millisecond never mint the same id"
     // Same clock, same slot, same sequence: only the tag differs.
     a.last_ms = currentMs() + 1000;
     b.last_ms = a.last_ms;
-    const ia = a.next(.action, 7, &buf_a);
-    const ib = b.next(.action, 7, &buf_b);
+    const ia = a.next(.action, 7, 1, &buf_a);
+    const ib = b.next(.action, 7, 1, &buf_b);
     try std.testing.expect(!std.mem.eql(u8, ia, ib));
     try std.testing.expectEqual(extractSlot(ia), extractSlot(ib));
 }
@@ -333,9 +350,66 @@ test "a generator never repeats an id: not past 256 in a millisecond, not when t
     var buf: [MAX_ID_LEN]u8 = undefined;
     var i: usize = 0;
     while (i < 600) : (i += 1) {
-        const id = gen.next(.workflow, 5, &buf);
+        const id = gen.next(.workflow, 5, 1, &buf);
         const gop = try seen.getOrPut(try std.testing.allocator.dupe(u8, id));
         try std.testing.expect(!gop.found_existing);
     }
     try std.testing.expectEqual(@as(usize, 600), seen.count());
+}
+
+test "a shard's next leader, its clock behind the last one's, never mints the last leader's ids" {
+    // Two replicas of shard 3: the same number, generators starting fresh,
+    // and the new leader's clock no later than the old one's.
+    var old = Generator{ .shard = 3 };
+    var new = Generator{ .shard = 3 };
+    const start = currentMs() + 60_000;
+    var seen = std.StringHashMap(void).init(std.testing.allocator);
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| std.testing.allocator.free(k.*);
+        seen.deinit();
+    }
+    var buf: [MAX_ID_LEN]u8 = undefined;
+    for ([_]*Generator{ &old, &new }, [_]u64{ 7, 8 }) |g, term| {
+        // Pinned ahead of the wall clock: both mint the same milliseconds.
+        g.last_ms = start;
+        for (0..300) |_| {
+            const id = g.next(.action, 9, term, &buf);
+            const gop = try seen.getOrPut(try std.testing.allocator.dupe(u8, id));
+            try std.testing.expect(!gop.found_existing);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 600), seen.count());
+}
+
+test "the longest id fits a run id field" {
+    var gen = Generator{ .shard = std.math.maxInt(u16), .last_ms = 0x3FF_FFFF_FFFF, .sequence = 255 };
+    var buf: [MAX_ID_LEN]u8 = undefined;
+    const id = gen.next(.workflow, SLOTS - 1, @import("../raft/node.zig").MAX_TERM, &buf);
+    try std.testing.expect(id.len <= MAX_ID_LEN);
+    try std.testing.expect(MAX_ID_LEN <= @import("../protocol/action_entries.zig").MAX_RUN_ID);
+}
+
+test "every production mint passes its shard's live term" {
+    // A site that passed a constant would mint a term's ids from any
+    // leader. Split so this test's own text doesn't match.
+    const needle = "run_id_gen" ++ ".next(";
+    const sources = [_][]const u8{
+        @embedFile("../actions/handler.zig"),
+        @embedFile("../processing/handler.zig"),
+        @embedFile("../workflow/handler.zig"),
+    };
+    var sites: usize = 0;
+    for (sources) |src| {
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, src, at, needle)) |i| : (at = i + needle.len) {
+            const end = std.mem.indexOfScalarPos(u8, src, i, ';') orelse return error.TestUnexpectedResult;
+            const call = src[i..end];
+            try std.testing.expect(std.mem.indexOf(u8, call, "shard.raft_node.current_term") != null);
+            sites += 1;
+        }
+    }
+    // Every production site: a new one belongs in this list's files, or
+    // the list grows.
+    try std.testing.expectEqual(@as(usize, 6), sites);
 }

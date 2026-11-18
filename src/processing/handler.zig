@@ -670,8 +670,8 @@ pub const ProcessingHandler = struct {
 
         // A job id routes nothing (every processing op runs on group 0), so
         // its slot bits are 0.
-        var id_buf: [32]u8 = undefined;
-        const job_id = shard.run_id_gen.next(.job, 0, &id_buf);
+        var id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+        const job_id = shard.run_id_gen.next(.job, 0, shard.raft_node.current_term, &id_buf);
 
         // Persist through Raft; the applier builds the job record and its
         // pipelines from the entry — the same applier a restart uses.

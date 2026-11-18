@@ -105,7 +105,7 @@ pub const table = [_]ops.Op{
             .{ .name = "outcome", .T = Optional(Bytes(MAX_OUTCOME)), .doc = "The outcome a completed run's worker named, which a workflow step follows; none for success" },
             .{ .name = "held", .T = Optional(Bytes(MAX_HELD_NOTE)), .doc = "Why its lease, past due, isn't ended: its end waits for room on the calling workflow's shard" },
         }),
-        .cli = .{ .expose = .hand, .render = .record, .examples = &.{"flo action status act-1a2b3c4d5e6f00-3"} },
+        .cli = .{ .expose = .hand, .render = .record, .examples = &.{"flo action status act-1a2b3c4d5e6f00-3-1c"} },
         .doc = "A run's status, timestamps, attempts, worker, and its output or last error.",
     },
     .{

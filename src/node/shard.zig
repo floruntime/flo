@@ -8588,6 +8588,14 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
     // Everything replay put in the log came from disk.
     raft.markDurable(raft.log.lastIndex());
     const cfg_index = raft.log.last_config_index;
+    // The log is evidence of the term too: a hard state that is missing,
+    // or behind it, never lets the node act in a term it already left,
+    // alone or in a group: a term it led minted run ids.
+    if (raft.log.lastTerm() > raft_node_mod.MAX_TERM) {
+        log.err("shard {d}: the log's last entry is from term {d}, past the highest term a node takes ({d}); refusing to start on it", .{ shard_id, raft.log.lastTerm(), raft_node_mod.MAX_TERM });
+        return error.TermSpaceExhausted;
+    }
+    raft.current_term = @max(raft.current_term, raft.log.lastTerm());
     if (role == .single) {
         // A data directory that belonged to a group must not lead alone:
         // it would take writes the group never sees.
@@ -8612,13 +8620,6 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
         return raft.bootstrap();
     }
     const empty = raft.log.lastIndex() == 0;
-    // The log is evidence of the term too: a hard state that is missing,
-    // or behind it, never lets the node act in a term it already left.
-    if (raft.log.lastTerm() > raft_node_mod.MAX_TERM) {
-        log.err("shard {d}: the log's last entry is from term {d}, past the highest term a node takes ({d}); refusing to start on it", .{ shard_id, raft.log.lastTerm(), raft_node_mod.MAX_TERM });
-        return error.TermSpaceExhausted;
-    }
-    raft.current_term = @max(raft.current_term, raft.log.lastTerm());
     if (cfg_index > 0) {
         const e = raft.log.getEntryCopy(cfg_index, buf) orelse {
             log.err("shard {d}: the config entry at index {d} could not be read; refusing to guess the membership", .{ shard_id, cfg_index });
@@ -18317,6 +18318,25 @@ test "a shard whose saved term or log runs past the term ceiling refuses to star
     }
 }
 
+test "a lone node whose hard state is gone leads past its log's last term, never in a term it already led" {
+    // No HARDSTATE (lost, or never written), and a log whose entries reach
+    // term 9: the terms up to 9 may have minted run ids, so it must not
+    // lead in any of them again.
+    var raft = try RaftNode.init(std.testing.allocator, 1, 0, 4096, .{});
+    defer raft.deinit();
+    for ([_]u64{ 2, 9 }, 1..) |term, i| {
+        var e = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, term, i, 0, "");
+        e.header.crc32c = e.computeCrc();
+        _ = try raft.log.append(&e);
+    }
+    var buf: [1024]u8 = undefined;
+    try bringUpGroup(&raft, .single, &buf, 0, 1, false, 0);
+    try std.testing.expect(raft.role == .leader);
+    try std.testing.expectEqual(@as(u64, 10), raft.current_term);
+    // Its noop follows the log, in the new term.
+    try std.testing.expectEqual(@as(u64, 10), raft.log.entryTerm(3).?);
+}
+
 test "a shard brought up with configs above its applied index records each of them, in order" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -25070,7 +25090,7 @@ test "Shard: action.status for a run on another shard goes there, by the run id'
     var gen: run_id_mod.Generator = .{ .shard = 1 };
     var id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
     const run_id = for (0..256) |_| {
-        const id = gen.next(.action, slot, &id_buf);
+        const id = gen.next(.action, slot, 1, &id_buf);
         if (a.router.hashToShard(node_router.routeNsKey(.default, id)) == 0) break id;
     } else return error.TestUnexpectedResult;
     _ = try applyActionEntry(&two.shards[1], .action_register, testRegister("echo"), 1, 1);
@@ -25136,7 +25156,7 @@ test "Shard: every processing op is pinned to group 0, whatever its job id's bit
     // routing sent status for it to shard 1.
     var gen: run_id_mod.Generator = .{};
     var id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
-    const job_id = gen.next(.job, 1, &id_buf);
+    const job_id = gen.next(.job, 1, 1, &id_buf);
     for ([_]proto.OpCode{ .processing_submit, .processing_stop, .processing_cancel, .processing_status, .processing_remove }) |op| {
         const req: proto.Request = .{ .header = proto.RequestHeader.init(op, 1), .namespace = "", .key = job_id, .value = "" };
         switch (b.resolveTarget(@backingInt(op), req)) {
@@ -26206,8 +26226,8 @@ test "Shard: a run id the client chose is told apart from a generated one exactl
     try two.init();
     defer two.deinit();
     const a = &two.shards[0];
-    var buf: [32]u8 = undefined;
-    const generated = a.run_id_gen.next(.workflow, 3, &buf);
+    var buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const generated = a.run_id_gen.next(.workflow, 3, a.raft_node.current_term, &buf);
     const chosen = [_][]const u8{ "alpha", "order-123", "run-1", "job-abc", "123e4567-e89b-12d3-a456-426614174000" };
     for (chosen) |id| try std.testing.expect(a.runIdUnplaced(.{ .header = proto.RequestHeader.init(.workflow_status, 1), .namespace = "", .key = id, .value = "" }));
     try std.testing.expect(!a.runIdUnplaced(.{ .header = proto.RequestHeader.init(.workflow_status, 1), .namespace = "", .key = generated, .value = "" }));
@@ -28838,8 +28858,8 @@ test "Shard: a step's call of an action on another shard is answered there, and 
     const n = try callNames(&two, 1, 0, &ab, &wb);
     // Chosen as a step chooses it: in the action's slot, so the run's
     // reports route to its shard.
-    var rb: [32]u8 = undefined;
-    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), &rb);
+    var rb: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), a.raft_node.current_term, &rb);
     _ = try proposeAction(b, .action_register, testRegister(n.action));
     two.settle();
     try proposeCall(a, n.action, n.workflow, rid, false);
@@ -28878,8 +28898,8 @@ test "Shard: a call cleared before its run ends, as a cancelled workflow's is, t
     const n = try callNames(&two, 1, 0, &ab, &wb);
     // Chosen as a step chooses it: in the action's slot, so the run's
     // reports route to its shard.
-    var rb: [32]u8 = undefined;
-    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), &rb);
+    var rb: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), a.raft_node.current_term, &rb);
     _ = try proposeAction(b, .action_register, testRegister(n.action));
     two.settle();
     try proposeCall(a, n.action, n.workflow, rid, false);
@@ -28907,8 +28927,8 @@ test "Shard: a call of an action not registered is answered so, asked again once
     const n = try callNames(&two, 1, 0, &ab, &wb);
     // Chosen as a step chooses it: in the action's slot, so the run's
     // reports route to its shard.
-    var rb: [32]u8 = undefined;
-    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), &rb);
+    var rb: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), a.raft_node.current_term, &rb);
     try proposeCall(a, n.action, n.workflow, rid, true);
     two.settle();
     pumpChannels(&two);
@@ -28938,8 +28958,8 @@ test "Shard: a task an await on another shard couldn't give goes back to its run
     var wb: [16]u8 = undefined;
     const n = try callNames(&two, 1, 0, &ab, &wb);
     _ = try proposeAction(b, .action_register, testRegister(n.action));
-    var rb: [32]u8 = undefined;
-    const rid = b.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), &rb);
+    var rb: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const rid = b.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), b.raft_node.current_term, &rb);
     _ = try proposeAction(b, .action_invoke, testInvoke(n.action, rid));
     two.settle();
     // A worker on b takes it.
@@ -29054,8 +29074,8 @@ test "Shard: a worker's complete of a run a step called is refused while the cal
     var ab: [16]u8 = undefined;
     var wb: [16]u8 = undefined;
     const n = try callNames(&two, 1, 0, &ab, &wb);
-    var rb: [32]u8 = undefined;
-    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), &rb);
+    var rb: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), a.raft_node.current_term, &rb);
     _ = try proposeAction(b, .action_register, testRegister(n.action));
     two.settle();
     try proposeCall(a, n.action, n.workflow, rid, false);
@@ -29130,8 +29150,8 @@ test "Shard: a call's start whose run id another caller's run holds is answered 
     var ab: [16]u8 = undefined;
     var wb: [16]u8 = undefined;
     const n = try callNames(&two, 1, 0, &ab, &wb);
-    var rb: [32]u8 = undefined;
-    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), &rb);
+    var rb: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), a.raft_node.current_term, &rb);
     _ = try proposeAction(b, .action_register, testRegister(n.action));
     // A client's run already holds the id.
     _ = try proposeAction(b, .action_invoke, testInvoke(n.action, rid));
@@ -29200,8 +29220,8 @@ test "Shard: a worker's fail that ends a run a step called is refused while the 
     var ab: [16]u8 = undefined;
     var wb: [16]u8 = undefined;
     const n = try callNames(&two, 1, 0, &ab, &wb);
-    var rb: [32]u8 = undefined;
-    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), &rb);
+    var rb: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), a.raft_node.current_term, &rb);
     _ = try proposeAction(b, .action_register, testRegister(n.action));
     two.settle();
     try proposeCall(a, n.action, n.workflow, rid, false);
@@ -29369,6 +29389,41 @@ fn createWorkflow(two: *TwoShards, s: *Shard, c: TestClient, id: u64, yaml: []co
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, s, &out)).header.status);
 }
 
+test "Shard: a workflow started by a client carries its leader's term in its run id, and a later term's start the later term" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    var wb: [16]u8 = undefined;
+    const wf = try workflowOn(&two, 0, "wf", &wb);
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var yb: [512]u8 = undefined;
+    try createWorkflow(&two, a, c, 1, try std.fmt.bufPrint(&yb, "{{\"kind\":\"Workflow\",\"name\":\"{s}\",\"version\":\"1.0.0\",\"start\":{{\"wait_for_signal\":{{\"type\":\"go\"}},\"transitions\":{{\"success\":\"flo.Completed\"}}}}}}", .{wf}), wf);
+    var ids: [2][run_id_mod.MAX_ID_LEN]u8 = undefined;
+    var lens: [2]usize = undefined;
+    for (0..2) |i| {
+        if (i == 1) {
+            // Leader again in a later term.
+            const raft = a.raft_node;
+            raft.current_term += 7;
+            raft.ready_index = raft.last_applied;
+        }
+        var out: [512]u8 = undefined;
+        a.runRequest(c.conn, try ParkTest.request(.workflow_start, 2 + i, proto.DEFAULT_NAMESPACE, wf, "", ""), .client);
+        two.settle();
+        const started = try nextAnswer(c, a, &out);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), started.header.status);
+        @memcpy(ids[i][0..started.data.len], started.data);
+        lens[i] = started.data.len;
+        var tb: [20]u8 = undefined;
+        const tail = try std.fmt.bufPrint(&tb, "-{x}", .{a.raft_node.current_term});
+        try std.testing.expect(std.mem.endsWith(u8, ids[i][0..lens[i]], tail));
+    }
+    try std.testing.expect(!std.mem.eql(u8, ids[0][0..lens[0]], ids[1][0..lens[1]]));
+}
+
 test "Shard: a channel carries a parent's child workflow to its shard and the child's end back, and the parent resumes" {
     var two: TwoShards = undefined;
     try two.init();
@@ -29487,8 +29542,8 @@ test "Shard: a child's call cleared before the child ends takes its end as nothi
     defer _ = std.c.close(cb.pair[1]);
     var yb: [512]u8 = undefined;
     try createWorkflow(&two, b, cb, 1, try std.fmt.bufPrint(&yb, "{{\"kind\":\"Workflow\",\"name\":\"{s}\",\"version\":\"1.0.0\",\"start\":{{\"wait_for_signal\":{{\"type\":\"go\"}},\"transitions\":{{\"success\":\"flo.Completed\"}}}}}}", .{kid_wf}), kid_wf);
-    var rb: [32]u8 = undefined;
-    const rid = a.run_id_gen.next(.workflow, node_router.nsKeySlot(.default, kid_wf), &rb);
+    var rb: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const rid = a.run_id_gen.next(.workflow, node_router.nsKeySlot(.default, kid_wf), a.raft_node.current_term, &rb);
     const slot = calls_machine.callerSlot(.default, parent_wf);
     _ = try proposeAction(a, .step_call, action_entries.Call.Value{ .ns = ns_table.DEFAULT.int(), .kind = .workflow, .caller_run = "p-run", .caller_workflow = parent_wf, .step = "s", .target = kid_wf, .version = "", .run = rid, .input = "{}", .can_wait = false });
     two.settle();
