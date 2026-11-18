@@ -216,6 +216,13 @@ test "e2e/scoping: a job reads other namespaces but writes only its own" {
     ;
     const path = try stdx.testing.writeDottedToTempYaml(testing.allocator, def, "reader-job.yaml");
     defer stdx.testing.cleanupTempFile(testing.allocator, path);
+    // The job lives on its first source's shard, found by that namespace's
+    // id: one that doesn't exist yet is refused, never created for it.
+    var early = try ctx.cli.run(&.{ "processing", "submit", path, "-n", "acme" });
+    defer early.deinit();
+    try testing.expect(early.exit_code != 0);
+    try stdx.testing.assertContains(early, "create namespace shared first, then submit");
+    try ctx.exec(&.{ "ns", "create", "shared" });
     try ctx.exec(&.{ "processing", "submit", path, "-n", "acme" });
     try ctx.exec(&.{ "stream", "append", "feed", "shared-record", "-n", "shared" });
     try testing.expect(try readsBack(ctx, "copied", "acme", "shared-record"));

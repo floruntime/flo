@@ -975,6 +975,7 @@ pub const Shard = struct {
         processing_handler.own_shard = shard_id;
         processing_handler.local_kv = kv_handler;
         processing_handler.ns_table = namespace_handler.table;
+        processing_handler.store = &partition.store;
 
         // Create SegmentWriter (persistence — per-shard, not per-partition)
         const seg_writer = try allocator.create(SegmentWriter);
@@ -1050,7 +1051,6 @@ pub const Shard = struct {
         replay_registry.register(.raft_config, @ptrCast(raft_node), applyRaftConfig);
         workflow_handler.registerReplay(&replay_registry);
         namespace_handler.registerReplay(&replay_registry);
-        processing_handler.registerReplay(&replay_registry);
         replay_registry.register(.action_abandon, @ptrCast(actions_handler), ActionsHandler.applyAbandonMessage);
         try checkAppliers(shard_id, &replay_registry);
 
@@ -2283,7 +2283,10 @@ pub const Shard = struct {
         // per namespace. One shard routes nothing: its write waits the same
         // way where it runs (`prepareWrite`), after a follower has
         // forwarded it to its leader.
-        if (self.shardCount() > 1 and req.ns_id == .invalid and req.key.len > 0 and op < proto.MAX_OPCODES and dispatcher_mod.opCreates(@fromBackingInt(@intCast(op)))) {
+        // A processing submit names no key, but routes by its namespace's id
+        // too: to its first source's shard (`submitHash` below).
+        const keyed = req.key.len > 0 or op == @backingInt(proto.OpCode.processing_submit);
+        if (self.shardCount() > 1 and req.ns_id == .invalid and keyed and op < proto.MAX_OPCODES and dispatcher_mod.opCreates(@fromBackingInt(@intCast(op)))) {
             if (self.id != 0) return self.ensureThenRun(conn, req, auth.origin);
             // Shard 0 proposes the create and routes by the id it gave.
             switch (self.namespace_handler.prepareWrite(self, req.namespace)) {
@@ -2328,6 +2331,15 @@ pub const Shard = struct {
             if (self.id == 0 and self.shardCount() > 1 and requestWrites(req) and !creates) if (nh.unpublishedIndex(name)) |index|
                 return self.holdAtEdgeFor(conn, req, name, auth.origin, nowMs(), index);
         }
+
+        // A processing job lives on its first source's shard: its submit
+        // goes there, routed by that source's hash as a stream or TS op on
+        // it routes, found from the definition by the namespace's id, so
+        // only past the wait above.
+        if (op == @backingInt(proto.OpCode.processing_submit) and self.shardCount() > 1) if (self.processing_handler.submitHash(req)) |hash| {
+            const home = self.router.hashToShard(hash);
+            if (home != self.id) return self.forwardToShard(home, conn, req, auth);
+        };
 
         // A start that chooses its run id is decided on its workflow's
         // shard, found by the namespace's id: only past the wait above.
@@ -2770,7 +2782,11 @@ pub const Shard = struct {
         // create nothing, wherever they are sent, and nor does a request
         // that names nothing to write to. A job submit names its targets in
         // its definition: its handler reserves once the definition passes.
-        if (req.key.len > 0 and req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opCreates(@fromBackingInt(@intCast(req.header.op_code)))) {
+        // A submit forwarded to its job's home ahead of its namespace's
+        // publish waits for it here, as a keyed write would, and is routed
+        // again by the id: its home was found by that id.
+        const unknown_submit = req.header.op_code == @backingInt(proto.OpCode.processing_submit) and req.ns_id == .invalid and self.id != 0 and self.shardCount() > 1;
+        if ((req.key.len > 0 or unknown_submit) and req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opCreates(@fromBackingInt(@intCast(req.header.op_code)))) {
             switch (self.namespace_handler.prepareWrite(self, req.namespace)) {
                 .go => {},
                 // Refused before anything was proposed, so a retry is safe.
@@ -6060,6 +6076,13 @@ pub const Shard = struct {
             if (leads and @import("test_faults.zig").of(entry) == .panic_leader_step) @panic("test fault: panic in the leader's step after apply");
         }
         self.workflow_handler.startApplied(self, entry, result);
+        // A leader's pipelines follow its jobs as each job entry applies,
+        // not at the next tick: a submit's job runs from its next poll.
+        switch (@as(entry_mod.EntryType, @fromBackingInt(@intCast(entry.header.entry_type)))) {
+            .processing_submit, .processing_stop, .processing_cancel, .processing_remove => if (self.raft_node.role == .leader and self.raft_node.leaderReady())
+                self.processing_handler.reconcileAt(self.raft_node.current_term),
+            else => {},
+        }
         // Each message an inbound or unpark applied is, to these steps, an
         // entry of its own: a blocking read waits on its key, a dequeue on
         // its queue.
@@ -6542,7 +6565,9 @@ pub const Shard = struct {
     pub fn runProducers(self: *Shard) void {
         const now = nowMs();
         // Drive processing pipelines (poll sources → write sinks)
-        if (!self.heldIfHalted(.processing, self.processing_handler.pipelines.count() > 0)) {
+        // Whether a job runs is applied state: a halted leader builds no
+        // pipelines, and its running jobs are still work it holds back.
+        if (!self.heldIfHalted(.processing, self.processing_handler.hasRunningJob())) {
             self.duties.note(.processing, if (self.processing_handler.tickPipelines(self)) .sink_halted else null, now);
         } else self.processing_handler.stopLeading(self);
         // Drive workflow stream triggers (poll streams → start runs)
@@ -11458,7 +11483,7 @@ test "Shard: a job whose sink writes to the system namespace, named or as the jo
         try std.testing.expect(std.mem.indexOf(u8, (try r.refused()).message, "reserved namespace name") != null);
     }
     try std.testing.expectEqual(from, a.raft_node.log.lastIndex());
-    try std.testing.expectEqual(@as(u32, 0), a.processing_handler.jobs.count());
+    try std.testing.expectEqual(@as(u32, 0), a.processing_handler.jobCount());
 }
 
 /// Client writes of `value` to `key` in the default namespace, from request
@@ -11800,6 +11825,53 @@ test "Shard: a namespace still unknown when the held write runs again is refused
     try std.testing.expectEqual(@as(usize, 0), b.gathers.inUse());
 }
 
+test "Shard: a submit into a namespace it creates is homed on its source's shard by the namespace's real id, from either shard" {
+    for ([_]u16{ 0, 1 }) |edge| {
+        var two: TwoShards = undefined;
+        try two.init();
+        defer two.deinit();
+        const a = &two.shards[0];
+        for (&two.shards) |*s| s.wireHandlerShardPtrs();
+        // A source that an unresolved id would put on the edge's shard and
+        // the namespace's real id puts on the other: homed before the id
+        // resolves, the job would land on the wrong shard.
+        const id = nextNamespaceId(a);
+        const home: u16 = 1 - edge;
+        var sbuf: [16]u8 = undefined;
+        var i: usize = 0;
+        const source = while (true) : (i += 1) {
+            const n = try std.fmt.bufPrint(&sbuf, "src{d}", .{i});
+            if (a.router.hashToShard(node_router.routeNsKey(.invalid, n)) == edge and a.router.hashToShard(node_router.routeNsKey(id, n)) == home) break n;
+        };
+        const at = &two.shards[edge];
+        const c = try TestClient.open(at);
+        defer _ = std.c.close(c.pair[1]);
+        var ybuf: [256]u8 = undefined;
+        const yaml = try std.fmt.bufPrint(&ybuf,
+            \\kind: Processing
+            \\name: fresh-job
+            \\namespace: fresh
+            \\sources:
+            \\  - name: src
+            \\    stream: {{ name: {s} }}
+            \\sinks:
+            \\  - name: out
+            \\    stream: {{ name: out }}
+        , .{source});
+        // The namespace's create and the submit go in together; nothing has
+        // applied either when the submit routes.
+        at.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "fresh", "", yaml, ""), .client);
+        two.settle();
+        try std.testing.expectEqual(id, two.namespaces.lookup("fresh").?);
+        try std.testing.expectEqual(@as(usize, 0), two.shards[edge].processing_handler.jobCount());
+        try std.testing.expectEqual(@as(usize, 1), two.shards[home].processing_handler.jobCount());
+        // Its id carries the slot its source's stream ops route by.
+        const job = two.shards[home].processing_handler.firstJob().?;
+        try std.testing.expectEqual(node_router.slot(node_router.routeNsKey(id, source)), run_id_mod.extractSlot(job.job_id_owned).?);
+        try std.testing.expectEqual(ProcessingHandler.JobStatus.running, job.status);
+    }
+}
+
 test "Shard: a processing sink in a namespace not yet published writes nothing until it is, then writes on the shard its id puts the stream on" {
     var two: TwoShards = undefined;
     try two.init();
@@ -11841,7 +11913,7 @@ test "Shard: a processing sink in a namespace not yet published writes nothing u
     // The create and the submit apply; shard 0 hasn't published yet.
     _ = a.applyCommitted();
     try std.testing.expect(two.namespaces.lookup("pns") == null);
-    try std.testing.expectEqual(@as(u32, 1), a.processing_handler.jobs.count());
+    try std.testing.expectEqual(@as(u32, 1), a.processing_handler.jobCount());
 
     const from_a = a.raft_node.log.lastIndex() + 1;
     var metrics = MetricsRegistry.init(std.testing.allocator);
@@ -11853,12 +11925,11 @@ test "Shard: a processing sink in a namespace not yet published writes nothing u
     try std.testing.expectEqualStrings("pns", it.next().?.wait.namespace);
     try std.testing.expectEqual(@as(usize, 0), entriesOf(a, .processing_sink_batch, from_a));
     try std.testing.expectEqual(@as(u64, 1), metrics.processing.pipelines_waiting_namespace.load(.monotonic));
-    // A node that stops leading says nothing of it, gauge included: its
-    // next leader will.
+    // A node that stops leading says nothing of it, gauge included, and
+    // keeps no pipelines: its next leader builds its own.
     a.raft_node.role = .follower;
     _ = try a.tick(0);
-    it = a.processing_handler.pipelines.valueIterator();
-    try std.testing.expect(it.next().?.wait == .none);
+    try std.testing.expectEqual(@as(u32, 0), a.processing_handler.pipelines.count());
     try std.testing.expectEqual(@as(u64, 0), metrics.processing.pipelines_waiting_namespace.load(.monotonic));
     a.raft_node.role = .leader;
     two.settle();
@@ -11872,8 +11943,7 @@ test "Shard: a processing sink in a namespace not yet published writes nothing u
     try std.testing.expectEqual(@as(usize, 0), entriesOf(a, .stream_append, from_a));
     try std.testing.expectEqual(@as(usize, 1), streamRecords(b, target, "pns"));
     try std.testing.expectEqual(@as(usize, 0), streamRecords(a, target, "pns"));
-    var jobs = a.processing_handler.jobs.valueIterator();
-    try std.testing.expect(!jobs.next().?.held);
+    try std.testing.expect(!a.processing_handler.firstJob().?.held);
     try std.testing.expectEqual(@as(u64, 0), a.processing_handler.sink_drops + b.processing_handler.sink_drops);
 }
 
@@ -11974,8 +12044,10 @@ fn tsPut(shard: *Shard, measurement: []const u8, value: f64, ts_ns: u64, tags: [
     _ = shard.applyCommitted();
 }
 
-/// A job on shard 0 whose source is `source` (a stream, or a measurement
-/// when `ts`), writing each record to stream `out`; its one pipeline.
+/// A job on shard 0 (its first source an empty stream there) whose second
+/// source is `source` (a stream, or a measurement when `ts`) on another
+/// shard, writing each record to stream `out`: the pipeline of `source`,
+/// which reads it through that shard's inbox.
 fn remoteSourceJob(two: *TwoShards, c: TestClient, source: []const u8, ts: bool, out: []const u8) !*ProcessingHandler.PipelineState {
     return remoteSourceJobLate(two, c, source, ts, out, 0);
 }
@@ -11983,37 +12055,49 @@ fn remoteSourceJob(two: *TwoShards, c: TestClient, source: []const u8, ts: bool,
 /// `remoteSourceJob`, its TS source holding back `lateness_ms`.
 fn remoteSourceJobLate(two: *TwoShards, c: TestClient, source: []const u8, ts: bool, out: []const u8, lateness_ms: u32) !*ProcessingHandler.PipelineState {
     const a = &two.shards[0];
-    var ybuf: [512]u8 = undefined;
+    var hbuf: [16]u8 = undefined;
+    const home = try keyOn(a, .default, 0, &hbuf);
+    var ybuf: [640]u8 = undefined;
     const yaml = if (ts) try std.fmt.bufPrint(&ybuf,
         \\kind: Processing
         \\name: far-src
         \\sources:
+        \\  - name: home
+        \\    stream: {{ name: {s} }}
         \\  - name: src
         \\    ts: {{ measurement: {s}, field: value, lateness_ms: {d} }}
         \\sinks:
         \\  - name: out
         \\    stream: {{ name: {s} }}
-    , .{ source, lateness_ms, out }) else try std.fmt.bufPrint(&ybuf,
+    , .{ home, source, lateness_ms, out }) else try std.fmt.bufPrint(&ybuf,
         \\kind: Processing
         \\name: far-src
         \\sources:
+        \\  - name: home
+        \\    stream: {{ name: {s} }}
         \\  - name: src
         \\    stream: {{ name: {s} }}
         \\sinks:
         \\  - name: out
         \\    stream: {{ name: {s} }}
-    , .{ source, out });
+    , .{ home, source, out });
     a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
     two.settle();
-    var pit = a.processing_handler.pipelines.valueIterator();
-    return pit.next().?;
+    return remotePipeline(a);
+}
+
+/// The pipeline of a job's second source on `a`.
+fn remotePipeline(a: *Shard) *ProcessingHandler.PipelineState {
+    var pit = a.processing_handler.pipelines.iterator();
+    while (pit.next()) |e| if (std.mem.indexOfScalar(u8, e.key_ptr.*, 0) != null) return e.value_ptr;
+    unreachable;
 }
 
 /// A sink batch on shard 0 with no writes, moving pipeline `key`'s cursor
 /// from `from` to `to`, applied.
 fn moveCursor(two: *TwoShards, ns: ns_table.Id, key: []const u8, from: anytype, to: anytype) !void {
     var buf: [256]u8 = undefined;
-    const payload = try @import("../protocol/processing_entries.zig").SinkBatch.encodeInto(&buf, .{ .ns = ns.int(), .pipeline = key, .from_a = from.a, .from_b = from.b, .to_a = to.a, .to_b = to.b, .messages = .{ .bytes = "", .count = 0 } });
+    const payload = try @import("../protocol/processing_entries.zig").SinkBatch.encodeInto(&buf, .{ .ns = ns.int(), .pipeline = key, .from_a = from.a, .from_b = from.b, .to_a = to.a, .to_b = to.b, .records = 0, .messages = .{ .bytes = "", .count = 0 } });
     _ = try two.shards[0].raft_node.propose(.processing_sink_batch, entry_mod.Flags.NONE, payload);
     // Applied without taking the inbox: a page waiting there is the next step's.
     try std.testing.expect(two.shards[0].applyCommitted());
@@ -12267,9 +12351,9 @@ test "Shard: operators that can't be rebuilt for a new term make the pipeline wa
     a.processing_handler.allocator = failing.allocator();
     tickNow(a, pipe);
     try std.testing.expectEqualStrings("out of memory", pipe.wait.operators);
-    var jobs = a.processing_handler.jobs.valueIterator();
+    const job = a.processing_handler.firstJob().?;
     var lb: [512]u8 = undefined;
-    try std.testing.expectEqualStrings("waiting: its operators couldn't be rebuilt: out of memory", a.processing_handler.liveNote(jobs.next().?, &lb).?);
+    try std.testing.expectEqualStrings("waiting: its operators couldn't be rebuilt: out of memory", a.processing_handler.liveNote(&job, &lb).?);
     // Ticks before the next poll don't try again.
     const tried = failing.alloc_index;
     for (0..5) |_| _ = a.processing_handler.tickPipelines(a);
@@ -12333,9 +12417,9 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
         try std.testing.expectEqual(held, channels_mod.metaOf(.{ .store = &r.defaultPartition().store }, 1).bytes);
         try std.testing.expectEqual(held, r.outboxBytes());
     }
-    var jobs = a.processing_handler.jobs.valueIterator();
+    const job = a.processing_handler.firstJob().?;
     var lb: [512]u8 = undefined;
-    try std.testing.expectEqualStrings("waiting: the outbox to shard 1 is full (46 B of 1 B)", a.processing_handler.liveNote(jobs.next().?, &lb).?);
+    try std.testing.expectEqualStrings("waiting: the outbox to shard 1 is full (46 B of 1 B)", a.processing_handler.liveNote(&job, &lb).?);
     // Delivered, acked and trimmed: room again, and the next record goes.
     pumpChannels(&two);
     try std.testing.expectEqual(@as(u64, 0), channels_mod.metaOf(read, 1).bytes);
@@ -12569,11 +12653,155 @@ test "Shard: records whose operators emit nothing aren't read again while their 
     two.settle();
     try std.testing.expectEqual(@as(u64, 5), pipe.records_in);
     try std.testing.expect(!pipe.ahead);
-    var jobs = a.processing_handler.jobs.iterator();
-    const key = jobs.next().?.key_ptr.*;
-    const at = @import("../processing/sinks_machine.zig").cursorOf(.{ .store = &a.defaultPartition().store }, .default, key);
+    const job = a.processing_handler.firstJob().?;
+    const at = @import("../processing/sinks_machine.zig").cursorOf(.{ .store = &a.defaultPartition().store }, .default, job.job_id_owned);
     try std.testing.expectEqual(pipe.stream_cursor_seq, at.b);
     try std.testing.expectEqual(pipe.stream_cursor_ts, at.a);
+    // Every record read is counted once, those whose batch waited too.
+    try std.testing.expectEqual(@as(u64, 5), job.records_processed);
+}
+
+test "Shard: a job's processed count takes each record once, across batches not logged, logged, and refused" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    for ([_][]const u8{ "r0", "r1", "r2" }) |r| _ = try a.stream_handler.appendPayloadToStream(source, "default", r);
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: counted
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\operators:
+        \\  - name: none
+        \\    type: filter
+        \\    condition: value_contains:never-in-a-record
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: counted-out }}
+    , .{source});
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    const pipe = pit.next().?;
+    const Step = struct {
+        fn run(t: *TwoShards, sh: *Shard, p: *ProcessingHandler.PipelineState, src: []const u8, rec: []const u8, logged: bool) !void {
+            _ = try sh.stream_handler.appendPayloadToStream(src, "default", rec);
+            t.settle();
+            // A batch with no writes is logged once a second has passed
+            // since the last; within it, it waits, unlogged.
+            if (logged) p.last_batch_ms = 0;
+            tickNow(sh, p);
+            t.settle();
+        }
+    };
+    const counted = struct {
+        fn n(sh: *Shard) u64 {
+            return sh.processing_handler.firstJob().?.records_processed;
+        }
+    }.n;
+    // Logged: the three there.
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 3), counted(a));
+    // Unlogged, then logged: the next batch takes it, then counts only its
+    // own.
+    try Step.run(&two, a, pipe, source, "r3", false);
+    try std.testing.expectEqual(@as(u64, 3), counted(a));
+    try Step.run(&two, a, pipe, source, "r4", true);
+    try std.testing.expectEqual(@as(u64, 5), counted(a));
+    try Step.run(&two, a, pipe, source, "r5", true);
+    try std.testing.expectEqual(@as(u64, 6), counted(a));
+    // Unlogged, then refused by the log: read again from the logged
+    // cursor, and counted once when a batch goes through.
+    try Step.run(&two, a, pipe, source, "r6", false);
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "r7");
+    two.settle();
+    a.raft_node.writes_stopped = true;
+    pipe.last_batch_ms = 0;
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 6), counted(a));
+    a.raft_node.writes_stopped = false;
+    pipe.last_batch_ms = 0;
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 8), counted(a));
+}
+
+test "Shard: a batch that carries a record on counts the records it covers once, after one not logged" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    var obuf: [16]u8 = undefined;
+    const out = try keyOn(a, .default, 0, &obuf);
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "drop-0");
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: carrying
+        \\batch_size: 500
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\operators:
+        \\  - name: some
+        \\    type: filter
+        \\    condition: value_contains:keep
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: {s} }}
+        \\  - name: again
+        \\    stream: {{ name: {s} }}
+    , .{ source, out, out });
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    const pipe = pit.next().?;
+    const counted = struct {
+        fn n(sh: *Shard) u64 {
+            return sh.processing_handler.firstJob().?.records_processed;
+        }
+    }.n;
+    // A record with no writes, within a second of the last batch: read on,
+    // not logged.
+    pipe.last_batch_ms = a.processing_handler.mono_ms();
+    tickNow(a, pipe);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 0), counted(a));
+    try std.testing.expect(pipe.ahead);
+    // Records of two writes each, one more than one batch's writes hold:
+    // the batch covers the first record and those it holds, the last
+    // carried to the next, which it leads without the cursor being read
+    // again.
+    const fit = channels_mod.MAX_SENDS / 2;
+    var rbuf: [16]u8 = undefined;
+    for (0..fit + 1) |i| _ = try a.stream_handler.appendPayloadToStream(source, "default", try std.fmt.bufPrint(&rbuf, "keep-{d}", .{i}));
+    two.settle();
+    tickNow(a, pipe);
+    _ = a.applyCommitted();
+    try std.testing.expectEqual(@as(u64, 1 + fit), counted(a));
+    try std.testing.expect(pipe.carry_n > 0);
+    for (0..3) |_| {
+        tickNow(a, pipe);
+        two.settle();
+    }
+    try std.testing.expectEqual(@as(u64, fit + 2), counted(a));
 }
 
 test "Shard: a batch proposed again in a new term before the first applied lands once" {
@@ -12654,15 +12882,14 @@ test "Shard: a record whose writes don't fit one entry is skipped, counted, and 
         const name = try std.fmt.bufPrint(&nb, "out{d}", .{k});
         try std.testing.expectEqual(@as(usize, 2), streamRecords(a, name, "default") + streamRecords(b, name, "default"));
     }
-    var jobs = a.processing_handler.jobs.valueIterator();
-    const job = jobs.next().?;
+    const job = a.processing_handler.firstJob().?;
     try std.testing.expectEqual(@as(u64, 1), job.drops);
     try std.testing.expectEqual(@as(u64, 1), a.processing_handler.too_large);
     // Counted once as dropped, and once as too large.
     try std.testing.expectEqual(@as(u64, 1), metrics.processing.records_dropped_total.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), metrics.processing.records_too_large_total.load(.monotonic));
     var lb: [512]u8 = undefined;
-    const note = a.processing_handler.liveNote(job, &lb).?;
+    const note = a.processing_handler.liveNote(&job, &lb).?;
     try std.testing.expect(std.mem.indexOf(u8, note, "1 record skipped") != null);
     try std.testing.expect(std.mem.indexOf(u8, note, "don't fit one entry") != null);
 }
@@ -12955,8 +13182,10 @@ test "Shard: a source page that answers no read in flight, comes in another term
     _ = b.drainInbox();
     const sm_ = @import("../processing/sinks_machine.zig");
     var pkit = a.processing_handler.pipelines.iterator();
-    const pkey = pkit.next().?.key_ptr.*;
-    const ns = a.processing_handler.jobs.getPtr(pkey).?.ns_id;
+    const pkey = while (pkit.next()) |e| {
+        if (std.mem.indexOfScalar(u8, e.key_ptr.*, 0) != null) break e.key_ptr.*;
+    } else unreachable;
+    const ns = a.processing_handler.runs.getPtr(pkey[0..std.mem.indexOfScalar(u8, pkey, 0).?]).?.ns_id;
     const at = sm_.cursorOf(.{ .store = &a.defaultPartition().store }, ns, pkey);
     try moveCursor(&two, ns, pkey, at, .{ .a = at.a, .b = at.b + 1 });
     _ = a.drainInbox();
@@ -25225,23 +25454,25 @@ test "Shard: a request naming no key runs on group 0, from any shard, by a pin a
     try std.testing.expect(two.shards[0].resolveTarget(@backingInt(proto.OpCode.stream_append), req) == .local);
 }
 
-test "Shard: every processing op is pinned to group 0, whatever its job id's bits say" {
+test "Shard: every op naming a processing job goes to the shard its id's slot names; a submit has no dispatcher route" {
     var two: TwoShards = undefined;
     try two.init();
     defer two.deinit();
-    const b = &two.shards[1];
-    // A job id minted with slot 1's bits, which shard 1 owns: the old
-    // routing sent status for it to shard 1.
+    const a = &two.shards[0];
+    // A job id minted with slot 1's bits, which shard 1 owns.
     var gen: run_id_mod.Generator = .{};
     var id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
     const job_id = gen.next(.job, 1, 1, &id_buf);
-    for ([_]proto.OpCode{ .processing_submit, .processing_stop, .processing_cancel, .processing_status, .processing_remove }) |op| {
+    for ([_]proto.OpCode{ .processing_stop, .processing_cancel, .processing_status, .processing_remove }) |op| {
         const req: proto.Request = .{ .header = proto.RequestHeader.init(op, 1), .namespace = "", .key = job_id, .value = "" };
-        switch (b.resolveTarget(@backingInt(op), req)) {
+        switch (a.resolveTarget(@backingInt(op), req)) {
             .local => return error.TestUnexpectedResult,
-            .shard => |t| try std.testing.expectEqual(@as(u16, 0), t.shard_id),
+            .shard => |t| try std.testing.expectEqual(@as(u16, 1), t.shard_id),
         }
     }
+    // A submit is sent to its home by `route`, from its definition.
+    const req: proto.Request = .{ .header = proto.RequestHeader.init(.processing_submit, 1), .namespace = "", .key = "", .value = "" };
+    try std.testing.expect(a.resolveTarget(@backingInt(proto.OpCode.processing_submit), req) == .local);
 }
 
 /// For tests: "k" in "default", as state and a single-key entry keep it.
@@ -27304,7 +27535,7 @@ test "Shard: a processing sink whose shard is capped while apply is suspended ho
     ;
     sh.runRequest(t.conn, try ParkTest.request(.processing_submit, 1, proto.DEFAULT_NAMESPACE, "", yaml, ""), .client);
     _ = sh.applyCommitted();
-    try std.testing.expectEqual(@as(u32, 1), sh.processing_handler.jobs.count());
+    try std.testing.expectEqual(@as(u32, 1), sh.processing_handler.jobCount());
 
     // More source records than the cap.
     const records = 1500;

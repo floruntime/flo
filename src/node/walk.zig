@@ -123,8 +123,8 @@ fn writeEntryTo(op: OpCode, ctx: *anyopaque, ns: dispatcher_mod.WalkNamespace, n
         .processing_list => {
             const handler: *const ProcessingHandler = @ptrCast(@alignCast(ctx));
             const job = handler.listedJob(ns.id, name) orelse return;
-            if (ProcessingHandler.entrySize(job) > w.buffer.len) return error.EntryTooLarge;
-            try ProcessingHandler.writeEntry(job, w);
+            if (ProcessingHandler.entrySize(&job) > w.buffer.len) return error.EntryTooLarge;
+            try ProcessingHandler.writeEntry(&job, w);
         },
         // [name_len:u16][name][version_len:u16][version][created_at:i64][enabled:u8]
         .workflow_list_definitions => {
