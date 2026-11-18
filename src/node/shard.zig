@@ -29293,6 +29293,41 @@ fn createWorkflow(two: *TwoShards, s: *Shard, c: TestClient, id: u64, yaml: []co
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, s, &out)).header.status);
 }
 
+test "Shard: a workflow started by a client carries its leader's term in its run id, and a later term's start the later term" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    var wb: [16]u8 = undefined;
+    const wf = try workflowOn(&two, 0, "wf", &wb);
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var yb: [512]u8 = undefined;
+    try createWorkflow(&two, a, c, 1, try std.fmt.bufPrint(&yb, "{{\"kind\":\"Workflow\",\"name\":\"{s}\",\"version\":\"1.0.0\",\"start\":{{\"wait_for_signal\":{{\"type\":\"go\"}},\"transitions\":{{\"success\":\"flo.Completed\"}}}}}}", .{wf}), wf);
+    var ids: [2][run_id_mod.MAX_ID_LEN]u8 = undefined;
+    var lens: [2]usize = undefined;
+    for (0..2) |i| {
+        if (i == 1) {
+            // Leader again in a later term.
+            const raft = a.raft_node;
+            raft.current_term += 7;
+            raft.ready_index = raft.last_applied;
+        }
+        var out: [512]u8 = undefined;
+        a.runRequest(c.conn, try ParkTest.request(.workflow_start, 2 + i, proto.DEFAULT_NAMESPACE, wf, "", ""), .client);
+        two.settle();
+        const started = try nextAnswer(c, a, &out);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), started.header.status);
+        @memcpy(ids[i][0..started.data.len], started.data);
+        lens[i] = started.data.len;
+        var tb: [20]u8 = undefined;
+        const tail = try std.fmt.bufPrint(&tb, "-{x}", .{a.raft_node.current_term});
+        try std.testing.expect(std.mem.endsWith(u8, ids[i][0..lens[i]], tail));
+    }
+    try std.testing.expect(!std.mem.eql(u8, ids[0][0..lens[0]], ids[1][0..lens[1]]));
+}
+
 test "Shard: a channel carries a parent's child workflow to its shard and the child's end back, and the parent resumes" {
     var two: TwoShards = undefined;
     try two.init();
