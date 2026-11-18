@@ -77,7 +77,14 @@ pub const FamilyState = struct {
     /// Records linked, replaced or unlinked, ever: a reader that published
     /// what the family holds knows from it whether there is more to say.
     commits: u64 = 0,
+    /// Records unlinked, ever: a node remembered before the last unlink may
+    /// be freed.
+    unlinks: u64 = 0,
 };
+
+/// A key prefix of a family whose keys under it only grow.
+const TailKey = struct { fam: u16, len: u8, bytes: [MAX_TAIL_PREFIX]u8 };
+pub const MAX_TAIL_PREFIX = 16;
 
 pub const Store = struct {
     allocator: Allocator,
@@ -104,6 +111,27 @@ pub const Store = struct {
     /// entries' payloads are the inbound's, so this holds until the next
     /// apply.
     messages: std.ArrayListUnmanaged(AppliedMessage) = .empty,
+    /// Per family, the length of a key prefix under which new keys tend to
+    /// come past every key held (a stream's records: an append's first id is
+    /// past its stream's last), or 0. Such a family remembers each prefix's
+    /// greatest node, and a key past it links beside that node without a
+    /// descent. Only speed, never state, because:
+    /// - the slot is checked against its neighbours before use: the key must
+    ///   be past the remembered node and before the node after it, and in
+    ///   a binary tree exactly one of the two has the free side between
+    ///   them. That is the slot a descent finds, so every replica builds the
+    ///   same tree with or without hints; a key that fails the check descends.
+    /// - a remembered node is never freed while held: only `unlink` and
+    ///   `clear` free nodes, and any unlink in the family voids all its hints
+    ///   (`tails_unlinks`), and `clear` empties them.
+    /// - a hint is only remembered by a link and only read by a commit's
+    ///   reserve, both on the applying thread, and a reserved slot holds only
+    ///   until the family's tree next changes (`View.commit`'s `moved`).
+    tail_prefix: [MAX_FAMILIES]u8 = @splat(0),
+    /// Each prefix's greatest node, as of `tails_unlinks`: an unlink in its
+    /// family may have freed it, so one empties them all.
+    tails: std.AutoHashMapUnmanaged(TailKey, *Tree.Node) = .empty,
+    tails_unlinks: [MAX_FAMILIES]u64 = @splat(0),
 
     pub fn init(allocator: Allocator) Store {
         var store: Store = .{ .allocator = allocator };
@@ -124,11 +152,14 @@ pub const Store = struct {
     pub fn deinit(self: *Store) void {
         self.clear();
         self.messages.deinit(self.allocator);
+        self.tails.deinit(self.allocator);
     }
 
     /// Empty every family, seeded again: a store loaded afresh (from a
     /// snapshot, say) builds the trees a new one would.
     pub fn clear(self: *Store) void {
+        self.tails.clearRetainingCapacity();
+        self.tails_unlinks = @splat(0);
         for (&self.families) |*f| {
             while (f.tree.getMin()) |node| {
                 var entry = f.tree.getEntryForExisting(node);
@@ -213,6 +244,83 @@ pub const Store = struct {
         f.count += 1;
         f.commits += 1;
         f.encoded_bytes += RECORD_OVERHEAD + rec.node.key.len + value.len;
+        self.noteTail(fam, &rec.node);
+    }
+
+    /// `link`, at a slot `getEntryFor` found for `rec`'s key with no change
+    /// to the family's tree since: no second descent.
+    pub fn linkAt(self: *Store, fam: u16, entry: *Tree.Entry, rec: *Record, value: []u8) void {
+        const f = &self.families[fam];
+        std.debug.assert(entry.node == null and entry.treap == &f.tree);
+        entry.key = rec.node.key;
+        rec.value = value;
+        entry.set(&rec.node);
+        f.count += 1;
+        f.commits += 1;
+        f.encoded_bytes += RECORD_OVERHEAD + rec.node.key.len + value.len;
+        self.noteTail(fam, &rec.node);
+    }
+
+    /// The slot for `key` in `fam`: its node if held, else where it would
+    /// go, valid until the family's tree next changes.
+    pub fn entryFor(self: *Store, fam: u16, key: []const u8) Tree.Entry {
+        if (self.tailSlot(fam, key)) |slot| return slot;
+        return self.families[fam].tree.getEntryFor(key);
+    }
+
+    /// `fam`'s keys come in rising order under their first `len` bytes: it
+    /// remembers each prefix's greatest node, to link past it without a
+    /// descent (`tail_prefix`).
+    pub fn setTailPrefix(self: *Store, fam: u16, len: u8) void {
+        std.debug.assert(len <= MAX_TAIL_PREFIX);
+        self.tail_prefix[fam] = len;
+    }
+
+    /// Room to remember `key`'s prefix's greatest node, so linking it can't
+    /// fail: what a commit takes before linking.
+    pub fn reserveTail(self: *Store, fam: u16, key: []const u8) Allocator.Error!void {
+        if (tailKey(self, fam, key) == null) return;
+        try self.tails.ensureUnusedCapacity(self.allocator, 1);
+    }
+
+    fn tailKey(self: *const Store, fam: u16, key: []const u8) ?TailKey {
+        const len = self.tail_prefix[fam];
+        if (len == 0 or key.len < len) return null;
+        var k: TailKey = .{ .fam = fam, .len = len, .bytes = @splat(0) };
+        @memcpy(k.bytes[0..len], key[0..len]);
+        return k;
+    }
+
+    /// Where `key` goes beside its prefix's greatest node, when it is past
+    /// that node and before the node after it: the slot a descent finds,
+    /// found without one. Null otherwise.
+    fn tailSlot(self: *Store, fam: u16, key: []const u8) ?Tree.Entry {
+        const k = tailKey(self, fam, key) orelse return null;
+        const f = &self.families[fam];
+        if (self.tails_unlinks[fam] != f.unlinks) {
+            self.tails.clearRetainingCapacity();
+            for (&self.tails_unlinks, &self.families) |*seen, *g| seen.* = g.unlinks;
+            return null;
+        }
+        const tail = self.tails.get(k) orelse return null;
+        if (compareKeys(key, tail.key) != .gt) return null;
+        const after = tail.next();
+        if (after) |n| if (compareKeys(key, n.key) != .lt) return null;
+        // In key order `key` sits between the two, so it goes under
+        // whichever has the free side: `tail`'s right, or else `after`'s
+        // left (the least of `tail`'s right subtree has no left child).
+        const parent = if (tail.children[1] == null) tail else after.?;
+        return .{ .key = key, .treap = &f.tree, .node = null, .context = .{ .inserted_under = parent } };
+    }
+
+    fn noteTail(self: *Store, fam: u16, node: *Tree.Node) void {
+        const k = tailKey(self, fam, node.key) orelse return;
+        if (self.tails_unlinks[fam] != self.families[fam].unlinks) return;
+        if (self.tails.getPtr(k)) |held| {
+            if (compareKeys(node.key, held.*.key) == .gt) held.* = node;
+        } else if (self.tails.available > 0) {
+            self.tails.putAssumeCapacityNoClobber(k, node);
+        }
     }
 
     /// Give the record at `node` a new value, freeing the old one.
@@ -232,6 +340,7 @@ pub const Store = struct {
         entry.set(null);
         f.count -= 1;
         f.commits += 1;
+        f.unlinks += 1;
         f.encoded_bytes -= RECORD_OVERHEAD + rec.node.key.len + rec.value.len;
         self.freeRecord(rec);
     }
@@ -301,6 +410,51 @@ pub fn checksum(store: *Store, fam: u16) u64 {
     var h = std.hash.Wyhash.init(0x666c_6f2d_6661_6d73); // "flo-fams"
     walk(store, fam, Sink{ .h = &h }) catch |err| switch (err) {};
     return h.final();
+}
+
+test "store: a hint that isn't its prefix's greatest node gives no slot past the node after it" {
+    const fam: u16 = 1;
+    const Put = struct {
+        fn value(s: *Store) ![]u8 {
+            return s.allocator.dupe(u8, "v");
+        }
+        fn fresh(s: *Store, key: []const u8) !void {
+            try s.reserveTail(fam, key);
+            const rec = try s.allocRecord(key);
+            var slot = s.entryFor(fam, key);
+            s.linkAt(fam, &slot, rec, try value(s));
+        }
+    };
+    // The tree's shape follows its keys' priorities: other prefixes' keys
+    // first vary it, so in some the hint has no right child and in some it
+    // does.
+    var shaped: [2]bool = .{ false, false };
+    for (0..16) |others| {
+        var store = Store.init(std.testing.allocator);
+        defer store.deinit();
+        store.setTailPrefix(fam, 1);
+        var kb: [2]u8 = undefined;
+        for (0..others) |i| {
+            kb = .{ 'b', @intCast('a' + i) };
+            store.link(fam, try store.allocRecord(&kb), try Put.value(&store));
+        }
+        // "a9" links with no room to remember it, so a lower key linked
+        // after it becomes its prefix's hint: "a0", whose next node is "a9".
+        store.tails.clearAndFree(store.allocator);
+        store.link(fam, try store.allocRecord("a9"), try Put.value(&store));
+        try Put.fresh(&store, "a0");
+        const hint = store.tails.get(Store.tailKey(&store, fam, "a0").?).?;
+        try std.testing.expectEqualStrings("a0", hint.key);
+        shaped[@intFromBool(hint.children[1] == null)] = true;
+        // Past the hint but past "a9" too: the slot must be a descent's.
+        try Put.fresh(&store, "a~");
+        var n: usize = 0;
+        var it = store.range(fam, "a");
+        const want = [_][]const u8{ "a0", "a9", "a~" };
+        while (it.next()) |rec| : (n += 1) try std.testing.expectEqualStrings(want[n], rec.key());
+        try std.testing.expectEqual(want.len, n);
+    }
+    try std.testing.expect(shaped[0] and shaped[1]);
 }
 
 test "store: the same contents reached by different writes in different orders encode the same size and bytes" {
