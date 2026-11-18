@@ -631,6 +631,10 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                 if (m.slot >= node_router.SLOTS or ownerOf(place, m.slot) != place.group) {
                     r.refuse(.bad_request, .malformed, "bad request: a message for a slot this group doesn't own");
                     bug = .wrong_slot;
+                } else if (if (owner) |o| (if (o.malformed) |f| f(&as) else null) else null) |why| {
+                    // Its payload can't apply: built wrong.
+                    r.refuse(.bad_request, .malformed, why);
+                    bug = .bad_payload;
                 } else if (if (owner) |o| namespaceRefusal(o, &as) else null) |why| {
                     // A namespace id no namespace could have: built wrong.
                     r.refuse(.bad_request, .malformed, why);

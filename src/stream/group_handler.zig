@@ -136,10 +136,8 @@ fn readOf(shard: *Shard) view_mod.ReadView {
 }
 
 /// A stream's floor and generation, as its groups read them.
-pub fn streamRecOf(shard: *Shard, sk: machine.StreamKey) machine.StreamRec.Value {
-    var b: [13]u8 = undefined;
-    const got = (readOf(shard).get(machine.Streams_, machine.recKey(&b, sk)) catch return machine.NO_STREAM_REC) orelse return machine.NO_STREAM_REC;
-    return got.v;
+pub fn streamRecOf(shard: *Shard, sk: machine.StreamKey) machine.StreamView {
+    return machine.streamViewOf(readOf(shard), sk);
 }
 
 /// The group named, if its meta is this one's (another may hash the same)

@@ -13,12 +13,11 @@
 //! - `group.dead`: each dead record, keyed (ns id, scope, when it died,
 //!   record id), so a group's dead letters page oldest first.
 //! - `group.stream`: each stream with groups, keyed by its `StreamKey` in
-//!   no namespace: the last record a trim cut (the floor), and its generation,
-//!   which a delete of the stream moves on. The stream's trims and deletes
-//!   write it as they apply (`observe`), one key whatever its groups hold.
-//!   A group of an older generation is gone; one's records at or below the
-//!   floor are trimmed. Both leave by `group.clean` entries, a bounded few
-//!   at a time.
+//!   no namespace: how many groups count it. Its floor (the last record a
+//!   trim cut) and its generation (moved on by a delete) are the streams
+//!   machine's (`stream/machine.zig`, `stream.meta`), read here. A group of
+//!   an older generation is gone; one's records at or below the floor are
+//!   trimmed. Both leave by `group.clean` entries, a bounded few at a time.
 //! - `group.ready`, `group.deadline`: the delivery model's
 //!   (`contract/delivery.zig`). A group's ready keys order by due time, then
 //!   record id.
@@ -90,14 +89,14 @@ pub const Meta = Record(&.{
     .{ .name = "trimmed", .T = Int(u64) },
 });
 
-/// A stream's floor and generation, as its groups read them. Kept only
-/// while groups of it are, live or gone: `groups` counts their metas.
+/// How many groups count a stream, live or gone: kept while any do.
 pub const StreamRec = Record(&.{
-    .{ .name = "floor_ms", .T = Int(u64) },
-    .{ .name = "floor_seq", .T = Int(u64) },
-    .{ .name = "gen", .T = Int(u64) },
     .{ .name = "groups", .T = Int(u64) },
 });
+
+/// A stream as its groups read it: its floor and generation (the streams
+/// machine's) and how many groups count it.
+pub const StreamView = struct { floor_ms: u64, floor_seq: u64, gen: u64, groups: u64 };
 
 /// A deleted group's generation: never a stream's.
 pub const GONE = std.math.maxInt(u64);
@@ -244,25 +243,34 @@ pub fn recKey(buf: *[13]u8, stream: StreamKey) []const u8 {
     return buf;
 }
 
-pub const NO_STREAM_REC: StreamRec.Value = .{ .floor_ms = 0, .floor_seq = 0, .gen = 0, .groups = 0 };
+pub const NO_STREAM_REC: StreamView = .{ .floor_ms = 0, .floor_seq = 0, .gen = 0, .groups = 0 };
 
-fn streamRec(view: *View, sk: StreamKey) ApplyError!StreamRec.Value {
+/// A stream as its groups read it. One the streams machine has no record
+/// of (never written, or deleted with no groups) is at floor 0,
+/// generation 0, as its first append makes it.
+fn streamRec(view: *View, sk: StreamKey) ApplyError!StreamView {
     var b: [13]u8 = undefined;
-    return if (try view.get(Streams_, recKey(&b, sk))) |r| r.v else NO_STREAM_REC;
+    const groups = if (try view.get(Streams_, recKey(&b, sk))) |r| r.v.groups else 0;
+    const m = (try view.get(sm.Metas, &sk)) orelse return .{ .floor_ms = 0, .floor_seq = 0, .gen = 0, .groups = groups };
+    return .{ .floor_ms = m.v.floor_ms, .floor_seq = m.v.floor_seq, .gen = m.v.gen, .groups = groups };
 }
 
-/// A group of the stream made: its record counts it, made at the stream's
-/// trim so far when the stream had none.
-fn addGroup(view: *View, sk: StreamKey) ApplyError!StreamRec.Value {
+/// `streamRec`, from committed state: what a reader outside apply sees.
+pub fn streamViewOf(read: view_mod.ReadView, sk: StreamKey) StreamView {
+    var b: [13]u8 = undefined;
+    const groups = if (read.get(Streams_, recKey(&b, sk)) catch null) |r| r.v.groups else 0;
+    const m = sm.metaAt(read, sk) orelse return .{ .floor_ms = 0, .floor_seq = 0, .gen = 0, .groups = groups };
+    return .{ .floor_ms = m.floor_ms, .floor_seq = m.floor_seq, .gen = m.gen, .groups = groups };
+}
+
+/// A group of the stream made: its record counts it.
+fn addGroup(view: *View, sk: StreamKey) ApplyError!StreamView {
     var b: [13]u8 = undefined;
     const key = recKey(&b, sk);
-    var rec = if (try view.get(Streams_, key)) |r| r.v else blk: {
-        const cut = (try view.streams()).removedThrough(sk);
-        break :blk StreamRec.Value{ .floor_ms = cut.timestamp_ms, .floor_seq = cut.sequence, .gen = 0, .groups = 0 };
-    };
+    var rec = if (try view.get(Streams_, key)) |r| r.v else StreamRec.Value{ .groups = 0 };
     rec.groups += 1;
     try view.put(Streams_, key, .{ .v = rec });
-    return rec;
+    return streamRec(view, sk);
 }
 
 /// A group's meta dropped: its stream's record goes with its last.
@@ -275,16 +283,17 @@ fn dropGroup(view: *View, sk: StreamKey) ApplyError!void {
     try view.put(Streams_, key, .{ .v = rec });
 }
 
-pub fn floorOf(r: StreamRec.Value) StreamID {
+pub fn floorOf(r: StreamView) StreamID {
     return .{ .timestamp_ms = r.floor_ms, .sequence = r.floor_seq };
 }
 
 /// Whether a group's meta is of its stream's current generation.
-pub fn live(m: Meta.Value, r: StreamRec.Value) bool {
+pub fn live(m: Meta.Value, r: StreamView) bool {
     return m.gen == r.gen;
 }
 
 const qm = @import("../queue/machine.zig");
+const sm = @import("machine.zig");
 const Helds = qm.Helds;
 const HELD_KEY = qm.HELD_KEY;
 
@@ -336,7 +345,14 @@ fn deadlinePrefix(buf: *[12 + SCOPE_LEN]u8, expiry_ns: u64, ns: NamespaceId, sco
 fn groupKeys(out: *KeySet, ns: NamespaceId, scope: []const u8) error{OutOfMemory}!void {
     try out.add(Helds.ID, "", HELD_KEY[1..]);
     var sb: [13]u8 = undefined;
-    try out.add(Streams_.ID, "", recKey(&sb, streamOfScope(ns, scope))[1..]);
+    const sk = streamOfScope(ns, scope);
+    try out.add(Streams_.ID, "", recKey(&sb, sk)[1..]);
+    // Its stream's floor and generation, and its records.
+    try out.addIn(sm.Metas.ID, ns, sk[4..12]);
+    out.addRangeIn(sm.Records.ID, ns, sk[4..12]) catch |e| switch (e) {
+        error.NoNamespace => return,
+        else => |o| return o,
+    };
     out.addIn(Metas.ID, ns, scope) catch |e| return e;
     var pb: [SCOPE_LEN + 1]u8 = undefined;
     inline for (.{ Items.ID, Dead.ID }) |fam| out.addRangeIn(fam, ns, scope) catch |e| switch (e) {
@@ -632,7 +648,7 @@ fn deliverApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     };
     if (!live(meta, rec)) return out.refuse(.unavailable, .unclassified, BEING_REMOVED);
     // A stream with no groups yet has no record: its floor is its trim.
-    const floor = if (rec.groups == 0) streams.removedThrough(sk) else floorOf(rec);
+    const floor = floorOf(rec);
     if (!std.mem.eql(u8, meta.stream, p.stream) or !std.mem.eql(u8, meta.group, p.group)) return out.refuse(.conflict, .unclassified, NAME_TAKEN);
     var budget: Budget = .{ .max = p.max_bytes };
     const token: ae.Token.Value = .{ .term = e.header.term, .index = e.header.index };
@@ -1055,63 +1071,12 @@ fn expireOne(view: *View, item: ge.ExpireItem.Value, stamp: u64) ApplyError!bool
     return true;
 }
 
-/// The stream an observed entry names. A trim's value is the stream's
-/// name hash under the entry's namespace; a delete's key is its name.
-fn observedStream(e: *const Entry) ?StreamKey {
-    const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return null;
-    return switch (typeOf(e)) {
-        .stream_trim => if (cmd.value.len != 8) null else blk: {
-            var k: StreamKey = undefined;
-            k[0..4].* = cmd.namespace_id.bytes();
-            k[4..12].* = cmd.value[0..8].*;
-            break :blk k;
-        },
-        .stream_delete => if (cmd.key.len == 0) null else streamOf(cmd.namespace_id, cmd.key),
-        else => null,
-    };
-}
-
-fn observeKeys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
-    const sk = observedStream(e) orelse return;
-    var sb: [13]u8 = undefined;
-    try out.add(Streams_.ID, "", recKey(&sb, sk)[1..]);
-}
-
-/// A stream trimmed, or deleted, as the stream applier applied it: its
-/// record's floor moves to the last record the stream lost, or its
-/// generation moves on. One key, whatever its groups hold; their records
-/// leave by cleanup. A stream with no groups has no record to move.
-fn observe(view: *View, e: *const Entry) ApplyError!void {
-    const sk = observedStream(e) orelse return error.Halt;
-    var sb: [13]u8 = undefined;
-    // No groups of it: nothing to follow.
-    var rec = ((try view.get(Streams_, recKey(&sb, sk))) orelse return).v;
-    switch (typeOf(e)) {
-        .stream_trim => {
-            const cut = (try view.streams()).removedThrough(sk);
-            if (!cut.greaterThan(floorOf(rec))) return;
-            rec.floor_ms = cut.timestamp_ms;
-            rec.floor_seq = cut.sequence;
-        },
-        .stream_delete => {
-            rec.gen += 1;
-            rec.floor_ms = 0;
-            rec.floor_seq = 0;
-        },
-        else => return error.Halt,
-    }
-    try view.put(Streams_, recKey(&sb, sk), .{ .v = rec });
-}
-
 pub const machine: machine_mod.Machine = .{
     .name = "groups",
     .entry_types = &.{ .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean, .group_steal, .group_requeue, .group_drop },
     .families = &.{ machine_mod.info(Metas), machine_mod.info(Items), machine_mod.info(Dead), machine_mod.info(Ready), machine_mod.info(Deadlines), machine_mod.info(Streams_) },
     .keys = keys,
     .apply = apply,
-    .observes = &.{ .stream_trim, .stream_delete },
-    .observe_keys = observeKeys,
-    .observe = observe,
 };
 
 // ─── Reads ───────────────────────────────────────────────────────────────
@@ -1129,7 +1094,8 @@ pub fn storeKey(buf: []u8, ns: NamespaceId, k: []const u8) []const u8 {
 pub const TestGroups = struct {
     store: store_mod.Store,
     scratch: std.heap.ArenaAllocator,
-    stream: stream_mod.StreamProjection,
+    /// Bytes for the stream entries the harness writes.
+    stream_buf: [8192]u8 = undefined,
     log: std.ArrayListUnmanaged(Logged) = .empty,
     index: u64 = 0,
     term: u64 = 1,
@@ -1150,7 +1116,7 @@ pub const TestGroups = struct {
     pub fn init(allocator: std.mem.Allocator) TestGroups {
         var store = store_mod.Store.init(allocator);
         store.strict_keys = true;
-        return .{ .store = store, .scratch = std.heap.ArenaAllocator.init(allocator), .stream = stream_mod.StreamProjection.init(allocator) };
+        return .{ .store = store, .scratch = std.heap.ArenaAllocator.init(allocator) };
     }
 
     pub fn deinit(self: *TestGroups) void {
@@ -1158,15 +1124,29 @@ pub const TestGroups = struct {
         self.log.deinit(self.store.allocator);
         self.store.deinit();
         self.scratch.deinit();
-        self.stream.deinit();
     }
 
     /// An append of `records` records to the default namespace's `stream`,
     /// stamped `ms`: its first record's id.
     pub fn append(self: *TestGroups, stream: []const u8, at_ms: u64, records: u32) !StreamID {
         try self.log.append(self.store.allocator, .{ .op = .{ .append = .{ .stream = stream, .at_ms = at_ms, .records = records } } });
+        var vb: [8 + 10 * 512]u8 = undefined;
+        const r = try self.streamEntry(.stream_append, 0, stream, stream_mod.appendValueOf(&vb, records, 4), at_ms * std.time.ns_per_ms);
+        var rd = r.reader();
+        const seq = rd.int(u64).?;
+        return .{ .timestamp_ms = rd.int(u64).?, .sequence = seq };
+    }
+
+    /// A stream entry applied through the streams machine, as the shard
+    /// applies it.
+    fn streamEntry(self: *TestGroups, etype: EntryType, flags: u16, key: []const u8, value: []const u8, stamp_ns: u64) !Result {
         self.index += 1;
-        return self.stream.appendToStreamAt(streamOf(.default, stream), self.index, 0, 0, at_ms, records, 10 * records);
+        const e = entry_mod.buildCommandEntry(etype, flags, self.term, self.index, stamp_ns, .default, key, value, &self.stream_buf).?;
+        var out: Result = .{};
+        out.reset(&e);
+        try machine_mod.applyEntry(&sm.machine, &self.store, &self.scratch, &e, &out);
+        try std.testing.expect(out.refused() == null);
+        return out;
     }
 
     pub fn apply(self: *TestGroups, comptime etype: EntryType, body: anytype, stamp_ns: u64) !Result {
@@ -1182,36 +1162,26 @@ pub const TestGroups = struct {
         const e = entry_mod.buildEntry(l.etype, entry_mod.Flags.NONE, l.term, l.index, l.stamp, l.payload);
         var out: Result = .{};
         out.reset(&e);
-        try machine_mod.applyEntryWith(&machine, &self.store, &self.scratch, .{ .proj = &self.stream }, &e, &out);
+        try machine_mod.applyEntry(&machine, &self.store, &self.scratch, &e, &out);
         return out;
     }
 
-    /// A stream entry the stream applier applied, followed as the shard
-    /// follows it.
-    fn observed(self: *TestGroups, etype: EntryType, key: []const u8, value: []const u8, stamp_ns: u64) !void {
-        var buf: [256]u8 = undefined;
-        const cmd: entry_mod.CommandPayload = .{ .namespace_id = .default, .key_length = @intCast(key.len), .value_length = @intCast(value.len), .key = key, .value = value };
-        const n = cmd.serialize(&buf).?;
-        self.index += 1;
-        const e = entry_mod.buildEntry(etype, entry_mod.Flags.NONE, self.term, self.index, stamp_ns, buf[0..n]);
-        try machine_mod.observeEntry(&machine, &self.store, &self.scratch, .{ .proj = &self.stream }, &e, .entry);
-    }
-
     /// The default namespace's `stream` trimmed through `up_to`, as the
-    /// stream applier and then the group machine apply it.
+    /// streams machine applies it.
     pub fn trim(self: *TestGroups, stream: []const u8, up_to: StreamID, stamp_ns: u64) !void {
         try self.log.append(self.store.allocator, .{ .op = .{ .trim = .{ .stream = stream, .up_to = up_to, .stamp = stamp_ns } } });
         const sk = streamOf(.default, stream);
-        _ = self.stream.trimStream(sk, up_to);
-        // As the stream handler writes a trim: the name hash, under the
-        // entry's namespace.
-        try self.observed(.stream_trim, "bound", sk[4..12], stamp_ns);
+        var kb: [stream_mod.TrimBound.MAX_SIZE]u8 = undefined;
+        // As the stream handler writes a trim: its bound, then the name
+        // hash, under the entry's namespace.
+        _ = try self.streamEntry(.stream_trim, 0, (stream_mod.TrimBound{ .id = up_to }).encode(&kb), sk[4..12], stamp_ns);
     }
 
+    /// The default namespace's `stream` deleted, forced, as the streams
+    /// machine applies it.
     pub fn deleteStream(self: *TestGroups, stream: []const u8, stamp_ns: u64) !void {
         try self.log.append(self.store.allocator, .{ .op = .{ .delete = .{ .stream = stream, .stamp = stamp_ns } } });
-        _ = self.stream.deleteStream(streamOf(.default, stream));
-        try self.observed(.stream_delete, stream, "", stamp_ns);
+        _ = try self.streamEntry(.stream_delete, entry_mod.Flags.FORCE, stream, "", stamp_ns);
     }
 
     /// One cleanup of the default namespace's group, as the duty proposes it.
@@ -1659,7 +1629,7 @@ test "group machine: a deliver's budget counts each append once, and the first r
 }
 
 fn stream_answer(t: *TestGroups, record: StreamID) usize {
-    const s: Streams = .{ .proj = &t.stream };
+    const s: Streams = .{ .read = t.read() };
     return s.appendOf(streamOf(.default, "s"), record).?.answer_bytes;
 }
 
