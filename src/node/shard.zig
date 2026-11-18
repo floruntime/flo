@@ -29607,6 +29607,16 @@ test "Shard: a second caller's start of a child run another caller started is an
     try std.testing.expectEqual(@as(u64, 1), metrics.workflow.action_answers_without_call_total.load(.monotonic));
 }
 
+/// Adds `name` to the names a function binds from the shard list.
+fn bindName(names: *[16][]const u8, n: *usize, name: []const u8) !void {
+    if (n.* == names.len) {
+        std.debug.print("more than {d} names bound from " ++ "peer_" ++ "shards in one function; grow the test's list\n", .{names.len});
+        return error.TestUnexpectedResult;
+    }
+    names[n.*] = name;
+    n.* += 1;
+}
+
 /// Whether `line` holds `name` as a whole word.
 fn hasWord(line: []const u8, name: []const u8) bool {
     var at: usize = 0;
@@ -29634,8 +29644,10 @@ test "no shard's thread reaches another shard's handler through peer_shards" {
     // Another shard's state is read by asking it (its mailbox), never
     // through its pointer: these lines only count shards or read the
     // offline flag. A new line naming the field is reviewed here, and no
-    // name a line binds from it (nor a loop over one) reaches a `*_handler`
-    // in the function that binds it. Split so this test's own text doesn't
+    // name bound from one (a capture, a `const`/`var` holding it or a name
+    // bound from it, a loop over one) reaches a `*_handler` in the function
+    // that binds it. Not caught: a bound name passed to another function,
+    // which reads a handler there. Split so this test's own text doesn't
     // match.
     const field = "peer_" ++ "shards";
     const allowed = [_][]const u8{
@@ -29684,26 +29696,27 @@ test "no shard's thread reaches another shard's handler through peer_shards" {
                     std.debug.print("a new use of peer_shards: {s}\n", .{t});
                     return error.TestUnexpectedResult;
                 }
-                if (std.mem.startsWith(u8, t, "const ")) {
-                    const end = std.mem.indexOfScalarPos(u8, t, 6, ' ') orelse t.len;
-                    names[n] = t[6..end];
-                    n += 1;
-                }
             }
-            // Bound by a capture: on a line naming the field, or a loop
-            // over a name bound from it.
+            // A line binds: one naming the field, a loop over a bound name,
+            // or a `const`/`var` whose value holds one. It binds its
+            // declared name and its captures.
+            const decl: ?[]const u8 = for ([_][]const u8{ "const ", "var " }) |kw| {
+                if (!std.mem.startsWith(u8, t, kw)) continue;
+                const end = std.mem.indexOfAnyPos(u8, t, kw.len, " :") orelse t.len;
+                break t[kw.len..end];
+            } else null;
+            const value = if (std.mem.indexOfScalar(u8, t, '=')) |eq| t[eq + 1 ..] else "";
             var bind = std.mem.indexOf(u8, t, field) != null;
-            if (std.mem.indexOf(u8, t, "for (") != null) {
-                for (names[0..n]) |nm| if (hasWord(t, nm)) {
-                    bind = true;
-                };
+            for (names[0..n]) |nm| {
+                if (std.mem.indexOf(u8, t, "for (") != null and hasWord(t, nm)) bind = true;
+                if (decl != null and hasWord(value, nm)) bind = true;
             }
             if (bind) {
+                if (decl) |d| try bindName(&names, &n, d);
                 var at: usize = 0;
                 while (std.mem.indexOfScalarPos(u8, t, at, '|')) |a| {
                     const b = std.mem.indexOfScalarPos(u8, t, a + 1, '|') orelse break;
-                    names[n] = std.mem.trimStart(u8, t[a + 1 .. b], "*");
-                    n += 1;
+                    try bindName(&names, &n, std.mem.trimStart(u8, t[a + 1 .. b], "*"));
                     at = b + 1;
                 }
             }
