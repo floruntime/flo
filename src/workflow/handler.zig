@@ -913,7 +913,7 @@ pub const WorkflowHandler = struct {
                     explicit_run_id = value[offset .. offset + rid_len];
                     offset += rid_len;
                     if (run_id_mod.looksGenerated(.workflow, explicit_run_id.?)) {
-                        shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: run ids of the form wfr-<hex>-<hex> are the server's; choose another");
+                        shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: run ids of the form wfr-<hex>-<hex>-<hex> are the server's; choose another");
                         return null;
                     }
                     if (explicit_run_id.?.len > MAX_RUN_ID) {

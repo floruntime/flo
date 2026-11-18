@@ -389,3 +389,27 @@ test "the longest id fits a run id field" {
     try std.testing.expect(id.len <= MAX_ID_LEN);
     try std.testing.expect(MAX_ID_LEN <= @import("../protocol/action_entries.zig").MAX_RUN_ID);
 }
+
+test "every production mint passes its shard's live term" {
+    // A site that passed a constant would mint a term's ids from any
+    // leader. Split so this test's own text doesn't match.
+    const needle = "run_id_gen" ++ ".next(";
+    const sources = [_][]const u8{
+        @embedFile("../actions/handler.zig"),
+        @embedFile("../processing/handler.zig"),
+        @embedFile("../workflow/handler.zig"),
+    };
+    var sites: usize = 0;
+    for (sources) |src| {
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, src, at, needle)) |i| : (at = i + needle.len) {
+            const end = std.mem.indexOfScalarPos(u8, src, i, ';') orelse return error.TestUnexpectedResult;
+            const call = src[i..end];
+            try std.testing.expect(std.mem.indexOf(u8, call, "shard.raft_node.current_term") != null);
+            sites += 1;
+        }
+    }
+    // Every production site: a new one belongs in this list's files, or
+    // the list grows.
+    try std.testing.expectEqual(@as(usize, 6), sites);
+}
