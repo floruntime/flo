@@ -713,10 +713,13 @@ pub fn Replica(comptime Io: type) type {
             }
             self.retireVouch();
             const r = raft.tick(now);
-            // A leader found or won ends the outage the attempt lines count.
+            // A leader found or won ends the outage the attempt lines count,
+            // and the silence of the members it knows: a leader they elected
+            // is speaking to it.
             if (raft.role == .leader or raft.leader_id != 0) {
                 self.elections_unlogged = 0;
                 self.election_warn_ms = 0;
+                self.unanswered_rounds = 0;
             }
             if (r.start_election and !self.loneVoterWaits(now)) {
                 if (raft.startElection()) |req| {
@@ -1831,4 +1834,23 @@ test "replica: a vouch restored with its index at or below this node's commit at
     h.replica.tickRaft();
     try testing.expectEqual(@as(u64, 0), h.raft.vouch.index);
     try testing.expectEqual(@as(u32, 1), sink.writes);
+}
+
+test "replica: a member that hears its leader again is no longer taken as having sat out a replace, whatever a stranger sends later" {
+    var h: VouchHarness = undefined;
+    try h.init(membership.Config.ofVoters(&.{ 1, 2, 3 }));
+    defer h.deinit();
+    // An old blip: rounds of asks no member answered.
+    for (0..VouchReplica.SILENT_ROUNDS + 1) |_| {
+        h.now += h.raft.config.election_timeout_max_ms + 1;
+        h.replica.tickRaft();
+    }
+    try testing.expect(h.replica.unanswered_rounds >= VouchReplica.SILENT_ROUNDS);
+    // Its leader, a member, is heard again.
+    h.heartbeat(1, 2);
+    try testing.expectEqual(@as(u32, 1), h.raft.leader_id);
+    h.replica.tickRaft();
+    // One later-term stranger isn't the sign on its own.
+    h.heartbeat(4, 9);
+    try testing.expect(!h.replica.membersSilent(h.now));
 }
