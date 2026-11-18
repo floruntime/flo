@@ -22,8 +22,12 @@ pub const Status = struct {
     /// Dropping frames from a node no config of its names, with no leader
     /// heard.
     strangers_while_quiet: bool,
+    /// And a stranger leads a later term while no member this node knows
+    /// answers: it sat out changes that replaced them all, and must be
+    /// wiped and rejoined.
+    members_silent: bool = false,
 
-    pub const SIZE = 30;
+    pub const SIZE = 31;
 
     pub fn encode(self: Status, buf: *[SIZE]u8) []const u8 {
         std.mem.writeInt(u32, buf[0..4], self.node_id, .little);
@@ -33,11 +37,12 @@ pub const Status = struct {
         std.mem.writeInt(u32, buf[17..21], self.member_count, .little);
         std.mem.writeInt(u64, buf[21..29], self.vouched_index, .little);
         buf[29] = @intFromBool(self.strangers_while_quiet);
+        buf[30] = @intFromBool(self.members_silent);
         return buf;
     }
 
     pub fn decode(data: []const u8) error{Malformed}!Status {
-        if (data.len != SIZE or data[29] > 1) return error.Malformed;
+        if (data.len != SIZE or data[29] > 1 or data[30] > 1) return error.Malformed;
         return .{
             .node_id = std.mem.readInt(u32, data[0..4], .little),
             .leader_id = std.mem.readInt(u32, data[4..8], .little),
@@ -46,6 +51,7 @@ pub const Status = struct {
             .member_count = std.mem.readInt(u32, data[17..21], .little),
             .vouched_index = std.mem.readInt(u64, data[21..29], .little),
             .strangers_while_quiet = data[29] != 0,
+            .members_silent = data[30] != 0,
         };
     }
 };

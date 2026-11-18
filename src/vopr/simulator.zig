@@ -16,6 +16,7 @@
 //! failures. The seed is the whole repro.
 
 const std = @import("std");
+const hard_state_mod = @import("../raft/hard_state.zig");
 const stdx = @import("stdx");
 const PRNG = @import("stdx").PRNG;
 const raft_node = @import("../raft/node.zig");
@@ -147,6 +148,7 @@ const SimDisk = struct {
     term: u64 = 0,
     voted_for: u32 = 0,
     lost_log: bool = false,
+    vouch: hard_state_mod.Vouch = .{},
     entries: std.ArrayListUnmanaged(DiskEntry) = .empty,
     /// entries[0..durable_len] survive a crash.
     durable_len: usize = 0,
@@ -318,11 +320,12 @@ const SimDisk = struct {
     /// RaftNode persists through this before granting a vote, adopting a
     /// term, or starting or ending its lost-log guard. The sim disk never
     /// fails a write.
-    fn persistHardState(ctx: *anyopaque, term: u64, voted_for: u32, lost_log: bool) bool {
+    fn persistHardState(ctx: *anyopaque, term: u64, voted_for: u32, lost_log: bool, vouch: *const hard_state_mod.Vouch) bool {
         const self: *SimDisk = @ptrCast(@alignCast(ctx));
         self.term = term;
         self.voted_for = voted_for;
         self.lost_log = lost_log;
+        self.vouch = vouch.*;
         return true;
     }
 
@@ -1524,7 +1527,10 @@ pub const Simulator = struct {
         node.raft.commit_index = if (cold) 0 else mark;
         if (node.raft.commit_index > 0) self.warm_restarts += 1;
         node.raft.voted_for = node.disk.voted_for;
-        if (node.disk.lost_log) node.raft.resumeLostLog();
+        if (node.disk.lost_log) {
+            node.raft.resumeLostLog();
+            node.raft.vouch = node.disk.vouch;
+        }
         self.attachDisk(node);
         if (node.wiped) {
             node.wiped = false;

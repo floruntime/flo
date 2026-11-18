@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 41;
+pub const CURRENT: u32 = 42;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -147,6 +147,9 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // shard's next leader never mints its last leader's ids; a run id field
     // holds 42 bytes.
     .{ .format = 41, .segment_version = 28, .entries = 0x6d5c0936fb61791f },
+    // HARDSTATE carries the vouch a guarded node took, with the guard, so a
+    // restart part way through catching up keeps it; the log is unchanged.
+    .{ .format = 42, .segment_version = 28, .entries = 0x6d5c0936fb61791f },
 };
 
 comptime {

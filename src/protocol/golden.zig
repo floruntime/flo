@@ -72,7 +72,7 @@ const testing = std.testing;
 const halt: wire.Halt = .{ .index = 987, .term = 5, .crc = 0xdeadbeef };
 
 /// What each vector holds.
-const status: wire.Status = .{ .node_id = 7, .leader_id = 3, .term = 42, .state = 2, .member_count = 3, .vouched_index = 0x1122, .strangers_while_quiet = true };
+const status: wire.Status = .{ .node_id = 7, .leader_id = 3, .term = 42, .state = 2, .member_count = 3, .vouched_index = 0x1122, .strangers_while_quiet = true, .members_silent = true };
 const members = [_]wire.Member{
     .{ .id = 3, .role = 0, .ip4 = .{ 10, 0, 0, 3 }, .port = 9000, .contact_ago_ms = wire.Member.UNKNOWN_CONTACT, .match = wire.Member.UNKNOWN_MATCH, .halt = .{ .at = halt } },
     .{ .id = 4, .role = 0, .ip4 = .{ 10, 0, 0, 4 }, .port = 9001, .contact_ago_ms = 12, .match = 990, .halt = .{ .at = halt } },

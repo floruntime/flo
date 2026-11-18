@@ -35,7 +35,7 @@ test "e2e/cluster: status --output json is machine-readable (#42 item 6)" {
 
     try testing.expect(std.mem.indexOf(u8, out.stdout, "\"role\":\"leader\"") != null);
     // A node running alone has no vouch to catch up to and drops no stranger.
-    try testing.expect(std.mem.indexOf(u8, out.stdout, "\"members\":1,\"vouched_index\":0,\"strangers_while_quiet\":false}") != null);
+    try testing.expect(std.mem.indexOf(u8, out.stdout, "\"members\":1,\"vouched_index\":0,\"strangers_while_quiet\":false,\"members_silent\":false}") != null);
 
     // Node and leader must be the same node, and actually populated.
     try testing.expect(std.mem.indexOf(u8, out.stdout, "\"node_id\":\"flo-") != null);

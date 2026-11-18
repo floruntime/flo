@@ -1119,7 +1119,12 @@ pub const Shard = struct {
                 }
                 raft_node.current_term = hs.term;
                 raft_node.voted_for = hs.voted_for;
-                if (hs.lost_log) raft_node.resumeLostLog();
+                // The vouch counts only while the guard it was taken under
+                // holds: same config, ending where it did before the restart.
+                if (hs.lost_log) {
+                    raft_node.resumeLostLog();
+                    raft_node.vouch = hs.vouch;
+                }
             }
             const store = try allocator.create(HardStateStore);
             store.* = .{ .dir = shard_dir, .node_id = node_id, .shard_id = shard_id };
@@ -5404,7 +5409,7 @@ pub const Shard = struct {
             }
         }
         const slot = self.health orelse return;
-        slot.publishVouch(self.replica.vouchedIndex(), self.replica.strangersWhileQuiet(nowMs()));
+        slot.publishVouch(self.replica.vouchedIndex(), self.replica.strangersWhileQuiet(nowMs()), self.replica.membersSilent(nowMs()));
         // The reason before the state: a reader that sees offline, halted
         // or diverged finds it.
         // The reason is the state's: a shard halted, then diverged, says why
@@ -7755,6 +7760,7 @@ pub const Shard = struct {
             .member_count = member_count,
             .vouched_index = shard.replica.vouchedIndex(),
             .strangers_while_quiet = shard.replica.strangersWhileQuiet(nowMs()),
+            .members_silent = shard.replica.membersSilent(nowMs()),
         };
         shard.sendOkResponse(conn, req.header.request_id, status.encode(&buf));
     }
@@ -8431,9 +8437,9 @@ const HardStateStore = struct {
     hardstate_failures: u64 = 0,
     hardstate_failing_since_ms: u64 = 0,
 
-    fn persist(ctx: *anyopaque, term: u64, voted_for: u32, lost_log: bool) bool {
+    fn persist(ctx: *anyopaque, term: u64, voted_for: u32, lost_log: bool, vouch: *const hard_state_mod.Vouch) bool {
         const self: *HardStateStore = @ptrCast(@alignCast(ctx));
-        hard_state_mod.save(self.dir, .{ .node_id = self.node_id, .term = term, .voted_for = voted_for, .lost_log = lost_log }) catch |err| {
+        hard_state_mod.save(self.dir, .{ .node_id = self.node_id, .term = term, .voted_for = voted_for, .lost_log = lost_log, .vouch = vouch.* }) catch |err| {
             self.hardstate_failures += 1;
             if (self.hardstate_failing_since_ms == 0) self.hardstate_failing_since_ms = Shard.nowMs();
             log.err("shard {d}: cannot write {s}/{s}: {s}; this node will not vote until it can (hardstate_failures={d})", .{ self.shard_id, self.dir, hard_state_mod.FILENAME, @errorName(err), self.hardstate_failures });
@@ -15703,7 +15709,7 @@ test "shard: a real HARDSTATE persist failure shows in the field, the metric sna
     try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(z, 0o500));
     defer _ = std.c.chmod(z, 0o700);
 
-    try std.testing.expect(!HardStateStore.persist(store, 7, 1, false)); // the save fails for real
+    try std.testing.expect(!HardStateStore.persist(store, 7, 1, false, &.{})); // the save fails for real
     try std.testing.expect(store.hardstate_failures >= 1);
     try std.testing.expect(store.hardstate_failing_since_ms != 0);
 
@@ -15736,7 +15742,7 @@ test "shard: a real HARDSTATE persist failure shows in the field, the metric sna
 
     // Writable again: a persist that reaches disk ends the run; the total stays.
     _ = std.c.chmod(z, 0o700);
-    try std.testing.expect(HardStateStore.persist(store, 8, 1, false));
+    try std.testing.expect(HardStateStore.persist(store, 8, 1, false, &.{}));
     try std.testing.expectEqual(@as(u64, 0), store.hardstate_failing_since_ms);
     shard.publishHealth();
     try std.testing.expectEqual(@as(u64, 0), shard.shard_metrics.?.snapshot().hardstate_failing_for_ms);
@@ -22300,14 +22306,14 @@ test "Shard: cluster status answers the vouched index while the node is behind i
     var buf: [512]u8 = undefined;
     var resp = try t.ask(.cluster_status, "", &buf);
     try std.testing.expectEqual(proto.StatusCode.ok, resp.getStatus());
-    try std.testing.expectEqual(@as(usize, 30), resp.data.len);
+    try std.testing.expectEqual(@as(usize, cluster_wire.Status.SIZE), resp.data.len);
     try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, resp.data[21..29], .little));
     try std.testing.expectEqual(@as(u8, 0), resp.data[29]);
 
     // A vouch for a config committed past this node's log, and a stranger
     // dropped just now with no leader heard.
     const raft = t.shard.raft_node;
-    t.shard.replica.vouch.index = raft.commit_index + 50;
+    raft.vouch.index = raft.commit_index + 50;
     t.shard.replica.strangers_quiet_ms = Shard.nowMs();
     resp = try t.ask(.cluster_status, "", &buf);
     try std.testing.expectEqual(raft.commit_index + 50, std.mem.readInt(u64, resp.data[21..29], .little));
@@ -29994,4 +30000,51 @@ test "Shard: a trigger's read with no answer is asked again after the deadline, 
     try std.testing.expect(t.trigger().read_seq != seq);
     t.two.settle();
     try std.testing.expectEqual(@as(usize, 1), t.runs());
+}
+
+test "Shard: a guarded node's vouch comes back with its guard at boot, exactly; an unguarded node's isn't read; a cut one refuses the start" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{data_dir});
+    defer std.testing.allocator.free(shard_dir);
+    try @import("stdx").fs.makePath(shard_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    const cfg = membership.Config.ofVoters(&.{ 1, 3 }).withJoiner(2, true);
+    const vouch: hard_state_mod.Vouch = .{ .config = cfg, .index = 3355, .term = 19 };
+
+    // Guarded, part way through catching up: the vouch it held, no more.
+    try hard_state_mod.save(shard_dir, .{ .node_id = 2, .term = 20, .voted_for = 0, .lost_log = true, .vouch = vouch });
+    {
+        var s = try Shard.init(std.testing.allocator, 0, 2, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 2, .join, .{}, .{});
+        defer s.deinit();
+        try std.testing.expect(s.raft_node.lost_log != .none);
+        try std.testing.expectEqual(@as(u64, 3355), s.raft_node.vouch.index);
+        try std.testing.expectEqual(@as(u64, 19), s.raft_node.vouch.term);
+        var ids: [membership.MAX_MEMBERS]u32 = undefined;
+        try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, s.raft_node.vouch.config.voterIds(&ids));
+        try std.testing.expect(s.raft_node.vouch.config.names(2));
+    }
+    // Not guarded: whatever vouch the file holds counts for nothing.
+    try hard_state_mod.save(shard_dir, .{ .node_id = 2, .term = 20, .voted_for = 0, .lost_log = false, .vouch = vouch });
+    {
+        var s = try Shard.init(std.testing.allocator, 0, 2, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 2, .join, .{}, .{});
+        defer s.deinit();
+        try std.testing.expectEqual(@as(u64, 0), s.raft_node.vouch.index);
+    }
+    // Cut inside the vouch: refused, never read as a vouch or a fresh start.
+    try hard_state_mod.save(shard_dir, .{ .node_id = 2, .term = 20, .voted_for = 0, .lost_log = true, .vouch = vouch });
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ shard_dir, hard_state_mod.FILENAME });
+    defer std.testing.allocator.free(path);
+    var buf: [hard_state_mod.MAX_SIZE]u8 = undefined;
+    const full = (try @import("stdx").fs.readFileAlloc(std.testing.allocator, path, hard_state_mod.MAX_SIZE));
+    defer std.testing.allocator.free(full);
+    @memcpy(buf[0..full.len], full);
+    const f = try @import("stdx").fs.createFile(path, .{});
+    try @import("stdx").fs.writeAll(f, buf[0 .. full.len - 5]);
+    @import("stdx").fs.closeFile(f);
+    try std.testing.expectError(error.Truncated, Shard.init(std.testing.allocator, 0, 2, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 2, .join, .{}, .{}));
 }

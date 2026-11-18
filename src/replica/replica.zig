@@ -31,11 +31,7 @@ pub const ANSWERED_SOURCES = 16;
 
 /// A committed config a member answered with, newer than this node's own:
 /// a member that missed a membership change learns the group from it.
-pub const Vouch = struct {
-    config: membership.Config = .{},
-    index: u64 = 0,
-    term: u64 = 0,
-};
+pub const Vouch = @import("../raft/hard_state.zig").Vouch;
 
 pub const DIVERGED_MESSAGE = "unavailable: this node's data diverged from the group and it takes no writes; use another node";
 
@@ -88,7 +84,6 @@ pub fn Replica(comptime Io: type) type {
         /// configs name for their committed config, and while one is newer
         /// than its own also hears that config's members' appends and vote
         /// requests. Quorum, votes and commit still read only the log.
-        vouch: Vouch = .{},
         /// The current round of asks: when it went out, and to whom. Only
         /// an asked member's answer is taken.
         ask_ms: u64 = 0,
@@ -106,6 +101,19 @@ pub fn Replica(comptime Io: type) type {
         replica_forwards_refused: u64 = 0,
         vouch_asks: u64 = 0,
         vouches_taken: u64 = 0,
+        /// A lone voter whose log names other members asks them before it
+        /// campaigns (`loneVoterWaits`): who it asked, when, and whether one
+        /// said the group has moved past this node's log.
+        lone_asked: [membership.MAX_MEMBERS]u32 = undefined,
+        lone_asked_count: u8 = 0,
+        lone_asked_ms: u64 = 0,
+        lone_refused: bool = false,
+        lone_warn_ms: u64 = 0,
+        /// When a stranger last sent this node its log in a later term, and
+        /// how many rounds of asks in a row no member has answered: together,
+        /// a member that sat out changes that replaced every member it knew.
+        later_stranger_ms: u64 = 0,
+        unanswered_rounds: u32 = 0,
 
         const Answered = struct { id: u32 = 0, at_ms: u64 = 0 };
 
@@ -222,6 +230,7 @@ pub fn Replica(comptime Io: type) type {
                 // that drops it until the group has taken that.
                 if (!self.isMember(frame.source_node)) {
                     if (self.vouchAdmits(frame.source_node, frame.msg_type)) return self.handleFrameFrom(frame);
+                    if (frame.msg_type == .term_check_response and std.mem.indexOfScalar(u32, self.lone_asked[0..self.lone_asked_count], frame.source_node) != null) return self.takeLoneAnswer(frame);
                     return self.dropStranger(frame);
                 }
                 // A joiner keeps its guard while it catches up: the configs it
@@ -349,6 +358,7 @@ pub fn Replica(comptime Io: type) type {
                 .term_check_response => {
                     const resp = transport.deserializeTermCheckResponse(frame.payload) orelse return self.badFrame(frame);
                     if (resp.from != frame.source_node) return self.impostorFrame(frame, resp.from);
+                    if (self.isMember(resp.from)) self.unanswered_rounds = 0;
                     const was = raft.lost_log;
                     self.takeVouch(resp);
                     raft.handleTermCheckResponse(resp);
@@ -376,12 +386,23 @@ pub fn Replica(comptime Io: type) type {
         /// latest config, which may be uncommitted and prove nothing.
         fn vouchLive(self: *Self) bool {
             const raft = self.raftNode();
-            return self.vouch.index > 0 and raft.commit_index < self.vouch.index and raft.committed_config_index < self.vouch.index;
+            const v = raft.vouch;
+            return v.index > 0 and raft.commit_index < v.index and raft.committed_config_index < v.index;
+        }
+
+        /// A vouch whose window has ended is cleared on disk too, so a restart
+        /// never brings it back. Until then a stored one past its index is
+        /// inert anyway: `vouchLive` is judged by the same commit.
+        fn retireVouch(self: *Self) void {
+            const raft = self.raftNode();
+            if (raft.vouch.index == 0 or self.vouchLive()) return;
+            raft.vouch = .{};
+            _ = raft.persistHardState();
         }
 
         /// The vouched config's index while it holds, else 0.
         pub fn vouchedIndex(self: *Self) u64 {
-            return if (self.vouchLive()) self.vouch.index else 0;
+            return if (self.vouchLive()) self.raftNode().vouch.index else 0;
         }
 
         /// Dropping a stranger's frames with no leader heard, lately: a
@@ -394,7 +415,58 @@ pub fn Replica(comptime Io: type) type {
         /// for its vote; nothing else.
         fn vouchAdmits(self: *Self, id: u32, t: transport.MsgType) bool {
             if (t != .append_entries and t != .request_vote) return false;
-            return self.vouchLive() and self.vouch.config.names(id);
+            return self.vouchLive() and self.raftNode().vouch.config.names(id);
+        }
+
+        /// A lone voter whose log names other members asks them, for one
+        /// election timeout, before it campaigns; and campaigns no more if
+        /// one holds a committed config newer than its own. Its log may be
+        /// an old copy (a data directory restored from one), and alone it
+        /// would commit on history the group has moved past. With no answer
+        /// it campaigns as before: a group shrunk to this node stays up.
+        fn loneVoterWaits(self: *Self, now: u64) bool {
+            const raft = self.raftNode();
+            if (raft.voterPeers() != 0 or !raft.latest_config.isVoter(raft.id)) return false;
+            if (self.lone_refused) {
+                if (now -| self.lone_warn_ms >= WARN_INTERVAL_MS) {
+                    self.lone_warn_ms = now;
+                    log.err("shard {d}: this node is its config's only voter, but a member its log names holds a newer committed config: its data may be an old copy. It won't campaign; wipe it and rejoin", .{self.id});
+                }
+                return true;
+            }
+            if (self.lone_asked_ms != 0) return now -| self.lone_asked_ms < raft.config.election_timeout_max_ms;
+            self.lone_asked_ms = now;
+            for (raft.config_records[0..raft.config_record_count]) |rec| {
+                for (rec.config.memberSlice()) |m| self.noteLone(m.id);
+                for (rec.config.removedSlice()) |r| self.noteLone(r.id);
+            }
+            for (raft.latest_config.removedSlice()) |r| self.noteLone(r.id);
+            if (self.lone_asked_count == 0) return false;
+            var buf: [transport.TERM_CHECK_SIZE]u8 = undefined;
+            const n = transport.serializeTermCheck(raft.termCheckRequest(), &buf).?;
+            for (self.lone_asked[0..self.lone_asked_count]) |id| self.sendRaft(id, .term_check, buf[0..n]);
+            return true;
+        }
+
+        fn noteLone(self: *Self, id: u32) void {
+            if (id == self.raftNode().id) return;
+            if (std.mem.indexOfScalar(u32, self.lone_asked[0..self.lone_asked_count], id) != null) return;
+            if (self.lone_asked_count == self.lone_asked.len) return;
+            self.lone_asked[self.lone_asked_count] = id;
+            self.lone_asked_count += 1;
+        }
+
+        /// An answer to a lone voter's ask: a committed config newer than
+        /// this node's own, from a member that isn't guarded, holds its
+        /// campaign for good.
+        fn takeLoneAnswer(self: *Self, frame: RaftFrame) void {
+            const resp = transport.deserializeTermCheckResponse(frame.payload) orelse return self.badFrame(frame);
+            if (resp.from != frame.source_node) return self.impostorFrame(frame, resp.from);
+            if (resp.guarded or resp.committed_index == 0) return;
+            const raft = self.raftNode();
+            const own: Version = .{ .term = raft.committedConfigTerm(), .index = raft.committed_config_index };
+            const theirs: Version = .{ .term = resp.committed_term, .index = resp.committed_index };
+            if (theirs.newerThan(own)) self.lone_refused = true;
         }
 
         fn dropStranger(self: *Self, frame: RaftFrame) void {
@@ -402,13 +474,31 @@ pub fn Replica(comptime Io: type) type {
             const now = Io.nowMs(self);
             self.askForVouch(now);
             const raft = self.raftNode();
+            if (frame.msg_type == .append_entries) if (transport.deserializeAppendRequestHeader(frame.payload)) |hdr| if (hdr.term > raft.current_term) {
+                self.later_stranger_ms = now;
+            };
             const quiet = now -| raft.last_leader_contact_ms > raft.config.election_timeout_max_ms;
             if (quiet) self.strangers_quiet_ms = now;
             if (quiet and now -| self.stranger_warn_ms >= WARN_INTERVAL_MS) {
                 self.stranger_warn_ms = now;
-                log.warn("shard {d}: dropping frames from node {d}, which no config this node holds names, with no leader heard for {d} ms; asked the members it knows for their committed config ({d} vouches taken so far)", .{ self.id, frame.source_node, now -| raft.last_leader_contact_ms, self.vouches_taken });
+                if (self.membersSilent(now)) {
+                    log.err("shard {d}: node {d} leads a later term but no config this node holds names it, and no member this node knows has answered for {d} rounds: it was likely down while every member it knew was replaced. Stop it, move its data directory aside, and start it again with --join naming a live member", .{ self.id, frame.source_node, self.unanswered_rounds });
+                } else log.warn("shard {d}: dropping frames from node {d}, which no config this node holds names, with no leader heard for {d} ms; asked the members it knows for their committed config ({d} vouches taken so far)", .{ self.id, frame.source_node, now -| raft.last_leader_contact_ms, self.vouches_taken });
             }
             self.strangerFrame(frame);
+        }
+
+        /// Rounds of asks no member answers before a later-term stranger is
+        /// taken as the group this node missed.
+        pub const SILENT_ROUNDS: u32 = 3;
+
+        /// A stranger leads a later term, and none of the members this node
+        /// knows has answered for `SILENT_ROUNDS` rounds: it can't learn
+        /// the group from anyone it trusts, and nothing a stranger says is
+        /// taken (a link proves only the cluster secret, not which node it
+        /// is). The way back is the operator's: wipe and rejoin.
+        pub fn membersSilent(self: *Self, now: u64) bool {
+            return self.unanswered_rounds >= SILENT_ROUNDS and self.later_stranger_ms != 0 and now -| self.later_stranger_ms < WARN_INTERVAL_MS;
         }
 
         /// Ask every member this node's configs name for its committed
@@ -417,6 +507,7 @@ pub fn Replica(comptime Io: type) type {
             const raft = self.raftNode();
             if (self.ask_ms != 0 and now -| self.ask_ms < raft.config.election_timeout_min_ms) return;
             self.ask_ms = now;
+            self.unanswered_rounds +|= 1;
             self.asked_count = 0;
             var latest: [membership.MAX_MEMBERS]u32 = undefined;
             for (raft.memberIds(&latest)) |id| self.noteAsked(id);
@@ -456,8 +547,15 @@ pub fn Replica(comptime Io: type) type {
             if (raft.committed_config_index > 0 and own.term == 0) return;
             const theirs: Version = .{ .term = resp.committed_term, .index = resp.committed_index };
             if (!theirs.newerThan(own)) return;
-            if (self.vouchLive() and !theirs.newerThan(.{ .term = self.vouch.term, .index = self.vouch.index })) return;
-            self.vouch = .{ .config = resp.committed, .index = resp.committed_index, .term = resp.committed_term };
+            if (self.vouchLive() and !theirs.newerThan(.{ .term = self.raftNode().vouch.term, .index = self.raftNode().vouch.index })) return;
+            // On disk with the guard before it admits anyone, so a restart
+            // keeps it; not taken if it can't be.
+            const was = raft.vouch;
+            raft.vouch = .{ .config = resp.committed, .index = resp.committed_index, .term = resp.committed_term };
+            if (!raft.persistHardState()) {
+                raft.vouch = was;
+                return;
+            }
             self.vouches_taken += 1;
             log.info("shard {d}: node {d} vouched for the config committed at index {d} (term {d}); hearing its members until this node's log reaches it", .{ self.id, resp.from, resp.committed_index, resp.committed_term });
         }
@@ -610,13 +708,14 @@ pub fn Replica(comptime Io: type) type {
                 var voters: [membership.MAX_MEMBERS]u32 = undefined;
                 Io.setVoters(self, raft.latest_config.voterIds(&voters));
             }
+            self.retireVouch();
             const r = raft.tick(now);
             // A leader found or won ends the outage the attempt lines count.
             if (raft.role == .leader or raft.leader_id != 0) {
                 self.elections_unlogged = 0;
                 self.election_warn_ms = 0;
             }
-            if (r.start_election) {
+            if (r.start_election and !self.loneVoterWaits(now)) {
                 if (raft.startElection()) |req| {
                     // The first attempt says why; a majority that stays away
                     // would otherwise be a line every election timeout.
@@ -1552,4 +1651,181 @@ test "replica: while a peer's read below the ring is pending it gets heartbeats 
     try testing.expectEqual(@as(usize, 1), h.batchesTo(2));
     try testing.expectEqual(@as(u64, 0), h.lastTo(2).?.prev_index);
     try testing.expect(raft.peers[0].inflight);
+}
+
+test "replica: a member back after one node was replaced asks a member it knows and hears the new leader" {
+    // Node 2 was down while the group went {1,2,3} -> {2,3,4}: node 4
+    // added, node 1 removed, node 4 leading.
+    var h: VouchHarness = undefined;
+    try h.init(membership.Config.ofVoters(&.{ 1, 2, 3 }));
+    defer h.deinit();
+    h.heartbeat(4, 3);
+    try testing.expectEqual(@as(u32, 0), h.raft.leader_id);
+    try testing.expectEqual(@as(usize, 1), h.sentTo(3, .term_check));
+    // Node 1 is gone; node 3 answers.
+    h.answer(3, membership.Config.ofVoters(&.{ 2, 3, 4 }), 3, 20, false);
+    h.heartbeat(4, 3);
+    try testing.expectEqual(@as(u32, 4), h.raft.leader_id);
+}
+
+test "replica: a stranger still can't get this node's vote" {
+    var h: VouchHarness = undefined;
+    try h.init(membership.Config.ofVoters(&.{ 1, 2, 3 }));
+    defer h.deinit();
+    var buf: [transport.VOTE_REQ_SIZE]u8 = undefined;
+    for ([_]bool{ false, true }) |pre| {
+        const n = transport.serializeVoteRequest(.{ .term = 9, .candidate_id = 4, .last_log_index = 99, .last_log_term = 9, .is_pre_vote = pre }, &buf).?;
+        h.frame(4, .request_vote, buf[0..n]);
+    }
+    try testing.expectEqual(@as(usize, 0), h.sentTo(4, .request_vote_response));
+    try testing.expectEqual(@as(u64, 1), h.raft.current_term);
+}
+
+/// Node 2 as the only voter of its config, at index 3, after a config at
+/// index 2 that named nodes 1 and 3 too.
+fn loneAfterGroup(h: *VouchHarness) !void {
+    try h.init(membership.Config.ofVoters(&.{ 1, 2, 3 }));
+    const alone = membership.Config.ofVoters(&.{2});
+    h.raft.recordConfig(3, 1, &alone);
+    h.raft.setMembership(&alone, 3);
+    h.raft.commitMembership(&alone, 3);
+}
+
+/// Ticks until the first election would be due, and its ask is out.
+fn untilAsked(h: *VouchHarness) !void {
+    for (0..4) |_| {
+        if (h.replica.lone_asked_ms != 0) return;
+        electionTimeouts(h, 1);
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn electionTimeouts(h: *VouchHarness, n: usize) void {
+    for (0..n) |_| {
+        h.now += h.raft.config.election_timeout_max_ms + 1;
+        h.replica.tickRaft();
+    }
+}
+
+test "replica: a lone voter asks the members its log names before it campaigns, and stays down if one has moved past it" {
+    var h: VouchHarness = undefined;
+    try loneAfterGroup(&h);
+    defer h.deinit();
+    try untilAsked(&h);
+    try testing.expectEqual(@as(usize, 1), h.sentTo(1, .term_check));
+    try testing.expectEqual(@as(usize, 1), h.sentTo(3, .term_check));
+    try testing.expect(h.raft.role != .leader);
+    // Node 1 holds a committed config newer than this node's.
+    h.answer(1, membership.Config.ofVoters(&.{ 1, 3, 4 }), 5, 40, false);
+    electionTimeouts(&h, 5);
+    try testing.expect(h.raft.role != .leader);
+}
+
+test "replica: a lone voter none of whose old members answers campaigns after one round" {
+    var h: VouchHarness = undefined;
+    try loneAfterGroup(&h);
+    defer h.deinit();
+    try untilAsked(&h);
+    try testing.expectEqual(@as(usize, 1), h.sentTo(3, .term_check));
+    try testing.expect(h.raft.role != .leader);
+    electionTimeouts(&h, 1);
+    try testing.expect(h.raft.role == .leader);
+}
+
+/// A hard-state sink that records what it was handed, or fails.
+const VouchSink = struct {
+    fail: bool = false,
+    writes: u32 = 0,
+    vouch: Vouch = .{},
+
+    fn persist(ctx: *anyopaque, term: u64, voted_for: u32, lost_log: bool, vouch: *const Vouch) bool {
+        _ = .{ term, voted_for, lost_log };
+        const self: *VouchSink = @ptrCast(@alignCast(ctx));
+        if (self.fail) return false;
+        self.writes += 1;
+        self.vouch = vouch.*;
+        return true;
+    }
+};
+
+test "replica: a vouch is on disk before it admits anyone, and not taken if it can't be" {
+    var h: VouchHarness = undefined;
+    try staleMember(&h);
+    defer h.deinit();
+    var sink: VouchSink = .{ .fail = true };
+    h.raft.hard_state_sink = .{ .ctx = @ptrCast(&sink), .persist = VouchSink.persist };
+    h.heartbeat(1, 2);
+    h.answer(3, groupNow(), 2, 20, false);
+    try testing.expectEqual(@as(u64, 0), h.replica.vouchedIndex());
+    h.heartbeat(1, 2);
+    try testing.expectEqual(@as(u32, 0), h.raft.leader_id);
+    // Once it can be written, the same answer is taken, and written as given.
+    sink.fail = false;
+    h.now += h.raft.config.election_timeout_min_ms;
+    h.heartbeat(1, 2);
+    h.answer(3, groupNow(), 2, 20, false);
+    try testing.expectEqual(@as(u64, 20), h.replica.vouchedIndex());
+    try testing.expectEqual(@as(u64, 20), sink.vouch.index);
+    try testing.expectEqual(@as(u64, 2), sink.vouch.term);
+    try testing.expect(sink.vouch.config.isVoter(1) and sink.vouch.config.isVoter(2));
+}
+
+test "replica: a vouch ends at the same index after a restart as before, and is cleared on disk when it does" {
+    var h: VouchHarness = undefined;
+    try staleMember(&h);
+    defer h.deinit();
+    var sink: VouchSink = .{};
+    h.raft.hard_state_sink = .{ .ctx = @ptrCast(&sink), .persist = VouchSink.persist };
+    // As a restart restores it: no ask, no answer, the stored vouch.
+    h.raft.vouch = .{ .config = groupNow(), .index = 20, .term = 2 };
+    h.heartbeat(1, 2);
+    try testing.expectEqual(@as(u32, 1), h.raft.leader_id);
+    // The window ends where it did: the node's commit reaching the index.
+    h.raft.commit_index = 20;
+    try testing.expectEqual(@as(u64, 0), h.replica.vouchedIndex());
+    h.replica.tickRaft();
+    try testing.expectEqual(@as(u64, 0), h.raft.vouch.index);
+    try testing.expectEqual(@as(u64, 0), sink.vouch.index);
+}
+
+test "replica: a member that hears a later-term stranger while no member it knows answers says it must be wiped and rejoined" {
+    var h: VouchHarness = undefined;
+    try h.init(membership.Config.ofVoters(&.{ 1, 2, 3 }));
+    defer h.deinit();
+    for (0..VouchReplica.SILENT_ROUNDS) |_| {
+        h.heartbeat(4, 9);
+        h.now += h.raft.config.election_timeout_max_ms + 1;
+    }
+    try testing.expect(h.replica.membersSilent(h.now));
+    try testing.expectEqual(@as(u32, 0), h.raft.leader_id);
+    // A member answering means it can still learn the group the usual way.
+    h.answer(3, membership.Config.ofVoters(&.{ 1, 2, 3 }), 1, 2, false);
+    try testing.expect(!h.replica.membersSilent(h.now));
+    // A stranger at this node's term, not a later one, isn't the sign.
+    var g: VouchHarness = undefined;
+    try g.init(membership.Config.ofVoters(&.{ 1, 2, 3 }));
+    defer g.deinit();
+    for (0..VouchReplica.SILENT_ROUNDS + 1) |_| {
+        g.heartbeat(4, 1);
+        g.now += g.raft.config.election_timeout_max_ms + 1;
+    }
+    try testing.expect(!g.replica.membersSilent(g.now));
+}
+
+test "replica: a vouch restored with its index at or below this node's commit at boot is not live, and is cleared" {
+    var h: VouchHarness = undefined;
+    try staleMember(&h);
+    defer h.deinit();
+    var sink: VouchSink = .{};
+    h.raft.hard_state_sink = .{ .ctx = @ptrCast(&sink), .persist = VouchSink.persist };
+    // Stored, then the node applied past it before the restart; nothing
+    // restarts its window.
+    h.raft.commit_index = 25;
+    h.raft.vouch = .{ .config = groupNow(), .index = 20, .term = 2 };
+    try testing.expectEqual(@as(u64, 0), h.replica.vouchedIndex());
+    h.heartbeat(1, 2);
+    try testing.expectEqual(@as(u32, 0), h.raft.leader_id);
+    h.replica.tickRaft();
+    try testing.expectEqual(@as(u64, 0), h.raft.vouch.index);
+    try testing.expectEqual(@as(u32, 1), sink.writes);
 }
