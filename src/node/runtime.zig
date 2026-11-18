@@ -779,7 +779,7 @@ pub const Runtime = struct {
         const shards_created = shards.len;
         // Every replay has finished on the workers above, and no shard
         // thread has started: shard 0 reads the others' maps safely.
-        shard_mod.raiseNamespaceIdFloor(shards);
+        try shard_mod.raiseNamespaceIdFloor(shards);
 
         wireWalkContexts(shards);
         for (shards) |*s| {

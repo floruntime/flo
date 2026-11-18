@@ -946,7 +946,7 @@ pub const Shard = struct {
         // Create Namespace handler (no projection needed)
         const namespace_handler = try allocator.create(NamespaceHandler);
         errdefer allocator.destroy(namespace_handler);
-        namespace_handler.* = try NamespaceHandler.initFor(allocator, shard_id, boot.namespaces);
+        namespace_handler.* = try NamespaceHandler.initFor(allocator, shard_id, boot.namespaces, &partition.store);
         errdefer namespace_handler.deinit();
 
         // Create Actions handler
@@ -1050,7 +1050,6 @@ pub const Shard = struct {
         // the Raft node is on the heap, so it is the applier's context.
         replay_registry.register(.raft_config, @ptrCast(raft_node), applyRaftConfig);
         workflow_handler.registerReplay(&replay_registry);
-        namespace_handler.registerReplay(&replay_registry);
         replay_registry.register(.action_abandon, @ptrCast(actions_handler), ActionsHandler.applyAbandonMessage);
         try checkAppliers(shard_id, &replay_registry);
 
@@ -6058,6 +6057,7 @@ pub const Shard = struct {
             }
             self.recordApplied(entry, result);
         }
+        self.namespace_handler.afterApply(entry);
         self.wakeApplied(entry);
         // The leader's own action steps: the await a deliver answers,
         // workers woken for a run ready again (once a pass: each wake is a
@@ -8775,8 +8775,12 @@ fn applyRaftConfig(ctx: *anyopaque, entry: *const entry_mod.Entry, _: *persisten
 /// decides `next_id`, and a log that lost its tail (damage, salvage) may
 /// have forgotten a create whose id another shard's data is keyed by.
 /// Those ids are reported, not refused (`reportUnknownNamespaces`).
-pub fn raiseNamespaceIdFloor(shards: []Shard) void {
+/// Shard 0 then publishes every create it replayed: all are on disk, and
+/// no request runs until they are in the table.
+pub fn raiseNamespaceIdFloor(shards: []Shard) error{OutOfMemory}!void {
     if (shards.len == 0) return;
+    try shards[0].namespace_handler.publishAll();
+    shards[0].namespace_handler.publish_from_store = false;
     for (shards[1..]) |*s| {
         const named = s.defaultPartition().highest_namespace;
         if (named != 0) shards[0].namespace_handler.raiseIdFloor(named);
@@ -11365,7 +11369,7 @@ fn keyOn(shard: *Shard, ns: ns_table.Id, want: u16, buf: []u8) ![]const u8 {
 /// namespace is routed by it once the create is published.
 fn nextNamespaceId(shard0: *const Shard) ns_table.Id {
     const nh = shard0.namespace_handler;
-    return .of(@max(nh.next_id, nh.next_alloc, nh.id_floor));
+    return .of(@max(nh.nextId(), nh.next_alloc, nh.id_floor));
 }
 
 /// The log index of the first `t` entry in `shard`'s log at or after `from`, or null.
@@ -11585,8 +11589,8 @@ test "Shard: a write on shard 1 to a namespace nobody created is answered once, 
     // Shard 0 created it and the node's table has it; shard 1 logged the
     // write alone, under the table's id, and keeps no name of its own.
     const id = two.namespaces.lookup("fresh").?;
-    try std.testing.expect(two.shards[0].namespace_handler.namespaces.contains("fresh"));
-    try std.testing.expect(!b.namespace_handler.namespaces.contains("fresh"));
+    try std.testing.expect(two.shards[0].namespace_handler.known("fresh"));
+    try std.testing.expect(!b.namespace_handler.known("fresh"));
     try std.testing.expectEqual(from, entryAt(b, .kv_put, from).?);
     try std.testing.expectEqual(b.raft_node.log.lastIndex(), from);
     try std.testing.expectEqual(id.int(), b.defaultPartition().highest_namespace);
@@ -11638,7 +11642,7 @@ test "Shard: shard 0 refusing to create the namespace refuses the write, and sha
     const b = &two.shards[1];
     // Shard 0 is full.
     var name_buf: [16]u8 = undefined;
-    const room = @import("../namespace/table.zig").MAX_LIVE - a.namespace_handler.namespaces.count();
+    const room = @import("../namespace/table.zig").MAX_LIVE - a.namespace_handler.live();
     for (0..room) |i| _ = a.namespace_handler.applyCreate(try std.fmt.bufPrint(&name_buf, "ns{d}", .{i}));
     const c = try TestClient.open(b);
     defer _ = std.c.close(c.pair[1]);
@@ -11662,7 +11666,7 @@ test "Shard: a forwarded write whose namespace shard 0 refuses is refused once t
     const a = &two.shards[0];
     const b = &two.shards[1];
     var name_buf: [16]u8 = undefined;
-    const room = @import("../namespace/table.zig").MAX_LIVE - a.namespace_handler.namespaces.count();
+    const room = @import("../namespace/table.zig").MAX_LIVE - a.namespace_handler.live();
     for (0..room) |i| _ = a.namespace_handler.applyCreate(try std.fmt.bufPrint(&name_buf, "ns{d}", .{i}));
     // The client is shard 0's; the write is shard 1's.
     const c = try TestClient.open(a);
@@ -14990,7 +14994,7 @@ test "Shard: a forward naming a namespace the leader publishes 100 ms later wait
     const raft = t.shard.raft_node;
     // The follower applied the create, at the index it will have here, and
     // resolved the write to its id; this node hasn't applied it yet.
-    const id: ns_table.Id = .of(nh.next_id);
+    const id: ns_table.Id = .of(nh.nextId());
     const published = raft.log.lastIndex() + 1;
     try t.forward(7, "orders", id, published);
     try std.testing.expectEqual(@as(u32, 1), t.shard.edge.held_count);
@@ -15019,7 +15023,7 @@ test "Shard: a forward whose namespace the leader hasn't published within a seco
     defer t.deinit();
     const raft = t.shard.raft_node;
     const before = raft.log.lastIndex();
-    try t.forward(8, "orders", .of(t.shard.namespace_handler.next_id), before + 1);
+    try t.forward(8, "orders", .of(t.shard.namespace_handler.nextId()), before + 1);
     t.shard.sweepHeldForwards(Shard.nowMs() + edge_mod.FORWARD_WAIT_MS - 100);
     try std.testing.expect((try t.reply(8)) == null);
     t.shard.sweepHeldForwards(Shard.nowMs() + edge_mod.FORWARD_WAIT_MS + 1);
@@ -15038,7 +15042,7 @@ test "Shard: a held forward whose id the leader publishes under another name is 
     try t.init();
     defer t.deinit();
     const raft = t.shard.raft_node;
-    const id: ns_table.Id = .of(t.shard.namespace_handler.next_id);
+    const id: ns_table.Id = .of(t.shard.namespace_handler.nextId());
     try t.forward(9, "orders", id, raft.log.lastIndex() + 1);
     try t.create("ledger");
     try std.testing.expectEqual(@as(?ns_table.Id, id), t.shard.namespace_handler.table.lookup("ledger"));
@@ -15058,7 +15062,7 @@ test "Shard: a forward carries a namespace's id only once this node's table has 
     const nh = t.shard.namespace_handler;
     try std.testing.expectEqual(ns_table.DEFAULT, t.shard.forwardedNamespaceId(""));
     // Applied here, not yet on disk and published.
-    const id: ns_table.Id = .of(nh.next_id);
+    const id: ns_table.Id = .of(nh.nextId());
     try std.testing.expect(nh.applyCreateAt("orders", id, 1, t.shard.raft_node.last_applied) == .created);
     try std.testing.expectEqual(@as(?ns_table.Id, id), nh.idOf("orders"));
     try std.testing.expectEqual(ns_table.INVALID, t.shard.forwardedNamespaceId("orders"));
@@ -15072,7 +15076,7 @@ test "Shard: past the held-forward bound a forward is refused overloaded, not ru
     defer t.deinit();
     const raft = t.shard.raft_node;
     const before = raft.log.lastIndex();
-    const id: ns_table.Id = .of(t.shard.namespace_handler.next_id);
+    const id: ns_table.Id = .of(t.shard.namespace_handler.nextId());
     for (0..edge_mod.HELD_FORWARDS) |i| try t.forward(@intCast(100 + i), "orders", id, before + 1);
     try std.testing.expectEqual(@as(u32, edge_mod.HELD_FORWARDS), t.shard.edge.held_count);
     try t.forward(99, "orders", id, before + 1);
@@ -15191,10 +15195,10 @@ test "Shard: at boot, shard 0 proposes no id another shard's entry names, though
     defer two.deinit();
     const a = &two.shards[0];
     const b = &two.shards[1];
-    const lost: u32 = a.namespace_handler.next_id + 7;
+    const lost: u32 = a.namespace_handler.nextId() + 7;
     // A group read's deliver, made under an id shard 0's log lost.
     try applyEntryUnder(b, lost, 1);
-    raiseNamespaceIdFloor(&two.shards);
+    try raiseNamespaceIdFloor(&two.shards);
     try std.testing.expect(a.namespace_handler.proposeCreateOn(a.raft_node, "fresh") == .proposed);
     try std.testing.expectEqual(@as(?ns_table.Id, .of(lost + 1)), a.namespace_handler.idOf("fresh"));
     try std.testing.expect(a.halted == null);
@@ -15228,10 +15232,10 @@ test "Shard: ids another shard holds data under, past shard 0's creates, are log
 
     // Shard 0's log lost the tail that created ids `first` to `lost`;
     // shard 1 applied an entry under `lost`.
-    const first = a.namespace_handler.next_id;
+    const first = a.namespace_handler.nextId();
     const lost: u32 = first + 2;
     try applyEntryUnder(b, lost, 1);
-    raiseNamespaceIdFloor(&two.shards);
+    try raiseNamespaceIdFloor(&two.shards);
 
     var ids: [8]u32 = undefined;
     try std.testing.expectEqual(@as(u32, 3), a.namespace_handler.unknownIds(&ids));
@@ -15265,7 +15269,7 @@ test "Shard: ids another shard holds data under, past shard 0's creates, are log
 
     // More of them: logged again.
     try applyEntryUnder(b, lost + 2, 2);
-    raiseNamespaceIdFloor(&two.shards);
+    try raiseNamespaceIdFloor(&two.shards);
     try std.testing.expectEqual(@as(u32, 2), nh.unknown_logged);
     try std.testing.expectEqual(@as(u64, 4), registry.server.namespace_ids_unknown.load(.monotonic));
 
@@ -15306,7 +15310,7 @@ test "Shard: ids another shard holds data under that shard 0 created are not rep
 
     try std.testing.expectEqual(.created, a.namespace_handler.applyCreate("orders"));
     try applyEntryUnder(b, two.namespaces.lookup("orders").?.int(), 1);
-    raiseNamespaceIdFloor(&two.shards);
+    try raiseNamespaceIdFloor(&two.shards);
     var ids: [8]u32 = undefined;
     try std.testing.expectEqual(@as(u32, 0), a.namespace_handler.unknownIds(&ids));
     try std.testing.expectEqual(@as(u32, 0), a.namespace_handler.unknown_logged);
@@ -15342,8 +15346,8 @@ test "Shard: a publish that fails partway publishes the rest next tick, and none
     defer shard.deinit();
     try std.testing.expect(shard.applyCommitted());
     const nh = shard.namespace_handler;
-    const first: ns_table.Id = .of(nh.next_id);
-    const second: ns_table.Id = .of(nh.next_id + 1);
+    const first: ns_table.Id = .of(nh.nextId());
+    const second: ns_table.Id = .of(nh.nextId() + 1);
     try std.testing.expectEqual(.created, nh.applyCreateAt("orders", first, 0, 1));
     try std.testing.expectEqual(.created, nh.applyCreateAt("ledger", second, 0, 2));
 
@@ -16724,7 +16728,7 @@ test "Shard: a write to a new namespace holds its room before it commits, so wri
 
     // One namespace short of the limit.
     var name_buf: [16]u8 = undefined;
-    const room = @import("../namespace/table.zig").MAX_LIVE - shard.namespace_handler.namespaces.count() - 1;
+    const room = @import("../namespace/table.zig").MAX_LIVE - shard.namespace_handler.live() - 1;
     for (0..room) |i| _ = shard.namespace_handler.applyCreate(try std.fmt.bufPrint(&name_buf, "ns{d}", .{i}));
 
     // Two writes to new namespaces, neither committed: the first holds
@@ -16741,8 +16745,8 @@ test "Shard: a write to a new namespace holds its room before it commits, so wri
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 40), one[0].header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
-    try std.testing.expect(shard.namespace_handler.namespaces.contains("first"));
-    try std.testing.expect(!shard.namespace_handler.namespaces.contains("second"));
+    try std.testing.expect(shard.namespace_handler.known("first"));
+    try std.testing.expect(!shard.namespace_handler.known("second"));
 }
 
 test "Shard: a KV transaction whose commit waits on a peer takes no second commit, write or rollback" {
@@ -17181,7 +17185,7 @@ test "Shard: shard 0 delivers a task in a namespace it created and hasn't publis
     var buf: [2048]u8 = undefined;
     const nh = t.shard.namespace_handler;
     // Created on shard 0, not yet on disk, so not in the table.
-    const id: ns_table.Id = .of(nh.next_id);
+    const id: ns_table.Id = .of(nh.nextId());
     try std.testing.expectEqual(.created, nh.applyCreateAt("fresh", id, 0, t.shard.raft_node.last_applied));
     try std.testing.expect(nh.table.nameOf(id) == null);
 
@@ -17956,7 +17960,7 @@ test "Shard: an internal op from a client is answered as an unknown one, and not
     try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
     try std.testing.expectEqualStrings("unknown op 0x16", (try one[0].refused()).message);
     try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
-    try std.testing.expect(!shard.namespace_handler.namespaces.contains("fresh"));
+    try std.testing.expect(!shard.namespace_handler.known("fresh"));
 }
 
 test "Shard: a stream's first append to a namespace nobody created is listed under that namespace" {
@@ -18406,7 +18410,7 @@ test "Shard: a burst of first writes to a new namespace proposes one implicit cr
 
     // Once it applies the namespace exists, and its next write proposes nothing.
     try ParkTest.ack(&shard);
-    try std.testing.expect(ns.namespaces.contains("fresh"));
+    try std.testing.expect(ns.known("fresh"));
     const again = raft.log.lastIndex() + 1;
     ns.markNamespaceHasData("fresh", &shard);
     try std.testing.expectEqual(@as(u32, 0), Count.creates(raft, again));
@@ -20016,7 +20020,7 @@ test "Shard: a namespace create is published, and answered, only once its segmen
         const nh = shard.namespace_handler;
         // Applied, so shard 0 knows it; not on disk, so nothing else does,
         // and its client waits.
-        try std.testing.expect(nh.namespaces.contains("orders"));
+        try std.testing.expect(nh.known("orders"));
         try std.testing.expect(nh.table.lookup("orders") == null);
         try std.testing.expect(conn.response_deferred);
 
@@ -20039,7 +20043,74 @@ test "Shard: a namespace create is published, and answered, only once its segmen
     _ = again.applyCommitted();
     again.namespace_handler.settle(&again);
     try std.testing.expectEqual(@as(?ns_table.Id, ns_table.FIRST_ALLOCATED), again.namespace_handler.table.lookup("orders"));
-    try std.testing.expectEqual(ns_table.FIRST_ALLOCATED.int() + 1, again.namespace_handler.next_id);
+    try std.testing.expectEqual(ns_table.FIRST_ALLOCATED.int() + 1, again.namespace_handler.nextId());
+}
+
+test "Shard: a restart puts every namespace its log created in the table before any request runs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    const N = 40;
+    var name_buf: [16]u8 = undefined;
+    var last_index: u64 = 0;
+    {
+        var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+        try std.testing.expect(shard.applyCommitted());
+        var pair: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+        defer _ = std.c.close(pair[1]);
+        const conn = try shard.addConnection(pair[0]);
+        for (0..N) |i| {
+            shard.runRequest(conn, try ParkTest.request(.namespace_create, @intCast(i + 1), "", try std.fmt.bufPrint(&name_buf, "ns{d}", .{i}), "", ""), .client);
+            _ = shard.applyCommitted();
+        }
+        shard.namespace_handler.settle(&shard);
+        try std.testing.expectEqual(@as(u32, N + 1), shard.namespace_handler.live());
+        last_index = shard.namespace_handler.table.publishedIndex();
+    }
+    var again = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer again.deinit();
+    again.wireHandlerShardPtrs();
+    const nh = again.namespace_handler;
+    // Replayed into the store, so shard 0 knows them; the table waits for
+    // the boot step every node runs before its shards start.
+    try std.testing.expectEqual(@as(u32, N + 1), nh.live());
+    try std.testing.expect(nh.table.lookup("ns0") == null);
+    try raiseNamespaceIdFloor((&again)[0..1]);
+    for (0..N) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "ns{d}", .{i});
+        try std.testing.expectEqual(nh.idOf(name), nh.table.lookup(name));
+        try std.testing.expectEqualStrings(name, nh.table.nameOf(nh.idOf(name).?).?);
+    }
+    try std.testing.expectEqual(last_index, nh.table.publishedIndex());
+    try std.testing.expectEqual(ns_table.FIRST_ALLOCATED.int() + N, nh.nextId());
+    // Nothing is published twice at the first settle.
+    nh.settle(&again);
+    try std.testing.expect(!nh.publish_from_store);
+}
+
+test "Shard: until shard 0 publishes a namespace, another shard's write to it waits for shard 0 rather than running under no id" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    // Applied on shard 0, as boot replay leaves a create: in its store, not
+    // yet in the table.
+    const id: ns_table.Id = .of(a.namespace_handler.nextId());
+    try std.testing.expectEqual(.created, a.namespace_handler.applyCreateAt("orders", id, 1, 1));
+    try std.testing.expect(a.namespace_handler.prepareWrite(a, "orders") == .go);
+    try std.testing.expect(b.namespace_handler.prepareWrite(b, "orders") == .ensure);
+    try std.testing.expectEqual(ns_table.INVALID, b.forwardedNamespaceId("orders"));
+    try raiseNamespaceIdFloor(&two.shards);
+    try std.testing.expect(b.namespace_handler.prepareWrite(b, "orders") == .go);
+    try std.testing.expectEqual(id, b.forwardedNamespaceId("orders"));
 }
 
 test "Shard: a second create of a name being created waits for the first, and is never told it exists when it doesn't" {
@@ -26784,8 +26855,8 @@ const CreateLog = struct {
         var name_buf: [16]u8 = undefined;
         switch (why) {
             // Every live namespace there can be, default among them.
-            .full => while (nh.namespaces.count() < ns_table.MAX_LIVE) {
-                _ = try create(shard, try std.fmt.bufPrint(&name_buf, "ns{d}", .{nh.next_id}), nh.next_id);
+            .full => while (nh.live() < ns_table.MAX_LIVE) {
+                _ = try create(shard, try std.fmt.bufPrint(&name_buf, "ns{d}", .{nh.nextId()}), nh.nextId());
                 try std.testing.expect(shard.applyCommitted());
             },
             .stale, .existed => {
@@ -26794,7 +26865,7 @@ const CreateLog = struct {
             },
         }
         const id: u32 = switch (why) {
-            .full, .existed => nh.next_id,
+            .full, .existed => nh.nextId(),
             // One another create already took.
             .stale => first,
         };
@@ -26809,8 +26880,8 @@ const CreateLog = struct {
         try std.testing.expectEqual(index, h.index);
         try std.testing.expectEqual(index - 1, shard.raft_node.last_applied);
         try std.testing.expect(held(shard, id) == null);
-        try std.testing.expect(!shard.namespace_handler.namespaces.contains("late"));
-        if (why == .full) try std.testing.expectEqual(@as(usize, ns_table.MAX_LIVE), shard.namespace_handler.namespaces.count());
+        try std.testing.expect(!shard.namespace_handler.known("late"));
+        if (why == .full) try std.testing.expectEqual(@as(usize, ns_table.MAX_LIVE), shard.namespace_handler.live());
         if (why == .existed) try std.testing.expect(shard.namespace_handler.createdName(id) == null);
     }
 };
@@ -26868,7 +26939,7 @@ test "Shard: a create cut with the log's tail by a new leader takes its write wi
         const nh = t.shard.namespace_handler;
         const term = r.current_term;
         const before = r.log.lastIndex();
-        const id: ns_table.Id = .of(nh.next_id);
+        const id: ns_table.Id = .of(nh.nextId());
         // A write to a namespace this leader doesn't know: the create, then
         // the write stamped with its id, neither committed.
         var set_buf: [64]u8 = undefined;
@@ -26909,14 +26980,14 @@ test "Shard: a create cut with the log's tail by a new leader takes its write wi
         try std.testing.expect(nh.idOf("orders") == null or kept == 1);
         if (kept == 0) {
             // Both cut: the id is the new leader's namespace, with its data only.
-            try std.testing.expect(!nh.namespaces.contains("orders"));
+            try std.testing.expect(!nh.known("orders"));
             try std.testing.expectEqualStrings("ledger", nh.createdName(id).?);
-            try std.testing.expectEqual(id, nh.namespaces.get("ledger").?.id);
+            try std.testing.expectEqual(id, nh.metaOf("ledger").?.id);
         } else {
             // The create kept, its write cut: the namespace is made, empty
             // of the old leader's write.
             try std.testing.expectEqualStrings("orders", nh.createdName(id).?);
-            try std.testing.expect(!nh.namespaces.contains("ledger"));
+            try std.testing.expect(!nh.known("ledger"));
         }
         try std.testing.expectEqualStrings("new leader's", CreateLog.held(&t.shard, id).?);
         // Nothing this node proposed is still taken for its own.
@@ -26933,7 +27004,7 @@ test "Shard: a leader is ready only once its next id is past every create in its
     const nh = t.shard.namespace_handler;
     const term = r.current_term;
     const before = r.log.lastIndex();
-    const first = nh.next_id;
+    const first = nh.nextId();
     // Node 2 leads term + 1 and creates two namespaces; this node, now
     // following, holds both, the first committed, neither applied.
     t.shard.replica.leadershipLost("a leader with a newer term spoke");
@@ -26944,7 +27015,7 @@ test "Shard: a leader is ready only once its next id is past every create in its
         e.header.crc32c = e.computeCrc();
     }
     _ = try r.handleAppendEntries(.{ .term = term + 1, .leader_id = 2, .prev_log_index = before, .prev_log_term = term, .entries = &entries, .leader_commit = before + 1 });
-    try std.testing.expectEqual(first, nh.next_id);
+    try std.testing.expectEqual(first, nh.nextId());
 
     // Elected at term + 2, as `becomeLeader` leaves it: nothing of the
     // earlier term applied yet.
@@ -26963,14 +27034,14 @@ test "Shard: a leader is ready only once its next id is past every create in its
     _ = try r.propose(.raft_noop, entry_mod.Flags.NONE, "");
     try ParkTest.ack(&t.shard);
     try std.testing.expect(r.leaderReady());
-    try std.testing.expectEqual(first + 2, nh.next_id);
+    try std.testing.expectEqual(first + 2, nh.nextId());
     try std.testing.expectEqualStrings("b", nh.createdName(.of(first + 1)).?);
     // Its first create takes the id after them.
     const at = r.log.lastIndex() + 1;
     try std.testing.expect(nh.proposeCreateOn(r, "fresh") == .proposed);
     try std.testing.expectEqual(@as(?ns_table.Id, .of(first + 2)), nh.idOf("fresh"));
     try ParkTest.ack(&t.shard);
-    try std.testing.expectEqual(at, nh.namespaces.get("fresh").?.created_index);
+    try std.testing.expectEqual(at, nh.metaOf("fresh").?.created_index);
 }
 
 /// A below-the-ring source that can never be read right now, to stand in for

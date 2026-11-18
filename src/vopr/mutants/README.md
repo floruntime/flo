@@ -50,6 +50,8 @@ means the check stopped catching its bug.
 | `catching-up.json` | `ns_ungated` | `ns_stale_id` | `was refused for an id another create took` |
 | `catching-up.json` | `ns_ready_on_commit` | `ns_stale_id` | `was refused for an id another create took` |
 | `catching-up-alloc.json` | `ns_keeps_alloc` | `ns_dense_id` | `took an id past the next free one` |
+| `catching-up.json` | `ns_stale_accepted` | `ns_rule` | `two namespaces hold one id` |
+| `catching-up.json` | `ns_live_unraised` | `ns_rule` | `the live namespace count isn't the namespaces held` |
 
 Mutants with no row, so CI's check that every mutant is accounted for
 passes:

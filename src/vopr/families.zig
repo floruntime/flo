@@ -15,7 +15,7 @@
 //! `Queues` is the same for queues' messages (`queue_family.zig`).
 //!
 //! `Namespaces` is shard 0's own namespace handler, its creates applied
-//! through the handler's replay path.
+//! through the namespaces machine as the server's applier runs it.
 //!
 //! `Mutant` plants the bugs this check exists to catch, one at a time.
 
@@ -35,6 +35,8 @@ const ae = @import("../protocol/action_entries.zig");
 const ns_handler = @import("../namespace/handler.zig");
 const NamespaceId = @import("../namespace/table.zig").Id;
 const namespace_entries = @import("../protocol/namespace_entries.zig");
+const ns_machine = @import("../namespace/machine.zig");
+const ns_table = @import("../namespace/table.zig");
 
 const Allocator = std.mem.Allocator;
 const HASH_SEED: u64 = 0xFA81_17E5;
@@ -109,6 +111,12 @@ pub const Mutant = enum {
     /// A leader that steps down keeps its in-flight namespace id: won
     /// again, it allocates past what the group created.
     ns_keeps_alloc,
+    /// A create is stored under an id another create took, on every
+    /// replica: the apply took an id below the next free one.
+    ns_stale_accepted,
+    /// A create leaves the live count where it was: the room is counted
+    /// short, and the limit passed.
+    ns_live_unraised,
     // Bugs in the queue machine, planted as the actions ones are: by
     // rewriting the entry it applies, or the state just before it.
     /// A settle completes the message whatever delivery it names.
@@ -182,7 +190,7 @@ pub const Mutant = enum {
     /// entries never reaches it.
     pub fn inActions(m: Mutant) bool {
         return switch (m) {
-            .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_condition_local, .kv_if_absent_holds, .kv_batch_conditions_ignored, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .kv_stops_batch_short, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
+            .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_condition_local, .kv_if_absent_holds, .kv_batch_conditions_ignored, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .kv_stops_batch_short, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc, .ns_stale_accepted, .ns_live_unraised => false,
             .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
             .queue_settle_ignores_token, .queue_release_removes, .queue_expire_ignores_deadline, .queue_deliver_wrong_order, .queue_deliver_short, .queue_expire_first_only, .queue_report_changes_unnamed, .queue_node_clock, .queue_cap_unchecked, .queue_cap_tightened, .queue_settle_keeps_bytes, .queue_requeue_keeps_failures, .queue_drop_keeps_bytes => false,
             .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .stream_trim_leaves_floor, .group_delete_keeps_count, .group_extend_clock_ahead, .group_steal_ignores_idle, .group_requeue_keeps_failures, .group_drop_keeps_bytes, .stream_append_reuses_id => false,
@@ -1035,14 +1043,17 @@ pub const Jobs = @import("processing_family.zig").Jobs;
 
 /// Shard 0's namespace registry: the server's handler, on a table of its
 /// own. The simulator proposes creates through it as shard 0's leader does
-/// (`proposeCreateOn`) and applies them through its replay path. Nothing
-/// is published: shard 0's create path reads its registry, never the table.
+/// (`proposeCreateOn`) and applies them through the namespaces machine.
+/// Nothing is published: shard 0's create path reads its store, never the
+/// table.
 pub const Namespaces = struct {
     handler: ns_handler.NamespaceHandler,
 
     /// `past_next`: created, at an id beyond the next free one. Every
-    /// replica agrees on the gap, so no checksum shows it.
-    pub const Effect = enum { created, past_next, stale_id, refused };
+    /// replica agrees on the gap, so no checksum shows it. `stale_id`: the
+    /// machine halted on an id below the next free one, as it must;
+    /// `stale_applied`: it applied one.
+    pub const Effect = enum { created, past_next, stale_id, stale_applied, refused };
 
     /// Creates by outcome, each counted once however many replicas apply it.
     pub const Counts = struct {
@@ -1058,7 +1069,7 @@ pub const Namespaces = struct {
                     self.created += 1;
                     self.past_next += 1;
                 },
-                .stale_id => self.stale_ids += 1,
+                .stale_id, .stale_applied => self.stale_ids += 1,
                 .refused => self.refusals += 1,
             }
         }
@@ -1083,39 +1094,82 @@ pub const Namespaces = struct {
         return entry_type == @backingInt(entry_mod.EntryType.namespace_create);
     }
 
-    /// Apply `e` as shard 0 does. An error is one a workload create must
-    /// never meet.
-    pub fn apply(self: *Namespaces, e: *const entry_mod.Entry) persistence.ApplyError!Effect {
+    /// Apply `e` as shard 0 does, with `mutant` planted. An error is one a
+    /// workload create must never meet.
+    pub fn apply(self: *Namespaces, e: *const entry_mod.Entry, mutant: Mutant) persistence.ApplyError!Effect {
         var out: persistence.Result = .{};
         out.reset(e);
-        const next = self.handler.next_id;
+        const next = self.handler.nextId();
         var diag: schema.Diagnostic = .{};
         const c = namespace_entries.Create.decodeAll(e.payload, &diag) catch return error.Halt;
-        // The server halts on a create its applier refuses (a ready leader
-        // never proposes one); the model says which, so the checker can.
-        if (c.id < next) return .stale_id;
-        self.handler.replayEntry(e, &out) catch |err| return switch (err) {
-            error.Halt => .refused,
+        // The machine decides; the model only says, after, whether it
+        // halted on an id below the next free one, as it must, or applied it.
+        self.handler.applyCommitted(e, &out) catch |err| return switch (err) {
+            error.Halt => if (c.id < next) .stale_id else .refused,
             else => err,
         };
+        if (c.id < next) return .stale_applied;
+        // Planted in the state the apply left, the same on every replica,
+        // so only the rule sees it.
+        const first = ns_table.FIRST_ALLOCATED.int();
+        if (mutant == .ns_stale_accepted and c.id > first) try self.rewrite(c.name, first, null);
+        if (mutant == .ns_live_unraised) try self.rewrite(null, 0, ns_machine.counts(self.read()).live - 1);
         return if (c.id == next) .created else .past_next;
     }
 
-    /// The registry, the creates this log refused, and the next id, in no
-    /// order of the maps': each name and each refused hash is hashed alone
-    /// and the hashes summed.
-    pub fn checksum(self: *const Namespaces) u64 {
-        const h = &self.handler;
-        var sum: u64 = std.hash.Wyhash.hash(HASH_SEED, std.mem.asBytes(&h.next_id));
-        var it = h.namespaces.iterator();
-        while (it.next()) |kv| {
-            var hasher = std.hash.Wyhash.init(HASH_SEED);
-            hasher.update(kv.key_ptr.*);
-            const m = kv.value_ptr.*;
-            hasher.update(std.mem.asBytes(&[3]u64{ m.id.int(), m.created_at_ns, m.created_index }));
-            sum +%= hasher.final();
+    fn read(self: *const Namespaces) view_mod.ReadView {
+        return .{ .store = self.handler.store };
+    }
+
+    /// Rewrite `name`'s id, or the live count, in the store.
+    fn rewrite(self: *Namespaces, name: ?[]const u8, id: u32, live: ?u32) persistence.ApplyError!void {
+        const st = self.handler.store;
+        var kb: [1 + ns_machine.MAX_NAME_LEN]u8 = undefined;
+        var bytes: [64]u8 = undefined;
+        const fam: u16, const key: []const u8, const value: []const u8 = if (name) |n| blk: {
+            var m = ns_machine.meta(self.read(), n).?;
+            m.id = id;
+            break :blk .{ ns_machine.NameFam.ID, ns_machine.nameKey(&kb, n), ns_machine.Meta.encodeInto(&bytes, m) catch return error.Halt };
+        } else blk: {
+            var cnt = ns_machine.counts(self.read());
+            cnt.live = live.?;
+            break :blk .{ ns_machine.CountsFam.ID, view_mod.key(&kb, "", "ids") catch unreachable, ns_machine.Counts.encodeInto(&bytes, cnt) catch return error.Halt };
+        };
+        const owned = try st.allocator.dupe(u8, value);
+        st.replace(fam, st.find(fam, key).?, owned);
+    }
+
+    /// What every create's record must hold: an id of its own, taken below
+    /// the next free one, and the live count one past the names ("default"
+    /// has none).
+    pub fn rule(self: *const Namespaces) ?[]const u8 {
+        const c = ns_machine.counts(self.read());
+        var taken: std.StaticBitSet(ns_table.CAPACITY) = .empty;
+        var names: u32 = 0;
+        var it = self.read().range(ns_machine.NameFam, ns_machine.NAME_PREFIX);
+        while (it.next() catch return "a namespace record doesn't decode") |rec| {
+            const id = rec.value.v.id;
+            if (id < ns_table.FIRST_ALLOCATED.int() or id >= c.next_id) return "a namespace holds an id it was never given: below the first allocated, or at or past the next free one";
+            if (taken.isSet(id)) return "two namespaces hold one id";
+            taken.set(id);
+            names += 1;
         }
-        return sum;
+        if (c.live != names + 1) return "the live namespace count isn't the namespaces held, with default";
+        return null;
+    }
+
+    /// The registry and its counts, hashed in the store's key order.
+    pub fn checksum(self: *const Namespaces) u64 {
+        const c = ns_machine.counts(self.read());
+        var hasher = std.hash.Wyhash.init(HASH_SEED);
+        hasher.update(std.mem.asBytes(&[2]u32{ c.next_id, c.live }));
+        var it = self.read().range(ns_machine.NameFam, ns_machine.NAME_PREFIX);
+        while (it.next() catch unreachable) |rec| {
+            hasher.update(rec.key);
+            const m = rec.value.v;
+            hasher.update(std.mem.asBytes(&[3]u64{ m.id, m.created_at_ns, m.created_index }));
+        }
+        return hasher.final();
     }
 };
 
@@ -1321,7 +1375,7 @@ fn nsCreate(n: *Namespaces, index: u64, name: []const u8, id: u32) !Namespaces.E
     const p = try namespace_entries.Create.encodeInto(&buf, .{ .name = name, .id = id });
     var e = entry_mod.buildEntry(.namespace_create, 0, 1, index, index, p);
     e.header.crc32c = e.computeCrc();
-    return n.apply(&e);
+    return n.apply(&e, .none);
 }
 
 test "families: a namespace create refused for its id leaves the checksum as it was, and resets" {

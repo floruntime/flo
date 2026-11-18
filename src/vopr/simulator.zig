@@ -119,6 +119,10 @@ pub const Invariant = enum {
     /// create refused before it: a leader proposed from an in-flight id
     /// that outlived its leadership. Every replica agrees on the gap.
     ns_dense_id,
+    /// A namespace record or count the store holds breaks what every create
+    /// keeps true: an id of its own, below the next free one, and the live
+    /// count one past the names.
+    ns_rule,
     convergence,
     api_error, // error return from a public API on protocol-legal input
 };
@@ -2550,7 +2554,8 @@ pub const Simulator = struct {
                 .detail = "the group machine failed a workload entry it should apply",
             },
         });
-        if (is_op and families.Namespaces.owns(e.header.entry_type)) if (node.ns.apply(e)) |effect| {
+        if (is_op and families.Namespaces.owns(e.header.entry_type)) if (node.ns.apply(e, self.options.family_mutant)) |effect| {
+            if (node.ns.rule()) |why| self.checker.fail(.{ .invariant = .ns_rule, .node = node.id, .index = idx, .tick = self.now, .detail = why });
             const first_entry = !(self.ns_seen.getOrPut(self.allocator, .{ idx, std.hash.Wyhash.hash(HASH_SEED, e.payload) }) catch @panic("sim OOM")).found_existing;
             // A refused create may have spent the id its leader chose, so the
             // ids stay dense only while none is refused.
@@ -2562,6 +2567,7 @@ pub const Simulator = struct {
                 .detail = "a namespace create took an id past the next free one",
             });
             if (first_entry) self.ns_counts.count(effect);
+            if (effect == .stale_applied) self.checker.fail(.{ .invariant = .ns_rule, .node = node.id, .index = idx, .tick = self.now, .detail = "a namespace create under an id below the next free one applied" });
             // Every replica refuses it alike: once is enough.
             if (first_entry and effect == .stale_id) {
                 const op_id = Workload.opIdFromPayload(e.header.entry_type, e.payload);
