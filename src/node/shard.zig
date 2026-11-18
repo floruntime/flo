@@ -11315,6 +11315,43 @@ fn entriesOf(shard: *Shard, t: entry_mod.EntryType, from: u64) usize {
     return n;
 }
 
+test "Shard: a client request that names the reserved _flo namespace is refused at the edge, every op family" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [512]u8 = undefined;
+
+    // "_flo" is the system's namespace — its name in the table (namespace/table.zig).
+    // A client that addresses it by name is refused at the shared request edge
+    // (runRequest's nameRefusal), before any handler runs, so the refusal holds
+    // for every op whatever it would do. A silently dropped edge check is Flo's
+    // usual bug shape, so this pins one op per family — reads and writes.
+    const before = shard.raft_node.log.lastIndex();
+    const op_families = [_]proto.OpCode{ .kv_put, .kv_get, .stream_append, .stream_read, .queue_enqueue, .ts_write, .workflow_create };
+    for (op_families, 0..) |op, i| {
+        const id: u64 = 40 + i;
+        shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(op, id), .namespace = "_flo", .key = "k", .value = "v" }, .client);
+        const r = try nextAnswer(c, &shard, &out);
+        try std.testing.expectEqual(id, r.header.request_id);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.header.status);
+        try std.testing.expect(std.mem.indexOf(u8, (try r.refused()).message, "reserved namespace name") != null);
+    }
+    // Refused at the edge: not one of them reached the log.
+    try std.testing.expectEqual(before, shard.raft_node.log.lastIndex());
+
+    // The same edge admits the default namespace, so this pins the reserved-name
+    // refusal and not a blanket one: a write to "default" is accepted and applied.
+    shard.runRequest(c.conn, testReq(.kv_put, 99, "", "k", "v", ""), .client);
+    _ = shard.applyCommitted();
+    const ok = try nextAnswer(c, &shard, &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), ok.header.status);
+}
+
 test "Shard: a job whose sink writes to the system namespace, named or as the job's own, is refused at submit and logs nothing" {
     var two: TwoShards = undefined;
     try two.init();
