@@ -957,12 +957,12 @@ pub const WorkflowHandler = struct {
         // Generate or use explicit run ID.
         // Server-generated IDs have embedded partition bits
         // for O(1) cross-shard routing on status/signal/cancel/history.
-        var run_id_buf: [32]u8 = undefined;
+        var run_id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
         const run_id_str = if (explicit_run_id) |rid|
             rid
         else blk: {
             const slot = router.nsKeySlot(req.ns_id, workflow_name);
-            break :blk shard.run_id_gen.next(.workflow, slot, &run_id_buf);
+            break :blk shard.run_id_gen.next(.workflow, slot, shard.raft_node.current_term, &run_id_buf);
         };
 
         // Build namespace-qualified key for the runs map
@@ -2128,8 +2128,8 @@ pub const WorkflowHandler = struct {
         // while that outbox, this shard's, or the namespace's share of
         // either has no room, so one tenant's calls can't fill them.
         if (shard.sendWait(shard.router.slotToShard(slot), ns) != null) return self.holdStepForRoom(run, step_label, now_ms);
-        var run_id_buf: [32]u8 = undefined;
-        const run_id = shard.run_id_gen.next(if (kind == .action) .action else .workflow, slot, &run_id_buf);
+        var run_id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+        const run_id = shard.run_id_gen.next(if (kind == .action) .action else .workflow, slot, shard.raft_node.current_term, &run_id_buf);
         const buf = self.allocator.alloc(u8, ae.Call.max_size) catch return definition.StepOutcome.execution_failure;
         defer self.allocator.free(buf);
         const payload = ae.Call.encodeInto(buf, .{
@@ -3419,9 +3419,9 @@ pub const WorkflowHandler = struct {
         const idem = std.fmt.bufPrint(&key_buf, "schedule:{d}:{s}:{d}", .{ schedule.ns.int(), schedule.workflow_name_owned, slot_ms }) catch return false;
 
         // Generate run ID with the definition's slot in its bits
-        var run_id_buf: [32]u8 = undefined;
+        var run_id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
         const slot = router.nsKeySlot(schedule.ns, schedule.workflow_name_owned);
-        const run_id_str = shard.run_id_gen.next(.workflow, slot, &run_id_buf);
+        const run_id_str = shard.run_id_gen.next(.workflow, slot, shard.raft_node.current_term, &run_id_buf);
 
         return self.proposeRun(shard, schedule.ns, run_id_str, schedule.workflow_name_owned, "latest", input, idem, "schedule_started") != null;
     }
@@ -3577,9 +3577,9 @@ pub const WorkflowHandler = struct {
         event_id: StreamID,
     ) bool {
         // Generate run ID with the definition's slot in its bits
-        var run_id_buf: [32]u8 = undefined;
+        var run_id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
         const slot = router.nsKeySlot(trigger.ns, trigger.workflow_name_owned);
-        const run_id_str = shard.run_id_gen.next(.workflow, slot, &run_id_buf);
+        const run_id_str = shard.run_id_gen.next(.workflow, slot, shard.raft_node.current_term, &run_id_buf);
 
         // Room for the longest stream name a trigger may have, and both
         // numbers at their widest.

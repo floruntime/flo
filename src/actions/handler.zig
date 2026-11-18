@@ -399,8 +399,8 @@ pub const ActionsHandler = struct {
         } };
         if (parsed.input.len > ae.MAX_INPUT) return .{ .err = .{ .code = .invalid_request, .message = "action input too large" } };
         if (parsed.labels) |l| if (l.len > ae.MAX_LABELS) return .{ .err = .{ .code = .invalid_request, .message = "invoke labels too large" } };
-        var id_buf: [32]u8 = undefined;
-        const run_id = shard.run_id_gen.next(.action, router.nsKeySlot(ns, name), &id_buf);
+        var id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+        const run_id = shard.run_id_gen.next(.action, router.nsKeySlot(ns, name), shard.raft_node.current_term, &id_buf);
         const proposed = propose(shard, .action_invoke, ae.Invoke.Value{ .ns = ns.int(), .action = name, .run = run_id, .input = parsed.input, .labels = parsed.labels, .source = .direct, .caller_run = null, .caller_workflow = null }) catch |err|
             return .{ .err = persistence.failureError(err, "action not persisted") };
         return .{ .parked = proposed };

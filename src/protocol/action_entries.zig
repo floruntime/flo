@@ -26,8 +26,8 @@ const BoundedList = schema.BoundedList;
 pub const NamespaceId = kv_entries.NamespaceId;
 pub const MAX_ACTION_NAME: u32 = 256;
 pub const ActionName = Bytes(MAX_ACTION_NAME);
-/// Run ids are made by the server, 32 bytes.
-pub const MAX_RUN_ID: u32 = 32;
+/// Run ids are made by the server: at most `run_id.MAX_ID_LEN` bytes.
+pub const MAX_RUN_ID: u32 = 42;
 pub const RunId = Bytes(MAX_RUN_ID);
 pub const Holder = Bytes(action_ops.MAX_WORKER_ID);
 pub const MAX_INPUT: u32 = 64 * 1024;
