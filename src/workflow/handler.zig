@@ -3496,16 +3496,19 @@ pub const WorkflowHandler = struct {
     }
 
     /// Whether a read of the stream made at `made` goes on from the
-    /// trigger's cursor. The first read says which stream the cursor is in;
-    /// a read of another (the stream deleted and made again, which numbers
-    /// its appends afresh) starts the cursor over, and reads again from
-    /// there.
+    /// trigger's cursor. The first read says which stream the cursor is in.
+    /// A read of a stream made later (deleted and made again, which today
+    /// numbers its appends afresh) starts the cursor over, and reads again
+    /// from there. Stamps only rise, so a read of one made earlier comes
+    /// from a replica that hasn't applied the remake yet: it is dropped,
+    /// and the cursor stays.
     fn sameStream(trigger: *StreamTriggerState, made: u64) bool {
         const was = trigger.stream_made_ns orelse {
             trigger.stream_made_ns = made;
             return true;
         };
-        if (was == made) return true;
+        if (made == was) return true;
+        if (made < was) return false;
         trigger.stream_made_ns = made;
         trigger.stream_cursor_ts = 0;
         trigger.stream_cursor_seq = 0;

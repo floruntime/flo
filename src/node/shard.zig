@@ -29880,6 +29880,28 @@ test "Shard: a trigger whose stream is deleted and made again reads the new one 
     try std.testing.expectEqual(@as(usize, 3), t.runs());
 }
 
+test "Shard: a trigger's page from a replica behind a remake of its stream is dropped, and the cursor kept" {
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    try t.append(2);
+    t.round();
+    try std.testing.expectEqual(@as(usize, 2), t.runs());
+    const cursor_ts = t.trigger().stream_cursor_ts;
+    const cursor_seq = t.trigger().stream_cursor_seq;
+    // The trigger has read a stream made later than the one the owner
+    // holds: as after it moved to a node whose replica hasn't applied a
+    // delete and remake yet.
+    const newer = t.trigger().stream_made_ns.? + 1;
+    t.trigger().stream_made_ns = newer;
+    try t.append(1);
+    t.round();
+    try std.testing.expectEqual(@as(usize, 2), t.runs());
+    try std.testing.expectEqual(cursor_ts, t.trigger().stream_cursor_ts);
+    try std.testing.expectEqual(cursor_seq, t.trigger().stream_cursor_seq);
+    try std.testing.expectEqual(newer, t.trigger().stream_made_ns.?);
+}
+
 test "Shard: a trigger's read with no answer is asked again after the deadline, not before" {
     var t: TriggerPair = .{};
     try t.init();
