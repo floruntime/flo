@@ -31,13 +31,13 @@ means the check stopped catching its bug.
 | `consumer-groups.json` | `group_abandon_counts_failure` | `group_rule` | `a group's counters are not the ledger's` |
 | `consumer-groups.json` | `group_expire_ignores_deadline` | `group_rule` | `an expire ended another number of leases than the ledger's` |
 | `consumer-groups.json` | `group_settle_keeps_bytes` | `group_rule` | `a group's held bytes are not what the ledger's records hold` |
-| `consumer-groups.json` | `group_trim_misses_floor` | `group_rule` | `a stream's floor is not the last record it lost` |
+| `consumer-groups.json` | `stream_trim_leaves_floor` | `group_rule` | `a stream's floor is not the last record it lost` |
 | `consumer-groups.json` | `group_delete_keeps_count` | `group_rule` | `a stream's record has another generation or group count than the ledger's` |
 | `consumer-groups.json` | `group_extend_clock_ahead` | `group_rule` | `an extend answered another expiry than the ledger's` |
 | `consumer-groups.json` | `group_steal_ignores_idle` | `group_rule` | `a steal took` |
 | `consumer-groups.json` | `group_requeue_keeps_failures` | `group_rule` | `a record's deliveries or failures are not the ledger's` |
 | `consumer-groups.json` | `group_drop_keeps_bytes` | `group_rule` | `a group's held bytes are not what the ledger's records hold` |
-| `consumer-groups.json` | `stream_append_unrecorded` | `group_rule` | `a stream with records has no stream.meta record` |
+| `consumer-groups.json` | `stream_append_reuses_id` | `group_rule` | `a stream's last id is not its last append's` |
 | `txn-limits.json` | `kv_if_absent_holds` | `applied_integrity` | `decided a put's condition` |
 | `txn-limits.json` | `kv_batch_conditions_ignored` | `applied_integrity` | `a condition that can't hold` |
 | `txn-limits.json` | `kv_refuses_over_own_limit` | `state_checksum` | `kv.value` |
@@ -100,13 +100,13 @@ are checked against the ledger, record by record.
 | An abandon counts no failure | `group_abandon_counts_failure` |
 | An expire ends only a lease past its deadline | `group_expire_ignores_deadline` |
 | A group's held bytes are what its records hold | `group_settle_keeps_bytes` |
-| A trim moves the stream's floor to the last record it lost | `group_trim_misses_floor` |
+| A trim moves the stream's floor to the last record it lost | `stream_trim_leaves_floor` |
 | A stream's record counts its groups exactly | `group_delete_keeps_count` |
 | An extend moves a lease only with half of it or less left, and answers where it ends | `group_extend_clock_ahead` |
 | A steal takes only a record idle at least its idle time, idle since its holder last touched it | `group_steal_ignores_idle` |
 | A requeue resets a dead letter's failures | `group_requeue_keeps_failures` |
 | A drop gives back the bytes of the records it removes | `group_drop_keeps_bytes` |
-| A stream exists in the streams machine (`stream.meta`) exactly while the projection holds it | `stream_append_unrecorded` |
+| A stream's appends take ids past its last, so no id is handed out twice and its last id is its last append's (`streamRule` also checks its counts above the floor and its reclaim mark against its appends) | `stream_append_reuses_id` |
 | A report applies only to the delivery it names; the same hand-back resent counts as applied, any other is answered by what became of the record | machine tests "a nack after an abandon of the same delivery, or the reverse, is answered released, not applied", "a report to a group that isn't there is refused not_found" |
 | Every ready, leased and dead record has its key, and no ready or dead key is left over | checked by the family from the store itself, after every applied group entry |
 

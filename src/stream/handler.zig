@@ -1,19 +1,16 @@
 //! Stream Handler — registers stream and consumer-group opcodes with Dispatcher.
 //!
-//! Read operations (read, info, group_pending) query the StreamProjection for
-//! per-stream records, then read payloads directly from the UAL
+//! Read operations (read, info, group_pending) find a stream's appends in
+//! the streams machine's families (`stream/machine.zig`, read through
+//! `StreamProjection`), then read payloads directly from the UAL
 //! (zero-copy when the entry is contiguous in the hot ring).
 //!
-//! Write operations (append, trim, delete, group commit) persist an entry
-//! through Raft and read their result back from the projection after
-//! `Shard.applyCommitted()`; `replayEntry` is the only code that mutates the
-//! StreamProjection from an entry.
+//! Write operations (create, alter, append, trim, delete) persist an entry
+//! through Raft; the streams machine applies it, and the client is
+//! answered from what it recorded.
 //!
-//! ## Design (UNIFIED_STORAGE_DESIGN.md — P6: Zero-Copy Stream Path)
-//!
-//! Stream data entries live in the UAL and are read directly — no materialization
-//! step. The UAL entry IS the stream record. The StreamProjection maintains
-//! per-stream StreamState (StreamID → ual_index).
+//! Stream data entries live in the UAL and are read directly: the UAL
+//! entry is the stream record, and `stream.record` says where it is.
 //!
 //! ## Opcode Ranges
 //!
@@ -22,8 +19,8 @@
 //!
 //! ## Data Model
 //!
-//! The StreamProjection tracks per-stream StreamRecord (StreamID → ual_index).
-//! Actual message payloads live in the UAL at the recorded ual_index.
+//! Each append's `stream.record` maps its first StreamID to its ual_index;
+//! the message payloads live in the UAL there.
 //! A consumer group leases each record it delivers until acked; its state
 //! is the group machine's, read from the stream at apply.
 
@@ -353,11 +350,15 @@ pub const StreamHandler = struct {
         const prefix = ns.id.bytes();
         var n: usize = 0;
         var counting = self.readView().range(stream_machine.Metas, &prefix);
-        while (counting.next() catch null) |_| n += 1;
+        // A tombstone (a deleted stream its groups still count) is no stream.
+        while (counting.next() catch null) |item| {
+            if (item.value.v.exists) n += 1;
+        }
         const name_buf = dispatcher_mod.scanScratch(n);
         var count: usize = 0;
         var it = self.readView().range(stream_machine.Metas, &prefix);
         while (it.next() catch null) |item| {
+            if (!item.value.v.exists) continue;
             if (count == name_buf.len) break;
             name_buf[count] = item.value.v.name;
             count += 1;
@@ -892,8 +893,13 @@ pub const StreamHandler = struct {
             };
             return .{ .parked = proposed };
         }
-        const trim_id = bound.resolve(self.nowNs()) orelse return trimmed(key, 0, self.stream);
-        return trimmed(key, self.stream.trimStream(key, trim_id), self.stream);
+        // Without a shard (unit tests), the machine applies it here.
+        var key_buf: [TrimBound.MAX_SIZE]u8 = undefined;
+        const t = trimCommand(&key, bound, &key_buf);
+        const out = self.applyLocal(.stream_trim, entry_mod.Flags.NONE, t.ns, t.key, t.value) catch
+            return .{ .err = .{ .code = .internal_error, .message = "stream trim not applied" } };
+        var r = out.reader();
+        return .{ .stream_trimmed = .{ .deleted_count = r.int(u64) orelse 0, .first_seq = r.int(u64) orelse 0 } };
     }
 
     fn trimmed(key: StreamKey, deleted: u64, stream: *StreamProjection) CommandResult {
@@ -905,14 +911,15 @@ pub const StreamHandler = struct {
         } };
     }
 
-    pub const NOT_EMPTY_MESSAGE = "stream is not empty; pass --force to delete";
+    pub const NOT_EMPTY_MESSAGE = stream_machine.NOT_EMPTY;
 
     // ── DELETE ──────────────────────────────────────────────────────────
 
-    /// Delete a stream, logged: its records go with the entry's apply, its
-    /// `stream.meta` record and retention with the streams machine's, its
-    /// metrics series after apply, and its groups by their generation
-    /// moving on (`group_machine`). Deleting a missing stream is ok.
+    /// Delete a stream, logged: the streams machine removes its appends,
+    /// retention and `stream.meta` record in the entry's apply (or leaves a
+    /// tombstone at the next generation while groups count it, so they read
+    /// as gone), and its metrics series goes after apply. Deleting a missing
+    /// stream is ok.
     /// Refuses a non-empty stream unless `force` (option 0x2C) is set.
     fn handleDelete(self: *StreamHandler, req: Request) CommandResult {
         if (req.key.len == 0) {
@@ -930,12 +937,11 @@ pub const StreamHandler = struct {
             };
             return .{ .parked = proposed };
         }
-        if (!force and self.stream.streamRecordCount(key) > 0) {
-            return .{ .err = .{ .code = .conflict, .message = NOT_EMPTY_MESSAGE } };
-        }
+        _ = key;
         if (req.key.len > ns_keys.MAX_QUALIFIED_KEY) return NAME_TOO_LONG;
-        _ = self.stream.deleteStream(key);
-        self.followLocal(.stream_delete, req.ns_id, req.key) catch return .{ .err = .{ .code = .internal_error, .message = "stream delete not applied" } };
+        const out = self.applyLocal(.stream_delete, if (force) entry_mod.Flags.FORCE else entry_mod.Flags.NONE, req.ns_id, req.key, "") catch
+            return .{ .err = .{ .code = .internal_error, .message = "stream delete not applied" } };
+        if (out.refused() != null) return .{ .err = .{ .code = .conflict, .message = NOT_EMPTY_MESSAGE } };
         return .ok;
     }
 
@@ -1041,12 +1047,14 @@ pub const StreamHandler = struct {
         return .{ .store = &self.partition.store };
     }
 
-    /// Without a shard (unit tests): what the streams machine follows of an
-    /// entry applied here, as the shard's apply runs it.
-    fn followLocal(self: *StreamHandler, etype: EntryType, ns: router.NamespaceId, name: []const u8) !void {
+    /// Without a shard (unit tests): an entry applied here through the
+    /// streams machine, as the shard's apply runs it, stamped now.
+    fn applyLocal(self: *StreamHandler, etype: EntryType, flags: u16, ns: router.NamespaceId, key: []const u8, value: []const u8) !Result {
         var payload_buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
-        const entry = entry_mod.buildCommandEntry(etype, entry_mod.Flags.NONE, 0, self.partition.committed_index + 1, 0, ns, name, "", &payload_buf) orelse return error.NameTooLong;
-        try contract_machine.observeEntry(&stream_machine.machine, &self.partition.store, &self.partition.apply_scratch, null, &entry, .entry);
+        const entry = entry_mod.buildCommandEntry(etype, flags, 0, self.partition.committed_index + 1, self.nowNs(), ns, key, value, &payload_buf) orelse return error.NameTooLong;
+        var out = Result.start(&entry);
+        try contract_machine.applyEntry(&stream_machine.machine, &self.partition.store, &self.partition.apply_scratch, &entry, &out);
+        return out;
     }
 
     /// The request's stream, if it exists.
@@ -1525,85 +1533,10 @@ pub const StreamHandler = struct {
 
         _ = try self.partition.apply(&entry);
         var out = Result.start(&entry);
-        replayEntry(@ptrCast(self), &entry, &out) catch return error.AppendNotApplied;
-        contract_machine.observeEntry(&stream_machine.machine, &self.partition.store, &self.partition.apply_scratch, null, &entry, .entry) catch return error.AppendNotApplied;
+        contract_machine.applyEntry(&stream_machine.machine, &self.partition.store, &self.partition.apply_scratch, &entry, &out) catch return error.AppendNotApplied;
+        if (out.refused() != null) return error.AppendNotApplied;
         const answer = appendedFrom(&out).stream_append_ok;
         return .{ .sequence = answer.sequence, .timestamp_ms = @intCast(answer.timestamp_ms) };
-    }
-
-    // ── Replay ──────────────────────────────────────────────────────────
-
-    /// Register stream entry types with the replay registry.
-    /// Called during shard init so replaySegments and handleInboxMessage
-    /// can rebuild stream state without hardcoded type checks.
-    pub fn registerReplay(self: *StreamHandler, registry: *ReplayRegistry) void {
-        registry.register(.stream_append, @ptrCast(self), replayEntry);
-        registry.register(.stream_trim, @ptrCast(self), replayEntry);
-        registry.register(.stream_delete, @ptrCast(self), replayEntry);
-    }
-
-    /// The stream applier: offset tracking, name registration, trims, deletes
-    /// and consumer-group cursors, from the entry alone. Runs for a live
-    /// commit, a replicated entry and boot replay alike. The partition has
-    /// already appended the entry to the ring, so `entry.header.index` is
-    /// the UAL index for stream lookups.
-    ///
-    /// Answers: an append, its id's sequence and milliseconds (two u64); a
-    /// trim, what it removed and the stream's first sequence after (two
-    /// u64); the rest, nothing.
-    fn replayEntry(ctx: *anyopaque, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
-        const self: *StreamHandler = @ptrCast(@alignCast(ctx));
-        const etype: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
-        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return error.Halt;
-
-        switch (etype) {
-            .stream_append => {
-                const key = stream_mod.streamKey(cmd.namespace_id, cmd.key);
-                // Recover the user partition from the value prefix so it survives
-                // restart — without it every record rebuilds as partition 0 and
-                // partition-filtered reads break.
-                const av = stream_mod.decodeAppendValue(cmd.value);
-                const record_count = stream_mod.batchRecordCount(av.payload);
-                const byte_len: u32 = @intCast(av.payload.len);
-                // Anchor to the entry timestamp so replay reproduces the same
-                // StreamIDs as the original live apply.
-                const ts_ms = entry.header.timestamp_ns / 1_000_000;
-                const id = self.stream.appendToStreamAt(key, entry.header.index, self.stream.applying_part, av.partition_index, ts_ms, record_count, byte_len) catch |err| {
-                    log.err("stream '{s}': append at index {d} not applied: {s}", .{ cmd.key, entry.header.index, @errorName(err) });
-                    return if (err == error.OutOfMemory) error.OutOfMemory else error.Halt;
-                };
-                out.putInt(u64, id.sequence);
-                out.putInt(u64, id.timestamp_ms);
-            },
-            .stream_trim => {
-                if (cmd.value.len != 8) return error.Halt;
-                var key: StreamKey = undefined;
-                key[0..4].* = cmd.namespace_id.bytes();
-                key[4..12].* = cmd.value[0..8].*;
-                const bound = TrimBound.decode(cmd.key) orelse return error.Halt;
-                // An age resolves against this entry's stamp, so every replica
-                // cuts at the same place.
-                const deleted = if (bound.resolve(entry.header.timestamp_ns)) |trim_id| self.stream.trimStream(key, trim_id) else 0;
-                const first_id = self.stream.streamFirstId(key);
-                out.putInt(u64, deleted);
-                out.putInt(u64, if (!first_id.eql(StreamID.MIN)) first_id.sequence else 0);
-            },
-            // Stream delete: key = the stream's name, in the entry's
-            // namespace. Applied from the committed log everywhere, like
-            // stream_trim.
-            .stream_delete => {
-                if (cmd.key.len == 0) return error.Halt;
-                const key = stream_mod.streamKey(cmd.namespace_id, cmd.key);
-                // In log order, so an append committed before the delete counts
-                // on every replica, whatever its proposer had applied.
-                if (entry.header.flags & entry_mod.Flags.FORCE == 0 and self.stream.streamRecordCount(key) > 0) {
-                    out.refuse(.conflict, .unclassified, NOT_EMPTY_MESSAGE);
-                    return;
-                }
-                _ = self.stream.deleteStream(key);
-            },
-            else => return error.Halt,
-        }
     }
 
     // ── Trim Persistence ────────────────────────────────────────────────
@@ -1634,8 +1567,11 @@ pub const StreamHandler = struct {
     /// Whether it was proposed (without a shard, applied here).
     pub fn persistTrim(self: *StreamHandler, key: StreamKey, bound: TrimBound) bool {
         const sptr = self.shard_ptr orelse {
-            const trim_id = bound.resolve(self.nowNs()) orelse return false;
-            return self.stream.trimStream(key, trim_id) > 0;
+            var key_buf: [TrimBound.MAX_SIZE]u8 = undefined;
+            const t = trimCommand(&key, bound, &key_buf);
+            const out = self.applyLocal(.stream_trim, entry_mod.Flags.NONE, t.ns, t.key, t.value) catch return false;
+            var r = out.reader();
+            return (r.int(u64) orelse 0) > 0;
         };
         _ = self.proposeTrim(shardFromPtr(sptr), key, bound) catch |err| {
             if (!shardFromPtr(sptr).quietHalted(err)) log.err("stream retention: trim of stream {x} not persisted: {s}", .{ &key, @errorName(err) });
@@ -1808,17 +1744,25 @@ fn readPartitionCount(handler: *StreamHandler, stream: []const u8, partition_ind
     };
 }
 
-/// `e` applied as the shard applies it: the streams machine's own, or the
-/// handler's applier and then what the streams machine follows of it.
+/// `e` applied as the shard applies it: through the streams machine.
 fn applyLogged(h: *StreamHandler, e: *const entry_mod.Entry) persistence_mod.ApplyError!Result {
     var out = Result.start(e);
-    if (@as(EntryType, @fromBackingInt(@intCast(e.header.entry_type))) == .stream_config) {
-        try contract_machine.applyEntry(&stream_machine.machine, &h.partition.store, &h.partition.apply_scratch, e, &out);
-        return out;
-    }
-    try StreamHandler.replayEntry(h, e, &out);
-    if (out.refused() == null) try contract_machine.observeAll(&.{stream_machine.machine}, &h.partition.store, &h.partition.apply_scratch, null, e, .entry);
+    try contract_machine.applyEntry(&stream_machine.machine, &h.partition.store, &h.partition.apply_scratch, e, &out);
     return out;
+}
+
+/// An append of `count` records to `ns`'s stream `name`, at log index
+/// `index` and `ms`, applied through the streams machine; its payload is
+/// in no tier unless the test puts it there.
+fn appendRecord(h: *StreamHandler, ns: router.NamespaceId, name: []const u8, index: u64, ms: u64, count: u32) !StreamID {
+    var vb: [512]u8 = undefined;
+    var pb: [1024]u8 = undefined;
+    const e = entry_mod.buildCommandEntry(.stream_append, entry_mod.Flags.NONE, 1, index, ms * std.time.ns_per_ms, ns, name, stream_mod.appendValueOf(&vb, count, 4), &pb).?;
+    var out = try applyLogged(h, &e);
+    try testing.expect(out.refused() == null);
+    var r = out.reader();
+    const seq = r.int(u64).?;
+    return .{ .timestamp_ms = r.int(u64).?, .sequence = seq };
 }
 
 /// The stream `name` in the default namespace, as the handler reads it.
@@ -2198,9 +2142,8 @@ test "stream handler: a read steps past an append it can't read" {
     var handler = StreamHandler.init(allocator, &partition);
     defer handler.deinit();
 
-    // An append the projection knows but whose payload is in no tier.
-    const h = stream_mod.streamKey(.default, "s1");
-    const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 0, 1_700_000_000_000, 1, 10);
+    // An append the stream holds but whose payload is in no tier.
+    const lost = try appendRecord(&handler, .default, "s1", 999_999, 1_700_000_000_000, 1);
     var vb: [64]u8 = undefined;
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
 
@@ -2235,8 +2178,7 @@ test "stream handler: a processing read skips and counts an append in no tier, a
     var handler = StreamHandler.init(allocator, &partition);
     defer handler.deinit();
 
-    const h = stream_mod.streamKey(.default, "s1");
-    const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 0, 1_700_000_000_000, 1, 10);
+    const lost = try appendRecord(&handler, .default, "s1", 999_999, 1_700_000_000_000, 1);
 
     const read = handler.readPayloadsForStream("s1", "default", StreamID.MIN, 10);
     defer allocator.free(read.payloads);
@@ -2312,9 +2254,9 @@ test "stream handler: partition_index survives restart/replay" {
     try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 1));
     try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 2));
 
-    // Simulate restart: drop the in-memory projection, then rebuild it from the
+    // Simulate restart: drop the shard's state, then rebuild it from the
     // persisted UAL entries — exactly the segment-replay path used on boot.
-    handler.stream.reset();
+    partition.store.clear();
     var idx: u64 = 1;
     while (idx <= partition.committed_index) : (idx += 1) {
         if (partition.ual.read(idx)) |entry| {
@@ -2343,7 +2285,7 @@ test "stream handler: an append that runs out of memory fails, rather than apply
         const entry = partition.ual.read(1) orelse return error.EntryMissing;
 
         // Replayed from scratch, each allocation failed in turn.
-        handler.stream.reset();
+        partition.store.clear();
         fa.fail_index = fa.alloc_index + fail_at;
         const outcome = applyLogged(&handler, &entry);
         if (outcome) |_| try testing.expect((metaFor(&handler, "s1") != null)) else |err| try testing.expectEqual(error.OutOfMemory, err);
@@ -2371,12 +2313,12 @@ test "stream handler: delete removes one stream, leaves siblings + --force gatin
     const ns_hash: router.NamespaceId = .default;
     const orders_hash = stream_mod.streamKey(ns_hash, "orders");
     const ship_hash = stream_mod.streamKey(ns_hash, "shipments");
-    try testing.expectEqual(@as(usize, 1), handler.stream.streamRecordCount(orders_hash));
+    try testing.expectEqual(@as(u64, 1), handler.stream.streamLogicalCount(orders_hash));
 
     // Non-empty without --force → conflict, stream untouched.
     const no_force = handler.handleCommand(makeRequest(.stream_delete, "orders", "", ""));
     try testing.expect(std.meta.activeTag(no_force) == .err);
-    try testing.expectEqual(@as(usize, 1), handler.stream.streamRecordCount(orders_hash));
+    try testing.expectEqual(@as(u64, 1), handler.stream.streamLogicalCount(orders_hash));
 
     // With --force → ok; orders gone, shipments intact.
     var ob: [8]u8 = undefined;
@@ -2384,8 +2326,8 @@ test "stream handler: delete removes one stream, leaves siblings + --force gatin
     try builder.addFlag(.force);
     const forced = handler.handleCommand(makeRequest(.stream_delete, "orders", "", builder.getOptions()));
     try testing.expect(std.meta.activeTag(forced) == .ok);
-    try testing.expectEqual(@as(usize, 0), handler.stream.streamRecordCount(orders_hash));
-    try testing.expectEqual(@as(usize, 1), handler.stream.streamRecordCount(ship_hash));
+    try testing.expectEqual(@as(usize, 0), handler.stream.streamLogicalCount(orders_hash));
+    try testing.expectEqual(@as(u64, 1), handler.stream.streamLogicalCount(ship_hash));
 
     // Idempotent: deleting the now-missing stream succeeds.
     const again = handler.handleCommand(makeRequest(.stream_delete, "orders", "", ""));
@@ -2409,7 +2351,7 @@ test "stream handler: a stream_delete entry without force is refused for a strea
     const refused = out.refused().?;
     try testing.expectEqual(proto.StatusCode.conflict, refused.status);
     try testing.expectEqual(proto.Ran.no, refused.refusal.ran);
-    try testing.expectEqual(@as(usize, 1), handler.stream.streamRecordCount(orders_hash));
+    try testing.expectEqual(@as(u64, 1), handler.stream.streamLogicalCount(orders_hash));
 
     // An empty stream, or none, is deleted all the same.
     var ebuf: [128]u8 = undefined;
@@ -2430,14 +2372,14 @@ test "stream handler: stream_delete replay/follower path wipes the stream" {
     _ = handler.handleCommand(makeRequest(.stream_append, "orders", makeBatchValue(&vb, "o1"), ""));
     const ns_hash: router.NamespaceId = .default;
     const orders_hash = stream_mod.streamKey(ns_hash, "orders");
-    try testing.expectEqual(@as(usize, 1), handler.stream.streamRecordCount(orders_hash));
+    try testing.expectEqual(@as(u64, 1), handler.stream.streamLogicalCount(orders_hash));
 
     // A replicated/replayed stream_delete entry (key = the stream's name)
     // must remove the stream — this is the exact path followers and restart use.
     var pbuf: [128]u8 = undefined;
     const del = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.FORCE, 0, partition.committed_index + 1, 1, .default, "orders", "", &pbuf).?;
     _ = try applyLogged(&handler, &del);
-    try testing.expectEqual(@as(usize, 0), handler.stream.streamRecordCount(orders_hash));
+    try testing.expectEqual(@as(usize, 0), handler.stream.streamLogicalCount(orders_hash));
 }
 
 test "stream handler: trim" {
@@ -2576,7 +2518,7 @@ test "stream handler: a trim by age cuts at its entry's stamp, not the host's cl
         const h = stream_mod.streamKey(.default, "aged");
         // 3 s old exactly is not older than 3 s: it stays.
         for ([_]u64{ 10_000, 5_000, 3_000, 1_000 }, 1..) |age, i| {
-            _ = try handler.stream.appendToStreamAt(h, i, 0, 0, stamp_ms - age, 1, 10);
+            _ = try appendRecord(&handler, .default, "aged", i, stamp_ms - age, 1);
         }
         var key_buf: [TrimBound.MAX_SIZE]u8 = undefined;
         // The entry carries the namespace; its value, the rest of the key.
@@ -2609,8 +2551,8 @@ test "stream handler: a trim applies in its entry's namespace alone, though the 
     const ours = stream_mod.streamKey(.of(16), "same");
     const theirs = stream_mod.streamKey(.of(17), "same");
     for (1..4) |i| {
-        _ = try handler.stream.appendToStreamAt(ours, 2 * i - 1, 0, 0, 1_000 + i, 1, 10);
-        _ = try handler.stream.appendToStreamAt(theirs, 2 * i, 0, 0, 1_000 + i, 1, 10);
+        _ = try appendRecord(&handler, .of(16), "same", 2 * i - 1, 1_000 + i, 1);
+        _ = try appendRecord(&handler, .of(17), "same", 2 * i, 1_000 + i, 1);
     }
     var key_buf: [TrimBound.MAX_SIZE]u8 = undefined;
     const t = StreamHandler.trimCommand(&ours, .{ .id = StreamID.MAX }, &key_buf);
@@ -2633,8 +2575,8 @@ test "stream handler: --maxage counts in seconds" {
 
     const h = stream_mod.streamKey(.default, "s1");
     const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
-    _ = try handler.stream.appendToStreamAt(h, 1, 0, 0, now_ms - 10_000, 1, 10);
-    _ = try handler.stream.appendToStreamAt(h, 2, 0, 0, now_ms - 1_000, 1, 10);
+    _ = try appendRecord(&handler, .default, "s1", 1, now_ms - 10_000, 1);
+    _ = try appendRecord(&handler, .default, "s1", 2, now_ms - 1_000, 1);
     // Older than 5 seconds: the 10 s old record, not the 1 s old one.
     var ob: [16]u8 = undefined;
     var b = OptionsBuilder.init(&ob);
@@ -2802,7 +2744,7 @@ test "stream handler: a stream name is refused when empty, holding a NUL, or too
     try testing.expect(StreamHandler.nameRefusal(.stream_list, makeRequest(.stream_list, "a\x00b", "", "")) == null);
 }
 
-test "stream handler: a stream's existence and settings live in the contract's state, so rebuilding the stream projection from nothing keeps a created stream with no records and its retention" {
+test "stream handler: a stream's existence and settings live in the contract's state: a created stream with no records, and its retention, read from its families alone" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
@@ -2820,9 +2762,8 @@ test "stream handler: a stream's existence and settings live in the contract's s
     try testing.expect(partition.store.family(stream_machine.Metas.ID).count == 1);
     try testing.expect(partition.store.family(stream_machine.Retained.ID).count == 1);
 
-    // The projection rebuilt from nothing, as from a snapshot with no log
-    // to replay: the stream still exists, empty, with its settings.
-    handler.stream.reset();
+    // Read from those families alone: the stream exists, empty, with its
+    // settings.
     switch (handler.handleCommand(makeRequest(.stream_info, "empty", "", ""))) {
         .stream_info => |i| {
             try testing.expectEqual(@as(u64, 0), i.count);
@@ -2834,4 +2775,27 @@ test "stream handler: a stream's existence and settings live in the contract's s
     const names = StreamHandler.localScanStreams(@ptrCast(&handler), .{ .id = .default, .name = "default" }, "", null, 10);
     try testing.expectEqual(@as(usize, 1), names.items.len);
     try testing.expectEqualStrings("empty", names.items[0]);
+}
+
+test "stream handler: a list skips a tombstone, a deleted stream its groups still count" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+    var pc: [4]u8 = undefined;
+    std.mem.writeInt(u32, &pc, 1, .little);
+    for ([_][]const u8{ "kept", "gone" }) |name| try testing.expectEqual(CommandResult.ok, handler.handleCommand(makeRequest(.stream_create, name, &pc, "")));
+    // "gone" as a delete leaves it while groups count it.
+    const sk = stream_mod.streamKey(.default, "gone");
+    const node = partition.store.find(stream_machine.Metas.ID, &sk).?;
+    var m = (try stream_machine.Metas.Value.decode(@import("../contract/store.zig").Record.of(node).value)).v;
+    m.exists = false;
+    const bytes = try partition.store.allocator.alloc(u8, try stream_machine.Meta.encodedSize(m));
+    _ = try stream_machine.Meta.encodeInto(bytes, m);
+    partition.store.replace(stream_machine.Metas.ID, node, bytes);
+    const names = StreamHandler.localScanStreams(@ptrCast(&handler), .{ .id = .default, .name = "default" }, "", null, 10);
+    try testing.expectEqual(@as(usize, 1), names.items.len);
+    try testing.expectEqualStrings("kept", names.items[0]);
 }

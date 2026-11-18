@@ -260,8 +260,6 @@ pub const View = struct {
     ranges: std.ArrayListUnmanaged(usize) = .empty,
     /// Fail on an undeclared key rather than count it (`Store.strict_keys`).
     strict: bool,
-    /// The shard's streams, read-only, when the apply was handed them.
-    streams_read: ?Streams = null,
     /// What the entry sends to other groups, in the order sent. The channel
     /// writes them to its outbox when the entry commits (`machine.applyEntryWith`).
     sends: std.ArrayListUnmanaged(Send) = .empty,
@@ -275,11 +273,11 @@ pub const View = struct {
         return .{ .store = store, .arena = arena, .declared = declared, .strict = store.strict_keys, .place = store.place };
     }
 
-    /// The shard's streams as of this entry. A machine that reads them is
-    /// applied with them (`machine.applyEntryWith`); asked without them,
-    /// this is a Flo bug, and the entry halts.
+    /// The shard's streams as committed before this entry, read-only: the
+    /// streams machine's families (`contract/streams.zig`). Its reads go to
+    /// the committed store and aren't checked against the declared keys.
     pub fn streams(self: *const View) ApplyError!Streams {
-        return self.streams_read orelse error.Halt;
+        return .{ .read = .{ .store = self.store } };
     }
 
     /// Sends `payload`, an entry of type `etype`, for `origin`, to the group
@@ -438,6 +436,37 @@ pub const View = struct {
         while (skip < r.staged.len and std.mem.order(u8, r.staged[skip].key, after) != .gt) skip += 1;
         r.staged = r.staged[skip..];
         return r;
+    }
+
+    /// The last key starting with `prefix` and before `before`, as this
+    /// entry sees it (its staged writes and range deletes over committed
+    /// state), with its value; null for none. One seek of the committed tree: a
+    /// stream's trim finds the append it cuts through with it.
+    pub fn lastBefore(self: *View, comptime F: type, prefix: []const u8, before: []const u8) ApplyError!?ViewRange(F).Item {
+        if (!self.declared.coversRange(F.ID, prefix)) self.undeclared();
+        // The greatest staged put under the prefix and before `before`, the
+        // last write per key, unless a later range delete took it.
+        var best: ?Op = null;
+        for (self.ops.items, 0..) |op, i| {
+            if (op.range or op.fam != F.ID or !std.mem.startsWith(u8, op.key, prefix)) continue;
+            if (std.mem.order(u8, op.key, before) != .lt) continue;
+            if (self.lastWrite(F.ID, op.key) != i) continue;
+            if (op.value == null or self.rangedAfter(F.ID, op.key, i)) continue;
+            if (best == null or std.mem.order(u8, op.key, best.?.key) == .gt) best = op;
+        }
+        // The greatest committed one this entry hasn't rewritten or hidden.
+        var committed: ?*store_mod.Record = null;
+        var it = self.store.rangeBefore(F.ID, prefix, before);
+        while (it.next()) |rec| {
+            if (self.lastWrite(F.ID, rec.key()) != null) continue;
+            if (self.ranges.items.len > 0 and self.rangedAfter(F.ID, rec.key(), null)) continue;
+            committed = rec;
+            break;
+        }
+        if (committed) |rec| if (best == null or std.mem.order(u8, rec.key(), best.?.key) == .gt)
+            return .{ .key = rec.key(), .value = F.Value.decode(rec.value) catch return error.Halt };
+        const op = best orelse return null;
+        return .{ .key = op.key, .value = F.Value.decode(op.value.?) catch return error.Halt };
     }
 
     fn bytesOf(self: *View, fam: u16, k: []const u8) ?[]const u8 {

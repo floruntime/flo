@@ -12,6 +12,7 @@ const ge = @import("../protocol/group_entries.zig");
 const ae = @import("../protocol/action_entries.zig");
 const qe = @import("../protocol/queue_entries.zig");
 const gm = @import("../stream/group_machine.zig");
+const stream_proj = @import("../projection/stream.zig");
 const store_mod = @import("../contract/store.zig");
 const view_mod = @import("../contract/view.zig");
 const schema = @import("../protocol/schema.zig");
@@ -25,7 +26,7 @@ const NS = gf.NS;
 const STREAMS = gf.STREAMS;
 const GROUPS = gf.GROUPS;
 
-pub const Made = struct { entry_type: EntryType, payload: []const u8 };
+pub const Made = struct { entry_type: EntryType, payload: []const u8, flags: u16 = 0 };
 
 /// Holders whose name starts so never report: their leases expire.
 const DEAD = "x";
@@ -47,6 +48,7 @@ const SPOIL: u8 = 15;
 /// the leader's applied state (`g` and its `store`); null when the leader
 /// has nothing of the kind drawn to propose.
 pub fn make(g: *ConsumerGroups, store: *store_mod.Store, l: Leader, r: std.Random, buf: []u8, max_len: usize) ?Made {
+    g.bind(store);
     const out = buf[0..@min(buf.len, max_len)];
     var roll = r.uintLessThan(u8, 100);
     const kind: Kind = for (WEIGHTS, 0..) |w, i| {
@@ -65,7 +67,7 @@ pub fn make(g: *ConsumerGroups, store: *store_mod.Store, l: Leader, r: std.Rando
         .create => create(store, out, r, s, grp),
         // A delete takes every record its group holds, so it is rare.
         .delete => if (r.uintLessThan(u8, 4) == 0) delete(out, s, grp) else null,
-        .stream_delete => if (r.uintLessThan(u8, 8) == 0) streamDelete(out, s) else null,
+        .stream_delete => if (r.uintLessThan(u8, 8) == 0) streamDelete(out, r, s) else null,
         .steal => steal(store, out, l, r, s, grp),
         .requeue, .drop => dead(store, out, kind, r, s, grp),
     } catch null;
@@ -81,9 +83,8 @@ fn recordsOf(g: *ConsumerGroups, s: usize) u64 {
 
 fn append(g: *ConsumerGroups, out: []u8, r: std.Random, s: usize) !?Made {
     if (recordsOf(g, s) >= MAX_RECORDS) return null;
-    var v: [4]u8 = undefined;
-    std.mem.writeInt(u32, &v, 1 + r.uintLessThan(u32, 3), .big);
-    return .{ .entry_type = .stream_append, .payload = gf.streamEntry(out, STREAMS[s], &v) orelse return null };
+    var v: [gf.MAX_APPEND_VALUE]u8 = undefined;
+    return .{ .entry_type = .stream_append, .payload = gf.streamEntry(out, STREAMS[s], gf.appendValue(&v, 1 + r.uintLessThan(u32, 3))) orelse return null };
 }
 
 fn trim(g: *ConsumerGroups, out: []u8, r: std.Random, s: usize) !?Made {
@@ -94,13 +95,16 @@ fn trim(g: *ConsumerGroups, out: []u8, r: std.Random, s: usize) !?Made {
     // grown: leases on newer records live long enough to be extended.
     if (n < MAX_RECORDS / 2) return null;
     const at = r.uintLessThan(usize, n / 4);
-    const key = gf.trimKey(ids[@min(at, n - 1)]);
+    var kb: [stream_proj.TrimBound.MAX_SIZE]u8 = undefined;
+    const key = (stream_proj.TrimBound{ .id = ids[@min(at, n - 1)] }).encode(&kb);
     const hash = gf.streamHash(STREAMS[s]);
-    return .{ .entry_type = .stream_trim, .payload = gf.streamEntry(out, &key, &hash) orelse return null };
+    return .{ .entry_type = .stream_trim, .payload = gf.streamEntry(out, key, &hash) orelse return null };
 }
 
-fn streamDelete(out: []u8, s: usize) !?Made {
-    return .{ .entry_type = .stream_delete, .payload = gf.streamEntry(out, STREAMS[s], "") orelse return null };
+/// Half of them forced, as `--force` sends it: one unforced of a stream
+/// holding records is refused.
+fn streamDelete(out: []u8, r: std.Random, s: usize) !?Made {
+    return .{ .entry_type = .stream_delete, .payload = gf.streamEntry(out, STREAMS[s], "") orelse return null, .flags = if (r.boolean()) entry_mod.Flags.FORCE else 0 };
 }
 
 fn create(store: *store_mod.Store, out: []u8, r: std.Random, s: usize, grp: usize) !?Made {

@@ -232,6 +232,34 @@ test "contract: a range reads keys in order, staged writes over committed ones, 
     try testing.expectEqual(@as(?u64, null), f.count("a"));
 }
 
+test "contract: lastBefore finds the greatest key below a bound, staged writes over committed ones, staged and range deletes hidden" {
+    var f = Fixture.init(testing.allocator);
+    defer f.deinit();
+    _ = try f.run(.incr, "b,d,f,h");
+    var keys = view_mod.KeySet.init(f.scratch.allocator());
+    try keys.addRange(Counters.ID, NS, "");
+    var view = View.init(&f.store, f.scratch.allocator(), &keys);
+    var prefix: [8]u8 = undefined;
+    const p = try view_mod.key(&prefix, NS, "");
+    var kb: [64]u8 = undefined;
+    var bb: [64]u8 = undefined;
+    // Committed only.
+    try testing.expectEqualStrings("d", (try view.lastBefore(Counters, p, keyOf(&bb, "e"))).?.key[2..]);
+    try testing.expectEqual(null, try view.lastBefore(Counters, p, keyOf(&bb, "b")));
+    // A staged put past the committed one wins; a staged delete hides one.
+    try view.put(Counters, keyOf(&kb, "e"), .{ .n = 50 });
+    try testing.expectEqual(@as(u64, 50), (try view.lastBefore(Counters, p, keyOf(&bb, "f"))).?.value.n);
+    try view.delete(Counters, keyOf(&kb, "e"));
+    try view.delete(Counters, keyOf(&kb, "d"));
+    try testing.expectEqualStrings("b", (try view.lastBefore(Counters, p, keyOf(&bb, "f"))).?.key[2..]);
+    // A staged rewrite of a committed key reads as the rewrite.
+    try view.put(Counters, keyOf(&kb, "h"), .{ .n = 80 });
+    try testing.expectEqual(@as(u64, 80), (try view.lastBefore(Counters, p, keyOf(&bb, "z"))).?.value.n);
+    // A range delete hides what it covers, staged before it or committed.
+    try view.deleteRange(Counters, p, null);
+    try testing.expectEqual(null, try view.lastBefore(Counters, p, keyOf(&bb, "z")));
+}
+
 test "contract: a range names its namespace, and a key the entry didn't declare is counted" {
     var f = Fixture.init(testing.allocator);
     defer f.deinit();
@@ -500,7 +528,7 @@ test "observers: every machine that follows a type runs, in list order, and a re
     defer scratch.deinit();
     for (&stores) |*store| for (1..4) |i| {
         const e = entry_mod.buildEntry(.stream_delete, entry_mod.Flags.NONE, 1, i, i, "");
-        try machine_mod.observeAll(&Observers.list, store, &scratch, null, &e, .entry);
+        try machine_mod.observeAll(&Observers.list, store, &scratch, &e, .entry);
     };
     for (&stores) |*store| {
         try testing.expectEqual(@as(?u64, 3), countOf(store, Seen, SEEN_KEY));
@@ -510,7 +538,7 @@ test "observers: every machine that follows a type runs, in list order, and a re
     for ([_]u16{ Seen.ID, Echo.ID }) |fam| try testing.expectEqual(store_mod.checksum(&stores[0], fam), store_mod.checksum(&stores[1], fam));
     // An entry no machine follows changes nothing.
     const other = entry_mod.buildEntry(.stream_trim, entry_mod.Flags.NONE, 1, 9, 9, "");
-    try machine_mod.observeAll(&Observers.list, &stores[0], &scratch, null, &other, .entry);
+    try machine_mod.observeAll(&Observers.list, &stores[0], &scratch, &other, .entry);
     try testing.expectEqual(@as(?u64, 3), countOf(&stores[0], Seen, SEEN_KEY));
 }
 
@@ -520,7 +548,7 @@ test "observers: one that writes a family it doesn't own halts, and writes nothi
     var scratch = std.heap.ArenaAllocator.init(testing.allocator);
     defer scratch.deinit();
     const e = entry_mod.buildEntry(.stream_delete, entry_mod.Flags.NONE, 1, 1, 1, "");
-    try testing.expectError(error.Halt, machine_mod.observeEntry(&Observers.intruder, &store, &scratch, null, &e, .entry));
+    try testing.expectError(error.Halt, machine_mod.observeEntry(&Observers.intruder, &store, &scratch, &e, .entry));
     try testing.expect(countOf(&store, Seen, SEEN_KEY) == null);
 }
 
@@ -531,8 +559,8 @@ test "observers: one may send on observing a log entry, and halts if it sends on
     var scratch = std.heap.ArenaAllocator.init(testing.allocator);
     defer scratch.deinit();
     const e = entry_mod.buildEntry(.stream_delete, entry_mod.Flags.NONE, 1, 1, 1, "");
-    try testing.expectError(error.Halt, machine_mod.observeEntry(&Observers.sender, &store, &scratch, null, &e, .message));
+    try testing.expectError(error.Halt, machine_mod.observeEntry(&Observers.sender, &store, &scratch, &e, .message));
     try testing.expectEqual(@as(u64, 0), store.family(@import("channels.zig").OutFam.ID).count);
-    try machine_mod.observeEntry(&Observers.sender, &store, &scratch, null, &e, .entry);
+    try machine_mod.observeEntry(&Observers.sender, &store, &scratch, &e, .entry);
     try testing.expectEqual(@as(u64, 1), store.family(@import("channels.zig").OutFam.ID).count);
 }

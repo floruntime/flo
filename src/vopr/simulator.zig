@@ -2118,7 +2118,7 @@ pub const Simulator = struct {
         const made = group_workload.make(&target.groups, &target.queues.store, leader, self.action_prng.random(), self.action_buf, self.scenario.payload_max) orelse return;
         const id = try self.workload.nextActionOp(made.entry_type, made.payload);
         std.debug.assert(target.raft.leaderReady());
-        const res = target.raft.propose(made.entry_type, 0, made.payload) catch return;
+        const res = target.raft.propose(made.entry_type, made.flags, made.payload) catch return;
         self.workload.recordProposal(id, target.id, res.term, res.index);
         try self.pending_ops.append(self.allocator, id);
     }

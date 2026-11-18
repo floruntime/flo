@@ -199,7 +199,7 @@ test "sinks: removing a job drops its pipelines' cursors, and no other job's" {
     }
     var cb: [64]u8 = undefined;
     const remove = entry_mod.buildCommandEntry(.processing_remove, 0, 1, t.index + 1, 0, .of(21), "job", "", &cb).?;
-    try machine_mod.observeEntry(&machine, &t.store, &t.scratch, null, &remove, .entry);
+    try machine_mod.observeEntry(&machine, &t.store, &t.scratch, &remove, .entry);
     try testing.expectEqual(At{}, cursorOf(t.read(), .of(21), "job"));
     try testing.expectEqual(At{}, cursorOf(t.read(), .of(21), "job\x001"));
     try testing.expectEqual(At{ .a = 2, .b = 2 }, cursorOf(t.read(), .of(21), "jobber"));

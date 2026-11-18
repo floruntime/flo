@@ -12,15 +12,10 @@ const targets = [_]machine.Machine{
     @import("../workflow/children_machine.zig").machine,
     @import("../queue/machine.zig").machine,
     @import("../stream/group_machine.zig").machine,
+    @import("../stream/machine.zig").machine,
     @import("../settings/machine.zig").machine,
     @import("../ts/machine.zig").machine,
 };
-
-/// The namespace a command payload names (a stream's append).
-fn commandNamespace(payload: []const u8) ?u32 {
-    const cmd = @import("../storage/ual/entry.zig").CommandPayload.deserialize(payload) orelse return null;
-    return cmd.namespace_id.int();
-}
 
 /// A hand-back's namespace, and why one can't be applied.
 fn abandonNamespace(payload: []const u8) ?u32 {
@@ -35,15 +30,13 @@ fn abandonRefusal(payload: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Two message types are applied outside a view, once the inbound
-/// commits: a stream append, by the shard's stream applier; and a task
-/// handed back, whose run's leader ends the lease from its own record.
+/// One message type is applied outside a view, once the inbound commits: a
+/// task handed back, whose run's leader ends the lease from its own record.
 pub const Channels = @import("channels.zig").ChannelsWith(&targets, &.{
-    .{ .entry_type = .stream_append, .refusal = @import("../projection/stream.zig").appendRefusal, .namespace = commandNamespace },
     .{ .entry_type = .action_abandon, .refusal = abandonRefusal, .namespace = abandonNamespace },
 });
 
-pub const list = targets ++ [_]machine.Machine{ Channels.machine, @import("../processing/sinks_machine.zig").machine, @import("../stream/machine.zig").machine };
+pub const list = targets ++ [_]machine.Machine{ Channels.machine, @import("../processing/sinks_machine.zig").machine };
 
 comptime {
     machine.check(&list);

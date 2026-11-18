@@ -94,7 +94,7 @@ pub const Partition = struct {
         var ual = try UAL.init(allocator, ual_capacity, max_hot_entries);
         errdefer ual.deinit();
 
-        const stream = stream_mod.StreamProjection.init(allocator);
+        const stream = stream_mod.StreamProjection.init();
 
         var part = Partition{
             .id = partition_id,
@@ -129,6 +129,7 @@ pub const Partition = struct {
     pub fn wireProjections(self: *Partition) void {
         self.kv.store = &self.store;
         self.ts.store = &self.store;
+        self.stream.store = &self.store;
     }
 
     /// Set the warm store budget (max bytes before eviction).
@@ -149,7 +150,6 @@ pub const Partition = struct {
         self.apply_scratch.deinit();
         self.store.deinit();
         self.ts.deinit();
-        self.stream.deinit();
         self.ual.deinit();
     }
 
@@ -347,11 +347,6 @@ pub const Partition = struct {
     pub fn kvGet(self: *Partition, key: []const u8) ?[]const u8 {
         const entry = self.kv.get(key) orelse return null;
         return entry.value;
-    }
-
-    /// Get the stream high water mark.
-    pub fn streamHWM(self: *const Partition) u64 {
-        return self.stream.highWaterMark();
     }
 
     // ── Snapshot ────────────────────────────────────────────────────────

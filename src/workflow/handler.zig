@@ -7344,9 +7344,9 @@ test "workflow handler: a trigger cursor restored inside an append resumes with 
         blob[4 + i * 7 + 4] = @intCast('a' + i);
         std.mem.writeInt(u16, blob[4 + i * 7 + 5 ..][0..2], 0, .little);
     }
-    _ = streams.appendForTest("ns", "events", &blob);
+    _ = streams.appendForTest("default", "events", &blob);
 
-    const all = streams.readPayloadsForStream("events", "ns", StreamID.MIN, 100);
+    const all = streams.readPayloadsForStream("events", "default", StreamID.MIN, 100);
     defer allocator.free(all.payloads);
     defer allocator.free(all.ids);
     try testing.expectEqual(@as(usize, 5), all.payloads.len);
@@ -7360,7 +7360,7 @@ test "workflow handler: a trigger cursor restored inside an append resumes with 
     try testing.expect(cursor.eql(all.ids[1]));
 
     // The next poll reads c, d, e: the rest of that append, nothing skipped.
-    const rest = streams.readPayloadsForStream("events", "ns", cursor, 100);
+    const rest = streams.readPayloadsForStream("events", "default", cursor, 100);
     defer allocator.free(rest.payloads);
     defer allocator.free(rest.ids);
     try testing.expectEqual(@as(usize, 3), rest.payloads.len);

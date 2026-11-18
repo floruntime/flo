@@ -149,9 +149,8 @@ pub const Mutant = enum {
     group_expire_ignores_deadline,
     /// A settle leaves the bytes of the records it removes held.
     group_settle_keeps_bytes,
-    /// A trim never reaches the group machine's observer: the stream's
-    /// floor stays where it was.
-    group_trim_misses_floor,
+    /// A trim leaves its stream's floor where it was.
+    stream_trim_leaves_floor,
     /// A group delete leaves its stream's group count one too high.
     group_delete_keeps_count,
     /// An extend applies as if half a lease later: a lease with more than
@@ -163,9 +162,9 @@ pub const Mutant = enum {
     group_requeue_keeps_failures,
     /// A drop leaves the bytes of the records it removes held.
     group_drop_keeps_bytes,
-    /// A stream append never reaches the streams machine: a stream with
-    /// records has no `stream.meta` record.
-    stream_append_unrecorded,
+    /// An append's ids start over at its stream's last: it takes ids
+    /// an earlier append holds.
+    stream_append_reuses_id,
 
     /// Whether the bug is in a node's transaction limit: a run with none
     /// never reaches it.
@@ -180,7 +179,7 @@ pub const Mutant = enum {
             .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_condition_local, .kv_if_absent_holds, .kv_batch_conditions_ignored, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .kv_stops_batch_short, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
             .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
             .queue_settle_ignores_token, .queue_release_removes, .queue_expire_ignores_deadline, .queue_deliver_wrong_order, .queue_deliver_short, .queue_expire_first_only, .queue_report_changes_unnamed, .queue_node_clock, .queue_cap_unchecked, .queue_cap_tightened, .queue_settle_keeps_bytes, .queue_requeue_keeps_failures, .queue_drop_keeps_bytes => false,
-            .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .group_trim_misses_floor, .group_delete_keeps_count, .group_extend_clock_ahead, .group_steal_ignores_idle, .group_requeue_keeps_failures, .group_drop_keeps_bytes, .stream_append_unrecorded => false,
+            .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .stream_trim_leaves_floor, .group_delete_keeps_count, .group_extend_clock_ahead, .group_steal_ignores_idle, .group_requeue_keeps_failures, .group_drop_keeps_bytes, .stream_append_reuses_id => false,
         };
     }
 
@@ -197,7 +196,7 @@ pub const Mutant = enum {
     /// group entries never reaches it.
     pub fn inGroups(m: Mutant) bool {
         return switch (m) {
-            .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .group_trim_misses_floor, .group_delete_keeps_count, .group_extend_clock_ahead, .group_steal_ignores_idle, .group_requeue_keeps_failures, .group_drop_keeps_bytes, .stream_append_unrecorded => true,
+            .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .stream_trim_leaves_floor, .group_delete_keeps_count, .group_extend_clock_ahead, .group_steal_ignores_idle, .group_requeue_keeps_failures, .group_drop_keeps_bytes, .stream_append_reuses_id => true,
             else => false,
         };
     }
