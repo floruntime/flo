@@ -798,6 +798,43 @@ test "streams machine: a trim past MAX_TRIM_APPENDS is whole at once, and its ap
     try testing.expect(t.store.get(Reclaim.ID, &k) == null);
 }
 
+/// The same tree: each node's key and priority, and its children's, alike.
+fn sameTree(a: ?*store_mod.Tree.Node, b: ?*store_mod.Tree.Node) bool {
+    const x = a orelse return b == null;
+    const y = b orelse return false;
+    return std.mem.eql(u8, x.key, y.key) and x.priority == y.priority and
+        sameTree(x.children[0], y.children[0]) and sameTree(x.children[1], y.children[1]);
+}
+
+test "streams machine: appends linked by their stream's hint build the tree a descent builds, through trims and deletes" {
+    var plain = TestStreams.init();
+    defer plain.deinit();
+    var hinted = TestStreams.init();
+    defer hinted.deinit();
+    hinted.store.setTailPrefix(Records.ID, @sizeOf(StreamKey));
+    const names = [_][]const u8{ "a", "b", "c" };
+    for ([_]*TestStreams{ &plain, &hinted }) |t| {
+        var ms: u64 = 100;
+        for (0..3) |round| {
+            // Appends interleaved across the streams, some in one ms.
+            for (0..40) |i| {
+                _ = try t.append(names[i % names.len], ms, @intCast(1 + i % 3), 4);
+                if (i % 4 == 0) ms += 1;
+            }
+            // A trim's unlinks, then appends after them.
+            _ = try t.trim(names[round % names.len], .{ .id = sid(ms - 5, 0) });
+            for (0..10) |i| _ = try t.append(names[i % names.len], ms + i, 1, 4);
+            ms += 10;
+        }
+        // A delete's range unlink, then the stream made again by an append.
+        _ = try t.delete("b", true);
+        for (0..12) |i| _ = try t.append(names[i % names.len], ms + i, 2, 4);
+    }
+    try testing.expect(hinted.store.tails.count() > 0);
+    try testing.expect(sameTree(plain.store.family(Records.ID).tree.root, hinted.store.family(Records.ID).tree.root));
+    try testing.expectEqual(store_mod.checksum(&plain.store, Records.ID), store_mod.checksum(&hinted.store, Records.ID));
+}
+
 test "streams machine: a delete is refused while records are above the floor unless forced, and takes every append" {
     var t = TestStreams.init();
     defer t.deinit();

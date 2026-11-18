@@ -340,6 +340,8 @@ pub const ConsumerGroups = struct {
     /// Point reads at `store`, the one applies change.
     pub fn bind(self: *ConsumerGroups, store: *Store) void {
         self.stream.store = store;
+        // Appends link by their stream's hint, as a server's do.
+        store.setTailPrefix(sm.Records.ID, @sizeOf(gm.StreamKey));
     }
 
     pub fn streams(self: *const ConsumerGroups) streams_mod.Streams {

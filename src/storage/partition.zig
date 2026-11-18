@@ -17,6 +17,7 @@ const router_mod = @import("../projection/router.zig");
 const kv_state = @import("../kv/state.zig");
 const kv_machine = @import("../kv/machine.zig");
 const stream_mod = @import("../projection/stream.zig");
+const stream_machine = @import("../stream/machine.zig");
 const ts_mod = @import("../projection/ts.zig");
 const log = @import("stdx").log;
 
@@ -130,6 +131,9 @@ pub const Partition = struct {
         self.kv.store = &self.store;
         self.ts.store = &self.store;
         self.stream.store = &self.store;
+        // A stream's next append is past its last: its record links beside
+        // the stream's greatest without a descent.
+        self.store.setTailPrefix(stream_machine.Records.ID, @sizeOf(stream_mod.StreamKey));
     }
 
     /// Set the warm store budget (max bytes before eviction).
