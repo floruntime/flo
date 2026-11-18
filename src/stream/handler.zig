@@ -1571,6 +1571,34 @@ pub const StreamHandler = struct {
         return persistence_mod.proposeEntryIn(shard, .stream_delete, if (force) entry_mod.Flags.FORCE else entry_mod.Flags.NONE, ns, name, "");
     }
 
+    /// The retention duty's batch removal of a marked stream's appends at or
+    /// below its floor (`stream_clean`), or its drop of a tombstone of
+    /// generation `gen` (`stream_forget`): proposed, applying when it
+    /// commits. Whether it was proposed.
+    pub fn persistClean(self: *StreamHandler, key: StreamKey) bool {
+        return self.persistDuty(.stream_clean, key, key[4..12]);
+    }
+
+    pub fn persistForget(self: *StreamHandler, key: StreamKey, gen: u64) bool {
+        var value: [16]u8 = undefined;
+        @memcpy(value[0..8], key[4..12]);
+        std.mem.writeInt(u64, value[8..16], gen, .little);
+        return self.persistDuty(.stream_forget, key, &value);
+    }
+
+    fn persistDuty(self: *StreamHandler, etype: EntryType, key: StreamKey, value: []const u8) bool {
+        const ns = stream_mod.keyNamespace(&key);
+        const sptr = self.shard_ptr orelse {
+            _ = self.applyLocal(etype, entry_mod.Flags.NONE, ns, "", value) catch return false;
+            return true;
+        };
+        _ = persistence_mod.proposeEntryIn(shardFromPtr(sptr), etype, entry_mod.Flags.NONE, ns, "", value) catch |err| {
+            if (!shardFromPtr(sptr).quietHalted(err)) log.err("stream retention: {s} of stream {x} not persisted: {s}", .{ @tagName(etype), &key, @errorName(err) });
+            return false;
+        };
+        return true;
+    }
+
     /// Retention's trims: proposed; the trim applies when it commits.
     /// Whether it was proposed (without a shard, applied here).
     pub fn persistTrim(self: *StreamHandler, key: StreamKey, bound: TrimBound) bool {

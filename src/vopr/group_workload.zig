@@ -12,6 +12,7 @@ const ge = @import("../protocol/group_entries.zig");
 const ae = @import("../protocol/action_entries.zig");
 const qe = @import("../protocol/queue_entries.zig");
 const gm = @import("../stream/group_machine.zig");
+const sm = @import("../stream/machine.zig");
 const stream_proj = @import("../projection/stream.zig");
 const store_mod = @import("../contract/store.zig");
 const view_mod = @import("../contract/view.zig");
@@ -38,9 +39,9 @@ const HOLDERS = [_][]const u8{ "c0", "c1", "s0", "x0" };
 const MAX_RECORDS: u64 = 64;
 const LEASES = [_]u64{ ae.MIN_LEASE_MS, 2 * ae.MIN_LEASE_MS, ge.DEFAULT_LEASE_MS };
 
-const Kind = enum { append, deliver, settle, release, extend, expire, clean, trim, create, delete, stream_delete, steal, requeue, drop };
+const Kind = enum { append, deliver, settle, release, extend, expire, clean, trim, create, delete, stream_delete, steal, requeue, drop, stream_clean, stream_forget };
 /// Out of 100.
-const WEIGHTS = [_]u8{ 18, 18, 11, 11, 9, 9, 7, 3, 4, 2, 1, 2, 3, 2 };
+const WEIGHTS = [_]u8{ 14, 18, 11, 11, 9, 9, 7, 3, 4, 2, 2, 2, 3, 2, 2, 1 };
 /// Percent of reports spoiled.
 const SPOIL: u8 = 15;
 
@@ -55,8 +56,16 @@ pub fn make(g: *ConsumerGroups, store: *store_mod.Store, l: Leader, r: std.Rando
         if (roll < w) break @fromBackingInt(@intCast(i));
         roll -= w;
     } else .append;
-    const s = r.uintLessThan(usize, STREAMS.len);
+    var s = r.uintLessThan(usize, STREAMS.len);
     const grp = r.uintLessThan(usize, GROUPS.len);
+    // The duty's cleans and forgets go mostly to tombstones, as its walk
+    // does; and a tombstone is mostly left to them, so that some are
+    // forgotten before an append makes the stream again.
+    const tomb = tombstoneOf(store, r);
+    if (kind == .stream_clean or kind == .stream_forget) if (tomb) |t| {
+        s = t;
+    };
+    if (kind == .append and isTombstone(store, s) and r.uintLessThan(u8, 8) != 0) return null;
     return switch (kind) {
         .append => append(g, out, r, s),
         .deliver => deliver(g, store, out, l, r, s, grp),
@@ -67,10 +76,29 @@ pub fn make(g: *ConsumerGroups, store: *store_mod.Store, l: Leader, r: std.Rando
         .create => create(store, out, r, s, grp),
         // A delete takes every record its group holds, so it is rare.
         .delete => if (r.uintLessThan(u8, 4) == 0) delete(out, s, grp) else null,
-        .stream_delete => if (r.uintLessThan(u8, 8) == 0) streamDelete(out, r, s) else null,
+        // Deletes and the appends after them make streams again over their
+        // tombstones, while the duty's cleans and forgets race them.
+        .stream_delete => if (r.uintLessThan(u8, 4) == 0) streamDelete(out, r, s) else null,
+        .stream_clean => streamClean(out, s),
+        .stream_forget => streamForget(store, out, r, s),
         .steal => steal(store, out, l, r, s, grp),
         .requeue, .drop => dead(store, out, kind, r, s, grp),
     } catch null;
+}
+
+fn isTombstone(store: *store_mod.Store, s: usize) bool {
+    const m = sm.metaAt(.{ .store = store }, gm.streamOf(NS, STREAMS[s])) orelse return false;
+    return !m.exists;
+}
+
+/// A tombstoned stream, from a random start, if any is.
+fn tombstoneOf(store: *store_mod.Store, r: std.Random) ?usize {
+    const start = r.uintLessThan(usize, STREAMS.len);
+    for (0..STREAMS.len) |i| {
+        const s = (start + i) % STREAMS.len;
+        if (isTombstone(store, s)) return s;
+    }
+    return null;
 }
 
 fn recordsOf(g: *ConsumerGroups, s: usize) u64 {
@@ -105,6 +133,24 @@ fn trim(g: *ConsumerGroups, out: []u8, r: std.Random, s: usize) !?Made {
 /// holding records is refused.
 fn streamDelete(out: []u8, r: std.Random, s: usize) !?Made {
     return .{ .entry_type = .stream_delete, .payload = gf.streamEntry(out, STREAMS[s], "") orelse return null, .flags = if (r.boolean()) entry_mod.Flags.FORCE else 0 };
+}
+
+/// The retention duty's clean of a stream, marked or not.
+fn streamClean(out: []u8, s: usize) !?Made {
+    const hash = gf.streamHash(STREAMS[s]);
+    return .{ .entry_type = .stream_clean, .payload = gf.streamEntry(out, "", &hash) orelse return null };
+}
+
+/// The duty's forget of a stream's tombstone, at the generation the leader
+/// holds; now and then another, which changes nothing.
+fn streamForget(store: *store_mod.Store, out: []u8, r: std.Random, s: usize) !?Made {
+    const held = sm.metaAt(.{ .store = store }, gm.streamOf(NS, STREAMS[s]));
+    var gen: u64 = if (held) |m| m.gen else 0;
+    if (r.uintLessThan(u8, 4) == 0) gen +%= 1;
+    var value: [16]u8 = undefined;
+    value[0..8].* = gf.streamHash(STREAMS[s]);
+    std.mem.writeInt(u64, value[8..16], gen, .little);
+    return .{ .entry_type = .stream_forget, .payload = gf.streamEntry(out, "", &value) orelse return null };
 }
 
 fn create(store: *store_mod.Store, out: []u8, r: std.Random, s: usize, grp: usize) !?Made {

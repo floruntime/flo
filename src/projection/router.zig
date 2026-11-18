@@ -94,7 +94,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .ts_write, .ts_write_batch, .ts_delete, .ts_retention => .none,
 
         // Stream — no projection (UAL direct reads)
-        .stream_append, .stream_trim, .stream_delete, .stream_config => .none,
+        .stream_append, .stream_trim, .stream_delete, .stream_config, .stream_clean, .stream_forget => .none,
 
         // Raft control — consensus layer
         .raft_config, .raft_noop, .repair_skip => .none,

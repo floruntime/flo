@@ -3563,7 +3563,7 @@ test "vopr sim: a consumer-groups run matches the ledger at every entry, and its
     // as applied.
     errdefer std.debug.print("{any}\n", .{s.groups});
     for (std.enums.values(group_family.ConsumerGroups.Kind)) |k| {
-        if (k == .stream_delete) continue;
+        if (k == .stream_delete or k == .stream_forget) continue;
         try testing.expect(s.groups.applied[@backingInt(k)] > 0);
     }
     try testing.expect(s.groups.items_applied > 0 and s.groups.items_refused > 0);

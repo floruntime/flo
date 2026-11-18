@@ -438,7 +438,7 @@ const GROUP_MARKS = std.enums.values(vopr.group_family.ConsumerGroups.Mark);
 
 /// One line a parent can read back, as the queues' line is.
 fn printGroupCounts(c: GroupCounts) void {
-    var buf: [512]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     w.writeAll("[vopr] consumer groups:") catch {};
     for (GROUP_KINDS, c.applied, c.refused) |k, a, r| w.print(" {t}={d}/{d}", .{ k, a, r }) catch {};

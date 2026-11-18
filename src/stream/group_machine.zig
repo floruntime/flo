@@ -1184,6 +1184,26 @@ pub const TestGroups = struct {
         _ = try self.streamEntry(.stream_delete, entry_mod.Flags.FORCE, stream, "", stamp_ns);
     }
 
+    /// The retention duty's clean of a stream (not logged): how many appends
+    /// it removed.
+    pub fn cleanStream(self: *TestGroups, stream: []const u8) !u64 {
+        const hash = streamOf(.default, stream)[4..12].*;
+        const r = try self.streamEntry(.stream_clean, 0, "", &hash, 0);
+        var rd = r.reader();
+        return rd.int(u64).?;
+    }
+
+    /// The retention duty's forget of a stream's tombstone at `gen` (not
+    /// logged): whether it forgot.
+    pub fn forgetStream(self: *TestGroups, stream: []const u8, gen: u64) !bool {
+        var value: [16]u8 = undefined;
+        value[0..8].* = streamOf(.default, stream)[4..12].*;
+        std.mem.writeInt(u64, value[8..16], gen, .little);
+        const r = try self.streamEntry(.stream_forget, 0, "", &value, 0);
+        var rd = r.reader();
+        return rd.int(u64).? == 1;
+    }
+
     /// One cleanup of the default namespace's group, as the duty proposes it.
     pub fn clean(self: *TestGroups, stream: []const u8, group: []const u8, stamp_ns: u64) !u64 {
         var ib: [ge.CleanItem.max_size]u8 = undefined;
@@ -1742,11 +1762,33 @@ test "group machine: a stream's delete leaves its groups gone at once, cleaned o
     try testing.expectEqual(@as(u64, 4), try t.clean("s", "g", 50 * ms));
     try testing.expect(t.meta("s", "g") == null);
     try testing.expectEqual(@as(usize, 0), t.count(Items));
-    // A stream of that name again: a new group, from its first record.
+    // A stream of that name again, in the same ms: a new group at the new
+    // generation, from its first record, whose id is past the old stream's
+    // last; nothing of the old stream is delivered.
     _ = try t.append("s", 100, 1);
     const fresh = try deliver(&t, 4, 1 << 20, "c2", 60 * ms);
     try testing.expectEqual(@as(usize, 1), fresh.n);
-    try testing.expect(fresh.records[0].eql(sid(100, 0)));
+    try testing.expect(fresh.records[0].eql(sid(100, ge.CLEAN_RECORDS + 4)));
+    try testing.expectEqual(@as(u64, 1), t.meta("s", "g").?.gen);
+}
+
+test "group machine: a deleted stream's tombstone is forgotten only once no group counts it and its appends are cleaned" {
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 3);
+    _ = try deliver(&t, 3, 1 << 20, "c1", 10 * ms);
+    try t.deleteStream("s", 20 * ms);
+    // Its group still counts it, and its append is still held.
+    try testing.expect(!try t.forgetStream("s", 1));
+    try testing.expectEqual(@as(u64, 1), try t.cleanStream("s"));
+    try testing.expect(!try t.forgetStream("s", 1));
+    // The group's cleanup ends it: the count is 0, and the tombstone goes,
+    // but only at its own generation.
+    try testing.expectEqual(@as(u64, 3), try t.clean("s", "g", 30 * ms));
+    try testing.expect(t.meta("s", "g") == null);
+    try testing.expect(!try t.forgetStream("s", 0));
+    try testing.expect(try t.forgetStream("s", 1));
+    try testing.expect(sm.metaAt(t.read(), streamOf(.default, "s")) == null);
 }
 
 test "group machine: a group's delete is gone at once, its records cleaned after" {

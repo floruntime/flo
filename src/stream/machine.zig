@@ -98,6 +98,13 @@ pub const Reclaim = view_mod.Family(53, "stream.reclaim", .id, delivery.Empty);
 /// for the retention duty, which trims it to its floor until none remain.
 pub const MAX_TRIM_APPENDS: usize = 1024;
 
+/// How many groups count the stream: a tombstone is forgotten only at 0.
+pub fn groupsOf(read: ReadView, sk: StreamKey) u64 {
+    var sb: [13]u8 = undefined;
+    const r = (read.get(gm.Streams_, gm.recKey(&sb, sk)) catch return 0) orelse return 0;
+    return r.v.groups;
+}
+
 /// The appends a stream still holds at or below `floor`, counting at most
 /// `cap`: what the retention duty has left to remove.
 pub fn heldThrough(read: ReadView, sk: StreamKey, floor: StreamID, cap: usize) usize {
@@ -292,13 +299,21 @@ fn commandOf(e: *const Entry) ?entry_mod.CommandPayload {
 }
 
 /// The stream an entry names: a trim's key is its bound and its value the
-/// name's hash; every other names it by its key.
+/// name's hash; a clean's value is the hash, and a forget's the hash and
+/// the generation it forgets; every other names it by its key.
 fn streamOfEntry(e: *const Entry) ?struct { ns: NamespaceId, hash: [8]u8 } {
     const cmd = commandOf(e) orelse return null;
     if (cmd.namespace_id == .invalid) return null;
-    if (typeOf(e) == .stream_trim) {
-        if (cmd.value.len != 8) return null;
-        return .{ .ns = cmd.namespace_id, .hash = cmd.value[0..8].* };
+    switch (typeOf(e)) {
+        .stream_trim, .stream_clean => {
+            if (cmd.value.len != 8) return null;
+            return .{ .ns = cmd.namespace_id, .hash = cmd.value[0..8].* };
+        },
+        .stream_forget => {
+            if (cmd.value.len != 16) return null;
+            return .{ .ns = cmd.namespace_id, .hash = cmd.value[0..8].* };
+        },
+        else => {},
     }
     if (cmd.key.len == 0) return null;
     return .{ .ns = cmd.namespace_id, .hash = hashOf(cmd.key) };
@@ -313,8 +328,8 @@ fn streamKeys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         error.NoNamespace => return,
         else => |o| return o,
     };
-    // A delete reads whether groups still count its stream.
-    if (typeOf(e) == .stream_delete) {
+    // A forget reads whether groups still count its stream.
+    if (typeOf(e) == .stream_forget) {
         var sb: [13]u8 = undefined;
         try out.add(gm.Streams_.ID, "", gm.recKey(&sb, s.ns.bytes() ++ s.hash)[1..]);
     }
@@ -332,6 +347,8 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         .stream_append => appendApply(view, e, out),
         .stream_trim => trimApply(view, e, out),
         .stream_delete => deleteApply(view, e, out),
+        .stream_clean => cleanApply(view, e, out),
+        .stream_forget => forgetApply(view, e, out),
         else => error.Halt,
     };
 }
@@ -347,10 +364,24 @@ fn putMeta(view: *View, sk: StreamKey, m: Meta.Value) ApplyError!void {
     if (m.exists and hasRetention(m)) try view.put(Retained, key, .{}) else try view.delete(Retained, key);
 }
 
-/// A stream made by its first append or a create: no settings asked, at
-/// the generation a tombstone of it holds.
+/// A stream made by its first append or a create: no settings asked. Made
+/// again over a tombstone, it keeps only the tombstone's generation, last
+/// id, floor and running totals: its ids continue past the old stream's,
+/// so every old record is at or below the floor (read as gone, and
+/// removed by the retention duty) and nothing above it, the new stream's
+/// records, can share a key with one.
 fn newMeta(name: []const u8, stamp: u64, tomb: ?Meta.Value) Meta.Value {
-    return .{ .name = name, .partition_count = 1, .retention_age_s = 0, .retention_count = 0, .created_ns = stamp, .explicit = false, .exists = true, .gen = if (tomb) |t| t.gen else 0, .last_ms = 0, .last_seq = 0, .floor_ms = 0, .floor_seq = 0, .appended_records = 0, .appended_bytes = 0 };
+    var m: Meta.Value = .{ .name = name, .partition_count = 1, .retention_age_s = 0, .retention_count = 0, .created_ns = stamp, .explicit = false, .exists = true, .gen = 0, .last_ms = 0, .last_seq = 0, .floor_ms = 0, .floor_seq = 0, .appended_records = 0, .appended_bytes = 0 };
+    if (tomb) |t| {
+        m.gen = t.gen;
+        m.last_ms = t.last_ms;
+        m.last_seq = t.last_seq;
+        m.floor_ms = t.floor_ms;
+        m.floor_seq = t.floor_seq;
+        m.appended_records = t.appended_records;
+        m.appended_bytes = t.appended_bytes;
+    }
+    return m;
 }
 
 /// A create of a stream with settings (from a create or an alter) is
@@ -454,7 +485,7 @@ fn trimApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     m.floor_ms = new_floor.timestamp_ms;
     m.floor_seq = new_floor.sequence;
     try putMeta(view, sk, m);
-    try reclaim(view, sk, new_floor);
+    _ = try reclaim(view, sk, new_floor, false);
     out.putInt(u64, before.records - after.records);
     out.putInt(u64, if (after.first) |f| f.sequence else 0);
 }
@@ -467,8 +498,10 @@ fn countAboveView(view: *View, sk: StreamKey, m: Meta.Value, floor: StreamID) Ap
 }
 
 /// Remove up to `MAX_TRIM_APPENDS` of a stream's appends at or below
-/// `floor`, oldest first, and mark it in `stream.reclaim` while any remain.
-fn reclaim(view: *View, sk: StreamKey, floor: StreamID) ApplyError!void {
+/// `floor`, oldest first, and mark it in `stream.reclaim` while any remain,
+/// or for a tombstone (`keep_mark`) until it is forgotten. How many it
+/// removed.
+fn reclaim(view: *View, sk: StreamKey, floor: StreamID, keep_mark: bool) ApplyError!usize {
     var it = try view.range(Records, &sk);
     var n: usize = 0;
     var more = false;
@@ -484,12 +517,17 @@ fn reclaim(view: *View, sk: StreamKey, floor: StreamID) ApplyError!void {
     }
     for (doomed[0..n]) |k| try view.delete(Records, k);
     const rk = try view.arena.dupe(u8, &sk);
-    if (more) try view.put(Reclaim, rk, .{}) else try view.delete(Reclaim, rk);
+    if (more or keep_mark) try view.put(Reclaim, rk, .{}) else try view.delete(Reclaim, rk);
+    return n;
 }
 
 /// A delete: refused while the stream holds records above its floor,
-/// unless forced. Its appends go with it, and its meta, or, while groups
-/// still count it, a tombstone at the next generation, so they read as gone.
+/// unless forced. It leaves a tombstone at the next generation, so groups
+/// of the old one read as gone, with its floor moved to its last id, so
+/// every record it held is gone at once and a stream made again takes ids
+/// past them. The tombstone is marked in `stream.reclaim`: the retention
+/// duty removes its records a bounded batch at a time (`stream_clean`),
+/// then forgets it once no group counts it (`stream_forget`).
 fn deleteApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     const cmd = commandOf(e) orelse return error.Halt;
     if (cmd.key.len == 0 or cmd.namespace_id == .invalid) return error.Halt;
@@ -500,22 +538,55 @@ fn deleteApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     // every replica, whatever its proposer had applied.
     if (e.header.flags & entry_mod.Flags.FORCE == 0 and (try countAboveView(view, sk, m, floorOf(m))).records > 0)
         return out.refuse(.conflict, .unclassified, NOT_EMPTY);
-    try view.deleteRange(Records, &sk, null);
     const key = try view.arena.dupe(u8, &sk);
-    try view.delete(Reclaim, key);
     try view.delete(Retained, key);
-    var sb: [13]u8 = undefined;
-    const groups = if (try view.get(gm.Streams_, gm.recKey(&sb, sk))) |r| r.v.groups else 0;
-    if (groups == 0) return view.delete(Metas, key);
-    var tomb = newMeta("", m.created_ns, null);
+    var tomb = newMeta("", m.created_ns, m);
     tomb.exists = false;
     tomb.gen = m.gen + 1;
+    const last = lastOf(m);
+    if (last.greaterThan(floorOf(m))) {
+        tomb.floor_ms = last.timestamp_ms;
+        tomb.floor_seq = last.sequence;
+    }
     try view.put(Metas, key, .{ .v = tomb });
+    try view.put(Reclaim, key, .{});
+}
+
+/// The retention duty's batch for a marked stream: up to `MAX_TRIM_APPENDS`
+/// of its appends at or below its floor removed, a live stream's or a
+/// tombstone's. A live stream's mark goes with its last batch; a
+/// tombstone's stays until it is forgotten. Answers how many it removed.
+fn cleanApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
+    const cmd = commandOf(e) orelse return error.Halt;
+    const sk: StreamKey = cmd.namespace_id.bytes() ++ cmd.value[0..8].*;
+    const m = ((try view.get(Metas, &sk)) orelse return out.putInt(u64, 0)).v;
+    const removed = try reclaim(view, sk, floorOf(m), !m.exists);
+    out.putInt(u64, removed);
+}
+
+/// The retention duty's drop of a tombstone: only if it is still one, at
+/// the generation the entry names, holding no appends, with no group
+/// counting it. A forget a recreate, a new group or an unfinished clean
+/// overtook changes nothing. Answers 1 if it forgot, 0 if not.
+fn forgetApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
+    const cmd = commandOf(e) orelse return error.Halt;
+    const sk: StreamKey = cmd.namespace_id.bytes() ++ cmd.value[0..8].*;
+    const gen = std.mem.readInt(u64, cmd.value[8..16], .little);
+    const m = ((try view.get(Metas, &sk)) orelse return out.putInt(u64, 0)).v;
+    if (m.exists or m.gen != gen) return out.putInt(u64, 0);
+    var sb: [13]u8 = undefined;
+    if (try view.get(gm.Streams_, gm.recKey(&sb, sk))) |r| if (r.v.groups > 0) return out.putInt(u64, 0);
+    var held = try view.range(Records, &sk);
+    if ((try held.next()) != null) return out.putInt(u64, 0);
+    const key = try view.arena.dupe(u8, &sk);
+    try view.delete(Metas, key);
+    try view.delete(Reclaim, key);
+    out.putInt(u64, 1);
 }
 
 pub const machine: machine_mod.Machine = .{
     .name = "streams",
-    .entry_types = &.{ .stream_config, .stream_append, .stream_trim, .stream_delete },
+    .entry_types = &.{ .stream_config, .stream_append, .stream_trim, .stream_delete, .stream_clean, .stream_forget },
     .families = &.{ machine_mod.info(Metas), machine_mod.info(Retained), machine_mod.info(Records), machine_mod.info(Reclaim) },
     .keys = streamKeys,
     .apply = apply,
@@ -595,6 +666,32 @@ pub const TestStreams = struct {
 
     pub fn delete(t: *TestStreams, name: []const u8, force: bool) !Result {
         return t.run(.stream_delete, if (force) entry_mod.Flags.FORCE else 0, name, "", 1);
+    }
+
+    /// The retention duty's clean of `name`: how many appends it removed.
+    pub fn clean(t: *TestStreams, name: []const u8) !u64 {
+        const hash = hashOf(name);
+        const out = try t.run(.stream_clean, 0, "", &hash, 1);
+        try testing.expect(out.refused() == null);
+        var r = out.reader();
+        return r.int(u64).?;
+    }
+
+    /// The retention duty's forget of `name`'s tombstone at `gen`: whether
+    /// it forgot.
+    pub fn forget(t: *TestStreams, name: []const u8, gen: u64) !bool {
+        var value: [16]u8 = undefined;
+        value[0..8].* = hashOf(name);
+        std.mem.writeInt(u64, value[8..16], gen, .little);
+        const out = try t.run(.stream_forget, 0, "", &value, 1);
+        try testing.expect(out.refused() == null);
+        var r = out.reader();
+        return r.int(u64).? == 1;
+    }
+
+    /// `name`'s `stream.meta` record, a tombstone's too.
+    pub fn stored(t: *TestStreams, name: []const u8) ?Meta.Value {
+        return metaAt(t.read(), sk(name));
     }
 
     pub fn config(t: *TestStreams, c: StreamConfig, name: []const u8, stamp: u64) !Result {
@@ -835,18 +932,99 @@ test "streams machine: appends linked by their stream's hint build the tree a de
     try testing.expectEqual(store_mod.checksum(&plain.store, Records.ID), store_mod.checksum(&hinted.store, Records.ID));
 }
 
-test "streams machine: a delete is refused while records are above the floor unless forced, and takes every append" {
+test "streams machine: a delete is refused while records are above the floor unless forced, leaves a tombstone, and its appends go by cleans" {
     var t = TestStreams.init();
     defer t.deinit();
     _ = try t.append("s", 100, 2, 4);
     try testing.expectEqual(proto.StatusCode.conflict, (try t.delete("s", false)).refused().?.status);
     _ = try t.trim("s", .{ .id = sid(100, 1) });
-    // Trimmed empty: it goes.
+    // Trimmed empty: it goes, as a tombstone at the next generation.
     try testing.expect((try t.delete("s", false)).refused() == null);
     try testing.expect(t.meta("s") == null);
-    _ = try t.append("f", 100, 2, 4);
+    try testing.expectEqual(@as(u64, 1), t.stored("s").?.gen);
+
+    const n = MAX_TRIM_APPENDS + 5;
+    for (0..n) |i| _ = try t.append("f", 100 + i, 1, 4);
     try testing.expect((try t.delete("f", true)).refused() == null);
+    // Gone at once: nothing reads, nothing counts.
+    try testing.expect(t.meta("f") == null);
+    const k = TestStreams.sk("f");
+    try testing.expectEqual(@as(u64, 0), countAbove(t.read(), k, t.stored("f").?, floorOf(t.stored("f").?)).records);
+    // Its appends leave a bounded batch at a time; the tombstone stays
+    // marked for its forget.
+    try testing.expectEqual(@as(u64, MAX_TRIM_APPENDS), try t.clean("f"));
+    try testing.expectEqual(@as(u64, 5), try t.clean("f"));
     try testing.expectEqual(@as(usize, 0), t.held("f"));
+    try testing.expect(t.store.get(Reclaim.ID, &k) != null);
+    // A forget of another generation changes nothing; of its own, it goes.
+    try testing.expect(!try t.forget("f", 0));
+    try testing.expect(try t.forget("f", 1));
+    try testing.expect(t.stored("f") == null);
+    try testing.expect(t.store.get(Reclaim.ID, &k) == null);
     // A delete of a stream that isn't there is ok.
     try testing.expect((try t.delete("nope", false)).refused() == null);
+}
+
+test "streams machine: a stream made again in the same ms after a delete reads only its own records, with ids past the old ones" {
+    var t = TestStreams.init();
+    defer t.deinit();
+    _ = try t.append("s", 100, 3, 4);
+    const old_last = lastOf(t.meta("s").?);
+    try testing.expect((try t.delete("s", true)).refused() == null);
+    // Made again by an append in the same ms, before any clean.
+    const first = try t.append("s", 100, 2, 4);
+    try testing.expect(first.greaterThan(old_last));
+    const m = t.meta("s").?;
+    try testing.expectEqual(@as(u64, 1), m.gen);
+    try testing.expectEqual(@as(u64, 2), countAbove(t.read(), TestStreams.sk("s"), m, floorOf(m)).records);
+    var it = Appends.init(t.read(), TestStreams.sk("s"), m, floorOf(m));
+    try testing.expect(it.next().?.id.eql(first));
+    try testing.expect(it.next() == null);
+    // The old append is still held, below the floor, until a clean.
+    try testing.expectEqual(@as(usize, 2), t.held("s"));
+    try testing.expectEqual(@as(u64, 1), try t.clean("s"));
+    try testing.expectEqual(@as(usize, 1), t.held("s"));
+    // A forget raced by the recreate changes nothing.
+    try testing.expect(!try t.forget("s", 1));
+    try testing.expect(t.meta("s") != null);
+}
+
+test "streams machine: a recreate keeps only the tombstone's generation, last id and floor; its settings are its create's" {
+    var t = TestStreams.init();
+    defer t.deinit();
+    try testing.expect((try t.config(.{ .op = .create, .partition_count = 4, .retention_age_s = 60, .retention_count = 9 }, "s", 1)).refused() == null);
+    _ = try t.append("s", 100, 2, 4);
+    try testing.expect((try t.delete("s", true)).refused() == null);
+    try testing.expect(!t.retained("s"));
+    try testing.expect((try t.config(.{ .op = .create, .partition_count = 2, .retention_age_s = 0, .retention_count = 0 }, "s", 7)).refused() == null);
+    const m = t.meta("s").?;
+    try testing.expectEqual(@as(u32, 2), m.partition_count);
+    try testing.expectEqual(@as(u64, 0), m.retention_age_s);
+    try testing.expectEqual(@as(u64, 0), m.retention_count);
+    try testing.expectEqual(@as(u64, 7), m.created_ns);
+    try testing.expectEqual(@as(u64, 1), m.gen);
+    try testing.expect(floorOf(m).eql(sid(100, 1)));
+    try testing.expectEqual(@as(u64, 0), countAbove(t.read(), TestStreams.sk("s"), m, floorOf(m)).records);
+
+    // Made again by an append, it is made at that append's stamp: a reader
+    // that keeps the stream's created_ns can tell it from the old one.
+    try testing.expect((try t.delete("s", true)).refused() == null);
+    _ = try t.append("s", 300, 1, 4);
+    const again = t.meta("s").?;
+    try testing.expectEqual(@as(u64, 300 * std.time.ns_per_ms), again.created_ns);
+    try testing.expect(again.created_ns != m.created_ns);
+    try testing.expectEqual(@as(u64, 2), again.gen);
+}
+
+test "streams machine: ids still rise across a delete and a recreate with the clock moved back" {
+    var t = TestStreams.init();
+    defer t.deinit();
+    _ = try t.append("s", 500, 2, 4);
+    const old_last = lastOf(t.meta("s").?);
+    try testing.expect((try t.delete("s", true)).refused() == null);
+    // The clock has gone back 400 ms.
+    const first = try t.append("s", 100, 1, 4);
+    try testing.expect(first.greaterThan(old_last));
+    const next = try t.append("s", 101, 1, 4);
+    try testing.expect(next.greaterThan(first));
 }
