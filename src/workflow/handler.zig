@@ -49,6 +49,7 @@ const StepOutputMap = wf_types.StepOutputMap;
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const StreamID = @import("../projection/stream.zig").StreamID;
+const source_page = @import("../processing/source_page.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence_mod = @import("../storage/persistence.zig");
 const Result = persistence_mod.Result;
@@ -411,6 +412,15 @@ pub const WorkflowHandler = struct {
         stream_cursor_ts: u64,
         stream_cursor_seq: u64,
         last_poll_ms: i64,
+        /// A read of a stream another shard owns, in flight (0 for none):
+        /// its number and the term it was asked in. At most one at a time.
+        read_seq: u64 = 0,
+        read_term: u64 = 0,
+        read_sent_ms: i64 = 0,
+        next_read_seq: u64 = 0,
+        /// Which stream the cursor is in (the stamp that made it), once a
+        /// read has said; a read of one made since starts the cursor over.
+        stream_made_ns: ?u64 = null,
     };
 
     pub const ScheduleState = struct {
@@ -2164,25 +2174,6 @@ pub const WorkflowHandler = struct {
         return shard.raft_node.propose(etype, entry_mod.Flags.NONE, payload);
     }
 
-    /// Resolve the StreamHandler that owns `stream_name` in namespace `ns`, using
-    /// the same composite hash the dispatcher uses to route stream_append. The
-    /// stream's data lives on that shard, so stream triggers must read from it
-    /// rather than the local shard (which is merely wherever the triggering
-    /// workflow definition happened to be created). Falls back to local.
-    fn resolveStreamHandler(shard: *Shard, ns: NamespaceId, stream_name: []const u8) @TypeOf(shard.stream_handler) {
-        const hash = router.routeNsKey(ns, stream_name);
-        const target = shard.router.route(hash);
-        switch (target) {
-            .local => return shard.stream_handler,
-            .shard => |t| {
-                if (shard.peer_shards) |peers| {
-                    return peers[t.shard_id].stream_handler;
-                }
-                return shard.stream_handler;
-            },
-        }
-    }
-
     /// Compute the shard ID that owns the given action.
     fn resolveActionShardId(self: *WorkflowHandler, shard: *Shard, ns: NamespaceId, action_name: []const u8) u16 {
         _ = self;
@@ -3450,7 +3441,7 @@ pub const WorkflowHandler = struct {
         self.triggers_dirty = false;
 
         var it = self.stream_triggers.iterator();
-        while (it.next()) |entry| tick: {
+        while (it.next()) |entry| {
             const trigger = entry.value_ptr;
 
             // Enforce poll interval unless a push-wake forced this poll.
@@ -3458,70 +3449,174 @@ pub const WorkflowHandler = struct {
                 const poll_ms: i64 = @intCast(trigger.poll_interval_ms);
                 if (now_ms - trigger.last_poll_ms < poll_ms) continue;
             }
-            trigger.last_poll_ms = now_ms;
 
             // Skip disabled workflows
             if (self.disabled.contains(entry.key_ptr.*)) continue;
 
-            // Read from the source stream
-            const batch_limit: usize = @intCast(trigger.batch_size);
-            const cursor = StreamID{ .timestamp_ms = trigger.stream_cursor_ts, .sequence = trigger.stream_cursor_seq };
-            // Read from the shard that owns the stream's data, not the local
-            // shard (which is just where this workflow definition was created).
+            // As many events as this shard can start runs for now; with room
+            // for none the trigger waits, its cursor where it is.
+            const limit = triggerReadLimit(shard, trigger) orelse continue;
             // A namespace the trigger names that isn't known here yet
             // reads as empty.
             const stream_ns = if (trigger.stream_namespace_owned) |n| shard.namespaceId(n) else trigger.ns;
-            const stream_handler = resolveStreamHandler(shard, stream_ns, trigger.stream_name_owned);
-            // As many events as this shard can start runs for now; with room
-            // for none the trigger waits, its cursor where it is.
-            const raft = shard.raft_node;
-            const room: usize = @intCast(raft_node_mod.MAX_OUTSTANDING -| (raft.log.lastIndex() -| raft.last_applied));
-            if (room == 0) continue;
-            const result = stream_handler.readPayloadsForStreamIn(
-                trigger.stream_name_owned,
-                stream_ns,
-                cursor,
-                @min(@max(batch_limit, 1) * 10, room * @max(batch_limit, 1)), // read ahead for batching
-            );
-            defer result.deinit(stream_handler.allocator);
-            if (result.payloads.len == 0) {
-                // Appends that couldn't be read still move the cursor past
-                // them (the stream handler logged them), so the trigger
-                // doesn't stall.
-                trigger.stream_cursor_ts = result.last_id.timestamp_ms;
-                trigger.stream_cursor_seq = result.last_id.sequence;
+            const owner = streamOwner(shard, stream_ns, trigger.stream_name_owned);
+            if (owner != shard.id) {
+                // The shard that owns the stream reads it, on its thread.
+                self.askTrigger(shard, entry.key_ptr.*, trigger, stream_ns, owner, limit, now_ms);
                 continue;
             }
+            trigger.last_poll_ms = now_ms;
+            const sh = shard.stream_handler;
+            const made = sh.madeAt(stream_ns, trigger.stream_name_owned) orelse continue;
+            if (!sameStream(trigger, made)) continue;
+            const cursor = StreamID{ .timestamp_ms = trigger.stream_cursor_ts, .sequence = trigger.stream_cursor_seq };
+            const result = sh.readPayloadsForStreamIn(trigger.stream_name_owned, stream_ns, cursor, limit);
+            defer result.deinit(sh.allocator);
+            self.takeRecords(shard, trigger, result.payloads, result.ids, result.last_id);
+        }
+    }
 
-            // Start one run per event (or per batch if batch_size > 1). A
-            // start the log refuses (full for now) leaves the cursor where the
-            // read began: the next tick reads these events again, and those
-            // already started are the same runs, by their idempotency keys.
+    /// How many events a trigger reads now: ahead for batching, but no more
+    /// than this shard's log has room to start runs for. Null for none.
+    fn triggerReadLimit(shard: *Shard, trigger: *const StreamTriggerState) ?usize {
+        const raft = shard.raft_node;
+        const room: usize = @intCast(raft_node_mod.MAX_OUTSTANDING -| (raft.log.lastIndex() -| raft.last_applied));
+        if (room == 0) return null;
+        const batch: usize = @max(@as(usize, @intCast(trigger.batch_size)), 1);
+        return @min(batch * 10, room * batch);
+    }
+
+    /// The shard that owns stream `name` in `ns`, as the dispatcher routes
+    /// its appends.
+    fn streamOwner(shard: *Shard, ns: NamespaceId, name: []const u8) u16 {
+        return switch (shard.router.route(router.routeNsKey(ns, name))) {
+            .local => shard.id,
+            .shard => |t| t.shard_id,
+        };
+    }
+
+    /// Whether a read of the stream made at `made` goes on from the
+    /// trigger's cursor. The first read says which stream the cursor is in;
+    /// a read of another (the stream deleted and made again, which numbers
+    /// its appends afresh) starts the cursor over, and reads again from
+    /// there.
+    fn sameStream(trigger: *StreamTriggerState, made: u64) bool {
+        const was = trigger.stream_made_ns orelse {
+            trigger.stream_made_ns = made;
+            return true;
+        };
+        if (was == made) return true;
+        trigger.stream_made_ns = made;
+        trigger.stream_cursor_ts = 0;
+        trigger.stream_cursor_seq = 0;
+        trigger.last_poll_ms = 0;
+        return false;
+    }
+
+    /// Most a trigger's read of another shard's stream waits for its page
+    /// before it is asked again: the answer may have found an inbox full.
+    pub const TRIGGER_READ_DEADLINE_MS: i64 = 5_000;
+
+    /// A stream another shard owns: ask that shard for a page from the
+    /// trigger's cursor, at most one at a time. The page starts runs when it
+    /// comes (`takeTriggerPage`).
+    fn askTrigger(self: *WorkflowHandler, shard: *Shard, key: []const u8, trigger: *StreamTriggerState, ns: NamespaceId, owner: u16, limit: usize, now_ms: i64) void {
+        _ = self;
+        const raft = shard.raft_node;
+        if (raft.role != .leader) return;
+        if (trigger.read_seq != 0 and trigger.read_term == raft.current_term and now_ms - trigger.read_sent_ms < TRIGGER_READ_DEADLINE_MS) return;
+        const mailboxes = shard.peer_mailboxes orelse return;
+        if (owner >= mailboxes.len) return;
+        const ns_name = trigger.stream_namespace_owned orelse (shard.namespace_handler.table.nameOf(ns) orelse return);
+        const seq = trigger.next_read_seq + 1;
+        const bytes = (source_page.Read{
+            .term = raft.current_term,
+            .seq = seq,
+            .kind = .stream,
+            .asker = .trigger,
+            .key = key,
+            .namespace = ns_name,
+            .source = trigger.stream_name_owned,
+            .from_a = trigger.stream_cursor_ts,
+            .from_b = trigger.stream_cursor_seq,
+            .limit = @intCast(limit),
+        }).encode(shard.allocator) orelse return;
+        if (!mailboxes[owner].inbox.send(.{ .tag = .source_read, .src_shard = @intCast(shard.id), .payload_len = @intCast(bytes.len), .payload_ptr = bytes.ptr })) {
+            // A full inbox: asked again next tick.
+            shard.allocator.free(bytes);
+            return;
+        }
+        trigger.last_poll_ms = now_ms;
+        trigger.next_read_seq = seq;
+        trigger.read_seq = seq;
+        trigger.read_term = raft.current_term;
+        trigger.read_sent_ms = now_ms;
+    }
+
+    /// A page the owner of a trigger's stream sent. Taken only if it
+    /// answers that trigger's read in flight, this node still leads in the
+    /// term it asked in, the workflow isn't disabled, the trigger's cursor
+    /// is still where the read began, and the owner read the stream (an
+    /// owner that couldn't says so, and the cursor stays); dropped
+    /// otherwise, and the next tick asks again.
+    pub fn takeTriggerPage(self: *WorkflowHandler, shard: *Shard, page: source_page.Page) void {
+        const entry = self.stream_triggers.getEntry(page.key) orelse return;
+        const trigger = entry.value_ptr;
+        if (trigger.read_seq != page.seq or trigger.read_term != page.term) return;
+        trigger.read_seq = 0;
+        const raft = shard.raft_node;
+        if (raft.role != .leader or raft.current_term != page.term) return;
+        if (self.disabled.contains(entry.key_ptr.*)) return;
+        if (page.kind != .stream or page.status != .ok) return;
+        if (trigger.stream_cursor_ts != page.from_a or trigger.stream_cursor_seq != page.from_b) return;
+        if (!sameStream(trigger, page.made_ns)) return;
+        _ = triggerReadLimit(shard, trigger) orelse return;
+        const records = self.allocator.alloc(source_page.Page.Record, page.count) catch return;
+        defer self.allocator.free(records);
+        const got = page.records(records) orelse return;
+        const payloads = self.allocator.alloc([]const u8, got.len) catch return;
+        defer self.allocator.free(payloads);
+        const ids = self.allocator.alloc(StreamID, got.len) catch return;
+        defer self.allocator.free(ids);
+        for (got, payloads, ids) |r, *p, *id| {
+            p.* = r.payload;
+            id.* = .{ .timestamp_ms = r.ms, .sequence = r.seq };
+        }
+        self.takeRecords(shard, trigger, payloads, ids, .{ .timestamp_ms = page.last_a, .sequence = page.last_b });
+    }
+
+    /// Starts the runs for events read from the trigger's cursor through
+    /// `last`, and moves the cursor there. A read that found no events but
+    /// reached past appends it couldn't read moves the cursor past them, so
+    /// the trigger doesn't stall. A start the log refuses (full for now)
+    /// leaves the cursor where the read began: the next read takes these
+    /// events again, and those already started are the same runs, by their
+    /// idempotency keys.
+    fn takeRecords(self: *WorkflowHandler, shard: *Shard, trigger: *StreamTriggerState, payloads: []const []const u8, ids: []const StreamID, last: StreamID) void {
+        if (payloads.len > 0) {
             if (trigger.batch_size <= 1) {
                 // One run per event
-                for (result.payloads, result.ids) |payload, event_id| {
-                    if (!self.startRunFromTrigger(shard, trigger, payload, event_id)) break :tick;
+                for (payloads, ids) |payload, event_id| {
+                    if (!self.startRunFromTrigger(shard, trigger, payload, event_id)) return;
                 }
             } else {
                 // Batch mode: collect batch_size events into a JSON array per run
+                const batch_limit: usize = @intCast(trigger.batch_size);
                 var i: usize = 0;
-                while (i < result.payloads.len) {
-                    const end = @min(i + batch_limit, result.payloads.len);
-                    const batch = result.payloads[i..end];
-                    const batch_json = self.buildBatchJson(batch) orelse {
+                while (i < payloads.len) {
+                    const end = @min(i + batch_limit, payloads.len);
+                    const batch_json = self.buildBatchJson(payloads[i..end]) orelse {
                         i = end;
                         continue;
                     };
                     defer self.allocator.free(batch_json);
-                    if (!self.startRunFromTrigger(shard, trigger, batch_json, result.ids[end - 1])) break :tick;
+                    if (!self.startRunFromTrigger(shard, trigger, batch_json, ids[end - 1])) return;
                     i = end;
                 }
             }
-
-            // Advance cursor to last StreamID read
-            trigger.stream_cursor_ts = result.last_id.timestamp_ms;
-            trigger.stream_cursor_seq = result.last_id.sequence;
         }
+        trigger.stream_cursor_ts = last.timestamp_ms;
+        trigger.stream_cursor_seq = last.sequence;
     }
 
     /// Build a JSON array from a batch of payloads: ["payload1","payload2",...]

@@ -159,6 +159,7 @@ const Partition = @import("../storage/partition.zig").Partition;
 const persistence_mod = @import("../storage/persistence.zig");
 const ReplayRegistry = persistence_mod.ReplayRegistry;
 pub const run_id_mod = @import("run_id.zig");
+const source_page_mod = @import("../processing/source_page.zig");
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
 const memory_budget = @import("memory_budget.zig");
@@ -3304,7 +3305,11 @@ pub const Shard = struct {
             .source_page => {
                 const bytes = inboxPayload(msg);
                 defer if (bytes.len > 0) self.allocator.free(bytes);
-                self.processing_handler.takeSourcePage(self, bytes);
+                const page = source_page_mod.Page.decode(bytes) orelse return;
+                switch (page.asker) {
+                    .pipeline => self.processing_handler.takeSourcePage(self, bytes),
+                    .trigger => self.workflow_handler.takeTriggerPage(self, page),
+                }
             },
             .channel => self.channelFrame(msg),
             .reply => self.deliverReply(msg),
@@ -5152,6 +5157,16 @@ pub const Shard = struct {
     fn leaderApplying(self: *const Shard) bool {
         const raft = self.raft_node;
         return raft.role == .leader and self.halted == null and !raft.leaderReady();
+    }
+
+    /// Whether this shard answers another shard's read of its state (a
+    /// source ask), as it serves its clients' local reads: not offline or
+    /// halted, not a leader still applying earlier terms, and past a cold
+    /// boot's catch-up. A follower that has caught up answers from what it
+    /// applied, as it does its clients: a group's leader may be on another
+    /// node, and asks don't leave this one.
+    pub fn servesAsks(self: *Shard) bool {
+        return self.offline == null and self.halted == null and !self.leaderApplying() and self.coldCaughtUp();
     }
 
     /// Whether a cold boot's projections hold what the group committed: a
@@ -12946,7 +12961,7 @@ test "Shard: source reads and pages are freed when dropped: a page for a pipelin
     const a = &two.shards[0];
     const b = &two.shards[1];
     for (&two.shards) |*s| s.wireHandlerShardPtrs();
-    const read: @import("../processing/source_page.zig").Read = .{ .term = a.raft_node.current_term, .seq = 1, .kind = .stream, .pipeline = "gone", .namespace = "default", .source = "s", .from_a = 0, .from_b = 0, .limit = 10 };
+    const read: @import("../processing/source_page.zig").Read = .{ .term = a.raft_node.current_term, .seq = 1, .kind = .stream, .key = "gone", .namespace = "default", .source = "s", .from_a = 0, .from_b = 0, .limit = 10 };
     var builder: @import("../processing/source_page.zig").Page.Builder = .{};
     defer builder.deinit(a.allocator);
     try builder.begin(a.allocator, read);
@@ -29590,4 +29605,301 @@ test "Shard: a second caller's start of a child run another caller started is an
     // The second caller hears (here no call waits on it, so it's counted).
     pumpChannels(&two);
     try std.testing.expectEqual(@as(u64, 1), metrics.workflow.action_answers_without_call_total.load(.monotonic));
+}
+
+/// Whether `line` holds `name` as a whole word.
+fn hasWord(line: []const u8, name: []const u8) bool {
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, line, at, name)) |i| : (at = i + 1) {
+        const before_ok = i == 0 or !(std.ascii.isAlphanumeric(line[i - 1]) or line[i - 1] == '_' or line[i - 1] == '.');
+        const after = i + name.len;
+        if (before_ok and (after == line.len or !(std.ascii.isAlphanumeric(line[after]) or line[after] == '_'))) return true;
+    }
+    return false;
+}
+
+/// Whether `line` uses `name` as a value: indexed or a field read, and not
+/// as part of a longer name.
+fn usesName(line: []const u8, name: []const u8) bool {
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, line, at, name)) |i| : (at = i + 1) {
+        const before_ok = i == 0 or !(std.ascii.isAlphanumeric(line[i - 1]) or line[i - 1] == '_' or line[i - 1] == '.');
+        const after = i + name.len;
+        if (before_ok and after < line.len and (line[after] == '[' or line[after] == '.')) return true;
+    }
+    return false;
+}
+
+test "no shard's thread reaches another shard's handler through peer_shards" {
+    // Another shard's state is read by asking it (its mailbox), never
+    // through its pointer: these lines only count shards or read the
+    // offline flag. A new line naming the field is reviewed here, and no
+    // name a line binds from it (nor a loop over one) reaches a `*_handler`
+    // in the function that binds it. Split so this test's own text doesn't
+    // match.
+    const field = "peer_" ++ "shards";
+    const allowed = [_][]const u8{
+        field ++ ": ?[]*Shard,",
+        "." ++ field ++ " = null,",
+        "if (self." ++ field ++ " == null or s.shard_id == self.id or s.shard_id >= mailboxes.len) break :blk null;",
+        "const shards = if (self." ++ field ++ ") |p| p.len else 1;",
+        "const peers = self." ++ field ++ " orelse {",
+        "return if (self." ++ field ++ ") |p| p.len else 1;",
+        "const shards = self." ++ field ++ " orelse return if (self.offline != null) self else null;",
+        "s." ++ field ++ " = &self.peers;",
+        "shard." ++ field ++ " = null;",
+    };
+    const sources = [_][]const u8{
+        @embedFile("shard.zig"),
+        @embedFile("../actions/handler.zig"),
+        @embedFile("../kv/handler.zig"),
+        @embedFile("../namespace/handler.zig"),
+        @embedFile("../processing/handler.zig"),
+        @embedFile("../queue/handler.zig"),
+        @embedFile("../stream/group_handler.zig"),
+        @embedFile("../stream/handler.zig"),
+        @embedFile("../ts/handler.zig"),
+        @embedFile("../worker/handler.zig"),
+        @embedFile("../workflow/handler.zig"),
+    };
+    for (sources) |src| {
+        var names: [16][]const u8 = undefined;
+        var n: usize = 0;
+        var in_test = false;
+        var lines = std.mem.splitScalar(u8, src, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "test \"")) in_test = true;
+            if (in_test) {
+                if (std.mem.eql(u8, line, "}")) in_test = false;
+                continue;
+            }
+            // A function's end: the names it bound are gone.
+            if (std.mem.eql(u8, line, "    }") or std.mem.eql(u8, line, "}")) n = 0;
+            const t = std.mem.trim(u8, line, " ");
+            if (std.mem.startsWith(u8, t, "//")) continue;
+            if (std.mem.indexOf(u8, t, field) != null) {
+                for (allowed) |a| {
+                    if (std.mem.eql(u8, t, a)) break;
+                } else {
+                    std.debug.print("a new use of peer_shards: {s}\n", .{t});
+                    return error.TestUnexpectedResult;
+                }
+                if (std.mem.startsWith(u8, t, "const ")) {
+                    const end = std.mem.indexOfScalarPos(u8, t, 6, ' ') orelse t.len;
+                    names[n] = t[6..end];
+                    n += 1;
+                }
+            }
+            // Bound by a capture: on a line naming the field, or a loop
+            // over a name bound from it.
+            var bind = std.mem.indexOf(u8, t, field) != null;
+            if (std.mem.indexOf(u8, t, "for (") != null) {
+                for (names[0..n]) |nm| if (hasWord(t, nm)) {
+                    bind = true;
+                };
+            }
+            if (bind) {
+                var at: usize = 0;
+                while (std.mem.indexOfScalarPos(u8, t, at, '|')) |a| {
+                    const b = std.mem.indexOfScalarPos(u8, t, a + 1, '|') orelse break;
+                    names[n] = std.mem.trimStart(u8, t[a + 1 .. b], "*");
+                    n += 1;
+                    at = b + 1;
+                }
+            }
+            if (std.mem.indexOf(u8, t, "_handler") == null) continue;
+            for (names[0..n]) |nm| {
+                if (usesName(t, nm)) {
+                    std.debug.print("another shard's handler, through {s}: {s}\n", .{ nm, t });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+}
+
+/// A workflow on shard 0 whose trigger reads a stream shard 1 owns.
+const TriggerPair = struct {
+    two: TwoShards = undefined,
+    c: TestClient = undefined,
+    wb: [16]u8 = undefined,
+    sb: [16]u8 = undefined,
+    wf: []const u8 = "",
+    stream: []const u8 = "",
+    key: []const u8 = "",
+
+    fn init(t: *TriggerPair) !void {
+        try t.two.init();
+        for (&t.two.shards) |*s| s.wireHandlerShardPtrs();
+        const a = &t.two.shards[0];
+        t.wf = try workflowOn(&t.two, 0, "wf", &t.wb);
+        t.stream = try workflowOn(&t.two, 1, "ev", &t.sb);
+        t.c = try TestClient.open(a);
+        var yb: [512]u8 = undefined;
+        try createWorkflow(&t.two, a, t.c, 1, try std.fmt.bufPrint(&yb, "{{\"kind\":\"Workflow\",\"name\":\"{s}\",\"version\":\"1.0.0\",\"trigger\":{{\"stream\":\"{s}\"}},\"start\":{{\"wait_for_signal\":{{\"type\":\"never\"}},\"transitions\":{{\"success\":\"flo.Completed\"}}}}}}", .{ t.wf, t.stream }), t.wf);
+        t.key = a.workflow_handler.nsKey(.default, t.wf).?;
+    }
+
+    fn deinit(t: *TriggerPair) void {
+        std.testing.allocator.free(t.key);
+        _ = std.c.close(t.c.pair[1]);
+        t.two.deinit();
+    }
+
+    fn append(t: *TriggerPair, n: usize) !void {
+        const b = &t.two.shards[1];
+        for (0..n) |k| {
+            var pb: [16]u8 = undefined;
+            _ = try b.stream_handler.appendPayloadToStream(t.stream, "default", try std.fmt.bufPrint(&pb, "{{\"k\":{d}}}", .{k}));
+        }
+        t.two.settle();
+    }
+
+    /// One poll of every trigger (forced, as an append's wake forces it),
+    /// without delivering what it asks.
+    fn ask(t: *TriggerPair) void {
+        const a = &t.two.shards[0];
+        a.workflow_handler.triggers_dirty = true;
+        a.workflow_handler.tickStreamTriggers(a);
+    }
+
+    fn round(t: *TriggerPair) void {
+        t.ask();
+        t.two.settle();
+    }
+
+    fn trigger(t: *TriggerPair) *WorkflowHandler.StreamTriggerState {
+        return t.two.shards[0].workflow_handler.stream_triggers.getPtr(t.key).?;
+    }
+
+    fn runs(t: *TriggerPair) usize {
+        return t.two.shards[0].workflow_handler.runs.count();
+    }
+
+    fn lastId(t: *TriggerPair) !StreamID {
+        const sh = t.two.shards[1].stream_handler;
+        const r = sh.readPayloadsForStreamIn(t.stream, .default, .{ .timestamp_ms = 0, .sequence = 0 }, 100);
+        defer r.deinit(sh.allocator);
+        return r.last_id;
+    }
+};
+
+test "Shard: a trigger over a stream another shard owns asks that shard, and starts a run per event from its page" {
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    try t.append(3);
+    t.round();
+    try std.testing.expectEqual(@as(usize, 3), t.runs());
+    const last = try t.lastId();
+    try std.testing.expectEqual(last.timestamp_ms, t.trigger().stream_cursor_ts);
+    try std.testing.expectEqual(last.sequence, t.trigger().stream_cursor_seq);
+    try std.testing.expectEqual(@as(u64, 0), t.trigger().read_seq);
+    // Nothing new: the next page starts nothing and leaves the cursor.
+    t.round();
+    try std.testing.expectEqual(@as(usize, 3), t.runs());
+}
+
+test "Shard: an owner that doesn't serve reads says so, the trigger's cursor stays, and the next ask reads" {
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    try t.append(3);
+    // The owner leads but hasn't applied what earlier terms committed.
+    const r = t.two.shards[1].raft_node;
+    r.ready_index = r.last_applied + 1000;
+    t.round();
+    try std.testing.expectEqual(@as(usize, 0), t.runs());
+    try std.testing.expectEqual(@as(u64, 0), t.trigger().stream_cursor_ts);
+    try std.testing.expectEqual(@as(u64, 0), t.trigger().stream_cursor_seq);
+    // Answered, so asked again at once, not after the deadline; and the
+    // refusal told it nothing about the stream.
+    try std.testing.expectEqual(@as(u64, 0), t.trigger().read_seq);
+    try std.testing.expectEqual(@as(?u64, null), t.trigger().stream_made_ns);
+    r.ready_index = r.last_applied;
+    t.round();
+    try std.testing.expectEqual(@as(usize, 3), t.runs());
+}
+
+test "Shard: a trigger's page is dropped after a term change, a moved cursor or a disable, and read again from the cursor" {
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    try t.append(3);
+    const a = &t.two.shards[0];
+    // A term change while the read is out.
+    t.ask();
+    a.raft_node.current_term += 1;
+    a.raft_node.ready_index = a.raft_node.last_applied;
+    t.two.settle();
+    try std.testing.expectEqual(@as(usize, 0), t.runs());
+    // The cursor moved while the read was out (a start applied, say): the
+    // page answers a read from elsewhere.
+    const sh = t.two.shards[1].stream_handler;
+    const read = sh.readPayloadsForStreamIn(t.stream, .default, .{ .timestamp_ms = 0, .sequence = 0 }, 1);
+    const first = read.ids[0];
+    read.deinit(sh.allocator);
+    t.ask();
+    t.trigger().stream_cursor_ts = first.timestamp_ms;
+    t.trigger().stream_cursor_seq = first.sequence;
+    t.two.settle();
+    try std.testing.expectEqual(@as(usize, 0), t.runs());
+    // Read again from where the cursor is: the two events after it.
+    t.round();
+    try std.testing.expectEqual(@as(usize, 2), t.runs());
+    // Disabled while a read is out: its page starts nothing.
+    try t.append(1);
+    t.ask();
+    var out: [512]u8 = undefined;
+    a.runRequest(t.c.conn, try ParkTest.request(.workflow_disable, 9, proto.DEFAULT_NAMESPACE, t.wf, "", ""), .client);
+    t.two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(t.c, a, &out)).header.status);
+    try std.testing.expectEqual(@as(usize, 2), t.runs());
+}
+
+test "Shard: a trigger whose stream is deleted and made again reads the new one from its start" {
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    try t.append(2);
+    t.round();
+    try std.testing.expectEqual(@as(usize, 2), t.runs());
+    const made0 = t.trigger().stream_made_ns.?;
+    const b = &t.two.shards[1];
+    _ = try persistence_mod.proposeEntryIn(b, .stream_delete, entry_mod.Flags.FORCE, .default, t.stream, "");
+    t.two.settle();
+    try t.append(1);
+    // The page names another stream: the cursor starts over, and the next
+    // read takes the new stream's event.
+    t.round();
+    try std.testing.expect(t.trigger().stream_made_ns.? != made0);
+    try std.testing.expectEqual(@as(u64, 0), t.trigger().stream_cursor_ts);
+    try std.testing.expectEqual(@as(u64, 0), t.trigger().stream_cursor_seq);
+    try std.testing.expectEqual(@as(usize, 2), t.runs());
+    t.round();
+    try std.testing.expectEqual(@as(usize, 3), t.runs());
+}
+
+test "Shard: a trigger's read with no answer is asked again after the deadline, not before" {
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    try t.append(1);
+    t.ask();
+    const seq = t.trigger().read_seq;
+    try std.testing.expect(seq != 0);
+    // The ask is lost: the owner never sees it.
+    const b = &t.two.shards[1];
+    var lost: [8]InboxMessage = undefined;
+    for (lost[0..b.mailbox.inbox.drain(&lost)]) |msg| {
+        const bytes = Shard.inboxPayload(msg);
+        if (bytes.len > 0) b.allocator.free(bytes);
+    }
+    t.ask();
+    try std.testing.expectEqual(seq, t.trigger().read_seq);
+    t.trigger().read_sent_ms -= WorkflowHandler.TRIGGER_READ_DEADLINE_MS;
+    t.ask();
+    try std.testing.expect(t.trigger().read_seq != seq);
+    t.two.settle();
+    try std.testing.expectEqual(@as(usize, 1), t.runs());
 }
