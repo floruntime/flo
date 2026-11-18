@@ -4709,7 +4709,7 @@ test "workflow handler: a create entry saying its trigger names its own namespac
     const allocator = testing.allocator;
     // Another shard's handler, before shard 0 publishes anything: as at
     // replay during boot.
-    var namespaces = try NamespaceHandler.initFor(allocator, 1, null);
+    var namespaces = try NamespaceHandler.initFor(allocator, 1, null, null);
     defer namespaces.deinit();
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();

@@ -24,6 +24,10 @@ const router = @import("../node/router.zig");
 const ns_table = @import("table.zig");
 const ReplyTo = @import("../node/reply_to.zig").ReplyTo;
 const RaftNode = @import("../raft/node.zig").RaftNode;
+const ns_machine = @import("machine.zig");
+const contract_machine = @import("../contract/machine.zig");
+const Store = @import("../contract/store.zig").Store;
+const ReadView = @import("../contract/view.zig").ReadView;
 
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
@@ -36,26 +40,9 @@ const Connection = connection_mod.Connection;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// The longest namespace name.
-pub const MAX_NAME_LEN: usize = @import("../protocol/limits.zig").MAX_NAMESPACE_NAME;
+pub const MAX_NAME_LEN: usize = ns_machine.MAX_NAME_LEN;
 
-/// Why `name` cannot name a namespace, or null if it can: 1–63 of
-/// `[a-z0-9_-]`, starting with a letter or digit and not ending in `-`; a
-/// leading `_` is the system's. Lowercase only, so no two names differ by
-/// case alone. The applier checks it too, so it is part of the replicated
-/// state: loosening it later is safe, tightening it is not.
-pub fn nameRefusal(name: []const u8) ?[]const u8 {
-    if (name.len == 0) return "namespace name is required";
-    if (name.len > MAX_NAME_LEN) return std.fmt.comptimePrint("namespace name too long (at most {d} bytes)", .{MAX_NAME_LEN});
-    if (name[0] == '_') return "reserved namespace name: a leading '_' is the system's";
-    for (name) |c| switch (c) {
-        'a'...'z', '0'...'9', '-', '_' => {},
-        'A'...'Z' => return "invalid namespace name: lowercase only",
-        else => return "invalid namespace name: letters, digits, '_' and '-' only",
-    };
-    if (name[0] == '-') return "invalid namespace name: must start with a letter or digit";
-    if (name[name.len - 1] == '-') return "invalid namespace name: must not end with '-'";
-    return null;
-}
+pub const nameRefusal = ns_machine.nameRefusal;
 
 /// Longest key, or stream or queue name: a namespace's name doesn't count
 /// against it, since those are keyed by the namespace's id. Keys beyond
@@ -78,8 +65,13 @@ pub const NamespaceHandler = struct {
     /// applied: a burst of first writes proposes one. Cleared when this
     /// node stops leading: a create the log then drops is proposed again.
     pending_creates: std.StringHashMapUnmanaged(ns_table.Id) = .{},
-    /// Shard 0: the next id a create may take, as applied on every replica.
-    next_id: u32 = ns_table.FIRST_ALLOCATED.int(),
+    /// The shard's contract state, where shard 0's namespaces machine keeps
+    /// every create (`namespace/machine.zig`); another shard's holds none.
+    store: *Store,
+    /// A store of its own, for a handler built without a shard (tests).
+    owned_store: ?*Store = null,
+    /// What a create applied here directly (`applyCommitted`) stages in.
+    scratch: std.heap.ArenaAllocator,
     /// Shard 0's leader: the next id it proposes, past the creates it has
     /// in flight, so two creates never take one id.
     next_alloc: u32 = 0,
@@ -88,7 +80,7 @@ pub const NamespaceHandler = struct {
     /// by id, so if shard 0's log lost the tail that created one, a create
     /// reusing it would read that shard's old data as its own. Only what
     /// this leader proposes rises past it: replicas check ids against
-    /// `next_id` alone, which every replica computes alike.
+    /// `nextId` alone, which every replica computes alike.
     id_floor: u32 = 0,
     /// Shard 0: ids past its highest create at boot that another shard of
     /// this node had applied entries under, `(unknown_above, unknown_top]`.
@@ -106,21 +98,21 @@ pub const NamespaceHandler = struct {
     /// Shard 0: creates applied and not yet on disk, published at the next
     /// flush.
     unpublished: std.ArrayListUnmanaged(Unpublished) = .empty,
+    /// Shard 0: the table may lack a create the store holds: one replayed
+    /// at boot, which doesn't queue it (`publishAll` at boot clears this),
+    /// or one applied that couldn't be queued for want of memory. The next
+    /// settle publishes from the store.
+    publish_from_store: bool = false,
     /// Shard 0: requests waiting for a name's create to be published.
     waiters: std.ArrayListUnmanaged(Waiter) = .empty,
     flush_warn_ms: i64 = 0,
     implicit_failed: u64 = 0,
     implicit_warn_ms: i64 = 0,
-
-    /// Shard 0: every namespace its log created, published or not. Other
-    /// shards hold "default" alone: their entries carry ids, and they read
-    /// names from `table`. Keys are owned copies of their names.
-    namespaces: std.StringHashMap(NamespaceMeta),
     /// A page of names, built for each namespace.list answer.
     list_buf: ?[]u8 = null,
 
     /// Live namespaces, "default" among them.
-    const MAX_NAMESPACES: usize = ns_table.MAX_LIVE;
+    pub const MAX_NAMESPACES: usize = ns_table.MAX_LIVE;
 
     pub const CreateOutcome = enum { created, existed, invalid, full, stale_id, failed };
 
@@ -144,7 +136,7 @@ pub const NamespaceHandler = struct {
     pub const CATCHING_UP_MESSAGE = "unavailable: a new leader is catching up; the namespace wasn't created — retry";
     pub const FLUSH_MESSAGE = "unavailable: the namespace isn't on disk yet; it may still be created — retry";
 
-    /// `name` is the registry's copy.
+    /// `name` is owned.
     const Unpublished = struct { index: u64, id: ns_table.Id, name: []const u8 };
     /// How a waiter is answered once its name's create settles: `create`
     /// made it (ok); `joined` asked to create a name another request was
@@ -175,42 +167,45 @@ pub const NamespaceHandler = struct {
     /// A handler that owns the namespaces and a table of its own: shard 0
     /// of a node built in a test.
     pub fn init(allocator: Allocator) !NamespaceHandler {
-        return initFor(allocator, 0, null);
+        return initFor(allocator, 0, null, null);
     }
 
-    /// Shard `shard_id`'s handler, reading `table` (the node's), or a table
-    /// of its own when there is none. "default" is registered from the
-    /// start, before replay, with no log entry: its id is a constant.
-    pub fn initFor(allocator: Allocator, shard_id: u16, table: ?*ns_table.Table) !NamespaceHandler {
+    /// Shard `shard_id`'s handler, reading `table` (the node's) and `store`
+    /// (the shard's), or ones of its own when there are none. "default" is
+    /// known from the start, with no log entry: its id is a constant.
+    pub fn initFor(allocator: Allocator, shard_id: u16, table: ?*ns_table.Table, store: ?*Store) !NamespaceHandler {
         const t = table orelse try ns_table.Table.create(allocator);
         errdefer if (table == null) t.destroy();
-        var self: NamespaceHandler = .{
+        const owned_store: ?*Store = if (store == null) blk: {
+            const st = try allocator.create(Store);
+            st.* = Store.init(allocator);
+            st.place = .{ .group = shard_id, .count = shard_id + 1 };
+            break :blk st;
+        } else null;
+        return .{
             .allocator = allocator,
             .table = t,
             .owns_table = table == null,
             .owner = shard_id == 0,
-            .namespaces = std.StringHashMap(NamespaceMeta).init(allocator),
+            .publish_from_store = shard_id == 0,
+            .store = store orelse owned_store.?,
+            .owned_store = owned_store,
+            .scratch = .init(allocator),
         };
-        errdefer self.deinit();
-        const owned = try allocator.dupe(u8, "default");
-        self.namespaces.put(owned, .{ .id = ns_table.DEFAULT, .created_at_ns = 0 }) catch |err| {
-            allocator.free(owned);
-            return err;
-        };
-        return self;
     }
 
     pub fn deinit(self: *NamespaceHandler) void {
         var ic = self.pending_creates.keyIterator();
         while (ic.next()) |k| self.allocator.free(k.*);
         self.pending_creates.deinit(self.allocator);
-        var it = self.namespaces.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.namespaces.deinit();
         if (self.list_buf) |b| self.allocator.free(b);
+        for (self.unpublished.items) |u| self.allocator.free(u.name);
         self.unpublished.deinit(self.allocator);
+        self.scratch.deinit();
+        if (self.owned_store) |st| {
+            st.deinit();
+            self.allocator.destroy(st);
+        }
         for (self.waiters.items) |w| self.freeWaiter(w);
         self.waiters.deinit(self.allocator);
         if (self.owns_table) self.table.destroy();
@@ -229,7 +224,7 @@ pub const NamespaceHandler = struct {
     pub fn markNamespaceHasData(self: *NamespaceHandler, name: []const u8, shard: ?*Shard) void {
         if (shard) |s| return self.proposeImplicitCreate(name, s);
         const effective = if (name.len == 0) "default" else name;
-        if (!self.namespaces.contains(effective)) _ = self.applyCreate(effective);
+        if (!self.known(effective)) _ = self.applyCreate(effective);
     }
 
     /// A namespace a handler is about to write to, created if this is shard
@@ -258,12 +253,12 @@ pub const NamespaceHandler = struct {
     /// filling the registry cannot lock it out.
     pub fn admission(self: *const NamespaceHandler, name: []const u8) ?Refusal {
         const effective = if (name.len == 0) "default" else name;
-        if (self.namespaces.contains(effective) or self.pending_creates.contains(effective)) return null;
+        if (self.known(effective) or self.pending_creates.contains(effective)) return null;
         if (nameRefusal(effective)) |why| return .{ .status = .bad_request, .message = why };
         // Only shard 0 knows every namespace, so only it decides the id and
         // the room; another shard learns of a name it publishes.
         if (!self.owner) return if (self.table.lookup(effective) != null) null else .{ .status = .unavailable, .message = UNKNOWN_HERE_MESSAGE };
-        if (self.namespaces.count() + self.pending_creates.count() >= MAX_NAMESPACES)
+        if (self.live() + self.pending_creates.count() >= MAX_NAMESPACES)
             return .{ .status = .bad_request, .message = LIMIT_MESSAGE };
         return null;
     }
@@ -272,8 +267,33 @@ pub const NamespaceHandler = struct {
         return self.admission(name) == null;
     }
 
-    fn isDefault(name: []const u8) bool {
-        return std.mem.eql(u8, name, "default");
+    const isDefault = ns_machine.isDefault;
+
+    fn read(self: *const NamespaceHandler) ReadView {
+        return .{ .store = self.store };
+    }
+
+    /// Whether this shard's log created `name`, or it is "default": on a
+    /// shard other than 0, "default" alone.
+    pub fn known(self: *const NamespaceHandler, name: []const u8) bool {
+        return self.metaOf(name) != null;
+    }
+
+    /// `name`'s record as this shard's log made it; "default"'s is fixed.
+    pub fn metaOf(self: *const NamespaceHandler, name: []const u8) ?NamespaceMeta {
+        if (isDefault(name)) return .{ .id = ns_table.DEFAULT, .created_at_ns = 0 };
+        const m = ns_machine.meta(self.read(), name) orelse return null;
+        return .{ .id = .of(m.id), .created_at_ns = m.created_at_ns, .created_index = m.created_index };
+    }
+
+    /// Live namespaces, "default" among them.
+    pub fn live(self: *const NamespaceHandler) u32 {
+        return ns_machine.counts(self.read()).live;
+    }
+
+    /// The next id a create may take, as applied on every replica.
+    pub fn nextId(self: *const NamespaceHandler) u32 {
+        return ns_machine.counts(self.read()).next_id;
     }
 
     /// Shard 0: room for a create this leader is about to propose, taken
@@ -316,15 +336,14 @@ pub const NamespaceHandler = struct {
         self.pending_creates.clearRetainingCapacity();
     }
 
-    // ── Appliers ────────────────────────────────────────────────────────
-    // Called from the registry for every committed namespace entry.
+    // ── Ids and names ──────────────────────────────────────────────────
 
     /// Shard 0: propose no id at or below `id` (`id_floor`), which another
     /// shard holds data under; past its own creates, the id is unknown here.
     pub fn raiseIdFloor(self: *NamespaceHandler, id: u32) void {
         std.debug.assert(self.owner);
         self.id_floor = @max(self.id_floor, id + 1);
-        self.unknown_above = self.next_id - 1;
+        self.unknown_above = self.nextId() - 1;
         self.unknown_top = @max(self.unknown_top, id);
     }
 
@@ -360,47 +379,63 @@ pub const NamespaceHandler = struct {
     pub fn idOf(self: *const NamespaceHandler, name: []const u8) ?ns_table.Id {
         std.debug.assert(self.owner);
         const effective = if (name.len == 0) "default" else name;
-        if (self.namespaces.get(effective)) |meta| return meta.id;
+        if (self.metaOf(effective)) |meta| return meta.id;
         return self.pending_creates.get(effective);
     }
 
-    /// Apply a committed namespace creation to the local registry. The
-    /// name, its id and the cap are checked again here, the same on every
-    /// replica, whatever proposed it.
-    /// For tests: create `name` with the next id, as a committed entry
-    /// would, and publish it at once.
+    /// For tests: create `name` with the next id, as a committed entry at
+    /// index 0 would, and publish it at once.
     pub fn applyCreate(self: *NamespaceHandler, name: []const u8) CreateOutcome {
-        const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
-        const outcome = self.applyCreateAt(name, .of(self.next_id), now_ns, 0);
+        const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, stdx.time.milliTimestamp()))) * std.time.ns_per_ms);
+        const outcome = self.applyCreateAt(name, .of(self.nextId()), now_ns, 0);
         if (outcome == .created) self.publishUnpublished();
         return outcome;
     }
 
-    /// A committed create of `name` as `id`, stamped `created_at_ns`, at
-    /// log index `index`. Checked again here, the same on every replica,
-    /// whatever proposed it: the name, the id, the room. The id must be at
-    /// least the next free one, so replicas agree whatever their leader
-    /// thought; one below it lost a race after a leader change. A created
-    /// namespace is published once it is on disk (`settle`).
+    /// For tests: a committed create of `name` as `id`, stamped
+    /// `created_at_ns`, at log index `index`, applied as shard 0 applies
+    /// one and queued to publish; one the machine would halt on is said
+    /// instead.
     pub fn applyCreateAt(self: *NamespaceHandler, name: []const u8, id: ns_table.Id, created_at_ns: u64, index: u64) CreateOutcome {
-        if (self.namespaces.contains(name)) return .existed;
-        if (nameRefusal(name) != null) return .invalid;
-        if (self.namespaces.count() >= MAX_NAMESPACES) return .full;
-        if (id.int() < self.next_id or id.int() >= ns_table.CAPACITY) return .stale_id;
-        const owned = self.allocator.dupe(u8, name) catch return .failed;
-        self.namespaces.put(owned, .{ .id = id, .created_at_ns = created_at_ns, .created_index = index }) catch {
-            self.allocator.free(owned);
-            return .failed;
-        };
-        // The registry holds it now: if the queue can't, the create is
-        // refused on every replica alike only if memory runs out on all,
-        // so it is a local failure.
-        self.unpublished.append(self.allocator, .{ .index = index, .id = id, .name = owned }) catch {
-            self.allocator.free(self.namespaces.fetchRemove(name).?.key);
-            return .failed;
-        };
-        self.next_id = id.int() + 1;
+        switch (ns_machine.verdict(ns_machine.counts(self.read()), ns_machine.meta(self.read(), name) != null, name, id.int())) {
+            .created => {},
+            .existed => return .existed,
+            .invalid => return .invalid,
+            .full => return .full,
+            .stale_id => return .stale_id,
+        }
+        var buf: [namespace_entries.Create.max_size]u8 = undefined;
+        const bytes = namespace_entries.Create.encodeInto(&buf, .{ .name = name, .id = id.int() }) catch return .invalid;
+        const e = entry_mod.buildEntry(.namespace_create, 0, 1, index, created_at_ns, bytes);
+        var out = Result.start(&e);
+        self.applyCommitted(&e, &out) catch return .failed;
         return .created;
+    }
+
+    /// Apply a committed create as shard 0 does: through the namespaces
+    /// machine, then what follows it here. For a handler with a store of its
+    /// own (tests, the simulator); a shard applies through its applier.
+    pub fn applyCommitted(self: *NamespaceHandler, e: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
+        try contract_machine.applyEntry(&ns_machine.machine, self.store, &self.scratch, e, out);
+        self.afterApply(e);
+    }
+
+    /// After a create applied on shard 0, on every replica: no longer in
+    /// flight here, and queued to publish once it is on disk (`settle`).
+    /// Boot replay doesn't come here; it publishes the lot (`publishAll`).
+    pub fn afterApply(self: *NamespaceHandler, e: *const entry_mod.Entry) void {
+        if (!self.owner or e.header.entry_type != @backingInt(entry_mod.EntryType.namespace_create)) return;
+        var diag: schema.Diagnostic = .{};
+        const c = namespace_entries.Create.decodeAll(e.payload, &diag) catch unreachable; // it applied
+        if (self.pending_creates.fetchRemove(c.name)) |kv| self.allocator.free(kv.key);
+        const owned = self.allocator.dupe(u8, c.name) catch {
+            self.publish_from_store = true;
+            return;
+        };
+        self.unpublished.append(self.allocator, .{ .index = e.header.index, .id = .of(c.id), .name = owned }) catch {
+            self.allocator.free(owned);
+            self.publish_from_store = true;
+        };
     }
 
     /// Publish every create applied so far, without a flush: for tests and
@@ -408,8 +443,28 @@ pub const NamespaceHandler = struct {
     fn publishUnpublished(self: *NamespaceHandler) void {
         for (self.unpublished.items) |u| {
             self.table.publish(u.id, u.name, u.index) catch {};
+            self.allocator.free(u.name);
         }
         self.unpublished.clearRetainingCapacity();
+    }
+
+    /// Shard 0: publish every create the store holds that the table lacks.
+    /// At boot, once replay is done, since everything replayed is on disk;
+    /// and at a settle after a create applied but couldn't be queued.
+    pub fn publishAll(self: *NamespaceHandler) error{OutOfMemory}!void {
+        std.debug.assert(self.owner);
+        // Walked in name order, not log order: the published index moves
+        // only once every name is in, so no reader takes it to cover a name
+        // still to come.
+        var top: u64 = 0;
+        var it = self.read().range(ns_machine.NameFam, ns_machine.NAME_PREFIX);
+        while (it.next() catch unreachable) |rec| { // written by the machine alone
+            top = @max(top, rec.value.v.created_index);
+            const id: ns_table.Id = .of(rec.value.v.id);
+            if (self.table.nameOf(id) != null) continue;
+            try self.table.publish(id, rec.key[ns_machine.NAME_PREFIX.len..], 0);
+        }
+        self.table.notePublished(top);
     }
 
     // ── Ops ─────────────────────────────────────────────────────────────
@@ -475,10 +530,10 @@ pub const NamespaceHandler = struct {
     /// id it would need; null when it may be created.
     fn createRefusal(self: *const NamespaceHandler, name: []const u8) ?Refusal {
         if (nameRefusal(name)) |why| return .{ .status = .bad_request, .message = why };
-        if (self.namespaces.contains(name) or self.pending_creates.contains(name)) return null;
+        if (self.known(name) or self.pending_creates.contains(name)) return null;
         // Creates in flight count against the room, so a burst cannot
         // overshoot.
-        if (self.namespaces.count() + self.pending_creates.count() >= MAX_NAMESPACES)
+        if (self.live() + self.pending_creates.count() >= MAX_NAMESPACES)
             return .{ .status = .bad_request, .message = LIMIT_MESSAGE };
         return null;
     }
@@ -512,7 +567,7 @@ pub const NamespaceHandler = struct {
         // its predecessor's yet.
         if (!shard.raft_node.leaderReady()) return .{ .refused = .{ .status = .unavailable, .refusal = .{ .reason = .leader_unknown, .ran = .no, .message = PUBLISHED_NOT_READY } } };
         const name = req.key;
-        const unpublished = self.table.lookup(name) == null and (self.namespaces.contains(name) or self.pending_creates.contains(name));
+        const unpublished = self.table.lookup(name) == null and (self.known(name) or self.pending_creates.contains(name));
         if (!unpublished) return .{ .answer = .{ .published_index = self.table.publishedIndex() } };
         try self.addWaiter(name, .published, conn.replyTo(), req.header.request_id);
         return .wait;
@@ -522,14 +577,14 @@ pub const NamespaceHandler = struct {
     /// table doesn't show yet, or null.
     pub fn unpublishedIndex(self: *const NamespaceHandler, name: []const u8) ?u64 {
         if (!self.owner or self.table.lookup(name) != null) return null;
-        const meta = self.namespaces.get(name) orelse return null;
+        const meta = self.metaOf(name) orelse return null;
         return meta.created_index;
     }
 
     /// Whether this shard has a create of `name` applied or under way that
     /// the table doesn't show yet: shard 0 only.
     pub fn creating(self: *const NamespaceHandler, name: []const u8) bool {
-        return self.owner and (self.namespaces.contains(name) or self.pending_creates.contains(name));
+        return self.owner and (self.known(name) or self.pending_creates.contains(name));
     }
 
     /// Shard 0: a published name answers now; a known or pending one waits
@@ -546,7 +601,7 @@ pub const NamespaceHandler = struct {
             unreachable; // ensure answers a published name itself
         }
         var as = kind;
-        if (self.namespaces.contains(name) or self.pending_creates.contains(name)) {
+        if (self.known(name) or self.pending_creates.contains(name)) {
             // Being created by another request: wait for its outcome, so
             // "exists" is never said of a create that then fails.
             if (kind == .create) as = .joined;
@@ -594,10 +649,10 @@ pub const NamespaceHandler = struct {
         std.debug.assert(!shard.applying);
         const name = if (name_or_empty.len == 0) "default" else name_or_empty;
         if (!self.owner) return if (self.table.lookup(name) != null) .go else .ensure;
-        if (self.namespaces.contains(name) or self.pending_creates.contains(name)) return .go;
+        if (self.known(name) or self.pending_creates.contains(name)) return .go;
         // Shard 0 proposes the create ahead of the write, in one log, and
         // the write carries the id the create proposed: every create a
-        // ready leader proposes applies (`replayEntry`), or is dropped with
+        // ready leader proposes applies (`namespace/machine.zig`), or is dropped with
         // the log's tail, writes behind it included.
         return switch (self.proposeCreateOn(shard.raft_node, name)) {
             .proposed => .go,
@@ -617,7 +672,7 @@ pub const NamespaceHandler = struct {
     pub fn settle(self: *NamespaceHandler, shard: *Shard) void {
         if (!self.owner) return;
 
-        if (self.unpublished.items.len > 0) publish: {
+        if (self.unpublished.items.len > 0 or self.publish_from_store) publish: {
             shard.flushSegmentToDisk() catch |err| {
                 const now = @import("stdx").time.milliTimestamp();
                 if (now - self.flush_warn_ms >= 30_000) {
@@ -627,15 +682,22 @@ pub const NamespaceHandler = struct {
                 break :publish;
             };
             for (self.unpublished.items, 0..) |u, i| {
-                self.table.publish(u.id, u.name, u.index) catch {
+                // Published already from the store (`publishAll`).
+                if (self.table.nameOf(u.id) == null) self.table.publish(u.id, u.name, u.index) catch {
                     // What was published stays published: drop it, and
                     // try the rest next tick.
                     self.unpublished.replaceRangeAssumeCapacity(0, i, &.{});
                     break :publish;
                 };
                 self.answerWaiters(shard, u.name, .published);
+                self.allocator.free(u.name);
             }
             self.unpublished.clearRetainingCapacity();
+            if (self.publish_from_store) {
+                self.publishAll() catch break :publish;
+                self.publish_from_store = false;
+                self.answerPublishedWaiters(shard);
+            }
         }
 
         const now = @import("stdx").time.monotonicMs();
@@ -652,6 +714,19 @@ pub const NamespaceHandler = struct {
                 shard.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, proto.notRun(READ_UNSETTLED))
             else
                 shard.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, .{ .reason = .unclassified, .ran = .unknown, .message = FLUSH_MESSAGE });
+        }
+    }
+
+    /// Answer every waiter whose name the table now has.
+    fn answerPublishedWaiters(self: *NamespaceHandler, shard: *Shard) void {
+        var name_buf: [MAX_NAME_LEN]u8 = undefined;
+        while (true) {
+            const w = for (self.waiters.items) |w| {
+                if (self.table.lookup(w.name) != null) break w;
+            } else return;
+            const name = name_buf[0..w.name.len];
+            @memcpy(name, w.name);
+            self.answerWaiters(shard, name, .published);
         }
     }
 
@@ -723,20 +798,6 @@ pub const NamespaceHandler = struct {
     /// The names after `cursor`, in name order, as many as `limit` allows.
     /// The cursor is the last name given when more are left.
     pub fn page(self: *NamespaceHandler, limit: u32, cursor: []const u8) Error!ListResponse.Value {
-        const names = try self.allocator.alloc([]const u8, self.namespaces.count());
-        defer self.allocator.free(names);
-        var n: usize = 0;
-        var it = self.namespaces.keyIterator();
-        while (it.next()) |k| {
-            if (std.mem.order(u8, k.*, cursor) != .gt) continue;
-            names[n] = k.*;
-            n += 1;
-        }
-        std.mem.sort([]const u8, names[0..n], {}, struct {
-            fn lt(_: void, a: []const u8, b: []const u8) bool {
-                return std.mem.lessThan(u8, a, b);
-            }
-        }.lt);
         const Names = ListResponse.field_list[0].T;
         const buf = self.list_buf orelse blk: {
             const b = try self.allocator.alloc(u8, Names.byte_bound.?);
@@ -744,17 +805,44 @@ pub const NamespaceHandler = struct {
             break :blk b;
         };
         var out = Names.Builder.init(buf);
-        for (names[0..n]) |name| {
-            if (out.count == limit or !(out.add(name) catch unreachable)) break; // a valid name never breaks its schema
+        // The store's names after the cursor, in key order, which is name
+        // order; "default", which has no record, merged in at its place.
+        var kb: [1 + std.math.maxInt(u8)]u8 = undefined;
+        const after = @import("../contract/view.zig").key(&kb, "", cursor) catch null;
+        var it = if (after) |k| self.read().rangeAfter(ns_machine.NameFam, ns_machine.NAME_PREFIX, k) else self.read().range(ns_machine.NameFam, ns_machine.NAME_PREFIX);
+        var default_due = std.mem.order(u8, "default", cursor) == .gt;
+        var next_stored = nameAfter(&it, cursor);
+        var last: ?[]const u8 = null;
+        var more = false;
+        while (true) {
+            const name = if (default_due and (next_stored == null or std.mem.lessThan(u8, "default", next_stored.?))) d: {
+                default_due = false;
+                break :d "default";
+            } else if (next_stored) |n| n: {
+                next_stored = nameAfter(&it, cursor);
+                break :n n;
+            } else break;
+            if (out.count == limit or !(out.add(name) catch unreachable)) { // a valid name never breaks its schema
+                more = true;
+                break;
+            }
+            last = name;
         }
-        const more = out.count < n;
-        return .{ .names = out.value(), .cursor = if (more) names[out.count - 1] else null };
+        return .{ .names = out.value(), .cursor = if (more) last else null };
+    }
+
+    fn nameAfter(it: anytype, cursor: []const u8) ?[]const u8 {
+        while (it.next() catch unreachable) |rec| { // written by the machine alone
+            const name = rec.key[ns_machine.NAME_PREFIX.len..];
+            if (std.mem.order(u8, name, cursor) == .gt) return name;
+        }
+        return null;
     }
 
     fn runInfo(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(InfoResponse) {
         const name = req.key;
         if (nameRefusal(name)) |why| return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(why) } };
-        const meta = shard.namespace_handler.namespaces.get(name) orelse return error.NoNamespace;
+        const meta = shard.namespace_handler.metaOf(name) orelse return error.NoNamespace;
         return .{ .answer = .{ .created_at_ms = @intCast(meta.created_at_ns / std.time.ns_per_ms) } };
     }
 
@@ -781,10 +869,10 @@ pub const NamespaceHandler = struct {
 
     /// Shard 0's leader proposes `name`'s create with the next id: past
     /// every id applied and every create it has in flight. Replicas never
-    /// choose an id; they check the one given (`applyCreateAt`).
+    /// choose an id; they check the one given (`namespace/machine.zig`).
     fn proposeCreate(self: *NamespaceHandler, raft: *RaftNode, name: []const u8) !persistence_mod.ProposeResult {
         std.debug.assert(self.owner);
-        const id: u32 = @max(self.next_id, self.next_alloc, self.id_floor);
+        const id: u32 = @max(self.nextId(), self.next_alloc, self.id_floor);
         if (id >= ns_table.CAPACITY) return error.NamespacesFull;
         const P = namespace_entries.Create;
         var buf: [P.max_size]u8 = undefined;
@@ -795,46 +883,6 @@ pub const NamespaceHandler = struct {
         self.next_alloc = id + 1;
         self.notePending(owned, .of(id));
         return proposed;
-    }
-
-    /// Register this handler's entry types with the ReplayRegistry.
-    pub fn registerReplay(self: *NamespaceHandler, registry: *persistence_mod.ReplayRegistry) void {
-        registry.register(.namespace_create, @ptrCast(self), replayEntryThunk);
-    }
-
-    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
-        const self: *NamespaceHandler = @ptrCast(@alignCast(ctx));
-        return self.replayEntry(entry, out);
-    }
-
-    /// Apply a namespace create, at boot or after commit. One its applier
-    /// refuses breaks the log, on every replica alike, and halts.
-    pub fn replayEntry(self: *NamespaceHandler, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
-        _ = out; // nothing a namespace entry applies answers a client
-        var diag: schema.Diagnostic = .{};
-        switch (@as(entry_mod.EntryType, @fromBackingInt(@intCast(entry.header.entry_type)))) {
-            .namespace_create => {
-                const c = namespace_entries.Create.decodeAll(entry.payload, &diag) catch return error.Halt;
-                // Only shard 0 logs creates; one elsewhere was never proposed.
-                if (!self.owner) return error.Halt;
-                if (self.pending_creates.fetchRemove(c.name)) |kv| self.allocator.free(kv.key);
-                const outcome = self.applyCreateAt(c.name, .of(c.id), entry.header.timestamp_ns, entry.header.index);
-                switch (outcome) {
-                    .created => {},
-                    .failed => return error.OutOfMemory,
-                    // A leader proposes a create only once it is ready, so
-                    // it has applied every earlier entry, and checks the
-                    // name and the room against them and its own creates in
-                    // flight; its ids run past every id in its log
-                    // (`proposeCreate`). So a create it proposed is never
-                    // refused here. One that is would leave the writes it
-                    // carries behind it naming an id that isn't theirs: the
-                    // log is broken, on every replica alike.
-                    .existed, .invalid, .full, .stale_id => return error.Halt,
-                }
-            },
-            else => return error.Halt,
-        }
     }
 };
 
@@ -894,44 +942,44 @@ test "namespace handler: a create takes the next dense id, and one its leader co
     const first = ns_table.FIRST_ALLOCATED.int();
     const e = try testEntry(.namespace_create, 7, 1234 * std.time.ns_per_s, .{ .name = "stamped", .id = first }, &buf);
     var out = Result.start(&e);
-    try handler.replayEntry(&e, &out);
+    try handler.applyCommitted(&e, &out);
     try testing.expect(out.refused() == null);
-    const meta = handler.namespaces.get("stamped").?;
+    const meta = handler.metaOf("stamped").?;
     try testing.expectEqual(ns_table.Id.of(first), meta.id);
     try testing.expectEqual(@as(u64, 1234 * std.time.ns_per_s), meta.created_at_ns);
     try testing.expectEqual(@as(u64, 7), meta.created_index);
-    try testing.expectEqual(first + 1, handler.next_id);
+    try testing.expectEqual(first + 1, handler.nextId());
     // Applied, not yet published: that waits for the flush.
     try testing.expect(handler.table.lookup("stamped") == null);
     // A second create of the name: its leader checks the name first, so
     // the log is broken, and every replica halts on it alike.
     var again = Result.start(&e);
-    try testing.expectError(error.Halt, handler.replayEntry(&e, &again));
+    try testing.expectError(error.Halt, handler.applyCommitted(&e, &again));
     // An id another create took first: no ready leader proposes one, so
     // the log is broken, and every replica halts on it alike.
     const stale = try testEntry(.namespace_create, 8, 0, .{ .name = "late", .id = first }, &buf);
     var st = Result.start(&stale);
-    try testing.expectError(error.Halt, handler.replayEntry(&stale, &st));
-    try testing.expect(!handler.namespaces.contains("late"));
+    try testing.expectError(error.Halt, handler.applyCommitted(&stale, &st));
+    try testing.expect(!handler.known("late"));
     // A reserved id is never allocated.
     const reserved = try testEntry(.namespace_create, 9, 0, .{ .name = "sneaky", .id = ns_table.SYSTEM.int() }, &buf);
     var rs = Result.start(&reserved);
-    try testing.expectError(error.Halt, handler.replayEntry(&reserved, &rs));
+    try testing.expectError(error.Halt, handler.applyCommitted(&reserved, &rs));
     // Only shard 0 logs creates.
-    var other = try NamespaceHandler.initFor(testing.allocator, 1, null);
+    var other = try NamespaceHandler.initFor(testing.allocator, 1, null, null);
     defer other.deinit();
     const elsewhere = try testEntry(.namespace_create, 10, 0, .{ .name = "x", .id = first }, &buf);
     var el = Result.start(&elsewhere);
-    try testing.expectError(error.Halt, other.replayEntry(&elsewhere, &el));
+    try testing.expectError(error.Halt, other.applyCommitted(&elsewhere, &el));
 }
 
 test "namespace handler: a write to an unknown namespace registers it" {
     var handler = try NamespaceHandler.init(testing.allocator);
     defer handler.deinit();
     handler.markNamespaceHasData("ghost", null);
-    try testing.expect(handler.namespaces.contains("ghost"));
+    try testing.expect(handler.known("ghost"));
     handler.markNamespaceHasData("", null);
-    try testing.expectEqual(@as(usize, 2), handler.namespaces.count());
+    try testing.expectEqual(@as(u32, 2), handler.live());
 }
 
 test "namespace handler: the name grammar, with a reason for each refusal" {
@@ -972,7 +1020,7 @@ test "namespace handler: the applier refuses a bad name and a full registry, wha
     defer handler.deinit();
     try testing.expectEqual(NamespaceHandler.CreateOutcome.invalid, handler.applyCreate(stdx.repeat("a", 300)));
     try testing.expectEqual(NamespaceHandler.CreateOutcome.invalid, handler.applyCreate("_flo"));
-    try testing.expectEqual(@as(usize, 1), handler.namespaces.count());
+    try testing.expectEqual(@as(u32, 1), handler.live());
 
     // "default" holds one of the 1024 from the start.
     var buf: [16]u8 = undefined;
@@ -983,7 +1031,7 @@ test "namespace handler: the applier refuses a bad name and a full registry, wha
     try testing.expect(!handler.admits("one-more"));
     try testing.expectEqual(NamespaceHandler.CreateOutcome.full, handler.applyCreate("one-more"));
     try testing.expectEqual(NamespaceHandler.CreateOutcome.existed, handler.applyCreate("ns0"));
-    try testing.expectEqual(NamespaceHandler.MAX_NAMESPACES, handler.namespaces.count());
+    try testing.expectEqual(@as(u32, NamespaceHandler.MAX_NAMESPACES), handler.live());
     // "default" is never locked out.
     try testing.expect(handler.admits(""));
     try testing.expect(handler.admits("default"));
@@ -1006,10 +1054,10 @@ test "namespace handler: applyCreate adds to local registry" {
     var handler = try NamespaceHandler.init(testing.allocator);
     defer handler.deinit();
 
-    try testing.expectEqual(@as(usize, 1), handler.namespaces.count());
+    try testing.expectEqual(@as(u32, 1), handler.live());
     _ = handler.applyCreate("test-ns");
-    try testing.expectEqual(@as(usize, 2), handler.namespaces.count());
-    try testing.expect(handler.namespaces.contains("test-ns"));
+    try testing.expectEqual(@as(u32, 2), handler.live());
+    try testing.expect(handler.known("test-ns"));
 }
 
 test "namespace handler: applyCreate is idempotent" {
@@ -1018,7 +1066,7 @@ test "namespace handler: applyCreate is idempotent" {
 
     _ = handler.applyCreate("test-ns");
     _ = handler.applyCreate("test-ns"); // duplicate — should be no-op
-    try testing.expectEqual(@as(usize, 2), handler.namespaces.count());
+    try testing.expectEqual(@as(u32, 2), handler.live());
 }
 
 test "namespace: a committed entry's id resolves to the name" {

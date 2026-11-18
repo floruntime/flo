@@ -133,6 +133,11 @@ pub const Table = struct {
         return self.names[id.int()][0..n];
     }
 
+    /// Every entry at or below `index` is published. Shard 0's thread only.
+    pub fn notePublished(self: *Table, index: u64) void {
+        if (index > self.published_index.load(.monotonic)) self.published_index.store(index, .release);
+    }
+
     pub fn publishedIndex(self: *const Table) u64 {
         return self.published_index.load(.acquire);
     }
