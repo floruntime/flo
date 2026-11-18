@@ -1,7 +1,7 @@
-//! A pipeline's read of a source another shard owns: the ask, and the
-//! owner's page. Only the owner reads its own state, on its own thread,
-//! with the reads its clients' reads use: applied data, nothing logged or
-//! replicated.
+//! A read of a source another shard owns, by a processing pipeline or a
+//! workflow's stream trigger: the ask, and the owner's page. Only the owner
+//! reads its own state, on its own thread, with the reads its clients'
+//! reads use: applied data, nothing logged or replicated.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -11,14 +11,28 @@ const NamespaceId = @import("../node/router.zig").NamespaceId;
 
 pub const Kind = enum(u8) { stream, ts };
 
+/// Who asks, so the page goes back to it.
+pub const Asker = enum(u8) { pipeline, trigger };
+
+/// What the owner could read. Only `ok` says where the read reached: the
+/// asker moves its cursor on no other answer, and asks again.
+pub const Status = enum(u8) {
+    ok,
+    /// The owner doesn't serve reads now: offline, halted, a leader still
+    /// applying earlier terms, or a boot not caught up with its group.
+    not_ready,
+    /// The owner has no such stream (never made, or deleted).
+    no_stream,
+};
+
 /// Most points one TS page carries; each is 26 bytes and its tag string.
 /// A stream page is what a client's stream read answers: whole appends,
 /// up to `MAX_ANSWER_BYTES` (256 KiB) past the first.
 pub const TS_PAGE_POINTS: usize = 512;
 
-/// What the pipeline asks: `limit` records of `source` after `from`.
+/// What the asker wants: `limit` records of `source` after `from`.
 ///
-/// `[term u64][seq u64][kind u8][pipeline len u16][pipeline][ns len u16][ns]
+/// `[term u64][seq u64][kind u8][asker u8][key len u16][key][ns len u16][ns]
 /// [source len u16][source][field len u16][field][tag_hash u64][from_a u64]
 /// [from_b u64][limit u32][behind_ns u64][idle_at u64]`
 pub const Read = struct {
@@ -26,8 +40,9 @@ pub const Read = struct {
     term: u64,
     seq: u64,
     kind: Kind,
-    /// The pipeline's key on the asking shard.
-    pipeline: []const u8,
+    asker: Asker = .pipeline,
+    /// The asker's key on its shard: a pipeline's, or a trigger's workflow.
+    key: []const u8,
     namespace: []const u8,
     /// The stream, or the measurement.
     source: []const u8,
@@ -51,19 +66,20 @@ pub const Read = struct {
     /// don't can't ask, and is refused (`ProcessingHandler.askSource`).
     pub fn fits(self: Read) bool {
         const max = std.math.maxInt(u16);
-        return self.pipeline.len <= max and self.source.len <= max and self.namespace.len <= max and self.field.len <= max;
+        return self.key.len <= max and self.source.len <= max and self.namespace.len <= max and self.field.len <= max;
     }
 
     pub fn encode(self: Read, allocator: Allocator) ?[]u8 {
         if (!fits(self)) return null;
-        const size = 8 + 8 + 1 + 2 + self.pipeline.len + 2 + self.namespace.len + 2 + self.source.len + 2 + self.field.len + 8 + 8 + 8 + 4 + 8 + 8;
+        const size = 8 + 8 + 1 + 1 + 2 + self.key.len + 2 + self.namespace.len + 2 + self.source.len + 2 + self.field.len + 8 + 8 + 8 + 4 + 8 + 8;
         const buf = allocator.alloc(u8, size) catch return null;
         var w: Writer = .{ .buf = buf };
         w.int(u64, self.term);
         w.int(u64, self.seq);
         w.int(u8, @backingInt(self.kind));
-        w.int(u16, @intCast(self.pipeline.len));
-        w.bytes(self.pipeline);
+        w.int(u8, @backingInt(self.asker));
+        w.int(u16, @intCast(self.key.len));
+        w.bytes(self.key);
         w.int(u16, @intCast(self.namespace.len));
         w.bytes(self.namespace);
         w.int(u16, @intCast(self.source.len));
@@ -85,7 +101,8 @@ pub const Read = struct {
         const term = r.int(u64) orelse return null;
         const seq = r.int(u64) orelse return null;
         const kind = std.enums.fromInt(Kind, r.int(u8) orelse return null) orelse return null;
-        const pipeline = r.take(r.int(u16) orelse return null) orelse return null;
+        const asker = std.enums.fromInt(Asker, r.int(u8) orelse return null) orelse return null;
+        const key = r.take(r.int(u16) orelse return null) orelse return null;
         const namespace = r.take(r.int(u16) orelse return null) orelse return null;
         const source = r.take(r.int(u16) orelse return null) orelse return null;
         const field = r.take(r.int(u16) orelse return null) orelse return null;
@@ -96,7 +113,7 @@ pub const Read = struct {
         const behind_ns = r.int(u64) orelse return null;
         const idle_at = r.int(u64) orelse return null;
         if (r.at != bytes.len) return null;
-        return .{ .term = term, .seq = seq, .kind = kind, .pipeline = pipeline, .namespace = namespace, .source = source, .field = field, .tag_hash = tag_hash, .from_a = from_a, .from_b = from_b, .limit = limit, .behind_ns = behind_ns, .idle_at = idle_at };
+        return .{ .term = term, .seq = seq, .kind = kind, .asker = asker, .key = key, .namespace = namespace, .source = source, .field = field, .tag_hash = tag_hash, .from_a = from_a, .from_b = from_b, .limit = limit, .behind_ns = behind_ns, .idle_at = idle_at };
     }
 };
 
@@ -107,17 +124,24 @@ pub const TsPoint = struct { timestamp_ns: u64, ual: u64, value: f64, tags: []co
 /// The owner's answer: the read's own header, then where the read reached
 /// and the records.
 ///
-/// `[term u64][seq u64][kind u8][pipeline len u16][pipeline][from_a u64]
-/// [from_b u64][last_a u64][last_b u64][late u64][count u32]` then each
+/// `[term u64][seq u64][kind u8][asker u8][key len u16][key][from_a u64]
+/// [from_b u64][status u8][made_ns u64][last_a u64][last_b u64][late u64]
+/// [count u32]` then each
 /// stream record `[ms u64][seq u64][len u32][payload]` or TS point
 /// `[ns u64][ual u64][value u64][tags len u16][tags]`.
 pub const Page = struct {
     term: u64,
     seq: u64,
     kind: Kind,
-    pipeline: []const u8,
+    asker: Asker,
+    key: []const u8,
     from_a: u64,
     from_b: u64,
+    status: Status,
+    /// Stream: which stream was read, by the stamp that made it, so an
+    /// asker whose cursor is in one since deleted and made again starts
+    /// over. 0 for TS.
+    made_ns: u64,
     /// Stream: the id the read reached, past appends it couldn't read, so
     /// the cursor still moves past them. TS: the field's newest time and
     /// its write count (0 when it has no series).
@@ -135,17 +159,22 @@ pub const Page = struct {
         count_at: usize = 0,
         last_at: usize = 0,
         count: u32 = 0,
+        status: Status = .ok,
+        made_ns: u64 = 0,
 
         pub fn begin(b: *Builder, allocator: Allocator, r: Read) !void {
             const w = &b.list;
             try appendInt(w, allocator, u64, r.term);
             try appendInt(w, allocator, u64, r.seq);
             try appendInt(w, allocator, u8, @backingInt(r.kind));
-            try appendInt(w, allocator, u16, @intCast(r.pipeline.len));
-            try w.appendSlice(allocator, r.pipeline);
+            try appendInt(w, allocator, u8, @backingInt(r.asker));
+            try appendInt(w, allocator, u16, @intCast(r.key.len));
+            try w.appendSlice(allocator, r.key);
             try appendInt(w, allocator, u64, r.from_a);
             try appendInt(w, allocator, u64, r.from_b);
             b.last_at = w.items.len;
+            try appendInt(w, allocator, u8, 0);
+            try appendInt(w, allocator, u64, 0);
             try appendInt(w, allocator, u64, 0);
             try appendInt(w, allocator, u64, 0);
             try appendInt(w, allocator, u64, 0);
@@ -172,11 +201,16 @@ pub const Page = struct {
         }
 
         /// The page's bytes, owned by the caller.
+        /// A page whose status isn't `ok` carries no records, and its `last`
+        /// is its `from`.
         pub fn finish(b: *Builder, allocator: Allocator, last_a: u64, last_b: u64, late: u64) ![]u8 {
             const s = b.list.items;
-            std.mem.writeInt(u64, s[b.last_at..][0..8], last_a, .little);
-            std.mem.writeInt(u64, s[b.last_at + 8 ..][0..8], last_b, .little);
-            std.mem.writeInt(u64, s[b.last_at + 16 ..][0..8], late, .little);
+            std.debug.assert(b.status == .ok or b.count == 0);
+            s[b.last_at] = @backingInt(b.status);
+            std.mem.writeInt(u64, s[b.last_at + 1 ..][0..8], b.made_ns, .little);
+            std.mem.writeInt(u64, s[b.last_at + 9 ..][0..8], last_a, .little);
+            std.mem.writeInt(u64, s[b.last_at + 17 ..][0..8], last_b, .little);
+            std.mem.writeInt(u64, s[b.last_at + 25 ..][0..8], late, .little);
             std.mem.writeInt(u32, s[b.count_at..][0..4], b.count, .little);
             return b.list.toOwnedSlice(allocator);
         }
@@ -195,14 +229,17 @@ pub const Page = struct {
         const term = r.int(u64) orelse return null;
         const seq = r.int(u64) orelse return null;
         const kind = std.enums.fromInt(Kind, r.int(u8) orelse return null) orelse return null;
-        const pipeline = r.take(r.int(u16) orelse return null) orelse return null;
+        const asker = std.enums.fromInt(Asker, r.int(u8) orelse return null) orelse return null;
+        const key = r.take(r.int(u16) orelse return null) orelse return null;
         const from_a = r.int(u64) orelse return null;
         const from_b = r.int(u64) orelse return null;
+        const status = std.enums.fromInt(Status, r.int(u8) orelse return null) orelse return null;
+        const made_ns = r.int(u64) orelse return null;
         const last_a = r.int(u64) orelse return null;
         const last_b = r.int(u64) orelse return null;
         const late = r.int(u64) orelse return null;
         const count = r.int(u32) orelse return null;
-        return .{ .term = term, .seq = seq, .kind = kind, .pipeline = pipeline, .from_a = from_a, .from_b = from_b, .last_a = last_a, .last_b = last_b, .late = late, .count = count, .items = bytes[r.at..] };
+        return .{ .term = term, .seq = seq, .kind = kind, .asker = asker, .key = key, .from_a = from_a, .from_b = from_b, .status = status, .made_ns = made_ns, .last_a = last_a, .last_b = last_b, .late = late, .count = count, .items = bytes[r.at..] };
     }
 
     pub const Record = struct { ms: u64, seq: u64, payload: []const u8 };
@@ -286,18 +323,23 @@ const Reader = struct {
 
 test "source read and page: fields come back as sent; a cut one doesn't decode" {
     const a = std.testing.allocator;
-    const read: Read = .{ .term = 3, .seq = 9, .kind = .ts, .pipeline = "job\x001", .namespace = "default", .source = "cpu", .field = "v", .tag_hash = 7, .from_a = 100, .from_b = 0, .limit = 50 };
+    const read: Read = .{ .term = 3, .seq = 9, .kind = .ts, .key = "job\x001", .namespace = "default", .source = "cpu", .field = "v", .tag_hash = 7, .from_a = 100, .from_b = 0, .limit = 50 };
     const rb = read.encode(a).?;
     defer a.free(rb);
     const got = Read.decode(rb).?;
-    try std.testing.expectEqualStrings("job\x001", got.pipeline);
+    try std.testing.expectEqualStrings("job\x001", got.key);
     try std.testing.expectEqual(@as(u64, 7), got.tag_hash);
     try std.testing.expectEqual(@as(u32, 50), got.limit);
     try std.testing.expectEqual(@as(?Read, null), Read.decode(rb[0 .. rb.len - 1]));
+    try std.testing.expectEqual(Asker.pipeline, got.asker);
+    const tr: Read = .{ .term = 1, .seq = 2, .kind = .stream, .asker = .trigger, .key = "wf", .namespace = "default", .source = "s", .from_a = 0, .from_b = 0, .limit = 1 };
+    const tb = tr.encode(a).?;
+    defer a.free(tb);
+    try std.testing.expectEqual(Asker.trigger, Read.decode(tb).?.asker);
 
     var b: Page.Builder = .{};
     defer b.deinit(a);
-    try b.begin(a, .{ .term = 3, .seq = 9, .kind = .stream, .pipeline = "j", .namespace = "default", .source = "s", .from_a = 1, .from_b = 2, .limit = 5 });
+    try b.begin(a, .{ .term = 3, .seq = 9, .kind = .stream, .key = "j", .namespace = "default", .source = "s", .from_a = 1, .from_b = 2, .limit = 5 });
     try b.record(a, 10, 0, "x");
     try b.record(a, 10, 1, "");
     const pb = try b.finish(a, 10, 1, 4);
@@ -306,11 +348,26 @@ test "source read and page: fields come back as sent; a cut one doesn't decode" 
     try std.testing.expectEqual(@as(u32, 2), page.count);
     try std.testing.expectEqual(@as(u64, 4), page.late);
     try std.testing.expectEqual(@as(u64, 2), page.from_b);
+    try std.testing.expectEqual(@as(u64, 10), page.last_a);
+    try std.testing.expectEqual(@as(u64, 1), page.last_b);
+    try std.testing.expectEqual(Status.ok, page.status);
+
+    // A refusal carries its status, its stream's stamp and asker, and no records.
+    var nb: Page.Builder = .{ .status = .not_ready, .made_ns = 5 };
+    defer nb.deinit(a);
+    try nb.begin(a, tr);
+    const np = try nb.finish(a, 0, 0, 0);
+    defer a.free(np);
+    const n = Page.decode(np).?;
+    try std.testing.expectEqual(Status.not_ready, n.status);
+    try std.testing.expectEqual(@as(u64, 5), n.made_ns);
+    try std.testing.expectEqual(Asker.trigger, n.asker);
+    try std.testing.expectEqual(@as(u32, 0), n.count);
     var recs: [4]Page.Record = undefined;
     const rs = page.records(&recs).?;
     try std.testing.expectEqualStrings("x", rs[0].payload);
     try std.testing.expectEqual(@as(u64, 1), rs[1].seq);
-    try std.testing.expectEqual(@as(?[]Page.Record, null), (Page{ .term = 0, .seq = 0, .kind = .stream, .pipeline = "", .from_a = 0, .from_b = 0, .last_a = 0, .last_b = 0, .late = 0, .count = 2, .items = page.items[0 .. page.items.len - 1] }).records(&recs));
+    try std.testing.expectEqual(@as(?[]Page.Record, null), (Page{ .term = 0, .seq = 0, .kind = .stream, .asker = .pipeline, .key = "", .from_a = 0, .from_b = 0, .status = .ok, .made_ns = 0, .last_a = 0, .last_b = 0, .late = 0, .count = 2, .items = page.items[0 .. page.items.len - 1] }).records(&recs));
 }
 
 test "readTsPage: pages may end among points sharing a time, and together read each point once" {

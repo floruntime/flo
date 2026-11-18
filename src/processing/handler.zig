@@ -2048,7 +2048,8 @@ pub const ProcessingHandler = struct {
             .term = raft.current_term,
             .seq = seq,
             .kind = kind,
-            .pipeline = pipeline_key,
+            .asker = .pipeline,
+            .key = pipeline_key,
             .namespace = pipe.src_namespace,
             .source = if (kind == .stream) pipe.src_stream else pipe.src_measurement,
             .field = pipe.src_field,
@@ -2070,32 +2071,48 @@ pub const ProcessingHandler = struct {
         pipe.read_sent_ms = now;
     }
 
-    /// Another shard's pipeline asks for a page of a source this shard
-    /// owns: read here, on this shard's thread, as a client's read is
-    /// (applied data only, nothing logged), and sent back. An answer that
-    /// finds the asker's inbox full is dropped; the asker asks again.
+    /// Another shard's pipeline or stream trigger asks for a page of a
+    /// source this shard owns: read here, on this shard's thread, as a
+    /// client's read is (applied data only, nothing logged), and sent back.
+    /// A shard that doesn't serve its clients' reads now answers so, and
+    /// reads nothing. An answer that finds the asker's inbox full is
+    /// dropped; the asker asks again.
     pub fn answerSourceRead(shard: *Shard, to: u16, bytes: []const u8) void {
         const r = source_page.Read.decode(bytes) orelse return;
         const mailboxes = shard.peer_mailboxes orelse return;
         if (to >= mailboxes.len) return;
         var b: source_page.Page.Builder = .{};
         defer b.deinit(shard.allocator);
-        const page = buildSourcePage(shard, r, &b) catch return;
+        const page = (if (shard.servesAsks()) buildSourcePage(shard, r, &b) else refusedPage(shard, r, &b, .not_ready)) catch return;
         if (!mailboxes[to].inbox.send(.{ .tag = .source_page, .src_shard = @intCast(shard.id), .payload_len = @intCast(page.len), .payload_ptr = page.ptr }))
             shard.allocator.free(page);
     }
 
-    fn buildSourcePage(shard: *Shard, r: source_page.Read, b: *source_page.Page.Builder) ![]u8 {
+    /// A page that reads nothing: `status` says why, and the asker's
+    /// cursor stays where it asked from.
+    fn refusedPage(shard: *Shard, r: source_page.Read, b: *source_page.Page.Builder, status: source_page.Status) ![]u8 {
+        b.status = status;
         try b.begin(shard.allocator, r);
+        return b.finish(shard.allocator, r.from_a, r.from_b, 0);
+    }
+
+    fn buildSourcePage(shard: *Shard, r: source_page.Read, b: *source_page.Page.Builder) ![]u8 {
         switch (r.kind) {
             .stream => {
+                const sh = shard.stream_handler;
+                b.made_ns = sh.madeAt(shard.namespaceId(r.namespace), r.source) orelse return refusedPage(shard, r, b, .no_stream);
+                try b.begin(shard.allocator, r);
                 const from: StreamID = .{ .timestamp_ms = r.from_a, .sequence = r.from_b };
-                const result = shard.stream_handler.readPayloadsForStream(r.source, r.namespace, from, r.limit);
-                defer result.deinit(shard.stream_handler.allocator);
+                // A read that stops before an append being read back from
+                // disk reaches only past what it read or couldn't: asked
+                // again, the append is there.
+                const result = sh.readPayloadsForStream(r.source, r.namespace, from, r.limit);
+                defer result.deinit(sh.allocator);
                 for (result.payloads, result.ids) |p, id| try b.record(shard.allocator, id.timestamp_ms, id.sequence, p);
                 return b.finish(shard.allocator, result.last_id.timestamp_ms, result.last_id.sequence, 0);
             },
             .ts => {
+                try b.begin(shard.allocator, r);
                 var points: [source_page.TS_PAGE_POINTS]TsPoint = undefined;
                 const ns = shard.namespaceId(r.namespace);
                 const f = shard.ts_handler.ts.fieldRecord(ns, r.source, r.field);
@@ -2117,11 +2134,14 @@ pub const ProcessingHandler = struct {
     /// frees the bytes.
     pub fn takeSourcePage(self: *ProcessingHandler, shard: *Shard, bytes: []const u8) void {
         const page = source_page.Page.decode(bytes) orelse return;
-        const entry = self.pipelines.getEntry(page.pipeline) orelse return;
+        const entry = self.pipelines.getEntry(page.key) orelse return;
         const pipeline_key = entry.key_ptr.*;
         const pipe = entry.value_ptr;
         if (pipe.read_seq != page.seq or pipe.read_term != page.term) return;
         pipe.read_seq = 0;
+        // The owner read nothing: the cursor stays, and the next tick asks
+        // again from it.
+        if (page.status != .ok) return;
         const raft = shard.raft_node;
         if (raft.role != .leader or raft.current_term != page.term) return;
         const base_job_id = if (std.mem.indexOfScalar(u8, pipeline_key, 0)) |nul| pipeline_key[0..nul] else pipeline_key;
