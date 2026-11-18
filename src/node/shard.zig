@@ -8559,6 +8559,14 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
     // Everything replay put in the log came from disk.
     raft.markDurable(raft.log.lastIndex());
     const cfg_index = raft.log.last_config_index;
+    // The log is evidence of the term too: a hard state that is missing,
+    // or behind it, never lets the node act in a term it already left,
+    // alone or in a group: a term it led minted run ids.
+    if (raft.log.lastTerm() > raft_node_mod.MAX_TERM) {
+        log.err("shard {d}: the log's last entry is from term {d}, past the highest term a node takes ({d}); refusing to start on it", .{ shard_id, raft.log.lastTerm(), raft_node_mod.MAX_TERM });
+        return error.TermSpaceExhausted;
+    }
+    raft.current_term = @max(raft.current_term, raft.log.lastTerm());
     if (role == .single) {
         // A data directory that belonged to a group must not lead alone:
         // it would take writes the group never sees.
@@ -8583,13 +8591,6 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
         return raft.bootstrap();
     }
     const empty = raft.log.lastIndex() == 0;
-    // The log is evidence of the term too: a hard state that is missing,
-    // or behind it, never lets the node act in a term it already left.
-    if (raft.log.lastTerm() > raft_node_mod.MAX_TERM) {
-        log.err("shard {d}: the log's last entry is from term {d}, past the highest term a node takes ({d}); refusing to start on it", .{ shard_id, raft.log.lastTerm(), raft_node_mod.MAX_TERM });
-        return error.TermSpaceExhausted;
-    }
-    raft.current_term = @max(raft.current_term, raft.log.lastTerm());
     if (cfg_index > 0) {
         const e = raft.log.getEntryCopy(cfg_index, buf) orelse {
             log.err("shard {d}: the config entry at index {d} could not be read; refusing to guess the membership", .{ shard_id, cfg_index });
@@ -18255,6 +18256,25 @@ test "a shard whose saved term or log runs past the term ceiling refuses to star
         var buf: [1024]u8 = undefined;
         try std.testing.expectError(error.TermSpaceExhausted, bringUpGroup(&raft, .join, &buf, 0, 1, true, 0));
     }
+}
+
+test "a lone node whose hard state is gone leads past its log's last term, never in a term it already led" {
+    // No HARDSTATE (lost, or never written), and a log whose entries reach
+    // term 9: the terms up to 9 may have minted run ids, so it must not
+    // lead in any of them again.
+    var raft = try RaftNode.init(std.testing.allocator, 1, 0, 4096, .{});
+    defer raft.deinit();
+    for ([_]u64{ 2, 9 }, 1..) |term, i| {
+        var e = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, term, i, 0, "");
+        e.header.crc32c = e.computeCrc();
+        _ = try raft.log.append(&e);
+    }
+    var buf: [1024]u8 = undefined;
+    try bringUpGroup(&raft, .single, &buf, 0, 1, false, 0);
+    try std.testing.expect(raft.role == .leader);
+    try std.testing.expectEqual(@as(u64, 10), raft.current_term);
+    // Its noop follows the log, in the new term.
+    try std.testing.expectEqual(@as(u64, 10), raft.log.entryTerm(3).?);
 }
 
 test "a shard brought up with configs above its applied index records each of them, in order" {
