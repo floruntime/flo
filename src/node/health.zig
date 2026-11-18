@@ -137,6 +137,7 @@ pub const ShardSlot = struct {
     /// stranger's frames with no leader heard, the stuck-member symptom.
     vouched_index: Atomic(u64) = .init(0),
     strangers_while_quiet: Atomic(bool) = .init(false),
+    members_silent: Atomic(bool) = .init(false),
     /// The entry the shard halted at, as a repair names it: written
     /// before the state reads `halted`.
     halt_index: Atomic(u64) = .init(0),
@@ -211,9 +212,10 @@ pub const ShardSlot = struct {
         self.state.store(@backingInt(state), .release);
     }
 
-    pub fn publishVouch(self: *ShardSlot, vouched_index: u64, strangers_while_quiet: bool) void {
+    pub fn publishVouch(self: *ShardSlot, vouched_index: u64, strangers_while_quiet: bool, members_silent: bool) void {
         self.vouched_index.store(vouched_index, .monotonic);
         self.strangers_while_quiet.store(strangers_while_quiet, .monotonic);
+        self.members_silent.store(members_silent, .monotonic);
     }
 
     pub fn publish(self: *ShardSlot, state: ShardState, role: Role, last_applied: u64, commit_index: u64) void {
@@ -340,6 +342,7 @@ pub const NodeHealth = struct {
             const vouched = s.vouched_index.load(.monotonic);
             if (vouched != 0) try w.print(",\"vouched_index\":{d}", .{vouched});
             if (s.strangers_while_quiet.load(.monotonic)) try w.writeAll(",\"strangers_while_quiet\":true");
+            if (s.members_silent.load(.monotonic)) try w.writeAll(",\"members_silent\":true");
             try w.print(",\"last_applied\":{d},\"commit_index\":{d},\"role\":\"{s}\",\"losses\":{{", .{ s.last_applied.load(.monotonic), s.commit_index.load(.monotonic), @tagName(role) });
             const sm = if (registry) |reg| reg.shardMetrics(@intCast(i)) else null;
             inline for (@typeInfo(silent_loss.Path).@"enum".field_names, 0..) |name, p| {
@@ -554,7 +557,7 @@ test "health: /status names each shard's state, its reason when offline, and its
     h.shards[1].setReason("an older reason is replaced");
     h.shards[1].setReason("segment 00000001.flseg failed its \"checksum\"");
     h.shards[1].publish(.offline, .follower, 4, 4);
-    h.shards[1].publishVouch(3726, true);
+    h.shards[1].publishVouch(3726, true, true);
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
@@ -577,6 +580,7 @@ test "health: /status names each shard's state, its reason when offline, and its
     try testing.expect(s0.get("reason") == null);
     try testing.expect(s0.get("vouched_index") == null);
     try testing.expect(s0.get("strangers_while_quiet") == null);
+    try testing.expect(s0.get("members_silent") == null);
     try testing.expectEqual(@as(usize, silent_loss.PATH_COUNT), s0.get("losses").?.object.count());
 
     const s1 = shards[1].object;
@@ -584,6 +588,7 @@ test "health: /status names each shard's state, its reason when offline, and its
     try testing.expectEqualStrings("segment 00000001.flseg failed its \"checksum\"", s1.get("reason").?.string);
     try testing.expectEqual(@as(i64, 3726), s1.get("vouched_index").?.integer);
     try testing.expect(s1.get("strangers_while_quiet").?.bool);
+    try testing.expect(s1.get("members_silent").?.bool);
     try testing.expectEqual(@as(i64, 3), s1.get("losses").?.object.get("segment_unreadable").?.integer);
     // A repeated index is shown beside the losses, not among them.
     try testing.expectEqual(@as(i64, 0), s0.get("duplicate_index").?.integer);

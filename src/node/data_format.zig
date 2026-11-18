@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 42;
+pub const CURRENT: u32 = 43;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -152,6 +152,9 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // a sink batch carries the source records it covers, kept with its
     // cursor (`processing.cursor.records`).
     .{ .format = 42, .segment_version = 29, .entries = 0xecc2f68c0588f846 },
+    // HARDSTATE carries the vouch a guarded node took, with the guard, so a
+    // restart part way through catching up keeps it; the log is unchanged.
+    .{ .format = 43, .segment_version = 29, .entries = 0xecc2f68c0588f846 },
 };
 
 comptime {

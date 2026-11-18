@@ -13,6 +13,7 @@ const testing = std.testing;
 const stdx = @import("stdx");
 const proto = @import("src").protocol.proto;
 const kv_ops = @import("src").protocol.kv_ops;
+const hard_state = @import("src").raft.hard_state;
 
 // =============================================================================
 // Helper: Parse version from JSON output
@@ -2387,18 +2388,13 @@ test "e2e/kv: a 5 KiB value is stored and read back whole" {
 
 const HardStateFields = struct { node_id: u32, term: u64, voted_for: u32 };
 
-/// The shard-0 HARDSTATE file: node id at 8, term at 12, vote at 20.
+/// The shard-0 HARDSTATE file, read through the server's own decoder, so a
+/// layout change can't leave this reading the wrong bytes.
 fn readHardState(data_dir: []const u8) !HardStateFields {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/00000/HARDSTATE", .{data_dir});
-    var file_buf: [64]u8 = undefined;
-    const bytes = try stdx.fs.readFile(path, &file_buf);
-    if (bytes.len != 28) return error.UnexpectedHardStateSize;
-    return .{
-        .node_id = std.mem.readInt(u32, bytes[8..12], .little),
-        .term = std.mem.readInt(u64, bytes[12..20], .little),
-        .voted_for = std.mem.readInt(u32, bytes[20..24], .little),
-    };
+    const dir = try std.fmt.bufPrint(&path_buf, "{s}/00000", .{data_dir});
+    const hs = (try hard_state.load(dir)) orelse return error.NoHardState;
+    return .{ .node_id = hs.node_id, .term = hs.term, .voted_for = hs.voted_for };
 }
 
 fn readHardStateTerm(data_dir: []const u8) !u64 {

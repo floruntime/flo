@@ -24,6 +24,7 @@ const Allocator = std.mem.Allocator;
 const raft_log = @import("log.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const membership = @import("membership.zig");
+const hard_state = @import("hard_state.zig");
 const plant = @import("../plant.zig");
 const limits = @import("../protocol/limits.zig");
 
@@ -157,7 +158,7 @@ pub const Config = struct {
 /// term is kept in memory anyway and counted in `persist_failures`.
 pub const HardStateSink = struct {
     ctx: *anyopaque,
-    persist: *const fn (ctx: *anyopaque, term: u64, voted_for: NodeId, lost_log: bool) bool,
+    persist: *const fn (ctx: *anyopaque, term: u64, voted_for: NodeId, lost_log: bool, vouch: *const hard_state.Vouch) bool,
 };
 
 /// Puts everything the log holds on disk, before a config entry takes
@@ -487,6 +488,9 @@ pub const RaftNode = struct {
 
     // ── Hard-state persistence ─────────────────────────────────────────
     hard_state_sink: ?HardStateSink,
+    /// The vouch a guarded node holds (the replica's), persisted with the
+    /// guard so a restart keeps it, and restored only while guarded.
+    vouch: hard_state.Vouch = .{},
     /// Persist calls that returned false. Each one is a term or vote the
     /// node holds in memory only.
     persist_failures: u64,
@@ -2136,9 +2140,9 @@ pub const RaftNode = struct {
 
     /// Hand (current_term, voted_for) to the sink. True when durable, or when
     /// there is no sink (an ephemeral node has nothing to persist to).
-    fn persistHardState(self: *RaftNode) bool {
+    pub fn persistHardState(self: *RaftNode) bool {
         const sink = self.hard_state_sink orelse return true;
-        if (sink.persist(sink.ctx, self.current_term, self.voted_for, self.lost_log != .none)) return true;
+        if (sink.persist(sink.ctx, self.current_term, self.voted_for, self.lost_log != .none, &self.vouch)) return true;
         self.persist_failures += 1;
         log.debug("Raft: hard state not durable, node_id={d}, group_id={d}, term={d}, voted_for={d} (persist_failures={d})", .{ self.id, self.group_id, self.current_term, self.voted_for, self.persist_failures });
         return false;
@@ -3252,7 +3256,8 @@ const SinkRecorder = struct {
     calls: u32 = 0,
     fail: bool = false,
 
-    fn persist(ctx: *anyopaque, term: u64, voted_for: NodeId, lost_log: bool) bool {
+    fn persist(ctx: *anyopaque, term: u64, voted_for: NodeId, lost_log: bool, vouch: *const hard_state.Vouch) bool {
+        _ = vouch;
         const self: *SinkRecorder = @ptrCast(@alignCast(ctx));
         self.lost_log = lost_log;
         self.calls += 1;
