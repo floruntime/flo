@@ -330,7 +330,7 @@ pub const StreamHandler = struct {
 
     /// Route by stream name — single-partition operations.
     /// Routed by the namespace's id and the stream's name (`routeNsKey`).
-    fn preRouteByStream(req: Request) ?u64 {
+    pub fn preRouteByStream(req: Request) ?u64 {
         if (req.key.len == 0) return null;
         return router.routeNsKey(req.ns_id, req.key);
     }

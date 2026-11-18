@@ -53,6 +53,8 @@ pub const SinkBatch = Record(&.{
     .{ .name = "from_b", .T = Int(u64) },
     .{ .name = "to_a", .T = Int(u64) },
     .{ .name = "to_b", .T = Int(u64) },
+    // The source records the batch covers.
+    .{ .name = "records", .T = Int(u32) },
     .{ .name = "messages", .T = Messages },
 });
 

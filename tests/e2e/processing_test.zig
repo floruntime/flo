@@ -3629,3 +3629,33 @@ test "e2e/processing: on 4 shards, a job reads a stream and a measurement other 
         }
     }
 }
+
+test "e2e/processing: on 4 shards, a job lives on its source's shard, runs there, and is stopped and removed by its id" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    const router = src.node.router.Router.init(4, 0);
+    // A source on each shard but 0, as stream ops route it.
+    for ([_]u16{ 1, 2, 3 }) |home| {
+        var sbuf: [24]u8 = undefined;
+        const source = for (0..256) |i| {
+            const name = try std.fmt.bufPrint(&sbuf, "home{d}-in{d}", .{ home, i });
+            if (router.hashToShard(src.node.router.routeNsKey(.default, name)) == home) break name;
+        } else return error.NoSourceOnShard;
+        var obuf: [24]u8 = undefined;
+        const out = try std.fmt.bufPrint(&obuf, "home{d}-out", .{home});
+        var ybuf: [256]u8 = undefined;
+        const yaml = try std.fmt.bufPrint(&ybuf, "kind: Processing\nname: home{d}\nsources.[0].stream.name: {s}\nsinks.[0].stream.name: {s}\n", .{ home, source, out });
+        const path = try writeDottedToTempYaml(testing.allocator, yaml, "e2e-home.yaml");
+        defer cleanupTempFile(testing.allocator, path);
+        const job_id = extractJobId(try ctx.execCapture(&.{ "processing", "submit", path })) orelse return error.NoJobId;
+        try testing.expectEqual(home, router.slotToShard(src.node.run_id.extractSlot(job_id).?));
+
+        try ctx.exec(&.{ "stream", "append", source, "rec-at-home" });
+        try testing.expect(try readStreamBlocking(ctx, out, "default", "rec-at-home", "6000"));
+        try expectRun(ctx.cli, &.{ "processing", "status", job_id }, 0, "RUNNING");
+        try ctx.exec(&.{ "processing", "stop", job_id });
+        try expectRun(ctx.cli, &.{ "processing", "status", job_id }, 0, "STOPPED");
+        try expectRun(ctx.cli, &.{ "processing", "remove", job_id }, 0, "Job removed: ");
+        try expectRun(ctx.cli, &.{ "processing", "status", job_id }, 1, "");
+    }
+}
