@@ -1,12 +1,10 @@
-//! Stream Projection — per-stream record tracking.
+//! Streams as reads see them, and the shapes the streams machine
+//! (`stream/machine.zig`) and its readers share: a stream's key, its ids,
+//! an append's place in the log, the append value and batch codecs.
 //!
 //! Each stream has its own StreamID space (timestamp-sequence, like Redis).
 //! Consumer groups are the group machine's (`stream/group_machine.zig`),
 //! which reads a stream's records through `contract/streams.zig`.
-//!
-//! Data flow:
-//!   stream_append → per-stream ID gen → record StreamID → UAL index mapping
-//!   stream_trim   → remove records with IDs below threshold
 
 const std = @import("std");
 const NamespaceId = @import("../namespace/table.zig").Id;
@@ -18,13 +16,17 @@ const node_router = @import("../node/router.zig");
 const MAX_QUALIFIED_KEY = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
 const ce = @import("../protocol/channel_entries.zig");
 const schema = @import("../protocol/schema.zig");
+const store_mod = @import("../contract/store.zig");
+const view_mod = @import("../contract/view.zig");
+const sm = @import("../stream/machine.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
 const CommandPayload = entry_mod.CommandPayload;
 pub const StreamID = stream_id_mod.StreamID;
 
-/// A stream's records, as the projection keys them: its namespace's id, then
+/// A stream's key in `stream.meta` and the prefix of its `stream.record`
+/// keys: its namespace's id, then
 /// its name's hash (`router.nsNameKey`). Leading with the id, two namespaces'
 /// streams never share state, even when their names' hashes collide.
 pub const StreamKey = [12]u8;
@@ -198,6 +200,24 @@ pub fn appendRefusal(payload: []const u8) ?[]const u8 {
     return null;
 }
 
+/// An append value as a client's is sent: partition 0, then a batch of `n`
+/// records of `payload_len` bytes each, with no headers. Its stored size
+/// is `4 + n * (payload_len + 6)`.
+pub fn appendValueOf(buf: []u8, n: u32, payload_len: u32) []const u8 {
+    std.mem.writeInt(u32, buf[0..4], 0, .little);
+    std.mem.writeInt(u32, buf[4..8], n, .little);
+    var pos: usize = 8;
+    for (0..n) |_| {
+        std.mem.writeInt(u32, buf[pos..][0..4], payload_len, .little);
+        pos += 4;
+        @memset(buf[pos..][0..payload_len], 'x');
+        pos += payload_len;
+        std.mem.writeInt(u16, buf[pos..][0..2], 0, .little);
+        pos += 2;
+    }
+    return buf[0..pos];
+}
+
 /// A record's `part` for message `ordinal` of an inbound.
 pub fn partOf(ordinal: u8) u8 {
     comptime std.debug.assert(ce.MAX_BATCH <= std.math.maxInt(u8));
@@ -341,477 +361,182 @@ pub fn batchRecordCount(batch: []const u8) u32 {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Per-Stream State
-// ═══════════════════════════════════════════════════════════════════════════════
-
-pub const StreamState = struct {
-    /// Per-stream ID generator for monotonic StreamIDs.
-    id_gen: StreamIdGenerator,
-    /// Records sorted by StreamID (append-only, trimmed from front).
-    records: std.ArrayList(StreamRecord),
-    /// First record ID (or MIN if empty).
-    first_id: StreamID,
-    /// Last record ID (or MIN if empty).
-    last_id: StreamID,
-    /// The last record a trim removed, never lowered: a trim cuts whole
-    /// appends, so this is the last record of the last append it cut, which
-    /// can lie past the trim's own bound. MIN until a trim removes one.
-    removed_through: StreamID,
-    /// The stream's key in its projection.
-    key: StreamKey,
-    /// Running sum of `record_count` over live entries — the logical record
-    /// count, maintained incrementally so `stream info` stays O(1).
-    total_records: u64,
-    /// Running sum of `byte_len` over live entries.
-    total_bytes: u64,
-
-    pub fn init(key: StreamKey) StreamState {
-        return .{
-            .id_gen = StreamIdGenerator.init(),
-            .records = .empty,
-            .first_id = StreamID.MIN,
-            .last_id = StreamID.MIN,
-            .removed_through = StreamID.MIN,
-            .key = key,
-            .total_records = 0,
-            .total_bytes = 0,
-        };
-    }
-
-    pub fn deinit(self: *StreamState, allocator: Allocator) void {
-        self.records.deinit(allocator);
-    }
-
-    /// Append anchored to an explicit timestamp (the originating UAL entry's
-    /// timestamp, in ms) so replay reproduces identical StreamIDs.
-    pub fn appendAt(self: *StreamState, allocator: Allocator, ual_index: u64, part: u8, partition_index: u32, ts_ms: u64, record_count: u32, byte_len: u32) !StreamID {
-        // Reserve one sequence per logical record: reads expand a batch into
-        // `id.sequence + 0..n-1`, so reserving a single sequence for an
-        // N-record batch would let the next append in the same millisecond
-        // hand out IDs the batch has already used.
-        const n = @max(1, record_count);
-        const batch = try self.id_gen.nextBatchAt(ts_ms, n);
-        try self.records.append(allocator, .{
-            .id = batch.first,
-            .ual_index = ual_index,
-            .part = part,
-            .partition_index = partition_index,
-            .record_count = n,
-            .byte_len = byte_len,
-        });
-        if (self.first_id.eql(StreamID.MIN)) {
-            self.first_id = batch.first;
-        }
-        // The stream's last ID is the batch's *last* record, not its first.
-        self.last_id = batch.last;
-        self.total_records += n;
-        self.total_bytes += byte_len;
-        return batch.first;
-    }
-
-    /// Read records with IDs in (after_id, to_id]: the start is a cursor,
-    /// exclusive like `readAfter`, the end inclusive.
-    /// Entries are whole: one starting at or before `to_id` is returned
-    /// entire, records past `to_id` included.
-    pub fn readRange(self: *const StreamState, after_id: StreamID, to_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
-        const items = self.records.items;
-        if (items.len == 0) return 0;
-        const start_idx = self.firstAfter(after_id);
-        if (start_idx >= items.len) return 0;
-        var n: usize = 0;
-        var i = start_idx;
-        while (i < items.len and n < buf.len) : (i += 1) {
-            const rec = &items[i];
-            if (rec.id.greaterThan(to_id)) break;
-            if (filter_partition) |fp| {
-                if (rec.partition_index != fp) continue;
-            }
-            buf[n] = rec.*;
-            n += 1;
-        }
-        return n;
-    }
-
-    /// The first entry holding a record after `after_id`. That can be the
-    /// entry holding `after_id` itself, so a cursor inside an append resumes
-    /// with the rest of it; readers skip its records up to the cursor.
-    fn firstAfter(self: *const StreamState, after_id: StreamID) usize {
-        const items = self.records.items;
-        var i = self.lowerBound(after_id);
-        if (i > 0 and lastRecordOf(items[i - 1]).greaterThan(after_id)) i -= 1;
-        while (i < items.len and !lastRecordOf(items[i]).greaterThan(after_id)) : (i += 1) {}
-        return i;
-    }
-
-    /// The ids of the records after `after_id`, one per record, oldest
-    /// first: an append's records are its first id's sequence onwards.
-    pub fn idsAfter(self: *const StreamState, after_id: StreamID, out: []StreamID) usize {
-        const items = self.records.items;
-        var n: usize = 0;
-        var i = self.firstAfter(after_id);
-        while (i < items.len and n < out.len) : (i += 1) {
-            const rec = items[i];
-            var k: u32 = 0;
-            while (k < rec.record_count and n < out.len) : (k += 1) {
-                const id: StreamID = .{ .timestamp_ms = rec.id.timestamp_ms, .sequence = rec.id.sequence + k };
-                if (!id.greaterThan(after_id)) continue;
-                out[n] = id;
-                n += 1;
-            }
-        }
-        return n;
-    }
-
-    /// The append holding record `id`, if the stream still does.
-    pub fn appendOf(self: *const StreamState, id: StreamID) ?StreamRecord {
-        const items = self.records.items;
-        var i = self.lowerBound(id);
-        if (i < items.len and items[i].id.eql(id)) return items[i];
-        if (i == 0) return null;
-        i -= 1;
-        return if (lastRecordOf(items[i]).lessThan(id)) null else items[i];
-    }
-
-    /// Read the entries holding records after `after_id` (exclusive).
-    pub fn readAfter(self: *const StreamState, after_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
-        const items = self.records.items;
-        if (items.len == 0) return 0;
-        const start_idx = self.firstAfter(after_id);
-        if (start_idx >= items.len) return 0;
-        var n: usize = 0;
-        var i = start_idx;
-        while (i < items.len and n < buf.len) : (i += 1) {
-            if (filter_partition) |fp| {
-                if (items[i].partition_index != fp) continue;
-            }
-            buf[n] = items[i];
-            n += 1;
-        }
-        return n;
-    }
-
-    /// Resolve specific StreamIDs back to records. Output preserves the input
-    /// order; any ID not currently in the stream (trimmed, never appended, or
-    /// belonging to a different stream) is silently skipped. Returns the
-    /// number of records written to `buf`.
-    pub fn readByIds(self: *const StreamState, ids: []const StreamID, buf: []StreamRecord) usize {
-        const items = self.records.items;
-        if (items.len == 0) return 0;
-        var n: usize = 0;
-        for (ids) |id| {
-            if (n >= buf.len) break;
-            const idx = self.lowerBound(id);
-            if (idx >= items.len) continue;
-            if (!items[idx].id.eql(id)) continue;
-            buf[n] = items[idx];
-            n += 1;
-        }
-        return n;
-    }
-
-    /// Number of live append *entries* (batches). Internal bookkeeping —
-    /// user-visible record counts must use `logicalCount`.
-    pub fn count(self: *const StreamState) usize {
-        return self.records.items.len;
-    }
-
-    /// Number of live logical records, counting each batch's contents.
-    pub fn logicalCount(self: *const StreamState) u64 {
-        return self.total_records;
-    }
-
-    /// Stored size of the live records, in bytes.
-    pub fn byteSize(self: *const StreamState) u64 {
-        return self.total_bytes;
-    }
-
-    /// What a trim to `up_to_id` would remove: the leading entries with
-    /// id <= up_to_id, and the logical records they hold.
-    pub fn trimExtent(self: *const StreamState, up_to_id: StreamID) struct { entries: usize, records: u64 } {
-        const items = self.records.items;
-        var cut: usize = 0;
-        var records: u64 = 0;
-        while (cut < items.len) : (cut += 1) {
-            if (items[cut].id.greaterThan(up_to_id)) break;
-            records += items[cut].record_count;
-        }
-        return .{ .entries = cut, .records = records };
-    }
-
-    /// Trim records with IDs <= up_to_id. Returns the logical records removed,
-    /// the same number `trimExtent` predicts.
-    pub fn trim(self: *StreamState, allocator: Allocator, up_to_id: StreamID) u64 {
-        _ = allocator;
-        const items = self.records.items;
-        if (items.len == 0) return 0;
-
-        const extent = self.trimExtent(up_to_id);
-        const cut = extent.entries;
-
-        if (cut == 0) return 0;
-        const removed_last = lastRecordOf(items[cut - 1]);
-        if (removed_last.greaterThan(self.removed_through)) self.removed_through = removed_last;
-
-        // Drop the trimmed entries from the running totals before shifting.
-        for (items[0..cut]) |rec| {
-            self.total_records -= @min(self.total_records, rec.record_count);
-            self.total_bytes -= @min(self.total_bytes, rec.byte_len);
-        }
-
-        // Shift remaining records to front
-        const remaining = items.len - cut;
-        if (remaining > 0) {
-            std.mem.copyForwards(StreamRecord, items[0..remaining], items[cut..items.len]);
-        }
-        self.records.items.len = remaining;
-
-        if (remaining > 0) {
-            self.first_id = self.records.items[0].id;
-        } else {
-            self.first_id = StreamID.MIN;
-            self.last_id = StreamID.MIN;
-            self.total_records = 0;
-            self.total_bytes = 0;
-        }
-        return extent.records;
-    }
-
-    /// Binary search: find first index where record.id >= target.
-    fn lowerBound(self: *const StreamState, target: StreamID) usize {
-        const items = self.records.items;
-        var lo: usize = 0;
-        var hi: usize = items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (items[mid].id.lessThan(target)) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        return lo;
-    }
-};
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // Stream Projection
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// A shard's streams as reads see them: the streams machine's families
+/// (`stream/machine.zig`), as committed. Nothing here changes a stream; an
+/// append, trim or delete is the machine's, applied from the log.
 pub const StreamProjection = struct {
-    allocator: Allocator,
+    /// The partition's store, wired once the partition is at its address.
+    store: ?*store_mod.Store = null,
 
-    // Which streams exist, their names and settings: the streams machine's
-    // (`stream/machine.zig`), not this.
-
-    /// Per-stream state — each stream has its own StreamID space.
-    streams: std.AutoHashMap(StreamKey, StreamState),
-
-    /// The `part` the append applying now takes (`StreamRecord.part`): the
-    /// shard sets it around a `stream_append` a channel message carries,
-    /// and it is 0 for a plain one.
-    applying_part: u8 = 0,
-
-    /// Stats.
-    stats: Stats,
+    stats: Stats = .{},
 
     pub const Stats = struct {
-        appended: u64 = 0,
         reads: u64 = 0,
-        trimmed: u64 = 0,
     };
 
-    pub fn init(allocator: Allocator) StreamProjection {
-        return .{
-            .allocator = allocator,
-            .streams = std.AutoHashMap(StreamKey, StreamState).init(allocator),
-            .stats = .{},
-        };
+    pub fn init() StreamProjection {
+        return .{};
     }
 
-    pub fn deinit(self: *StreamProjection) void {
-        // Free per-stream state
-        var sit = self.streams.iterator();
-        while (sit.next()) |kv| {
-            kv.value_ptr.deinit(self.allocator);
-        }
-        self.streams.deinit();
+    fn read(self: *const StreamProjection) ?view_mod.ReadView {
+        return .{ .store = self.store orelse return null };
     }
 
-    /// Reset the stream projection to empty state.
-    /// Clears every stream on this shard, as a restart would.
-    pub fn reset(self: *StreamProjection) void {
-        // Free per-stream state
-        var sit = self.streams.iterator();
-        while (sit.next()) |kv| {
-            kv.value_ptr.deinit(self.allocator);
-        }
-        self.streams.clearAndFree();
-        self.stats = .{};
+    fn metaOf(self: *const StreamProjection, key: StreamKey) ?sm.Meta.Value {
+        const m = sm.metaAt(self.read() orelse return null, key) orelse return null;
+        return if (m.exists) m else null;
     }
 
-    // ─── Per-stream state ──────────────────────────────────────────────────
-
-    /// Get or create per-stream state for a given name hash.
-    pub fn getOrCreateStream(self: *StreamProjection, key: StreamKey) !*StreamState {
-        const gop = try self.streams.getOrPut(key);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = StreamState.init(key);
-        }
-        return gop.value_ptr;
+    fn appends(self: *const StreamProjection, key: StreamKey, after_id: StreamID) ?sm.Appends {
+        const m = self.metaOf(key) orelse return null;
+        return sm.Appends.init(self.read().?, key, m, after_id);
     }
 
-    /// Append anchored to the originating UAL entry's timestamp (ms), so
-    /// replay reproduces identical StreamIDs.
-    pub fn appendToStreamAt(self: *StreamProjection, key: StreamKey, ual_index: u64, part: u8, partition_index: u32, ts_ms: u64, record_count: u32, byte_len: u32) !StreamID {
-        const ss = try self.getOrCreateStream(key);
-        const id = try ss.appendAt(self.allocator, ual_index, part, partition_index, ts_ms, record_count, byte_len);
-        self.stats.appended += 1;
-        return id;
-    }
-
-    /// Read records from a stream with IDs in (after_id, to_id].
+    /// Records with IDs in (after_id, to_id]: the start is a cursor,
+    /// exclusive like `readStreamAfter`, the end inclusive. Appends are
+    /// whole: one starting at or before `to_id` is returned entire.
     pub fn readStreamRange(self: *StreamProjection, key: StreamKey, after_id: StreamID, to_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
-        const ss = self.streams.getPtr(key) orelse return 0;
-        const n = ss.readRange(after_id, to_id, filter_partition, buf);
+        var it = self.appends(key, after_id) orelse return 0;
+        var n: usize = 0;
+        while (n < buf.len) {
+            const rec = it.next() orelse break;
+            if (rec.id.greaterThan(to_id)) break;
+            if (filter_partition) |fp| if (rec.partition_index != fp) continue;
+            buf[n] = rec;
+            n += 1;
+        }
         self.stats.reads += n;
         return n;
     }
 
-    /// Read records from a stream after a given ID (exclusive).
+    /// The appends holding records after `after_id` (exclusive): the one
+    /// holding `after_id` first, when it holds more past it.
     pub fn readStreamAfter(self: *StreamProjection, key: StreamKey, after_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
-        const ss = self.streams.getPtr(key) orelse return 0;
-        const n = ss.readAfter(after_id, filter_partition, buf);
-        self.stats.reads += n;
-        return n;
+        return self.readStreamRange(key, after_id, StreamID.MAX, filter_partition, buf);
     }
 
-    /// Resolve specific StreamIDs back to records (preserves input order, skips
-    /// missing IDs).
+    /// The appends whose first ids are `ids`, in that order; one the stream
+    /// no longer holds, or never did, is skipped.
     pub fn readStreamByIds(self: *StreamProjection, key: StreamKey, ids: []const StreamID, buf: []StreamRecord) usize {
-        const ss = self.streams.getPtr(key) orelse return 0;
-        const n = ss.readByIds(ids, buf);
+        const m = self.metaOf(key) orelse return 0;
+        var n: usize = 0;
+        for (ids) |id| {
+            if (n >= buf.len) break;
+            const rec = sm.appendOf(self.read().?, key, m, id) orelse continue;
+            if (!rec.id.eql(id)) continue;
+            buf[n] = rec;
+            n += 1;
+        }
         self.stats.reads += n;
         return n;
     }
 
-    /// Get the last StreamID for a stream.
+    fn streams(self: *const StreamProjection) ?@import("../contract/streams.zig").Streams {
+        return .{ .read = self.read() orelse return null };
+    }
+
+    /// The stream's last record, or MIN when it holds none.
     pub fn streamLastId(self: *const StreamProjection, key: StreamKey) StreamID {
-        const ss = self.streams.getPtr(key) orelse return StreamID.MIN;
-        return ss.last_id;
+        return if (self.streams()) |s| s.last(key) else StreamID.MIN;
     }
 
-    /// Get the first StreamID for a stream.
+    /// The stream's first record, or MIN when it holds none.
     pub fn streamFirstId(self: *const StreamProjection, key: StreamKey) StreamID {
-        const ss = self.streams.getPtr(key) orelse return StreamID.MIN;
-        return ss.first_id;
+        return if (self.streams()) |s| s.first(key) else StreamID.MIN;
     }
 
-    /// The last record a trim removed from a stream (`StreamState.removed_through`).
+    /// The last record a trim cut (the floor), or MIN.
     pub fn streamRemovedThrough(self: *const StreamProjection, key: StreamKey) StreamID {
-        const ss = self.streams.getPtr(key) orelse return StreamID.MIN;
-        return ss.removed_through;
+        return if (self.streams()) |s| s.removedThrough(key) else StreamID.MIN;
     }
 
     /// The append holding a stream's record `id`, if it still does.
     pub fn streamAppendOf(self: *const StreamProjection, key: StreamKey, id: StreamID) ?StreamRecord {
-        const ss = self.streams.getPtr(key) orelse return null;
-        return ss.appendOf(id);
+        const m = self.metaOf(key) orelse return null;
+        return sm.appendOf(self.read().?, key, m, id);
     }
 
     /// The ids of a stream's records after `after_id`, one per record.
     pub fn streamIdsAfter(self: *const StreamProjection, key: StreamKey, after_id: StreamID, out: []StreamID) usize {
-        const ss = self.streams.getPtr(key) orelse return 0;
-        return ss.idsAfter(after_id, out);
+        return if (self.streams()) |s| s.idsAfter(key, after_id, out) else 0;
     }
 
-    /// Get the record count for a stream.
-    pub fn streamRecordCount(self: *const StreamProjection, key: StreamKey) usize {
-        const ss = self.streams.getPtr(key) orelse return 0;
-        return ss.count();
+    /// Whether the stream holds any record above its floor.
+    pub fn streamHolds(self: *const StreamProjection, key: StreamKey) bool {
+        return self.streamLogicalCount(key) > 0;
     }
 
-    /// Logical record count — sums each append batch's contents. This is the
-    /// number a user sees from `stream read`, and what `stream info` reports.
+    /// Logical record count above the floor, each append's contents counted:
+    /// what `stream read` returns and `stream info` reports.
     pub fn streamLogicalCount(self: *const StreamProjection, key: StreamKey) u64 {
-        const ss = self.streams.getPtr(key) orelse return 0;
-        return ss.logicalCount();
+        const m = self.metaOf(key) orelse return 0;
+        return sm.countAbove(self.read().?, key, m, sm.floorOf(m)).records;
     }
 
-    /// Stored size of a stream's live records, in bytes.
+    /// Stored size of a stream's records above its floor, in bytes.
     pub fn streamByteSize(self: *const StreamProjection, key: StreamKey) u64 {
-        const ss = self.streams.getPtr(key) orelse return 0;
-        return ss.byteSize();
+        const m = self.metaOf(key) orelse return 0;
+        return sm.countAbove(self.read().?, key, m, sm.floorOf(m)).bytes;
     }
 
-    /// Trim a stream — remove records with IDs <= up_to_id.
-    pub fn trimStream(self: *StreamProjection, key: StreamKey, up_to_id: StreamID) u64 {
-        const ss = self.streams.getPtr(key) orelse return 0;
-        const trimmed = ss.trim(self.allocator, up_to_id);
-        self.stats.trimmed += trimmed;
-        return trimmed;
+    /// The floor a trim to `up_to_id` would leave: the last record of the
+    /// last append whose first id is at or before it, never below today's.
+    fn floorAfterTrim(self: *const StreamProjection, key: StreamKey, m: sm.Meta.Value, up_to_id: StreamID) StreamID {
+        const floor = sm.floorOf(m);
+        const rec = sm.appendOf(self.read().?, key, m, up_to_id) orelse {
+            // No held append holds `up_to_id`: the last one before it.
+            var it = self.read().?.rangeBefore(sm.Records, &key, blk: {
+                var kb: [sm.RECORD_KEY_LEN]u8 = undefined;
+                break :blk sm.recordKey(&kb, key, up_to_id);
+            });
+            const item = (it.next() catch return floor) orelse return floor;
+            const last = lastRecordOf(sm.recordOf(item.key, item.value.v));
+            return if (last.greaterThan(floor)) last else floor;
+        };
+        const last = lastRecordOf(rec);
+        return if (last.greaterThan(floor)) last else floor;
     }
 
     /// The logical records a trim to `up_to_id` would remove, removing none.
     pub fn trimCount(self: *const StreamProjection, key: StreamKey, up_to_id: StreamID) u64 {
-        const ss = self.streams.getPtr(key) orelse return 0;
-        return ss.trimExtent(up_to_id).records;
+        const m = self.metaOf(key) orelse return 0;
+        const r = self.read().?;
+        const now = sm.countAbove(r, key, m, sm.floorOf(m)).records;
+        return now - sm.countAbove(r, key, m, self.floorAfterTrim(key, m, up_to_id)).records;
     }
 
     /// The first id left after a trim to `up_to_id`; MIN when none would be.
     pub fn firstIdAfterTrim(self: *const StreamProjection, key: StreamKey, up_to_id: StreamID) StreamID {
-        const ss = self.streams.getPtr(key) orelse return StreamID.MIN;
-        const cut = ss.trimExtent(up_to_id).entries;
-        if (cut >= ss.records.items.len) return StreamID.MIN;
-        return ss.records.items[cut].id;
+        const m = self.metaOf(key) orelse return StreamID.MIN;
+        var it = sm.Appends.init(self.read().?, key, m, self.floorAfterTrim(key, m, up_to_id));
+        return if (it.next()) |rec| rec.id else StreamID.MIN;
     }
 
-    /// Resolve the StreamID of the Nth record in a stream (1-indexed).
-    /// Used by trim-by-count to convert a count to a deterministic StreamID
-    /// before persisting through Raft.
+    /// The id a "keep the newest N" trim cuts through, for `count` records to
+    /// go (1-indexed): the last append boundary that drops no more than
+    /// `count`, so retention never deletes a record inside its window.
+    /// MIN when even the first append would overshoot. Walks the appends a
+    /// trim would cut: a leader's read, never an apply.
     pub fn resolveNthRecordId(self: *const StreamProjection, key: StreamKey, count: u64) StreamID {
-        const ss = self.streams.getPtr(key) orelse return StreamID.MIN;
-        const records = ss.records.items;
-        if (records.len == 0 or count == 0) return StreamID.MIN;
-        // `count` is in logical records, so walk batch contents rather than
-        // indexing entries — otherwise "keep N records" retention kept N
-        // *batches* (N×batch_size records) for batched producers.
-        //
-        // Trim is entry-granular, so `count` rarely lands on a boundary. Cut at
-        // the last boundary that drops NO MORE than `count` records: retention
-        // is a cap, and keeping a few extra beats deleting records still inside
-        // the window. Returns MIN (trim nothing) when even the first entry
-        // would overshoot.
+        var it = self.appends(key, StreamID.MIN) orelse return StreamID.MIN;
+        if (count == 0) return StreamID.MIN;
         var cum: u64 = 0;
         var cut = StreamID.MIN;
-        for (records) |rec| {
+        while (it.next()) |rec| {
             if (cum + rec.record_count > count) break;
             cum += rec.record_count;
-            cut = .{
-                .timestamp_ms = rec.id.timestamp_ms,
-                .sequence = rec.id.sequence + rec.record_count - 1,
-            };
+            cut = lastRecordOf(rec);
         }
         return cut;
     }
 
-    /// Delete a stream's records. Returns true if it held any state.
-    pub fn deleteStream(self: *StreamProjection, key: StreamKey) bool {
-        const kv = self.streams.fetchRemove(key) orelse return false;
-        var ss = kv.value;
-        ss.deinit(self.allocator);
-        return true;
-    }
-
+    /// Bytes the streams' records hold in the store.
     pub fn memoryUsage(self: *const StreamProjection) usize {
-        var mem: usize = @sizeOf(StreamProjection);
-
-        // Per-stream state
-        var sit = self.streams.iterator();
-        while (sit.next()) |kv| {
-            mem += kv.value_ptr.records.items.len * @sizeOf(StreamRecord);
-        }
-
-        return mem;
+        const st = self.store orelse return @sizeOf(StreamProjection);
+        return @sizeOf(StreamProjection) + st.family(sm.Records.ID).encoded_bytes;
     }
 };
 
@@ -820,346 +545,78 @@ pub const StreamProjection = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
-/// The stamp test appends take: ids from a fixed time, as replay's are.
-const TEST_MS: u64 = 1_700_000_000_000;
 
-/// A stream key for a test that names its stream by a number.
-fn testKey(n: u32) StreamKey {
-    return streamKey(.default, std.mem.asBytes(&n));
+fn sid(ms: u64, seq: u64) StreamID {
+    return .{ .timestamp_ms = ms, .sequence = seq };
 }
 
-test "stream: same-named streams in two namespaces share no state, even when their names' hashes are equal" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-    const one: NamespaceId = .of(16);
-    const two: NamespaceId = .of(17);
-    // Different names, their hashes forced equal: only the id that leads
-    // the key tells them apart.
+fn testProjection(t: *sm.TestStreams) StreamProjection {
+    return .{ .store = &t.store };
+}
+
+test "stream: same-named streams in two namespaces share no state, and a stream's hash names its key" {
+    const one: NamespaceId = .of(2);
+    const two: NamespaceId = .of(3);
     const a = streamKey(one, "orders");
-    var b = streamKey(two, "other");
-    b[4..12].* = a[4..12].*;
+    const b = streamKey(two, "orders");
     try testing.expect(!std.mem.eql(u8, &a, &b));
-
-    _ = try s.appendToStreamAt(a, 1, 0, 0, TEST_MS, 3, 30);
-    _ = try s.appendToStreamAt(b, 2, 0, 0, TEST_MS, 1, 10);
-    try testing.expectEqual(@as(u64, 3), s.streamLogicalCount(a));
-    try testing.expectEqual(@as(u64, 1), s.streamLogicalCount(b));
-
-    // Deleting one namespace's stream leaves the other's records.
-    try testing.expect(s.deleteStream(a));
-    try testing.expectEqual(@as(u64, 1), s.streamLogicalCount(b));
+    try testing.expectEqualSlices(u8, a[4..12], b[4..12]);
 }
 
-test "stream: stats tracking" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(42);
-    _ = try s.appendToStreamAt(hash, 100, 0, 0, TEST_MS, 1, 0);
-    _ = try s.appendToStreamAt(hash, 101, 0, 0, TEST_MS, 1, 0);
-    try testing.expectEqual(@as(u64, 2), s.stats.appended);
+test "stream: reads go by the stream's appends above its floor, a range whole appends at or before its end, by ids exactly" {
+    var t = sm.TestStreams.init();
+    defer t.deinit();
+    var p = testProjection(&t);
+    const k = sm.TestStreams.sk("s");
+    _ = try t.append("s", 100, 3, 4);
+    _ = try t.append("s", 101, 2, 4);
+    _ = try t.append("s", 102, 1, 4);
+    var buf: [8]StreamRecord = undefined;
+    try testing.expectEqual(@as(usize, 3), p.readStreamAfter(k, StreamID.MIN, null, &buf));
+    // A cursor inside the first append resumes in it.
+    try testing.expectEqual(@as(usize, 3), p.readStreamAfter(k, sid(100, 1), null, &buf));
+    try testing.expectEqual(@as(usize, 2), p.readStreamAfter(k, sid(100, 2), null, &buf));
+    try testing.expectEqual(@as(usize, 2), p.readStreamRange(k, StreamID.MIN, sid(101, 0), null, &buf));
+    const ids = [_]StreamID{ sid(102, 0), sid(100, 1), sid(100, 0) };
+    try testing.expectEqual(@as(usize, 2), p.readStreamByIds(k, &ids, &buf));
+    try testing.expect(buf[0].id.eql(sid(102, 0)) and buf[1].id.eql(sid(100, 0)));
+    try testing.expectEqual(@as(u64, 6), p.streamLogicalCount(k));
+    try testing.expectEqual(@as(u64, 72), p.streamByteSize(k));
+    // A trim through the first append: it reads as gone at once.
+    _ = try t.trim("s", .{ .id = sid(100, 0) });
+    try testing.expectEqual(@as(usize, 2), p.readStreamAfter(k, StreamID.MIN, null, &buf));
+    try testing.expectEqual(@as(usize, 0), p.readStreamByIds(k, ids[2..], &buf));
+    try testing.expectEqual(@as(u64, 3), p.streamLogicalCount(k));
+    try testing.expect(p.streamFirstId(k).eql(sid(101, 0)));
+    try testing.expect(p.streamLastId(k).eql(sid(102, 0)));
 }
 
-test "stream: memory usage estimate" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    _ = try s.appendToStreamAt(testKey(42), 100, 0, 0, TEST_MS, 1, 0);
-
-    try testing.expect(s.memoryUsage() > 0);
+test "stream: a trim's count and the first id it leaves are predicted without trimming, by records not appends" {
+    var t = sm.TestStreams.init();
+    defer t.deinit();
+    var p = testProjection(&t);
+    const k = sm.TestStreams.sk("s");
+    _ = try t.append("s", 100, 3, 4);
+    _ = try t.append("s", 101, 2, 4);
+    try testing.expectEqual(@as(u64, 3), p.trimCount(k, sid(100, 1)));
+    try testing.expect(p.firstIdAfterTrim(k, sid(100, 1)).eql(sid(101, 0)));
+    try testing.expectEqual(@as(u64, 5), p.trimCount(k, sid(101, 0)));
+    try testing.expect(p.firstIdAfterTrim(k, sid(101, 0)).eql(StreamID.MIN));
+    try testing.expectEqual(@as(u64, 0), p.trimCount(k, sid(99, 0)));
+    try testing.expectEqual(@as(u64, 5), p.streamLogicalCount(k));
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// StreamState Tests
-// ═══════════════════════════════════════════════════════════════════════════════
-
-test "stream: StreamState append and read" {
-    var ss = StreamState.init(testKey(42));
-    defer ss.deinit(testing.allocator);
-
-    const id1 = try ss.appendAt(testing.allocator, 100, 0, 0, TEST_MS, 1, 0);
-    const id2 = try ss.appendAt(testing.allocator, 101, 0, 0, TEST_MS, 1, 0);
-    const id3 = try ss.appendAt(testing.allocator, 102, 0, 1, TEST_MS, 1, 0);
-
-    try testing.expectEqual(@as(usize, 3), ss.count());
-    try testing.expect(ss.first_id.eql(id1));
-    try testing.expect(ss.last_id.eql(id3));
-
-    // readRange: all records
-    var buf: [10]StreamRecord = undefined;
-    const n = ss.readRange(StreamID.MIN, StreamID.MAX, null, &buf);
-    try testing.expectEqual(@as(usize, 3), n);
-
-    // readRange: filtered by partition
-    const n2 = ss.readRange(StreamID.MIN, StreamID.MAX, 1, &buf);
-    try testing.expectEqual(@as(usize, 1), n2);
-    try testing.expectEqual(@as(u64, 102), buf[0].ual_index);
-
-    // readAfter
-    const n3 = ss.readAfter(id1, null, &buf);
-    try testing.expectEqual(@as(usize, 2), n3);
-    try testing.expect(buf[0].id.eql(id2));
-}
-
-test "stream: StreamState readByIds preserves order and skips missing" {
-    var ss = StreamState.init(testKey(42));
-    defer ss.deinit(testing.allocator);
-
-    const id1 = try ss.appendAt(testing.allocator, 100, 0, 0, TEST_MS, 1, 0);
-    const id2 = try ss.appendAt(testing.allocator, 101, 0, 0, TEST_MS, 1, 0);
-    const id3 = try ss.appendAt(testing.allocator, 102, 0, 0, TEST_MS, 1, 0);
-    const id4 = try ss.appendAt(testing.allocator, 103, 0, 0, TEST_MS, 1, 0);
-
-    // Sparse query: id3, id1 (out-of-order), id4 — should preserve input order
-    const query = [_]StreamID{ id3, id1, id4 };
-    var buf: [10]StreamRecord = undefined;
-    const n = ss.readByIds(&query, &buf);
-    try testing.expectEqual(@as(usize, 3), n);
-    try testing.expect(buf[0].id.eql(id3));
-    try testing.expect(buf[1].id.eql(id1));
-    try testing.expect(buf[2].id.eql(id4));
-
-    // Missing IDs are silently skipped
-    const fake = StreamID{ .timestamp_ms = 999_999_999, .sequence = 999 };
-    const query2 = [_]StreamID{ id2, fake, id3 };
-    const n2 = ss.readByIds(&query2, &buf);
-    try testing.expectEqual(@as(usize, 2), n2);
-    try testing.expect(buf[0].id.eql(id2));
-    try testing.expect(buf[1].id.eql(id3));
-
-    // Empty input
-    const empty: []const StreamID = &.{};
-    try testing.expectEqual(@as(usize, 0), ss.readByIds(empty, &buf));
-
-    // Buffer cap honored
-    const all = [_]StreamID{ id1, id2, id3, id4 };
-    var small: [2]StreamRecord = undefined;
-    try testing.expectEqual(@as(usize, 2), ss.readByIds(&all, &small));
-}
-
-test "stream: StreamState trim" {
-    var ss = StreamState.init(testKey(42));
-    defer ss.deinit(testing.allocator);
-
-    const id1 = try ss.appendAt(testing.allocator, 100, 0, 0, TEST_MS, 1, 0);
-    const id2 = try ss.appendAt(testing.allocator, 101, 0, 0, TEST_MS, 1, 0);
-    _ = try ss.appendAt(testing.allocator, 102, 0, 0, TEST_MS, 1, 0);
-
-    const trimmed = ss.trim(testing.allocator, id2);
-    try testing.expectEqual(@as(u64, 2), trimmed);
-    try testing.expectEqual(@as(usize, 1), ss.count());
-    try testing.expect(!ss.first_id.eql(id1));
-    try testing.expect(!ss.first_id.eql(id2));
-}
-
-test "stream: appendToStreamAt creates stream and returns StreamID" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(12345);
-    const id1 = try s.appendToStreamAt(hash, 100, 0, 0, TEST_MS, 1, 0);
-    const id2 = try s.appendToStreamAt(hash, 101, 0, 0, TEST_MS, 1, 0);
-
-    // StreamIDs are monotonically increasing
-    try testing.expect(id2.greaterThan(id1));
-
-    // Per-stream state recorded
-    try testing.expectEqual(@as(usize, 2), s.streamRecordCount(hash));
-    try testing.expect(s.streamFirstId(hash).eql(id1));
-    try testing.expect(s.streamLastId(hash).eql(id2));
-}
-
-test "stream: the next append in the same millisecond is past a cursor at the previous one" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(7);
-    const first = try s.appendToStreamAt(hash, 1, 0, 0, 1_000, 1, 0);
-    const second = try s.appendToStreamAt(hash, 2, 0, 0, 1_000, 1, 0);
-    try testing.expectEqual(first.timestamp_ms, second.timestamp_ms);
-
-    var buf: [4]StreamRecord = undefined;
-    try testing.expectEqual(@as(usize, 1), s.readStreamAfter(hash, first, null, &buf));
-    try testing.expect(buf[0].id.eql(second));
-    try testing.expectEqual(@as(usize, 1), s.readStreamRange(hash, first, StreamID.MAX, null, &buf));
-    try testing.expect(buf[0].id.eql(second));
-}
-
-test "stream: readStreamRange and readStreamAfter" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(42);
-    const id1 = try s.appendToStreamAt(hash, 100, 0, 0, TEST_MS, 1, 0);
-    _ = try s.appendToStreamAt(hash, 101, 0, 0, TEST_MS, 1, 0);
-    const id3 = try s.appendToStreamAt(hash, 102, 0, 1, TEST_MS, 1, 0);
-
-    // readStreamRange: all
-    var buf: [10]StreamRecord = undefined;
-    const n = s.readStreamRange(hash, StreamID.MIN, StreamID.MAX, null, &buf);
-    try testing.expectEqual(@as(usize, 3), n);
-
-    // readStreamRange: filtered by partition 1
-    const n2 = s.readStreamRange(hash, StreamID.MIN, StreamID.MAX, 1, &buf);
-    try testing.expectEqual(@as(usize, 1), n2);
-    try testing.expect(buf[0].id.eql(id3));
-
-    // readStreamAfter
-    const n3 = s.readStreamAfter(hash, id1, null, &buf);
-    try testing.expectEqual(@as(usize, 2), n3);
-
-    // Non-existent stream returns 0
-    const n4 = s.readStreamRange(testKey(999), StreamID.MIN, StreamID.MAX, null, &buf);
-    try testing.expectEqual(@as(usize, 0), n4);
-}
-
-test "stream: trimStream" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(42);
-    _ = try s.appendToStreamAt(hash, 100, 0, 0, TEST_MS, 1, 0);
-    const id2 = try s.appendToStreamAt(hash, 101, 0, 0, TEST_MS, 1, 0);
-    _ = try s.appendToStreamAt(hash, 102, 0, 0, TEST_MS, 1, 0);
-
-    const trimmed = s.trimStream(hash, id2);
-    try testing.expectEqual(@as(u64, 2), trimmed);
-    try testing.expectEqual(@as(usize, 1), s.streamRecordCount(hash));
-}
-
-test "stream: multiple streams are independent" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash_a = testKey(1);
-    const hash_b = testKey(2);
-
-    const a1 = try s.appendToStreamAt(hash_a, 100, 0, 0, TEST_MS, 1, 0);
-    const a2 = try s.appendToStreamAt(hash_a, 101, 0, 0, TEST_MS, 1, 0);
-    _ = try s.appendToStreamAt(hash_b, 200, 0, 0, TEST_MS, 1, 0);
-
-    try testing.expectEqual(@as(usize, 2), s.streamRecordCount(hash_a));
-    try testing.expectEqual(@as(usize, 1), s.streamRecordCount(hash_b));
-
-    // Reading stream A returns only A's records
-    var buf: [10]StreamRecord = undefined;
-    const n = s.readStreamAfter(hash_a, a1, null, &buf);
-    try testing.expectEqual(@as(usize, 1), n);
-    try testing.expect(buf[0].id.eql(a2));
-}
-
-test "stream: batch append reserves one sequence per record" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(42);
-    const ts: u64 = 1_700_000_000_000;
-
-    // A 3-record batch, then a single record in the SAME millisecond.
-    const first = try s.appendToStreamAt(hash, 10, 0, 0, ts, 3, 25);
-    const next = try s.appendToStreamAt(hash, 11, 0, 0, ts, 1, 9);
-
-    // Reads expand the batch across sequences 0,1,2, so the following append
-    // must start at 3. Reserving one sequence per batch would hand out
-    // sequence 1 twice — duplicate StreamIDs within a single millisecond.
-    try testing.expectEqual(@as(u64, 0), first.sequence);
-    try testing.expectEqual(@as(u64, 3), next.sequence);
-    try testing.expect(next.greaterThan(.{ .timestamp_ms = ts, .sequence = first.sequence + 2 }));
-}
-
-test "stream: info counts logical records and bytes, not entries" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(43);
-    const ts: u64 = 1_700_000_000_000;
-
-    _ = try s.appendToStreamAt(hash, 10, 0, 0, ts, 3, 25);
-    _ = try s.appendToStreamAt(hash, 11, 0, 0, ts + 1, 2, 14);
-
-    // Two append entries carrying five records between them.
-    try testing.expectEqual(@as(usize, 2), s.streamRecordCount(hash));
-    try testing.expectEqual(@as(u64, 5), s.streamLogicalCount(hash));
-    try testing.expectEqual(@as(u64, 39), s.streamByteSize(hash));
-
-    // The last ID is the batch's last record, not its first.
-    try testing.expectEqual(@as(u64, 1), s.streamLastId(hash).sequence);
-    try testing.expectEqual(@as(u64, ts + 1), s.streamLastId(hash).timestamp_ms);
-}
-
-test "stream: trim decrements logical counters" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(44);
-    const ts: u64 = 1_700_000_000_000;
-
-    const b1 = try s.appendToStreamAt(hash, 10, 0, 0, ts, 3, 25);
-    _ = try s.appendToStreamAt(hash, 11, 0, 0, ts + 1, 2, 14);
-
-    // Trim through the first batch's last record.
-    _ = s.trimStream(hash, .{ .timestamp_ms = ts, .sequence = b1.sequence + 2 });
-
-    try testing.expectEqual(@as(u64, 2), s.streamLogicalCount(hash));
-    try testing.expectEqual(@as(u64, 14), s.streamByteSize(hash));
-
-    // Trimming everything zeroes both counters.
-    _ = s.trimStream(hash, .{ .timestamp_ms = ts + 1, .sequence = 1 });
-    try testing.expectEqual(@as(u64, 0), s.streamLogicalCount(hash));
-    try testing.expectEqual(@as(u64, 0), s.streamByteSize(hash));
-}
-
-test "stream: count retention resolves by records, not batches" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(45);
-    const ts: u64 = 1_700_000_000_000;
-
-    _ = try s.appendToStreamAt(hash, 10, 0, 0, ts, 3, 25);
-    _ = try s.appendToStreamAt(hash, 11, 0, 0, ts + 1, 3, 25);
-    _ = try s.appendToStreamAt(hash, 12, 0, 0, ts + 2, 3, 25);
-
-    // Nine records across three batches. Dropping "the oldest four" can only
-    // cut on an entry boundary, so it cuts after the first batch (3 records) —
-    // never past it, which would delete records still inside the window.
-    const cut = s.resolveNthRecordId(hash, 4);
-    try testing.expectEqual(@as(u64, ts), cut.timestamp_ms);
-    try testing.expectEqual(@as(u64, 2), cut.sequence);
-
-    _ = s.trimStream(hash, cut);
-    try testing.expectEqual(@as(u64, 6), s.streamLogicalCount(hash));
-
-    // Indexing entries instead of records would have cut at entry 4 — past the
-    // end — and dropped all nine.
-    try testing.expect(s.streamLogicalCount(hash) > 0);
-
-    // A budget smaller than the first batch trims nothing at all.
-    try testing.expect(s.resolveNthRecordId(hash, 1).eql(StreamID.MIN));
-}
-
-test "stream: trimCount predicts trim in records, not batches" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(45);
-    const ts: u64 = 1_700_000_000_000;
-
-    const b1 = try s.appendToStreamAt(hash, 10, 0, 0, ts, 3, 25);
-    const b2 = try s.appendToStreamAt(hash, 11, 0, 0, ts + 1, 2, 14);
-    _ = try s.appendToStreamAt(hash, 12, 0, 0, ts + 2, 4, 30);
-
-    const through: StreamID = .{ .timestamp_ms = ts + 1, .sequence = b2.sequence + 1 };
-    try testing.expectEqual(@as(u64, 5), s.trimCount(hash, through));
-    const left = s.firstIdAfterTrim(hash, through);
-    try testing.expectEqual(@as(u64, 9), s.streamLogicalCount(hash));
-
-    try testing.expectEqual(@as(u64, 5), s.trimStream(hash, through));
-    try testing.expect(s.streamFirstId(hash).eql(left));
-    try testing.expectEqual(@as(u64, 4), s.streamLogicalCount(hash));
-
-    // A boundary before every record removes nothing.
-    try testing.expectEqual(@as(u64, 0), s.trimCount(hash, .{ .timestamp_ms = b1.timestamp_ms - 1, .sequence = 0 }));
+test "stream: count retention resolves by records, not appends, and never cuts inside its window" {
+    var t = sm.TestStreams.init();
+    defer t.deinit();
+    var p = testProjection(&t);
+    const k = sm.TestStreams.sk("s");
+    for (0..4) |i| _ = try t.append("s", 100 + i, 3, 4);
+    // Keep 6 of 12: 6 go, exactly two appends.
+    try testing.expect(p.resolveNthRecordId(k, 6).eql(sid(101, 2)));
+    // 5 to go: one append (3); a second would overshoot.
+    try testing.expect(p.resolveNthRecordId(k, 5).eql(sid(100, 2)));
+    try testing.expect(p.resolveNthRecordId(k, 2).eql(StreamID.MIN));
 }
 
 fn testBatch(buf: []u8, payloads: []const []const u8) []const u8 {

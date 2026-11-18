@@ -9,7 +9,6 @@ const entry_mod = @import("../storage/ual/entry.zig");
 const persistence = @import("../storage/persistence.zig");
 const store_mod = @import("store.zig");
 const view_mod = @import("view.zig");
-const Streams = @import("streams.zig").Streams;
 const channels = @import("channels.zig");
 
 const EntryType = entry_mod.EntryType;
@@ -59,6 +58,10 @@ pub const Machine = struct {
     /// The target's name for an operator, from one entry that writes it
     /// ("queue orders"), into `buf`.
     label: ?*const fn (e: *const Entry, buf: []u8) []const u8 = null,
+    /// Why an entry's payload can't apply, for one a channel may carry: a
+    /// message that fails it was built wrong by its sender, refused before
+    /// its machine sees it and counted as the sender's (`channels.zig`).
+    malformed: ?*const fn (e: *const Entry) ?[]const u8 = null,
     /// The namespace id an entry's payload names, for one whose applier
     /// can't take an id no namespace could have: a channel message naming
     /// one is refused before its machine sees it (`channels.zig`).
@@ -117,11 +120,11 @@ pub fn check(comptime machines: []const Machine) void {
 /// group sent, applied inside an inbound.
 pub const ObservedFrom = enum { entry, message };
 
-pub fn observeAll(comptime machines: []const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, streams: ?Streams, e: *const Entry, from: ObservedFrom) ApplyError!void {
+pub fn observeAll(comptime machines: []const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, e: *const Entry, from: ObservedFrom) ApplyError!void {
     const etype: EntryType = @fromBackingInt(@intCast(e.header.entry_type));
     inline for (machines) |*m| {
         for (m.observes) |t| if (t == etype) {
-            try observeEntry(m, store, scratch, streams, e, from);
+            try observeEntry(m, store, scratch, e, from);
             break;
         };
     }
@@ -134,14 +137,13 @@ pub fn observeAll(comptime machines: []const Machine, store: *store_mod.Store, s
 /// An observer sends only on observing an edge entry (a client's write or a
 /// leader's own proposal), never a message it applied, so an observed entry
 /// can't start a chain of sends.
-pub fn observeEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, streams: ?Streams, e: *const Entry, from: ObservedFrom) ApplyError!void {
+pub fn observeEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, e: *const Entry, from: ObservedFrom) ApplyError!void {
     if (m.observe_needed) |needed| if (!needed(.{ .store = store }, e)) return;
     _ = scratch.reset(.retain_capacity);
     const arena = scratch.allocator();
     var keys = view_mod.KeySet.init(arena);
     try m.observe_keys.?(e, &keys);
     var view = view_mod.View.init(store, arena, &keys);
-    view.streams_read = streams;
     try m.observe.?(&view, e);
     for (view.ops.items) |op| if (!ownsFamily(m, op.fam)) return error.Halt;
     if (view.sends.items.len > 0) {
@@ -180,17 +182,11 @@ pub fn families(comptime machines: []const Machine) []const FamilyInfo {
 /// unless it was refused or failed. `scratch` holds the entry's staged
 /// bytes and is reset first.
 pub fn applyEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, e: *const Entry, out: *persistence.Result) ApplyError!void {
-    return applyEntryWith(m, store, scratch, null, e, out);
-}
-
-/// `applyEntry`, with the shard's streams readable through the view.
-pub fn applyEntryWith(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, streams: ?Streams, e: *const Entry, out: *persistence.Result) ApplyError!void {
     _ = scratch.reset(.retain_capacity);
     const arena = scratch.allocator();
     var keys = view_mod.KeySet.init(arena);
     try m.keys(e, &keys);
     var view = view_mod.View.init(store, arena, &keys);
-    view.streams_read = streams;
     try m.apply(&view, e, out);
     if (out.refused() != null) return;
     // What it sends leaves with its writes: the outbox is written in the

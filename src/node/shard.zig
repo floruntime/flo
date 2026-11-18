@@ -1045,7 +1045,6 @@ pub const Shard = struct {
         workflow_handler.registerReplay(&replay_registry);
         namespace_handler.registerReplay(&replay_registry);
         processing_handler.registerReplay(&replay_registry);
-        stream_handler.registerReplay(&replay_registry);
         replay_registry.register(.action_abandon, @ptrCast(actions_handler), ActionsHandler.applyAbandonMessage);
         try checkAppliers(shard_id, &replay_registry);
 
@@ -6922,7 +6921,7 @@ pub const Shard = struct {
         if (self.raft_node.role != .leader) return 0;
         const proj = self.stream_handler.stream;
         const read: view_mod.ReadView = .{ .store = &self.defaultPartition().store };
-        if (self.heldIfHalted(.stream_retention, self.halted != null and anyRetention(read))) return 0;
+        if (self.heldIfHalted(.stream_retention, self.halted != null and (anyRetention(read) or anyReclaim(read)))) return 0;
         self.duties.note(.stream_retention, null, nowMs());
         const now_ns = self.raft_node.now();
         var trims_proposed: u64 = 0;
@@ -6963,11 +6962,41 @@ pub const Shard = struct {
             }
         }
 
+        // Streams a trim left holding appends at or below their floor: a
+        // trim to the floor cuts nothing more and removes the next
+        // `MAX_TRIM_APPENDS`, so propose as many as it takes to clear what
+        // is left, up to `MAX_DRAIN_TRIMS` a pass. Whether a stream has a
+        // retention policy doesn't matter: a client's trim marks it too.
+        var marked = read.range(stream_machine.Reclaim, "");
+        while (marked.next() catch null) |item| {
+            if (item.key.len != @sizeOf(stream_mod.StreamKey)) continue;
+            const key: stream_mod.StreamKey = item.key[0..@sizeOf(stream_mod.StreamKey)].*;
+            const found = read.get(stream_machine.Metas, &key) catch continue;
+            const meta = (found orelse continue).v;
+            if (!meta.exists) continue;
+            const floor = stream_machine.floorOf(meta);
+            const held = stream_machine.heldThrough(read, key, floor, MAX_DRAIN_TRIMS * stream_machine.MAX_TRIM_APPENDS);
+            const trims = (held + stream_machine.MAX_TRIM_APPENDS - 1) / stream_machine.MAX_TRIM_APPENDS;
+            for (0..trims) |_| {
+                if (!self.stream_handler.persistTrim(key, .{ .id = floor })) break;
+                trims_proposed += 1;
+            }
+        }
+
         return trims_proposed;
     }
 
+    /// The most trims to a floor one retention pass proposes for a stream:
+    /// a pass every 10 s clears up to 8 × 1024 appends a trim left behind.
+    const MAX_DRAIN_TRIMS: usize = 8;
+
     fn anyRetention(read: view_mod.ReadView) bool {
         var it = read.range(stream_machine.Retained, "");
+        return (it.next() catch null) != null;
+    }
+
+    fn anyReclaim(read: view_mod.ReadView) bool {
+        var it = read.range(stream_machine.Reclaim, "");
         return (it.next() catch null) != null;
     }
 
@@ -8863,30 +8892,24 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
         // The router has seen every index up to its own: one at or below it
         // was applied already, and must not be twice.
         if (applied.route == .skipped_already_applied) return .applied;
-        contract_machine.applyEntryWith(m, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, entry, out) catch |err| return .{ .applier_failed = err };
+        contract_machine.applyEntry(m, &partition.store, &partition.apply_scratch, entry, out) catch |err| return .{ .applier_failed = err };
         if (etype == .channel_inbound or etype == .channel_unpark) for (partition.store.messages.items) |*msg| {
             // A refused message took no effect: its bytes, maybe a sender's
             // garbage, name no namespace this shard holds.
             if (msg.result.refused() == null) noteNamespace(partition, &msg.entry);
             if (!msg.after_commit) continue;
-            // A stream append a message carries: its record lives in this
-            // inbound, at the message's part (`StreamRecord.part`). It
-            // lands after every message the view applied, whatever their
-            // seqs (`ChannelsWith`); `afterApply` runs over them all after.
-            partition.stream.applying_part = stream_mod.partOf(msg.ordinal);
-            defer partition.stream.applying_part = 0;
             const had = registry.dispatch(&msg.entry, &msg.result) catch |err| return .{ .applier_failed = err };
             if (!had) return .no_applier;
             // Followed as the same entry applied alone would be.
-            if (msg.result.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, &msg.entry, .message) catch |err| return .{ .applier_failed = err };
+            if (msg.result.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, &msg.entry, .message) catch |err| return .{ .applier_failed = err };
         };
         return .applied;
     }
     const had = registry.dispatch(entry, out) catch |err| return .{ .applier_failed = err };
     if (!had) return if (listed(&APPLIES_NOTHING, etype)) .applied else .no_applier;
-    // The machines that follow this entry (groups, a trim of their stream),
-    // after its owner, unless the owner refused it.
-    if (out.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, entry, .entry) catch |err| return .{ .applier_failed = err };
+    // The machines that follow this entry (a removed job's sinks, a child's
+    // parent), after its owner, unless the owner refused it.
+    if (out.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, entry, .entry) catch |err| return .{ .applier_failed = err };
     return .applied;
 }
 
@@ -13016,7 +13039,7 @@ test "Shard: stream.group.members answers the named group's members by id, and a
     // the stream. Its members are the consumers holding its records.
     for (&f.two.shards) |*s| {
         const p = s.defaultPartition();
-        for (0..4) |i| _ = try p.stream.appendToStreamAt(stream_mod.streamKey(.default, "s"), i + 1, 0, 0, 1, 1, 10);
+        for (0..4) |i| try testStreamAppend(p, "s", i + 1, 1, 1);
         // Delivered out of order; listed by id.
         for ([_][]const u8{ "c-9", "c-1", "c-5", "c-3" }, 0..) |id, i| {
             var pb: [ge_mod.Deliver.max_size]u8 = undefined;
@@ -13024,7 +13047,7 @@ test "Shard: stream.group.members answers the named group's members by id, and a
             const e = entry_mod.buildEntry(.group_deliver, entry_mod.Flags.NONE, 1, 100 + i, 2_000_000, body);
             var out: persistence_mod.Result = .{};
             out.reset(&e);
-            try contract_machine.applyEntryWith(&@import("../stream/group_machine.zig").machine, &p.store, &p.apply_scratch, .{ .proj = &p.stream }, &e, &out);
+            try contract_machine.applyEntry(&@import("../stream/group_machine.zig").machine, &p.store, &p.apply_scratch, &e, &out);
             try std.testing.expect(out.refused() == null);
         }
     }
@@ -17282,8 +17305,8 @@ fn parkAnswersFromOwnEntry(apart: bool) !void {
         }
     };
     Seen.id = null;
-    const v = try stream_mod.encodeAppendValue(std.testing.allocator, 0, "a");
-    defer std.testing.allocator.free(v);
+    var vb: [64]u8 = undefined;
+    const v = stream_mod.appendValueOf(&vb, 1, 1);
     const first = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
     if (apart) @import("stdx").time.sleep(2 * std.time.ns_per_ms);
     _ = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
@@ -18172,12 +18195,12 @@ test "every entry type has exactly one applier, or is listed as needing none, or
 
     // One of them missing: dropped at apply, so refused at boot.
     var missing = full;
-    missing.callbacks[@backingInt(entry_mod.EntryType.stream_trim)] = null;
+    missing.callbacks[@backingInt(entry_mod.EntryType.workflow_create)] = null;
     try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliers(0, &missing));
 
     // Registered twice: one handler's applier would never run.
     var twice = full;
-    twice.register(.stream_trim, @ptrCast(&ctx), Noop.apply);
+    twice.register(.workflow_create, @ptrCast(&ctx), Noop.apply);
     try std.testing.expectError(error.EntryTypeRegisteredTwice, checkAppliers(0, &twice));
 
     // A router-owned type with a callback as well: applied twice.
@@ -18675,7 +18698,7 @@ test "Shard: a stream delete proposed behind an append not yet applied is refuse
     try CondTest.expectConflict(refused, .unclassified);
     try std.testing.expectEqualStrings(@import("../stream/handler.zig").StreamHandler.NOT_EMPTY_MESSAGE, (try refused.refused()).message);
     const name_hash = stream_mod.streamKey(.default, "s");
-    try std.testing.expectEqual(@as(usize, 1), c.t.shard.defaultPartition().stream.streamRecordCount(name_hash));
+    try std.testing.expectEqual(@as(u64, 1), c.t.shard.defaultPartition().stream.streamLogicalCount(name_hash));
 
     // Forced, it goes whatever the stream holds.
     var ob: [8]u8 = undefined;
@@ -18684,7 +18707,7 @@ test "Shard: a stream delete proposed behind an append not yet applied is refuse
     c.t.shard.runRequest(c.other, try ParkTest.request(.stream_delete, 3, proto.DEFAULT_NAMESPACE, "s", "", options.getOptions()), .client);
     try ParkTest.ack(&c.t.shard);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.otherAnswer()).header.status);
-    try std.testing.expectEqual(@as(usize, 0), c.t.shard.defaultPartition().stream.streamRecordCount(name_hash));
+    try std.testing.expectEqual(@as(u64, 0), c.t.shard.defaultPartition().stream.streamLogicalCount(name_hash));
 }
 
 test "Shard: a run a new leader hasn't seen finish: a cancel is refused, then told it finished" {
@@ -22354,6 +22377,17 @@ test "Shard: a list page whose scan couldn't hold its names is refused, not cut 
     try std.testing.expect(!dispatcher_mod.takeScanShort());
 }
 
+/// An append of `count` records to the default namespace's stream `name`,
+/// at log index `index` and `ms`, applied through the streams machine.
+fn testStreamAppend(p: *Partition, name: []const u8, index: u64, ms: u64, count: u32) !void {
+    var vb: [512]u8 = undefined;
+    var pb: [1024]u8 = undefined;
+    const e = entry_mod.buildCommandEntry(.stream_append, entry_mod.Flags.NONE, 1, index, ms * std.time.ns_per_ms, .default, name, stream_mod.appendValueOf(&vb, count, 4), &pb).?;
+    var out = persistence_mod.Result.start(&e);
+    try contract_machine.applyEntry(&stream_machine.machine, &p.store, &p.apply_scratch, &e, &out);
+    try std.testing.expect(out.refused() == null);
+}
+
 /// The default namespace's stream `name` created with this retention, as
 /// an applied `stream_config` leaves it.
 fn streamSettings(shard: *Shard, name: []const u8, age_s: u64, count: u64) !void {
@@ -22405,12 +22439,43 @@ test "a stream's retention age counts in seconds when the sweeper trims by it" {
     const h = stream_mod.streamKey(.default, "aged");
     try streamSettings(&shard, "aged", 5, 0);
     const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
-    _ = try stream.appendToStreamAt(h, 1, 0, 0, now_ms - 10_000, 1, 10);
-    _ = try stream.appendToStreamAt(h, 2, 0, 0, now_ms - 1_000, 1, 10);
+    try testStreamAppend(shard.defaultPartition(), "aged", 1, now_ms - 10_000, 1);
+    try testStreamAppend(shard.defaultPartition(), "aged", 2, now_ms - 1_000, 1);
     // Older than 5 seconds: the 10 s old record goes, the 1 s old one stays.
     try std.testing.expectEqual(@as(u64, 1), Shard.streamRetentionTask(@ptrCast(&shard)));
     try std.testing.expect(shard.applyCommitted());
     try std.testing.expectEqual(@as(u64, 1), stream.streamLogicalCount(h));
+}
+
+test "Shard: the retention duty removes the appends a trim left below the floor, whether or not the stream has a policy" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+
+    const n = 3 * stream_machine.MAX_TRIM_APPENDS;
+    const p = shard.defaultPartition();
+    for (0..n) |i| try testStreamAppend(p, "big", i + 1, 1000 + i, 1);
+    const key = stream_mod.streamKey(.default, "big");
+    // A client's trim of every append but the last: whole at once, with
+    // the most it may remove removed and the stream marked for the rest.
+    try std.testing.expect(shard.stream_handler.persistTrim(key, .{ .id = .{ .timestamp_ms = 1000 + n - 2, .sequence = 0 } }));
+    try std.testing.expect(shard.applyCommitted());
+    const read: view_mod.ReadView = .{ .store = &p.store };
+    const floor = stream_machine.floorOf((try read.get(stream_machine.Metas, &key)).?.v);
+    try std.testing.expectEqual(n - 1 - stream_machine.MAX_TRIM_APPENDS, stream_machine.heldThrough(read, key, floor, n));
+    try std.testing.expect((try read.get(stream_machine.Reclaim, &key)) != null);
+    // One pass proposes the trims to the floor that clear the rest.
+    try std.testing.expectEqual(@as(u64, 2), Shard.streamRetentionTask(@ptrCast(&shard)));
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expectEqual(@as(usize, 0), stream_machine.heldThrough(read, key, floor, n));
+    try std.testing.expect((try read.get(stream_machine.Reclaim, &key)) == null);
+    try std.testing.expectEqual(@as(u64, 1), shard.stream_handler.stream.streamLogicalCount(key));
+    // Nothing is left to propose.
+    try std.testing.expectEqual(@as(u64, 0), Shard.streamRetentionTask(@ptrCast(&shard)));
 }
 
 // ── Silent loss and damage ──────────────────────────────────────────────
@@ -23510,9 +23575,8 @@ test "a halted shard's duties stop, and one with work counts as held until the s
     try std.testing.expectEqual(@as(u32, 0), shard.duties.held());
 
     // A stream past its retention: no trim while halted.
-    const h = stream_mod.streamKey(.default, "kept");
     try streamSettings(&shard, "kept", 0, 1);
-    for (1..4) |i| _ = try shard.stream_handler.stream.appendToStreamAt(h, i, 0, 0, 1, 1, 1);
+    for (1..4) |i| try testStreamAppend(shard.defaultPartition(), "kept", i, 1, 1);
     shard.halted = .{ .index = 1, .term = 1, .crc = 0 };
     try std.testing.expectEqual(@as(u64, 0), Shard.streamRetentionTask(@ptrCast(&shard)));
     try std.testing.expectEqual(@as(u32, 1), shard.duties.held());
@@ -25443,7 +25507,7 @@ test "checkAppliers: a type a contract machine owns may have no other applier, a
     // A type nothing else applies: the machine is its applier.
     try checkAppliersWith(&(listed_now ++ .{Toy.owning(.raft_snapshot)}), 0, &shard.replay_registry);
     // Registered by a handler too: refused.
-    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.stream_append)}), 0, &shard.replay_registry));
+    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.workflow_create)}), 0, &shard.replay_registry));
     // KV's types are its machine's: without it, they have no applier.
     try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliersWith(&.{}, 0, &shard.replay_registry));
 }
@@ -25469,8 +25533,8 @@ test "applyEntryCore: a machine reads the streams every entry below its own left
     };
     Reader.hash = stream_mod.streamKey(.default, "s");
 
-    const v = try stream_mod.encodeAppendValue(std.testing.allocator, 0, "a");
-    defer std.testing.allocator.free(v);
+    var vb: [64]u8 = undefined;
+    const v = stream_mod.appendValueOf(&vb, 1, 1);
     _ = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
     _ = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
     try std.testing.expect(shard.applyCommitted());
@@ -25485,14 +25549,9 @@ test "applyEntryCore: a machine reads the streams every entry below its own left
     try std.testing.expectEqual(@as(usize, 2), Reader.n);
     try std.testing.expect(Reader.seen[0].eql(shard.stream_handler.stream.streamFirstId(Reader.hash)));
     try std.testing.expect(Reader.seen[1].eql(shard.stream_handler.stream.streamLastId(Reader.hash)));
-
-    // Applied without the streams, the read halts the entry.
-    var bare: persistence_mod.Result = .{};
-    bare.reset(&e);
-    try std.testing.expectError(error.Halt, contract_machine.applyEntry(&Reader.machine, &shard.defaultPartition().store, &shard.defaultPartition().apply_scratch, &e, &bare));
 }
 
-test "applyEntryCore: a stream's delete reaches its groups after it applies, and not when it is refused" {
+test "applyEntryCore: a forced delete of a stream with groups moves their generation on; a refused one doesn't" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
@@ -25500,8 +25559,8 @@ test "applyEntryCore: a stream's delete reaches its groups after it applies, and
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
-    const v = try stream_mod.encodeAppendValue(std.testing.allocator, 0, "a");
-    defer std.testing.allocator.free(v);
+    var vb: [64]u8 = undefined;
+    const v = stream_mod.appendValueOf(&vb, 1, 1);
     _ = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
     try std.testing.expect(shard.applyCommitted());
 
@@ -25519,8 +25578,8 @@ test "applyEntryCore: a stream's delete reaches its groups after it applies, and
     const genOf = struct {
         fn f(part: *Partition, h: stream_mod.StreamKey) u64 {
             var b: [13]u8 = undefined;
-            const got = (@import("../contract/view.zig").ReadView{ .store = &part.store }).get(gm.Streams_, gm.recKey(&b, h)) catch unreachable;
-            return got.?.v.gen;
+            _ = &b;
+            return gm.streamViewOf(.{ .store = &part.store }, h).gen;
         }
     }.f;
     try std.testing.expectEqual(@as(u64, 0), genOf(p, hash));
@@ -28149,7 +28208,7 @@ test "Shard: a carried stream append its client path would refuse is refused as 
     try std.testing.expect(b.applyEntry(&e, &out));
     try std.testing.expectEqual(@as(u64, 2), channels_mod.inOf(.{ .store = &b.defaultPartition().store }, 0).?.applied);
     try std.testing.expectEqual(@as(u64, 2), b.channel.sender_bugs[0][@backingInt(contract_store.SenderBug.bad_payload)]);
-    try std.testing.expectEqual(@as(u32, 0), b.stream_handler.stream.streams.count());
+    try std.testing.expect(stream_machine.metaOf(.{ .store = &b.defaultPartition().store }, .default, "") == null);
     try std.testing.expectEqual(highest, b.defaultPartition().highest_namespace);
     var sm: @import("../metrics/registry.zig").ShardMetrics = .{ .shard_id = 1 };
     b.shard_metrics = &sm;
@@ -28584,7 +28643,7 @@ const TEST_DEFAULT_NS: u32 = @import("../namespace/table.zig").DEFAULT.int();
 /// entries would leave them: `n` records of "s", delivered to "w" at `stamp`.
 fn groupDelivered(sh: *Shard, n: u64, stamp: u64) !void {
     const p = sh.defaultPartition();
-    for (0..n) |i| _ = try p.stream.appendToStreamAt(stream_mod.streamKey(.default, "s"), i + 1, 0, 0, 1, 1, 10);
+    for (0..n) |i| try testStreamAppend(p, "s", i + 1, 1, 1);
     var pb: [ge_mod.Deliver.max_size]u8 = undefined;
     const body = try ge_mod.Deliver.encodeInto(&pb, .{ .ns = 1, .stream = "s", .group = "g", .count = @intCast(n), .max_bytes = 1 << 20, .holder = "w", .lease_ms = 30_000, .create = true, .ready = .{ .bytes = "", .count = 0 }, .through_ms = std.math.maxInt(u64), .through_seq = std.math.maxInt(u64), .max_held = qe_caps.DEFAULT_MAX_MESSAGES, .max_held_bytes = qe_caps.DEFAULT_MAX_BYTES, .shard_held_bytes = qe_caps.DEFAULT_SHARD_HELD_BYTES });
     try applyGroupEntry(sh, .group_deliver, body, 50, stamp);
@@ -28595,7 +28654,7 @@ fn applyGroupEntry(sh: *Shard, etype: entry_mod.EntryType, body: []const u8, ind
     const e = entry_mod.buildEntry(etype, entry_mod.Flags.NONE, 1, index, stamp, body);
     var out: persistence_mod.Result = .{};
     out.reset(&e);
-    try contract_machine.applyEntryWith(&@import("../stream/group_machine.zig").machine, &p.store, &p.apply_scratch, .{ .proj = &p.stream }, &e, &out);
+    try contract_machine.applyEntry(&@import("../stream/group_machine.zig").machine, &p.store, &p.apply_scratch, &e, &out);
     try std.testing.expect(out.refused() == null);
 }
 
