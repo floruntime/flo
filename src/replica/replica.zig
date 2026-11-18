@@ -458,7 +458,10 @@ pub fn Replica(comptime Io: type) type {
 
         /// An answer to a lone voter's ask: a committed config newer than
         /// this node's own, from a member that isn't guarded, holds its
-        /// campaign for good.
+        /// campaign for good. A guard of liveness, not integrity: a link
+        /// proves only the cluster secret, so the answer may be forged, and
+        /// a forged one can only keep this node waiting; nothing in it is
+        /// taken.
         fn takeLoneAnswer(self: *Self, frame: RaftFrame) void {
             const resp = transport.deserializeTermCheckResponse(frame.payload) orelse return self.badFrame(frame);
             if (resp.from != frame.source_node) return self.impostorFrame(frame, resp.from);
