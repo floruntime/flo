@@ -200,7 +200,10 @@ const LGroup = struct {
 /// A stream as the ledger keeps it: whether the streams machine holds a
 /// record of it (`made`; a tombstone holds one with `exists` false), its
 /// floor and generation, and how many groups count it.
-const LStream = struct { made: bool = false, exists: bool = false, floor: StreamID = StreamID.MIN, gen: u64 = 0, groups: u64 = 0, last: StreamID = StreamID.MIN };
+/// A stream as the ledger has it: `made` while the streams machine keeps a
+/// record of it, live or a tombstone; `below` its appends at or below the
+/// floor not yet removed.
+const LStream = struct { made: bool = false, exists: bool = false, floor: StreamID = StreamID.MIN, gen: u64 = 0, groups: u64 = 0, last: StreamID = StreamID.MIN, below: u64 = 0 };
 
 /// An append the ledger counts: its first and last record ids.
 const LAppend = struct { first: StreamID, last: StreamID, records: u32 };
@@ -265,11 +268,11 @@ pub const ConsumerGroups = struct {
     ledger: Ledger,
     allocator: Allocator,
 
-    pub const Kind = enum { append, trim, stream_delete, create, delete, deliver, settle, release, extend, expire, clean, steal, requeue, drop };
+    pub const Kind = enum { append, trim, stream_delete, stream_clean, stream_forget, create, delete, deliver, settle, release, extend, expire, clean, steal, requeue, drop };
 
     /// What an applied entry did, beyond applying: the swarm fails if one
     /// never happens, since a rule it never met was never checked.
-    pub const Mark = enum { deliver_leased, extend_moved, abandon, unread, nack_dead, nack_delay, nack_error, mixed_abandon_refused, cross_term_settle, cross_term_expire, steal_applied, requeue_applied, drop_applied, clean_gone, delete_refused };
+    pub const Mark = enum { deliver_leased, extend_moved, abandon, unread, nack_dead, nack_delay, nack_error, mixed_abandon_refused, cross_term_settle, cross_term_expire, steal_applied, requeue_applied, drop_applied, clean_gone, delete_refused, stream_remade, stream_forgot };
 
     pub const Effect = struct {
         kind: Kind,
@@ -324,7 +327,8 @@ pub const ConsumerGroups = struct {
 
     pub fn owns(entry_type: u8) bool {
         for (gm.machine.entry_types) |t| if (@backingInt(t) == entry_type) return true;
-        return entry_type == @backingInt(EntryType.stream_trim) or entry_type == @backingInt(EntryType.stream_delete) or entry_type == @backingInt(EntryType.stream_config);
+        return entry_type == @backingInt(EntryType.stream_trim) or entry_type == @backingInt(EntryType.stream_delete) or entry_type == @backingInt(EntryType.stream_config) or
+            entry_type == @backingInt(EntryType.stream_clean) or entry_type == @backingInt(EntryType.stream_forget);
     }
 
     /// The synthesized workload's appends share the type; this family's
@@ -353,6 +357,8 @@ pub const ConsumerGroups = struct {
             .stream_append => .append,
             .stream_trim => .trim,
             .stream_delete => .stream_delete,
+            .stream_clean => .stream_clean,
+            .stream_forget => .stream_forget,
             .group_create => .create,
             .group_delete => .delete,
             .group_deliver => .deliver,
@@ -424,8 +430,9 @@ pub const ConsumerGroups = struct {
         const kind = kindOf(e.header.entry_type);
         var effect: Effect = .{ .kind = kind, .refused = false };
         switch (kind) {
-            .append, .trim, .stream_delete => {
+            .append, .trim, .stream_delete, .stream_clean, .stream_forget => {
                 effect.refused = try self.applyStream(store, e, kind, r, &effect);
+                if (effect.broke == null) effect.broke = self.streamLedgerRule(store);
                 if (effect.broke == null) effect.broke = streamRule(store);
             },
             else => {
@@ -473,11 +480,9 @@ pub const ConsumerGroups = struct {
         var t: Touched = @splat(@splat(false));
         var diag: schema.Diagnostic = .{};
         switch (kind) {
-            .append, .trim, .stream_delete => {
+            .append, .trim, .stream_delete, .stream_clean, .stream_forget => {
                 const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return error.Halt;
-                const s = if (kind == .trim) for (STREAMS, 0..) |name, i| {
-                    if (std.mem.eql(u8, &streamHash(name), cmd.value)) break i;
-                } else return error.Halt else streamIndex(cmd.key) orelse return error.Halt;
+                const s = streamOfCmd(kind, cmd) orelse return error.Halt;
                 t[s] = @splat(true);
             },
             .expire => {
@@ -525,11 +530,20 @@ pub const ConsumerGroups = struct {
     /// trim moves its floor, and a delete (forced, or of a stream holding
     /// nothing above its floor) ends it, leaving a tombstone at the next
     /// generation while groups count it. Whether it was refused.
+    /// The stream a stream entry names: a trim's, clean's or forget's value
+    /// leads with its name's hash; every other's key is its name.
+    fn streamOfCmd(kind: Kind, cmd: entry_mod.CommandPayload) ?usize {
+        if (kind == .trim or kind == .stream_clean or kind == .stream_forget) {
+            if (cmd.value.len < 8) return null;
+            for (STREAMS, 0..) |name, i| if (std.mem.eql(u8, &streamHash(name), cmd.value[0..8])) return i;
+            return null;
+        }
+        return streamIndex(cmd.key);
+    }
+
     fn applyStream(self: *ConsumerGroups, store: *Store, e: *const Entry, kind: Kind, r: Replica, effect: *Effect) (persistence.ApplyError || error{RefusalChangedState})!bool {
         const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return error.Halt;
-        const s: usize = if (kind == .trim) (for (STREAMS, 0..) |name, i| {
-            if (cmd.value.len == 8 and std.mem.eql(u8, &streamHash(name), cmd.value)) break i;
-        } else return error.Halt) else streamIndex(cmd.key) orelse return error.Halt;
+        const s = streamOfCmd(kind, cmd) orelse return error.Halt;
         const sk = gm.streamOf(NS, STREAMS[s]);
         const st = &self.ledger.streams[s];
         // Whether a delete must be refused: the ledger's own appends above
@@ -550,12 +564,12 @@ pub const ConsumerGroups = struct {
             .append => {
                 if (r.mutant == .stream_append_reuses_id) if (prev) |p| try restoreLast(store, sk, p);
                 if (!st.exists) {
-                    // Made, or made again from a tombstone, at its generation.
-                    if (!st.made) st.gen = 0;
+                    // Made, or made again over a tombstone: that keeps its
+                    // generation, last id and floor, so its ids continue
+                    // past the old stream's.
+                    if (st.made) effect.marks.insert(.stream_remade) else st.* = .{ .groups = st.groups };
                     st.made = true;
                     st.exists = true;
-                    st.floor = StreamID.MIN;
-                    st.last = StreamID.MIN;
                 }
             },
             .trim => {
@@ -566,24 +580,38 @@ pub const ConsumerGroups = struct {
                 if (st.exists) if (bound.resolve(e.header.timestamp_ns)) |to| if (lastReached(prev, self.ledgerAppends(s), to)) |cut| {
                     if (cut.greaterThan(st.floor)) st.floor = cut;
                 };
-                // What the floor cut is gone from the ledger's appends.
+                // What the floor cut is gone from the ledger's appends, and
+                // held below the floor until removed.
                 const l = &self.ledger.appends[s];
                 var keep: usize = 0;
                 while (keep < l.items.len and !l.items[keep].last.greaterThan(st.floor)) keep += 1;
                 l.replaceRange(self.ledger.gpa, 0, keep, &.{}) catch @panic("sim OOM");
-            },
-            else => if (st.exists) {
-                st.exists = false;
-                st.floor = StreamID.MIN;
-                st.last = StreamID.MIN;
-                if (st.groups > 0) {
-                    // Its groups are of the old generation now: gone.
-                    st.gen += 1;
-                } else {
-                    st.made = false;
-                    st.gen = 0;
+                if (st.exists) {
+                    st.below += keep;
+                    st.below -= @min(st.below, sm.MAX_TRIM_APPENDS);
                 }
+            },
+            .stream_delete => if (st.exists) {
+                // A tombstone at the next generation, its floor at its last
+                // id: every append it held is below it, to be removed.
+                if (r.mutant == .stream_recreate_restarts_ids) try restartIds(store, sk);
+                st.exists = false;
+                st.gen += 1;
+                if (st.last.greaterThan(st.floor)) st.floor = st.last;
+                st.below += self.ledger.appends[s].items.len;
                 self.ledger.appends[s].clearRetainingCapacity();
+            },
+            .stream_clean => {
+                if (r.mutant == .stream_clean_crosses_floor) try removeAboveFloor(store, sk);
+                if (st.made) st.below -= @min(st.below, sm.MAX_TRIM_APPENDS);
+            },
+            else => {
+                const gen = std.mem.readInt(u64, cmd.value[8..16], .little);
+                const forgets = st.made and !st.exists and st.gen == gen and st.below == 0;
+                if (forgets and st.groups == 0) {
+                    st.* = .{};
+                    effect.marks.insert(.stream_forgot);
+                } else if (forgets and r.mutant == .stream_forget_ignores_groups) try forgetAnyway(store, sk);
             },
         }
         if (kind == .append and st.exists) {
@@ -595,6 +623,66 @@ pub const ConsumerGroups = struct {
             self.ledger.appends[s].append(self.ledger.gpa, .{ .first = first, .last = st.last, .records = n }) catch @panic("sim OOM");
         }
         return false;
+    }
+
+    /// `stream_recreate_restarts_ids`: the tombstone forgets its last id and
+    /// floor, so a stream made again takes ids from the start.
+    fn restartIds(store: *Store, sk: StreamKey) persistence.ApplyError!void {
+        const node = store.find(sm.Metas.ID, &sk) orelse return;
+        var m = (sm.Metas.Value.decode(store_mod.Record.of(node).value) catch return error.Halt).v;
+        m.last_ms = 0;
+        m.last_seq = 0;
+        m.floor_ms = 0;
+        m.floor_seq = 0;
+        try replaceMeta(store, node, m);
+    }
+
+    /// `stream_clean_crosses_floor`: the clean also removes the stream's
+    /// first append above its floor.
+    fn removeAboveFloor(store: *Store, sk: StreamKey) persistence.ApplyError!void {
+        const m = sm.metaAt(.{ .store = store }, sk) orelse return;
+        var it = store.range(sm.Records.ID, &sk);
+        while (it.next()) |rec| {
+            if (sm.idOfKey(rec.key()).greaterThan(sm.floorOf(m))) return store.unlink(sm.Records.ID, &rec.node);
+        }
+    }
+
+    /// `stream_forget_ignores_groups`: a tombstone groups still count goes.
+    fn forgetAnyway(store: *Store, sk: StreamKey) persistence.ApplyError!void {
+        if (store.find(sm.Metas.ID, &sk)) |node| store.unlink(sm.Metas.ID, node);
+        if (store.find(sm.Reclaim.ID, &sk)) |node| store.unlink(sm.Reclaim.ID, node);
+    }
+
+    /// The streams machine's record of each stream against the ledger's:
+    /// kept while the ledger keeps one, at its generation, last id and floor,
+    /// holding the appends above its floor the ledger counts.
+    fn streamLedgerRule(self: *ConsumerGroups, store: *Store) ?[]const u8 {
+        const rv: view_mod.ReadView = .{ .store = store };
+        for (STREAMS, 0..) |name, s| {
+            const st = self.ledger.streams[s];
+            const sk = gm.streamOf(NS, name);
+            const m = sm.metaAt(rv, sk) orelse {
+                if (st.made) return "a stream's tombstone is gone while the ledger holds it";
+                continue;
+            };
+            if (!st.made) return "a stream the ledger forgot is still held";
+            if (m.exists != st.exists or m.gen != st.gen) return "a stream is live or a tombstone, or at a generation, other than the ledger's";
+            if (!sm.lastOf(m).eql(st.last)) return "a stream's last id is not the ledger's";
+            if (!sm.floorOf(m).eql(st.floor)) return "a stream's floor is not the last record it lost";
+            // Raw records, past the ledger's own floor: none of the
+            // machine's floor handling is the checker's.
+            var it = rv.range(sm.Records, &sk);
+            var n: usize = 0;
+            const want = self.ledger.appends[s].items;
+            while (it.next() catch null) |rec_item| {
+                const rec = sm.recordOf(rec_item.key, rec_item.value.v);
+                if (!stream_proj.lastRecordOf(rec).greaterThan(st.floor)) continue;
+                if (n == want.len or !rec.id.eql(want[n].first)) return "a stream holds other appends above its floor than the ledger's";
+                n += 1;
+            }
+            if (n != want.len) return "a stream holds other appends above its floor than the ledger's";
+        }
+        return null;
     }
 
     fn ledgerAppends(self: *ConsumerGroups, s: usize) []const LAppend {
@@ -1454,14 +1542,11 @@ pub const ConsumerGroups = struct {
         const rv: view_mod.ReadView = .{ .store = store };
         for (STREAMS) |name| {
             const sk = gm.streamOf(NS, name);
-            const m = sm.metaAt(rv, sk);
             var it = rv.range(sm.Records, &sk);
-            const live = if (m) |x| x.exists else false;
-            if (!live) {
+            const sm_meta = sm.metaAt(rv, sk) orelse {
                 if ((it.next() catch null) != null) return "a stream that doesn't exist holds appends";
                 continue;
-            }
-            const sm_meta = m.?;
+            };
             const floor = sm.floorOf(sm_meta);
             var prev_last = StreamID.MIN;
             var any = false;
@@ -1476,7 +1561,14 @@ pub const ConsumerGroups = struct {
             }
             if (any and !prev_last.eql(sm.lastOf(sm_meta))) return "a stream's last id is not its last append's";
             if (above != sm.countAbove(rv, sk, sm_meta, floor).records) return "a stream's count above its floor is not its appends'";
-            if (below != (store.get(sm.Reclaim.ID, &sk) != null)) return "a stream keeps appends at or below its floor without being marked to reclaim them, or is marked with none";
+            const marked = store.get(sm.Reclaim.ID, &sk) != null;
+            // A tombstone holds nothing above its floor and stays marked
+            // until forgotten. A live stream holding appends at or below its
+            // floor is marked; one made again over a tombstone may stay
+            // marked with none until the duty's next clean.
+            if (!sm_meta.exists and above > 0) return "a deleted stream holds appends above its floor";
+            if (!sm_meta.exists and !marked) return "a tombstone isn't marked for the retention duty";
+            if (below and !marked) return "a stream keeps appends at or below its floor without being marked to reclaim them";
         }
         return null;
     }

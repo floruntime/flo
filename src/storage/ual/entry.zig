@@ -74,6 +74,12 @@ pub const EntryType = enum(u8) {
     stream_delete = 0x12,
     /// A stream created or altered: its partition count and retention.
     stream_config = 0x13,
+    /// The retention duty's: remove a bounded batch of a stream's appends
+    /// at or below its floor, a live stream's or a deleted one's.
+    stream_clean = 0x14,
+    /// The retention duty's: drop a deleted stream's tombstone once it holds
+    /// no appends and no group counts it.
+    stream_forget = 0x15,
 
     // ── Queue ──
     queue_enqueue = 0x20,
@@ -186,7 +192,7 @@ pub const EntryType = enum(u8) {
             .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => false,
             .step_call, .step_call_retry, .step_call_clear, .call_reply, .call_done, .action_abandon_send, .action_abandon => false,
             .child_start, .child_refuse => false,
-            .stream_append, .stream_trim, .stream_delete, .stream_config => true,
+            .stream_append, .stream_trim, .stream_delete, .stream_config, .stream_clean, .stream_forget => true,
             .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge, .queue_requeue, .queue_drop => false,
             .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean, .group_steal, .group_requeue, .group_drop => false,
             .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,

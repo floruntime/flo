@@ -574,10 +574,10 @@ pub const Shard = struct {
     node_health: []health_mod.ShardSlot = &.{},
     /// The leader duties held back, and since when.
     duties: duties_mod.Duties = .{},
-    /// The last stream the retention duty proposed a drain trim for: the
-    /// next pass starts after it, so streams share the budget in turn.
-    /// Leader-local and never reset: a node that leads again goes on from
-    /// where it last stopped, which shares the budget just as well.
+    /// The last marked stream the retention duty looked at: the next pass
+    /// starts after it, so streams share the budget in turn. Leader-local
+    /// and never reset: a node that leads again goes on from where it last
+    /// stopped, which shares the budget just as well.
     drain_after: ?stream_mod.StreamKey = null,
     join_first_asked_ms: u64,
     join_warned_ms: u64,
@@ -7016,41 +7016,58 @@ pub const Shard = struct {
         return trims_proposed;
     }
 
-    /// The most trims to a floor one retention pass proposes, over every
-    /// stream: a pass every 10 s clears up to 16 × 1024 appends trims left
-    /// behind.
+    /// The most cleans and forgets one retention pass proposes, over every
+    /// stream: a pass every 10 s removes up to 16 × 1024 appends trims and
+    /// deletes left behind.
     const DRAIN_BUDGET: usize = 16;
 
-    /// Streams a trim left holding appends at or below their floor: a trim
-    /// to the floor cuts nothing more and removes the next
-    /// `MAX_TRIM_APPENDS`, so each gets as many as it needs, in turn from
-    /// after the last stream served, within one budget for the pass. A
-    /// refused proposal ends the pass: the next would be refused too.
-    /// Whether a stream has a retention policy doesn't matter: a client's
-    /// trim marks it too.
+    /// The most marked streams one pass looks at, whether or not it
+    /// proposes anything for them: a tombstone whose groups still live is
+    /// looked at each pass and passed over.
+    const DRAIN_VISITS: usize = 64;
+
+    /// Streams marked in `stream.reclaim`: a live one a trim left holding
+    /// appends at or below its floor, or a deleted one's tombstone. Each
+    /// `stream_clean` removes the next `MAX_TRIM_APPENDS` at or below the
+    /// floor, so a stream gets as many as it needs; a tombstone holding none,
+    /// counted by no group, gets a `stream_forget`. In turn from after the
+    /// last stream looked at, within the pass's budget and visits. A refused
+    /// proposal ends the pass: the next would be refused too. Whether a
+    /// stream has a retention policy doesn't matter: a client's trim or
+    /// delete marks it too.
     fn drainReclaim(self: *Shard, read: view_mod.ReadView) u64 {
         var budget = DRAIN_BUDGET;
+        var visits = DRAIN_VISITS;
         const start = self.drain_after;
-        // From after the last stream served to the end, then from the first
-        // up to and including it.
+        // From after the last stream looked at to the end, then from the
+        // first up to and including it.
         for (0..2) |lap| {
-            var marked = if (lap == 0 and start != null) read.rangeAfter(stream_machine.Reclaim, "", &start.?) else read.range(stream_machine.Reclaim, "");
             if (lap == 1 and start == null) break;
+            var marked = if (lap == 0 and start != null) read.rangeAfter(stream_machine.Reclaim, "", &start.?) else read.range(stream_machine.Reclaim, "");
             while (marked.next() catch null) |item| {
-                if (budget == 0) return DRAIN_BUDGET;
+                if (budget == 0 or visits == 0) return DRAIN_BUDGET - budget;
                 if (item.key.len != @sizeOf(stream_mod.StreamKey)) continue;
                 const key: stream_mod.StreamKey = item.key[0..@sizeOf(stream_mod.StreamKey)].*;
                 if (lap == 1 and std.mem.order(u8, &key, &start.?) == .gt) break;
+                visits -= 1;
+                self.drain_after = key;
                 const found = read.get(stream_machine.Metas, &key) catch continue;
                 const meta = (found orelse continue).v;
-                if (!meta.exists) continue;
-                const floor = stream_machine.floorOf(meta);
-                const held = stream_machine.heldThrough(read, key, floor, budget * stream_machine.MAX_TRIM_APPENDS);
-                const trims = (held + stream_machine.MAX_TRIM_APPENDS - 1) / stream_machine.MAX_TRIM_APPENDS;
-                for (0..trims) |_| {
-                    if (!self.stream_handler.persistTrim(key, .{ .id = floor })) return DRAIN_BUDGET - budget;
+                const held = stream_machine.heldThrough(read, key, stream_machine.floorOf(meta), budget * stream_machine.MAX_TRIM_APPENDS);
+                if (held == 0) {
+                    // Nothing left to remove. A tombstone no group counts
+                    // goes; a live stream's mark, left by a tombstone it was
+                    // made again over, goes with a clean that removes nothing.
+                    if (!meta.exists) {
+                        if (stream_machine.groupsOf(read, key) > 0) continue;
+                        if (!self.stream_handler.persistForget(key, meta.gen)) return DRAIN_BUDGET - budget;
+                    } else if (!self.stream_handler.persistClean(key)) return DRAIN_BUDGET - budget;
                     budget -= 1;
-                    self.drain_after = key;
+                    continue;
+                }
+                for (0..(held + stream_machine.MAX_TRIM_APPENDS - 1) / stream_machine.MAX_TRIM_APPENDS) |_| {
+                    if (!self.stream_handler.persistClean(key)) return DRAIN_BUDGET - budget;
+                    budget -= 1;
                 }
             }
         }
@@ -22909,6 +22926,37 @@ test "Shard: the retention duty drains marked streams within one budget a pass, 
     try std.testing.expectEqual(@as(u64, streams - Shard.DRAIN_BUDGET), p.store.family(stream_machine.Reclaim.ID).count);
     try std.testing.expectEqual(@as(u64, streams - Shard.DRAIN_BUDGET), Shard.streamRetentionTask(@ptrCast(&shard)));
     try std.testing.expect(shard.applyCommitted());
+    try std.testing.expectEqual(@as(u64, 0), p.store.family(stream_machine.Reclaim.ID).count);
+    try std.testing.expectEqual(@as(u64, 0), Shard.streamRetentionTask(@ptrCast(&shard)));
+}
+
+test "Shard: a forced delete answers at once; the retention duty removes its appends, then forgets the tombstone" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+
+    const n = 2 * stream_machine.MAX_TRIM_APPENDS + 2;
+    const p = shard.defaultPartition();
+    for (0..n) |i| try testStreamAppend(p, "big", i + 1, 1000 + i, 1);
+    _ = try persistence_mod.proposeEntry(&shard, .stream_delete, entry_mod.Flags.FORCE, "default", "big", "");
+    try std.testing.expect(shard.applyCommitted());
+    const key = stream_mod.streamKey(.default, "big");
+    const read: view_mod.ReadView = .{ .store = &p.store };
+    // Gone at once; its appends stay, unread, until the duty removes them.
+    try std.testing.expect(stream_machine.metaOf(read, .default, "big") == null);
+    try std.testing.expectEqual(@as(usize, n), stream_machine.heldThrough(read, key, stream_machine.StreamID.MAX, n + 1));
+    // One pass: the cleans that remove them all.
+    try std.testing.expectEqual(@as(u64, 3), Shard.streamRetentionTask(@ptrCast(&shard)));
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expectEqual(@as(usize, 0), stream_machine.heldThrough(read, key, stream_machine.StreamID.MAX, n + 1));
+    // The next: the forget, as no group counts it.
+    try std.testing.expectEqual(@as(u64, 1), Shard.streamRetentionTask(@ptrCast(&shard)));
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expect(stream_machine.metaAt(read, key) == null);
     try std.testing.expectEqual(@as(u64, 0), p.store.family(stream_machine.Reclaim.ID).count);
     try std.testing.expectEqual(@as(u64, 0), Shard.streamRetentionTask(@ptrCast(&shard)));
 }
