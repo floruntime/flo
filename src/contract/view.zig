@@ -268,6 +268,10 @@ pub const View = struct {
     /// The message being applied, when the entry is another group's message
     /// this group took in: what a target's apply reads to know it.
     message: ?Message = null,
+    /// The committed record the last read found, which a write of the same
+    /// key at commit needn't find again. The store doesn't change before the
+    /// commit, so it stays held.
+    read_last: ?struct { fam: u16, node: *store_mod.Tree.Node } = null,
 
     pub fn init(store: *Store, arena: Allocator, declared: *const KeySet) View {
         return .{ .store = store, .arena = arena, .declared = declared, .strict = store.strict_keys, .place = store.place };
@@ -473,7 +477,9 @@ pub const View = struct {
         const last = self.lastWrite(fam, k);
         if (self.ranges.items.len > 0 and self.rangedAfter(fam, k, last)) return null;
         if (last) |i| return self.ops.items[i].value;
-        return self.store.get(fam, k);
+        const node = self.store.find(fam, k) orelse return null;
+        self.read_last = .{ .fam = fam, .node = node };
+        return store_mod.Record.of(node).value;
     }
 
     fn check(self: *View, fam: u16, k: []const u8) void {
@@ -526,7 +532,10 @@ pub const View = struct {
             reserved += 1;
         }
         // Nothing past here can fail: a range unlinks what it covers in
-        // place, then each step writes its key.
+        // place, then each step writes its key. A fresh key's slot, found
+        // while reserving, holds until its family's tree changes; past
+        // that, linking it looks again.
+        var moved: u64 = 0;
         for (self.ranges.items) |at| {
             const op = self.ops.items[at];
             var it = self.store.range(op.fam, op.key);
@@ -534,9 +543,10 @@ pub const View = struct {
                 if (op.below) |b| if (std.mem.order(u8, rec.key(), b) != .lt) break;
                 if (kept.contains(.{ .fam = op.fam, .key = rec.key() })) continue;
                 self.store.unlink(op.fam, &rec.node);
+                moved |= famBit(op.fam);
             }
         }
-        for (plan.items) |*s| self.apply(s);
+        for (plan.items) |*s| self.apply(s, &moved);
         for (&self.store.ts_late_points, self.ts_late_points) |*n, d| n.* += d;
     }
 
@@ -546,6 +556,8 @@ pub const View = struct {
         node: ?*store_mod.Tree.Node = null,
         /// A new record for a key the family doesn't hold.
         fresh: ?*store_mod.Record = null,
+        /// Where `fresh` goes, as the family's tree stood while reserving.
+        slot: ?store_mod.Tree.Entry = null,
         value: ?[]u8 = null,
     };
 
@@ -555,14 +567,27 @@ pub const View = struct {
     }
 
     fn reserve(self: *View, s: *Step) Allocator.Error!void {
-        s.node = self.store.find(s.op.fam, s.op.key);
+        // A key this entry read and now writes is found already: nothing
+        // moved in the store between.
+        if (self.read_last) |r| if (r.fam == s.op.fam and std.mem.eql(u8, r.node.key, s.op.key)) {
+            s.node = r.node;
+            const bytes = s.op.value orelse return;
+            s.value = try self.store.allocator.dupe(u8, bytes);
+            return;
+        };
+        const slot = self.store.entryFor(s.op.fam, s.op.key);
+        s.node = slot.node;
+        if (slot.node == null) s.slot = slot;
         const bytes = s.op.value orelse return;
         s.value = try self.store.allocator.dupe(u8, bytes);
         errdefer {
             self.store.allocator.free(s.value.?);
             s.value = null;
         }
-        if (s.node == null) s.fresh = try self.store.allocRecord(s.op.key);
+        if (s.node == null) {
+            try self.store.reserveTail(s.op.fam, s.op.key);
+            s.fresh = try self.store.allocRecord(s.op.key);
+        }
     }
 
     fn release(self: *View, s: *Step) void {
@@ -571,13 +596,22 @@ pub const View = struct {
         s.* = .{ .op = s.op };
     }
 
-    fn apply(self: *View, s: *Step) void {
+    fn apply(self: *View, s: *Step, moved: *u64) void {
         const fam = s.op.fam;
         if (s.value) |v| {
-            if (s.fresh) |r| self.store.link(fam, r, v) else self.store.replace(fam, s.node.?, v);
+            if (s.fresh) |r| {
+                if (moved.* & famBit(fam) == 0) self.store.linkAt(fam, &s.slot.?, r, v) else self.store.link(fam, r, v);
+                moved.* |= famBit(fam);
+            } else self.store.replace(fam, s.node.?, v);
         } else if (s.node) |n| {
             self.store.unlink(fam, n);
+            moved.* |= famBit(fam);
         }
+    }
+
+    fn famBit(fam: u16) u64 {
+        comptime std.debug.assert(store_mod.MAX_FAMILIES <= 64);
+        return @as(u64, 1) << @intCast(fam);
     }
 };
 
