@@ -27,6 +27,9 @@ pub const Halt = struct {
     term: u64,
     /// The entry's checksum: with its index and term, what a repair names.
     crc: u32,
+    /// The inbound message it halted at, for a `channel_inbound`: what a
+    /// repair of only that message names.
+    message: ?Applying = null,
     len: usize = 0,
     buf: [192]u8 = undefined,
 
@@ -145,7 +148,16 @@ pub const ReplayApply = struct {
     /// A repair skips `entry`: take it out of the applied set without running
     /// it. Non-null is damage this node could not even do that on.
     pass_over: *const fn (ctx: *anyopaque, entry: *const entry_mod.Entry) ?silent_loss.Damage,
+    /// Set (or clear, null) the skip a repair names in the inbound about to
+    /// apply: a skipped `channel_inbound` applies its skip, not nothing
+    /// (`channels.zig`). Null for a source that holds no skips.
+    inbound_skip: ?*const fn (ctx: *anyopaque, skip: ?InboundSkip) void = null,
+    /// The inbound message an apply that halted was running, if any.
+    halting_message: ?*const fn (ctx: *anyopaque) ?Applying = null,
 };
+
+pub const InboundSkip = @import("../contract/store.zig").InboundSkip;
+pub const Applying = @import("../contract/store.zig").Applying;
 
 /// Everything a replay needs that isn't the entry. One value per the two call
 /// sites, so same-typed inputs can't be transposed.
@@ -180,9 +192,13 @@ pub fn replayOneEntry(ctx: ReplayCtx, entry: *const entry_mod.Entry, out: *Repla
     // in the log, and nothing of it applies until a repair.
     const mark = if (comptime plant.active == .replay_watermark_off_by_one) ctx.watermark + 1 else ctx.watermark;
     if (entry.header.index > mark or out.halt != null) return;
-    // A repair skips it: taken as a halt on it left a replica that halted live,
-    // and its applier never runs.
-    if (skippedHere(ctx.skips, entry)) {
+    // A repair skips an inbound: its skip applies, as live (`channels.zig`).
+    const skipped_inbound = skippedHere(ctx.skips, entry) and entry.header.entry_type == @backingInt(entry_mod.EntryType.channel_inbound) and ctx.apply.inbound_skip != null;
+    if (skipped_inbound) ctx.apply.inbound_skip.?(ctx.apply.ctx, ctx.skips.inboundOf(entry).?);
+    defer if (skipped_inbound) ctx.apply.inbound_skip.?(ctx.apply.ctx, null);
+    // A repair skips anything else: taken as a halt on it left a replica that
+    // halted live, and its applier never runs.
+    if (!skipped_inbound and skippedHere(ctx.skips, entry)) {
         if (ctx.apply.pass_over(ctx.apply.ctx, entry)) |damage| {
             out.damage = damage;
             return;
@@ -206,7 +222,11 @@ pub fn replayOneEntry(ctx: ReplayCtx, entry: *const entry_mod.Entry, out: *Repla
         },
         .halt => |why| {
             const type_name = std.enums.tagName(entry_mod.EntryType, @fromBackingInt(@intCast(entry.header.entry_type))) orelse "unknown";
-            out.halt = Halt.init(entry, "entry {d} ({s}): {s} (a Flo bug)", .{ entry.header.index, type_name, why });
+            const msg = if (ctx.apply.halting_message) |f| f(ctx.apply.ctx) else null;
+            var mb: [64]u8 = undefined;
+            const at = if (msg) |m| std.fmt.bufPrint(&mb, ", message {d} from shard {d}", .{ m.seq, m.from }) catch "" else "";
+            out.halt = Halt.init(entry, "entry {d} ({s}){s}: {s} (a Flo bug)", .{ entry.header.index, type_name, at, why });
+            out.halt.?.message = msg;
             return;
         },
         .local => |damage| {
@@ -311,4 +331,41 @@ test "replay: an entry too large for the ring is damage, not a silent skip" {
     var e = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 100, &payload);
     e.header.crc32c = e.computeCrc();
     try std.testing.expect(restoreRaftEntry(0, &raft_log, &e) == .damage);
+}
+
+test "replay: a skipped inbound replays with its skip set, and the skip is cleared after" {
+    const allocator = std.testing.allocator;
+    var raft_log = try RaftLog.init(allocator, 4096);
+    defer raft_log.deinit();
+    var skips: repair.Skips = .{};
+    defer skips.deinit(allocator);
+    var e = entry_mod.buildEntry(.channel_inbound, entry_mod.Flags.NONE, 1, 1, 10, "x");
+    e.header.crc32c = e.computeCrc();
+    var skip = repair.Skip.of(&e, "");
+    skip.seq = 4;
+    try skips.add(allocator, &skip);
+    const Seen = struct {
+        var during: ?InboundSkip = null;
+        var now: ?InboundSkip = null;
+        var applied: bool = false;
+        fn apply(_: *anyopaque, _: *const entry_mod.Entry) Verdict {
+            during = now;
+            applied = true;
+            return .applied;
+        }
+        fn passOver(_: *anyopaque, _: *const entry_mod.Entry) ?silent_loss.Damage {
+            return null;
+        }
+        fn set(_: *anyopaque, s: ?InboundSkip) void {
+            now = s;
+        }
+    };
+    var unused: u8 = 0;
+    var out: ReplayOutcome = .{};
+    replayOneEntry(.{ .raft_log = &raft_log, .watermark = 1, .skips = &skips, .shard_id = 0, .apply = .{ .ctx = &unused, .apply = Seen.apply, .pass_over = Seen.passOver, .inbound_skip = Seen.set } }, &e, &out);
+    try std.testing.expect(Seen.applied);
+    try std.testing.expect(Seen.during.?.skips(4) and !Seen.during.?.skips(3));
+    try std.testing.expectEqual(@as(u64, 1), Seen.during.?.index);
+    try std.testing.expect(Seen.now == null);
+    try std.testing.expectEqual(@as(u64, 1), out.applied_through);
 }

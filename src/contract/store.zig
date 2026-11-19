@@ -23,7 +23,43 @@ pub const AppliedMessage = struct {
     /// Refused because its sender built it wrong, not because its target
     /// said no: counted and logged apart from ordinary refusals.
     sender_bug: ?SenderBug = null,
+    /// A repair skipped it: its applier never ran.
+    skipped: bool = false,
 };
+
+/// The repairs skipping an inbound being applied: the messages they named
+/// one at a time (`seqs`), or, `whole`, all it holds past the receiver's
+/// mark. `index` is the halted entry's and `halt_seq` the message a whole
+/// skip's group halted at (0: none known), for what the answers say.
+pub const InboundSkip = struct {
+    index: u64,
+    whole: bool = false,
+    halt_seq: u64 = 0,
+    n: u8 = 0,
+    seqs: [MAX_SEQS]u64 = @splat(0),
+
+    /// An inbound carries at most this many messages (`channel_entries.MAX_BATCH`).
+    pub const MAX_SEQS = 64;
+
+    pub fn all(index: u64) InboundSkip {
+        return .{ .index = index, .whole = true };
+    }
+
+    pub fn one(index: u64, seq: u64) InboundSkip {
+        var s: InboundSkip = .{ .index = index, .n = 1 };
+        s.seqs[0] = seq;
+        return s;
+    }
+
+    /// Whether message `seq` is skipped.
+    pub fn skips(self: *const InboundSkip, seq: u64) bool {
+        if (self.whole) return true;
+        return std.mem.indexOfScalar(u64, self.seqs[0..self.n], seq) != null;
+    }
+};
+
+/// The inbound message being applied, so a halt in its applier can name it.
+pub const Applying = struct { from: u16, seq: u64 };
 
 /// Why a message was refused as its sender's bug.
 pub const SenderBug = enum(u8) {
@@ -122,6 +158,10 @@ pub const Store = struct {
     /// entries' payloads are the inbound's, so this holds until the next
     /// apply.
     messages: std.ArrayListUnmanaged(AppliedMessage) = .empty,
+    /// Set by the shard around an inbound a repair skips (`InboundSkip`).
+    inbound_skip: ?InboundSkip = null,
+    /// The inbound message whose applier is running, or null.
+    applying: ?Applying = null,
     /// Per family, the length of a key prefix under which new keys tend to
     /// come past every key held (a stream's records: an append's first id is
     /// past its stream's last), or 0. Such a family remembers each prefix's

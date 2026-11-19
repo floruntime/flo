@@ -108,6 +108,10 @@ pub const Reason = enum(u16) {
     /// passes them. The shard's cap clears as its other groups and queues
     /// drain. The message says which cap was hit.
     group_held_full = 37,
+    /// A repair skipped the entry, or the channel message, that carried it:
+    /// it never runs, on any node. The message names the repair's entry
+    /// and the message's seq.
+    skipped_by_repair = 38,
 };
 
 /// Whether a refused request took effect.

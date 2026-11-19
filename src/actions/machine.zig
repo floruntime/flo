@@ -424,9 +424,13 @@ fn eqlOpt(a: ?[]const u8, b: ?[]const u8) bool {
 
 /// The answer to a call's start, to the calling workflow's slot.
 fn reply(view: *View, p: ae.Invoke.Value, answer: ae.Answer) ApplyError!void {
+    return replyWhy(view, p, answer, null);
+}
+
+fn replyWhy(view: *View, p: ae.Invoke.Value, answer: ae.Answer, why: ?[]const u8) ApplyError!void {
     const ns: NamespaceId = .of(p.ns);
     var buf: [ae.Reply.max_size]u8 = undefined;
-    const bytes = ae.Reply.encodeInto(&buf, .{ .ns = p.ns, .slot = calls.callerSlot(ns, p.caller_workflow.?), .run = p.run, .answer = answer }) catch return error.Halt;
+    const bytes = ae.Reply.encodeInto(&buf, .{ .ns = p.ns, .slot = calls.callerSlot(ns, p.caller_workflow.?), .run = p.run, .answer = answer, .why = if (why) |w| w[0..@min(w.len, ae.MAX_SKIP_WHY)] else null }) catch return error.Halt;
     try view.send(.user(ns), calls.callerSlot(ns, p.caller_workflow.?), @backingInt(EntryType.call_reply), bytes);
 }
 
@@ -469,7 +473,18 @@ pub const machine: machine_mod.Machine = .{
     .families = &([_]machine_mod.FamilyInfo{ machine_mod.info(Defs), machine_mod.info(Runs) } ++ M.FAMILIES),
     .keys = keys,
     .apply = apply,
+    .skipped = skipped,
 };
+
+/// A call's start a repair skipped: its caller is told, so the step fails
+/// saying so. A start no workflow made has nobody waiting.
+fn skipped(view: *View, e: *const Entry, why: []const u8) ApplyError!void {
+    if (e.header.entry_type != @backingInt(EntryType.action_invoke)) return;
+    var diag: schema.Diagnostic = .{};
+    const p = ae.Invoke.decodeAll(e.payload, &diag) catch return;
+    if (p.caller_workflow == null) return;
+    try replyWhy(view, p, .skipped, why);
+}
 
 // ─── Tests ───────────────────────────────────────────────────────────────
 

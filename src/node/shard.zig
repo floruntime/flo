@@ -618,6 +618,10 @@ pub const Shard = struct {
     /// When `noteSinkRefusal` last logged, and how many it has counted.
     sink_refusal_warn_ms: u64 = 0,
     sink_refusals_total: u64 = 0,
+    /// Processing sink writes a repair skipped, and their bytes: lost to
+    /// their sinks by the operator's choice, counted apart from refusals.
+    sink_skipped_writes: u64 = 0,
+    sink_skipped_bytes: u64 = 0,
     /// The unpark this leader last proposed, and when it last looked.
     unpark_index: u64 = 0,
     unpark_term: u64 = 0,
@@ -1167,7 +1171,7 @@ pub const Shard = struct {
                     // wins over a crash marker too.
                     boot_damage = try collectSkips(allocator, files, watermark, &skips, shard_id);
                     if (boot_damage != null) break :replay;
-                    if (marker.crashed) |*c| if (skips.holds(&.{ .index = c.index, .term = c.term, .crc = c.entry_crc })) marker.skipped();
+                    if (marker.crashed) |*c| if (skips.namesEntry(c.index, c.term, c.entry_crc)) marker.skipped();
                     const replayed = replaySegments(allocator, files, partition, &replay_registry, if (cold_boot) 0 else watermark, &raft_node.log, shard_id, &losses, &marker, &skips, boot, workflow_handler);
                     if (replayed.cancelled) return error.BootCancelled;
                     if (replayed.blocked) |b| return refuseBlockedRead(shard_id, b.name, b.err);
@@ -1583,6 +1587,13 @@ pub const Shard = struct {
     /// A sink's write its target refused for good: its record is lost to
     /// that sink. Counted by sender and reason, and logged at most once a
     /// minute naming both.
+    fn noteSinkSkipped(self: *Shard, m: *const contract_store.AppliedMessage) void {
+        self.sink_skipped_writes += 1;
+        self.sink_skipped_bytes += m.entry.payload.len;
+        var lb: [96]u8 = undefined;
+        log.err("shard {d}: a repair skipped a processing sink's write to {s} sent by shard {d} ({d} bytes); its records are lost to that sink ({d} skipped writes here so far)", .{ self.id, targetLabel(&m.entry, &lb), m.from, m.entry.payload.len, self.sink_skipped_writes });
+    }
+
     fn noteSinkRefusal(self: *Shard, m: *const contract_store.AppliedMessage, r: persistence_mod.Refused) void {
         if (m.from < self.channel.sink_refusals.len) self.channel.sink_refusals[m.from].getPtr(r.refusal.reason).* += 1;
         self.sink_refusals_total += 1;
@@ -3795,6 +3806,8 @@ pub const Shard = struct {
                     return answer(self, conn, req.header.request_id, &done);
                 }
                 var buf: [320]u8 = undefined;
+                if (around != null) if (self.staleSkipMessage(&buf, proposed.index)) |why|
+                    return self.sendRefusal(conn, req.header.request_id, .bad_request, proto.notRun(why));
                 const message = if (around == null) "shard is halted, and your write's entry can't be read back right now to say whether it took effect; do not resend" else self.pendingMessage(&buf, proposed.index);
                 return self.sendRefusal(conn, req.header.request_id, .outcome_pending, .{ .reason = .shard_halted, .ran = .unknown, .message = message });
             };
@@ -4887,7 +4900,13 @@ pub const Shard = struct {
     fn halt(self: *Shard, e: *const entry_mod.Entry, comptime fmt: []const u8, args: anytype) void {
         if (self.halted != null) return;
         const type_name = std.enums.tagName(entry_mod.EntryType, @fromBackingInt(@intCast(e.header.entry_type))) orelse "unknown";
-        self.halted = Halt.init(e, "entry {d} ({s}): " ++ fmt, .{ e.header.index, type_name } ++ args);
+        // Inside an inbound: the message whose applier halted, which a
+        // repair can skip alone (`flo cluster repair skip --seq`).
+        const msg = if (e.header.entry_type == @backingInt(entry_mod.EntryType.channel_inbound)) self.defaultPartition().store.applying else null;
+        var mb: [64]u8 = undefined;
+        const at = if (msg) |m| std.fmt.bufPrint(&mb, ", message {d} from shard {d}", .{ m.seq, m.from }) catch "" else "";
+        self.halted = Halt.init(e, "entry {d} ({s}){s}: " ++ fmt, .{ e.header.index, type_name, at } ++ args);
+        self.halted.?.message = msg;
         const raft = self.raft_node;
         raft.halt_at = .{ .index = e.header.index, .term = e.header.term, .crc = e.header.crc32c };
         raft.last_applied = e.header.index - 1;
@@ -4922,6 +4941,17 @@ pub const Shard = struct {
             if (self.read_blocked) self.clearReadBlocked();
             const skip = repair.Skip.decode(&e) orelse continue;
             if (skip.index != h.index or skip.term != h.term or skip.crc != h.crc) continue;
+            // An inbound halts at one message: a skip of another one leaves
+            // it halted there (it halted at the next after an earlier skip,
+            // or an offline repair named the wrong one).
+            const at_seq: u64 = if (h.message) |m| m.seq else 0;
+            if (skip.seq != 0 and skip.seq != at_seq) continue;
+            // One proposed at a halt of this entry it already got past
+            // (`Skips.stale`): a boot wouldn't take it either.
+            if (self.skips.stale(&skip)) {
+                log.warn("shard {d}: the repair at entry {d} was proposed at a halt of entry {d} an earlier repair already went past; it skips nothing, and the shard stays halted at message {d}", .{ self.id, idx, h.index, at_seq });
+                continue;
+            }
             self.skips.add(self.allocator, &skip) catch {
                 // Looked at again on the next call.
                 self.skip_scan_from = idx;
@@ -4947,10 +4977,12 @@ pub const Shard = struct {
     /// it takes now and goes on past.
     fn repairedOpaque(ctx: ?*anyopaque, h: raft_node_mod.HaltAt) bool {
         const self: *Shard = @ptrCast(@alignCast(ctx.?));
-        if (self.skips.holds(&.{ .index = h.index, .term = h.term, .crc = h.crc })) return true;
-        const halted = self.halted orelse return false;
-        if (halted.index != h.index or halted.term != h.term or halted.crc != h.crc) return false;
-        return self.resumePastSkip() and self.halted == null;
+        // Its own halt: repaired once a skip covers the message it halted at,
+        // which it takes now. A peer's halt names no message, and the peer
+        // meets the skips this shard went past it on.
+        if (self.halted) |*x| if (x.index == h.index and x.term == h.term and x.crc == h.crc)
+            return self.resumePastSkip() and self.halted == null;
+        return self.skips.namesEntry(h.index, h.term, h.crc);
     }
 
     /// A repair skip applied. Where its entry was skipped, or lies below
@@ -4965,6 +4997,12 @@ pub const Shard = struct {
             return true;
         };
         if (self.skips.holds(&skip)) return true;
+        // Stale: proposed at a halt of its entry the shard got past under an
+        // earlier skip, so it skips nothing here or at boot.
+        if (self.skips.stale(&skip)) {
+            log.warn("shard {d}: the repair at entry {d} was proposed at a halt of entry {d} an earlier repair already went past; it skips nothing", .{ self.id, at, skip.index });
+            return true;
+        }
         if (skip.index >= at) {
             log.warn("shard {d}: the repair at entry {d} names entry {d}, not one before it; it skips nothing", .{ self.id, at, skip.index });
             return true;
@@ -5071,6 +5109,22 @@ pub const Shard = struct {
         return std.fmt.bufPrint(buf, "shard {d} is halted at entry {d}; your write is entry {d} and will apply when the shard resumes — do not resend", .{ self.id, h.index, index }) catch "shard is halted; your write will apply when the shard resumes — do not resend";
     }
 
+    /// The answer to the repair skip committed at `index` when it is stale
+    /// (`Skips.stale`): proposed at a halt an earlier skip already took the
+    /// shard past, so it skipped nothing. Null for any other entry.
+    fn staleSkipMessage(self: *Shard, buf: []u8, index: u64) ?[]const u8 {
+        const e = switch (self.raft_node.log.readForApply(index, self.apply_buf)) {
+            .found => |x| x,
+            else => return null,
+        };
+        const skip = repair.Skip.decode(&e) orelse return null;
+        if (self.skips.took(&skip) or !self.skips.stale(&skip)) return null;
+        const at: u64 = if (skip.halt_seq != 0) skip.halt_seq else skip.seq;
+        const now = if (self.halted) |*h| if (h.index == skip.index) h.message else null else null;
+        if (now) |m| return std.fmt.bufPrint(buf, "stale: an earlier skip already passed this halt (message {d} of entry {d}); this one, entry {d}, skips nothing. The shard is halted at message {d} now: skip that one", .{ at, skip.index, index, m.seq }) catch "stale: an earlier skip already passed this halt; this one skips nothing";
+        return std.fmt.bufPrint(buf, "stale: an earlier skip already passed this halt (message {d} of entry {d}); this one, entry {d}, skips nothing", .{ at, skip.index, index }) catch "stale: an earlier skip already passed this halt; this one skips nothing";
+    }
+
     /// What a write to a halted shard is refused with.
     fn haltedMessage(self: *const Shard, buf: []u8) []const u8 {
         const h = &(self.halted orelse return "unavailable: shard is halted");
@@ -5117,7 +5171,9 @@ pub const Shard = struct {
                 continue;
             }
             var buf: [320]u8 = undefined;
-            self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .outcome_pending, .{ .reason = .shard_halted, .ran = .unknown, .message = self.pendingMessage(&buf, slot.index) });
+            if (self.staleSkipMessage(&buf, slot.index)) |why| {
+                self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .bad_request, proto.notRun(why));
+            } else self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .outcome_pending, .{ .reason = .shard_halted, .ran = .unknown, .message = self.pendingMessage(&buf, slot.index) });
             self.endPending(slot);
         }
     }
@@ -5408,6 +5464,8 @@ pub const Shard = struct {
                 for (self.channel.sink_refusals) |by_reason| n += by_reason.get(k);
                 sm.channel_sink_refusals.getPtr(k).store(n, .monotonic);
             }
+            sm.channel_sink_skipped_writes.store(self.sink_skipped_writes, .monotonic);
+            sm.channel_sink_skipped_bytes.store(self.sink_skipped_bytes, .monotonic);
             self.publishParked(sm);
             sm.bar_last.store(self.defaultPartition().last_bar, .monotonic);
             sm.bar_bytes.store(self.defaultPartition().bar_bytes, .monotonic);
@@ -5434,6 +5492,8 @@ pub const Shard = struct {
             slot.halt_index.store(h.index, .monotonic);
             slot.halt_term.store(h.term, .monotonic);
             slot.halt_crc.store(h.crc, .monotonic);
+            slot.halt_from.store(if (h.message) |m| m.from else 0, .monotonic);
+            slot.halt_seq.store(if (h.message) |m| m.seq else 0, .monotonic);
         }
         const raft = self.raft_node;
         // In `healthState`'s own order, strongest first, so a block that then
@@ -5934,7 +5994,14 @@ pub const Shard = struct {
                             log.info("shard {d}: committed entries are readable again; applying from {d}", .{ self.id, next_idx });
                         }
                         spent += applyCost(&e);
-                        if (replay.skippedHere(&self.skips, &e)) {
+                        // A skipped inbound applies its skip (`channels.zig`):
+                        // its messages are answered and its seqs taken.
+                        const skipped_inbound = replay.skippedHere(&self.skips, &e) and e.header.entry_type == @backingInt(entry_mod.EntryType.channel_inbound);
+                        if (skipped_inbound) self.defaultPartition().store.inbound_skip = self.skips.inboundOf(&e).?;
+                        defer if (skipped_inbound) {
+                            self.defaultPartition().store.inbound_skip = null;
+                        };
+                        if (!skipped_inbound and replay.skippedHere(&self.skips, &e)) {
                             self.last_entry_applied = false;
                             self.last_result.reset(&e);
                             self.defaultPartition().passOverSkipped(&e) catch |err| {
@@ -6092,7 +6159,9 @@ pub const Shard = struct {
             entry.header.entry_type == @backingInt(entry_mod.EntryType.channel_unpark))
         {
             for (self.defaultPartition().store.messages.items) |*m| {
-                if (m.sender_bug) |bug| self.noteSenderBug(m, bug) else if (m.entry.header.flags & entry_mod.Flags.SINK != 0) if (m.result.refused()) |r| self.noteSinkRefusal(m, r);
+                if (m.skipped) {
+                    if (m.entry.header.flags & entry_mod.Flags.SINK != 0) self.noteSinkSkipped(m);
+                } else if (m.sender_bug) |bug| self.noteSenderBug(m, bug) else if (m.entry.header.flags & entry_mod.Flags.SINK != 0) if (m.result.refused()) |r| self.noteSinkRefusal(m, r);
                 self.noteAnswerWithoutCall(m);
                 self.afterApply(&m.entry, &m.result);
             }
@@ -7952,6 +8021,40 @@ pub const Shard = struct {
             const text = std.fmt.bufPrint(&msg, "unavailable: only node(s) {any} of {d} voters are known halted at entry {d} (term {d}); a skip needs {d}. A voter that halted alone is diverged instead, and one that hasn't answered lately doesn't count — retry once they answer (flo cluster members shows each node's halt)", .{ halted, voters, ask.index, target.term, raft.quorum() }) catch "unavailable: no majority is halted at that entry";
             return shard.sendRefusal(conn, rid, .unavailable, proto.notRun(text));
         }
+        // A channel inbound: one message of it, or all of them, by the
+        // operator's explicit choice when the halt is at a known message.
+        const inbound = etype == @backingInt(entry_mod.EntryType.channel_inbound);
+        var from: u16 = 0;
+        var first_seq: u64 = 0;
+        var last_seq: u64 = 0;
+        if (inbound) {
+            var diag: schema.Diagnostic = .{};
+            if (@import("../protocol/channel_entries.zig").Inbound.decodeAll(e.payload, &diag)) |p| {
+                from = p.from;
+                first_seq = p.first_seq;
+                var it = p.messages.iterator();
+                var n: u64 = 0;
+                while (it.next() catch null) |_| n += 1;
+                last_seq = if (n == 0) 0 else p.first_seq + n - 1;
+            } else |_| {}
+        }
+        const halt_seq: u64 = if (shard.halted) |*h| (if (h.message) |m| m.seq else 0) else 0;
+        if (ask.seq != 0 and !inbound)
+            return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "--seq names a message of a channel inbound; entry {d} isn't one, and is skipped whole", .{ask.index}) catch "not a channel inbound");
+        if (ask.seq != 0 and ask.whole)
+            return shard.sendErrorResponse(conn, rid, .bad_request, "--seq and --whole-entry are two different repairs; give one");
+        // Not known here: a halt outside any one message (an inbound that
+        // won't decode). A seq this leader can't check against its own halt
+        // may name a message no replica halts at, which boot would skip and
+        // a live replica wouldn't.
+        if (ask.seq != 0 and halt_seq == 0)
+            return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "the leader halted at entry {d} but not at a message it can name, so --seq {d} can't be checked against the halt: skip the whole entry (--whole-entry), or see where a halted member stopped (its /status halt_message) and repair it offline", .{ ask.index, ask.seq }) catch "the leader doesn't know the halting message: use --whole-entry");
+        if (ask.seq != 0 and halt_seq != 0 and ask.seq != halt_seq)
+            return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "the group halted at message {d} of entry {d}, not {d}: only the message it halted at is skipped alone", .{ halt_seq, ask.index, ask.seq }) catch "not the halting message");
+        if (ask.seq != 0 and (ask.seq < first_seq or ask.seq > last_seq))
+            return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "entry {d} carries messages {d}..{d} from shard {d}; it has no message {d}", .{ ask.index, first_seq, last_seq, from, ask.seq }) catch "no such message");
+        if (ask.yes and inbound and halt_seq != 0 and ask.seq == 0 and !ask.whole)
+            return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "entry {d} is a channel inbound from shard {d} that halted at message {d}: skip that message alone (--seq {d}) or every message it carries, {d}..{d} (--whole-entry)", .{ ask.index, from, halt_seq, halt_seq, first_seq, last_seq }) catch "choose --seq or --whole-entry");
         if (!ask.yes) {
             const answer: cluster_wire.RepairSkipAnswer = .{
                 .skipped = false,
@@ -7961,12 +8064,16 @@ pub const Shard = struct {
                 .entry_size = entry_size,
                 .voters = voters,
                 .halted = halted,
+                .from = from,
+                .first_seq = first_seq,
+                .last_seq = last_seq,
+                .halt_seq = halt_seq,
             };
             var buf: [cluster_wire.RepairSkipAnswer.maxSize(raft_node_mod.MAX_PEERS + 1)]u8 = undefined;
             return shard.sendOkResponse(conn, rid, answer.encode(&buf));
         }
         var payload: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
-        const skip: repair.Skip = .{ .index = target.index, .term = target.term, .crc = target.crc, .reason = ask.reason };
+        const skip: repair.Skip = .{ .index = target.index, .term = target.term, .crc = target.crc, .seq = ask.seq, .halt_seq = halt_seq, .reason = ask.reason };
         const proposed = raft.propose(.repair_skip, entry_mod.Flags.NONE, skip.encode(&payload)) catch |err| return shard.sendRefusal(conn, rid, .unavailable, proto.notRun(switch (err) {
             error.NotLeader => "unavailable: the leader changed — retry",
             error.WritesStopped => "unavailable: the leader stopped taking writes (an entry could not reach disk); restart it, then repair",
@@ -7977,6 +8084,8 @@ pub const Shard = struct {
     }
 
     fn respondSkipCommitted(shard: *Shard, conn: *Connection, request_id: u64, result: *const persistence_mod.Result) void {
+        var why_buf: [320]u8 = undefined;
+        if (shard.staleSkipMessage(&why_buf, result.index)) |why| return shard.sendRefusal(conn, request_id, .bad_request, proto.notRun(why));
         const answer: cluster_wire.RepairSkipAnswer = .{ .skipped = true, .skip_index = result.index, .entry = .{ .index = 0, .term = 0, .crc = 0 }, .entry_type = 0, .entry_size = 0, .voters = 0, .halted = &.{} };
         var buf: [cluster_wire.RepairSkipAnswer.maxSize(0)]u8 = undefined;
         shard.sendOkResponse(conn, request_id, answer.encode(&buf));
@@ -8979,11 +9088,24 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
     // as applied already, or any other, must not find the last one's.
     partition.store.messages.clearRetainingCapacity();
     noteNamespace(partition, entry);
-    const applied = partition.applyRouted(entry) catch |err| return .{ .partition_reject = err };
+    const applied = partition.applyRouted(entry) catch |err| taken: {
+        // An inbound a live halt stopped in: the ring took it before its
+        // messages halted, and a repair's skip applies it again. Only the
+        // contract's state is touched: the take that failed appended
+        // nothing, the ring and warm store keep the copy the first take
+        // made, and the router (which routes an inbound nowhere) saw it
+        // then; the failed take stops before reaching it.
+        // The halting apply left no state (the machine's writes roll back
+        // with its error), and the receiver's mark per sender (`In.applied`)
+        // is the sole dedupe: a message at or below it is passed over, so
+        // none applies twice, whatever its earlier takes did.
+        if (err == error.IndexNotIncreasing and etype == .channel_inbound and partition.store.inbound_skip != null) break :taken null;
+        return .{ .partition_reject = err };
+    };
     if (contract_machine.ownerOf(machines, etype)) |m| {
         // The router has seen every index up to its own: one at or below it
         // was applied already, and must not be twice.
-        if (applied.route == .skipped_already_applied) return .applied;
+        if (applied) |a| if (a.route == .skipped_already_applied) return .applied;
         contract_machine.applyEntry(m, &partition.store, &partition.apply_scratch, entry, out) catch |err| return .{ .applier_failed = err };
         if (etype == .channel_inbound or etype == .channel_unpark) for (partition.store.messages.items) |*msg| {
             // A refused message took no effect: its bytes, maybe a sender's
@@ -9133,7 +9255,17 @@ const PartitionReplay = struct {
     result: persistence_mod.Result = .{},
 
     fn applier(self: *PartitionReplay) ReplayApply {
-        return .{ .ctx = self, .apply = apply, .pass_over = passOver };
+        return .{ .ctx = self, .apply = apply, .pass_over = passOver, .inbound_skip = inboundSkip, .halting_message = haltingMessage };
+    }
+
+    fn haltingMessage(ctx: *anyopaque) ?replay.Applying {
+        const self: *PartitionReplay = @ptrCast(@alignCast(ctx));
+        return self.partition.store.applying;
+    }
+
+    fn inboundSkip(ctx: *anyopaque, skip: ?replay.InboundSkip) void {
+        const self: *PartitionReplay = @ptrCast(@alignCast(ctx));
+        self.partition.store.inbound_skip = skip;
     }
 
     fn apply(ctx: *anyopaque, entry: *const entry_mod.Entry) Verdict {
@@ -22610,8 +22742,13 @@ const AdminTest = struct {
 
     /// A repair skip of `index` from `origin`.
     fn repairSkip(self: *AdminTest, origin: run_mod.Origin, index: u64, yes: bool, buf: []u8) !?proto.Response {
+        return self.repairSkipAsk(origin, .{ .index = index, .yes = yes, .reason = "test" }, buf);
+    }
+
+    /// The repair skip `ask` from `origin`: null when it parked.
+    fn repairSkipAsk(self: *AdminTest, origin: run_mod.Origin, want: cluster_wire.RepairSkip, buf: []u8) !?proto.Response {
         var v: [cluster_wire.RepairSkip.MAX_SIZE]u8 = undefined;
-        const body = try (cluster_wire.RepairSkip{ .index = index, .yes = yes, .reason = "test" }).encode(&v);
+        const body = try want.encode(&v);
         self.shard.runRequest(self.conn, try ParkTest.request(.cluster_repair_skip, 7, "", "", body, ""), origin);
         if (self.conn.response_deferred) return null;
         var into: [1]proto.Response = undefined;
@@ -24596,6 +24733,186 @@ test "Shard: a second skip for the same entry changes nothing, live or after a r
     try std.testing.expectEqual(@as(usize, 1), shard.skips.named.items.len);
 }
 
+/// Propose a skip of message `seq` of inbound `h` (0: all of it), as a
+/// repair of a group halted at message `halt_seq` commits one.
+fn proposeInboundSkip(shard: *Shard, h: u64, seq: u64, halt_seq: u64) !void {
+    var e_buf: [4096]u8 = undefined;
+    const halted = shard.raft_node.log.getEntryCopy(h, &e_buf) orelse return error.NoEntry;
+    var skip = repair.Skip.of(&halted, "test");
+    skip.seq = seq;
+    skip.halt_seq = halt_seq;
+    var p: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
+    _ = try shard.raft_node.propose(.repair_skip, entry_mod.Flags.NONE, skip.encode(&p));
+}
+
+test "Shard: an inbound whose messages halt it in turn is skipped a message at a time, then whole, live and after a restart" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const ce = @import("../protocol/channel_entries.zig");
+    var h: u64 = 0;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        // Its hooks point at this copy.
+        shard.wireHandlerShardPtrs();
+        // Three messages no applier on this build takes: each halts the shard.
+        var mb: [512]u8 = undefined;
+        var w: schema.Writer = .{ .buf = &mb };
+        for (0..3) |_| try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.cg_create), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = "" });
+        var ib: [1024]u8 = undefined;
+        h = (try shard.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 1, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 3 } }))).index;
+        try std.testing.expect(!shard.applyCommitted());
+        try std.testing.expectEqual(@as(u64, 1), shard.halted.?.message.?.seq);
+        // Message 1 skipped: it halts at 2, at the same entry.
+        try proposeInboundSkip(&shard, h, 1, 1);
+        try std.testing.expect(!shard.applyCommitted());
+        try std.testing.expectEqual(h, shard.halted.?.index);
+        try std.testing.expectEqual(@as(u64, 2), shard.halted.?.message.?.seq);
+        // Not repaired while it halts at a message no skip covers; a peer
+        // halted there is, once this shard goes past it.
+        const at = shard.raft_node.halt_at.?;
+        try std.testing.expect(!shard.raft_node.repaired.of(at));
+        // Message 2 skipped too: it halts at 3.
+        try proposeInboundSkip(&shard, h, 2, 2);
+        try std.testing.expect(!shard.applyCommitted());
+        try std.testing.expectEqual(@as(u64, 3), shard.halted.?.message.?.seq);
+        // Then the whole entry: it goes on, every seq taken.
+        try proposeInboundSkip(&shard, h, 0, 3);
+        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expect(shard.halted == null and shard.offline == null);
+        try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1).?.applied);
+        try std.testing.expectEqual(@as(usize, 3), shard.skips.named.items.len);
+        try std.testing.expect(shard.raft_node.repaired.of(at));
+        try shard.flushSegmentToDisk();
+    }
+    var shard = try t.open();
+    defer shard.deinit();
+    shard.applyDeferredTail();
+    try std.testing.expect(shard.halted == null and shard.offline == null);
+    try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1).?.applied);
+}
+
+test "Shard: a second skip of an inbound's halt, committed with the first, skips nothing, live or after a restart" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const ce = @import("../protocol/channel_entries.zig");
+    var h: u64 = 0;
+    var live: SkipState = undefined;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+        // Message 1 halts (no applier on this build); 2 and 3 are puts.
+        var mb: [1024]u8 = undefined;
+        var w: schema.Writer = .{ .buf = &mb };
+        try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.cg_create), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = "" });
+        var pb: [2][128]u8 = undefined;
+        var kb: [2][32]u8 = undefined;
+        var ki: usize = 0;
+        for (0..2) |i| {
+            // Keys this shard owns.
+            const key = while (true) : (ki += 1) {
+                const k = try std.fmt.bufPrint(&kb[i], "{s}in{d}", .{ ns_table.DEFAULT.bytes(), ki });
+                if (shard.router.hashToShard(node_router.routeNsKey(.default, k[ns_table.DEFAULT.bytes().len..])) == shard.id) break k;
+            };
+            ki += 1;
+            const put = try kv_entries.Put.encodeInto(&pb[i], .{ .key = key, .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null });
+            try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, key[ns_table.DEFAULT.bytes().len..]))), .entry_type = @backingInt(entry_mod.EntryType.kv_put), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = put });
+        }
+        var ib: [2048]u8 = undefined;
+        h = (try shard.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 1, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 3 } }))).index;
+        try std.testing.expect(!shard.applyCommitted());
+        try std.testing.expectEqual(@as(u64, 1), shard.halted.?.message.?.seq);
+        const kv_before = shard.kv_handler.kv.countLive();
+        // Both repairs of the halt at message 1 commit before the shard
+        // looks: message 1 alone, then the whole entry.
+        try proposeInboundSkip(&shard, h, 1, 1);
+        try proposeInboundSkip(&shard, h, 0, 1);
+        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expect(shard.halted == null and shard.offline == null);
+        try std.testing.expectEqual(@as(u64, 0), shard.losses.total(.applied_skipped));
+        // The first took it past; the second skipped nothing.
+        try std.testing.expectEqual(@as(usize, 1), shard.skips.named.items.len);
+        try std.testing.expectEqual(kv_before + 2, shard.kv_handler.kv.countLive());
+        try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1).?.applied);
+        live = SkipState.of(&shard, h);
+        try shard.flushSegmentToDisk();
+    }
+    var shard = try t.open();
+    defer shard.deinit();
+    shard.applyDeferredTail();
+    try std.testing.expect(shard.halted == null and shard.offline == null);
+    try std.testing.expectEqual(@as(usize, 1), shard.skips.named.items.len);
+    try std.testing.expectEqual(live, SkipState.of(&shard, h));
+    try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1).?.applied);
+}
+
+test "Shard: a second skip of an inbound's halt doesn't take it past the next message that halts it" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const ce = @import("../protocol/channel_entries.zig");
+    var h: u64 = 0;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+        // Two messages no applier on this build takes.
+        var mb: [512]u8 = undefined;
+        var w: schema.Writer = .{ .buf = &mb };
+        for (0..2) |_| try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.cg_create), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = "" });
+        var ib: [1024]u8 = undefined;
+        h = (try shard.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 1, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } }))).index;
+        try std.testing.expect(!shard.applyCommitted());
+        // Both proposed at the halt at message 1; the whole-entry one is
+        // stale once message 1's took the shard past it.
+        try proposeInboundSkip(&shard, h, 1, 1);
+        try proposeInboundSkip(&shard, h, 0, 1);
+        try std.testing.expect(!shard.applyCommitted());
+        try std.testing.expectEqual(h, shard.halted.?.index);
+        try std.testing.expectEqual(@as(u64, 2), shard.halted.?.message.?.seq);
+        try shard.flushSegmentToDisk();
+    }
+    // A boot holds it to the same: halted at message 2.
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+        shard.applyDeferredTail();
+        try std.testing.expectEqual(h, shard.halted.?.index);
+        try std.testing.expectEqual(@as(u64, 2), shard.halted.?.message.?.seq);
+        // A skip proposed at that halt takes it past.
+        try proposeInboundSkip(&shard, h, 2, 2);
+        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expect(shard.halted == null and shard.offline == null);
+        try std.testing.expectEqual(@as(u64, 2), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1).?.applied);
+    }
+}
+
+test "Shard: an inbound one message's skip took the shard past counts as repaired for a peer halted there" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const ce = @import("../protocol/channel_entries.zig");
+    var shard = try t.open();
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    var mb: [128]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &mb };
+    try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.cg_create), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = "" });
+    var ib: [256]u8 = undefined;
+    const h = (try shard.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 1, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } }))).index;
+    try std.testing.expect(!shard.applyCommitted());
+    const at = shard.raft_node.halt_at.?;
+    try proposeInboundSkip(&shard, h, 1, 1);
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expect(shard.halted == null);
+    // A peer halted at it meets the same skip: no "upgrade" for it.
+    try std.testing.expect(shard.raft_node.repaired.of(at));
+}
+
 test "Shard: a skip that names no entry of this log, an entry after it, or another skip skips nothing" {
     var t: DamageTest = undefined;
     try t.init();
@@ -25837,6 +26154,77 @@ test "Shard: a repair skip runs only from the admin socket, on a leader halted a
     // Asked again, it is skipped already, not a build split.
     t.conn.response_deferred = false;
     try expectAnswer((try t.repairSkip(.admin, h, false, &buf)).?, .bad_request, "skipped already");
+}
+
+test "Shard: a repair skip of one message needs the leader to know the message it halted at" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    try std.testing.expect(t.shard.applyCommitted());
+    try ParkTest.joinPeer(&t.shard);
+    var buf: [1024]u8 = undefined;
+    // An inbound whose first message is past the next seq from its sender
+    // halts outside any one message.
+    const ce = @import("../protocol/channel_entries.zig");
+    var mb: [128]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &mb };
+    try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.cg_create), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = "" });
+    var ib: [256]u8 = undefined;
+    const h = (try raft.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 1, .first_seq = 5, .messages = .{ .bytes = w.written(), .count = 1 } }))).index;
+    raft.peers[0].sent_up_to = h;
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = h, .from = 2 });
+    try std.testing.expect(!t.shard.applyCommitted());
+    const halt = raft.halt_at.?;
+    try std.testing.expect(t.shard.halted.?.message == null);
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = h, .from = 2, .halt = halt });
+    // Message 5 is the one it carries, but the leader can't say it halted there.
+    try expectAnswer((try t.repairSkipAsk(.admin, .{ .index = h, .seq = 5, .yes = true, .reason = "test" }, &buf)).?, .bad_request, "--whole-entry");
+    try std.testing.expectEqual(h, raft.log.lastIndex());
+    // The whole entry is skipped.
+    try std.testing.expect((try t.repairSkipAsk(.peer, .{ .index = h, .whole = true, .yes = true, .reason = "test" }, &buf)) == null);
+}
+
+test "Shard: a repair skip proposed at a halt an earlier one already passed answers stale, applied or still halted" {
+    const ce = @import("../protocol/channel_entries.zig");
+    for ([_]u64{ 1, 2 }) |count| {
+        var t: AdminTest = undefined;
+        try t.init(1, .bootstrap);
+        defer t.deinit();
+        const raft = t.shard.raft_node;
+        try std.testing.expect(t.shard.applyCommitted());
+        try ParkTest.joinPeer(&t.shard);
+        var buf: [2048]u8 = undefined;
+        // `count` messages no applier on this build takes.
+        var mb: [512]u8 = undefined;
+        var w: schema.Writer = .{ .buf = &mb };
+        for (0..count) |_| try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.cg_create), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = "" });
+        var ib: [1024]u8 = undefined;
+        const h = (try raft.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 1, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = @intCast(count) } }))).index;
+        raft.peers[0].sent_up_to = h;
+        raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = h, .from = 2 });
+        try std.testing.expect(!t.shard.applyCommitted());
+        const halt = raft.halt_at.?;
+        raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = h, .from = 2, .halt = halt });
+        // Both repairs of the halt at message 1, proposed before either commits.
+        try std.testing.expect((try t.repairSkipAsk(.peer, .{ .index = h, .seq = 1, .yes = true, .reason = "test" }, &buf)) == null);
+        t.conn.response_deferred = false;
+        try std.testing.expect((try t.repairSkipAsk(.peer, .{ .index = h, .whole = true, .yes = true, .reason = "test" }, &buf)) == null);
+        const s = raft.log.lastIndex();
+        raft.peers[0].sent_up_to = s;
+        raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = s, .from = 2, .halt = halt });
+        _ = t.shard.applyCommitted();
+        // One message: the first took it past. Two: it halts at the second.
+        try std.testing.expectEqual(count == 2, t.shard.halted != null);
+        var into: [2]proto.Response = undefined;
+        try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &into);
+        var stale: usize = 0;
+        for (into) |r| if (std.mem.indexOf(u8, r.data, "stale: an earlier skip already passed this halt") != null) {
+            stale += 1;
+            try std.testing.expectEqual(proto.StatusCode.bad_request, r.getStatus());
+        };
+        try std.testing.expectEqual(@as(usize, 1), stale);
+    }
 }
 
 test "Shard: a halted sync leader flushes its own repair skip, which commits only once its copy is on disk" {
@@ -29430,6 +29818,61 @@ test "Shard: a step's call of an action on another shard is answered there, and 
     _ = try proposeAction(a, .step_call_clear, action_entries.CallClear.Value{ .ns = ns_table.DEFAULT.int(), .slot = calls_machine.callerSlot(.default, n.workflow), .run = rid });
     two.settle();
     try std.testing.expect(callIn(a, n.workflow, rid) == null);
+}
+
+test "Shard: a step's call whose start a repair skipped is refused, saying so, and its action never runs" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var ab: [16]u8 = undefined;
+    var wb: [16]u8 = undefined;
+    const n = try callNames(&two, 1, 0, &ab, &wb);
+    var rb: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), a.raft_node.current_term, &rb);
+    _ = try proposeAction(b, .action_register, testRegister(n.action));
+    two.settle();
+    try proposeCall(a, n.action, n.workflow, rid, false);
+    two.settle();
+    // The inbound carrying the start is skipped, as a committed repair has it.
+    b.defaultPartition().store.inbound_skip = .all(4242);
+    pumpChannels(&two);
+    b.defaultPartition().store.inbound_skip = null;
+    pumpChannels(&two);
+    try std.testing.expect(ActionsHandler.for_tests.run(b, .default, rid) == null);
+    const c = callIn(a, n.workflow, rid).?;
+    try std.testing.expectEqual(calls_machine.State.refused, c.state);
+    try std.testing.expect(std.mem.indexOf(u8, c.outcome, "skipped by repair (entry 4242") != null);
+}
+
+test "Shard: a call whose run's end a repair skipped settles refused, saying so, rather than wait for ever" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var ab: [16]u8 = undefined;
+    var wb: [16]u8 = undefined;
+    const n = try callNames(&two, 1, 0, &ab, &wb);
+    var rb: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), a.raft_node.current_term, &rb);
+    _ = try proposeAction(b, .action_register, testRegister(n.action));
+    two.settle();
+    try proposeCall(a, n.action, n.workflow, rid, false);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(calls_machine.State.started, callIn(a, n.workflow, rid).?.state);
+    try completeNext(&two, b, n.action, "{}");
+    // The inbound carrying the run's end, on the caller's shard, is skipped.
+    a.defaultPartition().store.inbound_skip = .all(5151);
+    pumpChannels(&two);
+    a.defaultPartition().store.inbound_skip = null;
+    const c = callIn(a, n.workflow, rid).?;
+    try std.testing.expectEqual(calls_machine.State.refused, c.state);
+    try std.testing.expect(std.mem.indexOf(u8, c.outcome, "skipped by repair (entry 5151") != null);
 }
 
 test "Shard: a call cleared before its run ends, as a cancelled workflow's is, takes the run's end as nothing, and counts it" {

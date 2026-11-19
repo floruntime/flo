@@ -250,27 +250,39 @@ pub const Remove = struct {
 
 /// `cluster.repair_skip`'s request: the entry the group halted at, whether
 /// to skip it (without, the leader says what it would do and changes
-/// nothing), and why.
+/// nothing), and why. For a channel inbound, `seq` names the one message to
+/// skip, or `whole` all it holds; a halt at a known message takes one of the
+/// two.
 pub const RepairSkip = struct {
     index: u64,
     yes: bool,
+    seq: u64 = 0,
+    whole: bool = false,
     reason: []const u8 = "",
 
     pub const MAX_REASON = 256;
-    const FIXED = 9;
+    const FIXED = 18;
     pub const MAX_SIZE = FIXED + MAX_REASON;
 
     pub fn encode(self: RepairSkip, buf: *[MAX_SIZE]u8) error{Malformed}![]const u8 {
         if (self.reason.len > MAX_REASON) return error.Malformed;
         std.mem.writeInt(u64, buf[0..8], self.index, .little);
         buf[8] = @intFromBool(self.yes);
+        std.mem.writeInt(u64, buf[9..17], self.seq, .little);
+        buf[17] = @intFromBool(self.whole);
         @memcpy(buf[FIXED..][0..self.reason.len], self.reason);
         return buf[0 .. FIXED + self.reason.len];
     }
 
     pub fn decode(data: []const u8) error{Malformed}!RepairSkip {
-        if (data.len < FIXED or data.len > MAX_SIZE or data[8] > 1) return error.Malformed;
-        return .{ .index = std.mem.readInt(u64, data[0..8], .little), .yes = data[8] != 0, .reason = data[FIXED..] };
+        if (data.len < FIXED or data.len > MAX_SIZE or data[8] > 1 or data[17] > 1) return error.Malformed;
+        return .{
+            .index = std.mem.readInt(u64, data[0..8], .little),
+            .yes = data[8] != 0,
+            .seq = std.mem.readInt(u64, data[9..17], .little),
+            .whole = data[17] != 0,
+            .reason = data[FIXED..],
+        };
     }
 };
 
@@ -286,8 +298,14 @@ pub const RepairSkipAnswer = struct {
     entry_size: u32,
     voters: u8,
     halted: []const u32,
+    /// For a channel inbound: its sender, the seqs it carries, and the one
+    /// the leader halted at (0: not known, or not an inbound).
+    from: u16 = 0,
+    first_seq: u64 = 0,
+    last_seq: u64 = 0,
+    halt_seq: u64 = 0,
 
-    const FIXED = 1 + 8 + 8 + 8 + 4 + 1 + 4 + 1 + 1;
+    const FIXED = 1 + 8 + 8 + 8 + 4 + 1 + 4 + 1 + 1 + 2 + 8 + 8 + 8;
 
     pub fn maxSize(halted: usize) usize {
         return FIXED + halted * 4;
@@ -304,6 +322,10 @@ pub const RepairSkipAnswer = struct {
         std.mem.writeInt(u32, buf[30..34], self.entry_size, .little);
         buf[34] = self.voters;
         buf[35] = @intCast(self.halted.len);
+        std.mem.writeInt(u16, buf[36..38], self.from, .little);
+        std.mem.writeInt(u64, buf[38..46], self.first_seq, .little);
+        std.mem.writeInt(u64, buf[46..54], self.last_seq, .little);
+        std.mem.writeInt(u64, buf[54..62], self.halt_seq, .little);
         for (self.halted, 0..) |id, i| std.mem.writeInt(u32, buf[FIXED + i * 4 ..][0..4], id, .little);
         return buf[0 .. FIXED + self.halted.len * 4];
     }
@@ -326,6 +348,10 @@ pub const RepairSkipAnswer = struct {
             .entry_size = std.mem.readInt(u32, data[30..34], .little),
             .voters = data[34],
             .halted = ids[0..n],
+            .from = std.mem.readInt(u16, data[36..38], .little),
+            .first_seq = std.mem.readInt(u64, data[38..46], .little),
+            .last_seq = std.mem.readInt(u64, data[46..54], .little),
+            .halt_seq = std.mem.readInt(u64, data[54..62], .little),
         };
     }
 };

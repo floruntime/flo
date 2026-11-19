@@ -798,6 +798,9 @@ pub const ShardMetrics = struct {
     /// A sink's channel messages refused here for good by their target,
     /// by reason, summed over the shards that sent them.
     channel_sink_refusals: std.EnumArray(Reason, Atomic(u64)) = .initFill(Atomic(u64).init(0)),
+    /// Sink writes a repair skipped, and their bytes.
+    channel_sink_skipped_writes: Atomic(u64) = .init(0),
+    channel_sink_skipped_bytes: Atomic(u64) = .init(0),
     /// Payload bytes of the channel messages this shard sent and hasn't
     /// trimmed yet, over every channel (gauge).
     channel_outbox_bytes: Atomic(u64) = Atomic(u64).init(0),
@@ -1037,6 +1040,8 @@ pub const ShardMetrics = struct {
         ts_late: [TS_LATE_EDGES.len]u64,
         channel_sender_bugs: [SENDER_BUGS]u64,
         channel_sink_refusals: std.EnumArray(Reason, u64),
+        channel_sink_skipped_writes: u64,
+        channel_sink_skipped_bytes: u64,
         channel_outbox_bytes: u64,
         channel_parked_messages: u64,
         channel_parked_bytes: u64,
@@ -1112,6 +1117,8 @@ pub const ShardMetrics = struct {
                 break :blk v;
             },
             .channel_outbox_bytes = self.channel_outbox_bytes.load(.monotonic),
+            .channel_sink_skipped_writes = self.channel_sink_skipped_writes.load(.monotonic),
+            .channel_sink_skipped_bytes = self.channel_sink_skipped_bytes.load(.monotonic),
             .channel_sink_refusals = blk: {
                 var r: std.EnumArray(Reason, u64) = .initFill(0);
                 for (std.enums.values(Reason)) |k| r.set(k, self.channel_sink_refusals.getPtrConst(k).load(.monotonic));
@@ -1988,6 +1995,8 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
         const n = snap.channel_sink_refusals.get(k);
         if (n > 0) try writer.print("flo_shard_channel_sink_refusals_total{{shard_id=\"{d}\",reason=\"{s}\"}} {d}\n", .{ snap.shard_id, @tagName(k), n });
     }
+    if (snap.channel_sink_skipped_writes > 0) try writer.print("flo_shard_channel_sink_skipped_writes_total{{shard_id=\"{d}\"}} {d}\nflo_shard_channel_sink_skipped_bytes_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.channel_sink_skipped_writes, snap.shard_id, snap.channel_sink_skipped_bytes });
+
     try writer.print("flo_shard_channel_parked_messages{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.channel_parked_messages });
     try writer.print("flo_shard_channel_parked_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.channel_parked_bytes });
     try writer.print("flo_shard_channel_parked_targets{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.channel_parked_targets });

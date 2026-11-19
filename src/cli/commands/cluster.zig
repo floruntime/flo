@@ -134,6 +134,8 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                     .uintFlag("index", 0, 0, "The entry the cluster halted at (flo cluster members shows it)")
                     .stringFlag("reason", 0, "", "Why, recorded with the repair")
                     .boolFlag("yes", 0, "Skip it")
+                    .uintFlag("seq", 0, 0, "For a channel inbound halted at a message: skip that message alone")
+                    .boolFlag("whole-entry", 0, "For a channel inbound: skip every message it carries")
                     .stringFlag("config", 'c', "", "The node's config, naming its data directory or [admin] socket")
                     .stringFlag("data-dir", 'd', "", "The node's data directory (overrides the config)")
                     .examples(&.{
@@ -384,19 +386,36 @@ fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
         return outcome.localRefusal(ctx, "the admin socket {s} is {d} bytes, past the {d} a Unix socket path may hold, so the node started without one. Set [admin] socket to a shorter path in its config and restart it", .{ path, path.len, stdx.net.UNIX_PATH_MAX });
     }
 
+    const seq = ctx.getUint("seq") orelse 0;
+    const whole = ctx.getBool("whole-entry");
+    if (seq != 0 and whole) return outcome.usage(ctx, "--seq and --whole-entry are two different repairs; give one", .{});
+
     // The dry run first, so what is skipped is always shown.
-    var dry = try askAdmin(ctx, path, .{ .index = index, .yes = false, .reason = reason });
+    var dry = try askAdmin(ctx, path, .{ .index = index, .yes = false, .seq = seq, .whole = whole, .reason = reason });
     defer dry.deinit();
     var ids: [32]u32 = undefined;
     const would = wire.RepairSkipAnswer.decode(dry.data, &ids) catch return outcome.malformed(ctx, "repair answer");
     const type_name = std.enums.tagName(EntryType, @fromBackingInt(would.entry_type)) orelse "unknown";
     ctx.print("\nentry {d}: {s}, term {d}, {d} bytes\n", .{ would.entry.index, type_name, would.entry.term, would.entry_size });
     ctx.print("halted there: node(s) {any}, of {d} voters\n", .{ would.halted, would.voters });
+    const inbound = would.entry_type == @backingInt(EntryType.channel_inbound);
+    if (inbound) {
+        ctx.print("a channel inbound from shard {d}, carrying messages {d}..{d}", .{ would.from, would.first_seq, would.last_seq });
+        if (would.halt_seq != 0) ctx.print("; halted at message {d}", .{would.halt_seq});
+        ctx.print("\n", .{});
+    }
+    if (inbound and would.halt_seq != 0 and seq == 0 and !whole) {
+        return outcome.usage(ctx, "choose the repair: --seq {d} skips message {d} alone, and the others apply; --whole-entry skips every message, {d}..{d}. Each skipped message is answered as skipped by repair (a workflow's step fails saying so; a sink write is lost and counted)", .{ would.halt_seq, would.halt_seq, would.first_seq, would.last_seq });
+    }
     if (!ctx.getBool("yes")) {
-        ctx.print("Would append a repair that skips it: the write never runs, on this build or a later one. Run again with --yes to do it.\n", .{});
+        if (inbound and seq != 0) {
+            ctx.print("Would append a repair that skips message {d} alone: it never runs, on this build or a later one, and is answered as skipped by repair. Run again with --yes to do it.\n", .{seq});
+        } else if (inbound) {
+            ctx.print("Would append a repair that skips messages {d}..{d} (those not applied yet): none runs, on this build or a later one, and each is answered as skipped by repair. Run again with --yes to do it.\n", .{ would.first_seq, would.last_seq });
+        } else ctx.print("Would append a repair that skips it: the write never runs, on this build or a later one. Run again with --yes to do it.\n", .{});
         return;
     }
-    var done = try askAdmin(ctx, path, .{ .index = index, .yes = true, .reason = reason });
+    var done = try askAdmin(ctx, path, .{ .index = index, .yes = true, .seq = seq, .whole = whole, .reason = reason });
     defer done.deinit();
     const skipped = wire.RepairSkipAnswer.decode(done.data, &ids) catch return outcome.malformed(ctx, "repair answer");
     if (!skipped.skipped) return outcome.malformed(ctx, "repair answer");

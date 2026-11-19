@@ -199,6 +199,8 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                     .uintFlag("index", 0, 0, "The entry it halted at")
                     .stringFlag("reason", 0, "", "Why, recorded with the repair")
                     .boolFlag("yes", 0, "Append the repair")
+                    .uintFlag("seq", 0, 0, "For a channel inbound: skip that message alone")
+                    .boolFlag("whole-entry", 0, "For a channel inbound: skip every message it carries")
                     .action(wrapHandler(runRepairSkip)),
             ),
         )
@@ -917,11 +919,31 @@ fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
     const type_name = std.enums.tagName(@import("../../storage/ual/entry.zig").EntryType, @fromBackingInt(halted.header.entry_type)) orelse "unknown";
     ctx.print("\nshard {d}, entry {d}: {s}, term {d}, {d} bytes{s}\n", .{ shard, index, type_name, halted.header.term, halted.payload.len, if (index > sum.commit) " (not committed as last flushed)" else "" });
     offline.skippable(dir, shard, &halted) catch |err| return skipRefusal(ctx, err, shard, index, &halted);
+    // A channel inbound: one message of it or all, the operator's explicit
+    // choice (offline, which message halted it isn't known here: the
+    // shard's /status said, as halt_message).
+    const seq = ctx.getUint("seq") orelse 0;
+    const whole = ctx.getBool("whole-entry");
+    if (seq != 0 and whole) return outcome.usage(ctx, "--seq and --whole-entry are two different repairs; give one", .{});
+    if (halted.header.entry_type == @backingInt(@import("../../storage/ual/entry.zig").EntryType.channel_inbound)) {
+        var diag: @import("../../protocol/schema.zig").Diagnostic = .{};
+        const p = @import("../../protocol/channel_entries.zig").Inbound.decodeAll(halted.payload, &diag) catch null;
+        var n: u64 = 0;
+        if (p) |pp| {
+            var it = pp.messages.iterator();
+            while (it.next() catch null) |_| n += 1;
+        }
+        const first = if (p) |pp| pp.first_seq else 0;
+        const last = if (n == 0) first else first + n - 1;
+        ctx.print("a channel inbound from shard {d}, carrying messages {d}..{d}\n", .{ if (p) |pp| pp.from else 0, first, last });
+        if (seq == 0 and !whole) return outcome.usage(ctx, "choose the repair: --seq <n> skips the message the shard halted at (its /status says, as halt_message) and the others apply; --whole-entry skips every message, {d}..{d}", .{ first, last });
+        if (seq != 0 and (seq < first or seq > last)) return outcome.usage(ctx, "entry {d} carries messages {d}..{d}; it has no message {d}", .{ index, first, last, seq });
+    } else if (seq != 0) return outcome.usage(ctx, "--seq names a message of a channel inbound; entry {d} isn't one, and is skipped whole", .{index});
     if (!ctx.getBool("yes")) {
         ctx.print("Would append a repair at index {d} that skips it: the write never runs, on this build or a later one. Run again with --yes to do it.\n", .{sum.last_index + 1});
         return;
     }
-    const at = offline.repairSkip(ctx.allocator, dir, shard, &sum, &halted, ctx.getString("reason") orelse "") catch |err| switch (err) {
+    const at = offline.repairSkip(ctx.allocator, dir, shard, &sum, &halted, seq, ctx.getString("reason") orelse "") catch |err| switch (err) {
         error.IsSkip, error.NotSkippable, error.NamespaceEntry, error.NotHalted => return skipRefusal(ctx, err, shard, index, &halted),
         else => return outcome.localRefusal(ctx, "cannot write the repair: {}", .{err}),
     };

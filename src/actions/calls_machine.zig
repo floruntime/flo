@@ -251,9 +251,10 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             c.state = switch (p.answer) {
                 .started => .started,
                 .no_action => .no_action,
-                .conflict => .refused,
+                .conflict, .skipped => .refused,
                 .moved => unreachable,
             };
+            if (p.why) |w| c.outcome = w;
             c.last_ns = stamp;
             try view.put(Calls, k, .{ .v = c });
         },
@@ -282,4 +283,23 @@ pub const machine: machine_mod.Machine = .{
     .keys = keys,
     .apply = apply,
     .namespace = namespaceOf,
+    .skipped = skipped,
 };
+
+/// An answer to one of this shard's calls that a repair skipped: the call
+/// settles refused, saying so, so its step fails rather than waits for an
+/// answer that will never come. One already settled stays as it is. A
+/// skipped `started` reply fails the step while the callee's run, which
+/// did start, still executes: its end is answered to a call already
+/// settled, and changes nothing.
+fn skipped(view: *View, e: *const Entry, why: []const u8) ApplyError!void {
+    const n = named(e) orelse return;
+    var kb: KeyBuf = undefined;
+    const k = callKey(&kb, n.ns, n.slot, n.run) orelse return;
+    var c = ((try view.get(Calls, k)) orelse return).v;
+    if (c.state == .done or c.state == .refused or c.state == .no_action) return;
+    c.state = .refused;
+    c.outcome = why;
+    c.last_ns = e.header.timestamp_ns;
+    try view.put(Calls, k, .{ .v = c });
+}
