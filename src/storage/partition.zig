@@ -67,7 +67,8 @@ pub const Partition = struct {
     highest_namespace: u32 = 0,
 
     /// Warm store — payload copies for entries evicted from the hot ring buffer.
-    /// Populated on every non-KV apply() so reads can fall back to warm when UAL evicts.
+    /// Holds what the ring holds (`keptInRing`), so a stream read falls back
+    /// to it when the ring has evicted a record.
     warm_store: std.AutoHashMapUnmanaged(u64, []const u8),
     /// Under a budget the warm store holds steady, evicting as it adds;
     /// this keeps its tombstones bounded.
@@ -168,10 +169,9 @@ pub const Partition = struct {
 
     pub const Applied = struct { index: u64, route: router_mod.ApplyResult };
 
-    /// Apply a committed entry: route it to its projection and, unless a
-    /// machine owns its type and nothing reads its payload back
-    /// (`keptInRing`), append it to the hot ring and warm store. Returns the
-    /// entry's index and what the router made of it.
+    /// Whether an entry of type `t` is kept in the hot ring and warm store:
+    /// a stream append or a channel inbound, which the stream read path
+    /// fetches by index, and any type no machine owns.
     pub fn keptInRing(t: EntryType) bool {
         return kept_in_ring[@backingInt(t)];
     }
@@ -187,6 +187,9 @@ pub const Partition = struct {
         break :blk out;
     };
 
+    /// Apply a committed entry: route it to its projection and, if
+    /// `keptInRing`, append it to the hot ring and warm store. Returns the
+    /// entry's index and what the router made of it.
     pub fn applyRouted(self: *Partition, e: *const Entry) !Applied {
         return self.take(e, .apply);
     }
@@ -284,8 +287,8 @@ pub const Partition = struct {
     /// Counts an entry just taken towards the next bar, and makes it the bar
     /// if it reaches it. Every replica takes the same entries over the same
     /// state, so every replica finds the same bars.
-    /// Each index counts once, however often it is taken: a KV index skips
-    /// the ring that refuses a second take, so one applied and then halted
+    /// Each index counts once, however often it is taken: a machine-owned
+    /// index skips the ring that refuses a second take, so one applied and then halted
     /// on is taken again when a repair passes over it, where a replay that
     /// knows of the repair takes it only once.
     /// The threshold reads the state before the entry applies: the shard
