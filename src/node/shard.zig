@@ -163,7 +163,7 @@ const source_page_mod = @import("../processing/source_page.zig");
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
 const memory_budget = @import("memory_budget.zig");
-const host_stats = @import("dashboard/host_stats.zig");
+const host_memory = @import("host_memory.zig");
 const settings_machine = @import("../settings/machine.zig");
 const contract_view = @import("../contract/view.zig");
 
@@ -880,9 +880,11 @@ pub const Shard = struct {
     /// reads it to admit or refuse a write — it is for observability.
     budget: memory_budget.Observation = .{},
 
-    /// This node's own figures for its settings row, computed once at init from
-    /// the host RAM and this node's shard count. Shard 0's leader proposes them;
-    /// 0 on a node that could not read its RAM, and on shards other than 0.
+    /// This node's own figures for its settings row, set once at init: the host
+    /// RAM capped by its cgroup (`host_memory.detect`) and the reserve its shards
+    /// and rings hold back. Shard 0's leader proposes them. 0 on shards other
+    /// than 0; a shard-0 node that could read no real figure refuses to start,
+    /// so on a running node these are set.
     self_ram_bytes: u64 = 0,
     self_reserve_bytes: u64 = 0,
 
@@ -952,6 +954,22 @@ pub const Shard = struct {
         raft_config: raft_node_mod.Config,
         boot: Boot,
     ) !Shard {
+        // A node whose memory leaves no budget, or that could read no real
+        // figure at all, refuses to start before it allocates or replays
+        // anything. Shard 0 carries the node's figures; other shards hold none.
+        var self_ram: u64 = 0;
+        var self_reserve: u64 = 0;
+        if (shard_id == 0) {
+            const mem = host_memory.detect();
+            self_reserve = memory_budget.reserve(shard_count, memory_budget.ringBytesPerShard(ual_capacity), memory_budget.DEFAULT_MARGIN_BYTES);
+            if (startupRefusal(mem.bytes, mem.source == .fallback, self_reserve)) |why| {
+                var mb: [96]u8 = undefined;
+                log.err("shard 0: {s}; host memory {s}, reserve {d} MiB over {d} shard(s) including a {d} MiB margin — run fewer shards or a smaller hot buffer", .{ why, mem.describe(&mb), self_reserve >> 20, shard_count, memory_budget.DEFAULT_MARGIN_BYTES >> 20 });
+                return error.MemoryBudgetTooLow;
+            }
+            self_ram = mem.bytes;
+        }
+
         var reactor = try Reactor.init(allocator);
         errdefer reactor.deinit();
 
@@ -1356,15 +1374,6 @@ pub const Shard = struct {
             data_dir orelse "(ephemeral)",
         });
 
-        // Shard 0 carries the node's own memory figures and proposes them when
-        // it leads. This reads host RAM; a cgroup limit and a `ram` override
-        // come with the proper read later. The reserve is the node's floor plus
-        // rings over its shards, plus a margin.
-        const self_ram: u64 = if (shard_id == 0) host_stats.totalRamBytes() else 0;
-        const self_reserve: u64 = if (shard_id == 0)
-            memory_budget.reserve(shard_count, memory_budget.ringBytesPerShard(ual_capacity), memory_budget.DEFAULT_MARGIN_BYTES)
-        else
-            0;
         var channel = try channel_driver.Driver.init(allocator, shard_id, shard_count);
         errdefer channel.deinit();
         channel.admits = contract_machines.Channels.admits;
@@ -6329,15 +6338,27 @@ pub const Shard = struct {
         if (self.id == 0) self.refreshBudget();
     }
 
+    /// Why shard 0 must not start: its RAM after the reserve leaves no budget,
+    /// or no real host figure could be read (only the assumed fallback). Null
+    /// when it may start. Pure, so the boot check and its test share it. A
+    /// fallback figure is refused because the budget it would anchor is a guess;
+    /// a real figure read through any path (sysctl, meminfo, a cgroup limit) is
+    /// trusted.
+    fn startupRefusal(ram_bytes: u64, from_fallback: bool, reserve: u64) ?[]const u8 {
+        if (from_fallback) return "could read no host memory figure, so the budget would be a guess";
+        if (ram_bytes <= reserve) return "its memory leaves no budget once the reserve is held back";
+        return null;
+    }
+
     /// Shard 0's leader keeps the settings rows current: the genesis pool-share
-    /// once, this node's own memory row when it is missing or its figures
-    /// changed, and a delete for any row whose node is no longer a member. Each
-    /// is a plain family write — it doesn't compete for the one-in-flight config
-    /// slot — gated on a read-back so a steady node proposes nothing, and on an
-    /// in-flight marker so a stall doesn't stack duplicates. At most one entry
-    /// per call; the next tick carries the next. Follower self-reporting comes
-    /// with the proper RAM read later; a data-holder without a row keeps the
-    /// budget provisional until then.
+    /// once, this node's own memory row and each other data-holder's row from
+    /// the figure it advertised (when missing or changed), and a delete for any
+    /// row whose node is no longer a member. Each is a plain family write — it
+    /// doesn't compete for the one-in-flight config slot — gated on a read-back
+    /// so a steady node proposes nothing, and on an in-flight marker so a stall
+    /// doesn't stack duplicates. At most one entry per call; the next tick
+    /// carries the next. A data-holder that hasn't advertised keeps the budget
+    /// provisional until it does.
     fn proposeBudgetRows(self: *Shard) void {
         const raft = self.raft_node;
         // One settings entry in flight at a time. While the last hasn't applied
@@ -6369,10 +6390,9 @@ pub const Shard = struct {
             return;
         }
 
-        // This node's own row, when it is missing or its figures changed. A node
-        // that couldn't read its RAM proposes none (refuse-to-start is a later
-        // change), leaving the budget provisional rather than a 0 row — but the
-        // clean record below still holds the last good budget across a restart.
+        // This node's own row, when it is missing or its figures changed. A
+        // started node always read its RAM (the alternative is refuse-to-start),
+        // so self_ram_bytes is set; the guard stays as a cheap backstop.
         if (self.self_ram_bytes != 0) {
             var kb: [1 + 4]u8 = undefined;
             const current = (read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, self.cluster_node_id)) catch null);
@@ -6383,6 +6403,31 @@ pub const Shard = struct {
                     .node_id = self.cluster_node_id,
                     .ram_bytes = self.self_ram_bytes,
                     .reserve = self.self_reserve_bytes,
+                }) catch return;
+                self.budget_propose_pending = proposeOrNull(raft, .settings_node_mem, bytes);
+                return;
+            }
+        }
+
+        // Each other data-holder's row, from the figure it advertised: when its
+        // row is missing or the figure changed. advertisedMem answers only for a
+        // committed-config id, so a node whose add has not committed earns no row
+        // until it does. One entry per tick, like the own row above. The applied
+        // membership is read here, the same set staleNodeRow prunes against, so a
+        // row is never proposed for an id that pass would delete.
+        for (self.raft_node.applied_config.memberSlice()) |m| {
+            if (m.id == self.cluster_node_id) continue; // the own row is above
+            if (!(m.voter or m.caught_up)) continue; // only data-holders carry budget
+            const adv = self.advertisedMem(m.id) orelse continue;
+            var kb: [1 + 4]u8 = undefined;
+            const current = (read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, m.id)) catch null);
+            const fresh = if (current) |row| !(row.v.ram_bytes == adv.ram_bytes and row.v.reserve == adv.reserve) else true;
+            if (fresh) {
+                var buf: [settings_machine.SetNodeMem.max_size]u8 = undefined;
+                const bytes = settings_machine.SetNodeMem.encodeInto(&buf, .{
+                    .node_id = m.id,
+                    .ram_bytes = adv.ram_bytes,
+                    .reserve = adv.reserve,
                 }) catch return;
                 self.budget_propose_pending = proposeOrNull(raft, .settings_node_mem, bytes);
                 return;
@@ -6497,8 +6542,9 @@ pub const Shard = struct {
     /// Tell each linked peer this node's own figures: when its link comes up
     /// (a new session), and again every `NODE_MEM_READVERTISE_MS`, which
     /// repairs a frame lost on the way. Runs on shard 0 every tick, whatever
-    /// this node's role: a follower must reach whichever node leads. A node
-    /// that could not read its RAM sends nothing, leaving its row provisional.
+    /// this node's role: a follower must reach whichever node leads. A started
+    /// node has read its RAM (else it refused to start), so the 0 guard here is
+    /// a cheap backstop.
     fn advertiseNodeMem(self: *Shard, now_ms: u64) void {
         if (self.self_ram_bytes == 0) return;
         const rn = self.raft_network orelse return;
@@ -9785,6 +9831,152 @@ test "memory budget: the leader deletes a row whose node left the membership" {
     _ = shard.applyCommitted();
 
     try std.testing.expect((read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, 2)) catch null) == null); // and gone
+}
+
+test "memory budget: the leader proposes a committed data-holder's row from its advertised figure, not a joiner's" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const r = shard.raft_node;
+    try std.testing.expect(r.role == .leader);
+
+    // A real host figure booted the node (detect, not the fallback), so its own
+    // budget is positive — the refuse-to-start path did not fire.
+    try std.testing.expect(shard.self_ram_bytes > shard.self_reserve_bytes);
+
+    // Node 2 is a committed data-holder and has advertised its figure; node 3 is
+    // only a joiner in the latest config (its add hasn't committed) and has also
+    // advertised. advertisedMem answers only for the committed config.
+    const settled = membership.Config.ofVoters(&.{ 1, 2 });
+    r.applied_config = settled;
+    r.committed_config = settled;
+    r.latest_config = membership.Config.ofVoters(&.{ 1, 2 }).withJoiner(3, true);
+    const adv2: memory_budget.Holder.NodeMem = .{ .ram_bytes = 3 * 1024 * 1024 * 1024, .reserve = 120 * 1024 * 1024 };
+    const adv3: memory_budget.Holder.NodeMem = .{ .ram_bytes = 2 * 1024 * 1024 * 1024, .reserve = 100 * 1024 * 1024 };
+    shard.peer_mem[0] = .{ .id = 2, .mem = adv2 };
+    shard.peer_mem[1] = .{ .id = 3, .mem = adv3 };
+
+    // Drive the leader to steady state: genesis share, own row, then node 2's.
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        shard.proposeBudgetRows();
+        _ = shard.applyCommitted();
+    }
+
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    var kb: [1 + 4]u8 = undefined;
+    // Node 2's row carries exactly what it advertised.
+    const row2 = (read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, 2)) catch null) orelse return error.NoRowForCommittedMember;
+    try std.testing.expectEqual(adv2.ram_bytes, row2.v.ram_bytes);
+    try std.testing.expectEqual(adv2.reserve, row2.v.reserve);
+    // The joiner earns no row until its add commits, though it advertised.
+    try std.testing.expect((read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, 3)) catch null) == null);
+}
+
+test "memory budget: advertisedMem's committed check alone gates a row — an applied-but-uncommitted node earns none" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const r = shard.raft_node;
+    try std.testing.expect(r.role == .leader);
+
+    // Node 3 is in the applied config — so the propose loop reaches it and the
+    // data-holder filter admits it — but NOT in the committed config, and it has
+    // advertised. ONLY advertisedMem's committed check keeps it from a row:
+    // delete that check and this test fails (node 3 would get a row).
+    r.applied_config = membership.Config.ofVoters(&.{ 1, 2, 3 });
+    r.committed_config = membership.Config.ofVoters(&.{ 1, 2 });
+    const adv: memory_budget.Holder.NodeMem = .{ .ram_bytes = 2 * 1024 * 1024 * 1024, .reserve = 100 * 1024 * 1024 };
+    shard.peer_mem[0] = .{ .id = 2, .mem = adv };
+    shard.peer_mem[1] = .{ .id = 3, .mem = adv };
+
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        shard.proposeBudgetRows();
+        _ = shard.applyCommitted();
+    }
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    var kb: [1 + 4]u8 = undefined;
+    try std.testing.expect((read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, 2)) catch null) != null); // committed member got a row
+    try std.testing.expect((read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, 3)) catch null) == null); // uncommitted did not
+
+    // Steady: another pass proposes nothing — node 3 is skipped, and the budget
+    // is provisional on its missing row, so even the clean record isn't written.
+    try std.testing.expect(shard.budget_propose_pending == null);
+    const idx = r.log.lastIndex();
+    shard.proposeBudgetRows();
+    try std.testing.expectEqual(idx, r.log.lastIndex());
+}
+
+test "memory budget: two data-holders report and the smaller governs; removing one drops its row for good" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const r = shard.raft_node;
+    try std.testing.expect(r.role == .leader);
+    // Fix this node's own figure so it is clearly the largest, whatever the host.
+    shard.self_ram_bytes = 64 * 1024 * 1024 * 1024;
+
+    // Nodes 2 and 3 are committed data-holders that have reported; node 3 is the
+    // smaller after its reserve, so it governs the budget.
+    const cfg3 = membership.Config.ofVoters(&.{ 1, 2, 3 });
+    r.applied_config = cfg3;
+    r.committed_config = cfg3;
+    const big: memory_budget.Holder.NodeMem = .{ .ram_bytes = 4 * 1024 * 1024 * 1024, .reserve = 100 * 1024 * 1024 };
+    const small: memory_budget.Holder.NodeMem = .{ .ram_bytes = 1 * 1024 * 1024 * 1024, .reserve = 100 * 1024 * 1024 };
+    shard.peer_mem[0] = .{ .id = 2, .mem = big };
+    shard.peer_mem[1] = .{ .id = 3, .mem = small };
+
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        shard.proposeBudgetRows();
+        _ = shard.applyCommitted();
+    }
+    // All three reported: the budget is no longer provisional and node 3 governs.
+    try std.testing.expectEqual(@as(?u32, null), shard.budget.provisional_node);
+    try std.testing.expectEqual(@as(?u32, 3), shard.budget.governing_node);
+    try std.testing.expectEqual((small.ram_bytes - small.reserve) * memory_budget.DEFAULT_SHARE_PERMILLE / 1000, shard.budget.budget_bytes);
+
+    // Remove node 3: its row is deleted, node 2 governs, and node 3 is not re-proposed.
+    const cfg2 = membership.Config.ofVoters(&.{ 1, 2 });
+    r.applied_config = cfg2;
+    r.committed_config = cfg2;
+    i = 0;
+    while (i < 12) : (i += 1) {
+        shard.proposeBudgetRows();
+        _ = shard.applyCommitted();
+    }
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    var kb: [1 + 4]u8 = undefined;
+    try std.testing.expect((read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, 3)) catch null) == null); // gone
+    try std.testing.expectEqual(@as(?u32, 2), shard.budget.governing_node); // node 2 now governs
+    shard.proposeBudgetRows(); // and stays gone — not re-proposed
+    try std.testing.expect((read.get(settings_machine.NodeFam, settings_machine.nodeKey(&kb, 3)) catch null) == null);
+}
+
+test "memory budget: refuse to start when RAM leaves no budget, or no real figure was read" {
+    const reserve: u64 = 200 * 1024 * 1024;
+    // A real figure with room to spare: may start.
+    try std.testing.expect(Shard.startupRefusal(2 * 1024 * 1024 * 1024, false, reserve) == null);
+    // RAM at or below the reserve: refuse — no budget would be left.
+    try std.testing.expect(Shard.startupRefusal(reserve, false, reserve) != null);
+    try std.testing.expect(Shard.startupRefusal(reserve - 1, false, reserve) != null);
+    // Only the assumed fallback could be read: refuse even though 8 GiB > reserve.
+    try std.testing.expect(Shard.startupRefusal(8 * 1024 * 1024 * 1024, true, reserve) != null);
+    // A real figure read through a non-cgroup path (sysctl/meminfo on a dev host): boots.
+    try std.testing.expect(Shard.startupRefusal(16 * 1024 * 1024 * 1024, false, reserve) == null);
 }
 
 test "memory budget: the leader records the clean budget once it has moved, and not again" {
