@@ -172,11 +172,10 @@ pub const WorkflowHandler = struct {
 
     /// Completions a busy log refused, retried by the tick (`retryCompletions`).
     /// It drains only while this node leads; after a step-down and
-    /// re-election the entries fire against the run's local state, and a run
-    /// that turned terminal meanwhile is skipped. A completion refused with
-    /// NotLeader or WritesStopped isn't kept here: the run stays non-terminal
-    /// on this node until replay. Leader-only run state across failover is
-    /// for the delivery-leases work and the state-machine contract to settle.
+    /// re-election the entries fire against this node's copy of the run, and
+    /// a run that ended meanwhile is skipped. A completion refused with
+    /// NotLeader or WritesStopped isn't kept here. A run ends when a leader's
+    /// completion applies.
     completion_retries: std.ArrayListUnmanaged(PendingCompletion) = .empty,
     /// Logs a completion record. A seam so a test can make the log refuse.
     propose: *const fn (shard: *Shard, run_ns_key: []const u8, value: []const u8) anyerror!persistence_mod.ProposeResult = proposeCompletion,
@@ -194,8 +193,8 @@ pub const WorkflowHandler = struct {
 
     /// The runs this node has stepped while leading, by key (namespace id ‖
     /// run id): a working copy built from `workflow.run` when it takes one
-    /// (`liveRun`), with the step it is at and what it waits for. Leader
-    /// memory: the run itself is the runs machine's.
+    /// (`liveRun`), with the step it is at and what it waits for. Node
+    /// memory, kept past a step-down: the run itself is the runs machine's.
     runs: std.StringHashMap(RunRecord),
 
     /// Active stream triggers, by their definitions' keys.
@@ -1348,7 +1347,8 @@ pub const WorkflowHandler = struct {
     }
 
     /// A run as a read shows it: as applied, with the step it is at and
-    /// what it waits for from this node's copy while it steps it.
+    /// what it waits for from this node's copy if it holds one (a node that
+    /// stopped leading keeps its copy, and answers from it).
     const ShownRun = struct {
         run_id_owned: []const u8,
         workflow_name_owned: []const u8,
@@ -1431,8 +1431,8 @@ pub const WorkflowHandler = struct {
         // wire), a cancel reason (MAX_CANCEL_REASON), step or terminal names
         // from a definition under 64 KiB, or, once complete, the completion
         // record's, itself under 64 KiB. So each length fits u16.
-        // This node's own copy's while it steps the run (it holds events not
-        // yet logged); else the run's, as applied.
+        // This node's copy's if it holds one (it may hold events not yet
+        // logged); else the run's, as applied.
         var applied_events: std.ArrayListUnmanaged(HistoryEvent) = .empty;
         defer applied_events.deinit(self.allocator);
         const events: []const HistoryEvent = if (shown_run.copy) |c| c.history.items else blk: {
@@ -7479,7 +7479,7 @@ test "workflow keys: two namespaces keep their own workflows and runs, whatever 
     try testing.expectEqual(@as(usize, 4), handler.definitionCount());
 }
 
-test "workflow handler: a shard's thread never takes another shard's workflow handler, or its lock" {
+test "workflow handler: a shard's thread never takes another shard's workflow handler" {
     // Split so this test's own text doesn't match.
     const src = @embedFile("handler.zig");
     try testing.expect(std.mem.indexOf(u8, src, "]." ++ "workflow_handler") == null);

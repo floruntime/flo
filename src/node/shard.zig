@@ -17914,7 +17914,7 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
 
     // A second client's start is parked when the first run takes its
     // step. The step proposes the invoke and moves on: nothing waits for
-    // its commit with the workflow's lock held.
+    // its commit.
     try ParkTest.send(&shard, conn, .workflow_start, 22, "flow", "");
     wf.advanceStartedRuns(&shard);
     const a = Run.byId(wf, a_id);

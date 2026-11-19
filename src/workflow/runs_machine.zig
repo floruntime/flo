@@ -15,8 +15,8 @@
 //! - `workflow.parents`: a child run's parent, from the parent's call
 //!   (`child_start`) until the child ends.
 //!
-//! A child's parent hears from here: `call_reply` once its start applies,
-//! or `refused` when its workflow is disabled; `no_action` or `conflict`
+//! A child's parent hears from here: a `call_reply`, `started` once its
+//! start applies or `refused` when its workflow is disabled; `no_action` or `conflict`
 //! from a `child_refuse` this shard's leader proposed; `call_done` with how
 //! it ended. The start and the completion are this shard's leader's own
 //! proposals, never messages.
