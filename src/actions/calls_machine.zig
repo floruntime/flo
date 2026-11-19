@@ -1,8 +1,8 @@
 //! Calls: a workflow step's run of an action or a child workflow, asked for
 //! over a channel and recorded on the workflow's shard.
 //!
-//! - `step_call` records the call and sends the run's start
-//!   (`action_invoke`) to the action's slot.
+//! - A step's call is recorded, and the run's start (`action_invoke`)
+//!   sent to the action's slot, by the step that makes it (`record`).
 //! - The action's shard answers in the entry that applied the start
 //!   (`call_reply`): the run exists, or no such action is registered.
 //! - When the run ends, its shard sends `call_done` with what it
@@ -15,6 +15,10 @@
 //! workflow's, so a call is the slot's state and moves with it. An answer
 //! for a call that's gone (its workflow cancelled, its step resolved)
 //! applies nothing: its apply answers 0, which the shard counts.
+//!
+//! The workflow runs machine (`workflow/runs_machine.zig`) owns these
+//! entries and `step.calls`, and applies them here: a step's call is
+//! recorded in the same apply as the step that makes it (`record`).
 
 const std = @import("std");
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -100,6 +104,14 @@ fn callKey(buf: *KeyBuf, ns: NamespaceId, slot: u16, run: []const u8) ?[]const u
     return view_mod.idKey(buf, ns, rawKey(&raw, slot, run) orelse return null) catch null;
 }
 
+/// A call's key in `step.calls`, allocated; null for a run id no call can
+/// have.
+pub fn callKeyAlloc(a: std.mem.Allocator, ns: NamespaceId, slot: u16, run: []const u8) error{OutOfMemory}!?[]u8 {
+    var kb: KeyBuf = undefined;
+    const k = callKey(&kb, ns, slot, run) orelse return null;
+    return try a.dupe(u8, k);
+}
+
 /// The call `run` of the workflow on `slot` in `ns`, as applied.
 pub fn callOf(read: ReadView, ns: NamespaceId, slot: u16, run: []const u8) ?Call.Value {
     var kb: KeyBuf = undefined;
@@ -118,10 +130,6 @@ const Named = struct { ns: NamespaceId, slot: u16, run: []const u8 };
 fn named(e: *const Entry) ?Named {
     var diag: schema.Diagnostic = .{};
     return switch (typeOf(e) orelse return null) {
-        .step_call => blk: {
-            const p = ae.Call.decodeAll(e.payload, &diag) catch return null;
-            break :blk .{ .ns = .of(p.ns), .slot = callerSlot(.of(p.ns), p.caller_workflow), .run = p.run };
-        },
         .step_call_retry => blk: {
             const p = ae.CallRetry.decodeAll(e.payload, &diag) catch return null;
             break :blk .{ .ns = .of(p.ns), .slot = p.slot, .run = p.run };
@@ -142,7 +150,15 @@ fn named(e: *const Entry) ?Named {
     };
 }
 
-fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
+/// Whether `t` is one of the entries applied here.
+pub fn owns(t: EntryType) bool {
+    return switch (t) {
+        .step_call_retry, .step_call_clear, .call_reply, .call_done => true,
+        else => false,
+    };
+}
+
+pub fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
     const n = named(e) orelse return;
     if (n.ns == .invalid) return;
     var raw: [RAW_LEN]u8 = undefined;
@@ -150,7 +166,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
 }
 
 /// The namespace a message names, held to its origin's.
-fn namespaceOf(e: *const Entry) ?u32 {
+pub fn namespaceOf(e: *const Entry) ?u32 {
     const n = named(e) orelse return null;
     return n.ns.int();
 }
@@ -191,9 +207,44 @@ fn sendStart(view: *View, ns: NamespaceId, slot: u16, run: []const u8, c: Call.V
     }
 }
 
+/// The key a step's call `p` is recorded under, for the step's keys.
+pub fn recordKey(a: std.mem.Allocator, p: ae.Call.Value) error{OutOfMemory}!?[]u8 {
+    return callKeyAlloc(a, .of(p.ns), callerSlot(.of(p.ns), p.caller_workflow), p.run);
+}
+
+/// A step's call `p`, recorded and its start sent, stamped `stamp`: in the
+/// apply of the step that makes it. One already there (a step proposed
+/// twice) stands.
+pub fn record(view: *View, p: ae.Call.Value, stamp: u64) ApplyError!void {
+    const ns: NamespaceId = .of(p.ns);
+    const slot = callerSlot(ns, p.caller_workflow);
+    var kb: KeyBuf = undefined;
+    const k = callKey(&kb, ns, slot, p.run) orelse return error.Halt;
+    if (try view.get(Calls, k) != null) return;
+    const c: Call.Value = .{
+        .kind = p.kind,
+        .caller_run = p.caller_run,
+        .caller_workflow = p.caller_workflow,
+        .step = p.step,
+        .target = p.target,
+        .version = p.version,
+        .input = p.input,
+        .can_wait = p.can_wait,
+        .state = .sent,
+        .attempts = 1,
+        .first_ns = stamp,
+        .last_ns = stamp,
+        .status = 0,
+        .outcome = "",
+        .result = "",
+    };
+    try view.put(Calls, k, .{ .v = c });
+    try sendStart(view, ns, slot, p.run, c);
+}
+
 /// Answers: a reply or a done, 1 when it changed a call and 0 when it
 /// found none, which the shard counts. The rest answer nothing.
-fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
+pub fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     var diag: schema.Diagnostic = .{};
     const stamp = e.header.timestamp_ns;
     // Only a leader makes these entries, and only an actions machine these
@@ -204,30 +255,6 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     const k = callKey(&kb, n.ns, n.slot, n.run) orelse return error.Halt;
     const found = try view.get(Calls, k);
     switch (typeOf(e).?) {
-        .step_call => {
-            const p = ae.Call.decodeAll(e.payload, &diag) catch return error.Halt;
-            // Proposed twice before it applied: the first stands.
-            if (found != null) return;
-            const c: Call.Value = .{
-                .kind = p.kind,
-                .caller_run = p.caller_run,
-                .caller_workflow = p.caller_workflow,
-                .step = p.step,
-                .target = p.target,
-                .version = p.version,
-                .input = p.input,
-                .can_wait = p.can_wait,
-                .state = .sent,
-                .attempts = 1,
-                .first_ns = stamp,
-                .last_ns = stamp,
-                .status = 0,
-                .outcome = "",
-                .result = "",
-            };
-            try view.put(Calls, k, .{ .v = c });
-            try sendStart(view, n.ns, n.slot, n.run, c);
-        },
         .step_call_retry => {
             var c = (found orelse return).v;
             // Answered since the retry was proposed, or proposed twice.
@@ -276,23 +303,13 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
 
 pub const MOVED_NOT_YET = "bad request: a call's start answered moved, which nothing sends until slots move";
 
-pub const machine: machine_mod.Machine = .{
-    .name = "calls",
-    .entry_types = &.{ .step_call, .step_call_retry, .step_call_clear, .call_reply, .call_done },
-    .families = &.{machine_mod.info(Calls)},
-    .keys = keys,
-    .apply = apply,
-    .namespace = namespaceOf,
-    .skipped = skipped,
-};
-
 /// An answer to one of this shard's calls that a repair skipped: the call
 /// settles refused, saying so, so its step fails rather than waits for an
 /// answer that will never come. One already settled stays as it is. A
 /// skipped `started` reply fails the step while the callee's run, which
 /// did start, still executes: its end is answered to a call already
 /// settled, and changes nothing.
-fn skipped(view: *View, e: *const Entry, why: []const u8) ApplyError!void {
+pub fn skipped(view: *View, e: *const Entry, why: []const u8) ApplyError!void {
     const n = named(e) orelse return;
     var kb: KeyBuf = undefined;
     const k = callKey(&kb, n.ns, n.slot, n.run) orelse return;

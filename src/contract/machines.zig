@@ -8,7 +8,6 @@ const machine = @import("machine.zig");
 const targets = [_]machine.Machine{
     @import("../kv/machine.zig").machine,
     @import("../actions/machine.zig").machine,
-    @import("../actions/calls_machine.zig").machine,
     @import("../workflow/runs_machine.zig").machine,
     @import("../queue/machine.zig").machine,
     @import("../stream/group_machine.zig").machine,

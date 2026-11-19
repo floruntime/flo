@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 47;
+pub const CURRENT: u32 = 48;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -170,6 +170,11 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // `.idem`, `.per_def`); a completion names its run's workflow; a child
     // whose workflow is disabled is refused to its parent (`Answer.refused`).
     .{ .format = 47, .segment_version = 31, .entries = 0x96cb0c6a272e3e58 },
+    // A run's steps are logged (`workflow_step`, which replaces
+    // `workflow_step_started`), with its wait and its call (`step_call`
+    // goes); the calls family moves to the runs machine; a completion is a
+    // cancel's alone.
+    .{ .format = 48, .segment_version = 32, .entries = 0x3c67c9e3c68aaa5f },
 };
 
 comptime {

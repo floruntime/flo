@@ -326,7 +326,6 @@ pub const table = [_]entries.Entry{
     .{ .name = "action.release", .type_code = 0x76, .payload = Release, .max_payload = Release.max_size, .doc = "A delivery failed or abandoned by its holder." },
     .{ .name = "action.extend", .type_code = 0x77, .payload = Extend, .max_payload = Extend.max_size, .doc = "A delivery's lease moved out by its holder." },
     .{ .name = "action.expire", .type_code = 0x78, .payload = Expire, .max_payload = Expire.max_size, .doc = "Leases past their deadline ended, as failures." },
-    .{ .name = "step.call", .type_code = 0x79, .payload = Call, .max_payload = Call.max_size, .doc = "A workflow step's call recorded, and its run's start sent." },
     .{ .name = "step.call_retry", .type_code = 0x7A, .payload = CallRetry, .max_payload = CallRetry.max_size, .doc = "A call whose action wasn't registered, its start sent again." },
     .{ .name = "step.call_clear", .type_code = 0x7B, .payload = CallClear, .max_payload = CallClear.max_size, .doc = "A call its step is done with, its record dropped." },
     .{ .name = "call.reply", .type_code = 0x7C, .payload = Reply, .max_payload = Reply.max_size, .doc = "A message: the callee's shard's answer to a call's start." },
