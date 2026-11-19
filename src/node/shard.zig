@@ -963,6 +963,7 @@ pub const Shard = struct {
         const workflow_handler = try allocator.create(WorkflowHandler);
         errdefer allocator.destroy(workflow_handler);
         workflow_handler.* = WorkflowHandler.init(allocator);
+        workflow_handler.store = &partition.store;
         workflow_handler.namespaces = namespace_handler;
 
         // Create Processing handler
@@ -1167,7 +1168,7 @@ pub const Shard = struct {
                     boot_damage = try collectSkips(allocator, files, watermark, &skips, shard_id);
                     if (boot_damage != null) break :replay;
                     if (marker.crashed) |*c| if (skips.holds(&.{ .index = c.index, .term = c.term, .crc = c.entry_crc })) marker.skipped();
-                    const replayed = replaySegments(allocator, files, partition, &replay_registry, if (cold_boot) 0 else watermark, &raft_node.log, shard_id, &losses, &marker, &skips, boot);
+                    const replayed = replaySegments(allocator, files, partition, &replay_registry, if (cold_boot) 0 else watermark, &raft_node.log, shard_id, &losses, &marker, &skips, boot, workflow_handler);
                     if (replayed.cancelled) return error.BootCancelled;
                     if (replayed.blocked) |b| return refuseBlockedRead(shard_id, b.name, b.err);
                     boot_damage = replayed.damage;
@@ -6063,6 +6064,7 @@ pub const Shard = struct {
             self.recordApplied(entry, result);
         }
         self.namespace_handler.afterApply(entry);
+        self.workflow_handler.definitionApplied(entry, result);
         self.wakeApplied(entry);
         // The leader's own action steps: the await a deliver answers,
         // workers woken for a run ready again (once a pass: each wake is a
@@ -9125,6 +9127,9 @@ const PartitionReplay = struct {
     marker: *apply_marker.Marker,
     losses: *silent_loss.Counts,
     shard_id: u16,
+    /// Builds a definition's schedule and trigger as each create or enable
+    /// replays, in log order, as the live path does (`afterApply`).
+    workflow: *WorkflowHandler,
     result: persistence_mod.Result = .{},
 
     fn applier(self: *PartitionReplay) ReplayApply {
@@ -9137,7 +9142,9 @@ const PartitionReplay = struct {
         const prev = apply_marker.begin(self.marker, entry);
         defer apply_marker.end(prev);
         self.result.reset(entry);
-        return verdictOf(self.losses, self.shard_id, Shard.nowMs(), entry, applyEntryCore(self.partition, self.registry, entry, &self.result));
+        const verdict = verdictOf(self.losses, self.shard_id, Shard.nowMs(), entry, applyEntryCore(self.partition, self.registry, entry, &self.result));
+        if (verdict == .applied) self.workflow.definitionApplied(entry, &self.result);
+        return verdict;
     }
 
     fn passOver(ctx: *anyopaque, entry: *const entry_mod.Entry) ?silent_loss.Damage {
@@ -9166,6 +9173,7 @@ fn replaySegments(
     marker: *apply_marker.Marker,
     skips: *const repair.Skips,
     boot: Shard.Boot,
+    workflow: *WorkflowHandler,
 ) ReplayOutcome {
     // Listed in Raft index order so the projection router's applied_index
     // guard does not skip lower-index entries.
@@ -9174,7 +9182,7 @@ fn replaySegments(
     var last: u64 = 0;
     for (files) |sf| last = @max(last, sf.last_index);
     if (boot.health) |slot| slot.replay_last.store(last, .monotonic);
-    var prod: PartitionReplay = .{ .partition = partition, .registry = replay_registry, .marker = marker, .losses = losses, .shard_id = shard_id };
+    var prod: PartitionReplay = .{ .partition = partition, .registry = replay_registry, .marker = marker, .losses = losses, .shard_id = shard_id, .workflow = workflow };
     const ctx: ReplayCtx = .{ .raft_log = raft_log, .watermark = watermark, .skips = skips, .shard_id = shard_id, .apply = prod.applier() };
     for (files) |sf| {
         // Before reading and checksumming a whole segment it would not use.
@@ -18526,12 +18534,12 @@ test "every entry type has exactly one applier, or is listed as needing none, or
 
     // One of them missing: dropped at apply, so refused at boot.
     var missing = full;
-    missing.callbacks[@backingInt(entry_mod.EntryType.workflow_create)] = null;
+    missing.callbacks[@backingInt(entry_mod.EntryType.workflow_start)] = null;
     try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliers(0, &missing));
 
     // Registered twice: one handler's applier would never run.
     var twice = full;
-    twice.register(.workflow_create, @ptrCast(&ctx), Noop.apply);
+    twice.register(.workflow_start, @ptrCast(&ctx), Noop.apply);
     try std.testing.expectError(error.EntryTypeRegisteredTwice, checkAppliers(0, &twice));
 
     // A router-owned type with a callback as well: applied twice.
@@ -20018,6 +20026,57 @@ test "Shard: alone with async_flush, a gap held open never lets channelDurable p
     try s.shard.flushSegmentToDisk();
     try std.testing.expect(writer.first_unbuffered == null);
     try std.testing.expect(s.shard.channelDurable() >= gap_at);
+}
+
+test "Shard: a trigger moved to another stream and back reads its stream from the start, live and after a restart alike" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    const on = struct {
+        fn def(comptime stream: []const u8) []const u8 {
+            return "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1.0.0\",\"trigger\":{\"stream\":\"" ++ stream ++ "\"},\"start\":{\"wait_for_signal\":{\"type\":\"never\"},\"transitions\":{\"success\":\"flo.Completed\"}}}";
+        }
+    };
+    const key = wf_test_key(.default, "wf");
+    {
+        var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+        try std.testing.expect(shard.applyCommitted());
+        var pair: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+        defer _ = std.c.close(pair[1]);
+        const conn = try shard.addConnection(pair[0]);
+        try ParkTest.send(&shard, conn, .workflow_create, 1, "wf", on.def("events"));
+        _ = shard.applyCommitted();
+        for (0..3) |k| {
+            var pbuf: [16]u8 = undefined;
+            _ = try shard.stream_handler.appendPayloadToStream("events", "default", try std.fmt.bufPrint(&pbuf, "ev-{d}", .{k}));
+        }
+        _ = shard.applyCommitted();
+        shard.workflow_handler.triggers_dirty = true;
+        shard.workflow_handler.tickStreamTriggers(&shard);
+        _ = shard.applyCommitted();
+        try std.testing.expectEqual(@as(usize, 3), shard.workflow_handler.runs.count());
+        try std.testing.expect(shard.workflow_handler.stream_triggers.getPtr(key).?.stream_cursor_ts != 0);
+        // Moved to another stream, then back: no start between them.
+        try ParkTest.send(&shard, conn, .workflow_create, 2, "wf", on.def("other"));
+        _ = shard.applyCommitted();
+        try ParkTest.send(&shard, conn, .workflow_create, 3, "wf", on.def("events"));
+        _ = shard.applyCommitted();
+        try std.testing.expectEqual(@as(u64, 0), shard.workflow_handler.stream_triggers.getPtr(key).?.stream_cursor_ts);
+        try shard.flushSegmentToDisk();
+    }
+    var again = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer again.deinit();
+    again.wireHandlerShardPtrs();
+    _ = again.applyCommitted();
+    try std.testing.expectEqual(@as(usize, 3), again.workflow_handler.runs.count());
+    try std.testing.expectEqual(@as(u64, 0), again.workflow_handler.stream_triggers.getPtr(key).?.stream_cursor_ts);
 }
 
 test "Shard: a namespace create is published, and answered, only once its segment and directory are on disk" {
@@ -24328,12 +24387,12 @@ const SkipState = struct {
             .router_past = p.router.applied_index >= h,
             .queued = DamageTest.queued(shard),
             .kv = shard.kv_handler.kv.countLive(),
-            .defs = shard.workflow_handler.definitions.count(),
+            .defs = shard.workflow_handler.definitionCount(),
             .action_runs = ActionsHandler.runCount(shard),
         };
-        if (shard.workflow_handler.definitions.get(wf_test_key(.default, "wf"))) |d| {
-            const n = @min(d.version_owned.len, st.def_version.len);
-            @memcpy(st.def_version[0..n], d.version_owned[0..n]);
+        if (shard.workflow_handler.defOf(wf_test_key(.default, "wf"))) |d| {
+            const n = @min(d.version.len, st.def_version.len);
+            @memcpy(st.def_version[0..n], d.version[0..n]);
         }
         return st;
     }
@@ -25992,7 +26051,7 @@ test "checkAppliers: a type a contract machine owns may have no other applier, a
     // A type nothing else applies: the machine is its applier.
     try checkAppliersWith(&(listed_now ++ .{Toy.owning(.raft_snapshot)}), 0, &shard.replay_registry);
     // Registered by a handler too: refused.
-    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.workflow_create)}), 0, &shard.replay_registry));
+    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.workflow_start)}), 0, &shard.replay_registry));
     // KV's types are its machine's: without it, they have no applier.
     try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliersWith(&.{}, 0, &shard.replay_registry));
 }
@@ -27879,6 +27938,53 @@ test "Shard: a stream trigger whose shard is capped while apply is suspended kee
         while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
         if (sh.workflow_handler.runs.count() >= events) break;
     }
+    try std.testing.expectEqual(@as(usize, events), sh.workflow_handler.runs.count());
+}
+
+test "Shard: a stream trigger's starts lost to a step-down are proposed again when the node leads again, one run per event" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    const r = sh.raft_node;
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    const triggered =
+        \\{"kind":"Workflow","name":"on-events","version":"1.0.0","trigger":{"stream":"events"},
+        \\"start":{"wait_for_signal":{"type":"never"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    try ParkTest.send(sh, t.conn, .workflow_create, 1, "on-events", triggered);
+    try ParkTest.responses(sh, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    const events = 5;
+    for (0..events) |k| {
+        var pbuf: [16]u8 = undefined;
+        _ = try sh.stream_handler.appendPayloadToStream("events", "default", try std.fmt.bufPrint(&pbuf, "ev-{d}", .{k}));
+    }
+    var passes: u32 = 0;
+    while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
+    const before = r.log.lastIndex();
+    const committed = r.commit_index;
+
+    sh.workflow_handler.triggers_dirty = true;
+    sh.workflow_handler.tickStreamTriggers(sh);
+    try std.testing.expectEqual(before + events, r.log.lastIndex());
+    // It steps down before they commit; the next term's log holds none of
+    // them, and the same node leads it.
+    r.commit_index = committed;
+    r.log.truncateAfter(before);
+    r.current_term += 1;
+
+    sh.workflow_handler.triggers_dirty = true;
+    sh.workflow_handler.tickStreamTriggers(sh);
+    passes = 0;
+    while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
+    try std.testing.expectEqual(@as(usize, events), sh.workflow_handler.runs.count());
+    // Read again in the same term, nothing starts twice.
+    sh.workflow_handler.triggers_dirty = true;
+    sh.workflow_handler.tickStreamTriggers(sh);
+    passes = 0;
+    while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
     try std.testing.expectEqual(@as(usize, events), sh.workflow_handler.runs.count());
 }
 

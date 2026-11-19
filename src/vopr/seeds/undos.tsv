@@ -12,3 +12,5 @@ async-boot-applies-erased-123.json	async_boot_applies	--catching-up	request_perc
 halt-removed-member.json	repair_waits_on_removed	--halts	-	convergence	stranger_frames=[1-9]
 replay-watermark-past-mark.json	replay_watermark_off_by_one	--catching-up	-	leader_completeness	new leader holds a different term at a committed index
 stale-member-wedge-consumer-groups.json	no_vouches	--consumer-groups	-	convergence	vouches_taken=0 stranger_frames=[1-9]
+workflow-defs-redefine-enables.json	defs_redefine_enables	--workflows	-	workflow_rule	whether a workflow is enabled is not the ledger.s
+workflow-defs-enable-anchor.json	defs_enable_moves_anchor	--workflows	-	workflow_rule	schedule anchor is not the ledger.s
