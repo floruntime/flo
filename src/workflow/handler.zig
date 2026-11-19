@@ -60,7 +60,8 @@ const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const router = @import("../node/router.zig");
 const ae = @import("../protocol/action_entries.zig");
 const calls_mod = @import("../actions/calls_machine.zig");
-const children_mod = @import("children_machine.zig");
+const runs_machine = @import("runs_machine.zig");
+const children_mod = runs_machine;
 const contract_view = @import("../contract/view.zig");
 const run_id_mod = @import("../node/run_id.zig");
 const NamespaceId = @import("../namespace/table.zig").Id;
@@ -126,24 +127,23 @@ pub const WorkflowHandler = struct {
 
     allocator: Allocator,
 
-    /// Mutex for cross-shard thread safety. Acquired when this handler is
-    /// accessed from a different shard's thread via forwardToShard dispatch.
-    mu: @import("stdx").Mutex,
     /// Runs whose step_started this leader applied in its term, in log
     /// order, for the tick to take their first step (`advanceStartedRuns`).
     /// No run takes its first step where its entry applies: a step
     /// proposes, and the shard applies nothing in the middle of a module's
     /// work.
     started_to_advance: std.ArrayListUnmanaged(Started) = .empty,
-    /// Runs started and not yet stepped, by their keys in `runs`: kept by
-    /// the appliers on every replica, so whichever node leads steps them.
-    /// Their first steps go in this map's order, not their starts'.
+    /// Runs started and not yet stepped (`workflow.run`'s `stepped`), by
+    /// key, owned: an index of applied state, kept as each run entry applies
+    /// on every replica (`entryApplied`), so whichever node leads steps
+    /// them. Their first steps go in this map's order, not their starts'.
     to_step: std.StringHashMapUnmanaged(void) = .empty,
     /// Where the last pass over `to_step` stopped, so a burst of starts is
     /// walked once rather than from the top each pass.
     to_step_cursor: u32 = 0,
     /// Runs this leader has proposed a step_started for in `stepping_term`,
-    /// not yet applied. Leader memory: a new term starts it empty.
+    /// not yet applied, by key, owned. Leader memory: a new term starts it
+    /// empty.
     stepping: std.StringHashMapUnmanaged(void) = .empty,
     stepping_term: u64 = 0,
     /// Runs parked on an action or a child, by their keys in `runs`: what
@@ -169,17 +169,13 @@ pub const WorkflowHandler = struct {
     child_starting_term: u64 = 0,
     /// Where the next pass over parent records resumes.
     child_scan_after: std.ArrayListUnmanaged(u8) = .empty,
-    /// Runs not yet finished, by their workflow's key: kept by the appliers,
-    /// so a schedule's `max_concurrent` needn't count them.
-    active_runs: std.StringHashMapUnmanaged(u32) = .empty,
 
     /// Completions a busy log refused, retried by the tick (`retryCompletions`).
     /// It drains only while this node leads; after a step-down and
-    /// re-election the entries fire against the run's local state, and a run
-    /// that turned terminal meanwhile is skipped. A completion refused with
-    /// NotLeader or WritesStopped isn't kept here: the run stays non-terminal
-    /// on this node until replay. Leader-only run state across failover is
-    /// for the delivery-leases work and the state-machine contract to settle.
+    /// re-election the entries fire against this node's copy of the run, and
+    /// a run that ended meanwhile is skipped. A completion refused with
+    /// NotLeader or WritesStopped isn't kept here. A run ends when a leader's
+    /// completion applies.
     completion_retries: std.ArrayListUnmanaged(PendingCompletion) = .empty,
     /// Logs a completion record. A seam so a test can make the log refuse.
     propose: *const fn (shard: *Shard, run_ns_key: []const u8, value: []const u8) anyerror!persistence_mod.ProposeResult = proposeCompletion,
@@ -195,13 +191,11 @@ pub const WorkflowHandler = struct {
     /// built from (`syncProducers`), by definition key. Node memory.
     producers_built: std.StringHashMapUnmanaged(u64) = .empty,
 
-    /// Runs, by key (namespace id ‖ run id).
+    /// The runs this node has stepped while leading, by key (namespace id ‖
+    /// run id): a working copy built from `workflow.run` when it takes one
+    /// (`liveRun`), with the step it is at and what it waits for. Node
+    /// memory, kept past a step-down: the run itself is the runs machine's.
     runs: std.StringHashMap(RunRecord),
-
-    /// (namespace id, workflow, idempotency key) → the key in `runs` of the
-    /// run that key started (see `idemKey`). Kept by the start applier, so every node
-    /// and every replay decides duplicates alike, without a scan.
-    idem_index: std.StringHashMapUnmanaged([]const u8) = .{},
 
     /// Active stream triggers, by their definitions' keys.
     /// Registered when a workflow with a `trigger:` block is created.
@@ -237,34 +231,7 @@ pub const WorkflowHandler = struct {
     const MAX_DEFINITIONS: usize = 10_000;
     const MAX_RUNS: usize = 100_000;
 
-    pub const RunStatus = enum(u8) {
-        pending = 0,
-        running = 1,
-        waiting = 2,
-        completed = 3,
-        failed = 4,
-        cancelled = 5,
-        timed_out = 6,
-
-        pub fn toString(self: RunStatus) []const u8 {
-            return switch (self) {
-                .pending => "pending",
-                .running => "running",
-                .waiting => "waiting",
-                .completed => "completed",
-                .failed => "failed",
-                .cancelled => "cancelled",
-                .timed_out => "timed_out",
-            };
-        }
-
-        pub fn isTerminal(self: RunStatus) bool {
-            return switch (self) {
-                .pending, .running, .waiting => false,
-                .completed, .failed, .cancelled, .timed_out => true,
-            };
-        }
-    };
+    pub const RunStatus = runs_machine.RunStatus;
 
     /// A definition as the store holds it: its slices point into the
     /// store, so they hold until the next apply.
@@ -418,7 +385,7 @@ pub const WorkflowHandler = struct {
         stream_namespace_owned: ?[]const u8,
         batch_size: u32,
         poll_interval_ms: u32,
-        /// The last event a run applied here started from (`restoreTriggerCursor`):
+        /// The last event a run applied here started from (`followTrigger`):
         /// what every replica holds alike.
         stream_cursor_ts: u64,
         stream_cursor_seq: u64,
@@ -483,7 +450,6 @@ pub const WorkflowHandler = struct {
     pub fn init(allocator: Allocator) WorkflowHandler {
         return .{
             .allocator = allocator,
-            .mu = .{},
             .own_store = Store.init(allocator),
             .def_scratch = .init(allocator),
             .runs = std.StringHashMap(RunRecord).init(allocator),
@@ -516,18 +482,15 @@ pub const WorkflowHandler = struct {
             self.freeRunRecord(entry.value_ptr);
         }
         self.runs.deinit();
-        var ik = self.idem_index.keyIterator();
-        while (ik.next()) |k| self.allocator.free(k.*);
-        self.idem_index.deinit(self.allocator);
         for (self.started_to_advance.items) |s| self.allocator.free(s.ns_key);
         self.started_to_advance.deinit(self.allocator);
         self.parked.deinit(self.allocator);
+        var tk = self.to_step.keyIterator();
+        while (tk.next()) |k| self.allocator.free(k.*);
         self.to_step.deinit(self.allocator);
+        self.clearStepping();
         self.stepping.deinit(self.allocator);
         self.timers.deinit(self.allocator);
-        var ak = self.active_runs.keyIterator();
-        while (ak.next()) |k| self.allocator.free(k.*);
-        self.active_runs.deinit(self.allocator);
 
         // Free stream trigger state
         var tit = self.stream_triggers.iterator();
@@ -656,8 +619,6 @@ pub const WorkflowHandler = struct {
     fn dispatchWorkflow(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        // Parked outside the handler's lock: on a single node the entry
-        // applies straight away, and its applier takes the lock itself.
         const proposed = shard.workflow_handler.handleCommand(shard, conn, req) orelse return;
         shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
@@ -699,8 +660,6 @@ pub const WorkflowHandler = struct {
         if (shard.raft_node.role != .leader or entry.header.term != shard.raft_node.current_term) return;
         // The run's key is the entry's.
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
-        self.mu.lock();
-        defer self.mu.unlock();
         if (etype == .workflow_start) {
             if (result.refused() != null) return;
             var r = result.reader();
@@ -708,7 +667,7 @@ pub const WorkflowHandler = struct {
             return;
         }
         // Of this leader's term, so this leader proposed it.
-        _ = self.stepping.remove(cmd.key);
+        if (self.stepping.fetchRemove(cmd.key)) |kv| self.allocator.free(kv.key);
         // Refused: another entry took its first step already.
         if (result.refused() == null) self.queueFirstStep(cmd.key, result.index);
     }
@@ -720,8 +679,6 @@ pub const WorkflowHandler = struct {
     fn endingApplied(self: *WorkflowHandler, shard: *Shard, entry: *const entry_mod.Entry) void {
         if (shard.raft_node.role != .leader) return;
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
-        self.mu.lock();
-        defer self.mu.unlock();
         const run = self.runs.getPtr(cmd.key) orelse return;
         if (run.status.isTerminal()) self.dropCompletionRetry(cmd.key);
         // Its index and term: a node elected again and still behind may
@@ -741,8 +698,6 @@ pub const WorkflowHandler = struct {
 
     /// Answers the client, or returns the write the client is parked on.
     fn handleCommand(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) ?persistence_mod.ProposeResult {
-        self.mu.lock();
-        defer self.mu.unlock();
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         switch (op) {
             .workflow_create => return self.handleCreate(shard, conn, req),
@@ -974,7 +929,7 @@ pub const WorkflowHandler = struct {
         // by the applier.
         if (idempotency_key) |idem_key| {
             if (self.runForIdempotencyKey(req.ns_id, workflow_name, idem_key)) |existing| {
-                shard.sendOkResponse(conn, req.header.request_id, existing.run_id_owned);
+                shard.sendOkResponse(conn, req.header.request_id, existing);
                 return null;
             }
         }
@@ -997,7 +952,7 @@ pub const WorkflowHandler = struct {
         };
 
         // Guard against ID collision (e.g. replayed entry with same key)
-        if (self.runs.contains(run_ns_key)) {
+        if (self.appliedRun(run_ns_key) != null) {
             self.allocator.free(run_ns_key);
             shard.sendErrorResponse(conn, req.header.request_id, .conflict, "conflict: a run with this id already exists");
             return null;
@@ -1012,42 +967,6 @@ pub const WorkflowHandler = struct {
         return proposed;
     }
 
-    /// The index key for an idempotency key, any length the wire allows:
-    /// the namespace's id, then the workflow's name length-prefixed, so no
-    /// byte in a name can make two different triples the same key.
-    fn idemKey(self: *WorkflowHandler, ns: NamespaceId, wf_name: []const u8, key: []const u8) ![]u8 {
-        return std.fmt.allocPrint(self.allocator, "{s}{d}:{s}{s}", .{ &ns.bytes(), wf_name.len, wf_name, key });
-    }
-
-    /// The key in `runs` of the run an idempotency key started for this
-    /// workflow in this namespace, if one has applied.
-    fn runKeyForIdempotencyKey(self: *WorkflowHandler, ns: NamespaceId, wf_name: []const u8, key: []const u8) ?[]const u8 {
-        const ik = self.idemKey(ns, wf_name, key) catch return null;
-        defer self.allocator.free(ik);
-        return self.idem_index.get(ik);
-    }
-
-    fn runForIdempotencyKey(self: *WorkflowHandler, ns: NamespaceId, wf_name: []const u8, key: []const u8) ?*RunRecord {
-        const run_key = self.runKeyForIdempotencyKey(ns, wf_name, key) orelse return null;
-        return self.runs.getPtr(run_key);
-    }
-
-    fn indexIdempotencyKey(self: *WorkflowHandler, ns: NamespaceId, wf_name: []const u8, key: []const u8, run_key: []const u8) void {
-        const ik = self.idemKey(ns, wf_name, key) catch {
-            log.err("workflow {s}: idempotency key of run {f} not indexed (out of memory); a retry with it may start a second run", .{ wf_name, shown(run_key) });
-            return;
-        };
-        if (self.idem_index.contains(ik)) {
-            self.allocator.free(ik);
-            return;
-        }
-        self.idem_index.put(self.allocator, ik, run_key) catch {
-            self.allocator.free(ik);
-            log.err("workflow {s}: idempotency key of run {f} not indexed (out of memory); a retry with it may start a second run", .{ wf_name, shown(run_key) });
-        };
-    }
-
-    /// The caller holds `mu`.
     fn queueFirstStep(self: *WorkflowHandler, ns_key: []const u8, index: u64) void {
         const owned = self.allocator.dupe(u8, ns_key) catch {
             log.err("workflow run {f} started but cannot be queued for its first step; it stays at its start", .{shown(ns_key)});
@@ -1075,8 +994,6 @@ pub const WorkflowHandler = struct {
     /// proposes.
     pub fn advanceStartedRuns(self: *WorkflowHandler, shard: *Shard) void {
         if (shard.raft_node.role != .leader) return;
-        self.mu.lock();
-        defer self.mu.unlock();
         self.proposeFirstSteps(shard);
         var keep: usize = 0;
         var i: usize = 0;
@@ -1091,7 +1008,7 @@ pub const WorkflowHandler = struct {
                 continue;
             }
             defer self.allocator.free(s.ns_key);
-            if (!self.runs.contains(s.ns_key)) {
+            if (self.liveRun(s.ns_key) == null) {
                 log.warn("shard {d}: workflow run {f} was started but its start created no run; nothing will step it", .{ shard.id, shown(s.ns_key) });
                 continue;
             }
@@ -1102,11 +1019,11 @@ pub const WorkflowHandler = struct {
 
     /// A step_started for each run started and not yet stepped, up to
     /// `STEPS_PER_PASS`, once per term. Picks up where the last pass
-    /// stopped. The caller holds `mu`.
+    /// stopped.
     fn proposeFirstSteps(self: *WorkflowHandler, shard: *Shard) void {
         const term = shard.raft_node.current_term;
         if (self.stepping_term != term) {
-            self.stepping.clearRetainingCapacity();
+            self.clearStepping();
             self.stepping_term = term;
         }
         if (self.to_step.count() == 0) return;
@@ -1135,7 +1052,11 @@ pub const WorkflowHandler = struct {
                 if (!shard.quietHalted(err)) log.warn("shard {d}: workflow run {f}: first step not logged: {s}; tried again next tick", .{ shard.id, shown(ns_key), @errorName(err) });
                 break;
             };
-            self.stepping.put(self.allocator, ns_key, {}) catch break;
+            const owned = self.allocator.dupe(u8, ns_key) catch break;
+            self.stepping.put(self.allocator, owned, {}) catch {
+                self.allocator.free(owned);
+                break;
+            };
             proposed += 1;
         }
     }
@@ -1144,11 +1065,15 @@ pub const WorkflowHandler = struct {
     /// taken stays at its start: the next leader won't step it again. One
     /// whose step_started wasn't logged is the next leader's to step.
     pub fn dropStartedRuns(self: *WorkflowHandler, shard: *Shard) void {
-        self.mu.lock();
-        defer self.mu.unlock();
         if (self.started_to_advance.items.len > 0 or self.stepping.count() > 0) log.warn("shard {d}: stopped leading with {d} workflow runs whose first step was logged and not taken, and {d} whose step_started was proposed and not applied; those whose entry commits stay at their start", .{ shard.id, self.started_to_advance.items.len, self.stepping.count() });
         for (self.started_to_advance.items) |s| self.allocator.free(s.ns_key);
         self.started_to_advance.clearRetainingCapacity();
+        self.clearStepping();
+    }
+
+    fn clearStepping(self: *WorkflowHandler) void {
+        var it = self.stepping.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
         self.stepping.clearRetainingCapacity();
     }
 
@@ -1168,7 +1093,7 @@ pub const WorkflowHandler = struct {
         };
         defer self.allocator.free(run_ns_key);
 
-        const run = self.runs.getPtr(run_ns_key) orelse {
+        const run = self.liveRun(run_ns_key) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
@@ -1287,7 +1212,7 @@ pub const WorkflowHandler = struct {
         };
         defer self.allocator.free(run_ns_key);
 
-        const run = self.runs.getPtr(run_ns_key) orelse {
+        const run = self.liveRun(run_ns_key) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return null;
         };
@@ -1359,7 +1284,7 @@ pub const WorkflowHandler = struct {
         };
         defer self.allocator.free(run_ns_key);
 
-        const run = self.runs.get(run_ns_key) orelse {
+        const run = self.shownRun(run_ns_key, keyName(run_ns_key)) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
@@ -1421,6 +1346,57 @@ pub const WorkflowHandler = struct {
         shard.sendOkResponse(conn, req.header.request_id, fbs.buffered());
     }
 
+    /// A run as a read shows it: as applied, with the step it is at and
+    /// what it waits for from this node's copy if it holds one (a node that
+    /// stopped leading keeps its copy, and answers from it).
+    const ShownRun = struct {
+        run_id_owned: []const u8,
+        workflow_name_owned: []const u8,
+        workflow_version_owned: []const u8,
+        status: RunStatus,
+        current_step_name_owned: ?[]const u8,
+        input_owned: []const u8,
+        created_at_ms: i64,
+        started_at_ms: ?i64,
+        completed_at_ms: ?i64,
+        wait_signal_type_owned: ?[]const u8,
+        output_owned: ?[]const u8,
+        search_tags_owned: ?[]const u8,
+        /// This node's copy, while the run hasn't ended.
+        copy: ?*const RunRecord,
+    };
+
+    fn shownRun(self: *WorkflowHandler, run_key: []const u8, run_id: []const u8) ?ShownRun {
+        const rec = self.appliedRun(run_key) orelse return null;
+        const applied_status = appliedStatus(rec);
+        const copy: ?*const RunRecord = if (applied_status.isTerminal()) null else self.runs.getPtr(run_key);
+        const stepped = self.runs.getPtr(run_key);
+        return .{
+            .run_id_owned = run_id,
+            .workflow_name_owned = rec.workflow,
+            .workflow_version_owned = rec.version,
+            .status = if (copy) |c| c.status else applied_status,
+            .current_step_name_owned = if (stepped) |c| c.current_step_name_owned else null,
+            .input_owned = rec.input,
+            .created_at_ms = rec.created_at_ms,
+            .started_at_ms = rec.created_at_ms,
+            .completed_at_ms = if (rec.completed_at_ms != 0) rec.completed_at_ms else null,
+            .wait_signal_type_owned = if (copy) |c| c.wait_signal_type_owned else null,
+            .output_owned = if (rec.has_output != 0) rec.output else null,
+            .search_tags_owned = if (rec.search_tags.len > 0) rec.search_tags else null,
+            .copy = copy,
+        };
+    }
+
+    /// Run `run_key`'s history as applied (`workflow.hist`), oldest first;
+    /// the events point into the store, so they hold until the next apply.
+    fn appliedHistory(self: *WorkflowHandler, run_key: []const u8, out: *std.ArrayListUnmanaged(HistoryEvent)) !void {
+        const prefix = try runs_machine.runRange(self.allocator, keyNamespace(run_key), keyName(run_key));
+        defer self.allocator.free(prefix);
+        var it = self.defsRead().range(runs_machine.HistFam, prefix);
+        while (try it.next()) |item| try out.append(self.allocator, .{ .event_type_owned = item.value.v.event, .detail_owned = item.value.v.detail, .timestamp_ms = item.value.v.at_ms });
+    }
+
     // ── HISTORY ─────────────────────────────────────────────────────────
 
     fn handleHistory(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
@@ -1437,7 +1413,7 @@ pub const WorkflowHandler = struct {
         };
         defer self.allocator.free(run_ns_key);
 
-        const run = self.runs.get(run_ns_key) orelse {
+        const shown_run = self.shownRun(run_ns_key, keyName(run_ns_key)) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
@@ -1455,7 +1431,17 @@ pub const WorkflowHandler = struct {
         // wire), a cancel reason (MAX_CANCEL_REASON), step or terminal names
         // from a definition under 64 KiB, or, once complete, the completion
         // record's, itself under 64 KiB. So each length fits u16.
-        const events = run.history.items;
+        // This node's copy's if it holds one (it may hold events not yet
+        // logged); else the run's, as applied.
+        var applied_events: std.ArrayListUnmanaged(HistoryEvent) = .empty;
+        defer applied_events.deinit(self.allocator);
+        const events: []const HistoryEvent = if (shown_run.copy) |c| c.history.items else blk: {
+            self.appliedHistory(run_ns_key, &applied_events) catch {
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+                return;
+            };
+            break :blk applied_events.items;
+        };
         const count: u32 = @intCast(@min(events.len, limit));
 
         var total: usize = 4; // count
@@ -1502,8 +1488,8 @@ pub const WorkflowHandler = struct {
         created_at: i64,
     };
 
-    /// Collect runs matching filters from this handler's own runs map, on
-    /// its own thread.
+    /// Collect the runs of namespace `ns` matching filters, as applied, on
+    /// this handler's own thread.
     pub fn collectMatchingRuns(
         self: *WorkflowHandler,
         runs_list: *std.ArrayListUnmanaged(RunInfo),
@@ -1512,10 +1498,10 @@ pub const WorkflowHandler = struct {
         status_filter: ?[]const u8,
         search_lower: ?[]const u8,
     ) !void {
-        var rit = self.runs.iterator();
-        while (rit.next()) |entry| {
-            const run = entry.value_ptr;
-            if (keyNamespace(entry.key_ptr.*) != ns) continue;
+        const id = ns.bytes();
+        var rit = self.defsRead().range(runs_machine.RunFam, &id);
+        while (rit.next() catch unreachable) |item| { // written by the machine alone
+            const run = self.shownRun(item.key, keyName(item.key)).?;
             if (workflow_name.len > 0 and !std.mem.eql(u8, run.workflow_name_owned, workflow_name)) continue;
             if (status_filter) |sf| {
                 if (!std.mem.eql(u8, run.status.toString(), sf)) continue;
@@ -1657,14 +1643,6 @@ pub const WorkflowHandler = struct {
         };
     }
 
-    /// Apply a workflow_step_started entry: the run's first step is now
-    /// its leader's to take, once. A run already stepped, finished or
-    /// unknown is refused, and changes nothing.
-    fn replayStepStarted(self: *WorkflowHandler, ns_key: []const u8, value: []const u8, out: *Result) persistence_mod.ApplyError!void {
-        if (value.len != 0) return error.Halt;
-        if (!self.to_step.remove(ns_key)) return out.refuse(.conflict, .unclassified, "conflict: the run's first step was taken");
-    }
-
     // ── LIST DEFINITIONS ────────────────────────────────────────────────
 
     fn handleListDefinitions(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
@@ -1746,7 +1724,7 @@ pub const WorkflowHandler = struct {
     /// `shard` provides access to the ActionsHandler for action invocation.
     /// `run_ns_key` must be a key that is valid in `self.runs`.
     fn advanceWorkflow(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8) void {
-        const run = self.runs.getPtr(run_ns_key) orelse return;
+        const run = self.liveRun(run_ns_key) orelse return;
         if (run.status.isTerminal() or endingInFlight(shard, run)) return;
         const ns = keyNamespace(run_ns_key);
 
@@ -2348,7 +2326,7 @@ pub const WorkflowHandler = struct {
         // be refused, unobserved, for ever; the parent is told instead.
         const run_key = self.nsKey(ns, run_id) orelse return error.OutOfMemory;
         defer self.allocator.free(run_key);
-        const taken = self.runs.contains(run_key);
+        const taken = self.appliedRun(run_key) != null;
         if (!held or taken) {
             // A refusal is told to the parent: not past its outbox's room.
             if (shard.sendWait(shard.router.slotToShard(p.parent_slot), ns) != null) return error.Overloaded;
@@ -2390,7 +2368,7 @@ pub const WorkflowHandler = struct {
             const call = (calls_mod.Calls.Value.decode(rec.value) catch continue).v;
             const run_key = self.nsKey(ns, call.caller_run) orelse continue;
             defer self.allocator.free(run_key);
-            const ended = if (self.runs.getPtr(run_key)) |r| r.status.isTerminal() else true;
+            const ended = if (self.appliedRun(run_key)) |r| appliedStatus(r).isTerminal() else true;
             if (ended) proposeClear(shard, ns, slot, k[6..]) catch {};
         }
         if (at_end) self.calls_sweep_after.clearRetainingCapacity();
@@ -2476,8 +2454,6 @@ pub const WorkflowHandler = struct {
     /// Check parked runs for finished actions and children, and the timers
     /// now due. Called periodically by the shard's task scheduler.
     pub fn checkPendingActions(self: *WorkflowHandler, shard: *Shard) void {
-        self.mu.lock();
-        defer self.mu.unlock();
         self.retryCompletions(shard, @import("stdx").time.milliTimestamp());
         self.sweepCalls(shard, @import("stdx").time.milliTimestamp());
         self.startChildren(shard);
@@ -2953,6 +2929,7 @@ pub const WorkflowHandler = struct {
             // logged. The run's completion time is the entry's stamp.
             .last = .{ .event_type = terminalEventType(status), .detail = detail, .timestamp_ms = now_ms },
             .tags = tags,
+            .workflow = run.workflow_name_owned,
         };
         const value = encodeCompletion(self.allocator, parts, limit) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -3377,9 +3354,6 @@ pub const WorkflowHandler = struct {
     /// failover or restart neither bursts nor skips. A leader whose clock
     /// runs ahead fires early by as much.
     pub fn tickSchedules(self: *WorkflowHandler, shard: *Shard) void {
-        self.mu.lock();
-        defer self.mu.unlock();
-
         const now_ms: i64 = @import("stdx").time.milliTimestamp();
         const term = shard.raft_node.current_term;
 
@@ -3395,7 +3369,8 @@ pub const WorkflowHandler = struct {
 
             // Check max_concurrent
             if (schedule.max_concurrent > 0) {
-                if ((self.active_runs.get(entry.key_ptr.*) orelse 0) >= schedule.max_concurrent) continue;
+                const active = if (runs_machine.perDefOf(self.defsRead(), entry.key_ptr.*)) |per| per.active else 0;
+                if (active >= schedule.max_concurrent) continue;
             }
 
             if (self.startRunFromSchedule(shard, schedule, slot)) {
@@ -3427,17 +3402,6 @@ pub const WorkflowHandler = struct {
         const run_id_str = shard.run_id_gen.next(.workflow, slot, shard.raft_node.current_term, &run_id_buf);
 
         return self.proposeRun(shard, schedule.ns, run_id_str, schedule.workflow_name_owned, "latest", input, idem, "schedule_started") != null;
-    }
-
-    /// A schedule's start applied: its slot, the key's last part, has
-    /// fired.
-    fn restoreScheduleSlot(self: *WorkflowHandler, ns: NamespaceId, wf_name: []const u8, idem: []const u8) void {
-        const colon = std.mem.lastIndexOfScalar(u8, idem, ':') orelse return;
-        const slot = std.fmt.parseInt(i64, idem[colon + 1 ..], 10) catch return;
-        const key = self.nsKey(ns, wf_name) orelse return;
-        defer self.allocator.free(key);
-        const schedule = self.schedules.getPtr(key) orelse return;
-        schedule.fired_ms = @max(schedule.fired_ms, slot);
     }
 
     /// Poll all active stream triggers and start workflow runs for new events.
@@ -3701,10 +3665,6 @@ pub const WorkflowHandler = struct {
             return true;
         };
 
-        // The first-step queue is shared with a parent run on another
-        // shard starting a child here, which holds this handler's lock.
-        self.mu.lock();
-        defer self.mu.unlock();
         _ = self.proposeStart(shard, trigger.ns, run_id_str, trigger.workflow_name_owned, "latest", input, idem, "trigger_started") catch |err| {
             if (!shard.quietHalted(err)) log.err("workflow {s}: run {s} not started: {s}", .{ trigger.workflow_name_owned, run_id_str, @errorName(err) });
             // One that can pass (the log full for now, this node not leading
@@ -3716,26 +3676,6 @@ pub const WorkflowHandler = struct {
             };
         };
         return true;
-    }
-
-    /// Advance a stream trigger's cursor to the event a restored run came
-    /// from. Runs apply in log order after their definition, so by the end
-    /// of replay the cursor sits at the last event that started a run.
-    fn restoreTriggerCursor(self: *WorkflowHandler, ns: NamespaceId, wf_name: []const u8, idem: []const u8) void {
-        const at = std.mem.lastIndexOfScalar(u8, idem, '@') orelse return;
-        const colon = std.mem.lastIndexOfScalar(u8, idem, ':') orelse return;
-        if (colon <= at) return;
-        const ts = std.fmt.parseInt(u64, idem[at + 1 .. colon], 10) catch return;
-        const seq = std.fmt.parseInt(u64, idem[colon + 1 ..], 10) catch return;
-        const key = self.nsKey(ns, wf_name) orelse return;
-        defer self.allocator.free(key);
-        const trigger = self.stream_triggers.getPtr(key) orelse return;
-        const event = StreamID{ .timestamp_ms = ts, .sequence = seq };
-        const cursor = StreamID{ .timestamp_ms = trigger.stream_cursor_ts, .sequence = trigger.stream_cursor_seq };
-        if (event.greaterThan(cursor)) {
-            trigger.stream_cursor_ts = ts;
-            trigger.stream_cursor_seq = seq;
-        }
     }
 
     // ── Plan Health Helpers ─────────────────────────────────────────────
@@ -3861,7 +3801,7 @@ pub const WorkflowHandler = struct {
         // so a longer id is no run's.
         var buf: [MAX_START_KEY]u8 = undefined;
         if (KEY_PREFIX + run_id.len > buf.len) return false;
-        return self.runs.contains(writeKey(&buf, ns, run_id));
+        return self.appliedRun(writeKey(&buf, ns, run_id)) != null;
     }
 
     /// A key for the maps (`writeKey`), allocated; null when out of memory.
@@ -3905,7 +3845,7 @@ pub const WorkflowHandler = struct {
 
     /// Start a run for a producer (a schedule, a trigger, a parent run):
     /// the start is proposed and the tick takes its first step once it
-    /// applies, as for a client's. Returns the start's log index. The caller holds `mu`.
+    /// applies, as for a client's. Returns the start's log index.
     fn proposeRun(
         self: *WorkflowHandler,
         shard: *Shard,
@@ -3986,6 +3926,8 @@ pub const WorkflowHandler = struct {
         dropped: usize = 0,
         last: Event,
         tags: ?[]const u8,
+        /// The run's workflow: the runs machine counts its runs by it.
+        workflow: []const u8,
 
         const Event = struct { event_type: []const u8, detail: []const u8, timestamp_ms: i64 };
 
@@ -4003,6 +3945,7 @@ pub const WorkflowHandler = struct {
             for (c.history) |e| n += eventSize(e.event_type_owned, e.detail_owned);
             n += eventSize(c.last.event_type, c.last.detail);
             if (c.tags) |t| n += t.len;
+            n += 2 + c.workflow.len;
             return n;
         }
     };
@@ -4021,7 +3964,7 @@ pub const WorkflowHandler = struct {
     /// The bytes a run's completion record takes for what it holds now:
     /// its step outputs and history, before the final event, output and tags.
     fn completionBase(run: *const RunRecord) usize {
-        var n: usize = 1 + 1 + 2 + 2 + 2;
+        var n: usize = 1 + 1 + 2 + 2 + 2 + 2 + run.workflow_name_owned.len;
         if (run.step_outputs) |so| for (so.entries) |e| {
             n += 2 + e.step_name.len + 2 + e.outcome.len + 4 + e.output.len;
         };
@@ -4076,6 +4019,8 @@ pub const WorkflowHandler = struct {
         const t = c.tags orelse "";
         w.writeInt(u16, @intCast(t.len), .little) catch unreachable;
         w.writeAll(t) catch unreachable;
+        w.writeInt(u16, @intCast(c.workflow.len), .little) catch unreachable;
+        w.writeAll(c.workflow) catch unreachable;
         std.debug.assert(w.end == total);
         return buf;
     }
@@ -4105,6 +4050,7 @@ pub const WorkflowHandler = struct {
             .history = full.history,
             .last = .{ .event_type = terminalEventType(if (cancelled) .cancelled else .failed), .detail = detail, .timestamp_ms = full.last.timestamp_ms },
             .tags = null,
+            .workflow = full.workflow,
         };
         // Drop the oldest events until the rest fit.
         while (true) {
@@ -4121,77 +4067,20 @@ pub const WorkflowHandler = struct {
         }
     }
 
-    fn noteRunFinished(self: *WorkflowHandler, run: *const RunRecord) void {
-        const key = self.nsKey(keyNamespace(run.ns_key), run.workflow_name_owned) orelse return;
-        defer self.allocator.free(key);
-        if (self.active_runs.getPtr(key)) |n| n.* -|= 1;
-    }
-
-    /// Sets the run's terminal state from a workflow_complete value stamped
-    /// `completed_at_ms`; the producer and replay both apply it here. A
-    /// value cut short, or an allocation that fails, leaves the run as it
-    /// was.
-    fn applyComplete(self: *WorkflowHandler, run: *RunRecord, value: []const u8, completed_at_ms: i64) persistence_mod.ApplyError!void {
-        const entry = CompleteEntry.parse(value) orelse return error.Halt;
-        const built = try self.buildComplete(&entry);
-
-        if (!run.status.isTerminal()) self.noteRunFinished(run);
-        _ = self.to_step.remove(run.ns_key);
-        // The entry carries the whole terminal state: the run's steps,
-        // outputs and history are replaced with what was logged.
-        run.status = entry.status;
-        run.completed_at_ms = completed_at_ms;
-        if (run.output_owned) |o| self.allocator.free(o);
-        run.output_owned = built.output;
-        if (run.step_outputs) |*so| {
-            var mutable = so.*;
-            mutable.deinit(self.allocator);
-        }
-        run.step_outputs = built.steps;
-        for (run.history.items) |evt| {
-            self.allocator.free(evt.event_type_owned);
-            self.allocator.free(evt.detail_owned);
-        }
-        run.history.deinit(self.allocator);
-        run.history = built.history;
-        if (built.tags) |t| {
-            if (run.search_tags_owned) |old| self.allocator.free(old);
-            run.search_tags_owned = t;
-        }
-    }
-
-    /// Register this handler's entry types with the shared ReplayRegistry.
-    pub fn registerReplay(self: *WorkflowHandler, registry: *persistence_mod.ReplayRegistry) void {
-        registry.register(.workflow_start, @ptrCast(self), replayEntryThunk);
-        registry.register(.workflow_complete, @ptrCast(self), replayEntryThunk);
-        registry.register(.workflow_step_started, @ptrCast(self), replayEntryThunk);
-    }
-
-    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
-        const self: *WorkflowHandler = @ptrCast(@alignCast(ctx));
-        return self.replayEntry(entry, out);
-    }
-
-    /// Apply a workflow entry: live commit, replicated entry or boot replay
-    /// alike. A create is answered with the definition's name; a start with
-    /// whether it created its run (u8) and the run's id.
+    /// A workflow entry applied on this handler's store, through the
+    /// machine that owns it, then what follows it, as a shard's applier
+    /// runs them: for tests, and a handler built without a shard. A create
+    /// is answered with the definition's name; a start with whether it
+    /// created its run (u8) and the run's id.
     pub fn replayEntry(self: *WorkflowHandler, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
-        const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
-        // Every path that changes run state takes this lock; nothing holds
-        // it across an apply, so taking it here cannot nest.
-        self.mu.lock();
-        defer self.mu.unlock();
-        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return error.Halt;
-        // Every workflow key leads with the namespace its entry is stamped with.
-        if (cmd.key.len < KEY_PREFIX or keyNamespace(cmd.key) != cmd.namespace_id) return error.Halt;
-
-        return switch (etype) {
-            .workflow_create, .workflow_enabled => self.applyDefinition(entry, out),
-            .workflow_start => self.replayStart(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
-            .workflow_step_started => self.replayStepStarted(cmd.key, cmd.value, out),
-            .workflow_complete => self.replayComplete(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
-            else => error.Halt,
+        const etype = std.enums.fromInt(entry_mod.EntryType, entry.header.entry_type) orelse return error.Halt;
+        const m: *const contract_machine.Machine = switch (etype) {
+            .workflow_create, .workflow_enabled => &defs_machine.machine,
+            .workflow_start, .workflow_step_started, .workflow_complete, .child_start, .child_refuse => &runs_machine.machine,
+            else => return error.Halt,
         };
+        try contract_machine.applyEntry(m, self.defsRead().store, &self.def_scratch, entry, out);
+        self.entryApplied(entry, out);
     }
 
     // ── Definitions ─────────────────────────────────────────────────────
@@ -4241,26 +4130,241 @@ pub const WorkflowHandler = struct {
         self.direct_index += 1;
         const e = entry_mod.buildEntry(t, flags, 1, self.direct_index, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, buf);
         out.reset(&e);
-        return self.applyDefinition(&e, out);
+        return self.replayEntry(&e, out);
     }
 
-    /// A create or enable through the definitions machine on this handler's
-    /// store, then what follows it, as a shard's applier runs them.
-    fn applyDefinition(self: *WorkflowHandler, e: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
-        try contract_machine.applyEntry(&defs_machine.machine, self.defsRead().store, &self.def_scratch, e, out);
-        self.definitionApplied(e, out);
+    /// For tests: a committed start of run `ns_key`, as `replayCreate`.
+    pub fn replayStart(self: *WorkflowHandler, ns_key: []const u8, value: []const u8, stamp_ms: i64, out: *Result) persistence_mod.ApplyError!void {
+        return self.applyDirect(.workflow_start, 0, ns_key, value, stamp_ms, out);
     }
 
-    /// After a definition's create or enable applied, on every replica, live
-    /// and at boot replay alike (`PartitionReplay`): its schedule and
-    /// trigger follow its record, in log order, so a start replayed after it
-    /// restores into the producers its definition had then.
-    pub fn definitionApplied(self: *WorkflowHandler, e: *const entry_mod.Entry, out: *const Result) void {
-        const t: entry_mod.EntryType = @fromBackingInt(@intCast(e.header.entry_type));
-        if (t != .workflow_create and t != .workflow_enabled) return;
+    /// For tests: a committed first step of run `ns_key`.
+    pub fn replayStepStarted(self: *WorkflowHandler, ns_key: []const u8, out: *Result) persistence_mod.ApplyError!void {
+        return self.applyDirect(.workflow_step_started, 0, ns_key, "", 0, out);
+    }
+
+    /// For tests: a committed completion of run `ns_key`.
+    pub fn replayComplete(self: *WorkflowHandler, ns_key: []const u8, value: []const u8, stamp_ms: i64, out: *Result) persistence_mod.ApplyError!void {
+        return self.applyDirect(.workflow_complete, 0, ns_key, value, stamp_ms, out);
+    }
+
+    /// After a workflow entry applied, on every replica, live and at boot
+    /// replay alike (`PartitionReplay`). A definition's schedule and trigger
+    /// follow its record, in log order. A run's entry keeps `to_step`, the
+    /// producers' fired slot and cursor, and this node's working copy of the
+    /// run, if it holds one, as `workflow.run` now says.
+    pub fn entryApplied(self: *WorkflowHandler, e: *const entry_mod.Entry, out: *const Result) void {
         if (out.refused() != null) return;
+        const t = std.enums.fromInt(entry_mod.EntryType, e.header.entry_type) orelse return;
+        switch (t) {
+            .workflow_create, .workflow_enabled, .workflow_start, .workflow_step_started, .workflow_complete => {},
+            else => return,
+        }
         const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return;
-        self.syncProducers(cmd.key);
+        switch (t) {
+            .workflow_create, .workflow_enabled => self.syncProducers(cmd.key),
+            else => self.runApplied(t, cmd.key),
+        }
+    }
+
+    fn runApplied(self: *WorkflowHandler, t: entry_mod.EntryType, run_key: []const u8) void {
+        const run = runs_machine.runOf(self.defsRead(), run_key) orelse return;
+        const status = appliedStatus(run);
+        if (run.stepped == 0 and !status.isTerminal()) self.indexToStep(run_key) else self.unindexToStep(run_key);
+        switch (t) {
+            .workflow_start => {
+                self.followFired(keyNamespace(run_key), run.workflow);
+                self.followTrigger(keyNamespace(run_key), run.workflow, run.idempotency_key);
+            },
+            .workflow_complete => if (self.runs.getPtr(run_key)) |r| self.endCopy(r, run, status),
+            else => {},
+        }
+    }
+
+    fn indexToStep(self: *WorkflowHandler, run_key: []const u8) void {
+        if (self.to_step.contains(run_key)) return;
+        const owned = self.allocator.dupe(u8, run_key) catch return self.lostToStep(run_key);
+        self.to_step.put(self.allocator, owned, {}) catch {
+            self.allocator.free(owned);
+            self.lostToStep(run_key);
+        };
+    }
+
+    fn lostToStep(_: *WorkflowHandler, run_key: []const u8) void {
+        log.err("workflow run {f} started but cannot be indexed for its first step (out of memory); it stays at its start", .{shown(run_key)});
+    }
+
+    fn unindexToStep(self: *WorkflowHandler, run_key: []const u8) void {
+        if (self.to_step.fetchRemove(run_key)) |kv| self.allocator.free(kv.key);
+    }
+
+    /// A schedule's slots fired, as the starts applied so far moved them
+    /// (`workflow.per_def`), so a new leader fires only later slots.
+    fn followFired(self: *WorkflowHandler, ns: NamespaceId, wf_name: []const u8) void {
+        const def_key = self.nsKey(ns, wf_name) orelse return;
+        defer self.allocator.free(def_key);
+        const per = runs_machine.perDefOf(self.defsRead(), def_key) orelse return;
+        if (self.schedules.getPtr(def_key)) |schedule| {
+            if (per.fired_ms != 0) schedule.fired_ms = @max(schedule.fired_ms, per.fired_ms);
+        }
+    }
+
+    /// A trigger's cursor moved to the event a start applied here came from
+    /// (its key, "trigger:<stream>@<ts>:<seq>"), when that is the stream the
+    /// trigger reads now. Runs apply in log order after their definition,
+    /// so the cursor sits at the last event that started a run; a
+    /// redefinition onto another stream reads it from the start.
+    fn followTrigger(self: *WorkflowHandler, ns: NamespaceId, wf_name: []const u8, idem: []const u8) void {
+        if (!std.mem.startsWith(u8, idem, "trigger:")) return;
+        const at = std.mem.lastIndexOfScalar(u8, idem, '@') orelse return;
+        const colon = std.mem.lastIndexOfScalar(u8, idem, ':') orelse return;
+        if (colon <= at) return;
+        const ts = std.fmt.parseInt(u64, idem[at + 1 .. colon], 10) catch return;
+        const seq = std.fmt.parseInt(u64, idem[colon + 1 ..], 10) catch return;
+        const def_key = self.nsKey(ns, wf_name) orelse return;
+        defer self.allocator.free(def_key);
+        const trigger = self.stream_triggers.getPtr(def_key) orelse return;
+        if (!std.mem.eql(u8, idem["trigger:".len..at], trigger.stream_name_owned)) return;
+        const event = StreamID{ .timestamp_ms = ts, .sequence = seq };
+        const cursor = StreamID{ .timestamp_ms = trigger.stream_cursor_ts, .sequence = trigger.stream_cursor_seq };
+        if (event.greaterThan(cursor)) {
+            trigger.stream_cursor_ts = ts;
+            trigger.stream_cursor_seq = seq;
+        }
+    }
+
+    /// This node's working copy of a run that just ended: how, when and with
+    /// what output, as `workflow.run` holds it.
+    fn endCopy(self: *WorkflowHandler, r: *RunRecord, run: runs_machine.Run.Value, status: RunStatus) void {
+        self.takeLogged(r) catch log.err("workflow run {f}: its history and step outputs as logged not copied (out of memory); reads show them as applied", .{shown(r.ns_key)});
+        r.status = status;
+        r.completed_at_ms = run.completed_at_ms;
+        const output: ?[]const u8 = if (run.has_output != 0) self.allocator.dupe(u8, run.output) catch null else null;
+        if (r.output_owned) |o| self.allocator.free(o);
+        r.output_owned = output;
+        if (run.search_tags.len > 0) if (self.allocator.dupe(u8, run.search_tags) catch null) |t| {
+            if (r.search_tags_owned) |old| self.allocator.free(old);
+            r.search_tags_owned = t;
+        };
+    }
+
+    fn appliedStatus(r: runs_machine.Run.Value) RunStatus {
+        return std.enums.fromInt(RunStatus, r.status) orelse .failed;
+    }
+
+    /// Run `run_key` as `workflow.run` holds it, or null.
+    pub fn appliedRun(self: *const WorkflowHandler, run_key: []const u8) ?runs_machine.Run.Value {
+        return runs_machine.runOf(self.defsRead(), run_key);
+    }
+
+    /// The id of the run an idempotency key started for this workflow in
+    /// this namespace, if one has applied (`workflow.idem`).
+    fn runForIdempotencyKey(self: *const WorkflowHandler, ns: NamespaceId, wf_name: []const u8, key: []const u8) ?[]const u8 {
+        const k = runs_machine.idemKey(self.allocator, ns, wf_name, key) catch return null;
+        defer self.allocator.free(k);
+        const got = (self.defsRead().get(runs_machine.IdemFam, k) catch return null) orelse return null;
+        return got.v.run;
+    }
+
+    /// `r`'s history and step outputs replaced with the run's as applied.
+    fn takeLogged(self: *WorkflowHandler, r: *RunRecord) !void {
+        const a = self.allocator;
+        var history: std.ArrayList(HistoryEvent) = .empty;
+        errdefer freeHistory(a, &history);
+        var steps: ?StepOutputMap = null;
+        errdefer if (steps) |*so| so.deinit(a);
+        const read = self.defsRead();
+        const prefix = try runs_machine.runRange(a, keyNamespace(r.ns_key), keyName(r.ns_key));
+        defer a.free(prefix);
+        var hit = read.range(runs_machine.HistFam, prefix);
+        while (try hit.next()) |item| {
+            const ev = item.value.v;
+            const event_type = try a.dupe(u8, ev.event);
+            errdefer a.free(event_type);
+            const detail = try a.dupe(u8, ev.detail);
+            errdefer a.free(detail);
+            try history.append(a, .{ .event_type_owned = event_type, .detail_owned = detail, .timestamp_ms = ev.at_ms });
+        }
+        var oit = read.range(runs_machine.OutFam, prefix);
+        while (try oit.next()) |item| {
+            if (steps == null) steps = StepOutputMap.init();
+            try steps.?.put(a, item.key[prefix.len..], item.value.v.output, item.value.v.outcome);
+        }
+        freeHistory(a, &r.history);
+        r.history = history;
+        if (r.step_outputs) |*so| so.deinit(a);
+        r.step_outputs = steps;
+    }
+
+    fn freeHistory(a: Allocator, history: *std.ArrayList(HistoryEvent)) void {
+        for (history.items) |evt| {
+            a.free(evt.event_type_owned);
+            a.free(evt.detail_owned);
+        }
+        history.deinit(a);
+    }
+
+    /// This node's working copy of run `run_key`: the one it holds, or one
+    /// built now from `workflow.run`, its history and step outputs. Null
+    /// for a run that never started, or one it can't build (out of memory,
+    /// said in the log).
+    pub fn liveRun(self: *WorkflowHandler, run_key: []const u8) ?*RunRecord {
+        if (self.runs.getPtr(run_key)) |r| return r;
+        const rec = runs_machine.runOf(self.defsRead(), run_key) orelse return null;
+        self.copyRun(run_key, rec) catch {
+            log.err("workflow run {f}: not taken on (out of memory)", .{shown(run_key)});
+            return null;
+        };
+        return self.runs.getPtr(run_key);
+    }
+
+    fn copyRun(self: *WorkflowHandler, run_key: []const u8, rec: runs_machine.Run.Value) !void {
+        const a = self.allocator;
+        var run = RunRecord{
+            .run_id_owned = "",
+            .workflow_name_owned = "",
+            .workflow_version_owned = "",
+            .status = appliedStatus(rec),
+            .input_owned = "",
+            .created_at_ms = rec.created_at_ms,
+            .started_at_ms = rec.created_at_ms,
+            .completed_at_ms = if (rec.completed_at_ms != 0) rec.completed_at_ms else null,
+            .idempotency_key_owned = null,
+            .signals = .empty,
+            .history = .empty,
+        };
+        errdefer self.freeRunRecord(&run);
+        run.run_id_owned = try a.dupe(u8, keyName(run_key));
+        run.workflow_name_owned = try a.dupe(u8, rec.workflow);
+        run.workflow_version_owned = try a.dupe(u8, rec.version);
+        run.input_owned = try a.dupe(u8, rec.input);
+        if (rec.idempotency_key.len > 0) run.idempotency_key_owned = try a.dupe(u8, rec.idempotency_key);
+        if (rec.has_output != 0) run.output_owned = try a.dupe(u8, rec.output);
+        if (rec.search_tags.len > 0) run.search_tags_owned = try a.dupe(u8, rec.search_tags);
+
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const read = self.defsRead();
+        const prefix = try runs_machine.runRange(scratch.allocator(), keyNamespace(run_key), keyName(run_key));
+        var hit = read.range(runs_machine.HistFam, prefix);
+        while (try hit.next()) |item| {
+            const ev = item.value.v;
+            const event_type = try a.dupe(u8, ev.event);
+            errdefer a.free(event_type);
+            const detail = try a.dupe(u8, ev.detail);
+            errdefer a.free(detail);
+            try run.history.append(a, .{ .event_type_owned = event_type, .detail_owned = detail, .timestamp_ms = ev.at_ms });
+        }
+        var oit = read.range(runs_machine.OutFam, prefix);
+        while (try oit.next()) |item| {
+            if (run.step_outputs == null) run.step_outputs = StepOutputMap.init();
+            try run.step_outputs.?.put(a, item.key[prefix.len..], item.value.v.output, item.value.v.outcome);
+        }
+
+        const owned_key = try a.dupe(u8, run_key);
+        errdefer a.free(owned_key);
+        run.ns_key = owned_key;
+        try self.runs.put(owned_key, run);
     }
 
     /// `def_key`'s schedule and stream trigger as its record says: built,
@@ -4286,6 +4390,8 @@ pub const WorkflowHandler = struct {
         }
         // An enable after a disable moves the anchor without a create.
         if (self.schedules.getPtr(def_key)) |schedule| schedule.anchor_ms = d.anchor_ms;
+        // The slots the starts applied so far fired.
+        self.followFired(ns, name);
     }
 
     fn noteBuilt(self: *WorkflowHandler, def_key: []const u8, index: u64) void {
@@ -4297,297 +4403,12 @@ pub const WorkflowHandler = struct {
         self.producers_built.put(self.allocator, owned, index) catch self.allocator.free(owned);
     }
 
-    /// Apply a workflow_start entry, keyed by the run's key.
-    fn replayStart(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8, created_at_ms: i64, out: *Result) persistence_mod.ApplyError!void {
-        const ns = keyNamespace(ns_key_raw);
-        const raw_run_id = keyName(ns_key_raw);
-
-        var off: usize = 0;
-        if (off + 2 > value.len) return error.Halt;
-        const wf_name_len = std.mem.readInt(u16, value[off..][0..2], .little);
-        off += 2;
-        if (off + wf_name_len > value.len) return error.Halt;
-        const wf_name = value[off .. off + wf_name_len];
-        off += wf_name_len;
-
-        if (off + 2 > value.len) return error.Halt;
-        const ver_len = std.mem.readInt(u16, value[off..][0..2], .little);
-        off += 2;
-        if (off + ver_len > value.len) return error.Halt;
-        const version = value[off .. off + ver_len];
-        off += ver_len;
-
-        if (off + 1 > value.len) return error.Halt;
-        const status = std.enums.fromInt(RunStatus, value[off]) orelse return error.Halt;
-        off += 1;
-
-        if (off + 2 > value.len) return error.Halt;
-        const evt_len = std.mem.readInt(u16, value[off..][0..2], .little);
-        off += 2;
-        if (off + evt_len > value.len) return error.Halt;
-        const event_type = value[off .. off + evt_len];
-        off += evt_len;
-
-        if (off + 2 > value.len) return error.Halt;
-        const idem_len = std.mem.readInt(u16, value[off..][0..2], .little);
-        off += 2;
-        if (off + idem_len > value.len) return error.Halt;
-        const idem: ?[]const u8 = if (idem_len > 0) value[off .. off + idem_len] else null;
-        off += idem_len;
-
-        const input = if (off < value.len) value[off..] else "{}";
-
-        // Two starts with one idempotency key can both pass the handler's
-        // check before either applies; the log's order decides. The later
-        // one creates nothing, and its client is answered with the earlier
-        // run. Checked before the run id, as the handler does: a retry
-        // carrying both its key and its own run id is the same start.
-        if (idem) |k| {
-            if (self.runKeyForIdempotencyKey(ns, wf_name, k)) |run_key| {
-                const earlier = self.runs.get(run_key) orelse return error.Halt;
-                out.putInt(u8, 0);
-                out.putBytes(earlier.run_id_owned);
-                return;
-            }
-        }
-
-        // Already present: a re-apply, or a second start with a run id
-        // the client chose, which the handler let through while the first
-        // was uncommitted. The log's order decides; the later is refused.
-        if (self.runs.contains(ns_key_raw)) return out.refuse(.conflict, .unclassified, "conflict: a run with this id already exists");
-
-        // A disable or a redefinition that commits ahead of a start decides
-        // it, as the handler's checks would have. Only client and schedule
-        // starts. Not a child's: a parent reads a child on another shard
-        // that its start never created as not finished yet, so refusing it
-        // here would leave the parent waiting for good. Not a trigger's:
-        // its leader has moved the trigger's cursor past the record
-        // already, so a trigger start proposed before a disable commits
-        // still runs. A refused schedule start leaves its slot unfired;
-        // enabling re-anchors past it.
-        const client_start = std.mem.eql(u8, event_type, "workflow_started");
-        if (client_start or std.mem.eql(u8, event_type, "schedule_started")) {
-            const def_key = self.nsKey(ns, wf_name) orelse return error.OutOfMemory;
-            defer self.allocator.free(def_key);
-            if (self.isDisabled(def_key)) return out.refuse(.bad_request, .unclassified, "workflow is disabled");
-            if (client_start and idem == null) {
-                if (self.defOf(def_key)) |def| {
-                    if (def.idempotency == .required) return out.refuse(.bad_request, .unclassified, "idempotency key is required for this workflow");
-                }
-            }
-        }
-
-        const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return error.OutOfMemory;
-        var run = RunRecord{
-            .run_id_owned = self.allocator.dupe(u8, raw_run_id) catch {
-                self.allocator.free(ns_key);
-                return error.OutOfMemory;
-            },
-            .workflow_name_owned = "",
-            .workflow_version_owned = "",
-            .status = status,
-            .input_owned = "",
-            .created_at_ms = created_at_ms,
-            .started_at_ms = created_at_ms,
-            .completed_at_ms = null,
-            .idempotency_key_owned = null,
-            .signals = .empty,
-            .history = .empty,
-        };
-        run.workflow_name_owned = self.allocator.dupe(u8, wf_name) catch {
-            self.allocator.free(run.run_id_owned);
-            self.allocator.free(ns_key);
-            return error.OutOfMemory;
-        };
-        run.workflow_version_owned = self.allocator.dupe(u8, version) catch {
-            self.allocator.free(run.run_id_owned);
-            self.allocator.free(run.workflow_name_owned);
-            self.allocator.free(ns_key);
-            return error.OutOfMemory;
-        };
-        run.input_owned = self.allocator.dupe(u8, input) catch {
-            self.allocator.free(run.run_id_owned);
-            self.allocator.free(run.workflow_name_owned);
-            self.allocator.free(run.workflow_version_owned);
-            self.allocator.free(ns_key);
-            return error.OutOfMemory;
-        };
-        run.idempotency_key_owned = if (idem) |k| self.allocator.dupe(u8, k) catch {
-            self.allocator.free(run.run_id_owned);
-            self.allocator.free(run.workflow_name_owned);
-            self.allocator.free(run.workflow_version_owned);
-            self.allocator.free(run.input_owned);
-            self.allocator.free(ns_key);
-            return error.OutOfMemory;
-        } else null;
-        // The run's first history event, as the start path recorded it.
-        if (event_type.len > 0) self.addHistoryEvent(&run, event_type, input, created_at_ms);
-        if (idem) |k| {
-            if (std.mem.eql(u8, event_type, "trigger_started") and std.mem.startsWith(u8, k, "trigger:")) {
-                self.restoreTriggerCursor(ns, wf_name, k);
-            }
-            if (std.mem.eql(u8, event_type, "schedule_started") and std.mem.startsWith(u8, k, "schedule:")) {
-                self.restoreScheduleSlot(ns, wf_name, k);
-            }
-        }
-
-        run.ns_key = ns_key;
-        const active = self.activeRuns(ns, wf_name) orelse {
-            self.freeRunRecord(&run);
-            self.allocator.free(ns_key);
-            return error.OutOfMemory;
-        };
-        self.to_step.ensureUnusedCapacity(self.allocator, 1) catch {
-            self.freeRunRecord(&run);
-            self.allocator.free(ns_key);
-            return error.OutOfMemory;
-        };
-        self.runs.put(ns_key, run) catch {
-            self.freeRunRecord(&run);
-            self.allocator.free(ns_key);
-            return error.OutOfMemory;
-        };
-        active.* += 1;
-        if (status == .running) self.to_step.putAssumeCapacity(ns_key, {});
-        out.putInt(u8, 1);
-        out.putBytes(raw_run_id);
-        if (idem) |k| self.indexIdempotencyKey(ns, wf_name, k, ns_key);
-        // Search tags come from the definition and the input; derived here so
-        // every node computes the same ones.
-        if (self.runs.getPtr(ns_key)) |stored| {
-            if (self.nsKey(ns, wf_name)) |def_ns_key| {
-                defer self.allocator.free(def_ns_key);
-                stored.search_tags_owned = self.buildSearchTags(def_ns_key, stored);
-            }
-        }
-    }
-
-    /// The count of namespace `ns`'s unfinished runs of a workflow, for the
-    /// caller to change at once.
-    fn activeRuns(self: *WorkflowHandler, ns: NamespaceId, wf_name: []const u8) ?*u32 {
-        const key = self.nsKey(ns, wf_name) orelse return null;
-        const got = self.active_runs.getOrPut(self.allocator, key) catch {
-            self.allocator.free(key);
-            return null;
-        };
-        if (got.found_existing) self.allocator.free(key) else got.value_ptr.* = 0;
-        return got.value_ptr;
-    }
-
-    /// Apply a workflow_complete entry. Updates the run's terminal status,
-    /// output, step_outputs, and history events.
-    /// Value format: [status:u8]
-    ///   [has_output:u8][output_len:u32][output]?
-    ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
-    ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
-    fn replayComplete(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8, completed_at_ms: i64, out: *Result) persistence_mod.ApplyError!void {
-        // Runs are never removed: a completion names one that started.
-        const run = self.runs.getPtr(ns_key_raw) orelse return error.Halt;
-        // The first completion in the log ends the run; a cancel and a
-        // completion in flight together leave it as the first left it. A
-        // second with the same outcome (two cancels) succeeds, changing
-        // nothing.
-        if (run.status.isTerminal()) {
-            const entry = CompleteEntry.parse(value) orelse return error.Halt;
-            if (entry.status == run.status) return;
-            return out.refuse(.bad_request, .unclassified, "run already finished");
-        }
-        try self.applyComplete(run, value, completed_at_ms);
-    }
-
-    /// A workflow_complete value, checked against its length:
-    ///   [status:u8]
-    ///   [has_output:u8]([output_len:u32][output])?
-    ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
-    ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
-    ///   [tags_len:u16][search_tags]
-    const CompleteEntry = struct {
-        status: RunStatus,
-        output: ?[]const u8,
-        step_count: u16,
-        steps: Cursor,
-        history_count: u16,
-        history: Cursor,
-        tags: ?[]const u8,
-
-        fn parse(value: []const u8) ?CompleteEntry {
-            var c = Cursor{ .bytes = value };
-            const status = std.enums.fromInt(RunStatus, (c.take(1) orelse return null)[0]) orelse return null;
-            const has_output = (c.take(1) orelse return null)[0];
-            const output: ?[]const u8 = if (has_output == 1) c.take(c.int(u32) orelse return null) orelse return null else null;
-            const step_count = c.int(u16) orelse return null;
-            const steps = c;
-            for (0..step_count) |_| {
-                _ = c.take(c.int(u16) orelse return null) orelse return null;
-                _ = c.take(c.int(u16) orelse return null) orelse return null;
-                _ = c.take(c.int(u32) orelse return null) orelse return null;
-            }
-            const history_count = c.int(u16) orelse return null;
-            const history = c;
-            for (0..history_count) |_| {
-                _ = c.take(c.int(u16) orelse return null) orelse return null;
-                _ = c.take(c.int(u16) orelse return null) orelse return null;
-                _ = c.int(i64) orelse return null;
-            }
-            const tags_len = c.int(u16) orelse return null;
-            const tags: ?[]const u8 = if (tags_len > 0) c.take(tags_len) orelse return null else null;
-            return .{ .status = status, .output = output, .step_count = step_count, .steps = steps, .history_count = history_count, .history = history, .tags = tags };
-        }
-    };
-
-    const BuiltComplete = struct {
-        output: ?[]const u8,
-        steps: ?StepOutputMap,
-        history: std.ArrayList(HistoryEvent),
-        tags: ?[]const u8,
-    };
-
-    /// The run's new terminal state, owned. A failed allocation frees what
-    /// was built and leaves the run as it was.
-    fn buildComplete(self: *WorkflowHandler, entry: *const CompleteEntry) !BuiltComplete {
-        const output: ?[]const u8 = if (entry.output) |o| try self.allocator.dupe(u8, o) else null;
-        errdefer if (output) |o| self.allocator.free(o);
-
-        var steps: ?StepOutputMap = null;
-        errdefer if (steps) |*so| so.deinit(self.allocator);
-        if (entry.step_count > 0) {
-            steps = StepOutputMap.init();
-            var c = entry.steps;
-            for (0..entry.step_count) |_| {
-                const name = c.take(c.int(u16).?).?;
-                const outcome = c.take(c.int(u16).?).?;
-                const out = c.take(c.int(u32).?).?;
-                try steps.?.put(self.allocator, name, out, outcome);
-            }
-        }
-
-        var history: std.ArrayList(HistoryEvent) = .empty;
-        errdefer {
-            for (history.items) |evt| {
-                self.allocator.free(evt.event_type_owned);
-                self.allocator.free(evt.detail_owned);
-            }
-            history.deinit(self.allocator);
-        }
-        try history.ensureTotalCapacity(self.allocator, entry.history_count);
-        var c = entry.history;
-        for (0..entry.history_count) |_| {
-            const event_type = try self.allocator.dupe(u8, c.take(c.int(u16).?).?);
-            errdefer self.allocator.free(event_type);
-            const detail = try self.allocator.dupe(u8, c.take(c.int(u16).?).?);
-            history.appendAssumeCapacity(.{ .event_type_owned = event_type, .detail_owned = detail, .timestamp_ms = c.int(i64).? });
-        }
-
-        const tags: ?[]const u8 = if (entry.tags) |t| try self.allocator.dupe(u8, t) else null;
-        return .{ .output = output, .steps = steps, .history = history, .tags = tags };
-    }
-
     pub fn definitionCount(self: *const WorkflowHandler) usize {
         return self.defsRead().store.families[defs_machine.DefFam.ID].count;
     }
 
     pub fn runCount(self: *const WorkflowHandler) usize {
-        return self.runs.count();
+        return self.defsRead().store.families[runs_machine.RunFam.ID].count;
     }
 };
 
@@ -5012,99 +4833,30 @@ fn destroyTestShard(shard: *Shard) void {
 }
 
 fn createTestRun(handler: *WorkflowHandler, ns_key: []const u8, run_id: []const u8, wf_name: []const u8) void {
-    const alloc = handler.allocator;
-    const owned_ns = alloc.dupe(u8, ns_key) catch return;
-    const owned_rid = alloc.dupe(u8, run_id) catch {
-        alloc.free(owned_ns);
-        return;
-    };
-    const owned_wf = alloc.dupe(u8, wf_name) catch {
-        alloc.free(owned_ns);
-        alloc.free(owned_rid);
-        return;
-    };
-    const owned_ver = alloc.dupe(u8, "1.0.0") catch {
-        alloc.free(owned_ns);
-        alloc.free(owned_rid);
-        alloc.free(owned_wf);
-        return;
-    };
-    const owned_input = alloc.dupe(u8, "{}") catch {
-        alloc.free(owned_ns);
-        alloc.free(owned_rid);
-        alloc.free(owned_wf);
-        alloc.free(owned_ver);
-        return;
-    };
-
-    handler.runs.put(owned_ns, .{
-        .ns_key = owned_ns,
-        .run_id_owned = owned_rid,
-        .workflow_name_owned = owned_wf,
-        .workflow_version_owned = owned_ver,
-        .status = .running,
-        .input_owned = owned_input,
-        .created_at_ms = 0,
-        .started_at_ms = 0,
-        .completed_at_ms = null,
-        .idempotency_key_owned = null,
-        .signals = .empty,
-        .history = .empty,
-    }) catch {
-        alloc.free(owned_ns);
-        alloc.free(owned_rid);
-        alloc.free(owned_wf);
-        alloc.free(owned_ver);
-        alloc.free(owned_input);
-    };
+    createTestRunWithInput(handler, ns_key, run_id, wf_name, "{}");
 }
 
+/// A running run of `wf_name` whose first step a leader took: applied as a
+/// shard applies its start and step, and taken on by this handler.
 fn createTestRunWithInput(handler: *WorkflowHandler, ns_key: []const u8, run_id: []const u8, wf_name: []const u8, input: []const u8) void {
-    const alloc = handler.allocator;
-    const owned_ns = alloc.dupe(u8, ns_key) catch return;
-    const owned_rid = alloc.dupe(u8, run_id) catch {
-        alloc.free(owned_ns);
-        return;
-    };
-    const owned_wf = alloc.dupe(u8, wf_name) catch {
-        alloc.free(owned_ns);
-        alloc.free(owned_rid);
-        return;
-    };
-    const owned_ver = alloc.dupe(u8, "1.0.0") catch {
-        alloc.free(owned_ns);
-        alloc.free(owned_rid);
-        alloc.free(owned_wf);
-        return;
-    };
-    const owned_input = alloc.dupe(u8, input) catch {
-        alloc.free(owned_ns);
-        alloc.free(owned_rid);
-        alloc.free(owned_wf);
-        alloc.free(owned_ver);
-        return;
-    };
-
-    handler.runs.put(owned_ns, .{
-        .ns_key = owned_ns,
-        .run_id_owned = owned_rid,
-        .workflow_name_owned = owned_wf,
-        .workflow_version_owned = owned_ver,
-        .status = .running,
-        .input_owned = owned_input,
-        .created_at_ms = 0,
-        .started_at_ms = 0,
-        .completed_at_ms = null,
-        .idempotency_key_owned = null,
-        .signals = .empty,
-        .history = .empty,
-    }) catch {
-        alloc.free(owned_ns);
-        alloc.free(owned_rid);
-        alloc.free(owned_wf);
-        alloc.free(owned_ver);
-        alloc.free(owned_input);
-    };
+    _ = run_id; // the key's
+    var buf: [4096]u8 = undefined;
+    var off: usize = 0;
+    for ([_][]const u8{ wf_name, "1.0.0" }) |p| {
+        std.mem.writeInt(u16, buf[off..][0..2], @intCast(p.len), .little);
+        @memcpy(buf[off + 2 ..][0..p.len], p);
+        off += 2 + p.len;
+    }
+    buf[off] = @backingInt(WorkflowHandler.RunStatus.running);
+    off += 1;
+    @memset(buf[off..][0..4], 0); // no event, no idempotency key
+    off += 4;
+    @memcpy(buf[off..][0..input.len], input);
+    off += input.len;
+    var out: Result = .{};
+    handler.replayStart(ns_key, buf[0..off], 0, &out) catch |err| std.debug.panic("test run not started: {s}", .{@errorName(err)});
+    handler.replayStepStarted(ns_key, &out) catch |err| std.debug.panic("test run not stepped: {s}", .{@errorName(err)});
+    _ = handler.liveRun(ns_key) orelse std.debug.panic("test run not taken on", .{});
 }
 
 fn createTestDef(handler: *WorkflowHandler, ns_key: []const u8, name: []const u8, yaml: []const u8) void {
@@ -5123,7 +4875,7 @@ test "a producer's start leaves its run to step, its logged first step joins the
     defer destroyTestShard(&shard);
     registerTestAction(&shard, "step-a");
     registerTestAction(&shard, "step-b");
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -5147,7 +4899,7 @@ test "a producer's start leaves its run to step, its logged first step joins the
     handler.queueFirstStep(testKey(.default, "ghost"), shard.raft_node.last_applied);
     handler.advanceStartedRuns(&shard);
     try testing.expectEqual(@as(usize, 0), handler.started_to_advance.items.len);
-    const run = handler.runs.get(testKey(.default, "run-p")).?;
+    const run = handler.liveRun(testKey(.default, "run-p")).?.*;
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
     try testing.expect(run.pending_action_run_id_owned != null);
 }
@@ -5160,7 +4912,7 @@ test "a step whose child's call the log dropped fails once the call's index has 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "run-c"), "run-c", "test-wf");
@@ -5169,11 +4921,11 @@ test "a step whose child's call the log dropped fails once the call's index has 
     // but which made no call, as when a lost leadership truncated it.
     const proposed = try @import("../kv/handler.zig").KVHandler.testProposePut(&shard, "k", "v");
     settleTest(&shard);
-    const run = handler.runs.getPtr(testKey(.default, "run-c")).?;
+    const run = handler.liveRun(testKey(.default, "run-c")).?;
     handler.parkForCall(run, .workflow, "gone", "start", "child-wf", 0, 0, proposed.index);
     handler.checkPendingActions(&shard);
     settleTest(&shard);
-    const after = handler.runs.get(testKey(.default, "run-c")).?;
+    const after = handler.liveRun(testKey(.default, "run-c")).?.*;
     try testing.expectEqual(WorkflowHandler.RunStatus.failed, after.status);
     var lost = false;
     for (after.history.items) |evt| {
@@ -5211,7 +4963,7 @@ test "a child pinned to a version starts that version, and one pinned to a versi
         defer actions.deinit();
         var shard = try createTestShard(&actions);
         defer destroyTestShard(&shard);
-        handler.registerReplay(&shard.replay_registry);
+        handler.store = &shard.defaultPartition().store;
         shard.workflow_handler = &handler;
         registerTestAction(&shard, "step-a");
         var jb: [512]u8 = undefined;
@@ -5225,13 +4977,13 @@ test "a child pinned to a version starts that version, and one pinned to a versi
         handler.advanceWorkflow(&shard, testKey(.default, "par"));
         settleTest(&shard);
         startTestChildren(&handler, &shard);
-        const parent = handler.runs.get(testKey(.default, "par")).?;
+        const parent = handler.liveRun(testKey(.default, "par")).?.*;
         if (std.mem.eql(u8, pin, "1.0.0")) {
             // The child runs, at its pinned version.
             try testing.expectEqual(WorkflowHandler.RunStatus.waiting, parent.status);
             const kid_key = handler.nsKey(.default, parent.pending_action_run_id_owned.?).?;
             defer allocator.free(kid_key);
-            try testing.expectEqualStrings("1.0.0", handler.runs.get(kid_key).?.workflow_version_owned);
+            try testing.expectEqualStrings("1.0.0", handler.liveRun(kid_key).?.*.workflow_version_owned);
         } else {
             // No run, and the parent's step says which.
             try testing.expectEqual(@as(usize, 1), handler.runs.count());
@@ -5252,7 +5004,7 @@ test "a child whose run id another run already holds is refused, not proposed fo
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "par-wf"), "par-wf", test_parent_json);
@@ -5261,7 +5013,7 @@ test "a child whose run id another run already holds is refused, not proposed fo
     handler.advanceWorkflow(&shard, testKey(.default, "par"));
     settleTest(&shard);
     // Before its start, a run already holds the child's id.
-    const kid_id = try allocator.dupe(u8, handler.runs.get(testKey(.default, "par")).?.pending_action_run_id_owned.?);
+    const kid_id = try allocator.dupe(u8, handler.liveRun(testKey(.default, "par")).?.*.pending_action_run_id_owned.?);
     defer allocator.free(kid_id);
     const kid_key = handler.nsKey(.default, kid_id).?;
     defer allocator.free(kid_key);
@@ -5272,7 +5024,7 @@ test "a child whose run id another run already holds is refused, not proposed fo
     var i = before + 1;
     while (i <= raft.log.lastIndex()) : (i += 1) try testing.expect(raft.log.getEntry(i).?.header.entry_type != @backingInt(entry_mod.EntryType.workflow_start));
     try testing.expect(children_mod.parentOf(.{ .store = &shard.defaultPartition().store }, .default, kid_id) == null);
-    const parent = handler.runs.get(testKey(.default, "par")).?;
+    const parent = handler.liveRun(testKey(.default, "par")).?.*;
     try testing.expectEqual(WorkflowHandler.RunStatus.failed, parent.status);
     var refused = false;
     for (parent.history.items) |evt| {
@@ -5289,7 +5041,7 @@ test "a pending child's start is proposed once while it may apply, and a second 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "par-wf"), "par-wf", test_parent_json);
@@ -5313,8 +5065,8 @@ test "a pending child's start is proposed once while it may apply, and a second 
     handler.child_starting_term = 0;
     handler.checkPendingActions(&shard);
     settleTest(&shard);
-    try testing.expectEqual(@as(usize, 2), handler.runs.count());
-    const parent = handler.runs.get(testKey(.default, "par")).?;
+    try testing.expectEqual(@as(usize, 2), handler.runCount());
+    const parent = handler.liveRun(testKey(.default, "par")).?.*;
     try testing.expectEqual(calls_mod.State.started, WorkflowHandler.callOf(&shard, &parent, parent.pending_action_run_id_owned.?).?.state);
 }
 
@@ -5326,7 +5078,7 @@ test "a parent's child is called, started by the child's shard, and its end told
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "par-wf"), "par-wf", test_parent_json);
@@ -5335,7 +5087,7 @@ test "a parent's child is called, started by the child's shard, and its end told
     handler.advanceWorkflow(&shard, testKey(.default, "par"));
     settleTest(&shard);
     startTestChildren(&handler, &shard);
-    const parent = handler.runs.get(testKey(.default, "par")).?;
+    const parent = handler.liveRun(testKey(.default, "par")).?.*;
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, parent.status);
     try testing.expectEqual(ae.CallKind.workflow, parent.pending_call_kind);
     const kid_id = parent.pending_action_run_id_owned.?;
@@ -5343,15 +5095,15 @@ test "a parent's child is called, started by the child's shard, and its end told
     // The child ran its step; its end is proposed, not applied.
     const kid_key = handler.nsKey(.default, kid_id).?;
     defer allocator.free(kid_key);
-    const kid = handler.runs.getPtr(kid_key).?;
+    const kid = handler.liveRun(kid_key).?;
     handler.completeRun(&shard, kid_key, kid, .completed, "flo.Completed", 3);
     handler.checkPendingActions(&shard);
-    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.runs.get(testKey(.default, "par")).?.status);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.liveRun(testKey(.default, "par")).?.*.status);
     // Applied: its end reaches the call, and the parent resumes and ends.
     settleTest(&shard);
     handler.checkPendingActions(&shard);
     settleTest(&shard);
-    const resumed = handler.runs.get(testKey(.default, "par")).?;
+    const resumed = handler.liveRun(testKey(.default, "par")).?.*;
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, resumed.status);
     var completed = false;
     for (resumed.history.items) |evt| {
@@ -5370,18 +5122,18 @@ test "a step whose action run the log dropped fails once the invoke's index has 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "run-l"), "run-l", "test-wf");
 
     handler.advanceWorkflow(&shard, testKey(.default, "run-l"));
-    const run = handler.runs.getPtr(testKey(.default, "run-l")).?;
+    const run = handler.liveRun(testKey(.default, "run-l")).?;
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
     // Not applied yet: the run waits.
     handler.checkPendingActions(&shard);
-    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.runs.get(testKey(.default, "run-l")).?.status);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.liveRun(testKey(.default, "run-l")).?.*.status);
 
     // Point the run at an action run no invoke created, then apply the
     // invoke's index: the run it names does not exist, as when a lost
@@ -5391,7 +5143,7 @@ test "a step whose action run the log dropped fails once the invoke's index has 
     settleTest(&shard);
     handler.checkPendingActions(&shard);
     settleTest(&shard);
-    try testing.expectEqual(WorkflowHandler.RunStatus.failed, handler.runs.get(testKey(.default, "run-l")).?.status);
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, handler.liveRun(testKey(.default, "run-l")).?.*.status);
 }
 
 // The step executor tests step runs directly: after each step they apply
@@ -5406,7 +5158,7 @@ test "step executor: linear workflow completes via action invocation" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     registerTestAction(&shard, "step-b");
@@ -5420,7 +5172,7 @@ test "step executor: linear workflow completes via action invocation" {
     handler.advanceWorkflow(&shard, testKey(.default, "run-1"));
     settleTest(&shard);
     {
-        const run = handler.runs.getPtr(testKey(.default, "run-1")).?;
+        const run = handler.liveRun(testKey(.default, "run-1")).?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
         // Complete step-a with "success"
         completeTestAction(&shard, run.pending_action_run_id_owned.?);
@@ -5430,7 +5182,7 @@ test "step executor: linear workflow completes via action invocation" {
     handler.checkPendingActions(&shard);
     settleTest(&shard);
     {
-        const run = handler.runs.getPtr(testKey(.default, "run-1")).?;
+        const run = handler.liveRun(testKey(.default, "run-1")).?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
         // Complete step-b with "success"
         completeTestAction(&shard, run.pending_action_run_id_owned.?);
@@ -5440,7 +5192,7 @@ test "step executor: linear workflow completes via action invocation" {
     handler.checkPendingActions(&shard);
     settleTest(&shard);
 
-    const run = handler.runs.get(testKey(.default, "run-1")).?;
+    const run = handler.liveRun(testKey(.default, "run-1")).?.*;
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
     try testing.expect(run.completed_at_ms != null);
     // History should have: step_started(start), action_completed, step_completed(start),
@@ -5459,7 +5211,7 @@ test "step executor: wait_for_signal parks run" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "init");
 
@@ -5470,7 +5222,7 @@ test "step executor: wait_for_signal parks run" {
     handler.advanceWorkflow(&shard, testKey(.default, "run-2"));
     settleTest(&shard);
     {
-        const run = handler.runs.getPtr(testKey(.default, "run-2")).?;
+        const run = handler.liveRun(testKey(.default, "run-2")).?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
         // Complete init with success so workflow transitions to wait_approval
         completeTestAction(&shard, run.pending_action_run_id_owned.?);
@@ -5480,7 +5232,7 @@ test "step executor: wait_for_signal parks run" {
     handler.checkPendingActions(&shard);
     settleTest(&shard);
 
-    const run = handler.runs.get(testKey(.default, "run-2")).?;
+    const run = handler.liveRun(testKey(.default, "run-2")).?.*;
     // Should be waiting for approval signal after init → wait_approval
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
     try testing.expect(run.wait_signal_type_owned != null);
@@ -5496,7 +5248,7 @@ test "step executor: signal resumes waiting workflow" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "init");
 
@@ -5507,20 +5259,20 @@ test "step executor: signal resumes waiting workflow" {
     handler.advanceWorkflow(&shard, testKey(.default, "run-3"));
     settleTest(&shard);
     {
-        const run = handler.runs.getPtr(testKey(.default, "run-3")).?;
+        const run = handler.liveRun(testKey(.default, "run-3")).?;
         completeTestAction(&shard, run.pending_action_run_id_owned.?);
     }
     // Resume init → transitions to wait_approval → parks for signal
     handler.checkPendingActions(&shard);
     settleTest(&shard);
     {
-        const run = handler.runs.get(testKey(.default, "run-3")).?;
+        const run = handler.liveRun(testKey(.default, "run-3")).?.*;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
     }
 
     // Simulate signal delivery: set up matching signal, clear wait, resume
     {
-        const run = handler.runs.getPtr(testKey(.default, "run-3")).?;
+        const run = handler.liveRun(testKey(.default, "run-3")).?;
         const sig_type = try allocator.dupe(u8, "approval");
         try run.signals.append(allocator, .{
             .signal_type_owned = sig_type,
@@ -5536,7 +5288,7 @@ test "step executor: signal resumes waiting workflow" {
     handler.advanceWorkflow(&shard, testKey(.default, "run-3"));
     settleTest(&shard);
 
-    const run = handler.runs.get(testKey(.default, "run-3")).?;
+    const run = handler.liveRun(testKey(.default, "run-3")).?.*;
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
 }
 
@@ -5549,7 +5301,7 @@ test "step executor: missing definition does not crash" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
 
     // No definition registered
@@ -5559,7 +5311,7 @@ test "step executor: missing definition does not crash" {
     handler.advanceWorkflow(&shard, testKey(.default, "run-4"));
     settleTest(&shard);
 
-    const run = handler.runs.get(testKey(.default, "run-4")).?;
+    const run = handler.liveRun(testKey(.default, "run-4")).?.*;
     // Still running since we couldn't find the definition to advance
     try testing.expectEqual(WorkflowHandler.RunStatus.running, run.status);
 }
@@ -5580,7 +5332,7 @@ test "a leader drops the calls whose workflow run has ended or is gone, and keep
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "run-live"), "run-live", "test-wf");
@@ -5610,7 +5362,7 @@ test "step executor: a step whose action's outbox is at its cap waits for room, 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -5619,19 +5371,19 @@ test "step executor: a step whose action's outbox is at its cap waits for room, 
     // The first run's call leaves its start in the outbox, untrimmed.
     handler.advanceWorkflow(&shard, testKey(.default, "run-1"));
     settleTest(&shard);
-    try testing.expect(handler.runs.getPtr(testKey(.default, "run-1")).?.pending_action_run_id_owned != null);
+    try testing.expect(handler.liveRun(testKey(.default, "run-1")).?.pending_action_run_id_owned != null);
     // One byte a channel: the second's step waits, and logs no call.
     shard.outbox_caps = .{ .shard = 1 << 30, .channel = 1 };
     const before = shard.raft_node.log.lastIndex();
     handler.advanceWorkflow(&shard, testKey(.default, "run-2"));
-    const held = handler.runs.getPtr(testKey(.default, "run-2")).?;
+    const held = handler.liveRun(testKey(.default, "run-2")).?;
     try testing.expect(held.waiting_for_room);
     try testing.expect(held.pending_action_run_id_owned == null);
     try testing.expectEqual(before, shard.raft_node.log.lastIndex());
     // Room again: its next try calls.
     shard.outbox_caps = .{};
     handler.advanceWorkflow(&shard, testKey(.default, "run-2"));
-    try testing.expect(handler.runs.getPtr(testKey(.default, "run-2")).?.pending_action_run_id_owned != null);
+    try testing.expect(handler.liveRun(testKey(.default, "run-2")).?.pending_action_run_id_owned != null);
 }
 
 test "step executor: a step whose action isn't registered doesn't give up while it asks again" {
@@ -5642,7 +5394,7 @@ test "step executor: a step whose action isn't registered doesn't give up while 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "run-r"), "run-r", "test-wf");
@@ -5653,17 +5405,17 @@ test "step executor: a step whose action isn't registered doesn't give up while 
     @import("stdx").time.sleep(2 * std.time.ns_per_ms);
     // It asks again, and the retry isn't applied yet: the start may still
     // go out, so the step waits for it rather than give up under it.
-    const run = handler.runs.getPtr(testKey(.default, "run-r")).?;
+    const run = handler.liveRun(testKey(.default, "run-r")).?;
     const rid = run.pending_action_run_id_owned.?;
     handler.retryCall(&shard, run, rid, WorkflowHandler.callOf(&shard, run, rid).?, @import("stdx").time.milliTimestamp());
     try testing.expect(run.call_retry_index > shard.raft_node.last_applied);
     handler.checkPendingActions(&shard);
-    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.runs.getPtr(testKey(.default, "run-r")).?.status);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.liveRun(testKey(.default, "run-r")).?.status);
     // Applied, and answered again (no action): now it gives up.
     settleTest(&shard);
     handler.checkPendingActions(&shard);
     settleTest(&shard);
-    try testing.expectEqual(WorkflowHandler.RunStatus.failed, handler.runs.getPtr(testKey(.default, "run-r")).?.status);
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, handler.liveRun(testKey(.default, "run-r")).?.status);
 }
 
 test "step executor: a call asked for again waits while its action's outbox has no room" {
@@ -5674,13 +5426,13 @@ test "step executor: a call asked for again waits while its action's outbox has 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "run-q"), "run-q", "test-wf");
     handler.advanceWorkflow(&shard, testKey(.default, "run-q"));
     settleTest(&shard);
-    const run = handler.runs.getPtr(testKey(.default, "run-q")).?;
+    const run = handler.liveRun(testKey(.default, "run-q")).?;
     const rid = run.pending_action_run_id_owned.?;
     try testing.expectEqual(calls_mod.State.no_action, WorkflowHandler.callOf(&shard, run, rid).?.state);
     // No room: nothing is proposed.
@@ -5705,7 +5457,7 @@ test "step executor: missing action yields target_not_found" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
 
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -5719,7 +5471,7 @@ test "step executor: missing action yields target_not_found" {
     handler.checkPendingActions(&shard);
     settleTest(&shard);
 
-    const run = handler.runs.get(testKey(.default, "run-5")).?;
+    const run = handler.liveRun(testKey(.default, "run-5")).?.*;
     // Should fail because action "step-a" is not registered
     try testing.expectEqual(WorkflowHandler.RunStatus.failed, run.status);
 }
@@ -5733,7 +5485,7 @@ test "step executor: a plan's executor waits when the only other's breaker is op
         defer actions.deinit();
         var shard = try createTestShard(&actions);
         defer destroyTestShard(&shard);
-        handler.registerReplay(&shard.replay_registry);
+        handler.store = &shard.defaultPartition().store;
         shard.workflow_handler = &handler;
 
         createTestDef(&handler, testKey(.default, "plan-wf"), "plan-wf", test_plan_exhaust_workflow_json);
@@ -5764,7 +5516,7 @@ test "workflow duty: looks only at runs parked on an action or a child" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -5777,7 +5529,7 @@ test "workflow duty: looks only at runs parked on an action or a child" {
     handler.advanceWorkflow(&shard, testKey(.default, "p"));
     settleTest(&shard);
     try testing.expectEqual(@as(u32, 1), handler.parked.count());
-    const run = handler.runs.getPtr(testKey(.default, "p")).?;
+    const run = handler.liveRun(testKey(.default, "p")).?;
     run.status = .running;
     handler.checkPendingActions(&shard);
     try testing.expectEqual(@as(u32, 0), handler.parked.count());
@@ -5791,7 +5543,7 @@ test "workflow duty: a timer fires when due, and one the run moved past is dropp
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
 
@@ -5800,18 +5552,18 @@ test "workflow duty: a timer fires when due, and one the run moved past is dropp
     createTestRun(&handler, testKey(.default, "later"), "later", "test-wf");
     const now = @import("stdx").time.milliTimestamp();
     for ([_][]const u8{ testKey(.default, "due"), testKey(.default, "moved"), testKey(.default, "later") }, [_]i64{ now - 1, now - 1, now + 3_600_000 }) |key, at| {
-        const run = handler.runs.getPtr(key).?;
+        const run = handler.liveRun(key).?;
         run.status = .waiting;
         run.wait_timeout_at_ms = at;
         handler.armTimer(run, at);
     }
-    handler.runs.getPtr(testKey(.default, "moved")).?.status = .running;
+    handler.liveRun(testKey(.default, "moved")).?.status = .running;
     handler.checkPendingActions(&shard);
     settleTest(&shard);
 
-    try testing.expectEqual(WorkflowHandler.RunStatus.timed_out, handler.runs.get(testKey(.default, "due")).?.status);
-    try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get(testKey(.default, "moved")).?.status);
-    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.runs.get(testKey(.default, "later")).?.status);
+    try testing.expectEqual(WorkflowHandler.RunStatus.timed_out, handler.liveRun(testKey(.default, "due")).?.*.status);
+    try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.liveRun(testKey(.default, "moved")).?.*.status);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.liveRun(testKey(.default, "later")).?.*.status);
     // The later one's timer is still held.
     try testing.expectEqual(@as(usize, 1), handler.timers.count());
 }
@@ -5824,7 +5576,7 @@ test "workflow duty: a run with two timers due fires once" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "two-waits"), "two-waits", test_two_waits_json);
     createTestRun(&handler, testKey(.default, "r"), "r", "two-waits");
@@ -5832,7 +5584,7 @@ test "workflow duty: a run with two timers due fires once" {
 
     // Parked on its first wait, whose timeout goes to a second with none.
     // Two entries come due at once, as when an earlier wait's stays behind.
-    const run = handler.runs.getPtr(testKey(.default, "r")).?;
+    const run = handler.liveRun(testKey(.default, "r")).?;
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
     run.wait_timeout_at_ms = 1;
     handler.armTimer(run, 1);
@@ -5840,7 +5592,7 @@ test "workflow duty: a run with two timers due fires once" {
     handler.checkPendingActions(&shard);
     settleTest(&shard);
 
-    const after = handler.runs.get(testKey(.default, "r")).?;
+    const after = handler.liveRun(testKey(.default, "r")).?.*;
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, after.status);
     try testing.expectEqualStrings("second", after.current_step_name_owned.?);
     try testing.expectEqual(@as(i64, 0), after.wait_timeout_at_ms);
@@ -5854,14 +5606,14 @@ test "workflow duty: a wait with a timeout arms its timer, which holds until due
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "two-waits"), "two-waits", test_two_waits_json);
     createTestRun(&handler, testKey(.default, "r"), "r", "two-waits");
     handler.advanceWorkflow(&shard, testKey(.default, "r"));
     try testing.expectEqual(@as(usize, 1), handler.timers.count());
 
-    const run = handler.runs.getPtr(testKey(.default, "r")).?;
+    const run = handler.liveRun(testKey(.default, "r")).?;
     // Not due: it stays.
     handler.checkPendingActions(&shard);
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
@@ -5876,25 +5628,25 @@ test "workflow duty: an entry from before doesn't fire a run's later timer" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     const later = @import("stdx").time.milliTimestamp() + 3_600_000;
     createTestRun(&handler, testKey(.default, "w"), "w", "test-wf");
     createTestRun(&handler, testKey(.default, "p"), "p", "test-wf");
-    const waits = handler.runs.getPtr(testKey(.default, "w")).?;
+    const waits = handler.liveRun(testKey(.default, "w")).?;
     waits.status = .waiting;
     waits.wait_timeout_at_ms = later;
     handler.armTimer(waits, 1);
-    const polls = handler.runs.getPtr(testKey(.default, "p")).?;
+    const polls = handler.liveRun(testKey(.default, "p")).?;
     polls.status = .waiting;
     polls.poll_next_at_ms = later;
     handler.armTimer(polls, 1);
 
     handler.checkPendingActions(&shard);
     settleTest(&shard);
-    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.runs.get(testKey(.default, "w")).?.status);
-    try testing.expectEqual(later, handler.runs.get(testKey(.default, "p")).?.poll_next_at_ms);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.liveRun(testKey(.default, "w")).?.*.status);
+    try testing.expectEqual(later, handler.liveRun(testKey(.default, "p")).?.*.poll_next_at_ms);
     try testing.expectEqual(@as(usize, 0), handler.timers.count());
 }
 
@@ -5906,11 +5658,11 @@ test "workflow duty: a signal already there ends a wait, and leaves no deadline 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "two-waits"), "two-waits", test_two_waits_json);
     createTestRun(&handler, testKey(.default, "r"), "r", "two-waits");
-    const run = handler.runs.getPtr(testKey(.default, "r")).?;
+    const run = handler.liveRun(testKey(.default, "r")).?;
     // What an earlier wait left, and the signal the first wait wants.
     run.wait_timeout_at_ms = 1;
     run.wait_timeout_target_owned = try allocator.dupe(u8, "elsewhere");
@@ -5930,15 +5682,15 @@ test "workflow duty: a failed insert is made good from the runs" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "two-waits"), "two-waits", test_two_waits_json);
     createTestRun(&handler, testKey(.default, "r"), "r", "two-waits");
     createTestRun(&handler, testKey(.default, "p"), "p", "two-waits");
-    const timed = handler.runs.getPtr(testKey(.default, "r")).?;
+    const timed = handler.liveRun(testKey(.default, "r")).?;
     timed.status = .waiting;
     timed.wait_timeout_at_ms = @import("stdx").time.milliTimestamp() + 3_600_000;
-    const parked = handler.runs.getPtr(testKey(.default, "p")).?;
+    const parked = handler.liveRun(testKey(.default, "p")).?;
     parked.status = .waiting;
     parked.pending_action_run_id_owned = try allocator.dupe(u8, "gone");
 
@@ -5958,7 +5710,7 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
 
     var out: Result = .{};
@@ -5976,11 +5728,11 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     try handler.replayStart(testKey(TEST_NS_A, "r1"), value[0..off], 1, &out);
     try handler.replayStart(testKey(TEST_NS_A, "r2"), value[0..off], 1, &out);
     try handler.replayStart(testKey(TEST_NS_B, "r1"), value[0..off], 1, &out);
-    try testing.expectEqual(@as(?u32, 2), handler.active_runs.get(testKey(TEST_NS_A, "wf")));
-    try testing.expectEqual(@as(?u32, 1), handler.active_runs.get(testKey(TEST_NS_B, "wf")));
+    try testing.expectEqual(@as(?u32, 2), activeOf(&handler, testKey(TEST_NS_A, "wf")));
+    try testing.expectEqual(@as(?u32, 1), activeOf(&handler, testKey(TEST_NS_B, "wf")));
     // A start applied again creates nothing.
     try handler.replayStart(testKey(TEST_NS_A, "r1"), value[0..off], 1, &out);
-    try testing.expectEqual(@as(?u32, 2), handler.active_runs.get(testKey(TEST_NS_A, "wf")));
+    try testing.expectEqual(@as(?u32, 2), activeOf(&handler, testKey(TEST_NS_A, "wf")));
 
     // A start's entry carries its namespace's id: "a" is created first.
     try testing.expectEqual(.created, shard.namespace_handler.applyCreate("a"));
@@ -5998,16 +5750,21 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     // Two unfinished here: it holds, though another namespace's run makes three.
     try testing.expectEqual(@as(usize, 0), runsOf(&handler, &shard));
 
-    const run = handler.runs.getPtr(testKey(TEST_NS_A, "r1")).?;
-    const c: WorkflowHandler.Completion = .{ .status = .cancelled, .output = null, .steps = &.{}, .history = &.{}, .last = .{ .event_type = "workflow_cancelled", .detail = "stop", .timestamp_ms = 7 }, .tags = null };
+    const c: WorkflowHandler.Completion = .{ .status = .cancelled, .output = null, .steps = &.{}, .history = &.{}, .last = .{ .event_type = "workflow_cancelled", .detail = "stop", .timestamp_ms = 7 }, .tags = null, .workflow = "wf" };
     const record = try WorkflowHandler.encodeCompletion(allocator, c, WorkflowHandler.completionLimit(testKey(TEST_NS_A, "r1")));
     defer allocator.free(record);
-    // The producer's copy and the commit's: one run finished.
-    try handler.applyComplete(run, record, 7);
-    try handler.applyComplete(run, record, 7);
-    try testing.expectEqual(@as(?u32, 1), handler.active_runs.get(testKey(TEST_NS_A, "wf")));
+    // Applied twice (a second cancel): one run finished.
+    try handler.replayComplete(testKey(TEST_NS_A, "r1"), record, 7, &out);
+    try handler.replayComplete(testKey(TEST_NS_A, "r1"), record, 7, &out);
+    try testing.expectEqual(@as(?u32, 1), activeOf(&handler, testKey(TEST_NS_A, "wf")));
     // Room now: it fires once.
     try testing.expectEqual(@as(usize, 1), runsOf(&handler, &shard));
+}
+
+/// The runs of workflow `def_key` not ended, as applied; null before any started.
+fn activeOf(handler: *WorkflowHandler, def_key: []const u8) ?u32 {
+    const per = runs_machine.perDefOf(handler.defsRead(), def_key) orelse return null;
+    return per.active;
 }
 
 /// A workflow_start's value, as `proposeStart` encodes it.
@@ -6036,7 +5793,7 @@ test "workflow first steps: a burst bigger than a pass is logged across passes, 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
 
     // An entry carries its namespace's id: "a" is created first.
@@ -6046,14 +5803,12 @@ test "workflow first steps: a burst bigger than a pass is logged across passes, 
     for (&keys, 0..) |*k, i| {
         var id_buf: [8]u8 = undefined;
         const key = writeKey(k, a, try std.fmt.bufPrint(&id_buf, "r{d:0>5}", .{i}));
-        try handler.to_step.put(allocator, key, {});
+        handler.indexToStep(key);
     }
     var counts: [5]u64 = undefined;
     for (&counts) |*c| {
         const before = shard.raft_node.log.lastIndex();
-        handler.mu.lock();
         handler.proposeFirstSteps(&shard);
-        handler.mu.unlock();
         c.* = shard.raft_node.log.lastIndex() - before;
     }
     try testing.expectEqualSlices(u64, &.{ 64, 64, 64, 8, 0 }, &counts);
@@ -6139,20 +5894,20 @@ test "workflow start: a disable committed ahead refuses a client or schedule sta
     out = .{};
     try handler.replayStart(testKey(TEST_NS_A, "r-sched"), startValue(&buf, "wf", "schedule_started", "schedule:16:wf:4000"), 4600, &out);
     try testing.expectEqualStrings("workflow is disabled", out.refused().?.refusal.message);
-    try testing.expect(!handler.runs.contains(testKey(TEST_NS_A, "r-sched")));
+    try testing.expect(!(handler.appliedRun(testKey(TEST_NS_A, "r-sched")) != null));
     try testing.expectEqual(fired_before, sched.fired_ms);
-    try testing.expectEqual(@as(u32, 0), handler.active_runs.get(testKey(TEST_NS_A, "wf")) orelse 0);
+    try testing.expectEqual(@as(?u32, null), activeOf(&handler, testKey(TEST_NS_A, "wf")));
 
     out = .{};
     try handler.replayStart(testKey(TEST_NS_A, "r-client"), startValue(&buf, "wf", "workflow_started", ""), 4600, &out);
     try testing.expectEqualStrings("workflow is disabled", out.refused().?.refusal.message);
-    try testing.expect(!handler.runs.contains(testKey(TEST_NS_A, "r-client")));
+    try testing.expect(!(handler.appliedRun(testKey(TEST_NS_A, "r-client")) != null));
 
     // A trigger's start is not held to it: its leader moved the cursor.
     out = .{};
     try handler.replayStart(testKey(TEST_NS_A, "r-trig"), startValue(&buf, "wf", "trigger_started", ""), 4600, &out);
     try testing.expect(out.refused() == null);
-    try testing.expect(handler.runs.contains(testKey(TEST_NS_A, "r-trig")));
+    try testing.expect((handler.appliedRun(testKey(TEST_NS_A, "r-trig")) != null));
     out = .{};
     try handler.replayStart(testKey(TEST_NS_A, "r-child"), startValue(&buf, "wf", "child_started", ""), 4600, &out);
     try testing.expect(out.refused() == null);
@@ -6182,7 +5937,7 @@ test "workflow start: a redefinition that requires a key, committed ahead, refus
     out = .{};
     try handler.replayStart(testKey(TEST_NS_A, "r1"), startValue(&buf, "wf", "workflow_started", ""), 2000, &out);
     try testing.expectEqualStrings("idempotency key is required for this workflow", out.refused().?.refusal.message);
-    try testing.expect(!handler.runs.contains(testKey(TEST_NS_A, "r1")));
+    try testing.expect(!(handler.appliedRun(testKey(TEST_NS_A, "r1")) != null));
     out = .{};
     try handler.replayStart(testKey(TEST_NS_A, "r2"), startValue(&buf, "wf", "workflow_started", "k1"), 2000, &out);
     try testing.expect(out.refused() == null);
@@ -6200,7 +5955,7 @@ test "workflow schedule: a slot starts one run however many leaders propose it, 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
 
     // Created ten intervals ago; slot 0 fired then, nothing since.
@@ -6236,8 +5991,8 @@ test "workflow schedule: a slot starts one run however many leaders propose it, 
     const key = try std.fmt.bufPrint(&key_buf, "schedule:16:wf:{d}", .{latest});
     try handler.replayStart(testKey(TEST_NS_A, "r1"), startValue(&buf, "wf", "schedule_started", key), 2, &out);
     try handler.replayStart(testKey(TEST_NS_A, "r2"), startValue(&buf, "wf", "schedule_started", key), 3, &out);
-    try testing.expect(handler.runs.contains(testKey(TEST_NS_A, "r1")));
-    try testing.expect(!handler.runs.contains(testKey(TEST_NS_A, "r2")));
+    try testing.expect((handler.appliedRun(testKey(TEST_NS_A, "r1")) != null));
+    try testing.expect(!(handler.appliedRun(testKey(TEST_NS_A, "r2")) != null));
     try testing.expectEqual(latest, sched.fired_ms);
     // A later leader proposes nothing until the next slot.
     shard.raft_node.current_term += 1;
@@ -6259,12 +6014,12 @@ test "workflow cancel: while one is in flight nothing moves the run, and once it
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "two-waits"), "two-waits", test_two_waits_json);
     createTestRun(&handler, testKey(.default, "r"), "r", "two-waits");
     handler.advanceWorkflow(&shard, testKey(.default, "r"));
-    const run = handler.runs.getPtr(testKey(.default, "r")).?;
+    const run = handler.liveRun(testKey(.default, "r")).?;
     run.wait_timeout_at_ms = 1;
     handler.armTimer(run, 1);
 
@@ -6309,7 +6064,7 @@ test "workflow cancel: in flight, a finished action, a first step and a completi
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -6318,7 +6073,7 @@ test "workflow cancel: in flight, a finished action, a first step and a completi
     createTestRun(&handler, testKey(.default, "parked"), "parked", "test-wf");
     handler.advanceWorkflow(&shard, testKey(.default, "parked"));
     settleTest(&shard);
-    const parked = handler.runs.getPtr(testKey(.default, "parked")).?;
+    const parked = handler.liveRun(testKey(.default, "parked")).?;
     const action_run = parked.pending_action_run_id_owned.?;
     completeTestAction(&shard, action_run);
 
@@ -6330,7 +6085,7 @@ test "workflow cancel: in flight, a finished action, a first step and a completi
 
     const cancel = try unappliedEntry(&shard);
     for ([_][]const u8{ testKey(.default, "parked"), testKey(.default, "started"), testKey(.default, "retry") }) |key| {
-        const run = handler.runs.getPtr(key).?;
+        const run = handler.liveRun(key).?;
         run.ending_index = cancel.index;
         run.ending_term = cancel.term;
     }
@@ -6342,7 +6097,7 @@ test "workflow cancel: in flight, a finished action, a first step and a completi
     try testing.expectEqualStrings(action_run, parked.pending_action_run_id_owned.?);
     try testing.expectEqual(@as(usize, 1), handler.started_to_advance.items.len);
     try testing.expectEqual(@as(usize, 1), handler.completion_retries.items.len);
-    try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get(testKey(.default, "retry")).?.status);
+    try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.liveRun(testKey(.default, "retry")).?.*.status);
 
     // Its entry cut, each goes on.
     parked.ending_term = cancel.term + 1;
@@ -6385,7 +6140,7 @@ test "step executor: failing action follows failure transition" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     registerTestAction(&shard, "step-b"); // step-b will fail
@@ -6397,14 +6152,14 @@ test "step executor: failing action follows failure transition" {
     handler.advanceWorkflow(&shard, testKey(.default, "run-6"));
     settleTest(&shard);
     {
-        const run = handler.runs.getPtr(testKey(.default, "run-6")).?;
+        const run = handler.liveRun(testKey(.default, "run-6")).?;
         completeTestAction(&shard, run.pending_action_run_id_owned.?);
     }
     // Phase 2: step-a completes (success) → transitions to step_b → step-b parks
     handler.checkPendingActions(&shard);
     settleTest(&shard);
     {
-        const run = handler.runs.getPtr(testKey(.default, "run-6")).?;
+        const run = handler.liveRun(testKey(.default, "run-6")).?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
         // Complete step-b with "failure"
         completeTestActionWith(&shard, run.pending_action_run_id_owned.?, "failure");
@@ -6413,7 +6168,7 @@ test "step executor: failing action follows failure transition" {
     handler.checkPendingActions(&shard);
     settleTest(&shard);
 
-    const run = handler.runs.get(testKey(.default, "run-6")).?;
+    const run = handler.liveRun(testKey(.default, "run-6")).?.*;
     // step-a succeeds → step_b → step-b fails → "failure" → flo.Failed
     try testing.expectEqual(WorkflowHandler.RunStatus.failed, run.status);
 }
@@ -6427,7 +6182,7 @@ test "step executor: an action completed naming no outcome takes the success tra
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     registerTestAction(&shard, "step-b");
@@ -6439,13 +6194,13 @@ test "step executor: an action completed naming no outcome takes the success tra
     // Both steps' workers complete with an empty outcome, as a plain
     // complete sends.
     for (0..2) |_| {
-        const run = handler.runs.getPtr(testKey(.default, "run-e")).?;
+        const run = handler.liveRun(testKey(.default, "run-e")).?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
         completeTestActionWith(&shard, run.pending_action_run_id_owned.?, "");
         handler.checkPendingActions(&shard);
         settleTest(&shard);
     }
-    try testing.expectEqual(WorkflowHandler.RunStatus.completed, handler.runs.get(testKey(.default, "run-e")).?.status);
+    try testing.expectEqual(WorkflowHandler.RunStatus.completed, handler.liveRun(testKey(.default, "run-e")).?.*.status);
 }
 
 test "step executor: retry on failure" {
@@ -6457,7 +6212,7 @@ test "step executor: retry on failure" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "flaky"); // always fails
 
@@ -6473,7 +6228,7 @@ test "step executor: retry on failure" {
     // (which either retries→re-parks, or exhausts retries→flo.Failed)
     var attempt: u32 = 0;
     while (attempt < 5) : (attempt += 1) {
-        const run_ptr = handler.runs.getPtr(testKey(.default, "run-7")).?;
+        const run_ptr = handler.liveRun(testKey(.default, "run-7")).?;
         if (run_ptr.status.isTerminal()) break;
         const rid = run_ptr.pending_action_run_id_owned orelse break;
         completeTestActionWith(&shard, rid, "failure");
@@ -6481,7 +6236,7 @@ test "step executor: retry on failure" {
         settleTest(&shard);
     }
 
-    const run = handler.runs.get(testKey(.default, "run-7")).?;
+    const run = handler.liveRun(testKey(.default, "run-7")).?.*;
     // Should fail after retries exhausted (max_attempts=3 means up to 3 retries)
     try testing.expectEqual(WorkflowHandler.RunStatus.failed, run.status);
     // History should include retry events
@@ -6515,7 +6270,7 @@ test "step executor: a plan whose executors all fail fails the step after one pa
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "stripe");
     registerTestAction(&shard, "paypal");
@@ -6529,7 +6284,7 @@ test "step executor: a plan whose executors all fail fails the step after one pa
     // Each executor runs once and retries once: four tasks in all.
     var tasks: u32 = 0;
     while (tasks < 40) : (tasks += 1) {
-        const run_ptr = handler.runs.getPtr(testKey(.default, "run-plan")).?;
+        const run_ptr = handler.liveRun(testKey(.default, "run-plan")).?;
         if (run_ptr.status.isTerminal()) break;
         const rid = run_ptr.pending_action_run_id_owned orelse break;
         completeTestActionWith(&shard, rid, "failure");
@@ -6537,7 +6292,7 @@ test "step executor: a plan whose executors all fail fails the step after one pa
         settleTest(&shard);
     }
 
-    const run = handler.runs.get(testKey(.default, "run-plan")).?;
+    const run = handler.liveRun(testKey(.default, "run-plan")).?.*;
     try testing.expectEqual(WorkflowHandler.RunStatus.failed, run.status);
     try testing.expectEqual(@as(u32, 4), tasks);
     var exhausted: [2]u32 = .{ 0, 0 };
@@ -6558,7 +6313,7 @@ test "step executor: an action run that timed out takes the step's failure trans
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "flaky");
 
@@ -6570,14 +6325,14 @@ test "step executor: an action run that timed out takes the step's failure trans
     // Each attempt's action run times out; the step's retries then fail it.
     var attempts: u32 = 0;
     while (attempts < 6) : (attempts += 1) {
-        const run = handler.runs.getPtr(testKey(.default, "run-to")).?;
+        const run = handler.liveRun(testKey(.default, "run-to")).?;
         if (run.status.isTerminal()) break;
         const rid = run.pending_action_run_id_owned orelse break;
         timeOutTestAction(&shard, rid);
         handler.checkPendingActions(&shard);
         settleTest(&shard);
     }
-    try testing.expectEqual(WorkflowHandler.RunStatus.failed, handler.runs.get(testKey(.default, "run-to")).?.status);
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, handler.liveRun(testKey(.default, "run-to")).?.*.status);
 }
 
 // An action that returns the `pending` business outcome on a `poll:` step must
@@ -6593,7 +6348,7 @@ test "step executor: poll re-arms on pending and times out after max_attempts" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "poller");
 
@@ -6606,14 +6361,14 @@ test "step executor: poll re-arms on pending and times out after max_attempts" {
 
     // First `pending` must ARM a poll (not fail): status waiting, attempt incremented.
     {
-        const run = handler.runs.getPtr(testKey(.default, "run-poll")).?;
+        const run = handler.liveRun(testKey(.default, "run-poll")).?;
         try testing.expect(run.pending_action_run_id_owned != null);
         completeTestActionWith(&shard, run.pending_action_run_id_owned.?, "pending");
     }
     handler.checkPendingActions(&shard);
     settleTest(&shard);
     {
-        const run = handler.runs.getPtr(testKey(.default, "run-poll")).?;
+        const run = handler.liveRun(testKey(.default, "run-poll")).?;
         try testing.expect(!run.status.isTerminal()); // pre-fix bug: would be .failed
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
         try testing.expectEqual(@as(u32, 1), run.poll_attempt);
@@ -6624,7 +6379,7 @@ test "step executor: poll re-arms on pending and times out after max_attempts" {
     // completion (re-arming). max_attempts=2 → exhausted → `timeout` → flo.TimedOut.
     var i: u32 = 0;
     while (i < 12) : (i += 1) {
-        const run = handler.runs.getPtr(testKey(.default, "run-poll")).?;
+        const run = handler.liveRun(testKey(.default, "run-poll")).?;
         if (run.status.isTerminal()) break;
         if (run.pending_action_run_id_owned) |rid| {
             completeTestActionWith(&shard, rid, "pending");
@@ -6633,7 +6388,7 @@ test "step executor: poll re-arms on pending and times out after max_attempts" {
         settleTest(&shard);
     }
 
-    const run = handler.runs.get(testKey(.default, "run-poll")).?;
+    const run = handler.liveRun(testKey(.default, "run-poll")).?.*;
     try testing.expectEqual(WorkflowHandler.RunStatus.timed_out, run.status);
 
     var polls: u32 = 0;
@@ -6652,81 +6407,20 @@ test "step executor: checkPendingActions handles completed async action" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
 
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
 
-    // Manually create a run that's parked waiting for an action
+    // A run parked waiting for an action.
     {
-        const alloc = handler.allocator;
-        const ns_key = alloc.dupe(u8, testKey(.default, "run-8")) catch return;
-        const rid = alloc.dupe(u8, "run-8") catch {
-            alloc.free(ns_key);
-            return;
-        };
-        const wf = alloc.dupe(u8, "test-wf") catch {
-            alloc.free(ns_key);
-            alloc.free(rid);
-            return;
-        };
-        const ver = alloc.dupe(u8, "1.0.0") catch {
-            alloc.free(ns_key);
-            alloc.free(rid);
-            alloc.free(wf);
-            return;
-        };
-        const inp = alloc.dupe(u8, "{}") catch {
-            alloc.free(ns_key);
-            alloc.free(rid);
-            alloc.free(wf);
-            alloc.free(ver);
-            return;
-        };
-        const arid = alloc.dupe(u8, "action-42") catch {
-            alloc.free(ns_key);
-            alloc.free(rid);
-            alloc.free(wf);
-            alloc.free(ver);
-            alloc.free(inp);
-            return;
-        };
-        const step_name = alloc.dupe(u8, "start") catch {
-            alloc.free(ns_key);
-            alloc.free(rid);
-            alloc.free(wf);
-            alloc.free(ver);
-            alloc.free(inp);
-            alloc.free(arid);
-            return;
-        };
-
-        try handler.parked.put(alloc, ns_key, {});
-        handler.runs.put(ns_key, .{
-            .ns_key = ns_key,
-            .run_id_owned = rid,
-            .workflow_name_owned = wf,
-            .workflow_version_owned = ver,
-            .status = .waiting,
-            .input_owned = inp,
-            .created_at_ms = 0,
-            .started_at_ms = 0,
-            .completed_at_ms = null,
-            .idempotency_key_owned = null,
-            .signals = .empty,
-            .history = .empty,
-            .pending_action_run_id_owned = arid,
-            .pending_step_name_owned = step_name,
-        }) catch {
-            alloc.free(ns_key);
-            alloc.free(rid);
-            alloc.free(wf);
-            alloc.free(ver);
-            alloc.free(inp);
-            alloc.free(arid);
-            alloc.free(step_name);
-            return;
-        };
+        const key = testKey(.default, "run-8");
+        createTestRun(&handler, key, "run-8", "test-wf");
+        const run = handler.liveRun(key).?;
+        run.status = .waiting;
+        run.pending_action_run_id_owned = try allocator.dupe(u8, "action-42");
+        run.pending_step_name_owned = try allocator.dupe(u8, "start");
+        try handler.parked.put(allocator, run.ns_key, {});
     }
 
     // A completed action run, of an action the transitions resolve.
@@ -6750,7 +6444,7 @@ test "step executor: checkPendingActions handles completed async action" {
 
     // After step-a resumes, workflow advances to step_b (async) — parks again
     {
-        const run = handler.runs.getPtr(testKey(.default, "run-8")).?;
+        const run = handler.liveRun(testKey(.default, "run-8")).?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
         // Complete step-b so the workflow can finish
         completeTestAction(&shard, run.pending_action_run_id_owned.?);
@@ -6760,7 +6454,7 @@ test "step executor: checkPendingActions handles completed async action" {
     handler.checkPendingActions(&shard);
     settleTest(&shard);
 
-    const run = handler.runs.get(testKey(.default, "run-8")).?;
+    const run = handler.liveRun(testKey(.default, "run-8")).?.*;
     // After resuming start → step_b (success) → flo.Completed
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
 }
@@ -6796,9 +6490,6 @@ test "workflow replay: a start that runs out of memory fails and creates nothing
         var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
         var handler = WorkflowHandler.init(fa.allocator());
         defer handler.deinit();
-        // Room for the run up front: a failed copy must not be masked by
-        // the map's insert failing after it.
-        try handler.runs.ensureTotalCapacity(1);
         fa.fail_index = fa.alloc_index + fail_at;
         var out: Result = .{};
         handler.replayStart(testKey(.default, "r1"), &start, 1, &out) catch {
@@ -6806,8 +6497,8 @@ test "workflow replay: a start that runs out of memory fails and creates nothing
             try testing.expectEqual(@as(usize, 0), handler.runCount());
             continue;
         };
-        const run = handler.runs.get(testKey(.default, "r1")) orelse return error.RunMissing;
-        try testing.expectEqualStrings("key", run.idempotency_key_owned orelse return error.IdempotencyKeyLost);
+        const run = handler.appliedRun(testKey(.default, "r1")) orelse return error.RunMissing;
+        try testing.expectEqualStrings("key", run.idempotency_key);
         if (!fa.has_induced_failure) break;
     }
 }
@@ -6845,7 +6536,7 @@ test "workflow replay: an unknown status, or a complete entry without its output
     // Missing has_output byte; then an unknown status. Neither may change the run.
     try testing.expectError(error.Halt, handler.replayComplete(testKey(.default, "r1"), &[_]u8{3}, 2, &replay_out_for_tests));
     try testing.expectError(error.Halt, handler.replayComplete(testKey(.default, "r1"), &[_]u8{ 0xee, 0 }, 2, &replay_out_for_tests));
-    try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get(testKey(.default, "r1")).?.status);
+    try testing.expectEqual(WorkflowHandler.RunStatus.running, shownOf(&handler, testKey(.default, "r1")).?.status);
 }
 
 test "workflow replay: a redefinition that won't parse halts and keeps the definition it would replace" {
@@ -6883,10 +6574,10 @@ test "workflow replay: a run starts and completes at its entries' stamps, not th
         // Through `replayEntry`, as the log applies them.
         var out: Result = .{};
         try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, stamp_ns, .default, testKey(.default, "r1"), &start, &pbuf).?, &out);
-        try testing.expectEqual(stamp_ms, handler.runs.get(testKey(.default, "r1")).?.created_at_ms);
-        // completed, no output, no steps, no history, no tags
-        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, .default, testKey(.default, "r1"), &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0 }, &pbuf).?, &out);
-        const run = handler.runs.get(testKey(.default, "r1")).?;
+        try testing.expectEqual(stamp_ms, shownOf(&handler, testKey(.default, "r1")).?.created_at_ms);
+        // completed, no output, no steps, no history, no tags, workflow "wf"
+        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, .default, testKey(.default, "r1"), &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 'w', 'f' }, &pbuf).?, &out);
+        const run = shownOf(&handler, testKey(.default, "r1")).?;
         try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
         try testing.expectEqual(@as(?i64, stamp_ms + 9), run.completed_at_ms);
     }
@@ -6897,47 +6588,54 @@ test "workflow replay: a complete entry cut short leaves the run as it was, and 
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
 
-    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
+    // Its start records one event.
+    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 7, 0, 's', 't', 'a', 'r', 't', 'e', 'd', 0, 0 };
     var start_out: Result = .{};
     try handler.replayStart(testKey(.default, "r1"), &start, 1, &start_out);
 
-    // completed, output "ok", one step "s"/"done"/"x", one history event "e"/"d"@7, tags "t"
+    // completed, output "ok", one step "s"/"done"/"x", one history event "e"/"d"@7, tags "t", workflow "wf"
     const whole = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++
         [_]u8{ 1, 0, 1, 0, 's', 4, 0, 'd', 'o', 'n', 'e', 1, 0, 0, 0, 'x' } ++
-        [_]u8{ 1, 0, 1, 0, 'e', 1, 0, 'd', 7, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 1, 0, 't' };
+        [_]u8{ 1, 0, 1, 0, 'e', 1, 0, 'd', 7, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 1, 0, 't' } ++ [_]u8{ 2, 0, 'w', 'f' };
 
-    // The run already holds an event, which a skipped entry must keep.
-    try handler.runs.getPtr(testKey(.default, "r1")).?.history.append(allocator, .{
-        .event_type_owned = try allocator.dupe(u8, "started"),
-        .detail_owned = try allocator.dupe(u8, ""),
-        .timestamp_ms = 1,
-    });
-
-    // Every cut through the history or the steps is skipped whole.
-    const history_before = handler.runs.get(testKey(.default, "r1")).?.history.items.len;
-    try testing.expectEqual(@as(usize, 1), history_before);
-    for (1..whole.len - 3) |n| {
+    var events: std.ArrayListUnmanaged(WorkflowHandler.HistoryEvent) = .empty;
+    defer events.deinit(allocator);
+    try handler.appliedHistory(testKey(.default, "r1"), &events);
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    // Every cut is skipped whole.
+    for (1..whole.len) |n| {
         try testing.expectError(error.Halt, handler.replayComplete(testKey(.default, "r1"), whole[0..n], 2, &replay_out_for_tests));
-        const run = handler.runs.get(testKey(.default, "r1")).?;
+        const run = shownOf(&handler, testKey(.default, "r1")).?;
         try testing.expectEqual(WorkflowHandler.RunStatus.running, run.status);
         try testing.expect(run.output_owned == null);
-        try testing.expectEqual(history_before, run.history.items.len);
+        events.clearRetainingCapacity();
+        try handler.appliedHistory(testKey(.default, "r1"), &events);
+        try testing.expectEqualStrings("started", events.items[0].event_type_owned);
     }
 
     try handler.replayComplete(testKey(.default, "r1"), &whole, 2, &replay_out_for_tests);
-    const run = handler.runs.get(testKey(.default, "r1")).?;
+    const run = shownOf(&handler, testKey(.default, "r1")).?;
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
     try testing.expectEqualStrings("ok", run.output_owned.?);
-    try testing.expectEqual(@as(usize, 1), run.history.items.len);
     try testing.expectEqualStrings("t", run.search_tags_owned.?);
+    // The logged history and step outputs replace what was there.
+    events.clearRetainingCapacity();
+    try handler.appliedHistory(testKey(.default, "r1"), &events);
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqualStrings("e", events.items[0].event_type_owned);
+    _ = handler.liveRun(testKey(.default, "r1")).?;
+    const so = handler.liveRun(testKey(.default, "r1")).?.*.step_outputs.?;
+    try testing.expectEqual(@as(usize, 1), so.entries.len);
+    try testing.expectEqualStrings("done", so.entries[0].outcome);
 }
 
 test "workflow replay: a cancel logged after a completion is refused and changes nothing, on every replica; a second cancel after a cancel succeeds" {
     // A completion a deposed leader logged commits ahead of a cancel the
     // next leader took while that completion hadn't applied there.
     const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
-    const completed = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 };
-    const cancelled = [_]u8{5} ++ [_]u8{0} ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 };
+    const wf = [_]u8{ 2, 0, 'w', 'f' };
+    const completed = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ wf;
+    const cancelled = [_]u8{5} ++ [_]u8{0} ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ wf;
 
     // Two replicas apply the same log.
     for (0..2) |_| {
@@ -6953,10 +6651,10 @@ test "workflow replay: a cancel logged after a completion is refused and changes
         const refused = out.refused().?;
         try testing.expectEqualStrings("run already finished", refused.refusal.message);
         try testing.expectEqual(proto.Ran.no, refused.refusal.ran);
-        const run = handler.runs.get(testKey(.default, "r1")).?;
+        const run = shownOf(&handler, testKey(.default, "r1")).?;
         try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
         try testing.expectEqualStrings("ok", run.output_owned.?);
-        try testing.expectEqual(@as(i64, 2), run.completed_at_ms);
+        try testing.expectEqual(@as(?i64, 2), run.completed_at_ms);
     }
 
     // Two cancels: the first ends the run, the second is told it did.
@@ -6968,7 +6666,7 @@ test "workflow replay: a cancel logged after a completion is refused and changes
     out = .{};
     try handler.replayComplete(testKey(.default, "r1"), &cancelled, 3, &out);
     try testing.expect(out.refused() == null);
-    try testing.expectEqual(@as(i64, 2), handler.runs.get(testKey(.default, "r1")).?.completed_at_ms);
+    try testing.expectEqual(@as(?i64, 2), shownOf(&handler, testKey(.default, "r1")).?.completed_at_ms);
 }
 
 /// Fills a run's history past what a completion record holds.
@@ -6985,12 +6683,12 @@ test "a completion too large to log fails the run with a trimmed record that rep
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
 
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "big"), "big", "test-wf");
-    const run = handler.runs.getPtr(testKey(.default, "big")).?;
+    const run = handler.liveRun(testKey(.default, "big")).?;
     try overfillHistory(&handler, run);
     const before = run.history.items.len;
 
@@ -7003,6 +6701,7 @@ test "a completion too large to log fails the run with a trimmed record that rep
         .history = run.history.items,
         .last = .{ .event_type = "workflow_completed", .detail = "flo.Completed", .timestamp_ms = 99 },
         .tags = null,
+        .workflow = "test-wf",
     };
     try testing.expectError(error.TooLarge, WorkflowHandler.encodeCompletion(allocator, full, limit));
     const record = try WorkflowHandler.encodeTrimmed(allocator, full, limit);
@@ -7012,7 +6711,7 @@ test "a completion too large to log fails the run with a trimmed record that rep
     handler.completeRun(&shard, testKey(.default, "big"), run, .completed, "flo.Completed", 99);
     settleTest(&shard);
 
-    const done = handler.runs.getPtr(testKey(.default, "big")).?;
+    const done = handler.liveRun(testKey(.default, "big")).?;
     try testing.expectEqual(WorkflowHandler.RunStatus.failed, done.status);
     try testing.expectEqual(@as(?[]const u8, null), done.output_owned);
     const events = done.history.items;
@@ -7045,12 +6744,12 @@ test "a cancel whose completion record is too large stays a cancel, trimmed to f
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
 
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "big"), "big", "test-wf");
-    const run = handler.runs.getPtr(testKey(.default, "big")).?;
+    const run = handler.liveRun(testKey(.default, "big")).?;
     try overfillHistory(&handler, run);
 
     try handler.tryComplete(&shard, testKey(.default, "big"), run, .cancelled, "stop", 5);
@@ -7067,7 +6766,7 @@ test "a completion record that fits round-trips through replay" {
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
     createTestRun(&handler, testKey(.default, "r"), "r", "test-wf");
-    const run = handler.runs.getPtr(testKey(.default, "r")).?;
+    const run = handler.liveRun(testKey(.default, "r")).?;
     handler.addHistoryEvent(run, "signal_received", "go", 1);
 
     const c: WorkflowHandler.Completion = .{
@@ -7077,15 +6776,21 @@ test "a completion record that fits round-trips through replay" {
         .history = run.history.items,
         .last = .{ .event_type = "workflow_cancelled", .detail = "stop", .timestamp_ms = 7 },
         .tags = "{\"a\":1}",
+        .workflow = "test-wf",
     };
     const record = try WorkflowHandler.encodeCompletion(allocator, c, WorkflowHandler.completionLimit(testKey(.default, "r")));
     defer allocator.free(record);
-    try handler.applyComplete(run, record, 7);
+    var out: Result = .{};
+    try handler.replayComplete(testKey(.default, "r"), record, 7, &out);
+    // This node's copy follows the run's end, and the run holds what was logged.
     try testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
     try testing.expectEqualStrings("out", run.output_owned.?);
     try testing.expectEqualStrings("{\"a\":1}", run.search_tags_owned.?);
-    try testing.expectEqual(@as(usize, 2), run.history.items.len);
-    try testing.expectEqualStrings("stop", run.history.items[1].detail_owned);
+    var events: std.ArrayListUnmanaged(WorkflowHandler.HistoryEvent) = .empty;
+    defer events.deinit(allocator);
+    try handler.appliedHistory(testKey(.default, "r"), &events);
+    try testing.expectEqual(@as(usize, 2), events.items.len);
+    try testing.expectEqualStrings("stop", events.items[1].detail_owned);
 }
 
 /// The answer a handler queued on `conn`.
@@ -7101,13 +6806,13 @@ test "a signal that would leave the completion no headroom is refused, holding n
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     var conn = try Connection.init(allocator, -1, 0, 0);
     defer conn.deinit();
 
     createTestRun(&handler, testKey(.default, "s"), "s", "test-wf");
-    const run = handler.runs.getPtr(testKey(.default, "s")).?;
+    const run = handler.liveRun(testKey(.default, "s")).?;
     // Leave less than the headroom but more than two signal events: refused
     // only while the headroom is kept.
     const limit = WorkflowHandler.completionLimit(testKey(.default, "s"));
@@ -7150,11 +6855,11 @@ test "a completion the log is too busy for is retried from the run's state, and 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "r"), "r", "test-wf");
-    const run = handler.runs.getPtr(testKey(.default, "r")).?;
+    const run = handler.liveRun(testKey(.default, "r")).?;
     const status = run.status;
 
     handler.propose = refuseThenPropose;
@@ -7180,10 +6885,10 @@ test "a completion on a node that isn't leading changes nothing, and is kept for
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestRun(&handler, testKey(.default, "r"), "r", "test-wf");
-    const run = handler.runs.getPtr(testKey(.default, "r")).?;
+    const run = handler.liveRun(testKey(.default, "r")).?;
     const status = run.status;
     handler.addHistoryEvent(run, "step_started", "a", 1);
 
@@ -7210,7 +6915,7 @@ test "an ending is counted only for the entry this leader proposed: its index an
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     createTestRun(&handler, testKey(.default, "r"), "r", "test-wf");
-    const run = handler.runs.getPtr(testKey(.default, "r")).?;
+    const run = handler.liveRun(testKey(.default, "r")).?;
     // Proposed at index 5 in term 1.
     run.ending_index = 5;
     run.ending_term = 1;
@@ -7231,7 +6936,7 @@ test "a trimmed record leaves out the output, step outputs and tags" {
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
     createTestRun(&handler, testKey(.default, "big"), "big", "test-wf");
-    const run = handler.runs.getPtr(testKey(.default, "big")).?;
+    const run = handler.liveRun(testKey(.default, "big")).?;
     try overfillHistory(&handler, run);
     const steps = [_]wf_types.StepOutput{.{ .step_name = "a", .output = "{\"x\":1}", .outcome = "success" }};
     const full: WorkflowHandler.Completion = .{
@@ -7241,13 +6946,15 @@ test "a trimmed record leaves out the output, step outputs and tags" {
         .history = run.history.items,
         .last = .{ .event_type = "workflow_completed", .detail = "flo.Completed", .timestamp_ms = 1 },
         .tags = "{\"t\":1}",
+        .workflow = "test-wf",
     };
     const record = try WorkflowHandler.encodeTrimmed(allocator, full, WorkflowHandler.completionLimit(testKey(.default, "big")));
     defer allocator.free(record);
-    const entry = WorkflowHandler.CompleteEntry.parse(record).?;
+    const entry = runs_machine.Complete.parse(record).?;
     try testing.expectEqual(@as(?[]const u8, null), entry.output);
     try testing.expectEqual(@as(u16, 0), entry.step_count);
-    try testing.expectEqual(@as(?[]const u8, null), entry.tags);
+    try testing.expectEqualStrings("", entry.tags);
+    try testing.expectEqualStrings("test-wf", entry.workflow);
     try testing.expectEqual(WorkflowHandler.RunStatus.failed, entry.status);
 }
 
@@ -7259,18 +6966,21 @@ test "the completion limit counts the run's key: one byte over it is trimmed, ex
     defer destroyTestShard(&shard);
 
     // A long key, so a limit that forgot it would let through a record the log refuses.
-    const run_id = @as([3000]u8, @splat('k'));
-    const key = comptime testKey(.default, &run_id);
     for ([_]usize{ 0, 1 }) |over| {
+        // One run each: the shard's store keeps the first.
+        var run_id = @as([3000]u8, @splat('k'));
+        run_id[0] = '0' + @as(u8, @intCast(over));
+        var key_buf: [KEY_PREFIX + run_id.len]u8 = undefined;
+        const key = writeKey(&key_buf, .default, &run_id);
         var handler = WorkflowHandler.init(allocator);
         defer handler.deinit();
-        handler.registerReplay(&shard.replay_registry);
+        handler.store = &shard.defaultPartition().store;
         shard.workflow_handler = &handler;
         createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
         createTestRun(&handler, key, &run_id, "test-wf");
-        const run = handler.runs.getPtr(key).?;
+        const run = handler.liveRun(key).?;
         const limit = WorkflowHandler.completionLimit(key);
-        const fixed = 1 + 1 + 2 + 2 + 2 + WorkflowHandler.Completion.eventSize("workflow_completed", "flo.Completed");
+        const fixed = 1 + 1 + 2 + 2 + 2 + 2 + "test-wf".len + WorkflowHandler.Completion.eventSize("workflow_completed", "flo.Completed");
         const detail = try allocator.alloc(u8, limit + over - fixed - WorkflowHandler.Completion.eventSize("pad", ""));
         defer allocator.free(detail);
         @memset(detail, 'p');
@@ -7294,13 +7004,19 @@ test "a completion record cut inside its tags is refused, not read without them"
         .history = &.{},
         .last = .{ .event_type = "workflow_completed", .detail = "", .timestamp_ms = 1 },
         .tags = "{\"t\":1}",
+        .workflow = "w",
     };
     const record = try WorkflowHandler.encodeCompletion(allocator, c, 1 << 15);
     defer allocator.free(record);
-    try testing.expect(WorkflowHandler.CompleteEntry.parse(record) != null);
-    try testing.expectEqual(@as(?WorkflowHandler.CompleteEntry, null), WorkflowHandler.CompleteEntry.parse(record[0 .. record.len - 1]));
+    const Complete = runs_machine.Complete;
+    try testing.expect(Complete.parse(record) != null);
+    // Its workflow ([len:u16][w]) follows the tags.
+    const tags_end = record.len - 3;
+    try testing.expectEqual(@as(?Complete, null), Complete.parse(record[0 .. tags_end - 1]));
     // Cut before the tags' length too: the field is required.
-    try testing.expectEqual(@as(?WorkflowHandler.CompleteEntry, null), WorkflowHandler.CompleteEntry.parse(record[0 .. record.len - 2 - 7]));
+    try testing.expectEqual(@as(?Complete, null), Complete.parse(record[0 .. tags_end - 2 - 7]));
+    // And the workflow after them.
+    try testing.expectEqual(@as(?Complete, null), Complete.parse(record[0..tags_end]));
 }
 
 test "cancelling a run that already finished is refused and keeps its result" {
@@ -7311,13 +7027,13 @@ test "cancelling a run that already finished is refused and keeps its result" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     var conn = try Connection.init(allocator, -1, 0, 0);
     defer conn.deinit();
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "r"), "r", "test-wf");
-    const run = handler.runs.getPtr(testKey(.default, "r")).?;
+    const run = handler.liveRun(testKey(.default, "r")).?;
     handler.completeRun(&shard, testKey(.default, "r"), run, .completed, "flo.Completed", 3);
     settleTest(&shard);
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
@@ -7339,11 +7055,11 @@ test "an engine-reached cancel with a detail past the cancel-reason cap is trimm
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "big"), "big", "test-wf");
-    const run = handler.runs.getPtr(testKey(.default, "big")).?;
+    const run = handler.liveRun(testKey(.default, "big")).?;
     try overfillHistory(&handler, run);
 
     const detail = @as([2000]u8, @splat('t'));
@@ -7362,11 +7078,11 @@ test "a retry pending when the run is cancelled doesn't undo the cancel" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "r"), "r", "test-wf");
-    const run = handler.runs.getPtr(testKey(.default, "r")).?;
+    const run = handler.liveRun(testKey(.default, "r")).?;
 
     handler.propose = refuseThenPropose;
     fake_propose_refusals = 1;
@@ -7392,11 +7108,11 @@ test "a wait that times out with no target ends the run through the log" {
     for ([_]bool{ false, true }) |leading| {
         var handler = WorkflowHandler.init(allocator);
         defer handler.deinit();
-        handler.registerReplay(&shard.replay_registry);
+        handler.store = &shard.defaultPartition().store;
         shard.workflow_handler = &handler;
         createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
         createTestRun(&handler, testKey(.default, "w"), "w", "test-wf");
-        const run = handler.runs.getPtr(testKey(.default, "w")).?;
+        const run = handler.liveRun(testKey(.default, "w")).?;
         run.status = .waiting;
         run.wait_signal_type_owned = try allocator.dupe(u8, "go");
         run.wait_timeout_at_ms = 1;
@@ -7421,7 +7137,7 @@ test "a client signal with a reserved type is refused and doesn't move a run par
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "init");
     createTestDef(&handler, testKey(.default, "wait-wf"), "wait-wf", test_wait_workflow_json);
@@ -7469,13 +7185,13 @@ test "a signal to a finished run is refused and leaves its history alone" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     var conn = try Connection.init(allocator, -1, 0, 0);
     defer conn.deinit();
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "r"), "r", "test-wf");
-    const run = handler.runs.getPtr(testKey(.default, "r")).?;
+    const run = handler.liveRun(testKey(.default, "r")).?;
     handler.completeRun(&shard, testKey(.default, "r"), run, .completed, "flo.Completed", 3);
     settleTest(&shard);
     const events = run.history.items.len;
@@ -7520,7 +7236,9 @@ test "workflow handler: a trigger cursor restored inside an append resumes with 
     // Replay restored the run record "b" started: its id is the cursor.
     var idem_buf: [96]u8 = undefined;
     const idem = try std.fmt.bufPrint(&idem_buf, "trigger:events@{d}:{d}", .{ all.ids[1].timestamp_ms, all.ids[1].sequence });
-    handler.restoreTriggerCursor(TEST_NS, "wf", idem);
+    var start_buf: [160]u8 = undefined;
+    var out: Result = .{};
+    try handler.replayStart(testKey(TEST_NS, "b"), startValue(&start_buf, "wf", "trigger_started", idem), 1, &out);
     const t = handler.stream_triggers.getPtr(testKey(TEST_NS, "wf")).?;
     const cursor = StreamID{ .timestamp_ms = t.stream_cursor_ts, .sequence = t.stream_cursor_seq };
     try testing.expect(cursor.eql(all.ids[1]));
@@ -7543,7 +7261,7 @@ test "a step whose mapped input would nest past 128 levels fails its run" {
     defer destroyTestShard(&shard);
     registerTestAction(&shard, "step-a");
     // Its completions apply through the log, as on a shard.
-    handler.registerReplay(&shard.replay_registry);
+    handler.store = &shard.defaultPartition().store;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "map-wf"), "map-wf",
         \\{"kind":"Workflow","name":"map-wf","version":"1.0.0",
@@ -7562,7 +7280,7 @@ test "a step whose mapped input would nest past 128 levels fails its run" {
         handler.advanceWorkflow(&shard, ns_key);
         settleTest(&shard);
         const want: WorkflowHandler.RunStatus = if (n <= json_depth.MAX_DEPTH) .waiting else .failed;
-        try testing.expectEqual(want, handler.runs.get(ns_key).?.status);
+        try testing.expectEqual(want, handler.liveRun(ns_key).?.*.status);
     }
 }
 
@@ -7588,7 +7306,7 @@ test "workflow replay: a start whose input nests past 128 levels applies; a sear
 
         var out: Result = .{};
         try handler.replayStart(ns_key, value, 1, &out);
-        const tags = handler.runs.get(ns_key).?.search_tags_owned.?;
+        const tags = shownOf(&handler, ns_key).?.search_tags_owned.?;
         if (n <= json_depth.MAX_DEPTH) {
             try testing.expect(std.mem.indexOf(u8, tags, arrays) != null);
         } else {
@@ -7600,10 +7318,24 @@ test "workflow replay: a start whose input nests past 128 levels applies; a sear
 fn createTestRunAt(handler: *WorkflowHandler, run_id: []const u8, wf_name: []const u8, started_at: i64, status: WorkflowHandler.RunStatus) !void {
     var key_buf: [64]u8 = undefined;
     const ns_key = writeKey(&key_buf, .default, run_id);
-    createTestRun(handler, ns_key, run_id, wf_name);
-    const run = handler.runs.getPtr(ns_key) orelse return error.OutOfMemory;
-    run.started_at_ms = started_at;
-    run.status = status;
+    var value: [128]u8 = undefined;
+    var out: Result = .{};
+    try handler.replayStart(ns_key, startValue(&value, wf_name, "", ""), started_at, &out);
+    try handler.replayStepStarted(ns_key, &out);
+    const run = handler.liveRun(ns_key) orelse return error.OutOfMemory;
+    if (!status.isTerminal()) {
+        run.status = status;
+        return;
+    }
+    const c: WorkflowHandler.Completion = .{ .status = status, .output = null, .steps = &.{}, .history = &.{}, .last = .{ .event_type = "ended", .detail = "", .timestamp_ms = started_at }, .tags = null, .workflow = wf_name };
+    const record = try WorkflowHandler.encodeCompletion(handler.allocator, c, 1 << 15);
+    defer handler.allocator.free(record);
+    try handler.replayComplete(ns_key, record, started_at, &out);
+}
+
+/// Run `key` as a read shows it.
+fn shownOf(handler: *WorkflowHandler, key: []const u8) ?WorkflowHandler.ShownRun {
+    return handler.shownRun(key, keyName(key));
 }
 
 /// The run ids of a shard's page of runs, in order.
@@ -7727,8 +7459,9 @@ test "workflow keys: two namespaces keep their own workflows and runs, whatever 
         const defs = WorkflowHandler.localScanWorkflowDefs(@ptrCast(&handler), .{ .name = "", .id = ns }, "", null, 0);
         try testing.expectEqual(@as(usize, 2), defs.items.len);
         // One idempotency key, used in both, names each namespace's own run.
-        const run = handler.runForIdempotencyKey(ns, "wf", "k").?;
-        try testing.expectEqual(ns, keyNamespace(run.ns_key));
+        var kb: [64]u8 = undefined;
+        const run_id = handler.runForIdempotencyKey(ns, "wf", "k").?;
+        try testing.expect(handler.appliedRun(writeKey(&kb, ns, run_id)) != null);
     }
     // A key reads back as the namespace and name it was built from.
     var kbuf: [16]u8 = undefined;
@@ -7746,7 +7479,7 @@ test "workflow keys: two namespaces keep their own workflows and runs, whatever 
     try testing.expectEqual(@as(usize, 4), handler.definitionCount());
 }
 
-test "workflow handler: a shard's thread never takes another shard's workflow handler, or its lock" {
+test "workflow handler: a shard's thread never takes another shard's workflow handler" {
     // Split so this test's own text doesn't match.
     const src = @embedFile("handler.zig");
     try testing.expect(std.mem.indexOf(u8, src, "]." ++ "workflow_handler") == null);

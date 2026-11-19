@@ -1139,7 +1139,6 @@ pub const Shard = struct {
         // A committed config is the membership a truncation falls back to;
         // the Raft node is on the heap, so it is the applier's context.
         replay_registry.register(.raft_config, @ptrCast(raft_node), applyRaftConfig);
-        workflow_handler.registerReplay(&replay_registry);
         replay_registry.register(.action_abandon, @ptrCast(actions_handler), ActionsHandler.applyAbandonMessage);
         try checkAppliers(shard_id, &replay_registry);
 
@@ -6207,7 +6206,7 @@ pub const Shard = struct {
             self.recordApplied(entry, result);
         }
         self.namespace_handler.afterApply(entry);
-        self.workflow_handler.definitionApplied(entry, result);
+        self.workflow_handler.entryApplied(entry, result);
         self.wakeApplied(entry);
         // The leader's own action steps: the await a deliver answers,
         // workers woken for a run ready again (once a pass: each wake is a
@@ -9489,7 +9488,7 @@ const PartitionReplay = struct {
         defer apply_marker.end(prev);
         self.result.reset(entry);
         const verdict = verdictOf(self.losses, self.shard_id, Shard.nowMs(), entry, applyEntryCore(self.partition, self.registry, entry, &self.result));
-        if (verdict == .applied) self.workflow.definitionApplied(entry, &self.result);
+        if (verdict == .applied) self.workflow.entryApplied(entry, &self.result);
         return verdict;
     }
 
@@ -16180,11 +16179,14 @@ test "Shard: a run whose leader stepped down before its first step takes it when
     // Started, then this leader stepped down before taking its first step,
     // and leads again in a later term.
     try ParkTest.send(&shard, conn, .workflow_start, 2, "wf", "");
-    const run = blk: {
-        var it = shard.workflow_handler.runs.valueIterator();
-        break :blk it.next().?;
+    var key_buf: [64]u8 = undefined;
+    const key = blk: {
+        var it = shard.workflow_handler.to_step.keyIterator();
+        const k = it.next().?.*;
+        @memcpy(key_buf[0..k.len], k);
+        break :blk key_buf[0..k.len];
     };
-    const key = run.ns_key;
+    const run = shard.workflow_handler.liveRun(key).?;
     try std.testing.expectEqual(WorkflowHandler.RunStatus.running, run.status);
     shard.replica.leadershipLost("test");
     const r = shard.raft_node;
@@ -17887,9 +17889,10 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     const wf = shard.workflow_handler;
     const Run = struct {
         fn byId(h: *WorkflowHandler, id: []const u8) *WorkflowHandler.RunRecord {
-            var it = h.runs.valueIterator();
-            while (it.next()) |r| if (std.mem.eql(u8, r.run_id_owned, id)) return r;
-            @panic("no run with that id");
+            var kb: [64]u8 = undefined;
+            @memcpy(kb[0..4], &@import("../namespace/table.zig").Id.default.bytes());
+            @memcpy(kb[4..][0..id.len], id);
+            return h.liveRun(kb[0 .. 4 + id.len]) orelse @panic("no run with that id");
         }
     };
     var a_id_buf: [32]u8 = undefined;
@@ -17911,7 +17914,7 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
 
     // A second client's start is parked when the first run takes its
     // step. The step proposes the invoke and moves on: nothing waits for
-    // its commit with the workflow's lock held.
+    // its commit.
     try ParkTest.send(&shard, conn, .workflow_start, 22, "flow", "");
     wf.advanceStartedRuns(&shard);
     const a = Run.byId(wf, a_id);
@@ -18137,7 +18140,7 @@ test "Shard: an idempotency key of any length is scoped to its namespace, a retr
     // A long key: one run, both answered with it.
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[7].header.status);
     try std.testing.expectEqualStrings(rs[6].data, rs[7].data);
-    try std.testing.expectEqual(@as(usize, 5), shard.workflow_handler.runs.count());
+    try std.testing.expectEqual(@as(usize, 5), shard.workflow_handler.runCount());
 
     // A namespace a run key cannot carry (the key is read back up to its
     // first ':') is refused, for a definition and for a start, before
@@ -18201,7 +18204,7 @@ test "Shard: concurrent conditional writes are decided in log order: one run per
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[0].header.status);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[1].header.status);
     try std.testing.expectEqualStrings(rs[0].data, rs[1].data);
-    try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.runs.count());
+    try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.runCount());
     try std.testing.expectEqual(@as(u32, 1), shard.workflow_handler.to_step.count());
     // The second create finds the namespace being created.
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[2].header.status);
@@ -19140,12 +19143,12 @@ test "every entry type has exactly one applier, or is listed as needing none, or
 
     // One of them missing: dropped at apply, so refused at boot.
     var missing = full;
-    missing.callbacks[@backingInt(entry_mod.EntryType.workflow_start)] = null;
+    missing.callbacks[@backingInt(entry_mod.EntryType.raft_config)] = null;
     try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliers(0, &missing));
 
     // Registered twice: one handler's applier would never run.
     var twice = full;
-    twice.register(.workflow_start, @ptrCast(&ctx), Noop.apply);
+    twice.register(.raft_config, @ptrCast(&ctx), Noop.apply);
     try std.testing.expectError(error.EntryTypeRegisteredTwice, checkAppliers(0, &twice));
 
     // A router-owned type with a callback as well: applied twice.
@@ -20667,7 +20670,7 @@ test "Shard: a trigger moved to another stream and back reads its stream from th
         shard.workflow_handler.triggers_dirty = true;
         shard.workflow_handler.tickStreamTriggers(&shard);
         _ = shard.applyCommitted();
-        try std.testing.expectEqual(@as(usize, 3), shard.workflow_handler.runs.count());
+        try std.testing.expectEqual(@as(usize, 3), shard.workflow_handler.runCount());
         try std.testing.expect(shard.workflow_handler.stream_triggers.getPtr(key).?.stream_cursor_ts != 0);
         // Moved to another stream, then back: no start between them.
         try ParkTest.send(&shard, conn, .workflow_create, 2, "wf", on.def("other"));
@@ -20681,7 +20684,7 @@ test "Shard: a trigger moved to another stream and back reads its stream from th
     defer again.deinit();
     again.wireHandlerShardPtrs();
     _ = again.applyCommitted();
-    try std.testing.expectEqual(@as(usize, 3), again.workflow_handler.runs.count());
+    try std.testing.expectEqual(@as(usize, 3), again.workflow_handler.runCount());
     try std.testing.expectEqual(@as(u64, 0), again.workflow_handler.stream_triggers.getPtr(key).?.stream_cursor_ts);
 }
 
@@ -26928,7 +26931,7 @@ test "checkAppliers: a type a contract machine owns may have no other applier, a
     // A type nothing else applies: the machine is its applier.
     try checkAppliersWith(&(listed_now ++ .{Toy.owning(.raft_snapshot)}), 0, &shard.replay_registry);
     // Registered by a handler too: refused.
-    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.workflow_start)}), 0, &shard.replay_registry));
+    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.raft_config)}), 0, &shard.replay_registry));
     // KV's types are its machine's: without it, they have no applier.
     try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliersWith(&.{}, 0, &shard.replay_registry));
 }
@@ -27611,6 +27614,15 @@ test "Shard: a start's chosen run id is read from its value, and a start with no
     try std.testing.expect(WorkflowHandler.startChosenRunId("\x00\x00\x00\x01\x09\x00order") == null);
 }
 
+/// A run of "wf" started at `key`, applied on `wh`'s store as its shard applies one.
+fn wfTestStart(wh: *WorkflowHandler, key: []const u8) !void {
+    // [wf_len][wf][ver_len][ver][status: running][evt_len][idem_len]
+    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1, 0, 0, 0, 0 };
+    var out: persistence_mod.Result = .{};
+    try wh.replayStart(key, &start, 1, &out);
+    try std.testing.expect(out.refused() == null);
+}
+
 test "Shard: a shard holds a run by its id only in the namespace it was started in" {
     var two: TwoShards = undefined;
     try two.init();
@@ -27618,12 +27630,7 @@ test "Shard: a shard holds a run by its id only in the namespace it was started 
     const wh = two.shards[0].workflow_handler;
     const team_a = comptime ns_table.Id.of(16);
     const team_b = comptime ns_table.Id.of(17);
-    const key = try std.testing.allocator.dupe(u8, wf_test_key(team_a, "shared"));
-    try wh.runs.put(key, undefined);
-    defer {
-        _ = wh.runs.remove(key);
-        std.testing.allocator.free(key);
-    }
+    try wfTestStart(wh, wf_test_key(team_a, "shared"));
     try std.testing.expect(wh.holdsRun(team_a, "shared"));
     try std.testing.expect(!wh.holdsRun(team_b, "shared"));
     try std.testing.expect(!wh.holdsRun(team_a, "other"));
@@ -27634,15 +27641,7 @@ test "Shard: a lookup by a chosen run id two shards hold is refused as a conflic
     try two.init();
     defer two.deinit();
     // Two starts that raced with one id: each shard holds a run of it.
-    var keys: [2][]u8 = undefined;
-    for (&two.shards, &keys) |*s, *k| {
-        k.* = try std.testing.allocator.dupe(u8, wf_test_key(.default, "twice"));
-        try s.workflow_handler.runs.put(k.*, undefined);
-    }
-    defer for (&two.shards, keys) |*s, k| {
-        _ = s.workflow_handler.runs.remove(k);
-        std.testing.allocator.free(k);
-    };
+    for (&two.shards) |*s| try wfTestStart(s.workflow_handler, wf_test_key(.default, "twice"));
     const c = try TestClient.open(&two.shards[0]);
     defer _ = std.c.close(c.pair[1]);
     two.shards[0].runRequest(c.conn, .{ .header = proto.RequestHeader.init(.workflow_status, 5), .namespace = "default", .key = "twice", .value = "" }, .client);
@@ -28814,9 +28813,9 @@ test "Shard: a stream trigger whose shard is capped while apply is suspended kee
         Tick.triggers(sh);
         passes = 0;
         while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
-        if (sh.workflow_handler.runs.count() >= events) break;
+        if (sh.workflow_handler.runCount() >= events) break;
     }
-    try std.testing.expectEqual(@as(usize, events), sh.workflow_handler.runs.count());
+    try std.testing.expectEqual(@as(usize, events), sh.workflow_handler.runCount());
 }
 
 test "Shard: a stream trigger's starts lost to a step-down are proposed again when the node leads again, one run per event" {
@@ -28857,13 +28856,13 @@ test "Shard: a stream trigger's starts lost to a step-down are proposed again wh
     sh.workflow_handler.tickStreamTriggers(sh);
     passes = 0;
     while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
-    try std.testing.expectEqual(@as(usize, events), sh.workflow_handler.runs.count());
+    try std.testing.expectEqual(@as(usize, events), sh.workflow_handler.runCount());
     // Read again in the same term, nothing starts twice.
     sh.workflow_handler.triggers_dirty = true;
     sh.workflow_handler.tickStreamTriggers(sh);
     passes = 0;
     while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
-    try std.testing.expectEqual(@as(usize, events), sh.workflow_handler.runs.count());
+    try std.testing.expectEqual(@as(usize, events), sh.workflow_handler.runCount());
 }
 
 test "Shard: a workflow step whose action invoke the log is too full to take waits, says so once, and invokes once there's room" {
@@ -29017,7 +29016,7 @@ test "Shard: a workflow step whose child run's start the log is too full to take
 
     try fillCapSuspended(&t);
     sh.workflow_handler.advanceStartedRuns(sh);
-    try std.testing.expectEqual(@as(usize, 1), sh.workflow_handler.runs.count());
+    try std.testing.expectEqual(@as(usize, 1), sh.workflow_handler.runCount());
     var runs = sh.workflow_handler.runs.valueIterator();
     const run = runs.next().?;
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
@@ -29036,7 +29035,7 @@ test "Shard: a workflow step whose child run's start the log is too full to take
         sh.workflow_handler.checkPendingActions(sh);
     }
     _ = sh.applyCommitted();
-    try std.testing.expectEqual(@as(usize, 2), sh.workflow_handler.runs.count());
+    try std.testing.expectEqual(@as(usize, 2), sh.workflow_handler.runCount());
 }
 
 test "Shard: two replicas applying the same log find the same bars, the state a snapshot would encode moving between them" {
@@ -30940,7 +30939,7 @@ test "Shard: a channel carries a parent's child workflow to its shard and the ch
     turnWorkflows(&two);
     // The child runs on b, under the id the parent's call chose; its step's
     // action waits for a worker there.
-    try std.testing.expectEqual(@as(usize, 1), b.workflow_handler.runs.count());
+    try std.testing.expectEqual(@as(usize, 1), b.workflow_handler.runCount());
     try completeNext(&two, b, n.action, "{}");
     turnWorkflows(&two);
     var it = a.workflow_handler.runs.valueIterator();
@@ -30979,7 +30978,7 @@ test "Shard: a child's end waits while its own parent's outbox is full, and anot
     two.settle();
     b.workflow_handler.checkPendingActions(b);
     two.settle();
-    try std.testing.expectEqual(@as(usize, 2), b.workflow_handler.runs.count());
+    try std.testing.expectEqual(@as(usize, 2), b.workflow_handler.runCount());
     // Their starts' replies wait in the outboxes: shard 1 takes its own, and
     // shard 0 never answers, so its outbox stays full at one byte a channel.
     for (0..4) |_| {
@@ -30996,7 +30995,7 @@ test "Shard: a child's end waits while its own parent's outbox is full, and anot
     for ([_][]const u8{ "kid-far", "kid-near" }) |kid| {
         const key = wf.nsKey(.default, kid).?;
         defer std.testing.allocator.free(key);
-        wf.completeRun(b, key, wf.runs.getPtr(key).?, .completed, "flo.Completed", 3);
+        wf.completeRun(b, key, wf.liveRun(key).?, .completed, "flo.Completed", 3);
     }
     _ = b.applyCommitted();
     for ([_][]const u8{ "kid-far", "kid-near" }, [_]WorkflowHandler.RunStatus{ .running, .completed }) |kid, want| {
@@ -31040,11 +31039,11 @@ test "Shard: a child's call cleared before the child ends takes its end as nothi
     const wf = b.workflow_handler;
     const key = wf.nsKey(.default, rid).?;
     defer std.testing.allocator.free(key);
-    wf.completeRun(b, key, wf.runs.getPtr(key).?, .completed, "flo.Completed", 3);
+    wf.completeRun(b, key, wf.liveRun(key).?, .completed, "flo.Completed", 3);
     two.settle();
     pumpChannels(&two);
     try std.testing.expect(callIn(a, parent_wf, rid) == null);
-    try std.testing.expect(@import("../workflow/children_machine.zig").parentOf(.{ .store = &b.defaultPartition().store }, .default, rid) == null);
+    try std.testing.expect(@import("../workflow/runs_machine.zig").parentOf(.{ .store = &b.defaultPartition().store }, .default, rid) == null);
     try std.testing.expectEqual(@as(u64, 1), metrics.workflow.action_answers_without_call_total.load(.monotonic));
     // Not the sender's bug: nothing was refused.
     for (a.channel.sender_bugs) |row| for (row) |bugs| try std.testing.expectEqual(@as(u64, 0), bugs);
@@ -31068,7 +31067,7 @@ test "Shard: a second caller's start of a child run another caller started is an
         _ = try proposeAction(b, .child_start, action_entries.ChildStart.Value{ .ns = ns_table.DEFAULT.int(), .parent_slot = calls_machine.callerSlot(.default, parent_wf), .parent_run = parent_run, .parent_workflow = parent_wf, .workflow = kid_wf, .version = "", .run = "kid-same", .input = "{}" });
     }
     two.settle();
-    try std.testing.expectEqualStrings("first-run", @import("../workflow/children_machine.zig").parentOf(.{ .store = &b.defaultPartition().store }, .default, "kid-same").?.parent_run);
+    try std.testing.expectEqualStrings("first-run", @import("../workflow/runs_machine.zig").parentOf(.{ .store = &b.defaultPartition().store }, .default, "kid-same").?.parent_run);
     // The second caller hears (here no call waits on it, so it's counted).
     pumpChannels(&two);
     try std.testing.expectEqual(@as(u64, 1), metrics.workflow.action_answers_without_call_total.load(.monotonic));
@@ -31253,7 +31252,7 @@ const TriggerPair = struct {
     }
 
     fn runs(t: *TriggerPair) usize {
-        return t.two.shards[0].workflow_handler.runs.count();
+        return t.two.shards[0].workflow_handler.runCount();
     }
 
     fn lastId(t: *TriggerPair) !StreamID {

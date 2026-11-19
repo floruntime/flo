@@ -102,16 +102,15 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         // Snapshot installation
         .raft_snapshot => .snapshot,
 
-        // Registry-owned: applied by the owning handler's callback, never by
-        // this router (Shard.assertOneApplier enforces it).
+        // Workflows: their contract machines (workflow/defs_machine.zig,
+        // workflow/runs_machine.zig).
         .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step_started => .none,
         .namespace_create => .none,
         // Actions: their contract machine (actions/machine.zig).
         .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => .none,
         // Calls: their contract machine (actions/calls_machine.zig).
         .step_call, .step_call_retry, .step_call_clear, .call_reply, .call_done => .none,
-        // A child workflow's start and refusal: their contract machine
-        // (workflow/children_machine.zig).
+        // A child workflow's start and refusal: the runs machine.
         .child_start, .child_refuse => .none,
         // A hand-back: sent by the actions machine; applied, after its
         // commit, by the actions handler.

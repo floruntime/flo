@@ -251,7 +251,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             c.state = switch (p.answer) {
                 .started => .started,
                 .no_action => .no_action,
-                .conflict, .skipped => .refused,
+                .conflict, .skipped, .refused => .refused,
                 .moved => unreachable,
             };
             if (p.why) |w| c.outcome = w;
