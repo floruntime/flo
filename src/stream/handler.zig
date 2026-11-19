@@ -1071,8 +1071,10 @@ pub const StreamHandler = struct {
 
     /// Which stream `name` in `ns` is, or null where there is none: the
     /// stamp of the entry that made it. A reader resuming a cursor checks
-    /// it: a stream deleted and made again has another (stamps only rise),
-    /// and numbers its appends afresh, so the old cursor names nothing in it.
+    /// it: a stream deleted and made again has another (stamps only rise).
+    /// Its ids continue past the old stream's while the old one's tombstone
+    /// is held and start again once it is forgotten, so ids alone can't
+    /// tell an old cursor from a new one.
     pub fn madeAt(self: *const StreamHandler, ns: router.NamespaceId, name: []const u8) ?u64 {
         return (stream_machine.metaOf(self.readView(), ns, name) orelse return null).created_ns;
     }
