@@ -26826,17 +26826,18 @@ test "applyEntryCore: a forced delete of a stream with groups moves their genera
     }
 }
 
-test "applyEntryCore: a KV entry delivered twice applies once" {
+test "applyEntryCore: a KV entry delivered twice applies once, and is a duplicate the second time" {
     var part = try Partition.init(std.testing.allocator, 0, 8192, 0);
     defer part.deinit();
     part.wireProjections();
     var registry: ReplayRegistry = .{};
     var buf: [64]u8 = undefined;
     const e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 1, 0, try kv_entries.Put.encodeInto(&buf, .{ .key = TEST_KV_K, .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null }));
-    for (0..2) |_| {
+    for (0..2) |i| {
         var out: persistence_mod.Result = .{};
         out.reset(&e);
-        try std.testing.expect(applyEntryCore(&part, &registry, &e, &out) == .applied);
+        const got = applyEntryCore(&part, &registry, &e, &out);
+        if (i == 0) try std.testing.expect(got == .applied) else try std.testing.expect(got == .partition_reject and got.partition_reject == error.IndexNotIncreasing);
     }
     try std.testing.expectEqual(@as(u64, 1), part.kv.getIn(.default, "k").?.version);
 }
