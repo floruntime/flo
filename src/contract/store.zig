@@ -58,7 +58,9 @@ fn compareKeys(a: []const u8, b: []const u8) std.math.Order {
 pub const Tree = std.Treap([]const u8, compareKeys);
 
 /// A key and its value, both owned by the store. The node's key is the
-/// record's key.
+/// record's key. A slice of either, and a value decoded from it, holds only
+/// until the next apply that writes or deletes its key: whoever keeps one
+/// past that copies it first.
 pub const Record = struct {
     node: Tree.Node,
     value: []u8,

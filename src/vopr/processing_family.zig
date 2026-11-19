@@ -152,7 +152,11 @@ pub const Jobs = struct {
         const j = jobIndex(cmd.key) orelse return error.Halt;
         const want = self.predict(kind, j, cmd.value);
         const before = self.commits();
-        const prev = pm.jobOf(.{ .store = &self.store }, NS, cmd.key);
+        // Held across the apply, which may rewrite or free its record, so
+        // copied out of the store.
+        var prev_arena = std.heap.ArenaAllocator.init(self.store.allocator);
+        defer prev_arena.deinit();
+        const prev = if (pm.jobOf(.{ .store = &self.store }, NS, cmd.key)) |job| try copyJob(prev_arena.allocator(), job) else null;
         var out: persistence.Result = .{};
         out.reset(e);
         try machine_mod.applyEntry(&pm.machine, &self.store, &self.scratch, e, &out);
@@ -188,6 +192,15 @@ pub const Jobs = struct {
         }
         if (self.store.family(pm.JobFam.ID).count > LIMIT) return "the shard holds more jobs than its limit";
         return null;
+    }
+
+    fn copyJob(a: Allocator, j: pm.Job.Value) Allocator.Error!pm.Job.Value {
+        var c = j;
+        c.name = try a.dupe(u8, j.name);
+        c.home = try a.dupe(u8, j.home);
+        c.yaml = try a.dupe(u8, j.yaml);
+        c.failure = try a.dupe(u8, j.failure);
+        return c;
     }
 
     /// `job_stop_keeps_running` and `job_remove_keeps_job`: the job as it
