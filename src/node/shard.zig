@@ -618,6 +618,10 @@ pub const Shard = struct {
     /// When `noteSinkRefusal` last logged, and how many it has counted.
     sink_refusal_warn_ms: u64 = 0,
     sink_refusals_total: u64 = 0,
+    /// Processing sink writes a repair skipped, and their bytes: lost to
+    /// their sinks by the operator's choice, counted apart from refusals.
+    sink_skipped_writes: u64 = 0,
+    sink_skipped_bytes: u64 = 0,
     /// The unpark this leader last proposed, and when it last looked.
     unpark_index: u64 = 0,
     unpark_term: u64 = 0,
@@ -1582,6 +1586,13 @@ pub const Shard = struct {
     /// A sink's write its target refused for good: its record is lost to
     /// that sink. Counted by sender and reason, and logged at most once a
     /// minute naming both.
+    fn noteSinkSkipped(self: *Shard, m: *const contract_store.AppliedMessage) void {
+        self.sink_skipped_writes += 1;
+        self.sink_skipped_bytes += m.entry.payload.len;
+        var lb: [96]u8 = undefined;
+        log.err("shard {d}: a repair skipped a processing sink's write to {s} sent by shard {d} ({d} bytes); its records are lost to that sink ({d} skipped writes here so far)", .{ self.id, targetLabel(&m.entry, &lb), m.from, m.entry.payload.len, self.sink_skipped_writes });
+    }
+
     fn noteSinkRefusal(self: *Shard, m: *const contract_store.AppliedMessage, r: persistence_mod.Refused) void {
         if (m.from < self.channel.sink_refusals.len) self.channel.sink_refusals[m.from].getPtr(r.refusal.reason).* += 1;
         self.sink_refusals_total += 1;
@@ -4886,7 +4897,13 @@ pub const Shard = struct {
     fn halt(self: *Shard, e: *const entry_mod.Entry, comptime fmt: []const u8, args: anytype) void {
         if (self.halted != null) return;
         const type_name = std.enums.tagName(entry_mod.EntryType, @fromBackingInt(@intCast(e.header.entry_type))) orelse "unknown";
-        self.halted = Halt.init(e, "entry {d} ({s}): " ++ fmt, .{ e.header.index, type_name } ++ args);
+        // Inside an inbound: the message whose applier halted, which a
+        // repair can skip alone (`flo cluster repair skip --seq`).
+        const msg = if (e.header.entry_type == @backingInt(entry_mod.EntryType.channel_inbound)) self.defaultPartition().store.applying else null;
+        var mb: [64]u8 = undefined;
+        const at = if (msg) |m| std.fmt.bufPrint(&mb, ", message {d} from shard {d}", .{ m.seq, m.from }) catch "" else "";
+        self.halted = Halt.init(e, "entry {d} ({s}){s}: " ++ fmt, .{ e.header.index, type_name, at } ++ args);
+        self.halted.?.message = msg;
         const raft = self.raft_node;
         raft.halt_at = .{ .index = e.header.index, .term = e.header.term, .crc = e.header.crc32c };
         raft.last_applied = e.header.index - 1;
@@ -5407,6 +5424,8 @@ pub const Shard = struct {
                 for (self.channel.sink_refusals) |by_reason| n += by_reason.get(k);
                 sm.channel_sink_refusals.getPtr(k).store(n, .monotonic);
             }
+            sm.channel_sink_skipped_writes.store(self.sink_skipped_writes, .monotonic);
+            sm.channel_sink_skipped_bytes.store(self.sink_skipped_bytes, .monotonic);
             self.publishParked(sm);
             sm.bar_last.store(self.defaultPartition().last_bar, .monotonic);
             sm.bar_bytes.store(self.defaultPartition().bar_bytes, .monotonic);
@@ -5433,6 +5452,8 @@ pub const Shard = struct {
             slot.halt_index.store(h.index, .monotonic);
             slot.halt_term.store(h.term, .monotonic);
             slot.halt_crc.store(h.crc, .monotonic);
+            slot.halt_from.store(if (h.message) |m| m.from else 0, .monotonic);
+            slot.halt_seq.store(if (h.message) |m| m.seq else 0, .monotonic);
         }
         const raft = self.raft_node;
         // In `healthState`'s own order, strongest first, so a block that then
@@ -5933,7 +5954,14 @@ pub const Shard = struct {
                             log.info("shard {d}: committed entries are readable again; applying from {d}", .{ self.id, next_idx });
                         }
                         spent += applyCost(&e);
-                        if (replay.skippedHere(&self.skips, &e)) {
+                        // A skipped inbound applies its skip (`channels.zig`):
+                        // its messages are answered and its seqs taken.
+                        const skipped_inbound = replay.skippedHere(&self.skips, &e) and e.header.entry_type == @backingInt(entry_mod.EntryType.channel_inbound);
+                        if (skipped_inbound) self.defaultPartition().store.inbound_skip = .{ .index = e.header.index, .seq = self.skips.seqOf(&e).? };
+                        defer if (skipped_inbound) {
+                            self.defaultPartition().store.inbound_skip = null;
+                        };
+                        if (!skipped_inbound and replay.skippedHere(&self.skips, &e)) {
                             self.last_entry_applied = false;
                             self.last_result.reset(&e);
                             self.defaultPartition().passOverSkipped(&e) catch |err| {
@@ -6090,7 +6118,9 @@ pub const Shard = struct {
             entry.header.entry_type == @backingInt(entry_mod.EntryType.channel_unpark))
         {
             for (self.defaultPartition().store.messages.items) |*m| {
-                if (m.sender_bug) |bug| self.noteSenderBug(m, bug) else if (m.entry.header.flags & entry_mod.Flags.SINK != 0) if (m.result.refused()) |r| self.noteSinkRefusal(m, r);
+                if (m.skipped) {
+                    if (m.entry.header.flags & entry_mod.Flags.SINK != 0) self.noteSinkSkipped(m);
+                } else if (m.sender_bug) |bug| self.noteSenderBug(m, bug) else if (m.entry.header.flags & entry_mod.Flags.SINK != 0) if (m.result.refused()) |r| self.noteSinkRefusal(m, r);
                 self.noteAnswerWithoutCall(m);
                 self.afterApply(&m.entry, &m.result);
             }
@@ -7950,6 +7980,34 @@ pub const Shard = struct {
             const text = std.fmt.bufPrint(&msg, "unavailable: only node(s) {any} of {d} voters are known halted at entry {d} (term {d}); a skip needs {d}. A voter that halted alone is diverged instead, and one that hasn't answered lately doesn't count — retry once they answer (flo cluster members shows each node's halt)", .{ halted, voters, ask.index, target.term, raft.quorum() }) catch "unavailable: no majority is halted at that entry";
             return shard.sendRefusal(conn, rid, .unavailable, proto.notRun(text));
         }
+        // A channel inbound: one message of it, or all of them, by the
+        // operator's explicit choice when the halt is at a known message.
+        const inbound = etype == @backingInt(entry_mod.EntryType.channel_inbound);
+        var from: u16 = 0;
+        var first_seq: u64 = 0;
+        var last_seq: u64 = 0;
+        if (inbound) {
+            var diag: schema.Diagnostic = .{};
+            if (@import("../protocol/channel_entries.zig").Inbound.decodeAll(e.payload, &diag)) |p| {
+                from = p.from;
+                first_seq = p.first_seq;
+                var it = p.messages.iterator();
+                var n: u64 = 0;
+                while (it.next() catch null) |_| n += 1;
+                last_seq = if (n == 0) 0 else p.first_seq + n - 1;
+            } else |_| {}
+        }
+        const halt_seq: u64 = if (shard.halted) |*h| (if (h.message) |m| m.seq else 0) else 0;
+        if (ask.seq != 0 and !inbound)
+            return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "--seq names a message of a channel inbound; entry {d} isn't one, and is skipped whole", .{ask.index}) catch "not a channel inbound");
+        if (ask.seq != 0 and ask.whole)
+            return shard.sendErrorResponse(conn, rid, .bad_request, "--seq and --whole-entry are two different repairs; give one");
+        if (ask.seq != 0 and halt_seq != 0 and ask.seq != halt_seq)
+            return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "the group halted at message {d} of entry {d}, not {d}: only the message it halted at is skipped alone", .{ halt_seq, ask.index, ask.seq }) catch "not the halting message");
+        if (ask.seq != 0 and (ask.seq < first_seq or ask.seq > last_seq))
+            return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "entry {d} carries messages {d}..{d} from shard {d}; it has no message {d}", .{ ask.index, first_seq, last_seq, from, ask.seq }) catch "no such message");
+        if (ask.yes and inbound and halt_seq != 0 and ask.seq == 0 and !ask.whole)
+            return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "entry {d} is a channel inbound from shard {d} that halted at message {d}: skip that message alone (--seq {d}) or every message it carries, {d}..{d} (--whole-entry)", .{ ask.index, from, halt_seq, halt_seq, first_seq, last_seq }) catch "choose --seq or --whole-entry");
         if (!ask.yes) {
             const answer: cluster_wire.RepairSkipAnswer = .{
                 .skipped = false,
@@ -7959,12 +8017,16 @@ pub const Shard = struct {
                 .entry_size = entry_size,
                 .voters = voters,
                 .halted = halted,
+                .from = from,
+                .first_seq = first_seq,
+                .last_seq = last_seq,
+                .halt_seq = halt_seq,
             };
             var buf: [cluster_wire.RepairSkipAnswer.maxSize(raft_node_mod.MAX_PEERS + 1)]u8 = undefined;
             return shard.sendOkResponse(conn, rid, answer.encode(&buf));
         }
         var payload: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
-        const skip: repair.Skip = .{ .index = target.index, .term = target.term, .crc = target.crc, .reason = ask.reason };
+        const skip: repair.Skip = .{ .index = target.index, .term = target.term, .crc = target.crc, .seq = ask.seq, .reason = ask.reason };
         const proposed = raft.propose(.repair_skip, entry_mod.Flags.NONE, skip.encode(&payload)) catch |err| return shard.sendRefusal(conn, rid, .unavailable, proto.notRun(switch (err) {
             error.NotLeader => "unavailable: the leader changed — retry",
             error.WritesStopped => "unavailable: the leader stopped taking writes (an entry could not reach disk); restart it, then repair",
@@ -9128,7 +9190,17 @@ const PartitionReplay = struct {
     result: persistence_mod.Result = .{},
 
     fn applier(self: *PartitionReplay) ReplayApply {
-        return .{ .ctx = self, .apply = apply, .pass_over = passOver };
+        return .{ .ctx = self, .apply = apply, .pass_over = passOver, .inbound_skip = inboundSkip, .halting_message = haltingMessage };
+    }
+
+    fn haltingMessage(ctx: *anyopaque) ?replay.Applying {
+        const self: *PartitionReplay = @ptrCast(@alignCast(ctx));
+        return self.partition.store.applying;
+    }
+
+    fn inboundSkip(ctx: *anyopaque, skip: ?replay.InboundSkip) void {
+        const self: *PartitionReplay = @ptrCast(@alignCast(ctx));
+        self.partition.store.inbound_skip = skip;
     }
 
     fn apply(ctx: *anyopaque, entry: *const entry_mod.Entry) Verdict {
@@ -29309,6 +29381,61 @@ test "Shard: a step's call of an action on another shard is answered there, and 
     _ = try proposeAction(a, .step_call_clear, action_entries.CallClear.Value{ .ns = ns_table.DEFAULT.int(), .slot = calls_machine.callerSlot(.default, n.workflow), .run = rid });
     two.settle();
     try std.testing.expect(callIn(a, n.workflow, rid) == null);
+}
+
+test "Shard: a step's call whose start a repair skipped is refused, saying so, and its action never runs" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var ab: [16]u8 = undefined;
+    var wb: [16]u8 = undefined;
+    const n = try callNames(&two, 1, 0, &ab, &wb);
+    var rb: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), a.raft_node.current_term, &rb);
+    _ = try proposeAction(b, .action_register, testRegister(n.action));
+    two.settle();
+    try proposeCall(a, n.action, n.workflow, rid, false);
+    two.settle();
+    // The inbound carrying the start is skipped, as a committed repair has it.
+    b.defaultPartition().store.inbound_skip = .{ .index = 4242, .seq = 0 };
+    pumpChannels(&two);
+    b.defaultPartition().store.inbound_skip = null;
+    pumpChannels(&two);
+    try std.testing.expect(ActionsHandler.for_tests.run(b, .default, rid) == null);
+    const c = callIn(a, n.workflow, rid).?;
+    try std.testing.expectEqual(calls_machine.State.refused, c.state);
+    try std.testing.expect(std.mem.indexOf(u8, c.outcome, "skipped by repair (entry 4242") != null);
+}
+
+test "Shard: a call whose run's end a repair skipped settles refused, saying so, rather than wait for ever" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var ab: [16]u8 = undefined;
+    var wb: [16]u8 = undefined;
+    const n = try callNames(&two, 1, 0, &ab, &wb);
+    var rb: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const rid = a.run_id_gen.next(.action, node_router.nsKeySlot(.default, n.action), a.raft_node.current_term, &rb);
+    _ = try proposeAction(b, .action_register, testRegister(n.action));
+    two.settle();
+    try proposeCall(a, n.action, n.workflow, rid, false);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(calls_machine.State.started, callIn(a, n.workflow, rid).?.state);
+    try completeNext(&two, b, n.action, "{}");
+    // The inbound carrying the run's end, on the caller's shard, is skipped.
+    a.defaultPartition().store.inbound_skip = .{ .index = 5151, .seq = 0 };
+    pumpChannels(&two);
+    a.defaultPartition().store.inbound_skip = null;
+    const c = callIn(a, n.workflow, rid).?;
+    try std.testing.expectEqual(calls_machine.State.refused, c.state);
+    try std.testing.expect(std.mem.indexOf(u8, c.outcome, "skipped by repair (entry 5151") != null);
 }
 
 test "Shard: a call cleared before its run ends, as a cancelled workflow's is, takes the run's end as nothing, and counts it" {

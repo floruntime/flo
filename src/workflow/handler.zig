@@ -2185,6 +2185,13 @@ pub const WorkflowHandler = struct {
         };
     }
 
+    /// Why a call was refused: what its answer said (a repair's skip), or
+    /// the one other refusal, a run id another caller holds.
+    fn refusedWhy(call: ?calls_mod.Call.Value) []const u8 {
+        if (call) |c| if (c.outcome.len > 0) return c.outcome;
+        return "its run id names another caller's run";
+    }
+
     /// A step's call as this shard has applied it.
     fn callOf(shard: *Shard, run: *const RunRecord, action_rid: []const u8) ?calls_mod.Call.Value {
         const ns = keyNamespace(run.ns_key);
@@ -2645,7 +2652,7 @@ pub const WorkflowHandler = struct {
                 self.addHistoryEvent(run, "child_not_found", named, now_ms);
             },
             .lost => self.addHistoryEvent(run, "child_lost", outcome, now_ms),
-            .refused => self.addHistoryEvent(run, "child_refused", "its run id names another caller's run", now_ms),
+            .refused => self.addHistoryEvent(run, "child_refused", refusedWhy(call), now_ms),
             else => self.addHistoryEvent(run, "child_completed", outcome, now_ms),
         } else switch (settled) {
             .no_action => {
@@ -2663,7 +2670,7 @@ pub const WorkflowHandler = struct {
                 self.addHistoryEvent(run, "action_not_found", detail, now_ms);
             },
             .lost => self.addHistoryEvent(run, "action_lost", outcome, now_ms),
-            .refused => self.addHistoryEvent(run, "action_refused", "its run id names another caller's run", now_ms),
+            .refused => self.addHistoryEvent(run, "action_refused", refusedWhy(call), now_ms),
             else => self.addHistoryEvent(run, "action_completed", outcome, now_ms),
         }
         self.addHistoryEvent(run, "step_completed", step_label, now_ms);

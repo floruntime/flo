@@ -218,7 +218,8 @@ pub fn skippable(dir: []const u8, shard: u16, e: *const Entry) SkipError!void {
 /// Append a repair skip of `halted` to the stopped shard `shard` in `dir`,
 /// sealed as committed: its next boot passes over the entry, and so does
 /// every boot after, if it is `skippable`. Returns the skip's index.
-pub fn repairSkip(allocator: std.mem.Allocator, dir: []const u8, shard: u16, sum: *const Summary, halted: *const Entry, reason: []const u8) !u64 {
+/// `seq`: for a channel inbound, the one message to skip (0: all of it).
+pub fn repairSkip(allocator: std.mem.Allocator, dir: []const u8, shard: u16, sum: *const Summary, halted: *const Entry, seq: u64, reason: []const u8) !u64 {
     if (sum.last_index == 0) return error.NoLog;
     if (sum.truncation_pending) return error.TruncationIncomplete;
     try skippable(dir, shard, halted);
@@ -239,7 +240,9 @@ pub fn repairSkip(allocator: std.mem.Allocator, dir: []const u8, shard: u16, sum
     const now_ns: u64 = @intCast(@as(i64, @import("stdx").time.milliTimestamp()) * std.time.ns_per_ms);
     const stamp = @max(sum.last_stamp + 1, now_ns);
     var p: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
-    var e = entry_mod.buildEntry(.repair_skip, entry_mod.Flags.NONE, term, index, stamp, repair.Skip.of(halted, reason).encode(&p));
+    var skip = repair.Skip.of(halted, reason);
+    skip.seq = seq;
+    var e = entry_mod.buildEntry(.repair_skip, entry_mod.Flags.NONE, term, index, stamp, skip.encode(&p));
     e.header.crc32c = e.computeCrc();
     try writer.addEntry(&e);
     // Sealed with the watermark at its own index: boot knows it committed.

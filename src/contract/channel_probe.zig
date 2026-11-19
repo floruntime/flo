@@ -109,6 +109,9 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     var diag: schema.Diagnostic = .{};
     const p = ce.Probe.decodeAll(e.payload, &diag) catch return out.refuse(.bad_request, .malformed, "bad request: malformed probe");
     if (p.body.len < NAME_LEN) return out.refuse(.bad_request, .malformed, "bad request: a probe body names itself in 16 bytes");
+    // A body starting "halt-now" halts its applier where it arrives as a
+    // message: one every replica fails alike, for the repair tests.
+    if (view.message != null and std.mem.startsWith(u8, p.body, "halt-now")) return error.Halt;
     var fb: [6]u8 = undefined;
     const full_key = fullKey(&fb, p.slot);
     // A drain of a slot this group owns applies here, as a consumer's

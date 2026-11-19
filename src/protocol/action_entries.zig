@@ -258,6 +258,9 @@ pub const Answer = enum(u8) {
     /// Its run id names another caller's run (a clock stepped back): this
     /// call has no run, and won't.
     conflict = 4,
+    /// A repair skipped the start, the channel message that carried it: it
+    /// never runs. The reply's `why` names the repair.
+    skipped = 5,
 };
 
 /// The action's shard's answer to a call's start, sent back to the
@@ -267,7 +270,12 @@ pub const Reply = Record(&.{
     .{ .name = "slot", .T = Int(u16) },
     .{ .name = "run", .T = RunId },
     .{ .name = "answer", .T = schema.Enum(Answer) },
+    // Why, when it's `skipped`: the repair's entry and the message.
+    .{ .name = "why", .T = Optional(Bytes(MAX_SKIP_WHY)) },
 });
+
+/// Most a skip's `why` says.
+pub const MAX_SKIP_WHY = 128;
 
 /// How a called run ended.
 pub const DoneStatus = enum(u8) { completed = 1, failed = 2, timed_out = 3, cancelled = 4 };

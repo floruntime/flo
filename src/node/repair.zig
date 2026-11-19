@@ -10,15 +10,17 @@
 const std = @import("std");
 const entry_mod = @import("../storage/ual/entry.zig");
 
-/// What a skip names, and why.
+/// What a skip names, and why. A skip of a `channel_inbound` may name one
+/// message of it by `seq` (0: the whole entry); see `channels.zig`.
 pub const Skip = struct {
     index: u64,
     term: u64,
     crc: u32,
+    seq: u64 = 0,
     reason: []const u8 = "",
 
     pub const MAX_REASON = 256;
-    const FIXED = 8 + 8 + 4;
+    const FIXED = 8 + 8 + 4 + 8;
     pub const MAX_PAYLOAD = FIXED + MAX_REASON;
 
     /// The halted entry `e`, skipped for `reason`.
@@ -26,12 +28,13 @@ pub const Skip = struct {
         return .{ .index = e.header.index, .term = e.header.term, .crc = e.header.crc32c, .reason = reason };
     }
 
-    /// `[index:u64][term:u64][crc:u32][reason]`, little-endian; a reason
-    /// past `MAX_REASON` is cut short.
+    /// `[index:u64][term:u64][crc:u32][seq:u64][reason]`, little-endian; a
+    /// reason past `MAX_REASON` is cut short.
     pub fn encode(self: *const Skip, buf: *[MAX_PAYLOAD]u8) []const u8 {
         std.mem.writeInt(u64, buf[0..8], self.index, .little);
         std.mem.writeInt(u64, buf[8..16], self.term, .little);
         std.mem.writeInt(u32, buf[16..20], self.crc, .little);
+        std.mem.writeInt(u64, buf[20..28], self.seq, .little);
         const n = @min(self.reason.len, MAX_REASON);
         @memcpy(buf[FIXED..][0..n], self.reason[0..n]);
         return buf[0 .. FIXED + n];
@@ -46,6 +49,7 @@ pub const Skip = struct {
             .index = std.mem.readInt(u64, p[0..8], .little),
             .term = std.mem.readInt(u64, p[8..16], .little),
             .crc = std.mem.readInt(u32, p[16..20], .little),
+            .seq = std.mem.readInt(u64, p[20..28], .little),
             .reason = p[FIXED..],
         };
     }
@@ -61,7 +65,7 @@ pub const Skip = struct {
 pub const Skips = struct {
     named: std.ArrayListUnmanaged(Named) = .empty,
 
-    const Named = struct { index: u64, term: u64, crc: u32 };
+    const Named = struct { index: u64, term: u64, crc: u32, seq: u64 = 0 };
 
     pub fn deinit(self: *Skips, allocator: std.mem.Allocator) void {
         self.named.deinit(allocator);
@@ -70,7 +74,7 @@ pub const Skips = struct {
     /// Add `s`; a second skip for the same entry adds nothing.
     pub fn add(self: *Skips, allocator: std.mem.Allocator, s: *const Skip) !void {
         if (self.find(s.index)) |n| if (n.term == s.term and n.crc == s.crc) return;
-        try self.named.append(allocator, .{ .index = s.index, .term = s.term, .crc = s.crc });
+        try self.named.append(allocator, .{ .index = s.index, .term = s.term, .crc = s.crc, .seq = s.seq });
     }
 
     /// Whether a committed skip names `e`.
@@ -79,6 +83,15 @@ pub const Skips = struct {
             if (n.index == e.header.index and n.term == e.header.term and n.crc == e.header.crc32c) return true;
         }
         return false;
+    }
+
+    /// The message a committed skip of `e` names (0: all of it), or null
+    /// when no skip names `e`.
+    pub fn seqOf(self: *const Skips, e: *const entry_mod.Entry) ?u64 {
+        for (self.named.items) |n| {
+            if (n.index == e.header.index and n.term == e.header.term and n.crc == e.header.crc32c) return n.seq;
+        }
+        return null;
     }
 
     /// Whether `s` is a skip this set already holds.
@@ -105,13 +118,20 @@ fn testEntry(index: u64, term: u64) entry_mod.Entry {
 
 test "repair skip: a skip round-trips through its entry, and names only its entry" {
     const halted = testEntry(7, 2);
-    const s = Skip.of(&halted, "bad payload");
+    var s = Skip.of(&halted, "bad payload");
+    s.seq = 5;
     var buf: [Skip.MAX_PAYLOAD]u8 = undefined;
     const e = entry_mod.buildEntry(.repair_skip, entry_mod.Flags.NONE, 3, 9, 9, s.encode(&buf));
     const back = Skip.decode(&e).?;
     try testing.expectEqual(@as(u64, 7), back.index);
     try testing.expectEqual(@as(u64, 2), back.term);
+    try testing.expectEqual(@as(u64, 5), back.seq);
     try testing.expectEqualStrings("bad payload", back.reason);
+    var set: Skips = .{};
+    defer set.deinit(testing.allocator);
+    try set.add(testing.allocator, &back);
+    try testing.expectEqual(@as(?u64, 5), set.seqOf(&halted));
+    try testing.expectEqual(@as(?u64, null), set.seqOf(&testEntry(8, 2)));
     try testing.expect(back.names(&halted));
     try testing.expect(!back.names(&testEntry(7, 3)));
     // Not a skip, and a skip too short to carry one.

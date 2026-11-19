@@ -143,6 +143,10 @@ pub const ShardSlot = struct {
     halt_index: Atomic(u64) = .init(0),
     halt_term: Atomic(u64) = .init(0),
     halt_crc: Atomic(u32) = .init(0),
+    /// The inbound message the halt is at (`halt_seq` 0: none, or not an
+    /// inbound).
+    halt_from: Atomic(u16) = .init(0),
+    halt_seq: Atomic(u64) = .init(0),
     /// How long, in ms, the committed read has been blocked, computed at publish
     /// (0 when not blocked): a plain duration, so a reader needn't subtract a raw
     /// monotonic reading. The reason buffer holds what blocked it.
@@ -307,6 +311,7 @@ pub const NodeHealth = struct {
                 try std.json.Stringify.encodeJsonString(why, .{}, w);
             };
             if (state == .halted) try w.print(",\"halt_index\":{d},\"halt_term\":{d},\"halt_crc\":{d}", .{ s.halt_index.load(.monotonic), s.halt_term.load(.monotonic), s.halt_crc.load(.monotonic) });
+            if (state == .halted and s.halt_seq.load(.monotonic) != 0) try w.print(",\"halt_message\":{{\"from\":{d},\"seq\":{d}}}", .{ s.halt_from.load(.monotonic), s.halt_seq.load(.monotonic) });
             if (state == .read_blocked) try w.print(",\"read_blocked_for_ms\":{d}", .{s.read_blocked_for_ms.load(.monotonic)});
             // Shown once any flush has failed, so a healthy shard stays quiet.
             const persist_failures = s.persist_failures.load(.monotonic);

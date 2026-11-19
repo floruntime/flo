@@ -118,9 +118,14 @@ fn namespaceOf(e: *const Entry) ?u32 {
 
 /// A reply to the parent's call: the child started, or can't be.
 fn reply(view: *View, ns: NamespaceId, run: []const u8, p: Parent.Value, answer: ae.Answer) ApplyError!void {
+    return replyWhy(view, ns, run, p.parent_slot, answer, null);
+}
+
+fn replyWhy(view: *View, ns: NamespaceId, run: []const u8, parent_slot: u16, answer: ae.Answer, why: ?[]const u8) ApplyError!void {
+    const p_slot = parent_slot;
     var buf: [ae.Reply.max_size]u8 = undefined;
-    const bytes = ae.Reply.encodeInto(&buf, .{ .ns = ns.int(), .slot = p.parent_slot, .run = run, .answer = answer }) catch return error.Halt;
-    try view.send(.user(ns), p.parent_slot, @backingInt(EntryType.call_reply), bytes);
+    const bytes = ae.Reply.encodeInto(&buf, .{ .ns = ns.int(), .slot = p_slot, .run = run, .answer = answer, .why = if (why) |w| w[0..@min(w.len, ae.MAX_SKIP_WHY)] else null }) catch return error.Halt;
+    try view.send(.user(ns), p_slot, @backingInt(EntryType.call_reply), bytes);
 }
 
 fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
@@ -246,4 +251,14 @@ pub const machine: machine_mod.Machine = .{
     .observe_needed = isChild,
     .observe_keys = keys,
     .observe = observe,
+    .skipped = skipped,
 };
+
+/// A child's start a repair skipped: its parent's call is told, so the step
+/// fails saying so.
+fn skipped(view: *View, e: *const Entry, why: []const u8) ApplyError!void {
+    if (typeOf(e) != .child_start) return;
+    var diag: schema.Diagnostic = .{};
+    const p = ae.ChildStart.decodeAll(e.payload, &diag) catch return;
+    try replyWhy(view, .of(p.ns), p.run, p.parent_slot, .skipped, why);
+}

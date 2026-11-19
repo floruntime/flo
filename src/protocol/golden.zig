@@ -81,8 +81,8 @@ const members = [_]wire.Member{
 const removed = [_]wire.Removed{.{ .id = 9, .when_ms = 1_700_000_000_000 }};
 const promote: wire.Promote = .{ .id = 4 };
 const remove: wire.Remove = .{ .id = 9, .yes = true };
-const skip: wire.RepairSkip = .{ .index = 987, .yes = true, .reason = "malformed invoke" };
-const skip_answer: wire.RepairSkipAnswer = .{ .skipped = true, .skip_index = 1002, .entry = halt, .entry_type = 0x30, .entry_size = 512, .voters = 3, .halted = &.{ 3, 4 } };
+const skip: wire.RepairSkip = .{ .index = 987, .yes = true, .seq = 41, .reason = "malformed invoke" };
+const skip_answer: wire.RepairSkipAnswer = .{ .skipped = true, .skip_index = 1002, .entry = halt, .entry_type = 0x30, .entry_size = 512, .voters = 3, .halted = &.{ 3, 4 }, .from = 2, .first_seq = 40, .last_seq = 44, .halt_seq = 41 };
 
 fn bytesOf(comptime name: []const u8) []const u8 {
     for (vectors) |v| if (std.mem.eql(u8, v.name, name)) return v.bytes;

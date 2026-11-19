@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 44;
+pub const CURRENT: u32 = 45;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -159,6 +159,9 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // its appends removed later by `stream_clean` entries and the tombstone
     // dropped by `stream_forget`, both new to the log.
     .{ .format = 44, .segment_version = 29, .entries = 0xecc2f68c0588f846 },
+    // A repair skip may name one message of an inbound (`seq`); a call's
+    // reply may say it was skipped (`Answer.skipped`, with `why`).
+    .{ .format = 45, .segment_version = 30, .entries = 0xf25fb51a91e5d97f },
 };
 
 comptime {

@@ -23,7 +23,17 @@ pub const AppliedMessage = struct {
     /// Refused because its sender built it wrong, not because its target
     /// said no: counted and logged apart from ordinary refusals.
     sender_bug: ?SenderBug = null,
+    /// A repair skipped it: its applier never ran.
+    skipped: bool = false,
 };
+
+/// A repair skipping an inbound being applied: one message of it (`seq`),
+/// or all it holds past the receiver's mark (`seq` 0). `index` is the
+/// halted entry's, for what the answers say.
+pub const InboundSkip = struct { index: u64, seq: u64 };
+
+/// The inbound message being applied, so a halt in its applier can name it.
+pub const Applying = struct { from: u16, seq: u64 };
 
 /// Why a message was refused as its sender's bug.
 pub const SenderBug = enum(u8) {
@@ -115,6 +125,10 @@ pub const Store = struct {
     /// entries' payloads are the inbound's, so this holds until the next
     /// apply.
     messages: std.ArrayListUnmanaged(AppliedMessage) = .empty,
+    /// Set by the shard around an inbound a repair skips (`InboundSkip`).
+    inbound_skip: ?InboundSkip = null,
+    /// The inbound message whose applier is running, or null.
+    applying: ?Applying = null,
     /// Per family, the length of a key prefix under which new keys tend to
     /// come past every key held (a stream's records: an append's first id is
     /// past its stream's last), or 0. Such a family remembers each prefix's

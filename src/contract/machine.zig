@@ -62,6 +62,11 @@ pub const Machine = struct {
     /// message that fails it was built wrong by its sender, refused before
     /// its machine sees it and counted as the sender's (`channels.zig`).
     malformed: ?*const fn (e: *const Entry) ?[]const u8 = null,
+    /// A channel message of one of its types that a repair skipped: what it
+    /// answers instead of applying (a request's sender is told; an answer to
+    /// this shard's own call settles it). `why` says the repair skipped it,
+    /// naming the entry and seq. Null: nothing is answered.
+    skipped: ?*const fn (view: *view_mod.View, e: *const Entry, why: []const u8) ApplyError!void = null,
     /// The namespace id an entry's payload names, for one whose applier
     /// can't take an id no namespace could have: a channel message naming
     /// one is refused before its machine sees it (`channels.zig`).
