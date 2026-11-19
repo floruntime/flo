@@ -40,8 +40,9 @@ const MAX_RECORDS: u64 = 64;
 const LEASES = [_]u64{ ae.MIN_LEASE_MS, 2 * ae.MIN_LEASE_MS, ge.DEFAULT_LEASE_MS };
 
 const Kind = enum { append, deliver, settle, release, extend, expire, clean, trim, create, delete, stream_delete, steal, requeue, drop, stream_clean, stream_forget };
-/// Out of 100.
-const WEIGHTS = [_]u8{ 14, 18, 11, 11, 9, 9, 7, 3, 4, 2, 2, 2, 3, 2, 2, 1 };
+/// Out of 100. The duty's cleans and forgets come often enough that most
+/// runs forget a tombstone once its groups are cleaned away.
+const WEIGHTS = [_]u8{ 10, 18, 11, 11, 9, 9, 7, 3, 4, 2, 2, 2, 3, 2, 3, 4 };
 /// Percent of reports spoiled.
 const SPOIL: u8 = 15;
 
@@ -65,7 +66,9 @@ pub fn make(g: *ConsumerGroups, store: *store_mod.Store, l: Leader, r: std.Rando
     if (kind == .stream_clean or kind == .stream_forget) if (tomb) |t| {
         s = t;
     };
-    if (kind == .append and isTombstone(store, s) and r.uintLessThan(u8, 8) != 0) return null;
+    // So are its appends, and the groups made on it, which a forget waits
+    // out.
+    if ((kind == .append or kind == .create) and isTombstone(store, s) and r.uintLessThan(u8, 8) != 0) return null;
     return switch (kind) {
         .append => append(g, out, r, s),
         .deliver => deliver(g, store, out, l, r, s, grp),
