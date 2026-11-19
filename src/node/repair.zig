@@ -80,10 +80,12 @@ pub const Skips = struct {
         self.named.deinit(allocator);
     }
 
-    /// Add `s`; one that skips nothing more than the set already does
-    /// adds nothing.
+    /// Add `s`; one that skips nothing more than the set already does, or
+    /// is `stale`, adds nothing. Boot adds the log's skips in log order and
+    /// a halted shard adds each as it goes past a halt, so the set an
+    /// inbound applies under is the same on both paths.
     pub fn add(self: *Skips, allocator: std.mem.Allocator, s: *const Skip) !void {
-        if (self.holds(s)) return;
+        if (self.holds(s) or self.stale(s)) return;
         try self.named.append(allocator, .{ .index = s.index, .term = s.term, .crc = s.crc, .seq = s.seq, .halt_seq = s.halt_seq });
     }
 
@@ -119,6 +121,24 @@ pub const Skips = struct {
         return if (any) out else null;
     }
 
+    /// Whether `s` was proposed to get past a halt the set already got
+    /// past: an earlier skip of its entry covers the message the group
+    /// halted at when `s` was proposed (the one `s` names, where that isn't
+    /// known). Two skips of one halt can both commit (a resubmit, two
+    /// operators). A live shard takes the first and applies the inbound
+    /// before it applies the second, and a boot meets them in the same log
+    /// order. Taking the second, and widening the inbound by it, would hold
+    /// a boot to more than a live replica skipped. So it skips nothing: a
+    /// later halt of the inbound waits for a skip proposed at that halt.
+    pub fn stale(self: *const Skips, s: *const Skip) bool {
+        const at = if (s.halt_seq != 0) s.halt_seq else s.seq;
+        if (at == 0) return false;
+        for (self.named.items) |n| {
+            if (n.index == s.index and n.term == s.term and n.crc == s.crc and (n.seq == 0 or n.seq == at)) return true;
+        }
+        return false;
+    }
+
     /// Whether the set already skips all that `s` does: its entry whole,
     /// or the one message it names.
     pub fn holds(self: *const Skips, s: *const Skip) bool {
@@ -135,6 +155,36 @@ fn testEntry(index: u64, term: u64) entry_mod.Entry {
     var e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, term, index, index, "x");
     e.header.crc32c = e.computeCrc();
     return e;
+}
+
+test "repair skip: a skip proposed at a halt the set got past is stale and adds nothing" {
+    const allocator = testing.allocator;
+    var set: Skips = .{};
+    defer set.deinit(allocator);
+    var halted = testEntry(7, 2);
+    halted.header.entry_type = @backingInt(entry_mod.EntryType.channel_inbound);
+    halted.header.crc32c = halted.computeCrc();
+    var one = Skip.of(&halted, "");
+    one.seq = 1;
+    one.halt_seq = 1;
+    try set.add(allocator, &one);
+    // The whole entry, proposed at the same halt: stale.
+    var whole = Skip.of(&halted, "");
+    whole.halt_seq = 1;
+    try testing.expect(set.stale(&whole));
+    try set.add(allocator, &whole);
+    try testing.expect(!set.inboundOf(&halted).?.whole);
+    // Proposed at the next halt, message 2: taken.
+    whole.halt_seq = 2;
+    try testing.expect(!set.stale(&whole));
+    try set.add(allocator, &whole);
+    try testing.expect(set.inboundOf(&halted).?.whole);
+    // A whole skip whose halt isn't known is never stale.
+    var set2: Skips = .{};
+    defer set2.deinit(allocator);
+    try set2.add(allocator, &one);
+    whole.halt_seq = 0;
+    try testing.expect(!set2.stale(&whole));
 }
 
 test "repair skip: a skip round-trips through its entry, and names only its entry" {

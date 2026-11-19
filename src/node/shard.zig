@@ -4944,6 +4944,9 @@ pub const Shard = struct {
             // or an offline repair named the wrong one).
             const at_seq: u64 = if (h.message) |m| m.seq else 0;
             if (skip.seq != 0 and skip.seq != at_seq) continue;
+            // One proposed at a halt of this entry it already got past
+            // (`Skips.stale`): a boot wouldn't take it either.
+            if (self.skips.stale(&skip)) continue;
             self.skips.add(self.allocator, &skip) catch {
                 // Looked at again on the next call.
                 self.skip_scan_from = idx;
@@ -4988,7 +4991,9 @@ pub const Shard = struct {
             log.warn("shard {d}: entry {d} is a repair skip that won't decode; it skips nothing", .{ self.id, at });
             return true;
         };
-        if (self.skips.holds(&skip)) return true;
+        // Taken, or stale: proposed at a halt of its entry the shard got
+        // past under an earlier skip, so it skips nothing here or at boot.
+        if (self.skips.holds(&skip) or self.skips.stale(&skip)) return true;
         if (skip.index >= at) {
             log.warn("shard {d}: the repair at entry {d} names entry {d}, not one before it; it skips nothing", .{ self.id, at, skip.index });
             return true;
@@ -24746,6 +24751,104 @@ test "Shard: an inbound whose messages halt it in turn is skipped a message at a
     shard.applyDeferredTail();
     try std.testing.expect(shard.halted == null and shard.offline == null);
     try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1).?.applied);
+}
+
+test "Shard: a second skip of an inbound's halt, committed with the first, skips nothing, live or after a restart" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const ce = @import("../protocol/channel_entries.zig");
+    var h: u64 = 0;
+    var live: SkipState = undefined;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+        // Message 1 halts (no applier on this build); 2 and 3 are puts.
+        var mb: [1024]u8 = undefined;
+        var w: schema.Writer = .{ .buf = &mb };
+        try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.cg_create), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = "" });
+        var pb: [2][128]u8 = undefined;
+        var kb: [2][32]u8 = undefined;
+        var ki: usize = 0;
+        for (0..2) |i| {
+            // Keys this shard owns.
+            const key = while (true) : (ki += 1) {
+                const k = try std.fmt.bufPrint(&kb[i], "{s}in{d}", .{ ns_table.DEFAULT.bytes(), ki });
+                if (shard.router.hashToShard(node_router.routeNsKey(.default, k[ns_table.DEFAULT.bytes().len..])) == shard.id) break k;
+            };
+            ki += 1;
+            const put = try kv_entries.Put.encodeInto(&pb[i], .{ .key = key, .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null });
+            try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, key[ns_table.DEFAULT.bytes().len..]))), .entry_type = @backingInt(entry_mod.EntryType.kv_put), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = put });
+        }
+        var ib: [2048]u8 = undefined;
+        h = (try shard.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 1, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 3 } }))).index;
+        try std.testing.expect(!shard.applyCommitted());
+        try std.testing.expectEqual(@as(u64, 1), shard.halted.?.message.?.seq);
+        const kv_before = shard.kv_handler.kv.countLive();
+        // Both repairs of the halt at message 1 commit before the shard
+        // looks: message 1 alone, then the whole entry.
+        try proposeInboundSkip(&shard, h, 1, 1);
+        try proposeInboundSkip(&shard, h, 0, 1);
+        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expect(shard.halted == null and shard.offline == null);
+        try std.testing.expectEqual(@as(u64, 0), shard.losses.total(.applied_skipped));
+        // The first took it past; the second skipped nothing.
+        try std.testing.expectEqual(@as(usize, 1), shard.skips.named.items.len);
+        try std.testing.expectEqual(kv_before + 2, shard.kv_handler.kv.countLive());
+        try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1).?.applied);
+        live = SkipState.of(&shard, h);
+        try shard.flushSegmentToDisk();
+    }
+    var shard = try t.open();
+    defer shard.deinit();
+    shard.applyDeferredTail();
+    try std.testing.expect(shard.halted == null and shard.offline == null);
+    try std.testing.expectEqual(@as(usize, 1), shard.skips.named.items.len);
+    try std.testing.expectEqual(live, SkipState.of(&shard, h));
+    try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1).?.applied);
+}
+
+test "Shard: a second skip of an inbound's halt doesn't take it past the next message that halts it" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const ce = @import("../protocol/channel_entries.zig");
+    var h: u64 = 0;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+        // Two messages no applier on this build takes.
+        var mb: [512]u8 = undefined;
+        var w: schema.Writer = .{ .buf = &mb };
+        for (0..2) |_| try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.cg_create), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = "" });
+        var ib: [1024]u8 = undefined;
+        h = (try shard.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 1, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } }))).index;
+        try std.testing.expect(!shard.applyCommitted());
+        // Both proposed at the halt at message 1; the whole-entry one is
+        // stale once message 1's took the shard past it.
+        try proposeInboundSkip(&shard, h, 1, 1);
+        try proposeInboundSkip(&shard, h, 0, 1);
+        try std.testing.expect(!shard.applyCommitted());
+        try std.testing.expectEqual(h, shard.halted.?.index);
+        try std.testing.expectEqual(@as(u64, 2), shard.halted.?.message.?.seq);
+        try shard.flushSegmentToDisk();
+    }
+    // A boot holds it to the same: halted at message 2.
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+        shard.applyDeferredTail();
+        try std.testing.expectEqual(h, shard.halted.?.index);
+        try std.testing.expectEqual(@as(u64, 2), shard.halted.?.message.?.seq);
+        // A skip proposed at that halt takes it past.
+        try proposeInboundSkip(&shard, h, 2, 2);
+        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expect(shard.halted == null and shard.offline == null);
+        try std.testing.expectEqual(@as(u64, 2), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1).?.applied);
+    }
 }
 
 test "Shard: an inbound one message's skip took the shard past counts as repaired for a peer halted there" {

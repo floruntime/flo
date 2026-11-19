@@ -2246,6 +2246,29 @@ test "e2e/stream: alter gives a stream its first append made a retention, and in
     try testing.expect(info.stdoutContains("\"age_s\":86400"));
 }
 
+test "e2e/stream: alter --clear-retention drops the age bound and keeps the count" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "create", "alter-clear-test", "--retention", "48", "--retention-count", "100" });
+    var result = try ctx.cli.run(&.{ "stream", "alter", "alter-clear-test", "--clear-retention" });
+    defer result.deinit();
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+
+    var info = try ctx.cli.run(&.{ "stream", "info", "alter-clear-test", "-o", "json" });
+    defer info.deinit();
+    try testing.expectEqual(@as(u8, 0), info.exit_code);
+    try testing.expect(info.stdoutContains("\"retention\":{\"count\":100}"));
+
+    // Setting and clearing one bound at once is refused; the stream is unchanged.
+    var both = try ctx.cli.run(&.{ "stream", "alter", "alter-clear-test", "--retention-count", "5", "--clear-retention-count" });
+    defer both.deinit();
+    try testing.expect(both.contains("both sets and clears"));
+    var after = try ctx.cli.run(&.{ "stream", "info", "alter-clear-test", "-o", "json" });
+    defer after.deinit();
+    try testing.expect(after.stdoutContains("\"retention\":{\"count\":100}"));
+}
+
 test "e2e/stream: alter updates retention (create then alter then verify)" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
