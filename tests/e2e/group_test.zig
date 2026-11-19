@@ -613,3 +613,42 @@ test "e2e/group: a steal or dead-letter command to a group that isn't there is r
         try testing.expect(out.stderrContains("consumer group not found"));
     }
 }
+
+/// A steal naming no records is answered without a log entry; the CLI
+/// can't send one, so it goes over the wire as a client would.
+fn emptySteal(ctx: *stdx.testing.TestContext, group: []const u8) !struct { status: u8, message: []const u8 } {
+    const src = @import("src");
+    const proto = src.protocol.proto;
+    var body_buf: [256]u8 = undefined;
+    const body = try src.protocol.stream_ops.op("stream.group.steal").request.encodeInto(&body_buf, .{ .group = group, .consumer = "c", .min_idle_ms = 1, .lease_ms = null, .records = .{ .bytes = "", .count = 0 } });
+    const req: proto.Request = .{ .header = proto.RequestHeader.init(.stream_group_steal, 7), .namespace = "", .key = "s", .value = body, .options = "" };
+    var frame: [512]u8 = undefined;
+    const sent = try req.serialize(&frame);
+    const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
+    defer _ = std.c.close(fd);
+    if (std.c.write(fd, sent.ptr, sent.len) != @as(isize, @intCast(sent.len))) return error.ShortWrite;
+    const S = struct {
+        var out: [4096]u8 = undefined;
+    };
+    var got: usize = 0;
+    var waited: u32 = 0;
+    while (waited < 300) : (waited += 1) {
+        const rc = std.c.read(fd, S.out[got..].ptr, S.out.len - got);
+        if (rc > 0) got += @intCast(rc) else if (rc == 0) break;
+        if (proto.Response.parse(S.out[0..got])) |resp| return .{ .status = resp.header.status, .message = if (resp.header.status == 0) "" else (try resp.refused()).message } else |_| {}
+        stdx.time.sleep(10 * std.time.ns_per_ms);
+    }
+    return error.NoResponse;
+}
+
+test "e2e/group: an empty steal is answered for a group that is there and refused not found for one that isn't" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "stream", "append", "s", "a" });
+    try ctx.exec(&.{ "stream", "group", "create", "s", "--group", "g" });
+    const ok = try emptySteal(ctx, "g");
+    try testing.expectEqual(@as(u8, 0), ok.status);
+    const missing = try emptySteal(ctx, "nope");
+    try testing.expectEqual(@as(u8, @backingInt(@import("src").protocol.proto.StatusCode.not_found)), missing.status);
+    try testing.expectEqualStrings("not found: consumer group not found", missing.message);
+}

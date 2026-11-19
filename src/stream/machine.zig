@@ -6,8 +6,10 @@
 //! - `stream.meta`: each stream, keyed (ns id, name hash): its name and
 //!   settings, its last id, its floor (the last record a trim cut), its
 //!   generation (moved on by a delete), and its running totals. A delete
-//!   of a stream whose groups still count leaves it as a tombstone
-//!   (`exists` false) holding the generation, so those groups read as gone.
+//!   leaves it as a tombstone (`exists` false) holding the generation, last
+//!   id and floor, so its groups read as gone and a stream made again takes
+//!   ids past the old one's, until the retention duty has removed its
+//!   appends and no group counts it.
 //! - `stream.record`: each append, keyed (ns id, name hash, first record
 //!   id): where its payload is (log index and part), its partition, how
 //!   many records and bytes it holds, and the totals appended before it,
@@ -59,7 +61,7 @@ pub const Meta = Record(&.{
     // Its settings were asked for, by a create or an alter, rather than
     // implied by an append: a create of it must ask for the same ones.
     .{ .name = "explicit", .T = schema.Bool },
-    // False for a tombstone: a deleted stream whose groups still count.
+    // False for a tombstone: a deleted stream not yet forgotten.
     .{ .name = "exists", .T = schema.Bool },
     // Moved on by each delete: a group made at another is gone.
     .{ .name = "gen", .T = Int(u64) },
