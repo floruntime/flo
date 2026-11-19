@@ -1477,7 +1477,7 @@ pub const StreamHandler = struct {
     ///
     /// Wrap-safety: the zero-copy `read` below returns null for an entry whose
     /// payload wraps the hot-ring boundary. That is SAFE here precisely because
-    /// `partition.apply` copies every applied payload into the warm store, so the
+    /// `partition.apply` copies every payload a stream read fetches into the warm store, so the
     /// warm fallback serves the wrapped entry as tier=1. This is the canonical
     /// "null is OK, fall through" use of `read` — do not switch it to readCopy
     /// (that would force a copy + a response-lived buffer for no correctness gain).

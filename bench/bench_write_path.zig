@@ -40,7 +40,7 @@ const Run = struct {
 };
 
 /// The body a client sends for `op`: kv.set's request, a stream append's
-/// one-record batch, an enqueue's payload.
+/// one-record batch, a time-series point's value, an enqueue's payload.
 fn bodyOf(buf: []u8, op: proto.OpCode, value: []const u8) ![]const u8 {
     return switch (op) {
         .kv_put => try src.protocol.kv_ops.op("kv.set").request.encodeInto(buf, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null }),
@@ -51,6 +51,11 @@ fn bodyOf(buf: []u8, op: proto.OpCode, value: []const u8) ![]const u8 {
             @memcpy(buf[8..][0..value.len], value);
             std.mem.writeInt(u16, buf[8 + value.len ..][0..2], 0, .little);
             break :blk buf[0 .. 10 + value.len];
+        },
+        // An f64, little-endian.
+        .ts_write => blk: {
+            std.mem.writeInt(u64, buf[0..8], @bitCast(@as(f64, @floatFromInt(value.len))), .little);
+            break :blk buf[0..8];
         },
         else => value,
     };
@@ -112,6 +117,7 @@ pub fn main() !void {
         .{ .name = "kv_put", .op = .kv_put, .prefix = "bench-kv", .iters = ITERS },
         .{ .name = "stream_append", .op = .stream_append, .prefix = "bench-stream", .iters = ITERS },
         .{ .name = "queue_enqueue", .op = .queue_enqueue, .prefix = "bench-queue", .iters = QUEUE_ITERS },
+        .{ .name = "ts_write", .op = .ts_write, .prefix = "bench-ts", .iters = QUEUE_ITERS },
     };
 
     var next_id: u64 = 1;

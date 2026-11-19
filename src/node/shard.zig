@@ -9316,8 +9316,10 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
     };
     if (contract_machine.ownerOf(machines, etype)) |m| {
         // The router has seen every index up to its own: one at or below it
-        // was applied already, and must not be twice.
-        if (applied) |a| if (a.route == .skipped_already_applied) return .applied;
+        // was applied already, and must not be twice. A type the ring holds
+        // was refused by it above; one it skips is a duplicate here, so it
+        // is counted and answered as one.
+        if (applied) |a| if (a.route == .skipped_already_applied) return .{ .partition_reject = error.IndexNotIncreasing };
         contract_machine.applyEntry(m, &partition.store, &partition.apply_scratch, entry, out) catch |err| return .{ .applier_failed = err };
         if (etype == .channel_inbound or etype == .channel_unpark) for (partition.store.messages.items) |*msg| {
             // A refused message took no effect: its bytes, maybe a sender's
@@ -26342,11 +26344,26 @@ test "an entry repeating an index the partition holds is counted as a duplicate,
     try std.testing.expect(again == .partition_reject);
     try std.testing.expect(verdictOf(&shard.losses, shard.id, Shard.nowMs(), &e, again) == .duplicate);
 
+    // A type a machine owns skips the ring, so the router's mark is what
+    // finds it: it is a duplicate all the same.
+    try std.testing.expect(!Partition.keptInRing(.kv_put));
+    var pb: [128]u8 = undefined;
+    // Stored keys lead with the namespace id: the default's, 1.
+    const put = try @import("../protocol/kv_entries.zig").Put.encodeInto(&pb, .{ .key = "\x00\x00\x00\x01k", .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null });
+    var k = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 2, 1, put);
+    k.header.crc32c = k.computeCrc();
+    var kout = persistence_mod.Result.start(&k);
+    const kfirst = applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &k, &kout);
+    try std.testing.expect(kfirst == .applied);
+    kout = persistence_mod.Result.start(&k);
+    const kagain = applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &k, &kout);
+    try std.testing.expect(verdictOf(&shard.losses, shard.id, Shard.nowMs(), &k, kagain) == .duplicate);
+
     try std.testing.expectEqual(@as(u64, 0), shard.losses.total(.partition_reject));
-    try std.testing.expectEqual(@as(u64, 1), shard.losses.duplicate_index);
+    try std.testing.expectEqual(@as(u64, 2), shard.losses.duplicate_index);
     shard.publishHealth();
     const snap = sm.snapshot();
-    try std.testing.expectEqual(@as(u64, 1), snap.duplicate_index);
+    try std.testing.expectEqual(@as(u64, 2), snap.duplicate_index);
     for (snap.silent_loss) |n| try std.testing.expectEqual(@as(u64, 0), n);
 }
 
@@ -27001,17 +27018,18 @@ test "applyEntryCore: a forced delete of a stream with groups moves their genera
     }
 }
 
-test "applyEntryCore: a KV entry delivered twice applies once" {
+test "applyEntryCore: a KV entry delivered twice applies once, and is a duplicate the second time" {
     var part = try Partition.init(std.testing.allocator, 0, 8192, 0);
     defer part.deinit();
     part.wireProjections();
     var registry: ReplayRegistry = .{};
     var buf: [64]u8 = undefined;
     const e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 1, 0, try kv_entries.Put.encodeInto(&buf, .{ .key = TEST_KV_K, .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null }));
-    for (0..2) |_| {
+    for (0..2) |i| {
         var out: persistence_mod.Result = .{};
         out.reset(&e);
-        try std.testing.expect(applyEntryCore(&part, &registry, &e, &out) == .applied);
+        const got = applyEntryCore(&part, &registry, &e, &out);
+        if (i == 0) try std.testing.expect(got == .applied) else try std.testing.expect(got == .partition_reject and got.partition_reject == error.IndexNotIncreasing);
     }
     try std.testing.expectEqual(@as(u64, 1), part.kv.getIn(.default, "k").?.version);
 }
