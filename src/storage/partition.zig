@@ -823,7 +823,7 @@ test "Partition: only stream reads' entries and the registry's stay in the hot r
     for ([_]EntryType{ .stream_append, .channel_inbound }) |t| try testing.expect(Partition.keptInRing(t));
     // Applied by the registry: the ring's refusal of a repeated index keeps
     // one from applying twice.
-    for ([_]EntryType{ .raft_noop, .raft_config, .workflow_start, .workflow_complete }) |t| try testing.expect(Partition.keptInRing(t));
+    for ([_]EntryType{ .raft_noop, .raft_config, .action_abandon }) |t| try testing.expect(Partition.keptInRing(t));
     // Held by a machine's families, passed over by the router when repeated.
-    for ([_]EntryType{ .kv_put, .ts_write, .queue_enqueue, .action_invoke, .group_deliver, .stream_trim }) |t| try testing.expect(!Partition.keptInRing(t));
+    for ([_]EntryType{ .kv_put, .ts_write, .queue_enqueue, .action_invoke, .group_deliver, .stream_trim, .workflow_start, .workflow_complete }) |t| try testing.expect(!Partition.keptInRing(t));
 }
