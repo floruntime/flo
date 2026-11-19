@@ -63,6 +63,7 @@ const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
 const Result = persistence_mod.Result;
 const NamespaceId = machine.NamespaceId;
+const dead_page = @import("../node/dead_page.zig");
 const StreamID = machine.StreamID;
 const Scope = machine.Scope;
 const WireReader = wire.WireReader;
@@ -960,6 +961,9 @@ pub const Operator = struct {
     pub fn runSteal(shard: *Shard, _: *Connection, req: Request, group: []const u8, consumer: []const u8, min_idle_ms: u64, lease_ms: ?u64, records: Leased.Value) Error!table_run.Outcome(StealResponse) {
         if (try opChecks(shard, req, group)) |r| return .{ .refused = r };
         if (consumer.len == 0) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: a steal names the consumer that takes the records") } };
+        // Nothing to take: answered here, as a dead-letter requeue of none
+        // is, with no entry logged for it.
+        if (records.count == 0) return .{ .answer = .{ .term = 0, .index = 0, .expires_at_ms = 0, .stolen = .{ .bytes = "", .count = 0 }, .refused = .{ .bytes = "", .count = 0 } } };
         const meta = metaOf(shard, req.ns_id, req.key, group).?;
         // The group's lease when none is named, within a lease's bounds.
         const lease = std.math.clamp(lease_ms orelse meta.lease_ms, ae.MIN_LEASE_MS, ae.MAX_LEASE_MS);
@@ -1056,23 +1060,24 @@ pub const Operator = struct {
             found[nf] = .{ .dead_ns = d.dead_ns, .record = d.record };
             nf += 1;
         }
-        var last: ?stream_ops.DeadCursor.Value = null;
-        var more = false;
-        for (found[0..nf]) |d| {
-            if (page.count == limit) {
-                more = true;
-                break;
+        const Ctx = struct {
+            shard: *Shard,
+            ns: NamespaceId,
+            scope: @TypeOf(scope),
+            found: []const @TypeOf(found[0]),
+            page: *stream_ops.DeadPage.Builder,
+
+            fn take(c: *const @This(), i: usize) dead_page.Take {
+                const d = c.found[i];
+                const item = itemOf(c.shard, c.ns, c.scope, d.record) orelse return .skipped;
+                const err_text = item.@"error"[0..@min(item.@"error".len, stream_ops.MAX_DLQ_ERROR)];
+                const added = c.page.add(.{ .ms = d.record.timestamp_ms, .seq = d.record.sequence, .deliveries = item.deliveries, .failures = item.failures, .dead_at_ms = @intCast(d.dead_ns / std.time.ns_per_ms), .@"error" = err_text }) catch false;
+                return if (added) .added else .full;
             }
-            const item = itemOf(shard, req.ns_id, scope, d.record) orelse continue;
-            const err_text = item.@"error"[0..@min(item.@"error".len, stream_ops.MAX_DLQ_ERROR)];
-            const added = page.add(.{ .ms = d.record.timestamp_ms, .seq = d.record.sequence, .deliveries = item.deliveries, .failures = item.failures, .dead_at_ms = @intCast(d.dead_ns / std.time.ns_per_ms), .@"error" = err_text }) catch false;
-            if (!added) {
-                more = true;
-                break;
-            }
-            last = .{ .dead_ns = d.dead_ns, .ms = d.record.timestamp_ms, .seq = d.record.sequence };
-        }
-        return .{ .answer = .{ .dead = page.value(), .cursor = if (more) last else null } };
+        };
+        const w = dead_page.walk(nf, limit, &Ctx{ .shard = shard, .ns = req.ns_id, .scope = scope, .found = found[0..nf], .page = &page }, Ctx.take);
+        const cursor: ?stream_ops.DeadCursor.Value = if (!w.more) null else if (w.last) |i| .{ .dead_ns = found[i].dead_ns, .ms = found[i].record.timestamp_ms, .seq = found[i].record.sequence } else null;
+        return .{ .answer = .{ .dead = page.value(), .cursor = cursor } };
     }
 
     /// The records a requeue or delete names, or with `all` the group's

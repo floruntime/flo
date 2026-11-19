@@ -29289,6 +29289,21 @@ test "Shard: stream.group.steal takes a record idle at least min_idle_ms for its
     try std.testing.expect(left > 9_000 and left <= 10_000);
 }
 
+test "Shard: a stream.group.steal of no records is answered with none, and logs nothing" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    try groupDelivered(&t.shard, 1, t.shard.raft_node.now());
+    const Steal = table_run.op("stream.group.steal");
+    var body_buf: [Steal.request.max_size]u8 = undefined;
+    const before = t.shard.raft_node.log.lastIndex();
+    const none = try groupOpAnswer("stream.group.steal", &t, .stream_group_steal, 1, try Steal.request.encodeInto(&body_buf, .{ .group = "g", .consumer = "rescue", .min_idle_ms = 1, .lease_ms = null, .records = .{ .bytes = "", .count = 0 } }));
+    try std.testing.expectEqual(@as(u32, 0), none.stolen.count);
+    try std.testing.expectEqual(@as(u32, 0), none.refused.count);
+    try std.testing.expectEqual(@as(i64, 0), none.expires_at_ms);
+    try std.testing.expectEqual(before, t.shard.raft_node.log.lastIndex());
+}
+
 test "Shard: stream.group.dlq_list pages a group's dead letters by limit and after; dlq_requeue and dlq_delete take records or all up to a limit, never both, and a dry_run deletes nothing" {
     var t: ClusterActionsTest = undefined;
     try t.init();
