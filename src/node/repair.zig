@@ -139,6 +139,15 @@ pub const Skips = struct {
         return false;
     }
 
+    /// Whether `s` is the one the set took for its halt: a row of its entry
+    /// naming the same message, proposed at the same halt.
+    pub fn took(self: *const Skips, s: *const Skip) bool {
+        for (self.named.items) |n| {
+            if (n.index == s.index and n.term == s.term and n.crc == s.crc and n.seq == s.seq and n.halt_seq == s.halt_seq) return true;
+        }
+        return false;
+    }
+
     /// Whether the set already skips all that `s` does: its entry whole,
     /// or the one message it names.
     pub fn holds(self: *const Skips, s: *const Skip) bool {
