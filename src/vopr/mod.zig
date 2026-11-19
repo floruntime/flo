@@ -22,6 +22,7 @@ pub const SimNetwork = network.SimNetwork;
 
 pub const families = @import("families.zig");
 pub const group_family = @import("group_family.zig");
+pub const workflow_defs_family = @import("workflow_defs_family.zig");
 
 pub const simulator = @import("simulator.zig");
 pub const Simulator = simulator.Simulator;

@@ -36,7 +36,7 @@ pub const Channels = @import("channels.zig").ChannelsWith(&targets, &.{
     .{ .entry_type = .action_abandon, .refusal = abandonRefusal, .namespace = abandonNamespace },
 });
 
-pub const list = targets ++ [_]machine.Machine{ Channels.machine, @import("../processing/sinks_machine.zig").machine, @import("../namespace/machine.zig").machine };
+pub const list = targets ++ [_]machine.Machine{ Channels.machine, @import("../processing/sinks_machine.zig").machine, @import("../namespace/machine.zig").machine, @import("../workflow/defs_machine.zig").machine };
 
 comptime {
     machine.check(&list);

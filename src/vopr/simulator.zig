@@ -37,6 +37,7 @@ const families = @import("families.zig");
 const action_workload = @import("action_workload.zig");
 const queue_workload = @import("queue_workload.zig");
 const processing_family = @import("processing_family.zig");
+const workflow_defs_family = @import("workflow_defs_family.zig");
 const group_family = @import("group_family.zig");
 const group_workload = @import("group_workload.zig");
 const namespace_entries = @import("../protocol/namespace_entries.zig");
@@ -103,6 +104,10 @@ pub const Invariant = enum {
     /// stop that didn't stop, a remove that kept its job, a job past the
     /// shard's limit.
     processing_rule,
+    /// An applied workflow definition entry did otherwise than the ledger:
+    /// a redefinition that re-enabled, an anchor moved without a disable,
+    /// a record the ledger doesn't hold.
+    workflow_rule,
     /// An applied consumer-group entry did otherwise than the ledger: it
     /// leased other records, ended or counted a delivery otherwise, left a
     /// record, a key, a count or a floor the ledger doesn't hold.
@@ -436,6 +441,8 @@ const SimNode = struct {
     queues: families.Queues,
     /// The server's processing machine's jobs, on a store of their own.
     jobs: families.Jobs,
+    /// The server's workflow definitions machine, likewise.
+    wf_defs: workflow_defs_family.WorkflowDefs,
     queues_term: u64 = 0,
     queues_term_since_ns: u64 = 0,
     /// The server's group machine and stream projection, on the queues'
@@ -607,7 +614,7 @@ const SimIo = struct {
 const Canon = struct { term: u64, hash: u64, op_id: ?u64, recorded_at: u64 };
 /// The server machines' families compared: KV's, then actions', then
 /// queues', groups', then the namespaces.
-const SAMPLED = families.Kv.FAMILIES.len + families.Actions.FAMILIES.len + families.Queues.FAMILIES.len + group_family.SUMS + families.Jobs.FAMILIES.len + 1;
+const SAMPLED = families.Kv.FAMILIES.len + families.Actions.FAMILIES.len + families.Queues.FAMILIES.len + group_family.SUMS + families.Jobs.FAMILIES.len + workflow_defs_family.WorkflowDefs.FAMILIES.len + 1;
 const Sums = [SAMPLED]u64;
 const StateCanon = struct { history: u64, checksum: u64, rebuilt: bool, sums: ?Sums };
 
@@ -621,7 +628,7 @@ const APPLY_BUF_FLOOR = 64 * 1024;
 
 /// What a checksum mismatch names, by family.
 const MISMATCH = blk: {
-    const names = [_][]const u8{ "kv.value", "kv.history", "kv.ns_counts" } ++ families.Actions.NAMES ++ families.Queues.NAMES ++ group_family.NAMES ++ families.Jobs.NAMES ++ [_][]const u8{"namespaces"};
+    const names = [_][]const u8{ "kv.value", "kv.history", "kv.ns_counts" } ++ families.Actions.NAMES ++ families.Queues.NAMES ++ group_family.NAMES ++ families.Jobs.NAMES ++ workflow_defs_family.WorkflowDefs.FAMILY_NAMES ++ [_][]const u8{"namespaces"};
     var out: [SAMPLED][2][]const u8 = undefined;
     for (names, &out) |name, *m| m.* = .{
         "two replicas hold different " ++ name ++ " after the same history",
@@ -971,6 +978,8 @@ pub const Summary = struct {
     groups: group_family.ConsumerGroups.Counts,
     /// And the processing machine's jobs.
     jobs: families.Jobs.Counts,
+    /// And the workflow definitions machine.
+    wf_defs: workflow_defs_family.WorkflowDefs.Counts,
     /// How far KV batches went past the nodes' own limits.
     txn: families.TxnCounts,
     /// What the workload's namespace creates came to: at submit, and at
@@ -1058,6 +1067,7 @@ pub const Simulator = struct {
     queue_counts: families.Queues.Counts = .{},
     group_counts: group_family.ConsumerGroups.Counts = .{},
     job_counts: families.Jobs.Counts = .{},
+    wf_def_counts: workflow_defs_family.WorkflowDefs.Counts = .{},
     /// Action entries draw from their own stream, so a scenario without
     /// them replays as it did before they existed.
     action_prng: PRNG,
@@ -1152,6 +1162,7 @@ pub const Simulator = struct {
                 .actions = families.Actions.init(allocator),
                 .queues = families.Queues.init(allocator),
                 .jobs = families.Jobs.init(allocator),
+                .wf_defs = workflow_defs_family.WorkflowDefs.init(allocator),
                 .groups = group_family.ConsumerGroups.init(allocator),
                 .ns = families.Namespaces.init(allocator),
             };
@@ -1187,6 +1198,7 @@ pub const Simulator = struct {
             node.actions.deinit();
             node.queues.deinit();
             node.jobs.deinit();
+            node.wf_defs.deinit();
             node.groups.deinit();
             node.ns.deinit();
             self.allocator.free(node.replica.rpc_entries);
@@ -1458,6 +1470,7 @@ pub const Simulator = struct {
         node.actions.reset();
         node.queues.reset();
         node.jobs.reset();
+        node.wf_defs.reset();
         node.groups.reset();
         node.ns.reset();
         if (self.extension) |x| x.reset(x.ctx, node.id);
@@ -2046,6 +2059,7 @@ pub const Simulator = struct {
         if (self.scenario.queue_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.queue_percent) return self.submitQueueOp(target);
         if (self.scenario.group_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.group_percent) return self.submitGroupOp(target);
         if (self.scenario.processing_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.processing_percent) return self.submitJobOp(target);
+        if (self.scenario.workflow_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.workflow_percent) return self.submitWorkflowDefOp(target);
         const op = try self.workload.nextOp();
         if (op.entry_type == .namespace_create) return self.submitCreate(target, op.id, op.payload);
         // Production refuses a client write on a leader still applying earlier
@@ -2132,6 +2146,22 @@ pub const Simulator = struct {
         }
         const op_id = self.workload.next_op_id;
         const made = processing_family.make(self.action_prng.random(), self.action_buf) orelse return;
+        const id = try self.workload.nextActionOp(made.entry_type, made.payload);
+        std.debug.assert(id == op_id);
+        const res = target.raft.propose(made.entry_type, 0, made.payload) catch return;
+        self.workload.recordProposal(id, target.id, res.term, res.index);
+        try self.pending_ops.append(self.allocator, id);
+    }
+
+    /// A workflow definition entry, as a client's request to a handler
+    /// proposes it.
+    fn submitWorkflowDefOp(self: *Simulator, target: *SimNode) !void {
+        if (!target.raft.leaderReady()) {
+            self.leader_not_ready_refused += 1;
+            return;
+        }
+        const op_id = self.workload.next_op_id;
+        const made = workflow_defs_family.make(self.action_prng.random(), self.action_buf) orelse return;
         const id = try self.workload.nextActionOp(made.entry_type, made.payload);
         std.debug.assert(id == op_id);
         const res = target.raft.propose(made.entry_type, 0, made.payload) catch return;
@@ -2539,6 +2569,25 @@ pub const Simulator = struct {
                 .index = idx,
                 .tick = self.now,
                 .detail = "the processing machine failed a workload entry it should apply",
+            },
+        });
+        if (is_op and workflow_defs_family.WorkflowDefs.owns(e.header.entry_type)) if (node.wf_defs.apply(e)) |effect| {
+            if (first) self.wf_def_counts.count(effect);
+            if (effect.broke) |why| self.checker.fail(.{ .invariant = .workflow_rule, .node = node.id, .index = idx, .tick = self.now, .detail = why });
+        } else |err| self.checker.fail(switch (err) {
+            error.RefusalChangedState => .{
+                .invariant = .refusal_wrote,
+                .node = node.id,
+                .index = idx,
+                .tick = self.now,
+                .detail = "a workflow definition entry the machine refused changed a family",
+            },
+            else => .{
+                .invariant = .applied_integrity,
+                .node = node.id,
+                .index = idx,
+                .tick = self.now,
+                .detail = "the definitions machine failed a workload entry it should apply",
             },
         });
         if (is_op and group_family.ConsumerGroups.ownsEntry(e.header.entry_type, e.payload)) if (node.groups.apply(&node.queues.store, e, replica)) |effect| {
@@ -2994,7 +3043,7 @@ pub const Simulator = struct {
     }
 
     fn sumsOf(node: *SimNode) Sums {
-        return node.kv.checksums() ++ node.actions.checksums() ++ node.queues.checksums() ++ node.groups.checksums(&node.queues.store) ++ node.jobs.checksums() ++ [1]u64{node.ns.checksum()};
+        return node.kv.checksums() ++ node.actions.checksums() ++ node.queues.checksums() ++ node.groups.checksums(&node.queues.store) ++ node.jobs.checksums() ++ node.wf_defs.checksums() ++ [1]u64{node.ns.checksum()};
     }
 
     fn summary(self: *Simulator) Summary {
@@ -3056,6 +3105,7 @@ pub const Simulator = struct {
             .queues = self.queue_counts,
             .groups = self.group_counts,
             .jobs = self.job_counts,
+            .wf_defs = self.wf_def_counts,
             .txn = self.txn_counts,
             .ns_submits = self.ns_submits,
             .ns = self.ns_counts,
@@ -3388,7 +3438,7 @@ test "vopr sim: KV's families are compared at a run's last index even when sampl
     checker.onState(1, idx, 42, 7, null, false, 0);
     checker.onState(2, idx, 42, 7, null, false, 0);
     // The first final records them, the next compares.
-    const same: Sums = .{ 1, 2, 3 } ++ @as([families.Actions.FAMILIES.len]u64, @splat(4)) ++ @as([families.Queues.FAMILIES.len]u64, @splat(6)) ++ @as([group_family.SUMS]u64, @splat(7)) ++ @as([families.Jobs.FAMILIES.len]u64, @splat(8)) ++ [1]u64{5};
+    const same: Sums = .{ 1, 2, 3 } ++ @as([families.Actions.FAMILIES.len]u64, @splat(4)) ++ @as([families.Queues.FAMILIES.len]u64, @splat(6)) ++ @as([group_family.SUMS]u64, @splat(7)) ++ @as([families.Jobs.FAMILIES.len]u64, @splat(8)) ++ @as([workflow_defs_family.WorkflowDefs.FAMILIES.len]u64, @splat(10)) ++ [1]u64{5};
     var other = same;
     other[1] = 9;
     checker.onFinalSums(1, idx, 42, same, false, 0);

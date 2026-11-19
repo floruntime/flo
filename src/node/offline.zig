@@ -242,6 +242,9 @@ pub fn repairSkip(allocator: std.mem.Allocator, dir: []const u8, shard: u16, sum
     var p: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
     var skip = repair.Skip.of(halted, reason);
     skip.seq = seq;
+    // A stopped shard's halting message isn't known here: a skip of one
+    // message names it as the halting one.
+    skip.halt_seq = seq;
     var e = entry_mod.buildEntry(.repair_skip, entry_mod.Flags.NONE, term, index, stamp, skip.encode(&p));
     e.header.crc32c = e.computeCrc();
     try writer.addEntry(&e);

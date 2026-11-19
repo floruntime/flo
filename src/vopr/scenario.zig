@@ -172,6 +172,8 @@ pub const Scenario = struct {
     group_percent: u8 = 0,
     /// Percent of ops that are processing job entries.
     processing_percent: u8 = 0,
+    /// Percent of ops that are workflow definition entries.
+    workflow_percent: u8 = 0,
     /// About one workload op in sixteen creates a namespace, through shard
     /// 0's own create path. Off, the workload is what it was before
     /// creates existed.
@@ -398,6 +400,16 @@ pub const Scenario = struct {
         return s;
     }
 
+    /// The workflows slice: as the queues slice, with a share of the ops
+    /// workflow definition entries instead.
+    pub fn workflows(seed: u64) Scenario {
+        var s = queues(seed);
+        var prng = PRNG.init(std.hash.Wyhash.hash(0x9C, std.mem.asBytes(&seed)));
+        s.queue_percent = 0;
+        s.workflow_percent = prng.random().intRangeAtMost(u8, 25, 60);
+        return s;
+    }
+
     /// The consumer-groups slice: as the queues slice, with a share of the
     /// ops group and stream entries, and queue entries beside them so the
     /// shard's held bytes are shared for real.
@@ -536,6 +548,7 @@ pub const Scenario = struct {
             \\  "queue_percent": {d},
             \\  "group_percent": {d},
             \\  "processing_percent": {d},
+            \\  "workflow_percent": {d},
             \\  "namespace_creates": {},
             \\  "apply_lag_permille": {d},
             \\  "apply_lag_max_ms": {d},
@@ -544,7 +557,7 @@ pub const Scenario = struct {
             \\  "txn_limits": [{d}, {d}, {d}, {d}, {d}, {d}, {d}, {d}]
             \\}}
             \\
-        , .{ self.repair_halt, self.action_percent, self.queue_percent, self.group_percent, self.processing_percent, self.namespace_creates, self.apply_lag_permille, self.apply_lag_max_ms, self.pending_read_permille, self.pending_read_max_ticks, self.txn_limits[0], self.txn_limits[1], self.txn_limits[2], self.txn_limits[3], self.txn_limits[4], self.txn_limits[5], self.txn_limits[6], self.txn_limits[7] });
+        , .{ self.repair_halt, self.action_percent, self.queue_percent, self.group_percent, self.processing_percent, self.workflow_percent, self.namespace_creates, self.apply_lag_permille, self.apply_lag_max_ms, self.pending_read_permille, self.pending_read_max_ticks, self.txn_limits[0], self.txn_limits[1], self.txn_limits[2], self.txn_limits[3], self.txn_limits[4], self.txn_limits[5], self.txn_limits[6], self.txn_limits[7] });
     }
 
     /// Parse a scenario back from `writeJson` output — the pin format.
@@ -601,6 +614,7 @@ pub const Scenario = struct {
             .queue_percent = if (obj.get("queue_percent") == null) 0 else try jsonInt(u8, obj, "queue_percent"),
             .group_percent = if (obj.get("group_percent") == null) 0 else try jsonInt(u8, obj, "group_percent"),
             .processing_percent = if (obj.get("processing_percent") == null) 0 else try jsonInt(u8, obj, "processing_percent"),
+            .workflow_percent = if (obj.get("workflow_percent") == null) 0 else try jsonInt(u8, obj, "workflow_percent"),
             .namespace_creates = if (obj.get("namespace_creates")) |v| switch (v) {
                 .bool => |b| b,
                 else => return error.InvalidField,
@@ -842,13 +856,14 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 43), obj.count());
+    try testing.expectEqual(@as(usize, 44), obj.count());
     try testing.expectEqual(@as(usize, MAX_NODES), obj.get("txn_limits").?.array.items.len);
     try testing.expectEqual(s.repair_halt, obj.get("repair_halt").?.bool);
     try testing.expectEqual(@as(i64, s.action_percent), obj.get("action_percent").?.integer);
     try testing.expectEqual(@as(i64, s.queue_percent), obj.get("queue_percent").?.integer);
     try testing.expectEqual(@as(i64, s.group_percent), obj.get("group_percent").?.integer);
     try testing.expectEqual(@as(i64, s.processing_percent), obj.get("processing_percent").?.integer);
+    try testing.expectEqual(@as(i64, s.workflow_percent), obj.get("workflow_percent").?.integer);
     try testing.expectEqual(s.namespace_creates, obj.get("namespace_creates").?.bool);
     try testing.expectEqual(@as(i64, s.apply_lag_permille), obj.get("apply_lag_permille").?.integer);
     try testing.expectEqual(@as(i64, s.apply_lag_max_ms), obj.get("apply_lag_max_ms").?.integer);

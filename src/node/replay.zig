@@ -194,7 +194,7 @@ pub fn replayOneEntry(ctx: ReplayCtx, entry: *const entry_mod.Entry, out: *Repla
     if (entry.header.index > mark or out.halt != null) return;
     // A repair skips an inbound: its skip applies, as live (`channels.zig`).
     const skipped_inbound = skippedHere(ctx.skips, entry) and entry.header.entry_type == @backingInt(entry_mod.EntryType.channel_inbound) and ctx.apply.inbound_skip != null;
-    if (skipped_inbound) ctx.apply.inbound_skip.?(ctx.apply.ctx, .{ .index = entry.header.index, .seq = ctx.skips.seqOf(entry).? });
+    if (skipped_inbound) ctx.apply.inbound_skip.?(ctx.apply.ctx, ctx.skips.inboundOf(entry).?);
     defer if (skipped_inbound) ctx.apply.inbound_skip.?(ctx.apply.ctx, null);
     // A repair skips anything else: taken as a halt on it left a replica that
     // halted live, and its applier never runs.
@@ -364,8 +364,8 @@ test "replay: a skipped inbound replays with its skip set, and the skip is clear
     var out: ReplayOutcome = .{};
     replayOneEntry(.{ .raft_log = &raft_log, .watermark = 1, .skips = &skips, .shard_id = 0, .apply = .{ .ctx = &unused, .apply = Seen.apply, .pass_over = Seen.passOver, .inbound_skip = Seen.set } }, &e, &out);
     try std.testing.expect(Seen.applied);
-    try std.testing.expectEqual(@as(u64, 4), Seen.during.?.seq);
+    try std.testing.expect(Seen.during.?.skips(4) and !Seen.during.?.skips(3));
     try std.testing.expectEqual(@as(u64, 1), Seen.during.?.index);
-    try std.testing.expectEqual(@as(?InboundSkip, null), Seen.now);
+    try std.testing.expect(Seen.now == null);
     try std.testing.expectEqual(@as(u64, 1), out.applied_through);
 }

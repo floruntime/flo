@@ -28,6 +28,11 @@ pub const Plant = enum {
     /// Boot replay applies one entry past the commit watermark, so it can apply
     /// an entry a leader has not committed.
     replay_watermark_off_by_one,
+    /// A workflow's redefinition enables it, whatever it was.
+    defs_redefine_enables,
+    /// Every workflow enable moves its schedule's anchor, not only one after
+    /// a disable.
+    defs_enable_moves_anchor,
 };
 
 pub const active: Plant = std.meta.stringToEnum(Plant, @import("build_options").vopr_plant) orelse

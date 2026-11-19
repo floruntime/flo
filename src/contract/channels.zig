@@ -616,8 +616,8 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                 if (seq != applied + 1) return error.Halt;
                 // A repair skipped it: answered, never applied, and its seq
                 // is taken, so a resend is a duplicate.
-                if (skip) |sk| if (sk.seq == 0 or sk.seq == seq) {
-                    try skipMessage(view, e, m, p.from, seq, ordinal, sk.index);
+                if (skip) |*sk| if (sk.skips(seq)) {
+                    try skipMessage(view, e, m, p.from, seq, ordinal, sk);
                     applied = seq;
                     continue;
                 };
@@ -696,12 +696,17 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
         /// (`Machine.skipped`): a request's sender is told, an answer to this
         /// shard's own call settles it. Its sends leave under the inbound's
         /// index, as an applied message's do.
-        fn skipMessage(view: *View, e: *const Entry, m: ce.Message.Value, from: u16, seq: u64, ordinal: u8, index: u64) ApplyError!void {
+        fn skipMessage(view: *View, e: *const Entry, m: ce.Message.Value, from: u16, seq: u64, ordinal: u8, sk: *const store_mod.InboundSkip) ApplyError!void {
             const store = view.store;
             const as = asEntry(e, m);
             var r = Result.start(&as);
-            var buf: [128]u8 = undefined;
-            const why = std.fmt.bufPrint(&buf, "skipped by repair (entry {d}, message {d} from shard {d})", .{ index, seq, from }) catch "skipped by repair";
+            var buf: [@import("../protocol/action_entries.zig").MAX_SKIP_WHY]u8 = undefined;
+            // A message skipped with the rest of its inbound says which one
+            // halted the group, so its caller can tell it wasn't the cause.
+            const why = (if (sk.whole and sk.halt_seq != 0 and sk.halt_seq != seq)
+                std.fmt.bufPrint(&buf, "skipped by repair (entry {d}, halted at message {d}; message {d} from shard {d})", .{ sk.index, sk.halt_seq, seq, from })
+            else
+                std.fmt.bufPrint(&buf, "skipped by repair (entry {d}, message {d} from shard {d})", .{ sk.index, seq, from })) catch "skipped by repair";
             r.refuse(.conflict, .skipped_by_repair, why);
             const t = std.enums.fromInt(EntryType, m.entry_type);
             const owner = if (t) |x| machine_mod.ownerOf(targets, x) else null;
@@ -1144,7 +1149,7 @@ test "channels: a repair's skip of an inbound takes every seq it holds, answers 
     try testing.expectEqual(store_mod.Applying{ .from = 0, .seq = 2 }, b.store.applying.?);
     try testing.expect(inOf(b.read(), 0) == null);
     // Skipped whole: no message applies, every seq is taken and answered.
-    b.store.inbound_skip = .{ .index = 77, .seq = 0 };
+    b.store.inbound_skip = .all(77);
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
     b.store.inbound_skip = null;
     try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
@@ -1192,7 +1197,7 @@ test "channels: a skipped inbound leaves every replica the same, whether it halt
     // The same entry, at the same index, comes round again.
     halted_first.index -= 1;
     for ([_]*Group{ &live, &halted_first, &booted }) |g| {
-        g.store.inbound_skip = .{ .index = 77, .seq = 2 };
+        g.store.inbound_skip = .one(77, 2);
         _ = try g.run(&Probed.machine, .channel_inbound, inbound);
         g.store.inbound_skip = null;
     }
@@ -1218,7 +1223,7 @@ test "channels: a repair's skip of one message of an inbound applies the others"
     try a.probeTo(1, "halt-now----0002");
     try a.probeTo(1, "message-thr-0003");
     var buf: [8192]u8 = undefined;
-    b.store.inbound_skip = .{ .index = 77, .seq = 2 };
+    b.store.inbound_skip = .one(77, 2);
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
     b.store.inbound_skip = null;
     try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
@@ -1228,6 +1233,46 @@ test "channels: a repair's skip of one message of an inbound applies the others"
     try testing.expect(b.store.messages.items[1].skipped);
     try testing.expect(!b.store.messages.items[2].skipped);
     try testing.expectEqual(@as(?store_mod.Applying, null), b.store.applying);
+}
+
+test "channels: an inbound whose messages halt it in turn is skipped a message at a time, then whole, and a whole skip's answers name the halting message" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    var b = Group.init(1, 2);
+    defer b.deinit();
+    try a.probeTo(1, "message-one-0001");
+    try a.probeTo(1, "halt-now----0002");
+    try a.probeTo(1, "halt-now----0003");
+    try a.probeTo(1, "halt-now----0004");
+    try a.probeTo(1, "message-fiv-0005");
+    var buf: [8192]u8 = undefined;
+    const inbound = try inboundFrom(&a, 0, 1, 1, 5, &buf);
+    // Message 2 skipped: the inbound halts again, at 3, applying nothing.
+    var skip = store_mod.InboundSkip.one(77, 2);
+    b.store.inbound_skip = skip;
+    try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, inbound));
+    try testing.expectEqual(store_mod.Applying{ .from = 0, .seq = 3 }, b.store.applying.?);
+    try testing.expect(inOf(b.read(), 0) == null);
+    // 2 and 3 skipped: it halts at 4.
+    b.index -= 1;
+    skip.seqs[1] = 3;
+    skip.n = 2;
+    b.store.inbound_skip = skip;
+    try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, inbound));
+    try testing.expectEqual(store_mod.Applying{ .from = 0, .seq = 4 }, b.store.applying.?);
+    // Then the whole entry, the group halted at 4: every message is skipped,
+    // and one that didn't halt it says which did.
+    b.index -= 1;
+    skip.whole = true;
+    skip.halt_seq = 4;
+    b.store.inbound_skip = skip;
+    _ = try b.run(&Probed.machine, .channel_inbound, inbound);
+    b.store.inbound_skip = null;
+    try testing.expectEqual(@as(u64, 5), inOf(b.read(), 0).?.applied);
+    try testing.expect(b.got("message-one-0001") == null and b.got("message-fiv-0005") == null);
+    try testing.expectEqual(@as(usize, 5), b.store.messages.items.len);
+    try testing.expectEqualStrings("skipped by repair (entry 77, halted at message 4; message 1 from shard 0)", b.store.messages.items[0].result.refused().?.refusal.message);
+    try testing.expectEqualStrings("skipped by repair (entry 77, message 4 from shard 0)", b.store.messages.items[3].result.refused().?.refusal.message);
 }
 
 test "channels: a message's sends are held to an apply's limits on their own: past them, only it is refused, and the channel goes on" {

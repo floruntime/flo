@@ -133,13 +133,13 @@ fn writeEntryTo(op: OpCode, ctx: *anyopaque, ns: dispatcher_mod.WalkNamespace, n
             var kbuf: [WorkflowHandler.MAX_START_KEY]u8 = undefined;
             if (workflow_mod.KEY_PREFIX + name.len > kbuf.len) return;
             const key = workflow_mod.writeKey(&kbuf, ns.id, name);
-            const def = handler.definitions.get(key) orelse return;
-            try w.writeInt(u16, @intCast(def.name_owned.len), .little);
-            try w.writeAll(def.name_owned);
-            try w.writeInt(u16, @intCast(def.version_owned.len), .little);
-            try w.writeAll(def.version_owned);
+            const def = handler.defOf(key) orelse return;
+            try w.writeInt(u16, @intCast(def.name.len), .little);
+            try w.writeAll(def.name);
+            try w.writeInt(u16, @intCast(def.version.len), .little);
+            try w.writeAll(def.version);
             try w.writeInt(i64, def.created_at_ms, .little);
-            try w.writeByte(@intFromBool(!handler.disabled.contains(key)));
+            try w.writeByte(@intFromBool(def.enabled));
         },
         .action_list => try ActionsHandler.writeListEntry(@ptrCast(@alignCast(ctx)), ns.id, name, w),
         // [name_len:u16][name]

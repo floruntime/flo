@@ -27,10 +27,36 @@ pub const AppliedMessage = struct {
     skipped: bool = false,
 };
 
-/// A repair skipping an inbound being applied: one message of it (`seq`),
-/// or all it holds past the receiver's mark (`seq` 0). `index` is the
-/// halted entry's, for what the answers say.
-pub const InboundSkip = struct { index: u64, seq: u64 };
+/// The repairs skipping an inbound being applied: the messages they named
+/// one at a time (`seqs`), or, `whole`, all it holds past the receiver's
+/// mark. `index` is the halted entry's and `halt_seq` the message a whole
+/// skip's group halted at (0: none known), for what the answers say.
+pub const InboundSkip = struct {
+    index: u64,
+    whole: bool = false,
+    halt_seq: u64 = 0,
+    n: u8 = 0,
+    seqs: [MAX_SEQS]u64 = @splat(0),
+
+    /// An inbound carries at most this many messages (`channel_entries.MAX_BATCH`).
+    pub const MAX_SEQS = 64;
+
+    pub fn all(index: u64) InboundSkip {
+        return .{ .index = index, .whole = true };
+    }
+
+    pub fn one(index: u64, seq: u64) InboundSkip {
+        var s: InboundSkip = .{ .index = index, .n = 1 };
+        s.seqs[0] = seq;
+        return s;
+    }
+
+    /// Whether message `seq` is skipped.
+    pub fn skips(self: *const InboundSkip, seq: u64) bool {
+        if (self.whole) return true;
+        return std.mem.indexOfScalar(u64, self.seqs[0..self.n], seq) != null;
+    }
+};
 
 /// The inbound message being applied, so a halt in its applier can name it.
 pub const Applying = struct { from: u16, seq: u64 };

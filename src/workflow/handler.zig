@@ -65,6 +65,9 @@ const contract_view = @import("../contract/view.zig");
 const run_id_mod = @import("../node/run_id.zig");
 const NamespaceId = @import("../namespace/table.zig").Id;
 const NamespaceHandler = @import("../namespace/handler.zig").NamespaceHandler;
+const defs_machine = @import("defs_machine.zig");
+const contract_machine = @import("../contract/machine.zig");
+const Store = @import("../contract/store.zig").Store;
 
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
@@ -181,9 +184,16 @@ pub const WorkflowHandler = struct {
     /// Logs a completion record. A seam so a test can make the log refuse.
     propose: *const fn (shard: *Shard, run_ns_key: []const u8, value: []const u8) anyerror!persistence_mod.ProposeResult = proposeCompletion,
 
-    /// Definitions, by key (`writeKey`: namespace id ‖ workflow name), each
-    /// key allocated apart from its record.
-    definitions: std.StringHashMap(DefinitionRecord),
+    /// The shard's contract state, where the definitions machine keeps each
+    /// workflow (`defs_machine.zig`), keyed `writeKey`: namespace id ‖ name.
+    store: ?*Store = null,
+    /// A store of its own, for a handler built without a shard (tests).
+    own_store: Store,
+    /// What a definition applied here directly (`replayEntry`) stages in.
+    def_scratch: std.heap.ArenaAllocator,
+    /// The create index each definition's schedule and trigger were last
+    /// built from (`syncProducers`), by definition key. Node memory.
+    producers_built: std.StringHashMapUnmanaged(u64) = .empty,
 
     /// Runs, by key (namespace id ‖ run id).
     runs: std.StringHashMap(RunRecord),
@@ -192,9 +202,6 @@ pub const WorkflowHandler = struct {
     /// run that key started (see `idemKey`). Kept by the start applier, so every node
     /// and every replay decides duplicates alike, without a scan.
     idem_index: std.StringHashMapUnmanaged([]const u8) = .{},
-
-    /// Disabled workflows, by their definitions' keys.
-    disabled: std.StringHashMap(void),
 
     /// Active stream triggers, by their definitions' keys.
     /// Registered when a workflow with a `trigger:` block is created.
@@ -206,10 +213,8 @@ pub const WorkflowHandler = struct {
     /// timer — turning a polled (≤ batch_timeout_ms) latency into ~one tick.
     /// Single-threaded per shard (set/read only on the shard's reactor thread).
     triggers_dirty: bool = false,
-    /// Whether an applied definition installs its trigger and schedule here.
-    /// Cleared by the shard while it applies entries replicated from a peer:
-    /// those producers run on the node that owns the definition.
-    install_producers: bool = true,
+    /// The index the next definition applied here directly takes (tests).
+    direct_index: u64 = 0,
     /// This shard's namespace handler, whose table an applier reads a
     /// namespace's name from.
     namespaces: ?*const NamespaceHandler = null,
@@ -261,14 +266,18 @@ pub const WorkflowHandler = struct {
         }
     };
 
+    /// A definition as the store holds it: its slices point into the
+    /// store, so they hold until the next apply.
     pub const DefinitionRecord = struct {
-        name_owned: []const u8,
-        version_owned: []const u8,
-        yaml_owned: []const u8,
+        name: []const u8,
+        version: []const u8,
+        yaml: []const u8,
         created_at_ms: i64,
-        /// Cached idempotency mode (parsed once at create time) so the start
-        /// path can enforce `required` without re-parsing the YAML.
-        idempotency: definition.IdempotencyMode = .none,
+        created_index: u64,
+        idempotency: definition.IdempotencyMode,
+        own_namespace: bool,
+        enabled: bool,
+        anchor_ms: i64,
     };
 
     pub const RunRecord = struct {
@@ -409,8 +418,16 @@ pub const WorkflowHandler = struct {
         stream_namespace_owned: ?[]const u8,
         batch_size: u32,
         poll_interval_ms: u32,
+        /// The last event a run applied here started from (`restoreTriggerCursor`):
+        /// what every replica holds alike.
         stream_cursor_ts: u64,
         stream_cursor_seq: u64,
+        /// How far this leader has read in `proposed_term`, past starts it
+        /// proposed that may not apply: a step-down can drop them from the
+        /// log, so another term reads from the applied cursor again, and
+        /// the starts made twice are one run each by their idempotency keys.
+        /// Leader memory.
+        proposed: ?struct { at: StreamID, term: u64 } = null,
         last_poll_ms: i64,
         /// A read of a stream another shard owns, in flight (0 for none):
         /// its number and the term it was asked in. At most one at a time.
@@ -422,6 +439,15 @@ pub const WorkflowHandler = struct {
         /// read has said; a read of one made since starts the cursor over.
         stream_made_ns: ?u64 = null,
     };
+
+    /// Where a trigger reads from in `term`: past what this leader proposed
+    /// in that term, else from the applied cursor.
+    fn readFrom(trigger: *const StreamTriggerState, term: u64) StreamID {
+        const applied = StreamID{ .timestamp_ms = trigger.stream_cursor_ts, .sequence = trigger.stream_cursor_seq };
+        const p = trigger.proposed orelse return applied;
+        if (p.term != term or applied.greaterThan(p.at)) return applied;
+        return p.at;
+    }
 
     pub const ScheduleState = struct {
         workflow_name_owned: []const u8,
@@ -458,9 +484,9 @@ pub const WorkflowHandler = struct {
         return .{
             .allocator = allocator,
             .mu = .{},
-            .definitions = std.StringHashMap(DefinitionRecord).init(allocator),
+            .own_store = Store.init(allocator),
+            .def_scratch = .init(allocator),
             .runs = std.StringHashMap(RunRecord).init(allocator),
-            .disabled = std.StringHashMap(void).init(allocator),
             .stream_triggers = std.StringHashMap(StreamTriggerState).init(allocator),
             .schedules = std.StringHashMap(ScheduleState).init(allocator),
             .plan_health = std.StringHashMap(plan_types.ExecutorHealth).init(allocator),
@@ -477,15 +503,11 @@ pub const WorkflowHandler = struct {
             self.allocator.free(p.detail);
         }
         self.completion_retries.deinit(self.allocator);
-        // Free all definition records (ns-qualified key + record fields)
-        var dit = self.definitions.iterator();
-        while (dit.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*); // ns-qualified key
-            self.allocator.free(entry.value_ptr.name_owned);
-            self.allocator.free(entry.value_ptr.version_owned);
-            self.allocator.free(entry.value_ptr.yaml_owned);
-        }
-        self.definitions.deinit();
+        self.own_store.deinit();
+        self.def_scratch.deinit();
+        var pk = self.producers_built.keyIterator();
+        while (pk.next()) |k| self.allocator.free(k.*);
+        self.producers_built.deinit(self.allocator);
 
         // Free all run records (ns-qualified key + record fields)
         var rit = self.runs.iterator();
@@ -506,13 +528,6 @@ pub const WorkflowHandler = struct {
         var ak = self.active_runs.keyIterator();
         while (ak.next()) |k| self.allocator.free(k.*);
         self.active_runs.deinit(self.allocator);
-
-        // Free disabled keys (ns-qualified)
-        var diit = self.disabled.iterator();
-        while (diit.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.disabled.deinit();
 
         // Free stream trigger state
         var tit = self.stream_triggers.iterator();
@@ -621,17 +636,17 @@ pub const WorkflowHandler = struct {
         _: u32, // limit
     ) dispatcher_mod.NameWalker.ScanResult {
         const handler: *WorkflowHandler = @ptrCast(@alignCast(ctx));
-        handler.mu.lock();
-        defer handler.mu.unlock();
-        // Sized under the lock, so an insert can't outgrow it mid-scan.
-        const name_buf = dispatcher_mod.scanScratch(handler.definitions.count());
+        const id = ns.id.bytes();
+        var n: usize = 0;
+        var counter = handler.defsRead().range(defs_machine.DefFam, &id);
+        while (counter.next() catch unreachable) |_| n += 1; // written by the machine alone
+        const name_buf = dispatcher_mod.scanScratch(n);
 
         var count: usize = 0;
-        var dit = handler.definitions.iterator();
-        while (dit.next()) |entry| {
+        var it = handler.defsRead().range(defs_machine.DefFam, &id);
+        while (it.next() catch unreachable) |rec| {
             if (count >= name_buf.len) break;
-            if (keyNamespace(entry.key_ptr.*) != ns.id) continue;
-            name_buf[count] = entry.value_ptr.name_owned;
+            name_buf[count] = rec.value.v.name;
             count += 1;
         }
 
@@ -848,13 +863,13 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(def_ns_key);
 
         // Check workflow exists
-        if (!self.definitions.contains(def_ns_key)) {
+        const def_now = self.defOf(def_ns_key) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "workflow not found");
             return null;
-        }
+        };
 
         // Check workflow is not disabled
-        if (self.disabled.contains(def_ns_key)) {
+        if (!def_now.enabled) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow is disabled");
             return null;
         }
@@ -946,7 +961,7 @@ pub const WorkflowHandler = struct {
 
         // Enforce idempotency mode: `required` rejects starts with no key.
         if (idempotency_key == null) {
-            if (self.definitions.get(def_ns_key)) |def_rec| {
+            if (self.defOf(def_ns_key)) |def_rec| {
                 if (def_rec.idempotency == .required) {
                     shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "idempotency key is required for this workflow");
                     return null;
@@ -1596,20 +1611,20 @@ pub const WorkflowHandler = struct {
         };
         defer self.allocator.free(ns_key);
 
-        const def = self.definitions.get(ns_key) orelse {
+        const def = self.defOf(ns_key) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
 
         // If a specific version is requested, check it matches
         if (req.value.len > 0) {
-            if (!std.mem.eql(u8, def.version_owned, req.value)) {
+            if (!std.mem.eql(u8, def.version, req.value)) {
                 shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
                 return;
             }
         }
 
-        shard.sendOkResponse(conn, req.header.request_id, def.yaml_owned);
+        shard.sendOkResponse(conn, req.header.request_id, def.yaml);
     }
 
     // ── DISABLE / ENABLE ────────────────────────────────────────────────
@@ -1626,7 +1641,7 @@ pub const WorkflowHandler = struct {
             return null;
         };
         defer self.allocator.free(ns_key);
-        if (!self.definitions.contains(ns_key)) {
+        if (self.defOf(ns_key) == null) {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "workflow not found");
             return null;
         }
@@ -1644,28 +1659,6 @@ pub const WorkflowHandler = struct {
         if (!self.to_step.remove(ns_key)) return out.refuse(.conflict, .unclassified, "conflict: the run's first step was taken");
     }
 
-    /// Apply a workflow_enabled entry. The definition may have gone since it
-    /// was proposed; then nothing changes.
-    fn replayEnabled(self: *WorkflowHandler, ns_key: []const u8, value: []const u8, stamp_ms: i64, out: *Result) persistence_mod.ApplyError!void {
-        if (value.len != 1 or value[0] > 1) return error.Halt;
-        if (!self.definitions.contains(ns_key)) return out.refuse(.not_found, .not_found, "workflow not found");
-        if (value[0] == 1) {
-            // Enabled again, its schedule counts slots from now: those
-            // missed while disabled don't fire.
-            if (self.disabled.fetchRemove(ns_key)) |old| {
-                self.allocator.free(old.key);
-                if (self.schedules.getPtr(ns_key)) |schedule| schedule.anchor_ms = stamp_ms;
-            }
-            return;
-        }
-        if (self.disabled.contains(ns_key)) return;
-        const owned = self.allocator.dupe(u8, ns_key) catch return error.OutOfMemory;
-        self.disabled.put(owned, {}) catch {
-            self.allocator.free(owned);
-            return error.OutOfMemory;
-        };
-    }
-
     // ── LIST DEFINITIONS ────────────────────────────────────────────────
 
     fn handleListDefinitions(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
@@ -1673,13 +1666,13 @@ pub const WorkflowHandler = struct {
         var defs: std.ArrayListUnmanaged(DefInfo) = .empty;
         defer defs.deinit(self.allocator);
 
-        var dit = self.definitions.iterator();
-        while (dit.next()) |entry| {
-            const def = entry.value_ptr;
-            if (keyNamespace(entry.key_ptr.*) != req.ns_id) continue;
+        const id = req.ns_id.bytes();
+        var dit = self.defsRead().range(defs_machine.DefFam, &id);
+        while (dit.next() catch unreachable) |rec| { // written by the machine alone
+            const def = rec.value.v;
             defs.append(self.allocator, .{
-                .name = def.name_owned,
-                .version = def.version_owned,
+                .name = def.name,
+                .version = def.version,
                 .created_at = def.created_at_ms,
             }) catch {
                 shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
@@ -1752,10 +1745,10 @@ pub const WorkflowHandler = struct {
         const def_ns_key = self.nsKey(ns, run.workflow_name_owned) orelse return;
         defer self.allocator.free(def_ns_key);
 
-        const def_record = self.definitions.get(def_ns_key) orelse return;
+        const def_record = self.defOf(def_ns_key) orelse return;
 
         // Parse the definition to access the step graph
-        var def = self.parseStored(def_record.yaml_owned, def_ns_key) catch return;
+        var def = self.parseStored(def_record.yaml, def_ns_key) catch return;
         defer def.deinit(self.allocator);
 
         const now_ms: i64 = @import("stdx").time.milliTimestamp();
@@ -2339,8 +2332,8 @@ pub const WorkflowHandler = struct {
     fn startChild(self: *WorkflowHandler, shard: *Shard, ns: NamespaceId, run_id: []const u8, p: children_mod.Parent.Value) !persistence_mod.ProposeResult {
         const def_key = self.nsKey(ns, p.workflow) orelse return error.OutOfMemory;
         defer self.allocator.free(def_key);
-        const def = self.definitions.get(def_key);
-        const held = if (def) |d| p.version.len == 0 or std.mem.eql(u8, d.version_owned, p.version) else false;
+        const def = self.defOf(def_key);
+        const held = if (def) |d| p.version.len == 0 or std.mem.eql(u8, d.version, p.version) else false;
         // A run already holding its id is another's: a start of ours, once
         // applied, would have marked the record started. Proposing it would
         // be refused, unobserved, for ever; the parent is told instead.
@@ -2694,9 +2687,9 @@ pub const WorkflowHandler = struct {
         const ns = keyNamespace(run_ns_key);
         const def_ns_key = self.nsKey(ns, run.workflow_name_owned) orelse return;
         defer self.allocator.free(def_ns_key);
-        const def_record = self.definitions.get(def_ns_key) orelse return;
+        const def_record = self.defOf(def_ns_key) orelse return;
 
-        var def = self.parseStored(def_record.yaml_owned, def_ns_key) catch return;
+        var def = self.parseStored(def_record.yaml, def_ns_key) catch return;
         defer def.deinit(self.allocator);
 
         const step: definition.Step = if (run.current_step_name_owned) |sn|
@@ -2826,9 +2819,9 @@ pub const WorkflowHandler = struct {
             // Parse definition to resolve custom terminals
             const def_ns_key = self.nsKey(keyNamespace(run_ns_key), run.workflow_name_owned) orelse return;
             defer self.allocator.free(def_ns_key);
-            const def_record = self.definitions.get(def_ns_key) orelse return;
+            const def_record = self.defOf(def_ns_key) orelse return;
 
-            var def = self.parseStored(def_record.yaml_owned, def_ns_key) catch return;
+            var def = self.parseStored(def_record.yaml, def_ns_key) catch return;
             defer def.deinit(self.allocator);
 
             // Check if timeout target is a terminal (builtin or custom)
@@ -3073,10 +3066,10 @@ pub const WorkflowHandler = struct {
         // Look up the workflow definition
         const def_ns_key = self.nsKey(ns, run.workflow_name_owned) orelse return null;
         defer self.allocator.free(def_ns_key);
-        const def_record = self.definitions.get(def_ns_key) orelse return null;
+        const def_record = self.defOf(def_ns_key) orelse return null;
 
         // Parse definition to access the output mapping
-        var def = self.parseStored(def_record.yaml_owned, def_ns_key) catch return null;
+        var def = self.parseStored(def_record.yaml, def_ns_key) catch return null;
         defer def.deinit(self.allocator);
 
         const output_expr = def.output orelse return null;
@@ -3115,8 +3108,8 @@ pub const WorkflowHandler = struct {
     /// Returns an owned JSON string like `{"customer_id":"C-789","order_amount":149.99}`
     /// or null if the definition has no search attributes.
     fn buildSearchTags(self: *WorkflowHandler, def_ns_key: []const u8, run: *RunRecord) ?[]const u8 {
-        const def_rec = self.definitions.get(def_ns_key) orelse return null;
-        var def = self.parseStored(def_rec.yaml_owned, def_ns_key) catch return null;
+        const def_rec = self.defOf(def_ns_key) orelse return null;
+        var def = self.parseStored(def_rec.yaml, def_ns_key) catch return null;
         defer def.deinit(self.allocator);
         if (def.search_attributes.len == 0) return null;
 
@@ -3206,6 +3199,7 @@ pub const WorkflowHandler = struct {
         // to another stream starts that stream from its beginning.
         var cursor_ts: u64 = 0;
         var cursor_seq: u64 = 0;
+        var proposed: @FieldType(StreamTriggerState, "proposed") = null;
         const stream_ns = self.otherStreamNamespace(ns, trigger.namespace);
         if (self.stream_triggers.fetchRemove(trigger_key)) |old| {
             self.allocator.free(old.key);
@@ -3214,6 +3208,7 @@ pub const WorkflowHandler = struct {
             if (std.mem.eql(u8, state.stream_name_owned, trigger.stream) and same_ns) {
                 cursor_ts = state.stream_cursor_ts;
                 cursor_seq = state.stream_cursor_seq;
+                proposed = state.proposed;
             }
             self.freeTriggerState(&state);
             _ = global_stream_trigger_count.fetchSub(1, .monotonic);
@@ -3244,6 +3239,7 @@ pub const WorkflowHandler = struct {
             .poll_interval_ms = trigger.batch_timeout_ms,
             .stream_cursor_ts = cursor_ts,
             .stream_cursor_seq = cursor_seq,
+            .proposed = proposed,
             .last_poll_ms = 0,
         }) catch {
             self.allocator.free(trigger_key);
@@ -3386,7 +3382,7 @@ pub const WorkflowHandler = struct {
             if (schedule.proposed_term == term and slot <= schedule.proposed_ms) continue;
 
             // Skip disabled workflows
-            if (self.disabled.contains(entry.key_ptr.*)) continue;
+            if (self.isDisabled(entry.key_ptr.*)) continue;
 
             // Check max_concurrent
             if (schedule.max_concurrent > 0) {
@@ -3458,7 +3454,7 @@ pub const WorkflowHandler = struct {
             }
 
             // Skip disabled workflows
-            if (self.disabled.contains(entry.key_ptr.*)) continue;
+            if (self.isDisabled(entry.key_ptr.*)) continue;
 
             // As many events as this shard can start runs for now; with room
             // for none the trigger waits, its cursor where it is.
@@ -3476,7 +3472,7 @@ pub const WorkflowHandler = struct {
             const sh = shard.stream_handler;
             const made = sh.madeAt(stream_ns, trigger.stream_name_owned) orelse continue;
             if (!sameStream(trigger, made)) continue;
-            const cursor = StreamID{ .timestamp_ms = trigger.stream_cursor_ts, .sequence = trigger.stream_cursor_seq };
+            const cursor = readFrom(trigger, shard.raft_node.current_term);
             const result = sh.readPayloadsForStreamIn(trigger.stream_name_owned, stream_ns, cursor, limit);
             defer result.deinit(sh.allocator);
             self.takeRecords(shard, trigger, result.payloads, result.ids, result.last_id);
@@ -3519,6 +3515,7 @@ pub const WorkflowHandler = struct {
         trigger.stream_made_ns = made;
         trigger.stream_cursor_ts = 0;
         trigger.stream_cursor_seq = 0;
+        trigger.proposed = null;
         trigger.last_poll_ms = 0;
         return false;
     }
@@ -3539,6 +3536,7 @@ pub const WorkflowHandler = struct {
         if (owner >= mailboxes.len) return;
         const ns_name = trigger.stream_namespace_owned orelse (shard.namespace_handler.table.nameOf(ns) orelse return);
         const seq = trigger.next_read_seq + 1;
+        const from = readFrom(trigger, raft.current_term);
         const bytes = (source_page.Read{
             .term = raft.current_term,
             .seq = seq,
@@ -3547,8 +3545,8 @@ pub const WorkflowHandler = struct {
             .key = key,
             .namespace = ns_name,
             .source = trigger.stream_name_owned,
-            .from_a = trigger.stream_cursor_ts,
-            .from_b = trigger.stream_cursor_seq,
+            .from_a = from.timestamp_ms,
+            .from_b = from.sequence,
             .limit = @intCast(limit),
         }).encode(shard.allocator) orelse return;
         if (!mailboxes[owner].inbox.send(.{ .tag = .source_read, .src_shard = @intCast(shard.id), .payload_len = @intCast(bytes.len), .payload_ptr = bytes.ptr })) {
@@ -3576,9 +3574,10 @@ pub const WorkflowHandler = struct {
         trigger.read_seq = 0;
         const raft = shard.raft_node;
         if (raft.role != .leader or raft.current_term != page.term) return;
-        if (self.disabled.contains(entry.key_ptr.*)) return;
+        if (self.isDisabled(entry.key_ptr.*)) return;
         if (page.kind != .stream or page.status != .ok) return;
-        if (trigger.stream_cursor_ts != page.from_a or trigger.stream_cursor_seq != page.from_b) return;
+        const from = readFrom(trigger, page.term);
+        if (from.timestamp_ms != page.from_a or from.sequence != page.from_b) return;
         if (!sameStream(trigger, page.made_ns)) return;
         _ = triggerReadLimit(shard, trigger) orelse return;
         const records = self.allocator.alloc(source_page.Page.Record, page.count) catch return;
@@ -3596,7 +3595,7 @@ pub const WorkflowHandler = struct {
     }
 
     /// Starts the runs for events read from the trigger's cursor through
-    /// `last`, and moves the cursor there. A read that found no events but
+    /// `last`, and moves this leader's read position there (`proposed`). A read that found no events but
     /// reached past appends it couldn't read moves the cursor past them, so
     /// the trigger doesn't stall. A start the log refuses (full for now)
     /// leaves the cursor where the read began: the next read takes these
@@ -3625,8 +3624,7 @@ pub const WorkflowHandler = struct {
                 }
             }
         }
-        trigger.stream_cursor_ts = last.timestamp_ms;
-        trigger.stream_cursor_seq = last.sequence;
+        trigger.proposed = .{ .at = last, .term = shard.raft_node.current_term };
     }
 
     /// Build a JSON array from a batch of payloads: ["payload1","payload2",...]
@@ -4155,10 +4153,8 @@ pub const WorkflowHandler = struct {
 
     /// Register this handler's entry types with the shared ReplayRegistry.
     pub fn registerReplay(self: *WorkflowHandler, registry: *persistence_mod.ReplayRegistry) void {
-        registry.register(.workflow_create, @ptrCast(self), replayEntryThunk);
         registry.register(.workflow_start, @ptrCast(self), replayEntryThunk);
         registry.register(.workflow_complete, @ptrCast(self), replayEntryThunk);
-        registry.register(.workflow_enabled, @ptrCast(self), replayEntryThunk);
         registry.register(.workflow_step_started, @ptrCast(self), replayEntryThunk);
     }
 
@@ -4172,8 +4168,8 @@ pub const WorkflowHandler = struct {
     /// whether it created its run (u8) and the run's id.
     pub fn replayEntry(self: *WorkflowHandler, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
         const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
-        // Other shard threads walk these maps under this lock. Nothing
-        // holds it across an apply, so taking it here cannot nest.
+        // Every path that changes run state takes this lock; nothing holds
+        // it across an apply, so taking it here cannot nest.
         self.mu.lock();
         defer self.mu.unlock();
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return error.Halt;
@@ -4181,81 +4177,115 @@ pub const WorkflowHandler = struct {
         if (cmd.key.len < KEY_PREFIX or keyNamespace(cmd.key) != cmd.namespace_id) return error.Halt;
 
         return switch (etype) {
-            .workflow_create => self.replayCreate(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / 1_000_000), entry.header.flags, out),
+            .workflow_create, .workflow_enabled => self.applyDefinition(entry, out),
             .workflow_start => self.replayStart(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
-            .workflow_enabled => self.replayEnabled(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
             .workflow_step_started => self.replayStepStarted(cmd.key, cmd.value, out),
             .workflow_complete => self.replayComplete(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
             else => error.Halt,
         };
     }
 
-    /// Apply a workflow_create entry, keyed by the definition's key.
-    fn replayCreate(self: *WorkflowHandler, ns_key_raw: []const u8, yaml: []const u8, created_at_ms: i64, flags: u16, out: *Result) persistence_mod.ApplyError!void {
-        const ns = keyNamespace(ns_key_raw);
-        const raw_name = keyName(ns_key_raw);
-        out.putBytes(raw_name);
+    // ── Definitions ─────────────────────────────────────────────────────
 
-        // Parsed before anything changes: a definition that won't parse
-        // halts here and leaves the one it would replace in place.
-        var def = self.parseStored(yaml, ns_key_raw) catch |err| {
-            return if (err == error.OutOfMemory) error.OutOfMemory else error.Halt;
+    fn defsRead(self: *const WorkflowHandler) contract_view.ReadView {
+        return .{ .store = self.store orelse @constCast(&self.own_store) };
+    }
+
+    /// The definition `def_key` names, as the store holds it, or null.
+    pub fn defOf(self: *const WorkflowHandler, def_key: []const u8) ?DefinitionRecord {
+        const d = defs_machine.get(self.defsRead(), def_key) orelse return null;
+        return .{
+            .name = d.name,
+            .version = d.version,
+            .yaml = d.yaml,
+            .created_at_ms = d.created_at_ms,
+            .created_index = d.created_index,
+            .idempotency = std.enums.fromInt(definition.IdempotencyMode, d.idempotency) orelse .none,
+            .own_namespace = d.own_namespace != 0,
+            .enabled = d.enabled != 0,
+            .anchor_ms = d.anchor_ms,
         };
-        defer def.deinit(self.allocator);
+    }
 
-        const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return error.OutOfMemory;
-        if (self.definitions.fetchRemove(ns_key)) |old| {
-            self.allocator.free(old.key); // old ns-qualified key
-            self.allocator.free(old.value.name_owned);
-            self.allocator.free(old.value.version_owned);
-            self.allocator.free(old.value.yaml_owned);
+    pub fn isDisabled(self: *const WorkflowHandler, def_key: []const u8) bool {
+        const d = self.defOf(def_key) orelse return false;
+        return !d.enabled;
+    }
+
+    /// For tests: a committed create of `ns_key`'s workflow, stamped
+    /// `created_at_ms`, applied as a shard applies one.
+    pub fn replayCreate(self: *WorkflowHandler, ns_key: []const u8, yaml: []const u8, created_at_ms: i64, flags: u16, out: *Result) persistence_mod.ApplyError!void {
+        return self.applyDirect(.workflow_create, flags, ns_key, yaml, created_at_ms, out);
+    }
+
+    /// For tests: a committed enable (1) or disable (0), as `replayCreate`.
+    pub fn replayEnabled(self: *WorkflowHandler, ns_key: []const u8, value: []const u8, stamp_ms: i64, out: *Result) persistence_mod.ApplyError!void {
+        return self.applyDirect(.workflow_enabled, 0, ns_key, value, stamp_ms, out);
+    }
+
+    fn applyDirect(self: *WorkflowHandler, t: entry_mod.EntryType, flags: u16, ns_key: []const u8, value: []const u8, stamp_ms: i64, out: *Result) persistence_mod.ApplyError!void {
+        if (ns_key.len < KEY_PREFIX) return error.Halt;
+        const cmd: entry_mod.CommandPayload = .{ .namespace_id = keyNamespace(ns_key), .key_length = @intCast(ns_key.len), .value_length = @intCast(value.len), .key = ns_key, .value = value };
+        const buf = try self.allocator.alloc(u8, cmd.serializedSize());
+        defer self.allocator.free(buf);
+        _ = cmd.serialize(buf).?;
+        self.direct_index += 1;
+        const e = entry_mod.buildEntry(t, flags, 1, self.direct_index, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, buf);
+        out.reset(&e);
+        return self.applyDefinition(&e, out);
+    }
+
+    /// A create or enable through the definitions machine on this handler's
+    /// store, then what follows it, as a shard's applier runs them.
+    fn applyDefinition(self: *WorkflowHandler, e: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
+        try contract_machine.applyEntry(&defs_machine.machine, self.defsRead().store, &self.def_scratch, e, out);
+        self.definitionApplied(e, out);
+    }
+
+    /// After a definition's create or enable applied, on every replica, live
+    /// and at boot replay alike (`PartitionReplay`): its schedule and
+    /// trigger follow its record, in log order, so a start replayed after it
+    /// restores into the producers its definition had then.
+    pub fn definitionApplied(self: *WorkflowHandler, e: *const entry_mod.Entry, out: *const Result) void {
+        const t: entry_mod.EntryType = @fromBackingInt(@intCast(e.header.entry_type));
+        if (t != .workflow_create and t != .workflow_enabled) return;
+        if (out.refused() != null) return;
+        const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return;
+        self.syncProducers(cmd.key);
+    }
+
+    /// `def_key`'s schedule and stream trigger as its record says: built,
+    /// rebuilt after a redefinition (keeping the slots fired and the
+    /// cursor, `registerSchedule`/`registerStreamTrigger`), or dropped
+    /// when the definition has none. Node memory on every replica; only a
+    /// ready leader fires them (`Shard.tick` runs producers only when it `leads`).
+    fn syncProducers(self: *WorkflowHandler, def_key: []const u8) void {
+        const d = self.defOf(def_key) orelse return;
+        const ns = keyNamespace(def_key);
+        const name = keyName(def_key);
+        const built = self.producers_built.get(def_key);
+        if (built == null or built.? != d.created_index) {
+            var def = self.parseStored(d.yaml, def_key) catch return;
+            defer def.deinit(self.allocator);
+            if (def.trigger) |named| {
+                var trigger = named;
+                if (d.own_namespace) trigger.namespace = null;
+                self.registerStreamTrigger(ns, name, trigger);
+            } else self.unregisterStreamTrigger(ns, name);
+            if (def.schedule) |schedule| self.registerSchedule(ns, name, schedule, d.anchor_ms) else self.unregisterSchedule(ns, name);
+            self.noteBuilt(def_key, d.created_index);
         }
+        // An enable after a disable moves the anchor without a create.
+        if (self.schedules.getPtr(def_key)) |schedule| schedule.anchor_ms = d.anchor_ms;
+    }
 
-        const version = self.allocator.dupe(u8, def.version) catch {
-            self.allocator.free(ns_key);
-            return error.OutOfMemory;
-        };
-        const owned_name = self.allocator.dupe(u8, raw_name) catch {
-            self.allocator.free(ns_key);
-            self.allocator.free(version);
-            return error.OutOfMemory;
-        };
-        const owned_yaml = self.allocator.dupe(u8, yaml) catch {
-            self.allocator.free(ns_key);
-            self.allocator.free(owned_name);
-            self.allocator.free(version);
-            return error.OutOfMemory;
-        };
-        self.definitions.put(ns_key, .{
-            .name_owned = owned_name,
-            .version_owned = version,
-            .yaml_owned = owned_yaml,
-            .created_at_ms = created_at_ms,
-            .idempotency = def.idempotency,
-        }) catch {
-            self.allocator.free(ns_key);
-            self.allocator.free(owned_name);
-            self.allocator.free(version);
-            self.allocator.free(owned_yaml);
-            return error.OutOfMemory;
-        };
-
-        // A definition's trigger and schedule are part of it: (re)register
-        // them here so a restart keeps them and a redefinition without one
-        // drops it.
-        if (!self.install_producers) return;
-        if (def.trigger) |named| {
-            var trigger = named;
-            if (flags & entry_mod.Flags.OWN_NAMESPACE != 0) trigger.namespace = null;
-            self.registerStreamTrigger(ns, raw_name, trigger);
-        } else {
-            self.unregisterStreamTrigger(ns, raw_name);
+    fn noteBuilt(self: *WorkflowHandler, def_key: []const u8, index: u64) void {
+        if (self.producers_built.getPtr(def_key)) |v| {
+            v.* = index;
+            return;
         }
-        if (def.schedule) |schedule| {
-            self.registerSchedule(ns, raw_name, schedule, created_at_ms);
-        } else {
-            self.unregisterSchedule(ns, raw_name);
-        }
+        const owned = self.allocator.dupe(u8, def_key) catch return;
+        self.producers_built.put(self.allocator, owned, index) catch self.allocator.free(owned);
     }
 
     /// Apply a workflow_start entry, keyed by the run's key.
@@ -4330,9 +4360,9 @@ pub const WorkflowHandler = struct {
         if (client_start or std.mem.eql(u8, event_type, "schedule_started")) {
             const def_key = self.nsKey(ns, wf_name) orelse return error.OutOfMemory;
             defer self.allocator.free(def_key);
-            if (self.disabled.contains(def_key)) return out.refuse(.bad_request, .unclassified, "workflow is disabled");
+            if (self.isDisabled(def_key)) return out.refuse(.bad_request, .unclassified, "workflow is disabled");
             if (client_start and idem == null) {
-                if (self.definitions.get(def_key)) |def| {
+                if (self.defOf(def_key)) |def| {
                     if (def.idempotency == .required) return out.refuse(.bad_request, .unclassified, "idempotency key is required for this workflow");
                 }
             }
@@ -4544,7 +4574,7 @@ pub const WorkflowHandler = struct {
     }
 
     pub fn definitionCount(self: *const WorkflowHandler) usize {
-        return self.definitions.count();
+        return self.defsRead().store.families[defs_machine.DefFam.ID].count;
     }
 
     pub fn runCount(self: *const WorkflowHandler) usize {
@@ -5069,35 +5099,9 @@ fn createTestRunWithInput(handler: *WorkflowHandler, ns_key: []const u8, run_id:
 }
 
 fn createTestDef(handler: *WorkflowHandler, ns_key: []const u8, name: []const u8, yaml: []const u8) void {
-    const alloc = handler.allocator;
-    const owned_ns = alloc.dupe(u8, ns_key) catch return;
-    const owned_name = alloc.dupe(u8, name) catch {
-        alloc.free(owned_ns);
-        return;
-    };
-    const owned_ver = alloc.dupe(u8, "1.0.0") catch {
-        alloc.free(owned_ns);
-        alloc.free(owned_name);
-        return;
-    };
-    const owned_yaml = alloc.dupe(u8, yaml) catch {
-        alloc.free(owned_ns);
-        alloc.free(owned_name);
-        alloc.free(owned_ver);
-        return;
-    };
-
-    handler.definitions.put(owned_ns, .{
-        .name_owned = owned_name,
-        .version_owned = owned_ver,
-        .yaml_owned = owned_yaml,
-        .created_at_ms = 0,
-    }) catch {
-        alloc.free(owned_ns);
-        alloc.free(owned_name);
-        alloc.free(owned_ver);
-        alloc.free(owned_yaml);
-    };
+    _ = name; // the key's
+    var out: Result = .{};
+    handler.replayCreate(ns_key, yaml, 0, 0, &out) catch |err| std.debug.panic("test definition not created: {s}", .{@errorName(err)});
 }
 
 test "a producer's start leaves its run to step, its logged first step joins the queue, then it takes its step; one whose index applied without creating a run is dropped" {
@@ -5175,7 +5179,7 @@ const test_parent_json =
 ;
 
 const test_kid_json =
-    \\{"kind":"Workflow","name":"kid-wf","version":"2.0.0",
+    \\{"kind":"Workflow","name":"kid-wf","version":"1.0.0",
     \\"start":{"run":"@actions/step-a","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
 ;
 
@@ -5190,7 +5194,7 @@ fn startTestChildren(handler: *WorkflowHandler, shard: *Shard) void {
 
 test "a child pinned to a version starts that version, and one pinned to a version its shard doesn't hold is refused, as not found" {
     const allocator = testing.allocator;
-    // The test definitions are held at 1.0.0.
+    // The child definition is at 1.0.0.
     for ([_][]const u8{ "1.0.0", "9.9.9" }) |pin| {
         var handler = WorkflowHandler.init(allocator);
         defer handler.deinit();
@@ -6353,14 +6357,14 @@ test "workflow_enabled entries disable and enable a workflow on every replica, a
         }
     }.one;
     _ = try apply(&handler, &index, testKey(.default, "test-wf"), false);
-    try testing.expect(handler.disabled.contains(testKey(.default, "test-wf")));
+    try testing.expect(handler.isDisabled(testKey(.default, "test-wf")));
     _ = try apply(&handler, &index, testKey(.default, "test-wf"), false);
-    try testing.expectEqual(@as(u32, 1), handler.disabled.count());
+    try testing.expect(handler.isDisabled(testKey(.default, "test-wf")));
     _ = try apply(&handler, &index, testKey(.default, "test-wf"), true);
-    try testing.expect(!handler.disabled.contains(testKey(.default, "test-wf")));
+    try testing.expect(!handler.isDisabled(testKey(.default, "test-wf")));
     const gone = try apply(&handler, &index, testKey(.default, "no-such"), false);
     try testing.expectEqual(proto.StatusCode.not_found, gone.refused().?.status);
-    try testing.expectEqual(@as(u32, 0), handler.disabled.count());
+    try testing.expect(handler.defOf(testKey(.default, "no-such")) == null);
 }
 
 test "step executor: failing action follows failure transition" {
@@ -6852,9 +6856,9 @@ test "workflow replay: a redefinition that won't parse halts and keeps the defin
     var out: Result = .{};
     try handler.replayCreate(testKey(.default, "wf"), yaml, 1, 0, &out);
     try testing.expectError(error.Halt, handler.replayCreate(testKey(.default, "wf"), "kind: [", 2, 0, &out));
-    const def = handler.definitions.get(testKey(.default, "wf")) orelse return error.DefinitionDropped;
-    try testing.expectEqualStrings("1", def.version_owned);
-    try testing.expectEqual(@as(usize, 1), handler.definitions.count());
+    const def = handler.defOf(testKey(.default, "wf")) orelse return error.DefinitionDropped;
+    try testing.expectEqualStrings("1", def.version);
+    try testing.expectEqual(@as(usize, 1), handler.definitionCount());
 }
 
 test "workflow replay: a run starts and completes at its entries' stamps, not the host's clock" {
@@ -7691,4 +7695,45 @@ test "workflow handler: a shard's thread never takes another shard's workflow ha
     try testing.expect(std.mem.indexOf(u8, src, "]." ++ "workflow_handler") == null);
     try testing.expect(std.mem.indexOf(u8, src, "target_" ++ "handler") == null);
     try testing.expect(std.mem.indexOf(u8, src, "peer_shards) |peers| {\n                    return peers[t.shard_id]." ++ "workflow") == null);
+}
+
+test "workflow producers: a redefinition keeps a schedule's fired slot and a trigger's cursor that starts restored" {
+    const allocator = testing.allocator;
+    const sched_v1 = "kind: Workflow\nname: sched\nversion: 1.0.0\nschedule:\n  interval: 1000\nstart:\n  wait_for_signal:\n    type: never\n  transitions:\n    success: flo.Completed\n";
+    const sched_v2 = "kind: Workflow\nname: sched\nversion: 2.0.0\nschedule:\n  interval: 1000\nstart:\n  wait_for_signal:\n    type: never\n  transitions:\n    success: flo.Completed\n";
+    const trig_v1 = "{\"kind\":\"Workflow\",\"name\":\"trig\",\"version\":\"1.0.0\",\"trigger\":{\"stream\":\"events\"},\"start\":{\"run\":\"@actions/a\",\"transitions\":{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}";
+    const trig_v2 = "{\"kind\":\"Workflow\",\"name\":\"trig\",\"version\":\"2.0.0\",\"trigger\":{\"stream\":\"events\"},\"start\":{\"run\":\"@actions/a\",\"transitions\":{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}";
+    const Step = union(enum) { def: struct { name: []const u8, yaml: []const u8, at: i64 }, start: struct { run: []const u8, wf: []const u8, event: []const u8, idem: []const u8 } };
+    const steps = [_]Step{
+        .{ .def = .{ .name = "sched", .yaml = sched_v1, .at = 1000 } },
+        .{ .def = .{ .name = "trig", .yaml = trig_v1, .at = 1000 } },
+        .{ .start = .{ .run = "s1", .wf = "sched", .event = "schedule_started", .idem = "schedule:16:sched:3000" } },
+        .{ .start = .{ .run = "t1", .wf = "trig", .event = "trigger_started", .idem = "trigger:events@1700:0" } },
+        .{ .def = .{ .name = "sched", .yaml = sched_v2, .at = 5000 } },
+        .{ .def = .{ .name = "trig", .yaml = trig_v2, .at = 5000 } },
+        .{ .start = .{ .run = "s2", .wf = "sched", .event = "schedule_started", .idem = "schedule:16:sched:6000" } },
+        .{ .start = .{ .run = "t2", .wf = "trig", .event = "trigger_started", .idem = "trigger:events@1800:2" } },
+    };
+    {
+        var handler = WorkflowHandler.init(allocator);
+        defer handler.deinit();
+        var buf: [256]u8 = undefined;
+        inline for (steps) |step| switch (step) {
+            .def => |d| {
+                var out: Result = .{};
+                try handler.replayCreate(testKey(TEST_NS_A, d.name), d.yaml, d.at, 0, &out);
+            },
+            .start => |st| {
+                var out: Result = .{};
+                try handler.replayStart(testKey(TEST_NS_A, st.run), startValue(&buf, st.wf, st.event, st.idem), 7000, &out);
+                try testing.expect(out.refused() == null);
+            },
+        };
+        const sched = handler.schedules.getPtr(testKey(TEST_NS_A, "sched")).?;
+        try testing.expectEqual(@as(i64, 6000), sched.fired_ms);
+        try testing.expectEqual(@as(i64, 5000), sched.anchor_ms);
+        const trig = handler.stream_triggers.getPtr(testKey(TEST_NS_A, "trig")).?;
+        try testing.expectEqual(@as(u64, 1800), trig.stream_cursor_ts);
+        try testing.expectEqual(@as(u64, 2), trig.stream_cursor_seq);
+    }
 }

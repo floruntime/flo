@@ -967,6 +967,7 @@ pub const Shard = struct {
         const workflow_handler = try allocator.create(WorkflowHandler);
         errdefer allocator.destroy(workflow_handler);
         workflow_handler.* = WorkflowHandler.init(allocator);
+        workflow_handler.store = &partition.store;
         workflow_handler.namespaces = namespace_handler;
 
         // Create Processing handler
@@ -1170,8 +1171,8 @@ pub const Shard = struct {
                     // wins over a crash marker too.
                     boot_damage = try collectSkips(allocator, files, watermark, &skips, shard_id);
                     if (boot_damage != null) break :replay;
-                    if (marker.crashed) |*c| if (skips.holds(&.{ .index = c.index, .term = c.term, .crc = c.entry_crc })) marker.skipped();
-                    const replayed = replaySegments(allocator, files, partition, &replay_registry, if (cold_boot) 0 else watermark, &raft_node.log, shard_id, &losses, &marker, &skips, boot);
+                    if (marker.crashed) |*c| if (skips.namesEntry(c.index, c.term, c.entry_crc)) marker.skipped();
+                    const replayed = replaySegments(allocator, files, partition, &replay_registry, if (cold_boot) 0 else watermark, &raft_node.log, shard_id, &losses, &marker, &skips, boot, workflow_handler);
                     if (replayed.cancelled) return error.BootCancelled;
                     if (replayed.blocked) |b| return refuseBlockedRead(shard_id, b.name, b.err);
                     boot_damage = replayed.damage;
@@ -4938,6 +4939,11 @@ pub const Shard = struct {
             if (self.read_blocked) self.clearReadBlocked();
             const skip = repair.Skip.decode(&e) orelse continue;
             if (skip.index != h.index or skip.term != h.term or skip.crc != h.crc) continue;
+            // An inbound halts at one message: a skip of another one leaves
+            // it halted there (it halted at the next after an earlier skip,
+            // or an offline repair named the wrong one).
+            const at_seq: u64 = if (h.message) |m| m.seq else 0;
+            if (skip.seq != 0 and skip.seq != at_seq) continue;
             self.skips.add(self.allocator, &skip) catch {
                 // Looked at again on the next call.
                 self.skip_scan_from = idx;
@@ -4963,10 +4969,12 @@ pub const Shard = struct {
     /// it takes now and goes on past.
     fn repairedOpaque(ctx: ?*anyopaque, h: raft_node_mod.HaltAt) bool {
         const self: *Shard = @ptrCast(@alignCast(ctx.?));
-        if (self.skips.holds(&.{ .index = h.index, .term = h.term, .crc = h.crc })) return true;
-        const halted = self.halted orelse return false;
-        if (halted.index != h.index or halted.term != h.term or halted.crc != h.crc) return false;
-        return self.resumePastSkip() and self.halted == null;
+        // Its own halt: repaired once a skip covers the message it halted at,
+        // which it takes now. A peer's halt names no message, and the peer
+        // meets the skips this shard went past it on.
+        if (self.halted) |*x| if (x.index == h.index and x.term == h.term and x.crc == h.crc)
+            return self.resumePastSkip() and self.halted == null;
+        return self.skips.namesEntry(h.index, h.term, h.crc);
     }
 
     /// A repair skip applied. Where its entry was skipped, or lies below
@@ -5957,7 +5965,7 @@ pub const Shard = struct {
                         // A skipped inbound applies its skip (`channels.zig`):
                         // its messages are answered and its seqs taken.
                         const skipped_inbound = replay.skippedHere(&self.skips, &e) and e.header.entry_type == @backingInt(entry_mod.EntryType.channel_inbound);
-                        if (skipped_inbound) self.defaultPartition().store.inbound_skip = .{ .index = e.header.index, .seq = self.skips.seqOf(&e).? };
+                        if (skipped_inbound) self.defaultPartition().store.inbound_skip = self.skips.inboundOf(&e).?;
                         defer if (skipped_inbound) {
                             self.defaultPartition().store.inbound_skip = null;
                         };
@@ -6091,6 +6099,7 @@ pub const Shard = struct {
             self.recordApplied(entry, result);
         }
         self.namespace_handler.afterApply(entry);
+        self.workflow_handler.definitionApplied(entry, result);
         self.wakeApplied(entry);
         // The leader's own action steps: the await a deliver answers,
         // workers woken for a run ready again (once a pass: each wake is a
@@ -8026,7 +8035,7 @@ pub const Shard = struct {
             return shard.sendOkResponse(conn, rid, answer.encode(&buf));
         }
         var payload: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
-        const skip: repair.Skip = .{ .index = target.index, .term = target.term, .crc = target.crc, .seq = ask.seq, .reason = ask.reason };
+        const skip: repair.Skip = .{ .index = target.index, .term = target.term, .crc = target.crc, .seq = ask.seq, .halt_seq = halt_seq, .reason = ask.reason };
         const proposed = raft.propose(.repair_skip, entry_mod.Flags.NONE, skip.encode(&payload)) catch |err| return shard.sendRefusal(conn, rid, .unavailable, proto.notRun(switch (err) {
             error.NotLeader => "unavailable: the leader changed — retry",
             error.WritesStopped => "unavailable: the leader stopped taking writes (an entry could not reach disk); restart it, then repair",
@@ -9039,11 +9048,24 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
     // as applied already, or any other, must not find the last one's.
     partition.store.messages.clearRetainingCapacity();
     noteNamespace(partition, entry);
-    const applied = partition.applyRouted(entry) catch |err| return .{ .partition_reject = err };
+    const applied = partition.applyRouted(entry) catch |err| taken: {
+        // An inbound a live halt stopped in: the ring took it before its
+        // messages halted, and a repair's skip applies it again. Only the
+        // contract's state is touched: the take that failed appended
+        // nothing, the ring and warm store keep the copy the first take
+        // made, and the router (which routes an inbound nowhere) saw it
+        // then; the failed take stops before reaching it.
+        // The halting apply left no state (the machine's writes roll back
+        // with its error), and the receiver's mark per sender (`In.applied`)
+        // is the sole dedupe: a message at or below it is passed over, so
+        // none applies twice, whatever its earlier takes did.
+        if (err == error.IndexNotIncreasing and etype == .channel_inbound and partition.store.inbound_skip != null) break :taken null;
+        return .{ .partition_reject = err };
+    };
     if (contract_machine.ownerOf(machines, etype)) |m| {
         // The router has seen every index up to its own: one at or below it
         // was applied already, and must not be twice.
-        if (applied.route == .skipped_already_applied) return .applied;
+        if (applied) |a| if (a.route == .skipped_already_applied) return .applied;
         contract_machine.applyEntry(m, &partition.store, &partition.apply_scratch, entry, out) catch |err| return .{ .applier_failed = err };
         if (etype == .channel_inbound or etype == .channel_unpark) for (partition.store.messages.items) |*msg| {
             // A refused message took no effect: its bytes, maybe a sender's
@@ -9187,6 +9209,9 @@ const PartitionReplay = struct {
     marker: *apply_marker.Marker,
     losses: *silent_loss.Counts,
     shard_id: u16,
+    /// Builds a definition's schedule and trigger as each create or enable
+    /// replays, in log order, as the live path does (`afterApply`).
+    workflow: *WorkflowHandler,
     result: persistence_mod.Result = .{},
 
     fn applier(self: *PartitionReplay) ReplayApply {
@@ -9209,7 +9234,9 @@ const PartitionReplay = struct {
         const prev = apply_marker.begin(self.marker, entry);
         defer apply_marker.end(prev);
         self.result.reset(entry);
-        return verdictOf(self.losses, self.shard_id, Shard.nowMs(), entry, applyEntryCore(self.partition, self.registry, entry, &self.result));
+        const verdict = verdictOf(self.losses, self.shard_id, Shard.nowMs(), entry, applyEntryCore(self.partition, self.registry, entry, &self.result));
+        if (verdict == .applied) self.workflow.definitionApplied(entry, &self.result);
+        return verdict;
     }
 
     fn passOver(ctx: *anyopaque, entry: *const entry_mod.Entry) ?silent_loss.Damage {
@@ -9238,6 +9265,7 @@ fn replaySegments(
     marker: *apply_marker.Marker,
     skips: *const repair.Skips,
     boot: Shard.Boot,
+    workflow: *WorkflowHandler,
 ) ReplayOutcome {
     // Listed in Raft index order so the projection router's applied_index
     // guard does not skip lower-index entries.
@@ -9246,7 +9274,7 @@ fn replaySegments(
     var last: u64 = 0;
     for (files) |sf| last = @max(last, sf.last_index);
     if (boot.health) |slot| slot.replay_last.store(last, .monotonic);
-    var prod: PartitionReplay = .{ .partition = partition, .registry = replay_registry, .marker = marker, .losses = losses, .shard_id = shard_id };
+    var prod: PartitionReplay = .{ .partition = partition, .registry = replay_registry, .marker = marker, .losses = losses, .shard_id = shard_id, .workflow = workflow };
     const ctx: ReplayCtx = .{ .raft_log = raft_log, .watermark = watermark, .skips = skips, .shard_id = shard_id, .apply = prod.applier() };
     for (files) |sf| {
         // Before reading and checksumming a whole segment it would not use.
@@ -18598,12 +18626,12 @@ test "every entry type has exactly one applier, or is listed as needing none, or
 
     // One of them missing: dropped at apply, so refused at boot.
     var missing = full;
-    missing.callbacks[@backingInt(entry_mod.EntryType.workflow_create)] = null;
+    missing.callbacks[@backingInt(entry_mod.EntryType.workflow_start)] = null;
     try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliers(0, &missing));
 
     // Registered twice: one handler's applier would never run.
     var twice = full;
-    twice.register(.workflow_create, @ptrCast(&ctx), Noop.apply);
+    twice.register(.workflow_start, @ptrCast(&ctx), Noop.apply);
     try std.testing.expectError(error.EntryTypeRegisteredTwice, checkAppliers(0, &twice));
 
     // A router-owned type with a callback as well: applied twice.
@@ -20090,6 +20118,57 @@ test "Shard: alone with async_flush, a gap held open never lets channelDurable p
     try s.shard.flushSegmentToDisk();
     try std.testing.expect(writer.first_unbuffered == null);
     try std.testing.expect(s.shard.channelDurable() >= gap_at);
+}
+
+test "Shard: a trigger moved to another stream and back reads its stream from the start, live and after a restart alike" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    const on = struct {
+        fn def(comptime stream: []const u8) []const u8 {
+            return "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1.0.0\",\"trigger\":{\"stream\":\"" ++ stream ++ "\"},\"start\":{\"wait_for_signal\":{\"type\":\"never\"},\"transitions\":{\"success\":\"flo.Completed\"}}}";
+        }
+    };
+    const key = wf_test_key(.default, "wf");
+    {
+        var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+        try std.testing.expect(shard.applyCommitted());
+        var pair: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+        defer _ = std.c.close(pair[1]);
+        const conn = try shard.addConnection(pair[0]);
+        try ParkTest.send(&shard, conn, .workflow_create, 1, "wf", on.def("events"));
+        _ = shard.applyCommitted();
+        for (0..3) |k| {
+            var pbuf: [16]u8 = undefined;
+            _ = try shard.stream_handler.appendPayloadToStream("events", "default", try std.fmt.bufPrint(&pbuf, "ev-{d}", .{k}));
+        }
+        _ = shard.applyCommitted();
+        shard.workflow_handler.triggers_dirty = true;
+        shard.workflow_handler.tickStreamTriggers(&shard);
+        _ = shard.applyCommitted();
+        try std.testing.expectEqual(@as(usize, 3), shard.workflow_handler.runs.count());
+        try std.testing.expect(shard.workflow_handler.stream_triggers.getPtr(key).?.stream_cursor_ts != 0);
+        // Moved to another stream, then back: no start between them.
+        try ParkTest.send(&shard, conn, .workflow_create, 2, "wf", on.def("other"));
+        _ = shard.applyCommitted();
+        try ParkTest.send(&shard, conn, .workflow_create, 3, "wf", on.def("events"));
+        _ = shard.applyCommitted();
+        try std.testing.expectEqual(@as(u64, 0), shard.workflow_handler.stream_triggers.getPtr(key).?.stream_cursor_ts);
+        try shard.flushSegmentToDisk();
+    }
+    var again = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer again.deinit();
+    again.wireHandlerShardPtrs();
+    _ = again.applyCommitted();
+    try std.testing.expectEqual(@as(usize, 3), again.workflow_handler.runs.count());
+    try std.testing.expectEqual(@as(u64, 0), again.workflow_handler.stream_triggers.getPtr(key).?.stream_cursor_ts);
 }
 
 test "Shard: a namespace create is published, and answered, only once its segment and directory are on disk" {
@@ -24400,12 +24479,12 @@ const SkipState = struct {
             .router_past = p.router.applied_index >= h,
             .queued = DamageTest.queued(shard),
             .kv = shard.kv_handler.kv.countLive(),
-            .defs = shard.workflow_handler.definitions.count(),
+            .defs = shard.workflow_handler.definitionCount(),
             .action_runs = ActionsHandler.runCount(shard),
         };
-        if (shard.workflow_handler.definitions.get(wf_test_key(.default, "wf"))) |d| {
-            const n = @min(d.version_owned.len, st.def_version.len);
-            @memcpy(st.def_version[0..n], d.version_owned[0..n]);
+        if (shard.workflow_handler.defOf(wf_test_key(.default, "wf"))) |d| {
+            const n = @min(d.version.len, st.def_version.len);
+            @memcpy(st.def_version[0..n], d.version[0..n]);
         }
         return st;
     }
@@ -24607,6 +24686,88 @@ test "Shard: a second skip for the same entry changes nothing, live or after a r
     shard.applyDeferredTail();
     try std.testing.expect(shard.halted == null and shard.offline == null);
     try std.testing.expectEqual(@as(usize, 1), shard.skips.named.items.len);
+}
+
+/// Propose a skip of message `seq` of inbound `h` (0: all of it), as a
+/// repair of a group halted at message `halt_seq` commits one.
+fn proposeInboundSkip(shard: *Shard, h: u64, seq: u64, halt_seq: u64) !void {
+    var e_buf: [4096]u8 = undefined;
+    const halted = shard.raft_node.log.getEntryCopy(h, &e_buf) orelse return error.NoEntry;
+    var skip = repair.Skip.of(&halted, "test");
+    skip.seq = seq;
+    skip.halt_seq = halt_seq;
+    var p: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
+    _ = try shard.raft_node.propose(.repair_skip, entry_mod.Flags.NONE, skip.encode(&p));
+}
+
+test "Shard: an inbound whose messages halt it in turn is skipped a message at a time, then whole, live and after a restart" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const ce = @import("../protocol/channel_entries.zig");
+    var h: u64 = 0;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        // Its hooks point at this copy.
+        shard.wireHandlerShardPtrs();
+        // Three messages no applier on this build takes: each halts the shard.
+        var mb: [512]u8 = undefined;
+        var w: schema.Writer = .{ .buf = &mb };
+        for (0..3) |_| try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.cg_create), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = "" });
+        var ib: [1024]u8 = undefined;
+        h = (try shard.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 1, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 3 } }))).index;
+        try std.testing.expect(!shard.applyCommitted());
+        try std.testing.expectEqual(@as(u64, 1), shard.halted.?.message.?.seq);
+        // Message 1 skipped: it halts at 2, at the same entry.
+        try proposeInboundSkip(&shard, h, 1, 1);
+        try std.testing.expect(!shard.applyCommitted());
+        try std.testing.expectEqual(h, shard.halted.?.index);
+        try std.testing.expectEqual(@as(u64, 2), shard.halted.?.message.?.seq);
+        // Not repaired while it halts at a message no skip covers; a peer
+        // halted there is, once this shard goes past it.
+        const at = shard.raft_node.halt_at.?;
+        try std.testing.expect(!shard.raft_node.repaired.of(at));
+        // Message 2 skipped too: it halts at 3.
+        try proposeInboundSkip(&shard, h, 2, 2);
+        try std.testing.expect(!shard.applyCommitted());
+        try std.testing.expectEqual(@as(u64, 3), shard.halted.?.message.?.seq);
+        // Then the whole entry: it goes on, every seq taken.
+        try proposeInboundSkip(&shard, h, 0, 3);
+        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expect(shard.halted == null and shard.offline == null);
+        try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1).?.applied);
+        try std.testing.expectEqual(@as(usize, 3), shard.skips.named.items.len);
+        try std.testing.expect(shard.raft_node.repaired.of(at));
+        try shard.flushSegmentToDisk();
+    }
+    var shard = try t.open();
+    defer shard.deinit();
+    shard.applyDeferredTail();
+    try std.testing.expect(shard.halted == null and shard.offline == null);
+    try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1).?.applied);
+}
+
+test "Shard: an inbound one message's skip took the shard past counts as repaired for a peer halted there" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const ce = @import("../protocol/channel_entries.zig");
+    var shard = try t.open();
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    var mb: [128]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &mb };
+    try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.cg_create), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = "" });
+    var ib: [256]u8 = undefined;
+    const h = (try shard.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 1, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } }))).index;
+    try std.testing.expect(!shard.applyCommitted());
+    const at = shard.raft_node.halt_at.?;
+    try proposeInboundSkip(&shard, h, 1, 1);
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expect(shard.halted == null);
+    // A peer halted at it meets the same skip: no "upgrade" for it.
+    try std.testing.expect(shard.raft_node.repaired.of(at));
 }
 
 test "Shard: a skip that names no entry of this log, an entry after it, or another skip skips nothing" {
@@ -26064,7 +26225,7 @@ test "checkAppliers: a type a contract machine owns may have no other applier, a
     // A type nothing else applies: the machine is its applier.
     try checkAppliersWith(&(listed_now ++ .{Toy.owning(.raft_snapshot)}), 0, &shard.replay_registry);
     // Registered by a handler too: refused.
-    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.workflow_create)}), 0, &shard.replay_registry));
+    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.workflow_start)}), 0, &shard.replay_registry));
     // KV's types are its machine's: without it, they have no applier.
     try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliersWith(&.{}, 0, &shard.replay_registry));
 }
@@ -27954,6 +28115,53 @@ test "Shard: a stream trigger whose shard is capped while apply is suspended kee
     try std.testing.expectEqual(@as(usize, events), sh.workflow_handler.runs.count());
 }
 
+test "Shard: a stream trigger's starts lost to a step-down are proposed again when the node leads again, one run per event" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    const r = sh.raft_node;
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    const triggered =
+        \\{"kind":"Workflow","name":"on-events","version":"1.0.0","trigger":{"stream":"events"},
+        \\"start":{"wait_for_signal":{"type":"never"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    try ParkTest.send(sh, t.conn, .workflow_create, 1, "on-events", triggered);
+    try ParkTest.responses(sh, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    const events = 5;
+    for (0..events) |k| {
+        var pbuf: [16]u8 = undefined;
+        _ = try sh.stream_handler.appendPayloadToStream("events", "default", try std.fmt.bufPrint(&pbuf, "ev-{d}", .{k}));
+    }
+    var passes: u32 = 0;
+    while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
+    const before = r.log.lastIndex();
+    const committed = r.commit_index;
+
+    sh.workflow_handler.triggers_dirty = true;
+    sh.workflow_handler.tickStreamTriggers(sh);
+    try std.testing.expectEqual(before + events, r.log.lastIndex());
+    // It steps down before they commit; the next term's log holds none of
+    // them, and the same node leads it.
+    r.commit_index = committed;
+    r.log.truncateAfter(before);
+    r.current_term += 1;
+
+    sh.workflow_handler.triggers_dirty = true;
+    sh.workflow_handler.tickStreamTriggers(sh);
+    passes = 0;
+    while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
+    try std.testing.expectEqual(@as(usize, events), sh.workflow_handler.runs.count());
+    // Read again in the same term, nothing starts twice.
+    sh.workflow_handler.triggers_dirty = true;
+    sh.workflow_handler.tickStreamTriggers(sh);
+    passes = 0;
+    while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
+    try std.testing.expectEqual(@as(usize, events), sh.workflow_handler.runs.count());
+}
+
 test "Shard: a workflow step whose action invoke the log is too full to take waits, says so once, and invokes once there's room" {
     var t: AsyncAlone = undefined;
     try t.init();
@@ -29255,6 +29463,21 @@ test "Shard: stream.group.steal takes a record idle at least min_idle_ms for its
     try std.testing.expect(left > 9_000 and left <= 10_000);
 }
 
+test "Shard: a stream.group.steal of no records is answered with none, and logs nothing" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    try groupDelivered(&t.shard, 1, t.shard.raft_node.now());
+    const Steal = table_run.op("stream.group.steal");
+    var body_buf: [Steal.request.max_size]u8 = undefined;
+    const before = t.shard.raft_node.log.lastIndex();
+    const none = try groupOpAnswer("stream.group.steal", &t, .stream_group_steal, 1, try Steal.request.encodeInto(&body_buf, .{ .group = "g", .consumer = "rescue", .min_idle_ms = 1, .lease_ms = null, .records = .{ .bytes = "", .count = 0 } }));
+    try std.testing.expectEqual(@as(u32, 0), none.stolen.count);
+    try std.testing.expectEqual(@as(u32, 0), none.refused.count);
+    try std.testing.expectEqual(@as(i64, 0), none.expires_at_ms);
+    try std.testing.expectEqual(before, t.shard.raft_node.log.lastIndex());
+}
+
 test "Shard: stream.group.dlq_list pages a group's dead letters by limit and after; dlq_requeue and dlq_delete take records or all up to a limit, never both, and a dry_run deletes nothing" {
     var t: ClusterActionsTest = undefined;
     try t.init();
@@ -29400,7 +29623,7 @@ test "Shard: a step's call whose start a repair skipped is refused, saying so, a
     try proposeCall(a, n.action, n.workflow, rid, false);
     two.settle();
     // The inbound carrying the start is skipped, as a committed repair has it.
-    b.defaultPartition().store.inbound_skip = .{ .index = 4242, .seq = 0 };
+    b.defaultPartition().store.inbound_skip = .all(4242);
     pumpChannels(&two);
     b.defaultPartition().store.inbound_skip = null;
     pumpChannels(&two);
@@ -29430,7 +29653,7 @@ test "Shard: a call whose run's end a repair skipped settles refused, saying so,
     try std.testing.expectEqual(calls_machine.State.started, callIn(a, n.workflow, rid).?.state);
     try completeNext(&two, b, n.action, "{}");
     // The inbound carrying the run's end, on the caller's shard, is skipped.
-    a.defaultPartition().store.inbound_skip = .{ .index = 5151, .seq = 0 };
+    a.defaultPartition().store.inbound_skip = .all(5151);
     pumpChannels(&two);
     a.defaultPartition().store.inbound_skip = null;
     const c = callIn(a, n.workflow, rid).?;

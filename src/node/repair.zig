@@ -9,18 +9,21 @@
 
 const std = @import("std");
 const entry_mod = @import("../storage/ual/entry.zig");
+const InboundSkip = @import("../contract/store.zig").InboundSkip;
 
 /// What a skip names, and why. A skip of a `channel_inbound` may name one
-/// message of it by `seq` (0: the whole entry); see `channels.zig`.
+/// message of it by `seq` (0: the whole entry), and records the message
+/// the group halted at (`halt_seq`, 0: none known); see `channels.zig`.
 pub const Skip = struct {
     index: u64,
     term: u64,
     crc: u32,
     seq: u64 = 0,
+    halt_seq: u64 = 0,
     reason: []const u8 = "",
 
     pub const MAX_REASON = 256;
-    const FIXED = 8 + 8 + 4 + 8;
+    const FIXED = 8 + 8 + 4 + 8 + 8;
     pub const MAX_PAYLOAD = FIXED + MAX_REASON;
 
     /// The halted entry `e`, skipped for `reason`.
@@ -28,13 +31,15 @@ pub const Skip = struct {
         return .{ .index = e.header.index, .term = e.header.term, .crc = e.header.crc32c, .reason = reason };
     }
 
-    /// `[index:u64][term:u64][crc:u32][seq:u64][reason]`, little-endian; a
+    /// `[index:u64][term:u64][crc:u32][seq:u64][halt_seq:u64][reason]`,
+    /// little-endian; a
     /// reason past `MAX_REASON` is cut short.
     pub fn encode(self: *const Skip, buf: *[MAX_PAYLOAD]u8) []const u8 {
         std.mem.writeInt(u64, buf[0..8], self.index, .little);
         std.mem.writeInt(u64, buf[8..16], self.term, .little);
         std.mem.writeInt(u32, buf[16..20], self.crc, .little);
         std.mem.writeInt(u64, buf[20..28], self.seq, .little);
+        std.mem.writeInt(u64, buf[28..36], self.halt_seq, .little);
         const n = @min(self.reason.len, MAX_REASON);
         @memcpy(buf[FIXED..][0..n], self.reason[0..n]);
         return buf[0 .. FIXED + n];
@@ -50,6 +55,7 @@ pub const Skip = struct {
             .term = std.mem.readInt(u64, p[8..16], .little),
             .crc = std.mem.readInt(u32, p[16..20], .little),
             .seq = std.mem.readInt(u64, p[20..28], .little),
+            .halt_seq = std.mem.readInt(u64, p[28..36], .little),
             .reason = p[FIXED..],
         };
     }
@@ -61,50 +67,65 @@ pub const Skip = struct {
 };
 
 /// The entries this shard's committed skips name. Filled at boot from the
-/// log, and live as a halted shard finds the skip for its halt.
+/// log, and live as a halted shard finds the skip for its halt. An inbound
+/// may be skipped more than once, a message at a time, as each one it
+/// carries halts the shard in turn: one row per (entry, seq), seq 0 for
+/// the whole entry.
 pub const Skips = struct {
     named: std.ArrayListUnmanaged(Named) = .empty,
 
-    const Named = struct { index: u64, term: u64, crc: u32, seq: u64 = 0 };
+    const Named = struct { index: u64, term: u64, crc: u32, seq: u64 = 0, halt_seq: u64 = 0 };
 
     pub fn deinit(self: *Skips, allocator: std.mem.Allocator) void {
         self.named.deinit(allocator);
     }
 
-    /// Add `s`; a second skip for the same entry adds nothing.
+    /// Add `s`; one that skips nothing more than the set already does
+    /// adds nothing.
     pub fn add(self: *Skips, allocator: std.mem.Allocator, s: *const Skip) !void {
-        if (self.find(s.index)) |n| if (n.term == s.term and n.crc == s.crc) return;
-        try self.named.append(allocator, .{ .index = s.index, .term = s.term, .crc = s.crc, .seq = s.seq });
+        if (self.holds(s)) return;
+        try self.named.append(allocator, .{ .index = s.index, .term = s.term, .crc = s.crc, .seq = s.seq, .halt_seq = s.halt_seq });
     }
 
-    /// Whether a committed skip names `e`.
+    /// Whether a committed skip names `e`, all of it or one of its messages.
     pub fn skips(self: *const Skips, e: *const entry_mod.Entry) bool {
+        return self.namesEntry(e.header.index, e.header.term, e.header.crc32c);
+    }
+
+    /// Whether a committed skip names the entry `index`, `term`, `crc`.
+    pub fn namesEntry(self: *const Skips, index: u64, term: u64, crc: u32) bool {
         for (self.named.items) |n| {
-            if (n.index == e.header.index and n.term == e.header.term and n.crc == e.header.crc32c) return true;
+            if (n.index == index and n.term == term and n.crc == crc) return true;
         }
         return false;
     }
 
-    /// The message a committed skip of `e` names (0: all of it), or null
-    /// when no skip names `e`.
-    pub fn seqOf(self: *const Skips, e: *const entry_mod.Entry) ?u64 {
+    /// What the committed skips of inbound `e` skip, or null when none
+    /// names it. More seqs than an inbound carries can't name its messages.
+    pub fn inboundOf(self: *const Skips, e: *const entry_mod.Entry) ?InboundSkip {
+        var out: InboundSkip = .{ .index = e.header.index };
+        var any = false;
         for (self.named.items) |n| {
-            if (n.index == e.header.index and n.term == e.header.term and n.crc == e.header.crc32c) return n.seq;
+            if (n.index != e.header.index or n.term != e.header.term or n.crc != e.header.crc32c) continue;
+            any = true;
+            if (n.seq == 0) {
+                out.whole = true;
+                out.halt_seq = n.halt_seq;
+            } else if (out.n < InboundSkip.MAX_SEQS) {
+                out.seqs[out.n] = n.seq;
+                out.n += 1;
+            }
         }
-        return null;
+        return if (any) out else null;
     }
 
-    /// Whether `s` is a skip this set already holds.
+    /// Whether the set already skips all that `s` does: its entry whole,
+    /// or the one message it names.
     pub fn holds(self: *const Skips, s: *const Skip) bool {
         for (self.named.items) |n| {
-            if (n.index == s.index and n.term == s.term and n.crc == s.crc) return true;
+            if (n.index == s.index and n.term == s.term and n.crc == s.crc and (n.seq == 0 or n.seq == s.seq)) return true;
         }
         return false;
-    }
-
-    fn find(self: *const Skips, index: u64) ?Named {
-        for (self.named.items) |n| if (n.index == index) return n;
-        return null;
     }
 };
 
@@ -120,18 +141,21 @@ test "repair skip: a skip round-trips through its entry, and names only its entr
     const halted = testEntry(7, 2);
     var s = Skip.of(&halted, "bad payload");
     s.seq = 5;
+    s.halt_seq = 5;
     var buf: [Skip.MAX_PAYLOAD]u8 = undefined;
     const e = entry_mod.buildEntry(.repair_skip, entry_mod.Flags.NONE, 3, 9, 9, s.encode(&buf));
     const back = Skip.decode(&e).?;
     try testing.expectEqual(@as(u64, 7), back.index);
     try testing.expectEqual(@as(u64, 2), back.term);
     try testing.expectEqual(@as(u64, 5), back.seq);
+    try testing.expectEqual(@as(u64, 5), back.halt_seq);
     try testing.expectEqualStrings("bad payload", back.reason);
     var set: Skips = .{};
     defer set.deinit(testing.allocator);
     try set.add(testing.allocator, &back);
-    try testing.expectEqual(@as(?u64, 5), set.seqOf(&halted));
-    try testing.expectEqual(@as(?u64, null), set.seqOf(&testEntry(8, 2)));
+    const in = set.inboundOf(&halted).?;
+    try testing.expect(in.skips(5) and !in.skips(4) and !in.whole);
+    try testing.expect(set.inboundOf(&testEntry(8, 2)) == null);
     try testing.expect(back.names(&halted));
     try testing.expect(!back.names(&testEntry(7, 3)));
     // Not a skip, and a skip too short to carry one.
@@ -150,4 +174,31 @@ test "repair skip: a second skip for the same entry adds nothing" {
     try testing.expect(set.skips(&halted));
     try testing.expect(!set.skips(&testEntry(7, 3)));
     try testing.expect(!set.skips(&testEntry(8, 2)));
+}
+
+test "repair skip: an inbound's skips widen, a message at a time, then whole" {
+    var set: Skips = .{};
+    defer set.deinit(testing.allocator);
+    const halted = testEntry(7, 2);
+    var s = Skip.of(&halted, "");
+    s.seq = 3;
+    try set.add(testing.allocator, &s);
+    // The next message to halt it is skipped too: the first doesn't hold it.
+    s.seq = 4;
+    try testing.expect(!set.holds(&s));
+    try set.add(testing.allocator, &s);
+    try set.add(testing.allocator, &s);
+    try testing.expectEqual(@as(usize, 2), set.named.items.len);
+    var in = set.inboundOf(&halted).?;
+    try testing.expect(in.skips(3) and in.skips(4) and !in.skips(5) and !in.whole);
+    // Then the whole entry, which holds every message after it.
+    s.seq = 0;
+    s.halt_seq = 5;
+    try testing.expect(!set.holds(&s));
+    try set.add(testing.allocator, &s);
+    in = set.inboundOf(&halted).?;
+    try testing.expect(in.whole and in.skips(5) and in.skips(9));
+    try testing.expectEqual(@as(u64, 5), in.halt_seq);
+    s.seq = 6;
+    try testing.expect(set.holds(&s));
 }

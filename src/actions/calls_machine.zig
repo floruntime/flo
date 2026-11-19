@@ -288,7 +288,10 @@ pub const machine: machine_mod.Machine = .{
 
 /// An answer to one of this shard's calls that a repair skipped: the call
 /// settles refused, saying so, so its step fails rather than waits for an
-/// answer that will never come. One already settled stays as it is.
+/// answer that will never come. One already settled stays as it is. A
+/// skipped `started` reply fails the step while the callee's run, which
+/// did start, still executes: its end is answered to a call already
+/// settled, and changes nothing.
 fn skipped(view: *View, e: *const Entry, why: []const u8) ApplyError!void {
     const n = named(e) orelse return;
     var kb: KeyBuf = undefined;
