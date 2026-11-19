@@ -7,7 +7,7 @@
 //!
 //! Usage:
 //!   flo stream create <stream> [--partitions N] [--retention N] [--retention-count N]
-//!   flo stream alter <stream> [--retention N] [--retention-count N]
+//!   flo stream alter <stream> [--retention N] [--retention-count N] [--clear-retention] [--clear-retention-count]
 //!   flo stream append <stream> <payload>... [--header <k=v,k=v,...>]
 //!   flo stream read <stream> [--start <streamid>] [--limit <n>] [--follow] [--block <ms>]
 //!   flo stream info <stream>
@@ -153,10 +153,13 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                     "flo stream alter events --retention 24",
                     "flo stream alter logs --retention 168",
                     "flo stream alter audit --retention-count 100000",
+                    "flo stream alter logs --clear-retention",
                 })
                 .arg("stream", "Stream name")
                 .uintFlag("retention", 'r', 0, "Keep records this many hours (0 keeps the current bound)")
                 .uint64Flag("retention-count", 0, 0, "Keep at most this many records (0 keeps the current bound)")
+                .boolFlag("clear-retention", 0, "Drop the stream's age bound")
+                .boolFlag("clear-retention-count", 0, "Drop the stream's count bound")
                 .action(wrapHandler(runAlter)),
         )
         .subcommand(
@@ -709,7 +712,7 @@ fn runAlter(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var response = client_mod.stream.alter(&client, namespace, stream, ctx.getUint64("retention-count"), retention_age) catch |err| return outcome.requestFailed(ctx, err);
+    var response = client_mod.stream.alter(&client, namespace, stream, ctx.getUint64("retention-count"), retention_age, .{ .age = ctx.getBool("clear-retention"), .count = ctx.getBool("clear-retention-count") }) catch |err| return outcome.requestFailed(ctx, err);
     defer response.deinit();
 
     try outcome.check(ctx, response);

@@ -323,6 +323,8 @@ pub const OptionTag = enum(u8) {
     retention_age = 0x2A, // u64: Retention policy - max age in seconds
     retention_bytes = 0x2B, // u64: Retention policy - max bytes
     force = 0x2C, // void: Force a destructive op (e.g. delete a non-empty stream)
+    retention_age_clear = 0x2D, // void: Alter only: drop the stream's age bound
+    retention_count_clear = 0x2E, // void: Alter only: drop the stream's count bound
 
     // Consumer Group Options (0x30 - 0x3F)
     ack_timeout_ms = 0x30, // u32: A group's lease: a record not acked this long is redelivered (5 s to 12 h; default 30 s)
