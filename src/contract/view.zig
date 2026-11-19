@@ -535,7 +535,7 @@ pub const View = struct {
         // place, then each step writes its key. A fresh key's slot, found
         // while reserving, holds until its family's tree changes; past
         // that, linking it looks again.
-        var moved: u64 = 0;
+        var moved: store_mod.FamilySet = .empty;
         for (self.ranges.items) |at| {
             const op = self.ops.items[at];
             var it = self.store.range(op.fam, op.key);
@@ -543,7 +543,7 @@ pub const View = struct {
                 if (op.below) |b| if (std.mem.order(u8, rec.key(), b) != .lt) break;
                 if (kept.contains(.{ .fam = op.fam, .key = rec.key() })) continue;
                 self.store.unlink(op.fam, &rec.node);
-                moved |= famBit(op.fam);
+                moved.set(op.fam);
             }
         }
         for (plan.items) |*s| self.apply(s, &moved);
@@ -596,22 +596,17 @@ pub const View = struct {
         s.* = .{ .op = s.op };
     }
 
-    fn apply(self: *View, s: *Step, moved: *u64) void {
+    fn apply(self: *View, s: *Step, moved: *store_mod.FamilySet) void {
         const fam = s.op.fam;
         if (s.value) |v| {
             if (s.fresh) |r| {
-                if (moved.* & famBit(fam) == 0) self.store.linkAt(fam, &s.slot.?, r, v) else self.store.link(fam, r, v);
-                moved.* |= famBit(fam);
+                if (!moved.isSet(fam)) self.store.linkAt(fam, &s.slot.?, r, v) else self.store.link(fam, r, v);
+                moved.set(fam);
             } else self.store.replace(fam, s.node.?, v);
         } else if (s.node) |n| {
             self.store.unlink(fam, n);
-            moved.* |= famBit(fam);
+            moved.set(fam);
         }
-    }
-
-    fn famBit(fam: u16) u64 {
-        comptime std.debug.assert(store_mod.MAX_FAMILIES <= 64);
-        return @as(u64, 1) << @intCast(fam);
     }
 };
 

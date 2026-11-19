@@ -109,8 +109,6 @@ pub const Cursor = Record(&.{
     .{ .name = "records", .T = Int(u64) },
 });
 
-/// The last family id below `store.MAX_FAMILIES`: the next machine's
-/// family needs that raised.
 pub const CursorFam = view_mod.Family(63, "processing.cursor", .id, delivery.Stored(Cursor));
 
 pub const At = struct { a: u64 = 0, b: u64 = 0 };

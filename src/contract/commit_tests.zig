@@ -522,3 +522,38 @@ test "contract: a range before a key goes back through the keys with a prefix, l
     // Below every key: nothing.
     try std.testing.expectEqual(@as(usize, 0), T.keys(&store, try view_mod.key(&pb, "n", ""), try view_mod.key(&bb, "n", "a"), &out));
 }
+
+test "contract: a family past id 64 commits fresh keys, deletes and a range in one entry as one below does" {
+    const High = view_mod.Family(100, "probe.high", .shard, Bytes);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    var kb: [32]u8 = undefined;
+    {
+        var ks = view_mod.KeySet.init(scratch.allocator());
+        try ks.addRange(High.ID, NS, "");
+        var view = View.init(&store, scratch.allocator(), &ks);
+        for ([_][]const u8{ "a", "b", "c", "d" }) |n| try view.put(High, k(&kb, n), .{ .b = n });
+        try view.commit();
+    }
+    _ = scratch.reset(.retain_capacity);
+    var ks = view_mod.KeySet.init(scratch.allocator());
+    try ks.addRange(High.ID, NS, "");
+    var view = View.init(&store, scratch.allocator(), &ks);
+    // A delete first moves the family's tree; each fresh key after it
+    // looks again for its place.
+    try view.delete(High, k(&kb, "b"));
+    try view.put(High, k(&kb, "e"), .{ .b = "E" });
+    try view.put(High, k(&kb, "f"), .{ .b = "F" });
+    try view.commit();
+    try testing.expectEqual(@as(u64, 5), store.family(High.ID).count);
+    var rv = view_mod.ReadView{ .store = &store };
+    try testing.expect((try rv.get(High, k(&kb, "b"))) == null);
+    try testing.expectEqualStrings("F", (try rv.get(High, k(&kb, "f"))).?.b);
+    var it = rv.range(High, k(&kb, ""));
+    var names: [8]u8 = undefined;
+    var n: usize = 0;
+    while (try it.next()) |item| : (n += 1) names[n] = item.key[item.key.len - 1];
+    try testing.expectEqualStrings("acdef", names[0..n]);
+}
