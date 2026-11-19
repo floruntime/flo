@@ -1198,6 +1198,12 @@ pub const WorkflowHandler = struct {
         }
 
         const signal_type = req.value[2 .. 2 + sig_len];
+        // A leading '_' is the server's own: a run parked on a call waits on
+        // such a type, which only the call's end may give.
+        if (signal_type.len > 0 and signal_type[0] == '_') {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "reserved signal type: a leading '_' is the system's");
+            return;
+        }
         const payload_data = if (2 + sig_len < req.value.len) req.value[2 + sig_len ..] else null;
 
         // A signal adds up to two history events. Refused once they'd leave
@@ -7405,6 +7411,54 @@ test "a wait that times out with no target ends the run through the log" {
             try testing.expect(!run.status.isTerminal());
         }
     }
+}
+
+test "a client signal with a reserved type is refused and doesn't move a run parked on its call; another is taken" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
+    registerTestAction(&shard, "init");
+    createTestDef(&handler, testKey(.default, "wait-wf"), "wait-wf", test_wait_workflow_json);
+    createTestRun(&handler, testKey(.default, "r"), "r", "wait-wf");
+    handler.advanceWorkflow(&shard, testKey(.default, "r"));
+    settleTest(&shard);
+    const run = handler.runs.getPtr(testKey(.default, "r")).?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    const callee = run.pending_action_run_id_owned.?;
+    const events = run.history.items.len;
+
+    var sig_buf: [128]u8 = undefined;
+    const forged = try std.fmt.bufPrint(&sig_buf, "_action_done:{s}", .{callee});
+    for ([_][]const u8{ forged, "_x" }) |sig| {
+        var conn = try Connection.init(allocator, -1, 0, 0);
+        defer conn.deinit();
+        var value: [130]u8 = undefined;
+        std.mem.writeInt(u16, value[0..2], @intCast(sig.len), .little);
+        @memcpy(value[2..][0..sig.len], sig);
+        handler.handleSignal(&shard, &conn, makeRequest(.workflow_signal, "r", value[0 .. 2 + sig.len]));
+        const answer = try queuedAnswer(&conn);
+        try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), answer.header.status);
+        try testing.expectEqualStrings("reserved signal type: a leading '_' is the system's", (try answer.refused()).message);
+    }
+    handler.checkPendingActions(&shard);
+    settleTest(&shard);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    try testing.expectEqualStrings(callee, run.pending_action_run_id_owned.?);
+    try testing.expectEqual(@as(usize, 0), run.signals.items.len);
+    try testing.expectEqual(events, run.history.items.len);
+
+    var conn = try Connection.init(allocator, -1, 0, 0);
+    defer conn.deinit();
+    const value = [_]u8{ 8, 0 } ++ "approval".*;
+    handler.handleSignal(&shard, &conn, makeRequest(.workflow_signal, "r", &value));
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), (try queuedAnswer(&conn)).header.status);
+    try testing.expectEqual(@as(usize, 1), run.signals.items.len);
 }
 
 test "a signal to a finished run is refused and leaves its history alone" {
