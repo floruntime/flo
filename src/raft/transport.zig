@@ -74,6 +74,15 @@ pub const MsgType = enum(u8) {
     /// A member telling a node the group removed it, and when (u64 ms on
     /// the removing leader's clock).
     removed_notice = 16,
+    /// A node's own memory figures for the budget: {ram_bytes, reserve} as two
+    /// little-endian u64s. Sent when a link to a peer comes up and again when
+    /// the node's own figures change; the leader records the sender's figures
+    /// in a settings row. Carried on the peer link but not Raft state. Gated
+    /// like every frame — a non-member's is dropped — and, like every peer
+    /// frame, it proves the shared cluster secret, not identity, so it is as
+    /// forgeable as any other and adds no new trust surface; it binds once
+    /// per-node identity authentication lands.
+    node_mem = 17,
 };
 
 /// Write one frame (header, checksum, payload) into `buf`; returns the
