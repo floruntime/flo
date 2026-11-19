@@ -26156,11 +26156,13 @@ test "an entry repeating an index the partition holds is counted as a duplicate,
     // finds it: it is a duplicate all the same.
     try std.testing.expect(!Partition.keptInRing(.kv_put));
     var pb: [128]u8 = undefined;
-    const put = try @import("../protocol/kv_entries.zig").Put.encodeInto(&pb, .{ .key = "k", .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null });
+    // Stored keys lead with the namespace id: the default's, 1.
+    const put = try @import("../protocol/kv_entries.zig").Put.encodeInto(&pb, .{ .key = "\x00\x00\x00\x01k", .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null });
     var k = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 2, 1, put);
     k.header.crc32c = k.computeCrc();
     var kout = persistence_mod.Result.start(&k);
-    try std.testing.expect(applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &k, &kout) == .applied);
+    const kfirst = applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &k, &kout);
+    try std.testing.expect(kfirst == .applied);
     kout = persistence_mod.Result.start(&k);
     const kagain = applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &k, &kout);
     try std.testing.expect(verdictOf(&shard.losses, shard.id, Shard.nowMs(), &k, kagain) == .duplicate);
