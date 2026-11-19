@@ -40,12 +40,17 @@ pub const SenderBug = enum(u8) {
 
 pub const SENDER_BUGS = std.enums.values(SenderBug).len;
 
-/// Family ids are below this; a family's state is a slot of its own. Ids
-/// come in blocks by owner, so a new family takes a free id in its owner's
-/// block: 1–3 tests, 4–8 namespaces and the system, 9 and 63 processing,
-/// 10s KV, 20s actions and workflows, 30s queues, 40s groups, 46–49 and 53
-/// streams, 50–52 settings, 54–59 channels, 60–62 time series.
-pub const MAX_FAMILIES = 64;
+/// Family ids are below this; a family's state is a slot of its own on
+/// every shard. Ids come in blocks by owner, so a new family takes a free
+/// id in its owner's block: 1–3 tests, 4–8 namespaces and the system, 9
+/// and 63 processing, 10s KV, 20s actions and workflows, 30s queues, 40s
+/// groups, 46–49 and 53 streams, 50–52 settings, 54–59 channels, 60–62
+/// time series. 64–127 are unclaimed: an owner whose block is full takes
+/// the next free ten there (streams first: theirs filled at 53).
+pub const MAX_FAMILIES = 128;
+
+/// Which of the families an entry's commit changed the tree of.
+pub const FamilySet = std.StaticBitSet(MAX_FAMILIES);
 
 /// What a record adds to its family's encoded size beside its key and
 /// value: their two lengths.
