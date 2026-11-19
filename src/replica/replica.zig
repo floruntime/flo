@@ -191,6 +191,10 @@ pub fn Replica(comptime Io: type) type {
             Io.Host.takeForwardReply(self, frame);
         }
 
+        fn takeNodeMem(self: *Self, frame: RaftFrame) void {
+            Io.Host.takeNodeMem(self, frame);
+        }
+
         fn stopTakingPart(self: *Self, message: []const u8) void {
             Io.Host.stopTakingPart(self, message);
         }
@@ -203,7 +207,7 @@ pub fn Replica(comptime Io: type) type {
             _ = self.trySendRaft(peer, msg_type, payload);
         }
 
-        fn trySendRaft(self: *Self, peer: u32, msg_type: transport.MsgType, payload: []const u8) bool {
+        pub fn trySendRaft(self: *Self, peer: u32, msg_type: transport.MsgType, payload: []const u8) bool {
             if (!Io.networked(self)) return false;
             if (Io.send(self, peer, msg_type, self.id, payload)) return true;
             log.warn("shard {d}: could not queue a {s} for node {d}", .{ self.id, @tagName(msg_type), peer });
@@ -368,6 +372,7 @@ pub fn Replica(comptime Io: type) type {
                 .removed_notice => self.takeRemovedNotice(frame),
                 .forward_write => self.runForwardedWrite(frame),
                 .forward_reply => self.takeForwardReply(frame),
+                .node_mem => self.takeNodeMem(frame),
                 .peer_info, .hello, .hello_back, .verify, .welcome => {},
             }
         }
@@ -990,6 +995,7 @@ const TestIo = struct {
         pub fn takeRemovedNotice(_: *TestReplica, _: RaftFrame) void {}
         pub fn runForwardedWrite(_: *TestReplica, _: RaftFrame) void {}
         pub fn takeForwardReply(_: *TestReplica, _: RaftFrame) void {}
+        pub fn takeNodeMem(_: *TestReplica, _: RaftFrame) void {}
         pub fn stopTakingPart(_: *TestReplica, _: []const u8) void {}
         pub fn stoppedLeading(_: *TestReplica, _: []const u8) void {}
     };
@@ -1299,6 +1305,7 @@ const VouchIo = struct {
             of(r).forwards += 1;
         }
         pub fn takeForwardReply(_: *VouchReplica, _: RaftFrame) void {}
+        pub fn takeNodeMem(_: *VouchReplica, _: RaftFrame) void {}
         pub fn stopTakingPart(_: *VouchReplica, _: []const u8) void {}
         pub fn stoppedLeading(_: *VouchReplica, _: []const u8) void {}
     };

@@ -587,6 +587,12 @@ const SimIo = struct {
             of(r).sim.unexpected_frames += 1;
         }
 
+        // Memory figures are advertised by the shard, which the simulator
+        // doesn't run.
+        pub fn takeNodeMem(r: *Replica, _: RaftFrame) void {
+            of(r).sim.unexpected_frames += 1;
+        }
+
         /// As the shard: lead nothing. A diverged node is a finding unless
         /// an async-mode crash could have erased what it applied; then it
         /// is repaired as its operator would (`repairDiverged`).
