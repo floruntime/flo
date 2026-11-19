@@ -15,7 +15,8 @@ const ual_mod = @import("ual/ual.zig");
 const tombstones = @import("tombstones.zig");
 const router_mod = @import("../projection/router.zig");
 const kv_state = @import("../kv/state.zig");
-const kv_machine = @import("../kv/machine.zig");
+const contract_machine = @import("../contract/machine.zig");
+const contract_machines = @import("../contract/machines.zig");
 const stream_mod = @import("../projection/stream.zig");
 const stream_machine = @import("../stream/machine.zig");
 const ts_mod = @import("../projection/ts.zig");
@@ -167,9 +168,25 @@ pub const Partition = struct {
 
     pub const Applied = struct { index: u64, route: router_mod.ApplyResult };
 
-    /// Apply a committed entry: route it to its projection and, for every
-    /// type but KV, append it to the hot ring and warm store. Returns the
+    /// Apply a committed entry: route it to its projection and, unless a
+    /// machine owns its type and nothing reads its payload back
+    /// (`keptInRing`), append it to the hot ring and warm store. Returns the
     /// entry's index and what the router made of it.
+    pub fn keptInRing(t: EntryType) bool {
+        return kept_in_ring[@backingInt(t)];
+    }
+
+    const kept_in_ring: [256]bool = blk: {
+        @setEvalBranchQuota(100_000);
+        var out: [256]bool = @splat(true);
+        for (@typeInfo(EntryType).@"enum".field_values) |value| {
+            const t: EntryType = @fromBackingInt(@intCast(value));
+            if (t == .stream_append or t == .channel_inbound) continue;
+            if (contract_machine.ownerOf(&contract_machines.list, t) != null) out[value] = false;
+        }
+        break :blk out;
+    };
+
     pub fn applyRouted(self: *Partition, e: *const Entry) !Applied {
         return self.take(e, .apply);
     }
@@ -188,11 +205,15 @@ pub const Partition = struct {
 
     fn take(self: *Partition, e: *const Entry, how: enum { apply, pass_over }) !Applied {
         // The hot ring and the warm store exist for the stream read path,
-        // which fetches record payloads by index. KV's families hold its
-        // values and nothing reads a KV payload back from the partition
-        // log, so KV entries skip both copies.
-        const is_kv = kv_machine.owns(@fromBackingInt(@intCast(e.header.entry_type)));
-        const index = if (is_kv) e.header.index else try self.ual.append(e);
+        // which fetches a record's payload by its index: a stream append's,
+        // or the inbound that carried it as a channel message
+        // (`StreamHandler.getPayloadAndTier`). A type a contract machine
+        // owns otherwise keeps its data in the machine's families, and the
+        // router passes over one applied already, so it skips both copies.
+        // A type the registry applies stays in the ring: its refusal of an
+        // index applied already is what keeps one from applying twice.
+        const kept = keptInRing(@fromBackingInt(@intCast(e.header.entry_type)));
+        const index = if (kept) try self.ual.append(e) else e.header.index;
 
         // Route to projections via the real router (idempotent)
         const route: router_mod.ApplyResult = switch (how) {
@@ -210,7 +231,7 @@ pub const Partition = struct {
 
         // Save payload to warm store (survives UAL hot ring eviction).
         // Uses the entry's own index as key.
-        if (e.payload.len > 0 and !is_kv) {
+        if (e.payload.len > 0 and kept) {
             const copy = self.allocator.dupe(u8, e.payload) catch return .{ .index = index, .route = route };
             // Room in the order first, so every index stored is in it.
             self.warm_order.ensureUnusedCapacity(self.allocator, 1) catch {
@@ -792,4 +813,14 @@ test "partition: a KV index taken and then passed over by a repair counts once, 
     try replayed.passOverSkipped(&e);
     try testing.expectEqual(replayed.bar_bytes, live.bar_bytes);
     try testing.expectEqual(@as(u64, entry_mod.HEADER_SIZE + e.payload.len), live.bar_bytes);
+}
+
+test "Partition: only stream reads' entries and the registry's stay in the hot ring" {
+    // What a stream read fetches by index.
+    for ([_]EntryType{ .stream_append, .channel_inbound }) |t| try testing.expect(Partition.keptInRing(t));
+    // Applied by the registry: the ring's refusal of a repeated index keeps
+    // one from applying twice.
+    for ([_]EntryType{ .raft_noop, .raft_config, .workflow_start, .workflow_complete }) |t| try testing.expect(Partition.keptInRing(t));
+    // Held by a machine's families, passed over by the router when repeated.
+    for ([_]EntryType{ .kv_put, .ts_write, .queue_enqueue, .action_invoke, .group_deliver, .stream_trim }) |t| try testing.expect(!Partition.keptInRing(t));
 }
