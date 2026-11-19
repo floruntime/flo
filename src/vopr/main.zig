@@ -70,6 +70,7 @@ const Args = struct {
     queues: bool = false,
     consumer_groups: bool = false,
     processing: bool = false,
+    workflows: bool = false,
     family_mutant: vopr.families.Mutant = .none,
     catching_up: bool = false,
     txn_limits: bool = false,
@@ -97,7 +98,7 @@ const Args = struct {
 fn usage() void {
     std.debug.print(
         "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] [--jobs=N] [--out-dir=DIR] " ++
-            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--pending-reads] [--wipes] [--membership] [--byzantine] [--halts] [--actions] [--queues] [--consumer-groups] [--processing] [--catching-up] [--txn-limits] [--groups=N] [--max-delivered=N] " ++
+            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--pending-reads] [--wipes] [--membership] [--byzantine] [--halts] [--actions] [--queues] [--consumer-groups] [--processing] [--workflows] [--catching-up] [--txn-limits] [--groups=N] [--max-delivered=N] " ++
             "[--family-mutant=NAME] [--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
         .{},
     );
@@ -136,6 +137,8 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.consumer_groups = true;
         } else if (std.mem.eql(u8, arg, "--processing")) {
             args.processing = true;
+        } else if (std.mem.eql(u8, arg, "--workflows")) {
+            args.workflows = true;
         } else if (std.mem.startsWith(u8, arg, "--family-mutant=")) {
             args.family_mutant = std.meta.stringToEnum(vopr.families.Mutant, arg["--family-mutant=".len..]) orelse return error.Usage;
         } else if (std.mem.eql(u8, arg, "--catching-up")) {
@@ -221,6 +224,8 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         Scenario.consumerGroups(seed)
     else if (args.processing)
         Scenario.processing(seed)
+    else if (args.workflows)
+        Scenario.workflows(seed)
     else if (args.catching_up)
         Scenario.catchingUp(seed)
     else if (args.txn_limits)
@@ -329,6 +334,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     if (scenario.queue_percent > 0) printQueueCounts(s.queues);
     if (scenario.group_percent > 0) printGroupCounts(s.groups);
     if (scenario.processing_percent > 0) printJobCounts(s.jobs);
+    if (scenario.workflow_percent > 0) printWorkflowDefCounts(s.wf_defs);
     if (scenario.hasTxnLimits()) printTxnCounts(s.txn);
     if (scenario.pending_read_permille > 0) std.debug.print("[vopr] pending reads served: {d}\n", .{s.pending_reads});
     if (scenario.namespace_creates) std.debug.print("[vopr] namespace creates: proposed={d} catching_up={d} refused={d} stale_host={d}; applied created={d} past_next={d} stale_id={d} (from ready leaders {d}) refused={d}\n", .{ s.ns_submits.proposed, s.ns_submits.catching_up, s.ns_submits.refused, s.ns_submits.stale_host, s.ns.created, s.ns.past_next, s.ns.stale_ids, s.ns_stale_from_ready, s.ns.refusals });
@@ -350,13 +356,14 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
                 if (args.volatile_mode) " --mode=volatile" else "",
             });
         } else {
-            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
+            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
                 s.seed,
                 mutant,
                 if (args.actions) " --actions" else "",
                 if (args.queues) " --queues" else "",
                 if (args.consumer_groups) " --consumer-groups" else "",
                 if (args.processing) " --processing" else "",
+                if (args.workflows) " --workflows" else "",
                 if (args.small_ring) " --small-ring" else "",
                 if (args.pending_reads) " --pending-reads" else "",
                 if (args.wipes) " --wipes" else "",
@@ -536,6 +543,16 @@ fn printJobCounts(c: vopr.families.Jobs.Counts) void {
     std.debug.print("{s}", .{w.buffered()});
 }
 
+/// The workflow definitions machine's entries, applied/refused by kind.
+fn printWorkflowDefCounts(c: vopr.workflow_defs_family.WorkflowDefs.Counts) void {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.writeAll("[vopr] workflow definitions:") catch {};
+    for (std.enums.values(vopr.workflow_defs_family.WorkflowDefs.Kind), c.applied, c.refused) |k, a, r| w.print(" {t}={d}/{d}", .{ k, a, r }) catch {};
+    w.writeAll("\n") catch {};
+    std.debug.print("{s}", .{w.buffered()});
+}
+
 fn printQueueCounts(c: QueueCounts) void {
     var buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -643,6 +660,7 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
     if (args.queues) try argv.append(allocator, "--queues");
     if (args.consumer_groups) try argv.append(allocator, "--consumer-groups");
     if (args.processing) try argv.append(allocator, "--processing");
+    if (args.workflows) try argv.append(allocator, "--workflows");
     var mutant_arg: [64]u8 = undefined;
     if (args.family_mutant != .none) try argv.append(allocator, try std.fmt.bufPrint(&mutant_arg, "--family-mutant={t}", .{args.family_mutant}));
     if (args.catching_up) try argv.append(allocator, "--catching-up");
@@ -973,8 +991,8 @@ pub fn main(init: std.process.Init) !void {
     }
     // A pinned scenario is the whole input; a seed or ring flag beside it
     // would be silently overridden — refuse rather than guess.
-    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.pending_reads or args.wipes or args.membership or args.byzantine or args.halts or args.actions or args.queues or args.consumer_groups or args.processing or args.catching_up or args.txn_limits)) {
-        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--pending-reads/--wipes/--membership/--byzantine/--halts/--actions/--queues/--consumer-groups/--catching-up/--txn-limits (the pin carries them)\n", .{});
+    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.pending_reads or args.wipes or args.membership or args.byzantine or args.halts or args.actions or args.queues or args.consumer_groups or args.processing or args.workflows or args.catching_up or args.txn_limits)) {
+        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--pending-reads/--wipes/--membership/--byzantine/--halts/--actions/--queues/--consumer-groups/--processing/--workflows/--catching-up/--txn-limits (the pin carries them)\n", .{});
         std.process.exit(2);
     }
 
