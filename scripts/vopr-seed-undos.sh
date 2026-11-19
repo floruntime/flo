@@ -12,11 +12,13 @@
 #       Swarm with the seed's undo until a seed fails as the table says, check
 #       it passes without the undo, and write that scenario over the seed file.
 #
-# Run from the repository root. Env: ZIG (default zig), SEED_TIMEOUT (default 60).
+# Run from the repository root. Env: ZIG (default zig), SEED_TIMEOUT (default 60),
+# JOBS (plant builds at once; default the CPU count).
 set -uo pipefail
 
 ZIG=${ZIG:-zig}
 SEED_TIMEOUT=${SEED_TIMEOUT:-60}
+JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 # Far past any run that gets anywhere (at most about 12k here), and short of how far
 # the undos that go round without getting anywhere run on.
 MAX_DELIVERED=200000
@@ -31,8 +33,22 @@ rows() { grep -v '^#' "$TABLE"; }
 build() {
   local plant=$1
   [ -x "$WORK/$plant/bin/vopr" ] && return 0
-  "$ZIG" build vopr-build -Dvopr-plant="$plant" --release=safe --prefix "$WORK/$plant" > "$WORK/build.log" 2>&1 || {
-    grep -E ' error:' "$WORK/build.log" | head -5; echo "could not build with $plant" >&2; return 1; }
+  "$ZIG" build vopr-build -Dvopr-plant="$plant" --release=safe --prefix "$WORK/$plant" > "$WORK/build-$plant.log" 2>&1 || {
+    grep -E ' error:' "$WORK/build-$plant.log" | head -5; echo "could not build with $plant" >&2; return 1; }
+}
+
+# Build with each plant named, $JOBS at once: each is a whole release build
+# of its own (the plant is a build option), so one after another they come
+# to most of the check's time. A failed build is reported again by `build`.
+build_all() {
+  local plant running=0
+  for plant in "$@"; do
+    build "$plant" > /dev/null 2>&1 &
+    running=$((running + 1))
+    # In batches: macOS's bash has no `wait -n`.
+    if [ "$running" -ge "$JOBS" ]; then wait; running=0; fi
+  done
+  wait
 }
 
 # How a run ended: ok, hang, crash, or the first invariant it names.
@@ -67,6 +83,8 @@ check() {
   for f in "$SEEDS"/*.json; do
     rows | cut -f1 | grep -qxF "$(basename "$f")" || { echo "::error::$(basename "$f") has no undo in $TABLE"; bad=1; }
   done
+  # shellcheck disable=SC2046
+  build_all $(rows | cut -f2 | sort -u | { [ -z "$only" ] && cat || grep -xF "$only"; })
   while IFS=$'\t' read -r f plant flag values want says; do
     [ -e "$SEEDS/$f" ] || { echo "::error::$TABLE names $f, which isn't there"; bad=1; continue; }
     [ -z "$only" ] || [ "$only" = "$plant" ] || continue
@@ -111,6 +129,7 @@ record() {
   [ -n "$row" ] || { echo "$file has no row in $TABLE" >&2; return 2; }
   IFS=$'\t' read -r _ plant flag values want says <<< "$row"
   [ "$flag" = - ] && flag=
+  build_all "$plant" none
   build "$plant" || return 1
   build none || return 1
   for seed in $(seq 1 "$iterations"); do
