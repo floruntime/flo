@@ -1662,7 +1662,7 @@ pub const WorkflowHandler = struct {
     // ── LIST DEFINITIONS ────────────────────────────────────────────────
 
     fn handleListDefinitions(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
-        const DefInfo = struct { name: []const u8, version: []const u8, created_at: i64 };
+        const DefInfo = struct { name: []const u8, version: []const u8, created_at: i64, enabled: bool };
         var defs: std.ArrayListUnmanaged(DefInfo) = .empty;
         defer defs.deinit(self.allocator);
 
@@ -1674,18 +1674,19 @@ pub const WorkflowHandler = struct {
                 .name = def.name,
                 .version = def.version,
                 .created_at = def.created_at_ms,
+                .enabled = def.enabled != 0,
             }) catch {
                 shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
                 return;
             };
         }
 
-        // Serialize to binary wire format:
-        // [count:u32]([name_len:u16][name][version_len:u16][version][created_at:i64])*
+        // The walk's answer, for a shard with no walk context (`walk.zig`):
+        // [count:u32]([name_len:u16][name][version_len:u16][version][created_at:i64][enabled:u8])*
         // [has_more:u8][cursor_len:u16]
         var total: usize = 4; // count
         for (defs.items) |d| {
-            total += 2 + d.name.len + 2 + d.version.len + 8;
+            total += 2 + d.name.len + 2 + d.version.len + 8 + 1;
         }
         total += 1 + 2; // trailer
 
@@ -1710,6 +1711,8 @@ pub const WorkflowHandler = struct {
             pos += d.version.len;
             std.mem.writeInt(i64, buf[pos..][0..8], d.created_at, .little);
             pos += 8;
+            buf[pos] = @intFromBool(d.enabled);
+            pos += 1;
         }
         buf[pos] = 0; // has_more
         pos += 1;
@@ -7729,4 +7732,33 @@ test "workflow producers: a redefinition keeps a schedule's fired slot and a tri
         try testing.expectEqual(@as(u64, 1800), trig.stream_cursor_ts);
         try testing.expectEqual(@as(u64, 2), trig.stream_cursor_seq);
     }
+}
+
+test "a shard with no walk context lists definitions in the walk's entry form, whether each is enabled included" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    shard.workflow_handler = &handler;
+    var conn = try Connection.init(allocator, -1, 0, 0);
+    defer conn.deinit();
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    var out: Result = .{};
+    try handler.replayEnabled(testKey(.default, "test-wf"), &.{0}, 2, &out);
+
+    handler.handleListDefinitions(&shard, &conn, makeRequest(.workflow_list_definitions, "", ""));
+    const answer = try queuedAnswer(&conn);
+    const body = answer.data;
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, body[0..4], .little));
+    var pos: usize = 4;
+    const name_len = std.mem.readInt(u16, body[pos..][0..2], .little);
+    try testing.expectEqualStrings("test-wf", body[pos + 2 ..][0..name_len]);
+    pos += 2 + name_len;
+    pos += 2 + std.mem.readInt(u16, body[pos..][0..2], .little) + 8;
+    // Disabled, then the trailer: no more, no cursor.
+    try testing.expectEqual(@as(u8, 0), body[pos]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, body[pos + 1 ..]);
 }
