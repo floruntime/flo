@@ -66,6 +66,9 @@ pub const WorkflowDefs = struct {
     pub fn init(allocator: Allocator) WorkflowDefs {
         var w: WorkflowDefs = .{ .store = store_mod.Store.init(allocator), .scratch = std.heap.ArenaAllocator.init(allocator) };
         w.store.strict_keys = true;
+        // The runs machine shares this store and tells a child's parent,
+        // in another group, how it went.
+        w.store.place = .{ .group = 0, .count = 2 };
         return w;
     }
 

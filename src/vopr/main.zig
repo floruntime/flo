@@ -335,6 +335,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     if (scenario.group_percent > 0) printGroupCounts(s.groups);
     if (scenario.processing_percent > 0) printJobCounts(s.jobs);
     if (scenario.workflow_percent > 0) printWorkflowDefCounts(s.wf_defs);
+    if (scenario.workflow_percent > 0) printWorkflowRunCounts(s.wf_runs);
     if (scenario.hasTxnLimits()) printTxnCounts(s.txn);
     if (scenario.pending_read_permille > 0) std.debug.print("[vopr] pending reads served: {d}\n", .{s.pending_reads});
     if (scenario.namespace_creates) std.debug.print("[vopr] namespace creates: proposed={d} catching_up={d} refused={d} stale_host={d}; applied created={d} past_next={d} stale_id={d} (from ready leaders {d}) refused={d}\n", .{ s.ns_submits.proposed, s.ns_submits.catching_up, s.ns_submits.refused, s.ns_submits.stale_host, s.ns.created, s.ns.past_next, s.ns.stale_ids, s.ns_stale_from_ready, s.ns.refusals });
@@ -539,6 +540,16 @@ fn printJobCounts(c: vopr.families.Jobs.Counts) void {
     var w: std.Io.Writer = .fixed(&buf);
     w.writeAll("[vopr] processing jobs:") catch {};
     for (std.enums.values(vopr.families.Jobs.Kind), c.applied, c.refused) |k, a, r| w.print(" {t}={d}/{d}", .{ k, a, r }) catch {};
+    w.writeAll("\n") catch {};
+    std.debug.print("{s}", .{w.buffered()});
+}
+
+/// The workflow runs machine's entries, applied/refused by kind.
+fn printWorkflowRunCounts(c: vopr.workflow_runs_family.WorkflowRuns.Counts) void {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.writeAll("[vopr] workflow runs:") catch {};
+    for (std.enums.values(vopr.workflow_runs_family.WorkflowRuns.Kind), c.applied, c.refused) |k, a, r| w.print(" {t}={d}/{d}", .{ k, a, r }) catch {};
     w.writeAll("\n") catch {};
     std.debug.print("{s}", .{w.buffered()});
 }

@@ -33,6 +33,27 @@ pub const Plant = enum {
     /// Every workflow enable moves its schedule's anchor, not only one after
     /// a disable.
     defs_enable_moves_anchor,
+    /// A cancelled run's end leaves its workflow's count of runs not ended.
+    runs_cancel_keeps_active,
+    /// A completion keeps 257 history events, one past the bound.
+    runs_hist_keeps_257,
+    /// An ended run takes a first step.
+    runs_ended_takes_step,
+    /// A schedule start's slot replaces the fired slot, even an earlier one.
+    runs_fired_moves_back,
+    /// A start with an idempotency key doesn't record it.
+    runs_idem_unwritten,
+    /// A start doesn't look its idempotency key up, so a second run starts.
+    runs_idem_unchecked,
+    /// A disabled workflow's child start creates its run.
+    runs_disabled_child_created,
+    /// A disabled workflow's child start is refused, which drops its
+    /// parent's reply.
+    runs_disabled_child_refused,
+    /// Any start with a schedule's key fires its slot.
+    runs_any_start_fires,
+    /// Any start of a child's run tells its pending parent it started.
+    runs_any_start_answers_parent,
 };
 
 pub const active: Plant = std.meta.stringToEnum(Plant, @import("build_options").vopr_plant) orelse
