@@ -753,7 +753,7 @@ pub const Actions = struct {
 
         // The action an invoke or deliver names, as it stood: whether it
         // should have been refused.
-        const def_before: ?action_machine.Def.Value = switch (kind) {
+        var def_before: ?action_machine.Def.Value = switch (kind) {
             .invoke => blk: {
                 const p = ae.Invoke.decodeAll(e.payload, &diag) catch return error.Halt;
                 break :blk self.def(.of(p.ns), p.action);
@@ -764,6 +764,8 @@ pub const Actions = struct {
             },
             else => null,
         };
+        // Held across the apply, so copied out of the store.
+        if (def_before) |*d| d.owner = try ba.dupe(u8, d.owner);
 
         const applied = try self.rewritten(e, r);
         var out: persistence.Result = .{};
@@ -823,11 +825,19 @@ pub const Actions = struct {
         try touched.append(ba, .{ .ns = ns, .id = try ba.dupe(u8, id), .before = if (got) |v| try copyRun(ba, v) else null });
     }
 
+    /// A run, its every string copied out of the store: a value's slices
+    /// hold only until the next apply.
     fn copyRun(a: Allocator, v: action_machine.Run.Value) Allocator.Error!action_machine.Run.Value {
         var c = v;
         c.action = try a.dupe(u8, v.action);
         c.holder = try a.dupe(u8, v.holder);
+        c.input = try a.dupe(u8, v.input);
+        if (v.labels) |l| c.labels = try a.dupe(u8, l);
+        if (v.caller_run) |r| c.caller_run = try a.dupe(u8, r);
+        if (v.caller_workflow) |w| c.caller_workflow = try a.dupe(u8, w);
         if (v.request_key) |k| c.request_key = try a.dupe(u8, k);
+        c.result = try a.dupe(u8, v.result);
+        c.@"error" = try a.dupe(u8, v.@"error");
         return c;
     }
 

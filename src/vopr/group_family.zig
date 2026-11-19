@@ -552,7 +552,13 @@ pub const ConsumerGroups = struct {
         const before = commits(store);
         var out: persistence.Result = .{};
         out.reset(e);
-        const prev = if (sm.metaAt(.{ .store = store }, sk)) |m| m else null;
+        var prev = if (sm.metaAt(.{ .store = store }, sk)) |m| m else null;
+        // Held across the apply, so its name is copied out of the store.
+        var name_buf: [@import("../protocol/limits.zig").MAX_QUALIFIED_KEY]u8 = undefined;
+        if (prev) |*m| {
+            @memcpy(name_buf[0..m.name.len], m.name);
+            m.name = name_buf[0..m.name.len];
+        }
         try machine_mod.applyEntry(&sm.machine, store, &self.scratch, e, &out);
         if (out.refused()) |rf| {
             if (!std.mem.eql(u64, &before, &commits(store))) return error.RefusalChangedState;

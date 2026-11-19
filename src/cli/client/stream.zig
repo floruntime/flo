@@ -482,14 +482,18 @@ pub fn alter(
     stream: []const u8,
     retention_count: ?u64,
     retention_age: ?u64,
+    clear: struct { age: bool = false, count: bool = false },
 ) !Response {
     // Build options for retention policies using TLV OptionsBuilder
     var options_buf: [32]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
 
-    // Each bound given is sent; the server enforces both.
+    // Each bound given is sent; the server enforces both. A cleared one is
+    // dropped from the stream.
     if (retention_count) |rc| try builder.addU64(.retention_count, rc);
     if (retention_age) |ra| try builder.addU64(.retention_age, ra);
+    if (clear.age) try builder.addFlag(.retention_age_clear);
+    if (clear.count) try builder.addFlag(.retention_count_clear);
 
     const options: []const u8 = builder.getOptions();
 

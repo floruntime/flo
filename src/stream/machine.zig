@@ -126,6 +126,8 @@ pub const StreamConfig = struct {
     retention_count: u64,
 
     pub const SIZE = 1 + 4 + 8 + 8;
+    /// An alter's bound that drops the stream's own: 0 leaves it as it is.
+    pub const CLEAR: u64 = std.math.maxInt(u64);
 
     pub fn encode(c: StreamConfig, out: *[SIZE]u8) void {
         out[0] = @backingInt(c.op);
@@ -146,6 +148,7 @@ pub const StreamConfig = struct {
 };
 
 pub const NO_STREAM = "stream not found";
+pub const CLEAR_ON_CREATE = "bad request: only an alter drops a retention bound";
 pub const SETTINGS_DIFFER = "conflict: the stream exists with other settings; change them with stream alter";
 pub const NAME_TAKEN = "conflict: another stream's name hashes as this one's; choose another name";
 pub const NOT_EMPTY = "stream is not empty; pass --force to delete";
@@ -392,6 +395,8 @@ fn configApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     const cmd = commandOf(e) orelse return error.Halt;
     if (cmd.namespace_id == .invalid or cmd.key.len == 0) return error.Halt;
     const c = StreamConfig.decode(cmd.value) orelse return error.Halt;
+    // Only an alter drops a bound; its handler sends nothing else.
+    if (c.op == .create and (c.retention_age_s == StreamConfig.CLEAR or c.retention_count == StreamConfig.CLEAR)) return out.refuse(.bad_request, .malformed, CLEAR_ON_CREATE);
     const sk: StreamKey = cmd.namespace_id.bytes() ++ hashOf(cmd.key);
     const found: ?Meta.Value = if (try view.get(Metas, &sk)) |f| f.v else null;
     const live: ?Meta.Value = if (found) |f| (if (f.exists) f else null) else null;
@@ -411,8 +416,8 @@ fn configApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         },
         .alter => blk: {
             var m = live orelse return out.refuse(.not_found, .not_found, NO_STREAM);
-            if (c.retention_age_s > 0) m.retention_age_s = c.retention_age_s;
-            if (c.retention_count > 0) m.retention_count = c.retention_count;
+            if (c.retention_age_s == StreamConfig.CLEAR) m.retention_age_s = 0 else if (c.retention_age_s > 0) m.retention_age_s = c.retention_age_s;
+            if (c.retention_count == StreamConfig.CLEAR) m.retention_count = 0 else if (c.retention_count > 0) m.retention_count = c.retention_count;
             // It has settings now: a create must ask for them, as of one
             // a create made, or it would drop them.
             m.explicit = true;
@@ -1027,4 +1032,19 @@ test "streams machine: ids still rise across a delete and a recreate with the cl
     try testing.expect(first.greaterThan(old_last));
     const next = try t.append("s", 101, 1, 4);
     try testing.expect(next.greaterThan(first));
+}
+
+test "streams machine: an alter's clear drops a bound, and a create carrying one is refused" {
+    var t = TestStreams.init();
+    defer t.deinit();
+    try testing.expect((try t.config(create(1, 3600, 5), "s", 1)).refused() == null);
+    try testing.expect((try t.config(alter(StreamConfig.CLEAR, 0), "s", 2)).refused() == null);
+    const m = t.meta("s").?;
+    try testing.expectEqual(@as(u64, 0), m.retention_age_s);
+    try testing.expectEqual(@as(u64, 5), m.retention_count);
+    try testing.expect(t.retained("s"));
+    try testing.expect((try t.config(alter(0, StreamConfig.CLEAR), "s", 3)).refused() == null);
+    try testing.expect(!t.retained("s"));
+    try testing.expectEqual(proto.StatusCode.bad_request, (try t.config(create(1, StreamConfig.CLEAR, 0), "t", 4)).refused().?.status);
+    try testing.expect(t.meta("t") == null);
 }

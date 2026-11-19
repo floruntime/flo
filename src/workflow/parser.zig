@@ -229,6 +229,9 @@ fn parseWorkflowFromJson(allocator: Allocator, root: JsonValue, d: D) ParseError
 
     const name = try reqString(d, root, "name");
     const version = try reqString(d, root, "version");
+    // Each definition's list entry carries it: a long one would fail
+    // every list page that reaches it.
+    if (version.len > MAX_VERSION) return d.fail(ParseError.InvalidFieldType, "a version is at most {d} bytes, not {d}", .{ MAX_VERSION, version.len });
     const description = try optString(d, root, "description") orelse "";
 
     const idempotency = try oneOf(IdempotencyMode, d, "idempotency", try optString(d, root, "idempotency") orelse "none", &.{
@@ -558,6 +561,8 @@ fn parseSteps(allocator: Allocator, root: JsonValue, d: D) ParseError![]NamedSte
 }
 
 pub const MAX_TERMINAL_NAME: usize = 256;
+/// The longest version a definition names.
+pub const MAX_VERSION: usize = 256;
 
 /// The longest outcome a transition follows: the longest a worker can
 /// complete a run with, so no branch is out of reach.
@@ -1384,4 +1389,22 @@ test "parseWorkflow: a negative or zero duration is refused" {
     try expectRefused(wrap("",
         \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "breaker": { "cooldown_ms": -1 }, "tracking": { "timeout_ms": 0 } } ] } },
     ), ParseError.InvalidFieldType, "\"cooldown_ms\" must be at least 1, not -1 at plans.p.executors[0].breaker");
+}
+
+test "parseWorkflow: a version longer than a list entry holds is refused" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    for ([_]usize{ MAX_VERSION, MAX_VERSION + 1 }) |len| {
+        const version = try allocator.alloc(u8, len);
+        defer allocator.free(version);
+        @memset(version, '1');
+        const json = try std.fmt.allocPrint(allocator, "{{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"{s}\",\"start\":{{\"run\":\"@actions/a\",\"transitions\":{{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}}}}", .{version});
+        defer allocator.free(json);
+        var diag: Diagnostic = .{};
+        if (len == MAX_VERSION) {
+            var def = try parseWorkflow(allocator, json, &diag);
+            defer def.deinit(allocator);
+            try testing.expectEqual(len, def.version.len);
+        } else try testing.expectError(ParseError.InvalidFieldType, parseWorkflow(allocator, json, &diag));
+    }
 }

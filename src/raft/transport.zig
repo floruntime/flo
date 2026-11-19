@@ -75,9 +75,10 @@ pub const MsgType = enum(u8) {
     /// the removing leader's clock).
     removed_notice = 16,
     /// A node's own memory figures for the budget: {ram_bytes, reserve} as two
-    /// little-endian u64s. Sent when a link to a peer comes up and again when
-    /// the node's own figures change; the leader records the sender's figures
-    /// in a settings row. Carried on the peer link but not Raft state. Gated
+    /// little-endian u64s. Sent when a link to a peer comes up and again every
+    /// 30 s; the receiver keeps the sender's latest figures, which the log
+    /// never carries, for the leader's per-node budget rows. Carried on the
+    /// peer link but not Raft state. Gated
     /// like every frame — a non-member's is dropped — and, like every peer
     /// frame, it proves the shared cluster secret, not identity, so it is as
     /// forgeable as any other and adds no new trust surface; it binds once

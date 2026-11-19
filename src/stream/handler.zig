@@ -985,7 +985,9 @@ pub const StreamHandler = struct {
 
     fn handleCreate(self: *StreamHandler, req: Request) CommandResult {
         if (req.findOption(.retention_bytes) != null) return BYTE_RETENTION_REFUSAL;
-        if (retentionAgeRefusal(req)) |refused| return refused;
+        if (req.findOption(.retention_age_clear) != null or req.findOption(.retention_count_clear) != null)
+            return .{ .err = .{ .code = .invalid_request, .message = stream_machine.CLEAR_ON_CREATE } };
+        if (retentionRefusal(req)) |refused| return refused;
         if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "stream name is required" } };
         var partition_count: u32 = 1;
         if (req.value.len >= 4) {
@@ -1003,9 +1005,19 @@ pub const StreamHandler = struct {
     fn handleAlter(self: *StreamHandler, req: Request) CommandResult {
         if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "stream name is required" } };
         if (req.findOption(.retention_bytes) != null) return BYTE_RETENTION_REFUSAL;
-        if (retentionAgeRefusal(req)) |refused| return refused;
+        if (retentionRefusal(req)) |refused| return refused;
         const retention = parseRetentionOptions(req);
-        return self.proposeConfig(req, .{ .op = .alter, .partition_count = 0, .retention_age_s = retention.age_s, .retention_count = retention.count });
+        // A bound of 0 leaves the stream's as it is; a clear drops it.
+        const clear_age = req.findOption(.retention_age_clear) != null;
+        const clear_count = req.findOption(.retention_count_clear) != null;
+        if ((clear_age and retention.age_s > 0) or (clear_count and retention.count > 0))
+            return .{ .err = .{ .code = .invalid_request, .message = "bad request: an alter both sets and clears a retention bound" } };
+        return self.proposeConfig(req, .{
+            .op = .alter,
+            .partition_count = 0,
+            .retention_age_s = if (clear_age) StreamConfig.CLEAR else retention.age_s,
+            .retention_count = if (clear_count) StreamConfig.CLEAR else retention.count,
+        });
     }
 
     /// A create or an alter, logged so every replica holds the stream's
@@ -1076,9 +1088,12 @@ pub const StreamHandler = struct {
 
     /// A retention age past 100 years is a mistake, not a policy: refused
     /// rather than left to trim nothing.
-    fn retentionAgeRefusal(req: Request) ?CommandResult {
-        const age_s = parseRetentionOptions(req).age_s;
-        if (age_s > time_units.MAX_AGE_MS / std.time.ms_per_s) return .{ .err = .{ .code = .invalid_request, .message = "stream retention age is over 100 years" } };
+    fn retentionRefusal(req: Request) ?CommandResult {
+        const r = parseRetentionOptions(req);
+        if (r.age_s > time_units.MAX_AGE_MS / std.time.ms_per_s) return .{ .err = .{ .code = .invalid_request, .message = "stream retention age is over 100 years" } };
+        // The logged entry carries a cleared bound as this value: a client's
+        // own would clear the bound it meant to set.
+        if (r.count == StreamConfig.CLEAR) return .{ .err = .{ .code = .invalid_request, .message = "retention bound too large" } };
         return null;
     }
 
@@ -2834,4 +2849,67 @@ test "stream handler: a list skips a tombstone, a deleted stream its groups stil
     const names = StreamHandler.localScanStreams(@ptrCast(&handler), .{ .id = .default, .name = "default" }, "", null, 10);
     try testing.expectEqual(@as(usize, 1), names.items.len);
     try testing.expectEqualStrings("kept", names.items[0]);
+}
+
+test "stream handler: an alter drops a retention bound it clears and leaves the other; a create can't clear, nor an alter set and clear one bound" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    var ob: [32]u8 = undefined;
+    var b = OptionsBuilder.init(&ob);
+    try b.addU64(.retention_count, 5);
+    try b.addU64(.retention_age, 3600);
+    try testing.expectEqual(CommandResult.ok, handler.handleCommand(makeRequest(.stream_create, "c", "", b.getOptions())));
+
+    var cb: [8]u8 = undefined;
+    var clear = OptionsBuilder.init(&cb);
+    try clear.addFlag(.retention_count_clear);
+    try testing.expectEqual(CommandResult.ok, handler.handleCommand(makeRequest(.stream_alter, "c", "", clear.getOptions())));
+    const m = stream_machine.metaOf(handler.readView(), .default, "c").?;
+    try testing.expectEqual(@as(u64, 0), m.retention_count);
+    try testing.expectEqual(@as(u64, 3600), m.retention_age_s);
+
+    var bb: [32]u8 = undefined;
+    var both = OptionsBuilder.init(&bb);
+    try both.addU64(.retention_age, 60);
+    try both.addFlag(.retention_age_clear);
+    for ([_]struct { op: OpCode, opts: []const u8 }{ .{ .op = .stream_alter, .opts = both.getOptions() }, .{ .op = .stream_create, .opts = clear.getOptions() } }) |c| {
+        switch (handler.handleCommand(makeRequest(c.op, "c", "", c.opts))) {
+            .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(@as(u64, 3600), stream_machine.metaOf(handler.readView(), .default, "c").?.retention_age_s);
+}
+
+test "stream handler: a count bound the size of a clear is refused on a create and an alter, never taken as one" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    var ob: [32]u8 = undefined;
+    var keep = OptionsBuilder.init(&ob);
+    try keep.addU64(.retention_count, 5);
+    try testing.expectEqual(CommandResult.ok, handler.handleCommand(makeRequest(.stream_create, "c", "", keep.getOptions())));
+
+    var hb: [32]u8 = undefined;
+    var huge = OptionsBuilder.init(&hb);
+    try huge.addU64(.retention_count, StreamHandler.StreamConfig.CLEAR);
+    for ([_]OpCode{ .stream_create, .stream_alter }) |op| {
+        switch (handler.handleCommand(makeRequest(op, "c", "", huge.getOptions()))) {
+            .err => |e| {
+                try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code);
+                try testing.expectEqualStrings("retention bound too large", e.message);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(@as(u64, 5), stream_machine.metaOf(handler.readView(), .default, "c").?.retention_count);
 }

@@ -1074,7 +1074,7 @@ fn expireOne(view: *View, item: ge.ExpireItem.Value, stamp: u64) ApplyError!bool
 pub const machine: machine_mod.Machine = .{
     .name = "groups",
     .entry_types = &.{ .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean, .group_steal, .group_requeue, .group_drop },
-    .families = &.{ machine_mod.info(Metas), machine_mod.info(Items), machine_mod.info(Dead), machine_mod.info(Ready), machine_mod.info(Deadlines), machine_mod.info(Streams_) },
+    .families = &([_]machine_mod.FamilyInfo{ machine_mod.info(Metas), machine_mod.info(Items), machine_mod.info(Dead), machine_mod.info(Streams_) } ++ M.FAMILIES),
     .keys = keys,
     .apply = apply,
 };

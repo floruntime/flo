@@ -207,7 +207,7 @@ pub fn Replica(comptime Io: type) type {
             _ = self.trySendRaft(peer, msg_type, payload);
         }
 
-        fn trySendRaft(self: *Self, peer: u32, msg_type: transport.MsgType, payload: []const u8) bool {
+        pub fn trySendRaft(self: *Self, peer: u32, msg_type: transport.MsgType, payload: []const u8) bool {
             if (!Io.networked(self)) return false;
             if (Io.send(self, peer, msg_type, self.id, payload)) return true;
             log.warn("shard {d}: could not queue a {s} for node {d}", .{ self.id, @tagName(msg_type), peer });

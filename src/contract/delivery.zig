@@ -106,6 +106,10 @@ pub fn Model(comptime cfg: Config) type {
         // Expiry first, then the namespace's id (`deadlineKey`).
         pub const Deadlines = view_mod.Family(cfg.deadline_id, cfg.deadline_name, .{ .naming = 8 }, Stored(Deadline));
         pub const Requests = view_mod.Family(cfg.request_id, cfg.request_name, .id, Stored(Request));
+        /// The three, for the owning machine's `families`: each id is its
+        /// owner's whether or not it writes the family, so a list missing
+        /// one would let another machine take its id unseen (`listRule`).
+        pub const FAMILIES = [_]@import("machine.zig").FamilyInfo{ .{ .id = Ready.ID, .name = Ready.NAME, .scope = Ready.SCOPE }, .{ .id = Deadlines.ID, .name = Deadlines.NAME, .scope = Deadlines.SCOPE }, .{ .id = Requests.ID, .name = Requests.NAME, .scope = Requests.SCOPE } };
 
         pub const Ns = NamespaceId;
         /// A ready key's ordering prefix: an item's order field, or nothing.

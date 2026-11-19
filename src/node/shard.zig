@@ -350,6 +350,47 @@ const PeerMem = struct {
 /// A `node_mem` frame payload: {ram_bytes, reserve} as two little-endian u64s.
 const NODE_MEM_SIZE = 16;
 
+/// How often a node tells each linked peer its memory again under the same
+/// link: a frame the receiver dropped (its queue full) is repaired by the next.
+const NODE_MEM_READVERTISE_MS: u64 = 30_000;
+
+/// Which linked peers this node has told its memory, under which link session
+/// and when. A peer is told again when its link is a new session (a reconnect
+/// between ticks keeps the id but not the session), or the last telling is
+/// `NODE_MEM_READVERTISE_MS` old. Only a send that queued counts as told.
+const NodeMemTold = struct {
+    const N = @import("../raft/network.zig").MAX_PEERS;
+    const Told = struct { id: u32 = 0, session: u64 = 0, at_ms: u64 = 0 };
+    told: [N]Told = @splat(.{}),
+
+    /// Forget peers no longer linked, freeing their slots.
+    fn prune(self: *NodeMemTold, linked: []const u32) void {
+        for (&self.told) |*t| if (t.id != 0 and std.mem.indexOfScalar(u32, linked, t.id) == null) {
+            t.* = .{};
+        };
+    }
+
+    /// Whether `id`, linked under `session`, is due to be told at `now_ms`.
+    fn due(self: *const NodeMemTold, id: u32, session: u64, now_ms: u64) bool {
+        for (self.told) |t| if (t.id == id) return t.session != session or now_ms -| t.at_ms >= NODE_MEM_READVERTISE_MS;
+        return true;
+    }
+
+    /// `id` was told under `session` at `now_ms`.
+    fn mark(self: *NodeMemTold, id: u32, session: u64, now_ms: u64) void {
+        var slot: ?*Told = null;
+        for (&self.told) |*t| {
+            if (t.id == id) {
+                slot = t;
+                break;
+            }
+            if (slot == null and t.id == 0) slot = t;
+        }
+        // At most N peers are linked, and prune freed the rest.
+        if (slot) |t| t.* = .{ .id = id, .session = session, .at_ms = now_ms };
+    }
+};
+
 pub const Shard = struct {
     /// Shard index (0..shard_count-1).
     id: u16,
@@ -842,21 +883,16 @@ pub const Shard = struct {
     self_reserve_bytes: u64 = 0,
 
     /// What each peer last advertised as its own {ram_bytes, reserve}, keyed by
-    /// node id, so shard 0's leader can write a settings row for a follower it
-    /// would otherwise never learn the memory of. A data-holder that has not
-    /// advertised yet is absent, and its budget row stays provisional. Shard 0
-    /// only. Forgeable like every peer frame (the link proves the cluster
-    /// secret, not identity), so it adds no trust the log did not already take.
+    /// node id: the memory of a follower, which the log never carries, for the
+    /// leader's settings rows. Shard 0 only. Forgeable like every peer frame
+    /// (the link proves the cluster secret, not identity), so it adds no trust
+    /// the log did not already take.
     peer_mem: [membership.MAX_MEMBERS]PeerMem = std.mem.zeroes([membership.MAX_MEMBERS]PeerMem),
 
-    /// Peers this node has already advertised its figures to under their present
-    /// link, pruned when a peer drops so a reconnect re-advertises. This node's
-    /// figures are read once at boot and never change in flight, so a live host
-    /// change (a cgroup resize) is picked up only on the next reconnect or
-    /// restart; a future periodic re-read would clear this to re-advertise. Only
-    /// `[0..node_mem_advertised_count]` is read. Shard 0 only.
-    node_mem_advertised: [membership.MAX_MEMBERS]u32 = undefined,
-    node_mem_advertised_count: u32 = 0,
+    /// Which peers this node has told its own figures, under which link and
+    /// when. The figures are read once at boot, so a live host change (a cgroup
+    /// resize) is picked up on the next restart. Shard 0 only.
+    node_mem_told: NodeMemTold = .{},
 
     /// The last settings entry shard 0's leader proposed but hasn't seen apply:
     /// its term and index. While it is outstanding, the leader proposes no
@@ -6329,20 +6365,24 @@ pub const Shard = struct {
     // ─── Peer memory advertisement (the budget carrier) ────────────────────
     //
     // A follower's own RAM never reaches the leader through the log, so it
-    // rides the peer link as a `node_mem` frame. The leader reads the latest
-    // figure a peer advertised (`advertisedMem`) and proposes that peer's
-    // settings row, exactly as it proposes its own. The frame is member-gated
-    // by the stranger filter in the replica, so a non-member's is dropped.
+    // rides the peer link as a `node_mem` frame, and each node keeps the
+    // latest figure every peer sent (`advertisedMem`) for the leader to read.
 
-    /// Record a peer's advertised {ram_bytes, reserve}. Reached from the
-    /// replica's frame dispatch, so the source is already a member (a
-    /// stranger's frame never arrives here). The latest figure per id wins.
+    /// Record a peer's advertised {ram_bytes, reserve}. The replica's stranger
+    /// filter admits a member of the latest or committed config, or anyone
+    /// before this node knows one; only a member is kept, so a stranger can't
+    /// fill the slots, and `advertisedMem` answers only for the committed
+    /// config. The latest figure per id wins.
     fn takeNodeMem(self: *Shard, frame: RaftFrame) void {
         if (frame.payload.len != NODE_MEM_SIZE) return self.replica.badFrame(frame);
         const mem: memory_budget.Holder.NodeMem = .{
             .ram_bytes = std.mem.readInt(u64, frame.payload[0..8], .little),
             .reserve = std.mem.readInt(u64, frame.payload[8..16], .little),
         };
+        // A node that couldn't read its RAM sends nothing; a 0 would zero a
+        // budget taken as the least over the data-holders.
+        if (mem.ram_bytes == 0) return;
+        if (!self.memberKnown(frame.source_node)) return;
         var free: ?usize = null;
         for (&self.peer_mem, 0..) |*e, i| {
             if (e.id == frame.source_node) {
@@ -6358,12 +6398,13 @@ pub const Shard = struct {
     }
 
     /// The figures peer `node_id` last advertised, or null when it has not
-    /// advertised since this node (re)started or its link last came up. Read by
-    /// `proposeBudgetRows` on the leader to fill a follower's settings row. The
-    /// leader proposes a row only for a committed-config data-holder, so a
-    /// figure stored here for a not-yet-committed joiner waits, harmlessly,
-    /// until its membership commits.
+    /// advertised since this node started, or the committed config doesn't
+    /// name it. A joiner's figure is kept from before its membership commits
+    /// and answered once it does; one whose add is truncated is never
+    /// answered. A figure outlives the link it came on and a change of
+    /// leader: it stands until the peer sends another or leaves the config.
     pub fn advertisedMem(self: *const Shard, node_id: u32) ?memory_budget.Holder.NodeMem {
+        if (!self.raft_node.committed_config.names(node_id)) return null;
         for (self.peer_mem) |e| if (e.id == node_id) return e.mem;
         return null;
     }
@@ -6384,42 +6425,30 @@ pub const Shard = struct {
         }
     }
 
-    /// Advertise this node's own figures to each linked peer that has not heard
-    /// the current value under its present link. Runs on shard 0 every tick,
-    /// whatever this node's role: a follower must reach the leader, and the
-    /// leader's own row still comes from `self_ram_bytes`. A node that could not
-    /// read its RAM advertises nothing, leaving its row provisional rather than
-    /// a 0 it would have to walk back.
-    fn advertiseNodeMem(self: *Shard) void {
+    /// Tell each linked peer this node's own figures: when its link comes up
+    /// (a new session), and again every `NODE_MEM_READVERTISE_MS`, which
+    /// repairs a frame lost on the way. Runs on shard 0 every tick, whatever
+    /// this node's role: a follower must reach whichever node leads. A node
+    /// that could not read its RAM sends nothing, leaving its row provisional.
+    fn advertiseNodeMem(self: *Shard, now_ms: u64) void {
         if (self.self_ram_bytes == 0) return;
         const rn = self.raft_network orelse return;
         var ids: [@import("../raft/network.zig").MAX_PEERS]u32 = undefined;
         const linked = rn.linkedPeers(&ids);
-        // Drop marks for peers no longer linked, so a reconnect re-advertises.
-        var w: u32 = 0;
-        for (self.node_mem_advertised[0..self.node_mem_advertised_count]) |id| {
-            if (std.mem.indexOfScalar(u32, linked, id) != null) {
-                self.node_mem_advertised[w] = id;
-                w += 1;
-            }
-        }
-        self.node_mem_advertised_count = w;
-        // Advertise to any linked peer not yet told the current figure.
+        self.node_mem_told.prune(linked);
         for (linked) |peer| {
-            if (std.mem.indexOfScalar(u32, self.node_mem_advertised[0..self.node_mem_advertised_count], peer) != null) continue;
-            self.sendNodeMem(peer);
-            if (self.node_mem_advertised_count < self.node_mem_advertised.len) {
-                self.node_mem_advertised[self.node_mem_advertised_count] = peer;
-                self.node_mem_advertised_count += 1;
-            }
+            const session = rn.linkSession(peer) orelse continue;
+            if (!self.node_mem_told.due(peer, session, now_ms)) continue;
+            // Not queued: tried again next tick.
+            if (self.sendNodeMem(peer)) self.node_mem_told.mark(peer, session, now_ms);
         }
     }
 
-    fn sendNodeMem(self: *Shard, to: u32) void {
+    fn sendNodeMem(self: *Shard, to: u32) bool {
         var buf: [NODE_MEM_SIZE]u8 = undefined;
         std.mem.writeInt(u64, buf[0..8], self.self_ram_bytes, .little);
         std.mem.writeInt(u64, buf[8..16], self.self_reserve_bytes, .little);
-        self.replica.sendRaft(to, .node_mem, &buf);
+        return self.replica.trySendRaft(to, .node_mem, &buf);
     }
 
     /// A node-row whose id the applied membership no longer names, or null.
@@ -6638,7 +6667,7 @@ pub const Shard = struct {
 
         // Every shard-0 node, leader or not, tells its linked peers its own
         // memory so whichever node leads can write its row.
-        if (self.id == 0) self.advertiseNodeMem();
+        if (self.id == 0) self.advertiseNodeMem(@import("stdx").time.monotonicMs());
 
         // The producers above only proposed. What has committed (at once
         // on a single node) applies here, outside any module's work.
@@ -10082,6 +10111,7 @@ test "Shard: node_mem from a member is stored and read back; a stranger's is dro
     // 1 votes; 2 and 3 are replicas — data-holders that must report their memory.
     const config = membership.Config.ofVoters(&.{1}).withJoiner(2, true).withJoiner(3, true);
     raft.setMembership(&config, 1);
+    raft.commitMembership(&config, 1);
     raft.lost_log = .none;
 
     const ram: u64 = 2 * 1024 * 1024 * 1024;
@@ -10118,9 +10148,71 @@ test "Shard: node_mem from a member is stored and read back; a stranger's is dro
     try std.testing.expect(shard.advertisedMem(3) != null);
     const shrunk = membership.Config.ofVoters(&.{1}).withJoiner(3, true);
     raft.setMembership(&shrunk, 2);
+    raft.commitMembership(&shrunk, 2);
     shard.forgetDepartedPeers();
     try std.testing.expect(shard.advertisedMem(2) == null);
     try std.testing.expect(shard.advertisedMem(3) != null);
+
+    // A node that couldn't read its RAM sends 0: dropped, the figure kept.
+    std.mem.writeInt(u64, buf[0..8], 0, .little);
+    shard.replica.handleRaftFrame(.{ .source_node = 3, .group_id = 0, .msg_type = .node_mem, .payload = &buf });
+    try std.testing.expectEqual(ram * 2, (shard.advertisedMem(3) orelse return error.NoFigures).ram_bytes);
+}
+
+test "Shard: node_mem from a node before this one knows a config is not kept" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 3, .join, .{}, .{});
+    defer shard.deinit();
+    var buf: [NODE_MEM_SIZE]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], 1 << 30, .little);
+    std.mem.writeInt(u64, buf[8..16], 0, .little);
+    // No config yet, so the stranger filter lets every frame through.
+    shard.takeNodeMem(.{ .source_node = 9, .group_id = 0, .msg_type = .node_mem, .payload = &buf });
+    for (shard.peer_mem) |e| try std.testing.expectEqual(@as(u32, 0), e.id);
+}
+
+test "Shard: a joiner's node_mem is answered only once its membership commits" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 3, .join, .{}, .{});
+    defer shard.deinit();
+    const raft = shard.raft_node;
+    const committed = membership.Config.ofVoters(&.{1});
+    raft.setMembership(&committed, 1);
+    raft.commitMembership(&committed, 1);
+    raft.lost_log = .none;
+    // 2 is added, not yet committed: the filter lets its frame through.
+    const added = committed.withJoiner(2, true);
+    raft.setMembership(&added, 2);
+    var buf: [NODE_MEM_SIZE]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], 1 << 30, .little);
+    std.mem.writeInt(u64, buf[8..16], 0, .little);
+    shard.replica.handleRaftFrame(.{ .source_node = 2, .group_id = 0, .msg_type = .node_mem, .payload = &buf });
+    try std.testing.expect(shard.advertisedMem(2) == null);
+    // Its add commits: the figure it sent before is answered.
+    raft.commitMembership(&added, 2);
+    try std.testing.expectEqual(@as(u64, 1 << 30), (shard.advertisedMem(2) orelse return error.NoFigures).ram_bytes);
+}
+
+test "NodeMemTold: a peer is told again on a new link session or after the re-advertise interval, not before" {
+    var t: NodeMemTold = .{};
+    try std.testing.expect(t.due(2, 10, 0));
+    t.mark(2, 10, 1_000);
+    try std.testing.expect(!t.due(2, 10, 1_000 + NODE_MEM_READVERTISE_MS - 1));
+    // A reconnect between ticks: same id, new session.
+    try std.testing.expect(t.due(2, 11, 1_001));
+    // The interval passed: told again, repairing a frame the receiver dropped.
+    try std.testing.expect(t.due(2, 10, 1_000 + NODE_MEM_READVERTISE_MS));
+    // A peer that unlinked is forgotten, and its slot reused.
+    for (3..3 + NodeMemTold.N - 1) |id| t.mark(@intCast(id), 1, 1_000);
+    t.prune(&.{3});
+    try std.testing.expect(t.due(2, 10, 1_001));
+    try std.testing.expect(!t.due(3, 1, 1_001));
+    t.mark(9, 1, 1_000);
+    try std.testing.expect(!t.due(9, 1, 1_001));
 }
 
 /// A forward_write frame's payload: the forward id and fields the leader reads,

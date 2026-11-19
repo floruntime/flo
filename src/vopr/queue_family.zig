@@ -189,6 +189,7 @@ pub const Queues = struct {
             v.payload = "";
             v.queue = try a.dupe(u8, v.queue);
             v.@"error" = "";
+            if (v.request_key) |k| v.request_key = try a.dupe(u8, k);
             try s.msgs.put(a, qm.seqOf(item.key[4..]), v);
         }
         return s;
