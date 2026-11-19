@@ -466,7 +466,7 @@ const idKey = M.inNs;
 pub const machine: machine_mod.Machine = .{
     .name = "actions",
     .entry_types = &.{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_abandon_send },
-    .families = &.{ machine_mod.info(Defs), machine_mod.info(Runs), machine_mod.info(Ready), machine_mod.info(Deadlines), machine_mod.info(Requests) },
+    .families = &([_]machine_mod.FamilyInfo{ machine_mod.info(Defs), machine_mod.info(Runs) } ++ M.FAMILIES),
     .keys = keys,
     .apply = apply,
 };
