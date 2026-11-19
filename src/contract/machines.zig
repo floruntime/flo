@@ -38,6 +38,20 @@ pub const Channels = @import("channels.zig").ChannelsWith(&targets, &.{
 
 pub const list = targets ++ [_]machine.Machine{ Channels.machine, @import("../processing/sinks_machine.zig").machine, @import("../namespace/machine.zig").machine, @import("../workflow/defs_machine.zig").machine };
 
+/// Families only a test machine writes: no production family may take
+/// their ids either, so the check below sees them too.
+const test_only = machine.Machine{
+    .name = "test-only families",
+    .entry_types = &.{},
+    .families = &.{machine.info(@import("channel_probe.zig").GotFam)},
+    .keys = struct {
+        fn f(_: *const @import("../storage/ual/entry.zig").Entry, _: *@import("view.zig").KeySet) error{OutOfMemory}!void {}
+    }.f,
+    .apply = struct {
+        fn f(_: *@import("view.zig").View, _: *const @import("../storage/ual/entry.zig").Entry, _: *@import("../storage/persistence.zig").Result) @import("../storage/persistence.zig").ApplyError!void {}
+    }.f,
+};
+
 comptime {
-    machine.check(&list);
+    machine.check(&(list ++ [_]machine.Machine{test_only}));
 }

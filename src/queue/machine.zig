@@ -701,7 +701,7 @@ fn expireOne(view: *View, item: qe.ExpireItem.Value, stamp: u64) ApplyError!bool
 pub const machine: machine_mod.Machine = .{
     .name = "queues",
     .entry_types = &.{ .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge, .queue_requeue, .queue_drop },
-    .families = &.{ machine_mod.info(Metas), machine_mod.info(Msgs), machine_mod.info(Dead), machine_mod.info(Ready), machine_mod.info(Deadlines), machine_mod.info(Helds) },
+    .families = &([_]machine_mod.FamilyInfo{ machine_mod.info(Metas), machine_mod.info(Msgs), machine_mod.info(Dead), machine_mod.info(Helds) } ++ M.FAMILIES),
     .keys = keys,
     .apply = apply,
     .target = targetOf,
