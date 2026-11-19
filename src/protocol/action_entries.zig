@@ -261,6 +261,9 @@ pub const Answer = enum(u8) {
     /// A repair skipped the start, the channel message that carried it: it
     /// never runs. The reply's `why` names the repair.
     skipped = 5,
+    /// The callee won't take it now (a child whose workflow is disabled):
+    /// this call has no run. The reply's `why` says so.
+    refused = 6,
 };
 
 /// The action's shard's answer to a call's start, sent back to the
@@ -270,7 +273,7 @@ pub const Reply = Record(&.{
     .{ .name = "slot", .T = Int(u16) },
     .{ .name = "run", .T = RunId },
     .{ .name = "answer", .T = schema.Enum(Answer) },
-    // Why, when it's `skipped`: the repair's entry and the message.
+    // Why, when it's `skipped` or `refused`.
     .{ .name = "why", .T = Optional(Bytes(MAX_SKIP_WHY)) },
 });
 
