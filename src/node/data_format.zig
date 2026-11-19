@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 44;
+pub const CURRENT: u32 = 45;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -159,6 +159,10 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // its appends removed later by `stream_clean` entries and the tombstone
     // dropped by `stream_forget`, both new to the log.
     .{ .format = 44, .segment_version = 29, .entries = 0xecc2f68c0588f846 },
+    // A processing job's name is at most 4096 bytes and a workflow's version
+    // at most 256, so a logged definition past either no longer parses: a
+    // replayed workflow create would halt. The log is unchanged.
+    .{ .format = 45, .segment_version = 29, .entries = 0xecc2f68c0588f846 },
 };
 
 comptime {

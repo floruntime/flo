@@ -58,6 +58,9 @@ pub const OperatorSpec = job_definition.OperatorSpec;
 // Parse Errors
 // =============================================================================
 
+/// The longest job name: what a list page holds of a name.
+pub const MAX_JOB_NAME: usize = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
+
 pub const ParseError = error{
     MissingRequiredField,
     InvalidKind,
@@ -192,6 +195,9 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
     if (!mem.eql(u8, kind, "Processing")) return d.fail(ParseError.InvalidKind, "\"kind\" must be Processing, not \"{s}\"", .{kind});
 
     const name = try optString(d, root, "name") orelse "unnamed-job";
+    // A list page lists names this long at most: a longer one would fail
+    // every page that reaches it.
+    if (name.len > MAX_JOB_NAME) return d.fail(ParseError.InvalidFieldType, "a job name is at most {d} bytes, not {d}", .{ MAX_JOB_NAME, name.len });
     const description = try optString(d, root, "description") orelse "";
     const effective_namespace: []const u8 = try optString(d, root, "namespace") orelse (fallback_namespace orelse "default");
     const batch_size = try optPositive(u32, d, root, "batch_size", ParseError.InvalidFormat) orelse 100;
@@ -2227,5 +2233,21 @@ test "parser: a TS source's lateness window defaults to 30 s, takes 0, and is re
         } else {
             try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, null));
         }
+    }
+}
+
+test "parser: a job name the list page can't hold is refused at submit" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ MAX_JOB_NAME, MAX_JOB_NAME + 1 }) |len| {
+        const name = try allocator.alloc(u8, len);
+        defer allocator.free(name);
+        @memset(name, 'j');
+        const text = try std.fmt.allocPrint(allocator, "kind: Processing\nname: {s}\nsources:\n  - stream:\n      name: events\nsinks:\n  - stream:\n      name: results\n", .{name});
+        defer allocator.free(text);
+        if (len == MAX_JOB_NAME) {
+            var def = try parseJobDefinition(allocator, text, null);
+            defer def.deinit(allocator);
+            try std.testing.expectEqual(len, def.name.len);
+        } else try std.testing.expectError(ParseError.InvalidFieldType, parseJobDefinition(allocator, text, null));
     }
 }
