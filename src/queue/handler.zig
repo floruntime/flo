@@ -56,6 +56,7 @@ const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
 const ReadView = view_mod.ReadView;
 const NamespaceId = router.NamespaceId;
+const dead_page = @import("../node/dead_page.zig");
 const Msg = machine.Msg.Value;
 const Meta = machine.Meta.Value;
 
@@ -969,32 +970,33 @@ pub const QueueHandler = struct {
             found[nf] = .{ .dead_ns = d.dead_ns, .seq = d.seq };
             nf += 1;
         }
-        var last: ?queue_ops.DeadCursor.Value = null;
-        var more = false;
-        for (found[0..nf]) |d| {
-            if (page.count == limit) {
-                more = true;
-                break;
+        const Ctx = struct {
+            shard: *Shard,
+            ns: NamespaceId,
+            hash: @TypeOf(hash),
+            found: []const @TypeOf(found[0]),
+            page: *queue_ops.DeadPage.Builder,
+
+            fn take(c: *const @This(), i: usize) dead_page.Take {
+                const d = c.found[i];
+                const m = msgOf(c.shard, c.ns, c.hash, d.seq) orelse return .skipped;
+                const added = c.page.add(.{
+                    .seq = d.seq,
+                    .priority = m.priority,
+                    .deliveries = m.deliveries,
+                    .failures = m.failures,
+                    .enqueued_at_ms = nsToMs(m.enqueued_ns),
+                    .dead_at_ms = nsToMs(d.dead_ns),
+                    .size = @intCast(m.payload.len),
+                    .payload = m.payload[0..@min(m.payload.len, queue_ops.MAX_DLQ_PAYLOAD)],
+                    .@"error" = m.@"error"[0..@min(m.@"error".len, queue_ops.MAX_DLQ_ERROR)],
+                }) catch false;
+                return if (added) .added else .full;
             }
-            const m = msgOf(shard, req.ns_id, hash, d.seq) orelse continue;
-            const added = page.add(.{
-                .seq = d.seq,
-                .priority = m.priority,
-                .deliveries = m.deliveries,
-                .failures = m.failures,
-                .enqueued_at_ms = nsToMs(m.enqueued_ns),
-                .dead_at_ms = nsToMs(d.dead_ns),
-                .size = @intCast(m.payload.len),
-                .payload = m.payload[0..@min(m.payload.len, queue_ops.MAX_DLQ_PAYLOAD)],
-                .@"error" = m.@"error"[0..@min(m.@"error".len, queue_ops.MAX_DLQ_ERROR)],
-            }) catch false;
-            if (!added) {
-                more = true;
-                break;
-            }
-            last = .{ .dead_ns = d.dead_ns, .seq = d.seq };
-        }
-        return .{ .answer = .{ .dead = page.value(), .cursor = if (more) last else null } };
+        };
+        const w = dead_page.walk(nf, limit, &Ctx{ .shard = shard, .ns = req.ns_id, .hash = hash, .found = found[0..nf], .page = &page }, Ctx.take);
+        const cursor: ?queue_ops.DeadCursor.Value = if (!w.more) null else if (w.last) |i| .{ .dead_ns = found[i].dead_ns, .seq = found[i].seq } else null;
+        return .{ .answer = .{ .dead = page.value(), .cursor = cursor } };
     }
 
     /// The messages a requeue or delete names, or with `all` the queue's
