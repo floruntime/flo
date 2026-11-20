@@ -1215,6 +1215,8 @@ pub const QueueHandler = struct {
         }
         self.acking.clearRetainingCapacity();
         self.expiring = null;
+        // `expiring_full` stays: it is read only by the apply of the expire
+        // `expiring` names, cleared here, and set again by the next one.
         self.duty_term = 0;
     }
 };

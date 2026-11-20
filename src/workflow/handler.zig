@@ -4839,7 +4839,6 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     const partitions = try std.testing.allocator.alloc(*Partition, 1);
     partitions[0] = partition;
     shard.partitions = partitions;
-    shard.replay_registry = .{};
     shard.apply_buf = try std.testing.allocator.alloc(u8, @import("../protocol/limits.zig").MAX_LOG_ENTRY_PAYLOAD);
     shard.entry_buf = try std.testing.allocator.alloc(u8, persistence_mod.MAX_PERSIST_PAYLOAD);
     shard.scratch = try @import("../node/scratch.zig").Scratch.init(std.testing.allocator, shard_mod.SCRATCH_SIZE);

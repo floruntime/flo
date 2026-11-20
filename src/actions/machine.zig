@@ -213,6 +213,8 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
                 if (item.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, item.holder, k));
             }
         },
+        // A hand-back reads and writes nothing here.
+        .action_abandon => {},
         else => {},
     }
 }
@@ -373,6 +375,10 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             try view.put(Runs, rk, run);
             out.putInt(u64, to);
         },
+        // A task handed back, as a message: its run's leader ends the lease
+        // from its own record once it applies (`ActionsHandler.afterApply`).
+        // It changes nothing here.
+        .action_abandon => {},
         .action_abandon_send => {
             // Only an await's shard makes these, from a task it holds.
             const p = ae.Abandon.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -469,12 +475,32 @@ const idKey = M.inNs;
 
 pub const machine: machine_mod.Machine = .{
     .name = "actions",
-    .entry_types = &.{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_abandon_send },
+    .entry_types = &.{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_abandon_send, .action_abandon },
     .families = &([_]machine_mod.FamilyInfo{ machine_mod.info(Defs), machine_mod.info(Runs) } ++ M.FAMILIES),
     .keys = keys,
     .apply = apply,
     .skipped = skipped,
+    .malformed = malformed,
+    .namespace = namespaceOf,
 };
+
+/// A hand-back that doesn't decode was built wrong by its sender. Only a
+/// hand-back is checked: no other type here comes over a channel this way.
+fn malformed(e: *const Entry) ?[]const u8 {
+    if (typeOf(e) != .action_abandon) return null;
+    var diag: schema.Diagnostic = .{};
+    _ = ae.Abandon.decodeAll(e.payload, &diag) catch return "bad request: a hand-back that doesn't decode";
+    return null;
+}
+
+/// A hand-back's namespace, held to its message's origin; null for every
+/// other type, whose keys say it.
+fn namespaceOf(e: *const Entry) ?u32 {
+    if (typeOf(e) != .action_abandon) return null;
+    var diag: schema.Diagnostic = .{};
+    const p = ae.Abandon.decodeAll(e.payload, &diag) catch return null;
+    return p.ns;
+}
 
 /// A call's start a repair skipped: its caller is told, so the step fails
 /// saying so. A start no workflow made has nobody waiting.

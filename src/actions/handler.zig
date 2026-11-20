@@ -1210,7 +1210,7 @@ pub const ActionsHandler = struct {
 
     /// A task handed back from another shard, its message committed here:
     /// this leader ends the lease from its own record, as a worker's abandon
-    /// would. Its applier is the after-apply step; the registry's is none.
+    /// would. The actions machine applies it as nothing (`machine.zig`).
     fn abandonApplied(self: *ActionsHandler, shard: *Shard, e: *const Entry) void {
         if (shard.raft_node.role != .leader) return;
         var diag: schema.Diagnostic = .{};
@@ -1226,10 +1226,6 @@ pub const ActionsHandler = struct {
         // says, and the token fences it.
         self.abandon(shard, ns, if (p.holder.len > 0) p.holder else run.holder, t);
     }
-
-    /// The registry's applier for a handed-back task: nothing, since its
-    /// work is the leader's (`abandonApplied`), and a replay must not redo it.
-    pub fn applyAbandonMessage(_: *anyopaque, _: *const Entry, _: *Result) persistence.ApplyError!void {}
 
     /// An await's (or an ask's) answer that found no one to take it: its
     /// client went away, was told at its deadline, or its gather ended. A
@@ -1830,6 +1826,8 @@ pub const ActionsHandler = struct {
         self.dropped = null;
         self.rebuilding = false;
         self.expiring = null;
+        // `expiring_full` stays: it is read only by the apply of the expire
+        // `expiring` names, cleared here, and set again by the next one.
         self.duty_term = 0;
     }
 

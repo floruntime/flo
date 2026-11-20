@@ -95,10 +95,7 @@ pub fn listRule(comptime machines: []const Machine) ?[]const u8 {
         // keeps alike: they run in this list's order (`observeAll`); each
         // writes only its own families (`observeEntry` halts otherwise); none
         // can refuse, as `observe` has no result; and each runs inside the
-        // keys it declares itself, in a view of its own. A message applied
-        // after its inbound commits is followed the same way; its observers
-        // key by the namespace its payload names, which the channel holds to
-        // the message's origin (`AfterCommit.namespace`).
+        // keys it declares itself, in a view of its own.
         for (m.observes, 0..) |t, j| for (m.observes[0..j]) |u| if (t == u)
             return std.fmt.comptimePrint("{s} observes entry type {s} twice", .{ m.name, @tagName(t) });
     }
@@ -121,15 +118,11 @@ pub fn check(comptime machines: []const Machine) void {
 /// Every machine that follows `e`, an entry another applier applied and
 /// didn't refuse, in the list's order: each commits before the next runs, so
 /// a later one reads what an earlier one wrote, on every replica alike.
-/// Where an observed entry came from: the log itself, or a message another
-/// group sent, applied inside an inbound.
-pub const ObservedFrom = enum { entry, message };
-
-pub fn observeAll(comptime machines: []const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, e: *const Entry, from: ObservedFrom) ApplyError!void {
+pub fn observeAll(comptime machines: []const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, e: *const Entry) ApplyError!void {
     const etype: EntryType = @fromBackingInt(@intCast(e.header.entry_type));
     inline for (machines) |*m| {
         for (m.observes) |t| if (t == etype) {
-            try observeEntry(m, store, scratch, e, from);
+            try observeEntry(m, store, scratch, e);
             break;
         };
     }
@@ -139,10 +132,10 @@ pub fn observeAll(comptime machines: []const Machine, store: *store_mod.Store, s
 /// state with it, and what it sends leaves with them. A write to another
 /// machine's family halts: an observer keeps only its own.
 ///
-/// An observer sends only on observing an edge entry (a client's write or a
-/// leader's own proposal), never a message it applied, so an observed entry
-/// can't start a chain of sends.
-pub fn observeEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, e: *const Entry, from: ObservedFrom) ApplyError!void {
+/// Only an entry from the log itself is observed (a client's write or a
+/// leader's own proposal), never a message an inbound applied, so what an
+/// observer sends can't start a chain of sends.
+pub fn observeEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, e: *const Entry) ApplyError!void {
     if (m.observe_needed) |needed| if (!needed(.{ .store = store }, e)) return;
     _ = scratch.reset(.retain_capacity);
     const arena = scratch.allocator();
@@ -152,9 +145,6 @@ pub fn observeEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.he
     try m.observe.?(&view, e);
     for (view.ops.items) |op| if (!ownsFamily(m, op.fam)) return error.Halt;
     if (view.sends.items.len > 0) {
-        // Never for a message it observed: that would start a chain of
-        // sends no edge paid for. A bug in this build, so it halts.
-        if (from == .message) return error.Halt;
         if (channels.tooMuchSent(view.sends.items) != null) return error.Halt;
         try channels.writeSends(&view, e.header.index);
     }

@@ -75,7 +75,6 @@ const EntryType = entry_mod.EntryType;
 const UAL = @import("../storage/ual/ual.zig").UAL;
 const persistence_mod = @import("../storage/persistence.zig");
 const Result = persistence_mod.Result;
-const ReplayRegistry = persistence_mod.ReplayRegistry;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const TieredLogMetrics = @import("../metrics/registry.zig").TieredLogMetrics;
 
