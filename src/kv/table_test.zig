@@ -684,7 +684,7 @@ test "kv ops: history pages below before_version, and more says older versions f
     try testing.expectEqual(@as(usize, 2), pages);
 }
 
-test "kv ops: history marks a delete's version deleted" {
+test "kv ops: history marks a delete's version deleted, and keeps nothing from before it" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
@@ -692,7 +692,7 @@ test "kv ops: history marks a delete's version deleted" {
     _ = try h.ok("kv.delete", "k", .{ .cas_version = null, .txn = null });
     _ = try h.set("k", setBody("v3", .{}));
     var it = (try h.ok("kv.history", "k", .{ .limit = 10, .before_version = null })).versions.iterator();
-    for ([_]struct { version: u64, deleted: bool }{ .{ .version = 3, .deleted = false }, .{ .version = 2, .deleted = true }, .{ .version = 1, .deleted = false } }) |want| {
+    for ([_]struct { version: u64, deleted: bool }{ .{ .version = 3, .deleted = false }, .{ .version = 2, .deleted = true } }) |want| {
         const v = (try it.next()).?;
         try testing.expectEqual(want.version, v.version);
         try testing.expectEqual(want.deleted, v.deleted);

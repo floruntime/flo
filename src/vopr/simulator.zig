@@ -39,6 +39,7 @@ const queue_workload = @import("queue_workload.zig");
 const processing_family = @import("processing_family.zig");
 const workflow_defs_family = @import("workflow_defs_family.zig");
 const workflow_runs_family = @import("workflow_runs_family.zig");
+const kv_reap_workload = @import("kv_reap_workload.zig");
 const group_family = @import("group_family.zig");
 const group_workload = @import("group_workload.zig");
 const namespace_entries = @import("../protocol/namespace_entries.zig");
@@ -93,6 +94,10 @@ pub const Invariant = enum {
     /// An entry a server machine refused changed a family anyway. Every
     /// replica would agree on it, so `state_checksum` can't see it.
     refusal_wrote,
+    /// Keys that go: a reap drops every named key gone by its stamp, a
+    /// tombstone keeps no history, and a key written after it went never
+    /// repeats a version it had.
+    kv_reap_rule,
     /// An applied action entry broke a rule a lease must keep: delivered
     /// early, ended by a stale report or key, a failure uncounted. Every
     /// replica would apply the bug alike, so only the entry shows it.
@@ -2083,6 +2088,7 @@ pub const Simulator = struct {
         if (self.scenario.group_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.group_percent) return self.submitGroupOp(target);
         if (self.scenario.processing_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.processing_percent) return self.submitJobOp(target);
         if (self.scenario.workflow_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.workflow_percent) return self.submitWorkflowDefOp(target);
+        if (self.scenario.kv_reap_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.kv_reap_percent) return self.submitKvReapOp(target);
         const op = try self.workload.nextOp();
         if (op.entry_type == .namespace_create) return self.submitCreate(target, op.id, op.payload);
         // Production refuses a client write on a leader still applying earlier
@@ -2192,6 +2198,20 @@ pub const Simulator = struct {
         } else workflow_defs_family.make(self.action_prng.random(), self.action_buf) orelse return;
         const id = try self.workload.nextActionOp(made.entry_type, made.payload);
         std.debug.assert(id == op_id);
+        const res = target.raft.propose(made.entry_type, 0, made.payload) catch return;
+        self.workload.recordProposal(id, target.id, res.term, res.index);
+        try self.pending_ops.append(self.allocator, id);
+    }
+
+    /// A KV entry of keys that go (`kv_reap_workload`): a reap made from the
+    /// leader's own applied store at its clock, as its reap duty makes one.
+    fn submitKvReapOp(self: *Simulator, target: *SimNode) !void {
+        if (!target.raft.leaderReady()) {
+            self.leader_not_ready_refused += 1;
+            return;
+        }
+        const made = kv_reap_workload.make(self.action_prng.random(), self.action_buf, &target.kv.store, target.raft.wall_clock.read()) orelse return;
+        const id = try self.workload.nextActionOp(made.entry_type, made.payload);
         const res = target.raft.propose(made.entry_type, 0, made.payload) catch return;
         self.workload.recordProposal(id, target.id, res.term, res.index);
         try self.pending_ops.append(self.allocator, id);
@@ -2533,6 +2553,13 @@ pub const Simulator = struct {
                 .index = idx,
                 .tick = self.now,
                 .detail = "the KV machine decided a put's condition other than its key says",
+            },
+            error.ReapRuleBroken => .{
+                .invariant = .kv_reap_rule,
+                .node = node.id,
+                .index = idx,
+                .tick = self.now,
+                .detail = node.kv.reap_broke orelse "a KV reap rule broke",
             },
             else => .{
                 .invariant = .applied_integrity,

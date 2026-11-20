@@ -105,6 +105,26 @@ pub const JsonPatch = Record(&.{
     .{ .name = "document", .T = Optional(Bytes(kv_ops.MAX_DOCUMENT)) },
 });
 
+/// The most keys one reap names.
+pub const MAX_REAP_KEYS = 64;
+pub const ReapKey = Record(&.{
+    .{ .name = "key", .T = Key },
+});
+pub const ReapKeys = schema.BoundedList(ReapKey, MAX_REAP_KEYS, MAX_REAP_KEYS * ReapKey.max_size);
+/// The leader's drop of keys that have gone: each named key whose TTL ran
+/// out by the entry's stamp, or a tombstone `kv_ops.TOMBSTONE_KEEP_MS` old
+/// by it, decided at apply; a key that is neither by then stays.
+pub const Reap = Record(&.{
+    .{ .name = "keys", .T = ReapKeys },
+});
+
+/// A reap's payload: `keys`, each stored (`id ‖ key`). Encoded from a
+/// slice, as a batch's ops are.
+pub fn encodeReap(w: *schema.Writer, keys: []const ReapKey.Value) schema.EncodeError!void {
+    comptime std.debug.assert(Reap.field_list.len == 1 and Reap.field_list[0].T == ReapKeys);
+    try ReapKeys.encodeSlice(w, keys);
+}
+
 pub const table = [_]entries.Entry{
     .{ .name = "kv.put", .type_code = 0x01, .payload = Put, .max_payload = Put.max_size, .doc = "A key's new value, with its TTL if it has one." },
     .{ .name = "kv.delete", .type_code = 0x02, .payload = Delete, .max_payload = Delete.max_size, .doc = "A key deleted." },
@@ -112,6 +132,7 @@ pub const table = [_]entries.Entry{
     .{ .name = "kv.incr", .type_code = 0x04, .payload = Incr, .max_payload = Incr.max_size, .doc = "A counter's delta." },
     .{ .name = "kv.expire", .type_code = 0x05, .payload = Expire, .max_payload = Expire.max_size, .doc = "A key's TTL set, or cleared with 0." },
     .{ .name = "kv.json_patch", .type_code = 0x06, .payload = JsonPatch, .max_payload = JsonPatch.max_size, .doc = "A JSON document set or deleted at a path, merged with the key's value at apply." },
+    .{ .name = "kv.reap", .type_code = 0x07, .payload = Reap, .max_payload = Reap.max_size, .doc = "The leader's drop of keys whose TTL ran out, and of old tombstones." },
 };
 
 /// The payload schema of the KV entry with UAL type `type_code`.

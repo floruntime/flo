@@ -52,6 +52,10 @@ pub const HISTORY_MAX_BYTES: u32 = 64 * 1024;
 /// A literal, not a struct's size, so what replicas keep doesn't depend
 /// on a layout or the pointer width.
 pub const HISTORY_ENTRY_COST: u32 = 64;
+/// How long a deleted key's tombstone stays before the leader's reap drops
+/// it. Every replica judges it from the reap's stamp, so changing it
+/// changes what applies: a format change, not a tuning knob.
+pub const TOMBSTONE_KEEP_MS: u64 = 60 * 60 * 1000;
 /// Versions one history answer can list: the current one and the chain.
 pub const MAX_HISTORY: u32 = HISTORY_MAX_VERSIONS + 1;
 /// A scan's cursor: the shard it stopped on (u16), then the last key it

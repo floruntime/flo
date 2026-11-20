@@ -175,7 +175,7 @@ const READ_CHUNK: usize = 64 * 1024;
 /// frame of up to MAX_REQUEST_SIZE bytes, header included (a whole kv.get
 /// answer, or one `deliverDeferredOk` frames for another shard or node), or
 /// a single-key KV entry's payload.
-pub const SCRATCH_SIZE: usize = @max(@sizeOf(proto.ResponseHeader) + MAX_REQUEST_SIZE, @sizeOf(proto.ResponseHeader) + table_run.op("kv.get").response.max_size, kv_handler_mod.MAX_KEY_ENTRY_PAYLOAD);
+pub const SCRATCH_SIZE: usize = @max(@sizeOf(proto.ResponseHeader) + MAX_REQUEST_SIZE, @sizeOf(proto.ResponseHeader) + table_run.op("kv.get").response.max_size, kv_handler_mod.MAX_KEY_ENTRY_PAYLOAD, kv_entries.Reap.max_size);
 comptime {
     // An answer frame is sized from the request limit.
     std.debug.assert(MAX_REQUEST_SIZE >= proto.MAX_ANSWER_BYTES);
@@ -634,6 +634,12 @@ pub const Shard = struct {
     /// and never reset: a node that leads again goes on from where it last
     /// stopped, which shares the budget just as well.
     drain_after: ?stream_mod.StreamKey = null,
+    /// The last KV key the reap duty looked at, so the next pass goes on
+    /// from it; null to start from the first.
+    reap_after: [kv_machine.MAX_KEY]u8 = undefined,
+    reap_after_len: ?usize = null,
+    /// The last reap the reap duty proposed: a pass waits for it to apply.
+    reap_inflight: ?struct { index: u64, term: u64 } = null,
     join_first_asked_ms: u64,
     join_warned_ms: u64,
     join_refused_warn_ms: u64,
@@ -7151,6 +7157,14 @@ pub const Shard = struct {
             @ptrCast(self),
         ) catch {};
 
+        // KV keys whose TTL ran out, and old tombstones, on the leader.
+        self.task_scheduler.register(
+            "kv_reap",
+            KV_REAP_INTERVAL_MS,
+            kvReapTask,
+            @ptrCast(self),
+        ) catch {};
+
         // Action leases past their deadline, on the leader. The key bound
         // needs it at least every half the shortest lease.
         self.task_scheduler.register(
@@ -7296,6 +7310,92 @@ pub const Shard = struct {
 
         trims_proposed += self.drainReclaim(read);
         return trims_proposed;
+    }
+
+    const KV_REAP_INTERVAL_MS: u64 = 1_000;
+    /// The most reaps one pass proposes, each of at most `MAX_REAP_KEYS`:
+    /// a pass a second keeps up with this many keys going a second.
+    const KV_REAP_BATCHES: usize = 8;
+    /// The most keys one pass looks at: the whole store is walked in about
+    /// one pass per this many keys.
+    const KV_REAP_VISITS: usize = 8 * 4096;
+
+    /// TaskScheduler callback: on the leader, propose the drop of KV keys
+    /// that have gone (`Current.reapableAt`) by its clock, up to
+    /// `KV_REAP_BATCHES` reaps a pass, from after the last key looked at.
+    /// Each replica judges every key again from the entry's stamp, so one
+    /// written meanwhile stays. A pass waits for the last pass's reaps to
+    /// apply, so it names none of their keys again and at most one pass's
+    /// reaps are ever in flight.
+    fn kvReapTask(ctx: *anyopaque) u64 {
+        const self: *Shard = @ptrCast(@alignCast(ctx));
+        if (self.raft_node.role != .leader) return 0;
+        // Held on a halted shard, and counted as held only if a key waits.
+        if (self.heldIfHalted(.kv_reap, self.halted != null and anyReapable(self.kv_handler.kv.store, self.raft_node.now()))) return 0;
+        self.duties.note(.kv_reap, null, nowMs());
+        // The last pass's reaps, in this term, not applied yet. One from an
+        // earlier term may never apply: it doesn't hold this one back.
+        if (self.reap_inflight) |f| {
+            if (f.term == self.raft_node.current_term and self.raft_node.last_applied < f.index) return 0;
+            self.reap_inflight = null;
+        }
+        const read: view_mod.ReadView = .{ .store = self.kv_handler.kv.store };
+        const now_ns = self.raft_node.now();
+        var from_buf: [kv_machine.MAX_KEY]u8 = undefined;
+        const from: ?[]const u8 = if (self.reap_after_len) |len| blk: {
+            @memcpy(from_buf[0..len], self.reap_after[0..len]);
+            break :blk from_buf[0..len];
+        } else null;
+        var it = if (from) |f| read.rangeAfter(kv_machine.Values, "", f) else read.range(kv_machine.Values, "");
+        var keys: [kv_entries.MAX_REAP_KEYS]kv_entries.ReapKey.Value = undefined;
+        var n: usize = 0;
+        var visits: usize = 0;
+        var batches: usize = 0;
+        var reaped: u64 = 0;
+        while (true) {
+            const item = if (visits == KV_REAP_VISITS) null else (it.next() catch null);
+            if (item) |kv| {
+                visits += 1;
+                if (kv.value.reapableAt(now_ns)) {
+                    keys[n] = .{ .key = kv.key };
+                    n += 1;
+                }
+            }
+            // A full batch, or the last of what this pass looks at.
+            if (n == keys.len or (item == null and n > 0)) {
+                const res = kv_handler_mod.KVHandler.proposeReap(self, keys[0..n]) catch |err| {
+                    if (!self.quietHalted(err)) log.err("kv reap: {d} keys not proposed: {s}", .{ n, @errorName(err) });
+                    return reaped;
+                };
+                self.reap_inflight = .{ .index = res.index, .term = res.term };
+                reaped += n;
+                n = 0;
+                batches += 1;
+            }
+            if (item) |kv| {
+                // From after it next pass.
+                @memcpy(self.reap_after[0..kv.key.len], kv.key);
+                self.reap_after_len = kv.key.len;
+                if (batches == KV_REAP_BATCHES) return reaped;
+                continue;
+            }
+            // The store's end: the next pass starts from its first key. A
+            // pass cut short by its visits goes on from where it stopped.
+            if (visits < KV_REAP_VISITS) self.reap_after_len = null;
+            return reaped;
+        }
+    }
+
+    /// Whether any of the first `KV_REAP_VISITS` keys has gone by `now_ns`:
+    /// what a halted shard's reap duty is holding back.
+    fn anyReapable(store: *contract_store.Store, now_ns: u64) bool {
+        const read: view_mod.ReadView = .{ .store = store };
+        var it = read.range(kv_machine.Values, "");
+        for (0..KV_REAP_VISITS) |_| {
+            const item = (it.next() catch return false) orelse return false;
+            if (item.value.reapableAt(now_ns)) return true;
+        }
+        return false;
     }
 
     /// The most cleans and forgets one retention pass proposes, over every
@@ -19163,6 +19263,64 @@ test "applyCommitted: an applier that proposes does not re-enter the drain" {
     try std.testing.expect(shard.kv_handler.kv.getIn(.default, "nested") != null);
     try std.testing.expectEqual(shard.raft_node.commit_index, shard.raft_node.last_applied);
     try std.testing.expectEqual(@as(u32, 1), Probe.calls);
+}
+
+test "Shard: the reap duty keeps up with more keys going a second than one reap names, and waits for its reaps to apply" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    // Five reaps' worth of keys whose TTL runs out at once.
+    const n = 5 * kv_entries.MAX_REAP_KEYS;
+    var pbuf: [128]u8 = undefined;
+    for (0..n) |i| {
+        var key: [16]u8 = undefined;
+        key[0..4].* = ns_table.DEFAULT.bytes();
+        const raw = std.fmt.bufPrint(key[4..], "k{d}", .{i}) catch unreachable;
+        const put = try kv_entries.Put.encodeInto(&pbuf, .{ .key = key[0 .. 4 + raw.len], .value = "v", .ttl_ms = 1, .condition = .always, .cas_version = null });
+        _ = try shard.raft_node.propose(.kv_put, entry_mod.Flags.NONE, put);
+    }
+    try std.testing.expect(shard.applyCommitted());
+    const values = &shard.kv_handler.kv.store.families[kv_machine.Values.ID];
+    try std.testing.expectEqual(@as(u64, n), values.count);
+    @import("stdx").time.sleep(5 * std.time.ns_per_ms);
+    // One pass names them all, in several reaps; the next waits for them.
+    try std.testing.expectEqual(@as(u64, n), Shard.kvReapTask(@ptrCast(&shard)));
+    try std.testing.expectEqual(@as(u64, 0), Shard.kvReapTask(@ptrCast(&shard)));
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expectEqual(@as(u64, 0), values.count);
+    // Applied: the next pass looks again, from the store's start.
+    try std.testing.expectEqual(@as(u64, 0), Shard.kvReapTask(@ptrCast(&shard)));
+    try std.testing.expect(shard.reap_after_len == null);
+}
+
+test "Shard: a halted shard holds its reap duty, and counts it held only while a key has gone" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    var pbuf: [128]u8 = undefined;
+    const key = ns_table.DEFAULT.bytes() ++ "k";
+    _ = try shard.raft_node.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = key, .value = "v", .ttl_ms = 60_000, .condition = .always, .cas_version = null }));
+    try std.testing.expect(shard.applyCommitted());
+    shard.halted = .{ .index = 1, .term = 1, .crc = 0 };
+    // Nothing gone: held, and nothing to say so for.
+    try std.testing.expectEqual(@as(u64, 0), Shard.kvReapTask(@ptrCast(&shard)));
+    try std.testing.expectEqual(@as(u32, 0), shard.duties.held());
+    // A key gone: still nothing proposed, and now counted as held.
+    _ = try shard.raft_node.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = key, .value = "v", .ttl_ms = 1, .condition = .always, .cas_version = null }));
+    shard.halted = null;
+    try std.testing.expect(shard.applyCommitted());
+    shard.halted = .{ .index = 1, .term = 1, .crc = 0 };
+    @import("stdx").time.sleep(5 * std.time.ns_per_ms);
+    const last = shard.raft_node.log.lastIndex();
+    try std.testing.expectEqual(@as(u64, 0), Shard.kvReapTask(@ptrCast(&shard)));
+    try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
+    try std.testing.expectEqual(@as(u32, 1), shard.duties.held());
 }
 
 test "a shard whose saved term or log runs past the term ceiling refuses to start, rather than take it" {

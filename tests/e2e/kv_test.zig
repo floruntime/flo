@@ -1547,14 +1547,14 @@ test "e2e/kv: history for non-existent key fails" {
     try testing.expectEqual(@as(u8, 1), result.exit_code);
 }
 
-test "e2e/kv: history after delete preserves prior versions" {
+test "e2e/kv: history after delete shows the delete alone: the value before it goes" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     try ctx.exec(&.{ "kv", "set", "del_hist", "alive_value" });
     try ctx.exec(&.{ "kv", "delete", "del_hist" });
 
-    // The delete is a version too, and the value before it is still there.
+    // The delete is a version too; the value before it went with it.
     var result = try ctx.cli.run(&.{ "kv", "history", "del_hist", "-o", "raw" });
     defer result.deinit();
     try testing.expectEqual(@as(u8, 0), result.exit_code);
@@ -1563,9 +1563,6 @@ test "e2e/kv: history after delete preserves prior versions" {
     const deleted = lines.next() orelse return error.TooFewVersions;
     try testing.expect(std.mem.startsWith(u8, deleted, "2\t"));
     try testing.expect(std.mem.endsWith(u8, deleted, "\ttrue\t"));
-    const alive = lines.next() orelse return error.TooFewVersions;
-    try testing.expect(std.mem.startsWith(u8, alive, "1\t"));
-    try testing.expect(std.mem.endsWith(u8, alive, "\tfalse\talive_value"));
     try testing.expect(lines.next() == null);
 }
 
@@ -2571,4 +2568,34 @@ test "e2e/kv: json set adds field after field to one object" {
     }
     const doc = try ctx.execCapture(&.{ "kv", "json", "get", "grown" });
     try testing.expectEqualStrings("{\"a\":1,\"b\":2,\"c\":3,\"d\":3,\"e\":3,\"f\":3,\"g\":3,\"h\":3,\"i\":3,\"j\":3}", std.mem.trimEnd(u8, doc, "\n"));
+}
+
+test "e2e/kv: a key whose TTL ran out is reaped with its history, and a write after starts past the version it had" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "reaped", "one" });
+    try ctx.exec(&.{ "kv", "set", "reaped", "two", "--ttl-ms", "300" });
+    // The leader's reap runs each second: give it a few.
+    const deadline = stdx.time.milliTimestamp() + 10_000;
+    while (true) {
+        var h = try ctx.cli.run(&.{ "kv", "history", "reaped", "-o", "raw" });
+        defer h.deinit();
+        if (h.exit_code == 1) {
+            try expectNotFound(h);
+            break;
+        }
+        // Expired, not yet reaped: its versions are still there.
+        try testing.expectEqual(@as(u8, 0), h.exit_code);
+        try testing.expect(std.mem.startsWith(u8, h.stdout, "2\t"));
+        if (stdx.time.milliTimestamp() > deadline) return error.NeverReaped;
+        stdx.time.sleep(200 * std.time.ns_per_ms);
+    }
+    // Version 2 went with it: a CAS at 2 can't match the key's next life.
+    try ctx.exec(&.{ "kv", "set", "reaped", "three" });
+    try testing.expectEqual(@as(?u64, 3), parseVersion(try ctx.execCapture(&.{ "kv", "get", "reaped", "-o", "json" })));
+    var stale = try ctx.cli.run(&.{ "kv", "set", "reaped", "late", "--cas-version", "2" });
+    defer stale.deinit();
+    try testing.expectEqual(@as(u8, 3), stale.exit_code);
+    try testing.expectEqualStrings("Error: conflict: cas_version isn't the key's version [conflict/cas_mismatch]", std.mem.trimEnd(u8, stale.stderr, "\n"));
 }
