@@ -330,13 +330,13 @@ jobs:
         run: |
           mode=check
           if [ "${{ github.event_name }}" = pull_request ] && changed=$(git diff --name-only HEAD^1 HEAD) && [ -n "$changed" ]; then
-            if ! grep -qE '^(src/(vopr|raft|replica|storage/ual|stdx|kv|contract|actions|queue|stream|projection|namespace|protocol)/|src/node/repair\.zig|src/node/replay\.zig|src/storage/persistence\.zig|src/plant\.zig|build\.zig|scripts/vopr-seed-undos\.sh)' <<< "$changed"; then
+            if ! grep -qE '^(src/(vopr|raft|replica|storage/ual|stdx|kv|contract|actions|queue|stream|projection|namespace|protocol|workflow)/|src/node/repair\.zig|src/node/replay\.zig|src/storage/persistence\.zig|src/plant\.zig|build\.zig|scripts/vopr-seed-undos\.sh)' <<< "$changed"; then
               mode=compile
             fi
           fi
           echo "running $mode"
           scripts/vopr-seed-undos.sh "$mode"
-        timeout-minutes: 15
+        timeout-minutes: 25
   # The simulator runs ReleaseSafe (-Drelease selects it) so any UB in the
   # unit under test traps instead of silently corrupting a run. Seeds 1-20
   # are the known-green set; the wider swarm finds real bugs and is run
