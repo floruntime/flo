@@ -546,7 +546,7 @@ fn printJobCounts(c: vopr.families.Jobs.Counts) void {
 
 /// The workflow runs machine's entries, applied/refused by kind.
 fn printWorkflowRunCounts(c: vopr.workflow_runs_family.WorkflowRuns.Counts) void {
-    var buf: [256]u8 = undefined;
+    var buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     w.writeAll("[vopr] workflow runs:") catch {};
     for (std.enums.values(vopr.workflow_runs_family.WorkflowRuns.Kind), c.applied, c.refused) |k, a, r| w.print(" {t}={d}/{d}", .{ k, a, r }) catch {};

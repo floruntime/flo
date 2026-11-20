@@ -32,6 +32,7 @@ const machine_mod = @import("../contract/machine.zig");
 const delivery = @import("../contract/delivery.zig");
 const router = @import("../node/router.zig");
 const NamespaceId = @import("../namespace/table.zig").Id;
+const plant = @import("../plant.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -289,7 +290,10 @@ pub fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             const p = ae.Done.decodeAll(e.payload, &diag) catch return error.Halt;
             var c = (found orelse return out.putInt(u8, 0)).v;
             out.putInt(u8, 1);
-            if (c.state == .done) return;
+            // A call settles once: a run's end after it settled refused or
+            // no action (a skipped `started`, say) leaves it as it was.
+            const settled = if (comptime plant.active == .runs_done_overrides_settled) c.state == .done else c.state != .sent and c.state != .started;
+            if (settled) return;
             c.state = .done;
             c.status = @backingInt(p.status);
             c.outcome = p.outcome;

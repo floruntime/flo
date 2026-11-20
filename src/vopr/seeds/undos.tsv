@@ -16,11 +16,16 @@ workflow-defs-redefine-enables.json	defs_redefine_enables	--workflows	-	workflow
 workflow-defs-enable-anchor.json	defs_enable_moves_anchor	--workflows	-	workflow_rule	schedule anchor is not the ledger.s
 workflow-runs-cancel-keeps-active.json	runs_cancel_keeps_active	--workflows	-	workflow_run_rule	count is not its runs not ended
 workflow-runs-hist-257.json	runs_hist_keeps_257	--workflows	-	workflow_run_rule	history counts are not the ledger.s
-workflow-runs-ended-step.json	runs_ended_takes_step	--workflows	-	workflow_run_rule	applied an entry the ledger refuses
+workflow-runs-ended-step.json	runs_ended_takes_step	--workflows	-	workflow_run_rule	applied a step the ledger refuses: the run has ended
 workflow-runs-fired-back.json	runs_fired_moves_back	--workflows	-	workflow_run_rule	count or fired slot is not the ledger.s
 workflow-runs-idem-unwritten.json	runs_idem_unwritten	--workflows	-	workflow_run_rule	idempotency keys are not the ledger.s
-workflow-runs-idem-unchecked.json	runs_idem_unchecked	--workflows	-	workflow_run_rule	(count or fired slot is not the ledger.s|refused an entry the ledger applies)
+workflow-runs-idem-unchecked.json	runs_idem_unchecked	--workflows	-	workflow_run_rule	(count or fired slot is not the ledger.s|refused a start the ledger applies|run the ledger doesn.t hold is stored)
 workflow-runs-disabled-child-created.json	runs_disabled_child_created	--workflows	-	workflow_run_rule	(reply is not the ledger.s|count or fired slot|record is not the ledger.s)
-workflow-runs-disabled-child-refused.json	runs_disabled_child_refused	--workflows	-	workflow_run_rule	refused an entry the ledger applies
+workflow-runs-disabled-child-refused.json	runs_disabled_child_refused	--workflows	-	workflow_run_rule	refused a start the ledger applies
 workflow-runs-any-start-fires.json	runs_any_start_fires	--workflows	-	workflow_run_rule	count or fired slot is not the ledger.s
 workflow-runs-any-start-answers.json	runs_any_start_answers_parent	--workflows	-	workflow_run_rule	sent a parent a message the ledger doesn.t
+workflow-runs-rev-unchecked.json	runs_step_rev_unchecked	--workflows	-	workflow_run_rule	applied a step the ledger refuses: the run moved on from that rev
+workflow-runs-settle-early.json	runs_settle_before_call_ends	--workflows	-	workflow_run_rule	applied a step the ledger refuses: it takes its run.s call.s end before the call has one
+workflow-runs-call-unsettled.json	runs_call_left_unsettled	--workflows	-	workflow_run_rule	applied a step the ledger refuses: it leaves its run.s call without taking its end
+workflow-runs-settled-call-kept.json	runs_settled_call_kept	--workflows	-	workflow_run_rule	call the ledger doesn.t hold is recorded
+workflow-runs-done-overrides.json	runs_done_overrides_settled	--workflows	-	workflow_run_rule	a call.s state is not the ledger.s
