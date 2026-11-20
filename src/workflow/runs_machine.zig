@@ -1439,6 +1439,29 @@ test "workflow runs machine: a wait takes the oldest signal of its type, so two 
     try testing.expectEqual(Wait.signal, f.get("r1").?.wait);
 }
 
+test "workflow runs machine: a step that takes a signal, refused because the run moved on first, takes nothing" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    var kb: [64]u8 = undefined;
+    const key = view_mod.idKey(&kb, .default, "r1") catch unreachable;
+    var sb: [128]u8 = undefined;
+    try testing.expect((try f.command(.workflow_signal, key, try Signal.encodeInto(&sb, .{ .type = "go", .payload = "" }), 2)).refused() == null);
+    // Another step from rev 0 (its timeout) applies first.
+    try testing.expect((try f.step("r1", .{ .rev = 0, .wait = .timer })).refused() == null);
+    const stale = try f.step("r1", .{ .rev = 0, .takes = &.{"go"} });
+    try testing.expectEqualStrings("conflict: the run moved on from that step", stale.refused().?.refusal.message);
+    try testing.expectEqual(@as(u64, 1), f.get("r1").?.sig_held);
+    try testing.expect(try hasSignal(testing.allocator, .{ .store = &f.store }, key, "go"));
+    // And a cancel: the run ends with the signal still held.
+    var vb: [512]u8 = undefined;
+    _ = try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 3);
+    const ended = try f.step("r1", .{ .rev = 1, .takes = &.{"go"} });
+    try testing.expectEqualStrings("conflict: the run has ended", ended.refused().?.refusal.message);
+    try testing.expectEqual(@as(u64, 1), f.get("r1").?.sig_held);
+    try testing.expect(try hasSignal(testing.allocator, .{ .store = &f.store }, key, "go"));
+}
+
 test "workflow runs machine: a run that takes each signal it is sent never fills up" {
     var f = Fixture.init();
     defer f.deinit();
