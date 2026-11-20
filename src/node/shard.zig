@@ -30601,6 +30601,96 @@ test "Shard: a workflow run whose action ended just before a leader change finis
     try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, fresh.inspect(key).?.status);
 }
 
+test "Shard: a workflow step its leader logged and lost with its leadership is taken again by the next leader, once" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const shard = &t.shard;
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [1024]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    _ = try proposeAction(shard, .action_register, testRegister("act"));
+    try ParkTest.ack(shard);
+    const def =
+        \\{"kind":"Workflow","name":"flow","version":"1.0.0",
+        \\"start":{"run":"@actions/act","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+    ;
+    try ParkTest.send(shard, conn, .workflow_create, 20, "flow", def);
+    try ParkTest.ack(shard);
+    try ParkTest.responses(shard, conn, pair[1], &buf, &one);
+    try ParkTest.send(shard, conn, .workflow_start, 21, "flow", "");
+    try ParkTest.ack(shard);
+    try ParkTest.responses(shard, conn, pair[1], &buf, &one);
+    var id_buf: [32]u8 = undefined;
+    const run_id = id_buf[0..one[0].data.len];
+    @memcpy(run_id, one[0].data);
+    // Its first step calls the action, whose run starts.
+    shard.workflow_handler.advanceStartedRuns(shard);
+    try ParkTest.ack(shard);
+    shard.workflow_handler.advanceStartedRuns(shard);
+    try ParkTest.deliverOwn(shard);
+    var rid_buf: [64]u8 = undefined;
+    const rid = blk: {
+        var rit = shard.defaultPartition().store.range(action_machine.Runs.ID, "");
+        const k = rit.next().?.key();
+        @memcpy(rid_buf[0 .. k.len - 4], k[4..]);
+        break :blk rid_buf[0 .. k.len - 4];
+    };
+    // The action's run is taken and completed, and its end reaches the
+    // call: all logged. The step hasn't resumed when the leader changes.
+    const ready = ActionsHandler.for_tests.run(shard, .default, rid).?;
+    _ = try proposeAction(shard, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = rid, .due_ns = ready.due_ns, .holder = "w", .request_key = null, .lease_ms = 300_000 });
+    try ParkTest.ack(shard);
+    const held = ActionsHandler.for_tests.run(shard, .default, rid).?;
+    _ = try proposeAction(shard, .action_settle, action_entries.Settle.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = rid, .holder = "w", .request_key = null, .deliveries = held.deliveries, .token = held.token, .expiry_ns = held.expiry_ns, .outcome = "", .result = "" });
+    try ParkTest.ack(shard);
+    try ParkTest.deliverOwn(shard);
+    try std.testing.expectEqual(calls_machine.State.done, callIn(shard, "flow", rid).?.state);
+
+    // Every node holds the run as the leader does: waiting on that call.
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var r = try replicaOf(shard, pipe_fds[0]);
+    defer r.deinit();
+    var kb: [64]u8 = undefined;
+    @memcpy(kb[0..4], &ns_table.Id.default.bytes());
+    @memcpy(kb[4..][0..run_id.len], run_id);
+    const key = kb[0 .. 4 + run_id.len];
+    try std.testing.expectEqual(calls_machine.State.done, callIn(&r, "flow", rid).?.state);
+    const there = r.workflow_handler.inspect(key).?;
+    const here = shard.workflow_handler.inspect(key).?;
+    try std.testing.expectEqual(here.status, there.status);
+    try std.testing.expectEqual(here.rev, there.rev);
+    try std.testing.expectEqualStrings(here.pending_action_run_id_owned.?, there.pending_action_run_id_owned.?);
+
+    // The old leader takes the run's next step: logged, not committed, and
+    // cut from the log with its leadership.
+    const before = shard.raft_node.log.lastIndex();
+    shard.workflow_handler.checkPendingActions(shard);
+    try std.testing.expectEqual(before + 1, shard.raft_node.log.lastIndex());
+    try std.testing.expectEqual(@as(u32, 1), shard.workflow_handler.stepping.count());
+    shard.raft_node.log.truncateAfter(before);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, shard.workflow_handler.inspect(key).?.status);
+
+    // Another node leads now: none of the old leader's memory. It takes the
+    // step again from what applied, and ends the run, once.
+    var fresh = WorkflowHandler.init(std.testing.allocator);
+    defer fresh.deinit();
+    fresh.store = &shard.defaultPartition().store;
+    fresh.namespaces = shard.workflow_handler.namespaces;
+    const old = shard.workflow_handler;
+    shard.workflow_handler = &fresh;
+    defer shard.workflow_handler = old;
+    fresh.rewatch = true;
+    fresh.checkPendingActions(shard);
+    try ParkTest.ack(shard);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, fresh.inspect(key).?.status);
+}
+
 test "Shard: a worker's complete of a run a step called is refused while the caller's outbox has no room, saying so, and goes through once it has" {
     var two: TwoShards = undefined;
     try two.init();

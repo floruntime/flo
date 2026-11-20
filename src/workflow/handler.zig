@@ -6645,6 +6645,36 @@ test "a step's logged counters that won't decode end the run failed, saying why,
     try testing.expectEqual(last, shard.raft_node.log.lastIndex());
 }
 
+test "a signal that wakes a run is the log's: a leader with none of the old one's memory takes the run on" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    shard.workflow_handler = &handler;
+    createTestDef(&handler, testKey(.default, "two-waits"), "two-waits", test_two_waits_json);
+    createTestRun(&handler, testKey(.default, "r"), "r", "two-waits");
+    handler.advanceWorkflow(&shard, testKey(.default, "r"));
+    settleTest(&shard);
+    try testing.expectEqualStrings("first", handler.inspect(testKey(.default, "r")).?.wait_signal_type_owned.?);
+    try testSignal(&handler, testKey(.default, "r"), "first");
+
+    var fresh = WorkflowHandler.init(allocator);
+    defer fresh.deinit();
+    fresh.store = handler.store;
+    shard.workflow_handler = &fresh;
+    defer shard.workflow_handler = &handler;
+    fresh.rewatch = true;
+    fresh.advanceStartedRuns(&shard);
+    settleTest(&shard);
+    const run = fresh.inspect(testKey(.default, "r")).?;
+    try testing.expectEqualStrings("second", run.current_step_name_owned.?);
+    try testing.expectEqualStrings("second", run.wait_signal_type_owned.?);
+}
+
 test "a signal to a finished run is refused and leaves its history alone" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
