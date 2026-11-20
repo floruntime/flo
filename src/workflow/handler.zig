@@ -143,6 +143,14 @@ pub const WorkflowHandler = struct {
     /// Runs not ended that wait on a call, by key, owned: indexed like
     /// `to_step`, so the duty's cost follows the work in flight.
     parked: std.StringHashMapUnmanaged(void) = .empty,
+    /// Parked runs whose call may need a step: one whose call record just
+    /// changed, whose retry is due, or whose action was registered. Only
+    /// these are looked at, so runs whose calls can't move cost nothing
+    /// per tick. Keys owned.
+    call_dirty: std.StringHashMapUnmanaged(void) = .empty,
+    /// Decisions taken (`takeRun`), each a copy built from what applied:
+    /// what an idle pass must not grow.
+    taken: u64 = 0,
     /// When a run's timer or signal deadline is due, earliest first, keys
     /// owned. An entry is checked against the run's wait as applied when it
     /// comes due, so one the run moved past is dropped then.
@@ -487,7 +495,7 @@ pub const WorkflowHandler = struct {
             self.allocator.destroy(copy);
         }
         self.inspected.deinit(self.allocator);
-        inline for (.{ &self.parked, &self.to_step, &self.ending }) |map| {
+        inline for (.{ &self.parked, &self.call_dirty, &self.to_step, &self.ending }) |map| {
             var k = map.keyIterator();
             while (k.next()) |key| self.allocator.free(key.*);
             map.deinit(self.allocator);
@@ -1035,6 +1043,9 @@ pub const WorkflowHandler = struct {
     pub fn dropStartedRuns(self: *WorkflowHandler, shard: *Shard) void {
         _ = shard;
         self.clearStepping();
+        // Looked at again when this node next leads.
+        var pit = self.parked.keyIterator();
+        while (pit.next()) |k| self.indexKey(&self.call_dirty, k.*);
         var it = self.ending.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.ending.clearRetainingCapacity();
@@ -2418,42 +2429,37 @@ pub const WorkflowHandler = struct {
         }
         defer for (due_keys[0..due_count]) |k| self.allocator.free(k);
 
-        var resume_keys: [64][]const u8 = undefined;
-        var resume_count: usize = 0;
-        defer for (resume_keys[0..resume_count]) |k| self.allocator.free(k);
-        var it = self.parked.keyIterator();
-        while (it.next()) |key_ptr| {
-            if (resume_count == resume_keys.len) break;
-            const ns_key = key_ptr.*;
-            if (self.steppingAt(shard, ns_key) != null or self.endingInFlight(shard, ns_key)) continue;
-            const rec = self.appliedRun(ns_key) orelse continue;
-            const ns = keyNamespace(ns_key);
-            // Only a call that settled, or one waiting on its action to be
-            // registered (it may be asked again), is a decision to take.
-            if (calls_mod.callOf(self.defsRead(), ns, calls_mod.callerSlot(ns, rec.workflow), rec.wait_on)) |c| switch (c.state) {
-                .sent, .started => continue,
-                .done, .refused, .no_action => {},
-            };
-            resume_keys[resume_count] = self.allocator.dupe(u8, ns_key) catch break;
-            resume_count += 1;
+        // Parked runs whose call may need a step, decided from what applied
+        // alone: a run is taken only when its step logs something. One not
+        // due yet gets a timer; one that can't move leaves the set until
+        // its call changes.
+        var look_keys: [64][]const u8 = undefined;
+        var look_count: usize = 0;
+        defer for (look_keys[0..look_count]) |k| self.allocator.free(k);
+        var it = self.call_dirty.keyIterator();
+        while (it.next()) |k| {
+            if (look_count == look_keys.len) break;
+            look_keys[look_count] = self.allocator.dupe(u8, k.*) catch break;
+            look_count += 1;
         }
-
-        for (resume_keys[0..resume_count]) |ns_key| {
-            const run = self.takeRun(shard, ns_key) orelse continue;
-            const rid = run.pending_action_run_id_owned orelse {
-                self.dropRun(ns_key);
-                continue;
-            };
-            const retry_index = run.call_retry_index;
-            const noted = run.call_unregistered_noted;
-            if (self.callSettled(shard, run, rid, now_ms)) {
-                self.resumeFromAction(shard, ns_key, now_ms);
-            } else if (run.call_retry_index == retry_index and run.call_unregistered_noted == noted) {
-                // Still waiting, nothing changed: nothing to log.
-                self.dropRun(ns_key);
-                continue;
+        for (look_keys[0..look_count]) |ns_key| {
+            if (self.steppingAt(shard, ns_key) != null or self.endingInFlight(shard, ns_key)) continue;
+            unindexKey(self, &self.call_dirty, ns_key);
+            switch (self.callWork(shard, ns_key, now_ms)) {
+                .none => {},
+                .later => |at| self.armTimer(ns_key, at),
+                .step => {
+                    const run = self.takeRun(shard, ns_key) orelse continue;
+                    const rid = run.pending_action_run_id_owned orelse {
+                        self.dropRun(ns_key);
+                        continue;
+                    };
+                    if (self.callSettled(shard, run, rid, now_ms)) self.resumeFromAction(shard, ns_key, now_ms);
+                    self.commitRun(shard, ns_key);
+                    // Not logged (the log was full): looked at again.
+                    if (self.steppingAt(shard, ns_key) == null) self.indexKey(&self.call_dirty, ns_key);
+                },
             }
-            self.commitRun(shard, ns_key);
         }
 
         // A signal kept here for a run whose logged wait wants it: the step
@@ -2486,6 +2492,11 @@ pub const WorkflowHandler = struct {
         // may have moved it on: each is asked again as it fires.
         for (due_keys[0..due_count]) |ns_key| {
             const rec = self.appliedRun(ns_key) orelse continue;
+            // A call's retry or its wait running out comes due.
+            if (rec.wait == .call) {
+                if (self.parked.contains(ns_key)) self.indexKey(&self.call_dirty, ns_key);
+                continue;
+            }
             if (rec.wait_due_ms == 0 or rec.wait_due_ms > now_ms) continue;
             if (rec.wait != .timer and rec.wait != .signal) continue;
             if (self.steppingAt(shard, ns_key) != null) continue;
@@ -2508,6 +2519,46 @@ pub const WorkflowHandler = struct {
                 .wait => self.handleWaitTimeout(shard, ns_key, now_ms),
             }
             self.commitRun(shard, ns_key);
+        }
+    }
+
+    const CallWork = union(enum) {
+        /// Nothing to do until its call's record changes.
+        none,
+        /// Nothing to do before this stamp (ms): a retry, or its wait over.
+        later: i64,
+        /// A step to log: the call settled, or a note or a retry is due.
+        step,
+    };
+
+    /// What parked run `run_key`'s call needs, read from what applied and
+    /// its logged counters, with nothing allocated: what `callSettled`
+    /// would do with a copy, without taking one.
+    fn callWork(self: *WorkflowHandler, shard: *Shard, run_key: []const u8, now_ms: i64) CallWork {
+        const rec = self.appliedRun(run_key) orelse return .none;
+        if (rec.wait != .call or appliedStatus(rec).isTerminal()) return .none;
+        const ns = keyNamespace(run_key);
+        // Gone: the step takes it as lost.
+        const c = calls_mod.callOf(self.defsRead(), ns, calls_mod.callerSlot(ns, rec.workflow), rec.wait_on) orelse return .step;
+        switch (c.state) {
+            .sent, .started => return .none,
+            .done, .refused => return .step,
+            .no_action => {
+                const wait_ms = shard.actions_handler.missing_action_wait_ms;
+                if (!c.can_wait or wait_ms == 0) return .step;
+                // Counters that won't decode end the run when taken.
+                const p = progress_mod.Progress.decode(rec.progress) catch return .step;
+                if (!p.call_unregistered_noted) return .step;
+                // A retry asked for and not applied yet: its apply moves the call.
+                if (p.call_retry_index > shard.raft_node.last_applied) return .none;
+                const now_ns: u64 = @intCast(@max(now_ms, 0) *| std.time.ns_per_ms);
+                const waited_out_ms: i64 = @intCast((c.first_ns / std.time.ns_per_ms) +| wait_ms);
+                if (now_ms >= waited_out_ms) return .step;
+                const next_ns = c.last_ns +| callRetryMs(c.attempts) * std.time.ns_per_ms;
+                const due_ms: i64 = @max(@as(i64, @intCast(next_ns / std.time.ns_per_ms)), p.call_retry_at_ms);
+                if (now_ns >= next_ns and now_ms >= p.call_retry_at_ms) return .step;
+                return .{ .later = @min(due_ms, waited_out_ms) };
+            },
         }
     }
 
@@ -2856,6 +2907,7 @@ pub const WorkflowHandler = struct {
         const rec = runs_machine.runOf(self.defsRead(), run_key) orelse return null;
         if (appliedStatus(rec).isTerminal()) return null;
         if (self.steppingAt(shard, run_key)) |rev| if (rev == rec.rev) return null;
+        self.taken += 1;
         self.copyRun(run_key, rec) catch {
             log.err("workflow run {f}: not taken on (out of memory)", .{shown(run_key)});
             return null;
@@ -4051,6 +4103,13 @@ pub const WorkflowHandler = struct {
         const t = std.enums.fromInt(entry_mod.EntryType, e.header.entry_type) orelse return;
         switch (t) {
             .workflow_create, .workflow_enabled, .workflow_start, .workflow_step, .workflow_complete => {},
+            .call_reply, .call_done, .step_call_retry => return self.callChanged(t, e),
+            // A run waiting on an action not registered may now go on.
+            .action_register => {
+                var it = self.parked.keyIterator();
+                while (it.next()) |k| self.indexKey(&self.call_dirty, k.*);
+                return;
+            },
             else => return,
         }
         const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return;
@@ -4060,11 +4119,41 @@ pub const WorkflowHandler = struct {
         }
     }
 
+    /// A call's record changed (answered, ended, asked again): the run
+    /// that made it is looked at.
+    fn callChanged(self: *WorkflowHandler, t: entry_mod.EntryType, e: *const entry_mod.Entry) void {
+        var diag: wire_schema.Diagnostic = .{};
+        const ns: NamespaceId, const slot: u16, const callee: []const u8 = switch (t) {
+            .call_reply => blk: {
+                const p = ae.Reply.decodeAll(e.payload, &diag) catch return;
+                break :blk .{ .of(p.ns), p.slot, p.run };
+            },
+            .call_done => blk: {
+                const p = ae.Done.decodeAll(e.payload, &diag) catch return;
+                break :blk .{ .of(p.ns), p.slot, p.run };
+            },
+            else => blk: {
+                const p = ae.CallRetry.decodeAll(e.payload, &diag) catch return;
+                break :blk .{ .of(p.ns), p.slot, p.run };
+            },
+        };
+        const c = calls_mod.callOf(self.defsRead(), ns, slot, callee) orelse return;
+        const key = self.nsKey(ns, c.caller_run) orelse return self.lostIndex(c.caller_run);
+        defer self.allocator.free(key);
+        if (self.parked.contains(key)) self.indexKey(&self.call_dirty, key);
+    }
+
     fn runApplied(self: *WorkflowHandler, t: entry_mod.EntryType, run_key: []const u8) void {
         const run = runs_machine.runOf(self.defsRead(), run_key) orelse return;
         const live = !appliedStatus(run).isTerminal();
         if (live and run.wait == .none) self.indexToStep(run_key) else self.unindexToStep(run_key);
-        if (live and run.wait == .call) self.indexKey(&self.parked, run_key) else unindexKey(self, &self.parked, run_key);
+        if (live and run.wait == .call) {
+            self.indexKey(&self.parked, run_key);
+            self.indexKey(&self.call_dirty, run_key);
+        } else {
+            unindexKey(self, &self.parked, run_key);
+            unindexKey(self, &self.call_dirty, run_key);
+        }
         if (live and (run.wait == .timer or (run.wait == .signal and run.wait_due_ms > 0))) self.armTimer(run_key, run.wait_due_ms);
         if (!live) self.dropSignals(run_key);
         if (t == .workflow_start) {
@@ -6743,6 +6832,59 @@ test "a step's logged counters that won't decode end the run failed, saying why,
     const last = shard.raft_node.log.lastIndex();
     handler.advanceStartedRuns(&shard);
     try testing.expectEqual(last, shard.raft_node.log.lastIndex());
+}
+
+test "runs parked on actions never registered cost no step per tick, and don't hold up a run whose call settled" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    shard.workflow_handler = &handler;
+    // They wait an hour for their action to be registered.
+    actions.missing_action_wait_ms = 3_600_000;
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    // More than one pass looks at, each parked on an action not registered.
+    var kbs: [80][16]u8 = undefined;
+    for (&kbs, 0..) |*kb, i| {
+        var id_buf: [8]u8 = undefined;
+        const key = writeKey(kb, .default, try std.fmt.bufPrint(&id_buf, "s{d:0>3}", .{i}));
+        createTestRun(&handler, key, keyName(key), "test-wf");
+        handler.advanceWorkflow(&shard, key);
+        settleTest(&shard);
+    }
+    // Each says once that its action isn't registered.
+    for (0..4) |_| {
+        handler.checkPendingActions(&shard);
+        settleTest(&shard);
+    }
+    try testing.expectEqual(@as(u32, 0), handler.call_dirty.count());
+
+    // Then nothing: no step logged, no run taken, nothing left to look at.
+    const logged = shard.raft_node.log.lastIndex();
+    const taken = handler.taken;
+    for (0..20) |_| handler.checkPendingActions(&shard);
+    try testing.expectEqual(logged, shard.raft_node.log.lastIndex());
+    try testing.expectEqual(taken, handler.taken);
+    try testing.expectEqual(@as(u32, 0), handler.call_dirty.count());
+    try testing.expectEqual(@as(u32, 0), handler.runs.count());
+
+    // A run whose call settles, behind them all: it resumes.
+    registerTestAction(&shard, "step-a");
+    createTestRun(&handler, testKey(.default, "late"), "late", "test-wf");
+    handler.advanceWorkflow(&shard, testKey(.default, "late"));
+    settleTest(&shard);
+    completeTestAction(&shard, handler.inspect(testKey(.default, "late")).?.pending_action_run_id_owned.?);
+    // The registration has every parked run looked at again: more than one
+    // pass holds, and each pass takes the next, so none is left behind.
+    for (0..2) |_| {
+        handler.checkPendingActions(&shard);
+        settleTest(&shard);
+    }
+    try testing.expectEqualStrings("step_b", handler.inspect(testKey(.default, "late")).?.current_step_name_owned.?);
 }
 
 test "a signal to a finished run is refused and leaves its history alone" {
