@@ -428,25 +428,11 @@ fn asEntry(e: *const Entry, m: ce.Message.Value) Entry {
     return .{ .header = h, .payload = m.payload };
 }
 
-/// A message type applied after its inbound commits (`ChannelsWith`), and
-/// the check of its payload made before that commit: why it won't apply, or
-/// null. It covers every reason its applier could halt but running out of
-/// memory, and whatever its client path would refuse, so a sender's bad
-/// message is refused alone, in the inbound, and never reaches its applier.
-pub const AfterCommit = struct {
-    entry_type: EntryType,
-    refusal: *const fn (payload: []const u8) ?[]const u8,
-    /// The namespace the payload writes in, or null for none it names:
-    /// held to the message's origin, as a view's declared keys are.
-    namespace: *const fn (payload: []const u8) ?u32,
-};
-
 /// An origin refusal: why, and whether for a reserved namespace, which is
 /// refused as unauthorized rather than as built wrong.
 const OriginRefused = struct { why: []const u8, reserved: bool = false };
 
-/// Why a message `m`, for `owner` (or applied after commit as `after`),
-/// may not be applied for its origin, or null: its origin has no kind or
+/// Why a message `m`, for `owner`, may not be applied for its origin, or null: its origin has no kind or
 /// names no namespace, a user sends for a reserved one, its payload names
 /// a namespace other than its origin's, or the keys its owner declares for
 /// it reach outside that namespace. Its sender built it wrong, so it is
@@ -454,15 +440,11 @@ const OriginRefused = struct { why: []const u8, reserved: bool = false };
 /// applies. The check binds the keys declared; that an apply stays inside
 /// what it declared is the applier's existing contract (`strict_keys` in
 /// debug builds), across every message of the inbound.
-fn originRefusal(comptime scopes: anytype, owner: ?*const machine_mod.Machine, after: ?AfterCommit, as: *const Entry, m: ce.Message.Value, arena: std.mem.Allocator) error{OutOfMemory}!?OriginRefused {
+fn originRefusal(comptime scopes: anytype, owner: ?*const machine_mod.Machine, as: *const Entry, m: ce.Message.Value, arena: std.mem.Allocator) error{OutOfMemory}!?OriginRefused {
     const kind = std.enums.fromInt(view_mod.Origin.Kind, m.origin_kind) orelse return .{ .why = "bad request: a message with no origin" };
     const ns: ns_table.Id = .of(m.origin_ns);
     if (ns == .invalid or m.origin_ns >= ns_table.CAPACITY) return .{ .why = "bad request: a message from no namespace" };
     if (ns == ns_table.SYSTEM and kind != .system) return .{ .why = "unauthorized: a user's message to the system's namespace", .reserved = true };
-    if (after) |a| {
-        if (a.namespace(m.payload)) |named| if (named != m.origin_ns) return .{ .why = "bad request: a message writing outside its origin's namespace" };
-        return null;
-    }
     const o = owner orelse return null;
     if (o.namespace) |nf| if (nf(as)) |named| if (named != m.origin_ns) return .{ .why = "bad request: a message writing outside its origin's namespace" };
     var declared = KeySet.init(arena);
@@ -498,28 +480,8 @@ fn scopesOf(comptime machines: []const machine_mod.Machine) [store_mod.MAX_FAMIL
 
 /// The channels machine over `targets`, the machines a message may be for.
 pub fn Channels(comptime targets: []const machine_mod.Machine) type {
-    return ChannelsWith(targets, &.{});
-}
-
-/// `Channels`, with `after_commit` the entry types a message may also be
-/// whose applier works outside the view (a stream's append, kept in its
-/// projection and read back from the log): the inbound takes their seq and
-/// reports them, and the shard applies each once the inbound has committed,
-/// in order, live and in replay alike. So within one inbound such a
-/// message's state lands after every view message's, whatever their seqs: a
-/// view message never sees an earlier one's (a deliver after an append in
-/// the same batch doesn't hand out that record; the next deliver does).
-/// The shard's after-apply steps then run per message in seq order, over
-/// the whole inbound's state.
-pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime after_commit: []const AfterCommit) type {
-    comptime for (after_commit) |a| std.debug.assert(machine_mod.ownerOf(targets, a.entry_type) == null);
     return struct {
         const scopes = scopesOf(targets);
-
-        fn afterCommitOf(t: EntryType) ?AfterCommit {
-            inline for (after_commit) |a| if (a.entry_type == t) return a;
-            return null;
-        }
 
         fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             var diag: schema.Diagnostic = .{};
@@ -627,9 +589,7 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                 if (m.flags & ~view_mod.MESSAGE_FLAGS != 0) return error.Halt;
                 const t = std.enums.fromInt(EntryType, m.entry_type) orelse return error.Halt;
                 const owner = machine_mod.ownerOf(targets, t);
-                const after = if (owner == null) afterCommitOf(t) else null;
-                const later = after != null;
-                if (owner == null and !later) return error.Halt;
+                if (owner == null) return error.Halt;
                 const as = asEntry(e, m);
                 const mark = view.mark();
                 view.message = .{ .from = p.from, .seq = seq, .ordinal = ordinal };
@@ -649,16 +609,9 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                     // A namespace id no namespace could have: built wrong.
                     r.refuse(.bad_request, .malformed, why);
                     bug = .bad_payload;
-                } else if (try originRefusal(scopes, owner, after, &as, m, view.arena)) |o| {
+                } else if (try originRefusal(scopes, owner, &as, m, view.arena)) |o| {
                     r.refuse(if (o.reserved) .unauthorized else .bad_request, if (o.reserved) .reserved_key else .malformed, o.why);
                     bug = .wrong_origin;
-                } else if (after) |a| {
-                    // Checked now: past the commit its applier may only run
-                    // out of memory.
-                    if (a.refusal(m.payload)) |why| {
-                        r.refuse(.bad_request, .malformed, why);
-                        bug = .bad_payload;
-                    }
                 } else if (owner) |o| {
                     const sink = m.flags & entry_mod.Flags.SINK != 0;
                     const target = targetOf(o, &as);
@@ -683,7 +636,7 @@ pub fn ChannelsWith(comptime targets: []const machine_mod.Machine, comptime afte
                     if (r.refused() == null) if (tooMuchSent(view.sends.items[mark.sends..])) |why| r.refuse(.bad_request, .malformed, why);
                 }
                 if (r.refused() != null) try view.rollback(mark) else try writeSends(view, e.header.index);
-                try store.messages.append(store.allocator, .{ .entry = as, .result = r, .ordinal = ordinal, .after_commit = later and r.refused() == null, .from = p.from, .seq = seq, .sender_bug = bug });
+                try store.messages.append(store.allocator, .{ .entry = as, .result = r, .ordinal = ordinal, .from = p.from, .seq = seq, .sender_bug = bug });
                 store.applying = null;
                 applied = seq;
             }
@@ -1345,85 +1298,6 @@ test "channels: a message applies with the flags its send gave it, not its inbou
     try testing.expectEqual(sink, b.store.messages.items[0].entry.header.flags);
 }
 
-/// The probe machine, with stream appends applied after the commit.
-fn testCommandNamespace(payload: []const u8) ?u32 {
-    const cmd = entry_mod.CommandPayload.deserialize(payload) orelse return null;
-    return cmd.namespace_id.int();
-}
-const Later = ChannelsWith(&.{probe.machine}, &.{.{ .entry_type = .stream_append, .refusal = @import("../projection/stream.zig").appendRefusal, .namespace = testCommandNamespace }});
-
-/// A stream append's command payload, as an append logs it: one record.
-fn appendCommand(buf: []u8) []const u8 {
-    return appendCommandOf(buf, 1);
-}
-
-/// A stream append's command payload whose batch claims `count` records,
-/// holding one: `[partition][count]([len]["x"][header_count])`.
-fn appendCommandOf(buf: []u8, count: u32) []const u8 {
-    var value: [4 + 4 + 4 + 1 + 2]u8 = undefined;
-    std.mem.writeInt(u32, value[0..4], 0, .little);
-    std.mem.writeInt(u32, value[4..8], count, .little);
-    std.mem.writeInt(u32, value[8..12], 1, .little);
-    value[12] = 'x';
-    std.mem.writeInt(u16, value[13..15], 0, .little);
-    return (entry_mod.buildCommandEntry(.stream_append, 0, 1, 1, 0, .default, "s", &value, buf) orelse unreachable).payload;
-}
-
-test "channels: an after-commit message its applier would halt on, or its client path refuse, is refused alone before the commit" {
-    var a = Group.init(0, 2);
-    defer a.deinit();
-    var b = Group.init(1, 2);
-    defer b.deinit();
-    try a.probeTo(1, "message-one-0001");
-    var mw: schema.Writer = .{ .buf = try testing.allocator.alloc(u8, 1024) };
-    defer testing.allocator.free(mw.buf);
-    const o = a.outRecord(1, 1).?;
-    try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = 0, .flags = 0, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload });
-    // Not a command payload: past the commit, the stream applier would halt.
-    try ce.Message.encode(&mw, .{ .slot = 1, .entry_type = @backingInt(EntryType.stream_append), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = "x" });
-    // A command, but its batch claims more records than an append may carry.
-    var over: [64]u8 = undefined;
-    try ce.Message.encode(&mw, .{ .slot = 1, .entry_type = @backingInt(EntryType.stream_append), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = appendCommandOf(&over, @import("../projection/stream.zig").MAX_BATCH_RECORDS + 1) });
-    var buf: [2048]u8 = undefined;
-    const inbound = try ce.Inbound.encodeInto(&buf, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 3 } });
-    _ = try b.run(&Later.machine, .channel_inbound, inbound);
-    // Each refused alone, before the commit, and never handed to its
-    // applier; the probe before them applied, and all three took their seq.
-    try testing.expect(b.got("message-one-0001") != null);
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
-    const reported = b.store.messages.items;
-    try testing.expect(reported[1].result.refused() != null and !reported[1].after_commit);
-    try testing.expect(reported[2].result.refused() != null and !reported[2].after_commit);
-    // Counted as the sender's bugs, apart from the probe's own refusals.
-    try testing.expectEqual(@as(?store_mod.SenderBug, null), reported[0].sender_bug);
-    try testing.expectEqual(@as(?store_mod.SenderBug, .bad_payload), reported[1].sender_bug);
-    try testing.expectEqual(@as(?store_mod.SenderBug, .bad_payload), reported[2].sender_bug);
-    try testing.expectEqual(@as(u16, 0), reported[1].from);
-}
-
-test "channels: a message whose applier runs after the commit takes its seq and is reported for it, unless refused" {
-    var b = Group.init(1, 3);
-    defer b.deinit();
-    var mw: schema.Writer = .{ .buf = try testing.allocator.alloc(u8, 1024) };
-    defer testing.allocator.free(mw.buf);
-    var cb: [64]u8 = undefined;
-    const append = appendCommand(&cb);
-    // Slot 1 is b's; slot 3 is group 0's.
-    for ([_]u16{ 1, 3, 1 }) |slot| try ce.Message.encode(&mw, .{ .slot = slot, .entry_type = @backingInt(EntryType.stream_append), .layout_epoch = 0, .flags = 0, .origin_kind = @backingInt(view_mod.Origin.Kind.user), .origin_ns = ns_table.DEFAULT.int(), .payload = append });
-    var buf: [2048]u8 = undefined;
-    const inbound = try ce.Inbound.encodeInto(&buf, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 3 } });
-    _ = try b.run(&Later.machine, .channel_inbound, inbound);
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
-    const reported = b.store.messages.items;
-    try testing.expectEqual(@as(usize, 3), reported.len);
-    for (reported, [_]bool{ true, false, true }, 0..) |m, later, i| {
-        try testing.expectEqual(later, m.after_commit);
-        try testing.expectEqual(@as(u8, @intCast(i)), m.ordinal);
-    }
-    // A type with no applier at all is still a Flo bug.
-    try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, try ce.Inbound.encodeInto(&buf, .{ .from = 2, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 3 } })));
-}
-
 test "channels: a message carrying a flag no message may carry halts its inbound, which commits nothing" {
     var a = Group.init(0, 2);
     defer a.deinit();
@@ -1899,25 +1773,6 @@ test "channels: a user's message to the shard's own state is refused as its send
     try testing.expectEqual(@as(?store_mod.SenderBug, null), reported[1].sender_bug);
     try testing.expect(reported[1].result.refused() == null);
     try testing.expectEqual(@as(usize, 1), st.family(settings.PolicyFam.ID).count);
-}
-
-test "channels: an after-commit append naming a namespace not its origin's is refused before the commit; one from its own goes after it" {
-    var b = Group.init(1, 2);
-    defer b.deinit();
-    var mw: schema.Writer = .{ .buf = try testing.allocator.alloc(u8, 1024) };
-    defer testing.allocator.free(mw.buf);
-    var cb: [64]u8 = undefined;
-    // The command names the default namespace.
-    const append = appendCommand(&cb);
-    for ([_]ns_table.Id{ .of(17), ns_table.DEFAULT }) |ns| try ce.Message.encode(&mw, .{ .slot = 1, .entry_type = @backingInt(EntryType.stream_append), .layout_epoch = 0, .flags = 0, .origin_kind = @backingInt(view_mod.Origin.Kind.user), .origin_ns = ns.int(), .payload = append });
-    var buf: [2048]u8 = undefined;
-    _ = try b.run(&Later.machine, .channel_inbound, try ce.Inbound.encodeInto(&buf, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 2 } }));
-    const reported = b.store.messages.items;
-    try testing.expectEqual(@as(usize, 2), reported.len);
-    try testing.expectEqual(@as(?store_mod.SenderBug, .wrong_origin), reported[0].sender_bug);
-    try testing.expect(!reported[0].after_commit);
-    try testing.expectEqual(@as(?store_mod.SenderBug, null), reported[1].sender_bug);
-    try testing.expect(reported[1].after_commit);
 }
 
 /// A test message's origin: the default namespace's user.
