@@ -15,6 +15,7 @@ const targets = [_]machine.Machine{
     @import("../stream/machine.zig").machine,
     @import("../settings/machine.zig").machine,
     @import("../ts/machine.zig").machine,
+    @import("../budget/machine.zig").machine,
 };
 
 /// A hand-back's namespace, and why one can't be applied.
