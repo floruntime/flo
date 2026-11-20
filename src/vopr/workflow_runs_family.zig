@@ -66,12 +66,11 @@ const INPUT = "{}";
 const SWEEP_EVERY = 16;
 const DISABLED_WHY = "workflow is disabled";
 
-/// A history a completion carries: `n` events, the one at seq `i` named
-/// "e" and `i`'s last digit, at `i` ms.
-fn histEvent(buf: *[2]u8, i: u64) []const u8 {
-    buf.* = .{ 'e', '0' + @as(u8, @intCast(i % 10)) };
-    return buf;
-}
+/// A run's history past its start's event: a step's events are "e" at 0
+/// ms, a cancel's is "c" at its entry's stamp. Not named by seq: a step
+/// made at a rev ahead of the leader's may apply after another step.
+const STEP_EVENT = "e";
+const CANCEL_EVENT = "c";
 
 pub const WorkflowRuns = struct {
     scratch: std.heap.ArenaAllocator,
@@ -86,8 +85,12 @@ pub const WorkflowRuns = struct {
         completed_ms: i64 = 0,
         output: ?usize = null,
         hist_next: u64,
-        /// Its history: the start's event, or the last completion's `n`.
-        hist: union(enum) { started: usize, completed: u64 },
+        /// The start's event, at seq 0.
+        started: usize,
+        /// Its steps taken: a step applies only at this.
+        rev: u64 = 0,
+        /// The seq of a cancel's event, at `completed_ms`.
+        ended_at: ?u64 = null,
         outs: [STEPS.len]?usize = @splat(null),
     };
     const PerDefL = struct { active: u32, fired_ms: i64 };
@@ -136,7 +139,7 @@ pub const WorkflowRuns = struct {
 
     pub fn owns(entry_type: u8) bool {
         return switch (@as(EntryType, @fromBackingInt(entry_type))) {
-            .workflow_start, .workflow_step_started, .workflow_complete, .child_start, .child_refuse => true,
+            .workflow_start, .workflow_step, .workflow_complete, .child_start, .child_refuse => true,
             else => false,
         };
     }
@@ -198,8 +201,16 @@ pub const WorkflowRuns = struct {
                 const r = indexOf(&RUNS, cmd.key[4..]) orelse return null;
                 switch (kind) {
                     .step => {
+                        const st = rm.Step.decodeAll(cmd.value, &diag) catch return null;
                         var run = l.runs[r] orelse return .{ .refused = true };
-                        if (run.stepped or run.status.isTerminal()) return .{ .refused = true };
+                        if (!std.mem.eql(u8, st.workflow, NAMES[run.wf])) return null;
+                        if (run.status.isTerminal() or st.rev != run.rev) return .{ .refused = true };
+                        run.hist_next += st.events.count;
+                        var outs = st.outputs.iterator();
+                        while (outs.next() catch return null) |o| {
+                            run.outs[indexOf(&STEPS, o.step) orelse return null] = indexOf(&OUTCOMES, o.outcome) orelse return null;
+                        }
+                        run.rev += 1;
                         run.stepped = true;
                         l.runs[r] = run;
                     },
@@ -222,7 +233,7 @@ pub const WorkflowRuns = struct {
                             }
                             if (ev != TRIGGER) return .{ .refused = true };
                         }
-                        l.runs[r] = .{ .wf = w, .status = s.status, .stepped = s.status != .running, .idem = k, .created_ms = stamp_ms, .hist_next = 1, .hist = .{ .started = ev } };
+                        l.runs[r] = .{ .wf = w, .status = s.status, .stepped = false, .idem = k, .created_ms = stamp_ms, .hist_next = 1, .started = ev };
                         if (k) |ki| l.idem[w][ki] = r;
                         var per = l.per_def[w] orelse PerDefL{ .active = 0, .fired_ms = 0 };
                         if (!s.status.isTerminal()) per.active += 1;
@@ -244,18 +255,9 @@ pub const WorkflowRuns = struct {
                         }
                         run.status = c.status;
                         run.completed_ms = stamp_ms;
-                        run.stepped = true;
                         run.output = if (c.output) |o| indexOf(&OUTPUTS, o) orelse return null else null;
-                        run.hist_next = c.history_count;
-                        run.hist = .{ .completed = c.history_count };
-                        run.outs = @splat(null);
-                        var st = c.steps;
-                        for (0..c.step_count) |_| {
-                            const name = st.take(st.int(u16).?).?;
-                            const outcome = st.take(st.int(u16).?).?;
-                            _ = st.take(st.int(u32).?).?;
-                            run.outs[indexOf(&STEPS, name) orelse return null] = indexOf(&OUTCOMES, outcome) orelse return null;
-                        }
+                        run.ended_at = run.hist_next;
+                        run.hist_next += 1;
                         l.runs[r] = run;
                         if (l.per_def[run.wf]) |*per| per.active -|= 1;
                         if (l.parents[r]) |f| {
@@ -283,7 +285,7 @@ pub const WorkflowRuns = struct {
     fn kindOf(t: EntryType) Kind {
         return switch (t) {
             .workflow_start => .start,
-            .workflow_step_started => .step,
+            .workflow_step => .step,
             .workflow_complete => .complete,
             .child_start => .child_start,
             else => .child_refuse,
@@ -440,7 +442,7 @@ pub const WorkflowRuns = struct {
         const g = got orelse return "a run the ledger holds is gone";
         if (!std.mem.eql(u8, g.workflow, NAMES[run.wf])) return "a run's workflow is not its start's";
         if (g.status != @backingInt(run.status)) return "a run's status is not the ledger's";
-        if ((g.stepped != 0) != run.stepped) return "whether a run's first step was taken is not the ledger's";
+        if ((g.rev > 0) != run.stepped or g.rev != run.rev) return "whether a run's first step was taken is not the ledger's";
         if (g.created_at_ms != run.created_ms or g.completed_at_ms != run.completed_ms) return "a run's stamps are not the ledger's";
         if (!std.mem.eql(u8, g.idempotency_key, if (run.idem) |k| IDEMS[k] else "")) return "a run's idempotency key is not its start's";
         if ((g.has_output != 0) != (run.output != null) or !std.mem.eql(u8, g.output, if (run.output) |o| OUTPUTS[o] else "")) return "a run's output is not its completion's";
@@ -463,24 +465,24 @@ pub const WorkflowRuns = struct {
             if (seq >= run.hist_next) return "a run holds more history than its last 256 events";
             if (std.mem.readInt(u64, item.key[item.key.len - 8 ..][0..8], .big) != seq) return "a run's history is not its last seqs";
             const h = item.value.v;
-            switch (run.hist) {
-                .started => |ev| if (!std.mem.eql(u8, h.event, EVENTS[ev]) or !std.mem.eql(u8, h.detail, INPUT) or h.at_ms != run.created_ms) return "a run's first event is not its start's",
-                .completed => {
-                    var eb: [2]u8 = undefined;
-                    if (!std.mem.eql(u8, h.event, histEvent(&eb, seq)) or h.at_ms != @as(i64, @intCast(seq))) return "a run's history is not its completion's";
-                },
+            if (seq == 0) {
+                if (!std.mem.eql(u8, h.event, EVENTS[run.started]) or !std.mem.eql(u8, h.detail, INPUT) or h.at_ms != run.created_ms) return "a run's first event is not its start's";
+            } else if (run.ended_at == seq) {
+                if (!std.mem.eql(u8, h.event, CANCEL_EVENT) or h.at_ms != run.completed_ms) return "a run's last event is not its cancel's";
+            } else {
+                if (!std.mem.eql(u8, h.event, STEP_EVENT) or h.at_ms != 0 or h.detail.len != 0) return "a run's history is not its steps'";
             }
         }
         if (seq != run.hist_next) return "a run's history is missing events";
         var outs = rv.range(rm.OutFam, prefix);
         var got_outs: [STEPS.len]?usize = @splat(null);
         while (outs.next() catch return "a step output could not be read") |item| {
-            const step = indexOf(&STEPS, item.key[prefix.len..]) orelse return "a step output under a step the completion doesn't name";
-            const o = indexOf(&OUTCOMES, item.value.v.outcome) orelse return "a step's outcome is not the completion's";
-            if (!std.mem.eql(u8, item.value.v.output, OUTPUTS[o])) return "a step's output is not the completion's";
+            const step = indexOf(&STEPS, item.key[prefix.len..]) orelse return "a step output under a step no step names";
+            const o = indexOf(&OUTCOMES, item.value.v.outcome) orelse return "a step's outcome is not its step's";
+            if (!std.mem.eql(u8, item.value.v.output, OUTPUTS[o])) return "a step's output is not its step's";
             got_outs[step] = o;
         }
-        if (!std.mem.eql(?usize, &got_outs, &run.outs)) return "a run's step outputs are not its completion's";
+        if (!std.mem.eql(?usize, &got_outs, &run.outs)) return "a run's step outputs are not its steps'";
         return null;
     }
 
@@ -495,9 +497,10 @@ pub const Made = struct { entry_type: EntryType, payload: []const u8 };
 
 /// A runs entry, as the workflows handler and a parent's call make them,
 /// from the leader's own applied ledger: starts of every kind (some of a
-/// disabled workflow, some repeating a key or a run), first steps, child
-/// calls and refusals, and completions of runs it holds, some carrying
-/// more history than a run keeps.
+/// disabled workflow, some repeating a key or a run), steps at a run's
+/// rev (some at one another leader moved past, some carrying enough
+/// events that a run's history passes what it keeps), child calls and
+/// refusals, and cancels of runs it holds.
 pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
     const l = &leader.ledger;
     // The runs as the leader holds them, so most entries find what they
@@ -540,7 +543,22 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
         const p = ae.ChildRefuse.encodeInto(buf, .{ .ns = NS.int(), .run = RUNS[pending.or_(r, 70, any)], .answer = answers[r.uintLessThan(usize, answers.len)] }) catch return null;
         return .{ .entry_type = .child_refuse, .payload = p };
     }
-    if (roll < 34) return command(buf, .workflow_step_started, view_mod.idKey(&kb, NS, RUNS[unstepped.or_(r, 70, any)]) catch unreachable, "");
+    // A step of a run the leader holds, at its rev, or now and then a rev
+    // another leader moved past.
+    if (roll < 34 and held.n > 0) {
+        // Now and then the run with the longest history, so some pass
+        // what a run keeps.
+        var longest: ?usize = null;
+        for (live.ids[0..live.n]) |i| {
+            if (longest == null or l.runs[i].?.hist_next > l.runs[longest.?].?.hist_next) longest = i;
+        }
+        const c = if (longest != null and r.uintLessThan(u8, 100) < 25) longest.? else live.or_(r, 80, unstepped.or_(r, 30, held.at(r)));
+        const run = l.runs[c].?;
+        const rev = if (r.uintLessThan(u8, 100) < 10) run.rev +% 1 else run.rev;
+        const vb = buf[buf.len / 2 ..];
+        const value = stepValue(r, vb, rev, NAMES[run.wf], run.hist_next) orelse return null;
+        return command(buf[0 .. buf.len / 2], .workflow_step, view_mod.idKey(&kb, NS, RUNS[c]) catch unreachable, value);
+    }
     // A completion names a run the leader holds, and its workflow.
     if (roll < 60 and held.n > 0) {
         const c = live.or_(r, 75, held.at(r));
@@ -597,49 +615,58 @@ fn startValue(buf: []u8, wf: []const u8, event: []const u8, idem: []const u8) []
     return w.buffered();
 }
 
-/// A completion, as `Complete.parse` reads it: maybe an output, some steps,
-/// and a history, sometimes longer than a run keeps.
-fn completeValue(r: std.Random, buf: []u8, status: RunStatus, wf: []const u8) ?[]const u8 {
-    var w: std.Io.Writer = .fixed(buf);
-    // Long histories are rare: every replica's checksums walk them all.
-    const events: u16 = if (r.uintLessThan(u8, 100) < 3) r.intRangeAtMost(u16, 257, 264) else r.uintLessThan(u16, 8);
-    write(&w, status, r, events, wf) catch return null;
-    return w.buffered();
+/// A step at `rev`: some
+/// events, now and then nearly a step's most, so a run's history passes
+/// what it keeps; maybe some step outputs; no wait.
+fn stepValue(r: std.Random, buf: []u8, rev: u64, wf: []const u8, hist_next: u64) ?[]const u8 {
+    // Long steps are rare, but likelier for a run already long: every
+    // replica's checksums walk them all.
+    const long_percent: u8 = if (hist_next >= rm.MAX_STEP_EVENTS) 50 else 4;
+    const events: u32 = if (r.uintLessThan(u8, 100) < long_percent) r.intRangeAtMost(u32, 56, rm.MAX_STEP_EVENTS) else r.uintLessThan(u32, 4);
+    var eb: [rm.MAX_STEP_EVENTS * 24]u8 = undefined;
+    var ew: schema.Writer = .{ .buf = &eb };
+    for (0..events) |_| rm.Event.encode(&ew, .{ .event = STEP_EVENT, .detail = "", .at_ms = 0 }) catch return null;
+    var ob: [STEPS.len * 32]u8 = undefined;
+    var ow: schema.Writer = .{ .buf = &ob };
+    var outs: u32 = 0;
+    for (STEPS) |step| if (r.uintLessThan(u8, 100) < 30) {
+        const o = r.uintLessThan(usize, OUTCOMES.len);
+        rm.StepOutput.encode(&ow, .{ .step = step, .outcome = OUTCOMES[o], .output = OUTPUTS[o] }) catch return null;
+        outs += 1;
+    };
+    const value: rm.Step.Value = .{
+        .rev = rev,
+        .step = "",
+        .events = .{ .bytes = ew.written(), .count = events },
+        .outputs = .{ .bytes = ow.written(), .count = outs },
+        .wait = .none,
+        .wait_kind = .action,
+        .wait_slot = 0,
+        .wait_on = "",
+        .wait_due_ms = 0,
+        .wait_timeout_to = "",
+        .progress = "",
+        .settles = "",
+        .caller_slot = 0,
+        .workflow = wf,
+        .ends = 0,
+        .has_output = false,
+        .output = "",
+        .tags = "",
+        .call = "",
+    };
+    return rm.Step.encodeInto(buf, value) catch null;
 }
 
-fn write(w: *std.Io.Writer, status: RunStatus, r: std.Random, events: u16, wf: []const u8) std.Io.Writer.Error!void {
-    try w.writeByte(@backingInt(status));
-    if (r.boolean()) {
-        const o = OUTPUTS[r.uintLessThan(usize, OUTPUTS.len)];
-        try w.writeByte(1);
-        try w.writeInt(u32, @intCast(o.len), .little);
-        try w.writeAll(o);
-    } else try w.writeByte(0);
-    var steps: [STEPS.len]usize = undefined;
-    var n: u16 = 0;
-    for (0..STEPS.len) |i| if (r.boolean()) {
-        steps[n] = i;
-        n += 1;
+/// A cancel's completion, as `Complete.parse` reads it: maybe an output.
+fn completeValue(r: std.Random, buf: []u8, status: RunStatus, wf: []const u8) ?[]const u8 {
+    const c: rm.Complete = .{
+        .status = status,
+        .output = if (r.boolean()) OUTPUTS[r.uintLessThan(usize, OUTPUTS.len)] else null,
+        .event = CANCEL_EVENT,
+        .detail = "",
+        .tags = "",
+        .workflow = wf,
     };
-    try w.writeInt(u16, n, .little);
-    for (steps[0..n]) |s| {
-        const o = r.uintLessThan(usize, OUTCOMES.len);
-        try w.writeInt(u16, @intCast(STEPS[s].len), .little);
-        try w.writeAll(STEPS[s]);
-        try w.writeInt(u16, @intCast(OUTCOMES[o].len), .little);
-        try w.writeAll(OUTCOMES[o]);
-        try w.writeInt(u32, @intCast(OUTPUTS[o].len), .little);
-        try w.writeAll(OUTPUTS[o]);
-    }
-    try w.writeInt(u16, events, .little);
-    for (0..events) |i| {
-        var eb: [2]u8 = undefined;
-        try w.writeInt(u16, 2, .little);
-        try w.writeAll(histEvent(&eb, i));
-        try w.writeInt(u16, 0, .little);
-        try w.writeInt(i64, @intCast(i), .little);
-    }
-    try w.writeInt(u16, 0, .little);
-    try w.writeInt(u16, @intCast(wf.len), .little);
-    try w.writeAll(wf);
+    return c.encode(buf);
 }

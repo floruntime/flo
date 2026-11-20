@@ -128,9 +128,8 @@ pub const EntryType = enum(u8) {
     workflow_complete = 0x52,
     /// A workflow disabled or enabled: `[enabled:u8]` for "namespace:name".
     workflow_enabled = 0x53,
-    /// A run's first step is taken: once, by the leader whose entry this is.
-    /// Key "namespace:run", no value.
-    workflow_step_started = 0x54,
+    /// A step a run's leader took (`runs_machine.Step`), keyed by the run.
+    workflow_step = 0x57,
     /// A child workflow's start, a message from its parent's call; and a
     /// child its shard couldn't start.
     child_start = 0x55,
@@ -151,10 +150,9 @@ pub const EntryType = enum(u8) {
     action_release = 0x76,
     action_extend = 0x77,
     action_expire = 0x78,
-    /// A workflow step's call of an action or a child workflow, its retry
-    /// and its clear, on the workflow's shard; and the two messages that
-    /// answer it.
-    step_call = 0x79,
+    /// A workflow step's call asked for again and dropped, on the workflow's
+    /// shard; and the two messages that answer it. The call itself is
+    /// recorded by the `workflow_step` that makes it.
     step_call_retry = 0x7A,
     step_call_clear = 0x7B,
     call_reply = 0x7C,
@@ -190,14 +188,14 @@ pub const EntryType = enum(u8) {
             .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch => false,
             .namespace_create => false,
             .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => false,
-            .step_call, .step_call_retry, .step_call_clear, .call_reply, .call_done, .action_abandon_send, .action_abandon => false,
+            .step_call_retry, .step_call_clear, .call_reply, .call_done, .action_abandon_send, .action_abandon => false,
             .child_start, .child_refuse => false,
             .stream_append, .stream_trim, .stream_delete, .stream_config, .stream_clean, .stream_forget => true,
             .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge, .queue_requeue, .queue_drop => false,
             .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean, .group_steal, .group_requeue, .group_drop => false,
             .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,
             .cg_create => true,
-            .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step_started => true,
+            .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step => true,
             .processing_submit, .processing_stop, .processing_cancel, .processing_remove => true,
             // A sink batch's payload is a schema (`protocol/processing_entries.zig`).
             .processing_sink_batch => false,

@@ -477,11 +477,6 @@ const RunState = struct {
     }
 };
 
-/// A wait on an action's result is an internal signal; it shows as "action".
-fn waitType(signal: []const u8) []const u8 {
-    return if (std.mem.startsWith(u8, signal, "_action_done:")) "action" else signal;
-}
-
 const HistoryEvent = struct { event_type: []const u8, detail: []const u8, timestamp: i64 };
 
 /// The events of a `workflow_history` answer:
@@ -620,7 +615,7 @@ fn listRuns(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
         const completed_at: ?i64 = if (state) |st| st.completed_at else null;
         try optionalInt(&obj, "completed_at", completed_at);
         try optionalInt(&obj, "duration_ms", if (completed_at) |t| t - row.created_at else null);
-        try optionalString(&obj, "wait_type", if (state) |st| (if (st.wait_signal) |w| waitType(w) else null) else null);
+        try optionalString(&obj, "wait_type", if (state) |st| st.wait_signal else null);
         for ([_][]const u8{ "parent_run_id", "terminal_name", "error", "history_event_count" }) |f| try obj.nullField(f);
         try obj.end();
     }
@@ -864,8 +859,8 @@ test "RunState reads a workflow_status answer, its optional fields absent or pre
     try w.writeInt(i64, 20, .little);
     try w.writeByte(0);
     try w.writeByte(1);
-    try w.writeInt(u16, 18, .little);
-    try w.writeAll("_action_done:a-123");
+    try w.writeInt(u16, 8, .little);
+    try w.writeAll("approval");
     try w.writeByte(0);
 
     const run = RunState.parse(w.buffered()).?;
@@ -875,7 +870,7 @@ test "RunState reads a workflow_status answer, its optional fields absent or pre
     try std.testing.expectEqualStrings("step", run.current_step);
     try std.testing.expectEqual(@as(?i64, 20), run.started_at);
     try std.testing.expectEqual(@as(?i64, null), run.completed_at);
-    try std.testing.expectEqualStrings("action", waitType(run.wait_signal.?));
+    try std.testing.expectEqualStrings("approval", run.wait_signal.?);
     try std.testing.expectEqual(@as(?[]const u8, null), run.output);
     // Cut short anywhere, it is no answer.
     try std.testing.expectEqual(@as(?RunState, null), RunState.parse(w.buffered()[0 .. w.buffered().len - 1]));

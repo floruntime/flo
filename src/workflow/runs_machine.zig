@@ -14,6 +14,10 @@
 //!   stream reads that stream from the start.
 //! - `workflow.parents`: a child run's parent, from the parent's call
 //!   (`child_start`) until the child ends.
+//! - `step.calls`: each step's call of an action's run or a child's, kept
+//!   by `actions/calls_machine.zig`, whose entries this machine applies
+//!   there. A step's call is recorded, and its start sent, in the apply of
+//!   the `workflow_step` that makes it.
 //!
 //! A child's parent hears from here: a `call_reply`, `started` once its
 //! start applies or `refused` when its workflow is disabled; `no_action` or `conflict`
@@ -35,6 +39,7 @@ const delivery = @import("../contract/delivery.zig");
 const persistence = @import("../storage/persistence.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const defs_machine = @import("defs_machine.zig");
+const calls_mod = @import("../actions/calls_machine.zig");
 const parser = @import("parser.zig");
 const jsonpath = @import("jsonpath.zig");
 const NamespaceId = @import("../namespace/table.zig").Id;
@@ -89,9 +94,6 @@ pub const Run = Record(&.{
     .{ .name = "created_at_ms", .T = Int(i64) },
     // 0 until it ends.
     .{ .name = "completed_at_ms", .T = Int(i64) },
-    // Whether its first step was taken: one `workflow_step_started` takes
-    // it, and a second is refused.
-    .{ .name = "stepped", .T = Int(u8) },
     .{ .name = "has_output", .T = Int(u8) },
     .{ .name = "output", .T = Bytes(MAX_PERSIST_PAYLOAD) },
     .{ .name = "search_tags", .T = Bytes(MAX_PERSIST_PAYLOAD) },
@@ -99,6 +101,91 @@ pub const Run = Record(&.{
     // keep `HIST_KEEP`.
     .{ .name = "hist_next", .T = Int(u64) },
     .{ .name = "hist_dropped", .T = Int(u64) },
+    // The step it is at ("" for its start), and how many steps it has
+    // taken: a `workflow_step` applies only at this `rev`, then adds one.
+    .{ .name = "step", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+    .{ .name = "rev", .T = Int(u64) },
+    // What it waits for (`Wait`), and its fields: a call's kind, the
+    // callee's slot and run id; a signal's type, its deadline and where it
+    // goes then; a timer's due stamp.
+    .{ .name = "wait", .T = schema.Enum(Wait) },
+    .{ .name = "wait_kind", .T = schema.Enum(ae.CallKind) },
+    .{ .name = "wait_slot", .T = Int(u16) },
+    .{ .name = "wait_on", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+    .{ .name = "wait_due_ms", .T = Int(i64) },
+    .{ .name = "wait_timeout_to", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+    // The step's own counters, as its leader encoded them; kept verbatim.
+    .{ .name = "progress", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+});
+
+/// What a run waits for between steps.
+pub const Wait = enum(u8) {
+    /// Nothing: its leader takes its next step.
+    none = 0,
+    /// A step's call: an action's run or a child's (`step.calls`).
+    call = 1,
+    /// A signal of `wait_on`'s type, until `wait_due_ms` (0: no deadline).
+    signal = 2,
+    /// Until `wait_due_ms`: a poll, a retry, or a hold for room.
+    timer = 3,
+};
+
+/// The most a step's counters (`progress`) may hold.
+pub const MAX_PROGRESS: usize = 1024;
+
+/// The most a logged event's type, a step's name or an outcome holds.
+const MAX_NAME = 1024;
+/// The most a step's event detail or output holds: an entry, less the
+/// rest of the step.
+const MAX_BODY = MAX_PERSIST_PAYLOAD - 4 * MAX_NAME;
+
+pub const Event = Record(&.{
+    .{ .name = "event", .T = Bytes(MAX_NAME) },
+    .{ .name = "detail", .T = Bytes(MAX_BODY) },
+    .{ .name = "at_ms", .T = Int(i64) },
+});
+
+pub const StepOutput = Record(&.{
+    .{ .name = "step", .T = Bytes(MAX_NAME) },
+    .{ .name = "outcome", .T = Bytes(MAX_NAME) },
+    .{ .name = "output", .T = Bytes(MAX_BODY) },
+});
+
+/// The events and outputs one step may log.
+pub const MAX_STEP_EVENTS: u32 = 64;
+pub const MAX_STEP_OUTPUTS: u32 = 16;
+
+/// A `workflow_step` value: the step its leader took, decided from the run
+/// at `rev`. Its key is the run's.
+pub const Step = Record(&.{
+    .{ .name = "rev", .T = Int(u64) },
+    .{ .name = "step", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+    .{ .name = "events", .T = schema.BoundedList(Event, MAX_STEP_EVENTS, MAX_PERSIST_PAYLOAD) },
+    .{ .name = "outputs", .T = schema.BoundedList(StepOutput, MAX_STEP_OUTPUTS, MAX_PERSIST_PAYLOAD) },
+    .{ .name = "wait", .T = schema.Enum(Wait) },
+    .{ .name = "wait_kind", .T = schema.Enum(ae.CallKind) },
+    .{ .name = "wait_slot", .T = Int(u16) },
+    .{ .name = "wait_on", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+    .{ .name = "wait_due_ms", .T = Int(i64) },
+    .{ .name = "wait_timeout_to", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+    .{ .name = "progress", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+    // The callee whose end the step takes, when it takes its run's call's
+    // end (empty for none): the run's call, and settled in `step.calls`, at
+    // the run's workflow's slot (`caller_slot`).
+    .{ .name = "settles", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+    .{ .name = "caller_slot", .T = Int(u16) },
+    // The run's workflow, which counts its runs (`workflow.per_def`).
+    .{ .name = "workflow", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+    // When the step ends the run: how (a terminal `RunStatus`; 0 for a step
+    // that doesn't), its output and its search tags.
+    .{ .name = "ends", .T = Int(u8) },
+    .{ .name = "has_output", .T = schema.Bool },
+    .{ .name = "output", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+    .{ .name = "tags", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+    // The call the step makes (an `ae.Call`; empty for none): recorded in
+    // `step.calls` and its start sent in this apply, its callee the run's
+    // new wait.
+    .{ .name = "call", .T = Bytes(MAX_PERSIST_PAYLOAD) },
 });
 
 pub const Hist = Record(&.{
@@ -264,17 +351,16 @@ pub const Start = struct {
 /// A `workflow_complete` value:
 ///   [status:u8]
 ///   [has_output:u8]([output_len:u32][output])?
-///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
-///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
+///   [event_len:u16][event][detail_len:u16][detail]
 ///   [tags_len:u16][search_tags]
 ///   [wf_len:u16][workflow]
+/// The event is the run's last, stamped with the entry's time; the history
+/// before it is the run's own (`workflow.hist`).
 pub const Complete = struct {
     status: RunStatus,
     output: ?[]const u8,
-    step_count: u16,
-    steps: Cursor,
-    history_count: u16,
-    history: Cursor,
+    event: []const u8,
+    detail: []const u8,
     tags: []const u8,
     workflow: []const u8,
 
@@ -283,25 +369,34 @@ pub const Complete = struct {
         const status = std.enums.fromInt(RunStatus, (c.take(1) orelse return null)[0]) orelse return null;
         if (!status.isTerminal()) return null;
         const has_output = (c.take(1) orelse return null)[0];
+        if (has_output > 1) return null;
         const output: ?[]const u8 = if (has_output == 1) c.take(c.int(u32) orelse return null) orelse return null else null;
-        const step_count = c.int(u16) orelse return null;
-        const steps = c;
-        for (0..step_count) |_| {
-            _ = c.take(c.int(u16) orelse return null) orelse return null;
-            _ = c.take(c.int(u16) orelse return null) orelse return null;
-            _ = c.take(c.int(u32) orelse return null) orelse return null;
-        }
-        const history_count = c.int(u16) orelse return null;
-        const history = c;
-        for (0..history_count) |_| {
-            _ = c.take(c.int(u16) orelse return null) orelse return null;
-            _ = c.take(c.int(u16) orelse return null) orelse return null;
-            _ = c.int(i64) orelse return null;
-        }
+        const event = c.take(c.int(u16) orelse return null) orelse return null;
+        const detail = c.take(c.int(u16) orelse return null) orelse return null;
         const tags = c.take(c.int(u16) orelse return null) orelse return null;
         const workflow = c.take(c.int(u16) orelse return null) orelse return null;
         if (c.off != value.len) return null;
-        return .{ .status = status, .output = output, .step_count = step_count, .steps = steps, .history_count = history_count, .history = history, .tags = tags, .workflow = workflow };
+        return .{ .status = status, .output = output, .event = event, .detail = detail, .tags = tags, .workflow = workflow };
+    }
+
+    /// Its encoding into `buf`, or null when it doesn't fit.
+    pub fn encode(c: Complete, buf: []u8) ?[]const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        w.writeByte(@backingInt(c.status)) catch return null;
+        if (c.output) |o| {
+            w.writeByte(1) catch return null;
+            w.writeInt(u32, std.math.cast(u32, o.len) orelse return null, .little) catch return null;
+            w.writeAll(o) catch return null;
+        } else w.writeByte(0) catch return null;
+        for ([_][]const u8{ c.event, c.detail, c.tags, c.workflow }) |part| {
+            w.writeInt(u16, std.math.cast(u16, part.len) orelse return null, .little) catch return null;
+            w.writeAll(part) catch return null;
+        }
+        return w.buffered();
+    }
+
+    pub fn size(c: Complete) usize {
+        return 2 + (if (c.output) |o| 4 + o.len else 0) + 8 + c.event.len + c.detail.len + c.tags.len + c.workflow.len;
     }
 };
 
@@ -309,15 +404,15 @@ pub const Complete = struct {
 /// call's result holds goes as none.
 pub const Ended = struct { status: ae.DoneStatus, output: []const u8 };
 
-pub fn endOf(c: *const Complete) Ended {
-    const status: ae.DoneStatus = switch (c.status) {
+pub fn endOf(status: RunStatus, output: ?[]const u8) Ended {
+    const done: ae.DoneStatus = switch (status) {
         .completed => .completed,
         .cancelled => .cancelled,
         .timed_out => .timed_out,
         else => .failed,
     };
-    const out = c.output orelse "";
-    return .{ .status = status, .output = if (out.len <= @import("../protocol/action_ops.zig").MAX_OUTPUT) out else "" };
+    const out = output orelse "";
+    return .{ .status = done, .output = if (out.len <= @import("../protocol/action_ops.zig").MAX_OUTPUT) out else "" };
 }
 
 /// Reads a value front to back; every read is null rather than past the end.
@@ -354,7 +449,7 @@ fn named(e: *const Entry) ?Named {
             const p = ae.ChildRefuse.decodeAll(e.payload, &diag) catch return null;
             break :blk .{ .ns = .of(p.ns), .run = p.run };
         },
-        .workflow_start, .workflow_step_started, .workflow_complete => blk: {
+        .workflow_start, .workflow_step, .workflow_complete => blk: {
             const cmd = command(e) orelse return null;
             break :blk .{ .ns = cmd.namespace_id, .run = cmd.key[KEY_PREFIX..] };
         },
@@ -371,6 +466,7 @@ fn command(e: *const Entry) ?entry_mod.CommandPayload {
 }
 
 fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
+    if (calls_mod.owns(typeOf(e) orelse return)) return calls_mod.keys(e, out);
     const n = named(e) orelse return;
     if (n.ns == .invalid) return;
     const arena = out.allocator;
@@ -386,7 +482,21 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             try out.addIn(HistFam.ID, n.ns, (try histKey(arena, n.ns, n.run, 0))[KEY_PREFIX..]);
             if (s.idem) |k| try out.addIn(IdemFam.ID, n.ns, (try idemKey(arena, n.ns, s.workflow, k))[KEY_PREFIX..]);
         },
-        .workflow_step_started => try out.addIn(RunFam.ID, n.ns, n.run),
+        .workflow_step => {
+            const cmd = command(e).?;
+            try out.addIn(RunFam.ID, n.ns, n.run);
+            const range = (try runRange(arena, n.ns, n.run))[KEY_PREFIX..];
+            out.addRangeIn(HistFam.ID, n.ns, range) catch return error.OutOfMemory;
+            out.addRangeIn(OutFam.ID, n.ns, range) catch return error.OutOfMemory;
+            var diag: schema.Diagnostic = .{};
+            const st = Step.decodeAll(cmd.value, &diag) catch return;
+            if (st.settles.len > 0) if (try calls_mod.callKeyAlloc(arena, n.ns, st.caller_slot, st.settles)) |k| try out.addIn(calls_mod.Calls.ID, n.ns, k[KEY_PREFIX..]);
+            try out.addIn(PerDefFam.ID, n.ns, st.workflow);
+            if (st.call.len > 0) {
+                const p = ae.Call.decodeAll(st.call, &diag) catch return;
+                if (try calls_mod.recordKey(arena, p)) |k| try out.addIn(calls_mod.Calls.ID, n.ns, k[KEY_PREFIX..]);
+            }
+        },
         .workflow_complete => {
             const cmd = command(e).?;
             try out.addIn(RunFam.ID, n.ns, n.run);
@@ -403,6 +513,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
 
 /// The namespace a child's start names, held to its origin's.
 fn namespaceOf(e: *const Entry) ?u32 {
+    if (calls_mod.owns(typeOf(e) orelse return null)) return calls_mod.namespaceOf(e);
     if (typeOf(e) != .child_start) return null;
     const n = named(e) orelse return null;
     return n.ns.int();
@@ -411,23 +522,14 @@ fn namespaceOf(e: *const Entry) ?u32 {
 // ─── Apply ───────────────────────────────────────────────────────────────────
 
 fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
+    if (calls_mod.owns(typeOf(e) orelse return error.Halt)) return calls_mod.apply(view, e, out);
     const n = named(e) orelse return error.Halt;
     if (n.ns == .invalid) return error.Halt;
     const stamp_ms: i64 = @intCast(e.header.timestamp_ns / std.time.ns_per_ms);
     switch (typeOf(e).?) {
         .child_start, .child_refuse => return applyParent(view, e, n),
         .workflow_start => return applyStart(view, n, command(e).?, stamp_ms, out),
-        .workflow_step_started => {
-            const cmd = command(e).?;
-            if (cmd.value.len != 0) return error.Halt;
-            var run = (try view.get(RunFam, cmd.key)) orelse
-                return out.refuse(.conflict, .unclassified, "conflict: the run's first step was taken");
-            const ended_steps = comptime plant.active == .runs_ended_takes_step;
-            if (!(ended_steps and statusOf(run.v).isTerminal()) and (run.v.stepped != 0 or statusOf(run.v).isTerminal()))
-                return out.refuse(.conflict, .unclassified, "conflict: the run's first step was taken");
-            run.v.stepped = 1;
-            try view.put(RunFam, cmd.key, run);
-        },
+        .workflow_step => return applyStep(view, n, command(e).?, stamp_ms, out),
         .workflow_complete => return applyComplete(view, n, command(e).?, stamp_ms, out),
         else => return error.Halt,
     }
@@ -486,19 +588,23 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i6
         .status = @backingInt(s.status),
         .created_at_ms = stamp_ms,
         .completed_at_ms = 0,
-        // Only a running run has a first step to take.
-        .stepped = @intFromBool(s.status != .running),
         .has_output = 0,
         .output = "",
         .search_tags = if (def) |d| try searchTags(arena, d.yaml, s.input, n.run) else "",
         .hist_next = 0,
         .hist_dropped = 0,
+        .step = "",
+        .rev = 0,
+        .wait = .none,
+        .wait_kind = .action,
+        .wait_slot = 0,
+        .wait_on = "",
+        .wait_due_ms = 0,
+        .wait_timeout_to = "",
+        .progress = "",
     };
     // The run's first history event, as the start path recorded it.
-    if (s.event.len > 0) {
-        try view.put(HistFam, try histKey(arena, n.ns, n.run, 0), .{ .v = .{ .event = s.event, .detail = s.input, .at_ms = stamp_ms } });
-        run.hist_next = 1;
-    }
+    if (s.event.len > 0) try appendHist(view, n, &run, s.event, s.input, stamp_ms);
     try view.put(RunFam, cmd.key, .{ .v = run });
     if (comptime plant.active != .runs_idem_unwritten) if (idem_key) |k| try view.put(IdemFam, k, .{ .v = .{ .run = n.run } });
 
@@ -547,9 +653,86 @@ fn refuseChild(view: *View, n: Named) ApplyError!void {
     try view.delete(Parents, k);
 }
 
+/// One event onto `run`'s history at its next seq; past `HIST_KEEP` the
+/// oldest goes, counted.
+fn appendHist(view: *View, n: Named, run: *Run.Value, event: []const u8, detail: []const u8, at_ms: i64) ApplyError!void {
+    const arena = view.arena;
+    try view.put(HistFam, try histKey(arena, n.ns, n.run, run.hist_next), .{ .v = .{ .event = event, .detail = detail, .at_ms = at_ms } });
+    const keep: u64 = if (comptime plant.active == .runs_hist_keeps_257) HIST_KEEP + 1 else HIST_KEEP;
+    if (run.hist_next >= keep) {
+        try view.delete(HistFam, try histKey(arena, n.ns, n.run, run.hist_next - keep));
+        run.hist_dropped += 1;
+    }
+    run.hist_next += 1;
+}
+
+/// A step its leader took from the run at `rev`: applied only while the
+/// run is still there, so two proposals from one state, by any leaders,
+/// move it once. One that takes the run's call's end applies only once
+/// that call is settled.
+fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64, out: *Result) ApplyError!void {
+    var diag: schema.Diagnostic = .{};
+    // Only a leader proposes one: one that doesn't decode is a Flo bug.
+    const st = Step.decodeAll(cmd.value, &diag) catch return error.Halt;
+    var run = ((try view.get(RunFam, cmd.key)) orelse return out.refuse(.not_found, .not_found, "run not found")).v;
+    if (!std.mem.eql(u8, run.workflow, st.workflow)) return error.Halt;
+    const ends: ?RunStatus = if (st.ends == 0) null else blk: {
+        const status = std.enums.fromInt(RunStatus, st.ends) orelse return error.Halt;
+        if (!status.isTerminal()) return error.Halt;
+        break :blk status;
+    };
+    const ended_steps = comptime plant.active == .runs_ended_takes_step;
+    if (!ended_steps and statusOf(run).isTerminal()) return out.refuse(.conflict, .unclassified, "conflict: the run has ended");
+    if (st.rev != run.rev) return out.refuse(.conflict, .unclassified, "conflict: the run moved on from that step");
+    if (st.progress.len > MAX_PROGRESS) return out.refuse(.bad_request, .unclassified, "a step's counters are past their bound");
+    // A step leaves its run's call only by taking its end, or by ending the
+    // run (the call then goes with the run, unanswered).
+    const leaves_call = run.wait == .call and !(st.wait == .call and std.mem.eql(u8, st.wait_on, run.wait_on));
+    if (leaves_call and ends == null and st.settles.len == 0) return out.refuse(.conflict, .unclassified, "conflict: the step leaves its run's call unsettled");
+    if (st.settles.len > 0) {
+        if (run.wait != .call or !std.mem.eql(u8, run.wait_on, st.settles)) return out.refuse(.conflict, .unclassified, "conflict: the run waits on another call");
+        if (st.caller_slot != calls_mod.callerSlot(n.ns, run.workflow)) return error.Halt;
+        // Its record goes with the step that takes its end. One already
+        // gone (cleared with a repair) can't be unfinished: taken as lost.
+        const k = (try calls_mod.callKeyAlloc(view.arena, n.ns, st.caller_slot, st.settles)) orelse return error.Halt;
+        if (try view.get(calls_mod.Calls, k)) |call| {
+            switch (call.v.state) {
+                .done, .refused, .no_action => {},
+                .sent, .started => return out.refuse(.conflict, .unclassified, "conflict: the run's call hasn't ended"),
+            }
+            try view.delete(calls_mod.Calls, k);
+        }
+    }
+
+    if (st.call.len > 0) {
+        const p = ae.Call.decodeAll(st.call, &diag) catch return error.Halt;
+        // The call is the run's new wait, of this run, and from its workflow.
+        if (st.wait != .call or !std.mem.eql(u8, p.run, st.wait_on) or p.ns != n.ns.int() or
+            !std.mem.eql(u8, p.caller_run, n.run) or !std.mem.eql(u8, p.caller_workflow, run.workflow)) return error.Halt;
+        try calls_mod.record(view, p, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms);
+    }
+    var events = st.events.iterator();
+    while (events.next() catch return error.Halt) |ev| try appendHist(view, n, &run, ev.event, ev.detail, ev.at_ms);
+    var outputs = st.outputs.iterator();
+    while (outputs.next() catch return error.Halt) |o| {
+        try view.put(OutFam, try outKey(view.arena, n.ns, n.run, o.step), .{ .v = .{ .outcome = o.outcome, .output = o.output } });
+    }
+    run.rev += 1;
+    run.step = st.step;
+    run.wait = st.wait;
+    run.wait_kind = st.wait_kind;
+    run.wait_slot = st.wait_slot;
+    run.wait_on = st.wait_on;
+    run.wait_due_ms = st.wait_due_ms;
+    run.wait_timeout_to = st.wait_timeout_to;
+    run.progress = st.progress;
+    run.status = @backingInt(if (st.wait == .none) RunStatus.running else RunStatus.waiting);
+    if (ends) |status| return endRun(view, n, cmd.key, &run, status, if (st.has_output) st.output else null, st.tags, stamp_ms);
+    try view.put(RunFam, cmd.key, .{ .v = run });
+}
+
 fn applyComplete(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64, out: *Result) ApplyError!void {
     const c = Complete.parse(cmd.value) orelse return error.Halt;
-    const arena = view.arena;
     // Runs are never removed: a completion names one that started.
     var run = ((try view.get(RunFam, cmd.key)) orelse return error.Halt).v;
     if (!std.mem.eql(u8, run.workflow, c.workflow)) return error.Halt;
@@ -561,53 +744,39 @@ fn applyComplete(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms:
         return out.refuse(.bad_request, .unclassified, "run already finished");
     }
 
-    run.status = @backingInt(c.status);
+    try appendHist(view, n, &run, c.event, c.detail, stamp_ms);
+    return endRun(view, n, cmd.key, &run, c.status, c.output, c.tags, stamp_ms);
+}
+
+/// `run` ended `status` at `stamp_ms`: no longer counted among its
+/// workflow's, and a child's parent hears how, its record gone.
+fn endRun(view: *View, n: Named, run_key: []const u8, run: *Run.Value, status: RunStatus, output: ?[]const u8, tags: []const u8, stamp_ms: i64) ApplyError!void {
+    const arena = view.arena;
+    run.status = @backingInt(status);
     run.completed_at_ms = stamp_ms;
-    run.stepped = 1;
-    run.has_output = @intFromBool(c.output != null);
-    run.output = c.output orelse "";
-    if (c.tags.len > 0) run.search_tags = c.tags;
+    run.has_output = @intFromBool(output != null);
+    run.output = output orelse "";
+    if (tags.len > 0) run.search_tags = tags;
+    run.wait = .none;
+    run.wait_on = "";
+    run.wait_due_ms = 0;
+    run.wait_timeout_to = "";
+    run.progress = "";
+    try view.put(RunFam, run_key, .{ .v = run.* });
 
-    // The entry carries the run's history and step outputs as its leader
-    // kept them: they replace what was there.
-    const range = try runRange(arena, n.ns, n.run);
-    try view.deleteRange(HistFam, range, null);
-    const keep_from: u64 = c.history_count -| (if (comptime plant.active == .runs_hist_keeps_257) HIST_KEEP + 1 else HIST_KEEP);
-    var h = c.history;
-    for (0..c.history_count) |i| {
-        const event = h.take(h.int(u16).?).?;
-        const detail = h.take(h.int(u16).?).?;
-        const at_ms = h.int(i64).?;
-        if (i < keep_from) continue;
-        try view.put(HistFam, try histKey(arena, n.ns, n.run, i), .{ .v = .{ .event = event, .detail = detail, .at_ms = at_ms } });
-    }
-    run.hist_next = c.history_count;
-    run.hist_dropped = keep_from;
-
-    try view.deleteRange(OutFam, range, null);
-    var st = c.steps;
-    for (0..c.step_count) |_| {
-        const name = st.take(st.int(u16).?).?;
-        const outcome = st.take(st.int(u16).?).?;
-        const output = st.take(st.int(u32).?).?;
-        try view.put(OutFam, try outKey(arena, n.ns, n.run, name), .{ .v = .{ .outcome = outcome, .output = output } });
-    }
-    try view.put(RunFam, cmd.key, .{ .v = run });
-
-    const def_key = try idKeyAlloc(arena, n.ns, c.workflow);
+    const def_key = try idKeyAlloc(arena, n.ns, run.workflow);
     if (try view.get(PerDefFam, def_key)) |found| {
         var per = found;
         const cancel_keeps = comptime plant.active == .runs_cancel_keeps_active;
-        if (!cancel_keeps or c.status != .cancelled) per.v.active -|= 1;
+        if (!cancel_keeps or status != .cancelled) per.v.active -|= 1;
         try view.put(PerDefFam, def_key, per);
     }
 
-    // A child's parent hears how it ended, and its record goes.
     var pk: [KEY_PREFIX + ae.MAX_RUN_ID]u8 = undefined;
     if (n.run.len > ae.MAX_RUN_ID) return;
     const k = view_mod.idKey(&pk, n.ns, n.run) catch unreachable;
     const p = (try view.get(Parents, k)) orelse return;
-    const ended = endOf(&c);
+    const ended = endOf(status, output);
     const buf = try arena.alloc(u8, ae.Done.max_size);
     const bytes = ae.Done.encodeInto(buf, .{
         .ns = n.ns.int(),
@@ -669,6 +838,7 @@ fn reply(view: *View, ns: NamespaceId, run: []const u8, parent_slot: u16, answer
 /// A child's start a repair skipped: its parent's call is told, so the step
 /// fails saying so.
 fn skipped(view: *View, e: *const Entry, why: []const u8) ApplyError!void {
+    if (calls_mod.owns(typeOf(e) orelse return)) return calls_mod.skipped(view, e, why);
     if (typeOf(e) != .child_start) return;
     var diag: schema.Diagnostic = .{};
     const p = ae.ChildStart.decodeAll(e.payload, &diag) catch return;
@@ -719,8 +889,9 @@ fn writeJsonEscaped(w: *std.Io.Writer, s: []const u8) !void {
 
 pub const machine: machine_mod.Machine = .{
     .name = "workflow runs",
-    .entry_types = &.{ .workflow_start, .workflow_step_started, .workflow_complete, .child_start, .child_refuse },
+    .entry_types = &.{ .workflow_start, .workflow_step, .workflow_complete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done },
     .families = &.{
+        machine_mod.info(calls_mod.Calls),
         machine_mod.info(Parents),
         machine_mod.info(RunFam),
         machine_mod.info(HistFam),
@@ -782,9 +953,44 @@ const Fixture = struct {
         return f.command(.workflow_complete, view_mod.idKey(&kb, .default, run_id) catch unreachable, value, stamp_ms);
     }
 
-    fn stepStarted(f: *Fixture, run_id: []const u8) !Result {
+    fn step(f: *Fixture, run_id: []const u8, spec: StepSpec) !Result {
         var kb: [64]u8 = undefined;
-        return f.command(.workflow_step_started, view_mod.idKey(&kb, .default, run_id) catch unreachable, "", 1);
+        var events_buf: [16 * 1024]u8 = undefined;
+        var ew: schema.Writer = .{ .buf = &events_buf };
+        for (0..spec.events) |i| try Event.encode(&ew, .{ .event = "e", .detail = "", .at_ms = @intCast(i) });
+        var outputs_buf: [256]u8 = undefined;
+        var ow: schema.Writer = .{ .buf = &outputs_buf };
+        if (spec.output_step.len > 0) try StepOutput.encode(&ow, .{ .step = spec.output_step, .outcome = "success", .output = "{}" });
+        const value: Step.Value = .{
+            .rev = spec.rev,
+            .step = spec.at,
+            .events = .{ .bytes = ew.written(), .count = spec.events },
+            .outputs = .{ .bytes = ow.written(), .count = @intFromBool(spec.output_step.len > 0) },
+            .wait = spec.wait,
+            .wait_kind = .action,
+            .wait_slot = 0,
+            .wait_on = spec.wait_on,
+            .wait_due_ms = 0,
+            .wait_timeout_to = "",
+            .progress = spec.progress,
+            .settles = spec.settles,
+            .caller_slot = calls_mod.callerSlot(.default, spec.workflow),
+            .workflow = spec.workflow,
+            .ends = if (spec.ends) |e| @backingInt(e) else 0,
+            .has_output = spec.ends != null,
+            .output = if (spec.ends != null) "out" else "",
+            .tags = "",
+            .call = spec.call,
+        };
+        var vb: [32 * 1024]u8 = undefined;
+        return f.command(.workflow_step, view_mod.idKey(&kb, .default, run_id) catch unreachable, try Step.encodeInto(&vb, value), 1);
+    }
+
+    /// A call's reply or end, as the callee's shard sends it.
+    fn answer(f: *Fixture, t: EntryType, payload: []const u8) !Result {
+        f.index += 1;
+        const e = entry_mod.buildEntry(t, entry_mod.Flags.NONE, 1, f.index, 0, payload);
+        return run(&machine, f, &e);
     }
 
     fn create(f: *Fixture, wf: []const u8) !void {
@@ -820,6 +1026,20 @@ const Fixture = struct {
     }
 };
 
+const StepSpec = struct {
+    rev: u64,
+    at: []const u8 = "s",
+    events: u32 = 1,
+    wait: Wait = .none,
+    wait_on: []const u8 = "",
+    settles: []const u8 = "",
+    progress: []const u8 = "",
+    ends: ?RunStatus = null,
+    call: []const u8 = "",
+    workflow: []const u8 = "wf",
+    output_step: []const u8 = "",
+};
+
 fn startValue(buf: []u8, wf: []const u8, event: []const u8, idem: []const u8) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.writeInt(u16, @intCast(wf.len), .little) catch unreachable;
@@ -834,33 +1054,10 @@ fn startValue(buf: []u8, wf: []const u8, event: []const u8, idem: []const u8) []
     return w.buffered();
 }
 
-/// A completion's value with `events` history events, each "e"/"" at its
-/// own seq's ms.
-fn completeValue(buf: []u8, status: RunStatus, wf: []const u8, events: u16) []const u8 {
-    var w: std.Io.Writer = .fixed(buf);
-    w.writeByte(@backingInt(status)) catch unreachable;
-    w.writeByte(1) catch unreachable;
-    w.writeInt(u32, 2, .little) catch unreachable;
-    w.writeAll("ok") catch unreachable;
-    // One step: "s", "done", "x".
-    w.writeInt(u16, 1, .little) catch unreachable;
-    for ([_][]const u8{ "s", "done" }) |p| {
-        w.writeInt(u16, @intCast(p.len), .little) catch unreachable;
-        w.writeAll(p) catch unreachable;
-    }
-    w.writeInt(u32, 1, .little) catch unreachable;
-    w.writeAll("x") catch unreachable;
-    w.writeInt(u16, events, .little) catch unreachable;
-    for (0..events) |i| {
-        w.writeInt(u16, 1, .little) catch unreachable;
-        w.writeAll("e") catch unreachable;
-        w.writeInt(u16, 0, .little) catch unreachable;
-        w.writeInt(i64, @intCast(i), .little) catch unreachable;
-    }
-    w.writeInt(u16, 0, .little) catch unreachable;
-    w.writeInt(u16, @intCast(wf.len), .little) catch unreachable;
-    w.writeAll(wf) catch unreachable;
-    return w.buffered();
+/// A cancel's completion of a run of `wf`.
+fn completeValue(buf: []u8, status: RunStatus, wf: []const u8) []const u8 {
+    const c: Complete = .{ .status = status, .output = null, .event = "workflow_cancelled", .detail = "stop", .tags = "", .workflow = wf };
+    return c.encode(buf).?;
 }
 
 test "workflow runs machine: a start creates its run, first event, idempotency key and count; one with a used key or id creates nothing" {
@@ -872,7 +1069,7 @@ test "workflow runs machine: a start creates its run, first event, idempotency k
     const run = f.get("r1").?;
     try testing.expectEqualStrings("wf", run.workflow);
     try testing.expectEqual(@as(i64, 1000), run.created_at_ms);
-    try testing.expectEqual(@as(u8, 0), run.stepped);
+    try testing.expectEqual(@as(u64, 0), run.rev);
     try testing.expectEqual(@as(u64, 1), run.hist_next);
     try testing.expectEqual(@as(u32, 1), f.active("wf").?.active);
     var seqs: [4]u64 = undefined;
@@ -890,58 +1087,108 @@ test "workflow runs machine: a start creates its run, first event, idempotency k
     try testing.expectEqual(@as(u32, 1), f.active("wf").?.active);
 }
 
-test "workflow runs machine: a run's first step is taken once, and never after it ends" {
+test "workflow runs machine: a step applies only at its run's rev, and never after the run ends" {
     var f = Fixture.init();
     defer f.deinit();
     _ = try f.start("r1", "wf", "workflow_started", "", 1);
-    try testing.expect((try f.stepStarted("r1")).refused() == null);
-    try testing.expectEqual(@as(u8, 1), f.get("r1").?.stepped);
-    try testing.expect((try f.stepStarted("r1")).refused() != null);
-    try testing.expect((try f.stepStarted("nope")).refused() != null);
+    try testing.expect((try f.step("r1", .{ .rev = 0, .at = "a" })).refused() == null);
+    var run = f.get("r1").?;
+    try testing.expectEqual(@as(u64, 1), run.rev);
+    try testing.expectEqualStrings("a", run.step);
+    // Two leaders' steps from one state: only the first applies.
+    const stale = try f.step("r1", .{ .rev = 0, .at = "b" });
+    try testing.expectEqualStrings("conflict: the run moved on from that step", stale.refused().?.refusal.message);
+    try testing.expectEqualStrings("a", f.get("r1").?.step);
+    try testing.expect((try f.step("nope", .{ .rev = 0 })).refused() != null);
+    // One naming another workflow is a broken log.
+    try testing.expectError(error.Halt, f.step("r1", .{ .rev = 1, .workflow = "other" }));
 
-    _ = try f.start("r2", "wf", "workflow_started", "", 1);
-    var vb: [512]u8 = undefined;
-    _ = try f.complete("r2", completeValue(&vb, .cancelled, "wf", 1), 2);
-    try testing.expect((try f.stepStarted("r2")).refused() != null);
+    // A step that ends its run: counted no longer, and no step after it.
+    try testing.expect((try f.step("r1", .{ .rev = 1, .ends = .completed })).refused() == null);
+    run = f.get("r1").?;
+    try testing.expectEqual(@as(u8, @backingInt(RunStatus.completed)), run.status);
+    try testing.expectEqualStrings("out", run.output);
+    try testing.expectEqual(@as(u32, 0), f.active("wf").?.active);
+    try testing.expect((try f.step("r1", .{ .rev = 2 })).refused() != null);
 }
 
-test "workflow runs machine: a completion ends its run with its logged history, keeping the last 256, and its step outputs; a second with the same status changes nothing" {
+test "workflow runs machine: a run's history keeps its last 256 events, counting the dropped; a cancel ends it and a second cancel changes nothing" {
     var f = Fixture.init();
     defer f.deinit();
     _ = try f.start("r1", "wf", "workflow_started", "", 1);
     _ = try f.start("r2", "wf", "workflow_started", "", 1);
-    try testing.expectEqual(@as(u32, 2), f.active("wf").?.active);
-
-    const buf = try testing.allocator.alloc(u8, 16 * 1024);
-    defer testing.allocator.free(buf);
-    const value = completeValue(buf, .completed, "wf", 300);
-    try testing.expect((try f.complete("r1", value, 50)).refused() == null);
-    const run = f.get("r1").?;
-    try testing.expectEqual(@as(u8, @backingInt(RunStatus.completed)), run.status);
-    try testing.expectEqual(@as(i64, 50), run.completed_at_ms);
-    try testing.expectEqualStrings("ok", run.output);
-    try testing.expectEqual(@as(u64, 300), run.hist_next);
-    try testing.expectEqual(@as(u64, 300 - HIST_KEEP), run.hist_dropped);
-    var seqs: [300]u64 = undefined;
+    // 1 from the start, then 5 steps of 60.
+    for (0..5) |i| try testing.expect((try f.step("r1", .{ .rev = i, .events = 60 })).refused() == null);
+    var run = f.get("r1").?;
+    try testing.expectEqual(@as(u64, 301), run.hist_next);
+    try testing.expectEqual(@as(u64, 301 - HIST_KEEP), run.hist_dropped);
+    var seqs: [301]u64 = undefined;
     const kept = try f.histSeqs("r1", &seqs);
     try testing.expectEqual(@as(usize, HIST_KEEP), kept.len);
-    try testing.expectEqual(@as(u64, 300 - HIST_KEEP), kept[0]);
-    try testing.expectEqual(@as(u64, 299), kept[kept.len - 1]);
-    // The other run is still counted.
-    try testing.expectEqual(@as(u32, 1), f.active("wf").?.active);
+    try testing.expectEqual(@as(u64, 301 - HIST_KEEP), kept[0]);
+    try testing.expectEqual(@as(u64, 300), kept[kept.len - 1]);
 
-    // A second completion, the same status: OK, and nothing changes.
-    const commits = f.store.families[RunFam.ID].commits;
-    try testing.expect((try f.complete("r1", value, 60)).refused() == null);
-    try testing.expectEqual(commits, f.store.families[RunFam.ID].commits);
-    try testing.expectEqual(@as(u32, 1), f.active("wf").?.active);
-    // Another status: refused.
     var vb: [512]u8 = undefined;
-    const other = try f.complete("r1", completeValue(&vb, .cancelled, "wf", 1), 70);
+    try testing.expect((try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 50)).refused() == null);
+    run = f.get("r1").?;
+    try testing.expectEqual(@as(u8, @backingInt(RunStatus.cancelled)), run.status);
+    try testing.expectEqual(@as(i64, 50), run.completed_at_ms);
+    try testing.expectEqual(@as(u64, 302), run.hist_next);
+    try testing.expectEqual(@as(u32, 1), f.active("wf").?.active);
+    // A second cancel: OK, and nothing changes. Another end: refused.
+    const commits = f.store.families[RunFam.ID].commits;
+    try testing.expect((try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 60)).refused() == null);
+    try testing.expectEqual(commits, f.store.families[RunFam.ID].commits);
+    const other = try f.complete("r1", completeValue(&vb, .failed, "wf"), 70);
     try testing.expectEqualStrings("run already finished", other.refused().?.refusal.message);
     // One naming another workflow, or a run never started, is a broken log.
-    try testing.expectError(error.Halt, f.complete("r2", completeValue(&vb, .completed, "other", 1), 80));
-    try testing.expectError(error.Halt, f.complete("nope", completeValue(&vb, .completed, "wf", 1), 80));
+    try testing.expectError(error.Halt, f.complete("r2", completeValue(&vb, .cancelled, "other"), 80));
+    try testing.expectError(error.Halt, f.complete("nope", completeValue(&vb, .cancelled, "wf"), 80));
+}
+
+test "workflow runs machine: a step's call is recorded and its start sent with it; a step taking its end applies only once it settled" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    var cb: [ae.Call.max_size]u8 = undefined;
+    const call = try ae.Call.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .kind = .action, .caller_run = "r1", .caller_workflow = "wf", .step = "s", .target = "act", .version = "", .run = "a1", .input = "{}", .can_wait = false });
+    const sent = f.store.families[channels.OutFam.ID].count;
+    try testing.expect((try f.step("r1", .{ .rev = 0, .wait = .call, .wait_on = "a1", .call = call })).refused() == null);
+    const slot = calls_mod.callerSlot(.default, "wf");
+    try testing.expectEqual(calls_mod.State.sent, calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1").?.state);
+    try testing.expectEqual(sent + 1, f.store.families[channels.OutFam.ID].count);
+    try testing.expectEqual(@as(u8, @backingInt(RunStatus.waiting)), f.get("r1").?.status);
+    // A call that isn't the step's wait is a broken log.
+    _ = try f.start("r2", "wf", "workflow_started", "", 1);
+    try testing.expectError(error.Halt, f.step("r2", .{ .rev = 0, .wait = .call, .wait_on = "other", .call = call }));
+    // Nor may a step leave the call unsettled.
+    const left = try f.step("r1", .{ .rev = 1 });
+    try testing.expectEqualStrings("conflict: the step leaves its run's call unsettled", left.refused().?.refusal.message);
+
+    // Its end taken while the call is out: refused, the run waiting still.
+    var r = try f.step("r1", .{ .rev = 1, .settles = "a1" });
+    try testing.expectEqualStrings("conflict: the run's call hasn't ended", r.refused().?.refusal.message);
+    // Another callee's end: refused.
+    r = try f.step("r1", .{ .rev = 1, .settles = "a2" });
+    try testing.expect(r.refused() != null);
+    // Its run ends: then the step taking it applies.
+    var db: [ae.Done.max_size]u8 = undefined;
+    _ = try f.answer(.call_done, try ae.Done.encodeInto(&db, .{ .ns = NamespaceId.default.int(), .slot = slot, .run = "a1", .status = .completed, .outcome = "", .result = "{}" }));
+    try testing.expect((try f.step("r1", .{ .rev = 1, .settles = "a1" })).refused() == null);
+    try testing.expectEqual(Wait.none, f.get("r1").?.wait);
+    // Its record went with it.
+    try testing.expect(calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1") == null);
+}
+
+test "workflow runs machine: a step whose counters are past their bound is refused, writing nothing" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    const big: [MAX_PROGRESS + 1]u8 = @splat(1);
+    const r = try f.step("r1", .{ .rev = 0, .progress = &big });
+    try testing.expectEqualStrings("a step's counters are past their bound", r.refused().?.refusal.message);
+    try testing.expectEqual(@as(u64, 0), f.get("r1").?.rev);
+    try testing.expect((try f.step("r1", .{ .rev = 0, .progress = big[0..MAX_PROGRESS] })).refused() == null);
 }
 
 test "workflow runs machine: a disabled workflow refuses a client or schedule start, not a trigger's, and refuses a child to its parent without creating it" {
