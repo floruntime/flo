@@ -35,6 +35,9 @@ pub const FORWARD_WAIT_MS: u64 = 1000;
 
 pub const HeldForward = struct {
     active: bool = false,
+    /// When it was held, in this edge's order: forwards run together run
+    /// in it.
+    seq: u64 = 0,
     /// The forward as it came, run again once the table has caught up.
     payload: []u8 = &.{},
     source_node: u32 = 0,
@@ -49,7 +52,7 @@ pub const HeldForward = struct {
 pub const Wait = struct {
     active: bool = false,
     /// When it began waiting, in this edge's order: waits resolved together
-    /// run in it, so a client's pipelined requests run as it sent them.
+    /// run in it, not in the order of the slots they hold.
     seq: u64 = 0,
     /// The client's own connection, on this shard.
     reply_to: ReplyTo = undefined,

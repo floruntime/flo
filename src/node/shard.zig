@@ -4411,21 +4411,23 @@ pub const Shard = struct {
         const t = self.namespace_handler.table;
         // Those resolved now run in the order they began waiting, not their
         // slots': a slot freed earlier may hold a later request.
-        var ready: [edge_mod.WAITS]*edge_mod.Wait = undefined;
+        const Ready = struct { w: *edge_mod.Wait, seq: u64 };
+        var ready: [edge_mod.WAITS]Ready = undefined;
         var n: usize = 0;
         for (&self.edge.waits) |*w| {
             if (!w.active) continue;
             if (w.index) |index| if (t.publishedIndex() >= index) {
-                ready[n] = w;
+                ready[n] = .{ .w = w, .seq = w.seq };
                 n += 1;
             };
         }
-        std.mem.sortUnstable(*edge_mod.Wait, ready[0..n], {}, struct {
-            fn lessThan(_: void, a: *edge_mod.Wait, b: *edge_mod.Wait) bool {
+        std.mem.sortUnstable(Ready, ready[0..n], {}, struct {
+            fn lessThan(_: void, a: Ready, b: Ready) bool {
                 return a.seq < b.seq;
             }
         }.lessThan);
-        for (ready[0..n]) |w| self.resolveAtEdge(w, now);
+        // Ended, or its slot taken again, by what ran before it: skipped.
+        for (ready[0..n]) |r| if (r.w.active and r.w.seq == r.seq) self.resolveAtEdge(r.w, now);
         for (&self.edge.waits) |*w| {
             if (!w.active) continue;
             if (w.index) |index| if (t.publishedIndex() >= index) continue;
@@ -4603,6 +4605,7 @@ pub const Shard = struct {
             return self.sendForwardReply(frame.source_node, id, proto.Response.serializeRefusal(.internal_error, request_id, proto.notRun("internal error: out of memory"), &err_buf), 0);
         h.* = .{
             .active = true,
+            .seq = self.edge.takeSeq(),
             .payload = payload,
             .source_node = frame.source_node,
             .group_id = frame.group_id,
@@ -4618,16 +4621,37 @@ pub const Shard = struct {
     /// forwarder's index, so the write is checked again and runs or is
     /// refused as on arrival, or the wait ran out and it never ran.
     fn sweepHeldForwards(self: *Shard, now: u64) void {
+        // Those the table has caught up for run in the order they were held,
+        // not their slots': a slot freed earlier may hold a later write.
+        const Ready = struct { h: *edge_mod.HeldForward, seq: u64 };
+        var ready: [edge_mod.HELD_FORWARDS]Ready = undefined;
+        var n: usize = 0;
+        for (&self.edge.held) |*h| {
+            if (h.active and self.namespace_handler.table.publishedIndex() >= h.published) {
+                ready[n] = .{ .h = h, .seq = h.seq };
+                n += 1;
+            }
+        }
+        std.mem.sortUnstable(Ready, ready[0..n], {}, struct {
+            fn lessThan(_: void, a: Ready, b: Ready) bool {
+                return a.seq < b.seq;
+            }
+        }.lessThan);
+        for (ready[0..n]) |r| {
+            const h = r.h;
+            // Ended, or its slot taken again, by what ran before it.
+            if (!h.active or h.seq != r.seq) continue;
+            const payload = h.payload;
+            h.payload = &.{};
+            const frame: RaftFrame = .{ .source_node = h.source_node, .group_id = h.group_id, .msg_type = .forward_write, .payload = payload };
+            self.edge.dropHeld(self.allocator, h);
+            defer self.allocator.free(payload);
+            self.runForwardedWrite(frame);
+        }
         for (&self.edge.held) |*h| {
             if (!h.active) continue;
-            if (self.namespace_handler.table.publishedIndex() >= h.published) {
-                const payload = h.payload;
-                h.payload = &.{};
-                const frame: RaftFrame = .{ .source_node = h.source_node, .group_id = h.group_id, .msg_type = .forward_write, .payload = payload };
-                self.edge.dropHeld(self.allocator, h);
-                defer self.allocator.free(payload);
-                self.runForwardedWrite(frame);
-            } else if (now >= h.deadline_ms) {
+            if (self.namespace_handler.table.publishedIndex() >= h.published) continue;
+            if (now >= h.deadline_ms) {
                 var err_buf: [256]u8 = undefined;
                 self.sendForwardReply(h.source_node, h.forward_id, proto.Response.serializeRefusal(.unavailable, h.request_id, FORWARD_NOT_CAUGHT_UP, &err_buf), 0);
                 self.edge.dropHeld(self.allocator, h);
@@ -15740,7 +15764,11 @@ const HeldForwardTest = struct {
     /// Member 2 forwards a put to `ns`, resolved there as `id`, from a table
     /// published through `published`.
     fn forward(t: *HeldForwardTest, forward_id: u32, ns: []const u8, id: ns_table.Id, published: u64) !void {
-        const wire = try Shard.serializeRequest(std.testing.allocator, testReq(.kv_put, 900 + forward_id, ns, "k", "v", ""));
+        return t.forwardPut(forward_id, ns, id, published, "v");
+    }
+
+    fn forwardPut(t: *HeldForwardTest, forward_id: u32, ns: []const u8, id: ns_table.Id, published: u64, value: []const u8) !void {
+        const wire = try Shard.serializeRequest(std.testing.allocator, testReq(.kv_put, 900 + forward_id, ns, "k", value, ""));
         defer std.testing.allocator.free(wire);
         const frame = try std.testing.allocator.alloc(u8, FORWARD_PREFIX + FORWARD_FIELDS + wire.len);
         defer std.testing.allocator.free(frame);
@@ -15842,6 +15870,43 @@ test "Shard: a held forward whose id the leader publishes under another name is 
     const resp = (try t.reply(9)).?;
     try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
     try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
+}
+
+test "Shard: forwarded writes held until this node's table catches up run in the order they came, though a later one took an earlier slot" {
+    var t: HeldForwardTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    const nh = t.shard.namespace_handler;
+    const a_id: ns_table.Id = .of(nh.nextId());
+    const b_id: ns_table.Id = .of(a_id.int() + 1);
+    const next = raft.log.lastIndex() + 1;
+    // One for "aa", held in the first slot; a write of "bb" in the next.
+    try t.forward(1, "aa", a_id, next);
+    try t.forwardPut(2, "bb", b_id, next + 1, "v1");
+    // "aa" published: its write runs, and its slot is free.
+    try t.create("aa");
+    t.shard.sweepHeldForwards(Shard.nowMs());
+    try std.testing.expect(!t.shard.edge.held[0].active);
+    // The second write of "bb" takes that first slot.
+    try t.forwardPut(3, "bb", b_id, next + 1, "v2");
+    try std.testing.expect(t.shard.edge.held[0].active);
+    const from = raft.log.lastIndex() + 1;
+    try t.create("bb");
+    t.shard.sweepHeldForwards(Shard.nowMs());
+    try std.testing.expectEqual(@as(u32, 0), t.shard.edge.held_count);
+    // Proposed v1, then v2.
+    var order: [2]u8 = undefined;
+    var n: usize = 0;
+    var i = from;
+    while (i <= raft.log.lastIndex()) : (i += 1) {
+        const e = raft.log.getEntry(i).?;
+        if (e.header.entry_type != @backingInt(entry_mod.EntryType.kv_put)) continue;
+        if (std.mem.indexOf(u8, e.payload, "v1") != null) order[n] = 1 else if (std.mem.indexOf(u8, e.payload, "v2") != null) order[n] = 2 else continue;
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, &order);
 }
 
 test "Shard: a forward carries a namespace's id only once this node's table has published it" {
