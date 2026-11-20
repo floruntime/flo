@@ -36,3 +36,12 @@ kv-delete-keeps-history.json	kv_delete_keeps_history	--kv-reaps	-	kv_reap_rule	t
 kv-reap-keeps-expired.json	kv_reap_keeps_expired	--kv-reaps	-	kv_reap_rule	reap left a key it names that had gone
 kv-reap-floor-unraised.json	kv_reap_floor_unraised	--kv-reaps	-	kv_reap_rule	repeats a version it had
 kv-reap-trusts-leader.json	kv_reap_trusts_leader	--kv-reaps	-	kv_reap_rule	reap dropped a key it names that hadn.t gone
+workflow-runs-wake-keeps-rev.json	runs_signal_wake_keeps_rev	--workflows	-	workflow_run_rule	a woken run.s rev is not the ledger.s
+workflow-runs-take-keeps-signal.json	runs_take_keeps_signal	--workflows	-	workflow_run_rule	a run.s held signals are not the ledger.s
+workflow-runs-end-keeps-signals.json	runs_end_keeps_signals	--workflows	-	workflow_run_rule	an ended run holds signals
+workflow-runs-signal-bound.json	runs_signal_bound_counts_all	--workflows	-	workflow_run_rule	refused a signal the ledger applies
+workflow-runs-stale-wait.json	runs_stale_wait_unchecked	--workflows	-	workflow_run_rule	it waits on a signal its run holds
+workflow-runs-take-newest.json	runs_take_newest	--workflows	-	workflow_run_rule	a run.s held signals are not the ledger.s
+workflow-runs-wake-any-type.json	runs_wake_any_type	--workflows	-	workflow_run_rule	a run.s status is not the ledger.s
+workflow-runs-take-picked.json	runs_take_ignores_picked	--workflows	-	workflow_run_rule	its takes name a signal its run doesn.t hold
+workflow-runs-signal-after-end.json	runs_signal_after_end	--workflows	-	workflow_run_rule	applied a signal the ledger refuses: its run has ended
