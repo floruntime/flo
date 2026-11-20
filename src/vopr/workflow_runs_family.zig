@@ -647,6 +647,7 @@ fn stepValue(r: std.Random, buf: []u8, rev: u64, wf: []const u8, hist_next: u64)
         .wait_timeout_to = "",
         .progress = "",
         .settles = "",
+        .takes = .{ .bytes = "", .count = 0 },
         .caller_slot = 0,
         .workflow = wf,
         .ends = 0,

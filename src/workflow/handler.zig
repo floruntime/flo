@@ -345,6 +345,9 @@ pub const WorkflowHandler = struct {
         /// and whether this decision took that call's end.
         took_call: ?[]const u8 = null,
         took_call_end: bool = false,
+        /// The signal types this decision's waits took, in order, owned:
+        /// each the oldest of its type the run holds.
+        takes: std.ArrayListUnmanaged([]u8) = .empty,
         /// The call this decision makes (an encoded `ae.Call`), logged with
         /// the step that waits on it.
         call_payload: ?[]const u8 = null,
@@ -534,6 +537,8 @@ pub const WorkflowHandler = struct {
         if (run.output_owned) |o| self.allocator.free(o);
         if (run.search_tags_owned) |t| self.allocator.free(t);
         if (run.took_call) |c| self.allocator.free(c);
+        for (run.takes.items) |t| self.allocator.free(t);
+        run.takes.deinit(self.allocator);
         if (run.call_payload) |c| self.allocator.free(c);
         if (run.ending_detail_owned) |d| self.allocator.free(d);
         if (run.step_outputs) |*so| {
@@ -1746,20 +1751,31 @@ pub const WorkflowHandler = struct {
                     const step_label = run.current_step_name_owned orelse "start";
                     // Whether a signal of its type applied already. Out of
                     // memory: the run stops at this step, taken again later.
-                    const signal_found = runs_machine.hasSignal(self.allocator, self.defsRead(), run_ns_key, wait_step.signal_type) catch |err| switch (err) {
+                    const held = runs_machine.signalsHeld(self.allocator, self.defsRead(), run_ns_key, wait_step.signal_type) catch |err| switch (err) {
                         error.OutOfMemory => return,
                         error.Malformed => {
                             self.completeRun(shard, run_ns_key, run, .failed, "the run's signals won't decode", now_ms);
                             return;
                         },
                     };
+                    // Less those this decision's waits took already.
+                    var took: u64 = 0;
+                    for (run.takes.items) |t| took += @intFromBool(std.mem.eql(u8, t, wait_step.signal_type));
+                    const signal_found = held > took;
                     self.addHistoryEvent(run, "waiting_for_signal", wait_step.signal_type, now_ms);
 
                     // A signal's match brings the run back here, so this is
                     // how any wait ends too.
                     self.clearWaitTimeout(run);
                     if (signal_found) {
-                        // Signal already received — follow "success" transition
+                        // It takes the signal: the step that logs this
+                        // removes it, so another wait of its type needs
+                        // another.
+                        const owned_take = self.allocator.dupe(u8, wait_step.signal_type) catch return;
+                        run.takes.append(self.allocator, owned_take) catch {
+                            self.allocator.free(owned_take);
+                            return;
+                        };
                         self.addHistoryEvent(run, "step_completed", step_label, now_ms);
                         if (shard.metrics_registry) |m| m.workflow.recordStepExecuted();
                         const transition = wait_step.getTransition(definition.StepOutcome.success) orelse {
@@ -2857,6 +2873,9 @@ pub const WorkflowHandler = struct {
             }
         }
 
+        var takes: wire_schema.Writer = .{ .buf = try a.alloc(u8, limit) };
+        for (run.takes.items) |t| try runs_machine.Take.encode(&takes, .{ .type = t });
+
         var wait: runs_machine.Wait = .none;
         var wait_on: []const u8 = "";
         var wait_due: i64 = 0;
@@ -2881,7 +2900,7 @@ pub const WorkflowHandler = struct {
         var pbuf: [progress_mod.Progress.max_size]u8 = undefined;
         const prog = progressOf(run);
         // A decision that changed nothing logs nothing.
-        if (run.ending == null and event_count == 0 and output_count == 0 and run.call_payload == null and settles.len == 0) {
+        if (run.ending == null and event_count == 0 and output_count == 0 and run.call_payload == null and settles.len == 0 and run.takes.items.len == 0) {
             const rec = self.appliedRun(run.ns_key) orelse return error.Unchanged;
             var lb: [progress_mod.Progress.max_size]u8 = undefined;
             const now_progress = prog.encode(&lb);
@@ -2925,6 +2944,7 @@ pub const WorkflowHandler = struct {
             .output = output orelse "",
             .tags = tags,
             .call = if (wait == .call) run.call_payload orelse "" else "",
+            .takes = .{ .bytes = takes.written(), .count = @intCast(run.takes.items.len) },
         };
         const bytes = Step.encodeInto(try a.alloc(u8, limit), value) catch |err| switch (err) {
             error.NoSpaceLeft, error.TooLong => return self.proposeTooLarge(shard, run, a, limit, now_ms),
@@ -2953,6 +2973,7 @@ pub const WorkflowHandler = struct {
             .wait_timeout_to = "",
             .progress = "",
             .settles = "",
+            .takes = .{ .bytes = "", .count = 0 },
             .caller_slot = calls_mod.callerSlot(ns, run.workflow_name_owned),
             .workflow = run.workflow_name_owned,
             .ends = @backingInt(RunStatus.failed),
@@ -4483,6 +4504,13 @@ const test_two_waits_json =
     \\{"kind":"Workflow","name":"two-waits","version":"1.0.0",
     \\"start":{"wait_for_signal":{"type":"first","timeout_ms":3600000,"on_timeout":"second"},"transitions":{"success":"second"}},
     \\"steps":{"second":{"wait_for_signal":{"type":"second"},"transitions":{"success":"flo.Completed"}}}}
+;
+
+/// Two waits on one type, one after the other.
+const test_two_approvals_json =
+    \\{"kind":"Workflow","name":"two-approvals","version":"1.0.0",
+    \\"start":{"wait_for_signal":{"type":"approve"},"transitions":{"success":"again"}},
+    \\"steps":{"again":{"wait_for_signal":{"type":"approve"},"transitions":{"success":"flo.Completed"}}}}
 ;
 
 /// Workflow with a wait_for_signal step
@@ -6631,6 +6659,7 @@ test "a step's logged counters that won't decode end the run failed, saying why,
         .wait_timeout_to = "",
         .progress = &.{ progress_mod.VERSION + 1, 0 },
         .settles = "",
+        .takes = .{ .bytes = "", .count = 0 },
         .caller_slot = calls_mod.callerSlot(.default, "test-wf"),
         .workflow = "test-wf",
         .ends = 0,
@@ -6709,6 +6738,39 @@ test "a signal that commits between a wait's decision and its step is taken: the
     const run = handler.inspect(testKey(.default, "r")).?;
     try testing.expectEqualStrings("second", run.current_step_name_owned.?);
     try testing.expectEqualStrings("second", run.wait_signal_type_owned.?);
+}
+
+test "a signal sent before its wait is taken by that wait alone: a second wait of its type needs a second signal" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    shard.workflow_handler = &handler;
+    const key = testKey(.default, "r");
+    createTestDef(&handler, testKey(.default, "two-approvals"), "two-approvals", test_two_approvals_json);
+    createTestRun(&handler, key, "r", "two-approvals");
+    try testSignal(&handler, key, "approve");
+    handler.advanceWorkflow(&shard, key);
+    settleTest(&shard);
+    // The first wait took it; the second waits.
+    var run = handler.inspect(key).?;
+    try testing.expectEqualStrings("again", run.current_step_name_owned.?);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    try testing.expect(!try runs_machine.hasSignal(testing.allocator, handler.defsRead(), key, "approve"));
+    handler.advanceStartedRuns(&shard);
+    settleTest(&shard);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.inspect(key).?.status);
+    // A second signal ends the second wait.
+    try testSignal(&handler, key, "approve");
+    handler.advanceStartedRuns(&shard);
+    settleTest(&shard);
+    run = handler.inspect(key).?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
+    try testing.expectEqual(@as(u64, 0), runs_machine.runOf(handler.defsRead(), key).?.sig_held);
 }
 
 test "a signal to a finished run is refused and leaves its history alone" {
@@ -6870,6 +6932,7 @@ fn createTestRunAt(handler: *WorkflowHandler, run_id: []const u8, wf_name: []con
                 .wait_timeout_to = "",
                 .progress = "",
                 .settles = "",
+                .takes = .{ .bytes = "", .count = 0 },
                 .caller_slot = calls_mod.callerSlot(.default, wf_name),
                 .workflow = wf_name,
                 .ends = 0,

@@ -116,14 +116,15 @@ pub const Run = Record(&.{
     .{ .name = "wait_timeout_to", .T = Bytes(MAX_PERSIST_PAYLOAD) },
     // The step's own counters, as its leader encoded them; kept verbatim.
     .{ .name = "progress", .T = Bytes(MAX_PERSIST_PAYLOAD) },
-    // The seq the next signal takes (`workflow.sig`): every signal it was
-    // sent, which `MAX_SIGNALS` bounds.
+    // The seq the next signal takes (`workflow.sig`), and how many it holds
+    // that no wait has taken: those `MAX_SIGNALS` bounds.
     .{ .name = "sig_next", .T = Int(u64) },
+    .{ .name = "sig_held", .T = Int(u64) },
 });
 
-/// The most signals one run is sent; one past it is refused. A signal
-/// stays once a wait took it (a later wait of its type ends at once), so
-/// every one counts.
+/// The most signals one run holds that no wait has taken; one past it is
+/// refused. A wait takes the oldest it holds of its type, so each signal
+/// ends one wait.
 pub const MAX_SIGNALS: u64 = 64;
 
 /// A `workflow_signal` value: a client's signal to the run its key names.
@@ -133,6 +134,11 @@ pub const Signal = Record(&.{
 });
 
 /// A signal a run was sent, at its entry's stamp.
+/// A signal type a step's wait took: the oldest of it the run holds.
+pub const Take = Record(&.{
+    .{ .name = "type", .T = Bytes(MAX_NAME) },
+});
+
 pub const Sig = Record(&.{
     .{ .name = "type", .T = Bytes(MAX_NAME) },
     .{ .name = "payload", .T = Bytes(MAX_BODY) },
@@ -207,6 +213,9 @@ pub const Step = Record(&.{
     // `step.calls` and its start sent in this apply, its callee the run's
     // new wait.
     .{ .name = "call", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+    // The signals its waits took, in order: each the oldest of its type the
+    // run holds, gone from `workflow.sig` in this apply.
+    .{ .name = "takes", .T = schema.BoundedList(Take, MAX_SIGNALS, MAX_PERSIST_PAYLOAD) },
 });
 
 pub const Hist = Record(&.{
@@ -630,6 +639,7 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i6
         .hist_next = 0,
         .hist_dropped = 0,
         .sig_next = 0,
+        .sig_held = 0,
         .step = "",
         .rev = 0,
         .wait = .none,
@@ -700,9 +710,10 @@ fn applySignal(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i
     const sig = Signal.decodeAll(cmd.value, &diag) catch return error.Halt;
     var run = ((try view.get(RunFam, cmd.key)) orelse return out.refuse(.not_found, .not_found, "")).v;
     if (statusOf(run).isTerminal()) return out.refuse(.bad_request, .unclassified, "run already finished");
-    if (run.sig_next >= MAX_SIGNALS) return out.refuse(.bad_request, .unclassified, "run's signals are full");
+    if (run.sig_held >= MAX_SIGNALS) return out.refuse(.bad_request, .unclassified, "run's signals are full");
     try view.put(SigFam, try sigKey(view.arena, n.ns, n.run, run.sig_next), .{ .v = .{ .type = sig.type, .payload = sig.payload, .at_ms = stamp_ms } });
     run.sig_next += 1;
+    run.sig_held += 1;
     try appendHist(view, n, &run, "signal_received", sig.type, stamp_ms);
     if (run.wait == .signal and std.mem.eql(u8, run.wait_on, sig.type)) {
         try appendHist(view, n, &run, "signal_matched", sig.type, stamp_ms);
@@ -716,19 +727,35 @@ fn applySignal(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i
     try view.put(RunFam, cmd.key, .{ .v = run });
 }
 
-/// Whether run `run_key` was sent a signal of `signal_type`, as applied.
+/// Whether run `run_key` holds a signal of `signal_type` no wait has
+/// taken, as applied.
 pub fn hasSignal(a: std.mem.Allocator, read: ReadView, run_key: []const u8, signal_type: []const u8) error{ OutOfMemory, Malformed }!bool {
+    return try signalsHeld(a, read, run_key, signal_type) > 0;
+}
+
+/// How many signals of `signal_type` run `run_key` holds that no wait has
+/// taken, as applied.
+pub fn signalsHeld(a: std.mem.Allocator, read: ReadView, run_key: []const u8, signal_type: []const u8) error{ OutOfMemory, Malformed }!u64 {
     const prefix = try runRange(a, keyNamespace(run_key), run_key[KEY_PREFIX..]);
     defer a.free(prefix);
     var it = read.range(SigFam, prefix);
-    while (try it.next()) |item| if (std.mem.eql(u8, item.value.v.type, signal_type)) return true;
-    return false;
+    var n: u64 = 0;
+    while (try it.next()) |item| {
+        if (std.mem.eql(u8, item.value.v.type, signal_type)) n += 1;
+    }
+    return n;
 }
 
-fn holdsSignal(view: *View, n: Named, signal_type: []const u8) ApplyError!bool {
+/// The key of the oldest signal of `signal_type` run `n` holds, past those
+/// in `taken`, if any.
+fn oldestHeld(view: *View, n: Named, signal_type: []const u8, taken: []const []const u8) ApplyError!?[]const u8 {
     var it = try view.range(SigFam, try runRange(view.arena, n.ns, n.run));
-    while (try it.next()) |item| if (std.mem.eql(u8, item.value.v.type, signal_type)) return true;
-    return false;
+    next: while (try it.next()) |item| {
+        if (!std.mem.eql(u8, item.value.v.type, signal_type)) continue;
+        for (taken) |k| if (std.mem.eql(u8, k, item.key)) continue :next;
+        return item.key;
+    }
+    return null;
 }
 
 /// One event onto `run`'s history at its next seq; past `HIST_KEEP` the
@@ -762,10 +789,17 @@ fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64
     const ended_steps = comptime plant.active == .runs_ended_takes_step;
     if (!ended_steps and statusOf(run).isTerminal()) return out.refuse(.conflict, .unclassified, "conflict: the run has ended");
     if (st.rev != run.rev) return out.refuse(.conflict, .unclassified, "conflict: the run moved on from that step");
+    // Each wait it passed takes the oldest signal of its type the run holds.
+    var taken: std.ArrayListUnmanaged([]const u8) = .empty;
+    var takes = st.takes.iterator();
+    while (takes.next() catch return error.Halt) |t| {
+        const k = (try oldestHeld(view, n, t.type, taken.items)) orelse return out.refuse(.conflict, .unclassified, "conflict: the run holds no such signal");
+        try taken.append(view.arena, try view.arena.dupe(u8, k));
+    }
     // A signal of its type applied after the wait was decided and before
     // it: the run would wait on what it holds, which wakes nothing. Refused,
     // so its next step is decided with the signal there.
-    if (st.wait == .signal and try holdsSignal(view, n, st.wait_on)) return out.refuse(.conflict, .unclassified, "conflict: the run holds that signal already");
+    if (st.wait == .signal and try oldestHeld(view, n, st.wait_on, taken.items) != null) return out.refuse(.conflict, .unclassified, "conflict: the run holds that signal already");
     if (st.progress.len > MAX_PROGRESS) return out.refuse(.bad_request, .unclassified, "a step's counters are past their bound");
     // A step leaves its run's call only by taking its end, or by ending the
     // run (the call then goes with the run, unanswered).
@@ -785,6 +819,9 @@ fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64
             try view.delete(calls_mod.Calls, k);
         }
     }
+
+    for (taken.items) |k| try view.delete(SigFam, k);
+    run.sig_held -= @intCast(taken.items.len);
 
     if (st.call.len > 0) {
         const p = ae.Call.decodeAll(st.call, &diag) catch return error.Halt;
@@ -1044,6 +1081,9 @@ const Fixture = struct {
         var outputs_buf: [256]u8 = undefined;
         var ow: schema.Writer = .{ .buf = &outputs_buf };
         if (spec.output_step.len > 0) try StepOutput.encode(&ow, .{ .step = spec.output_step, .outcome = "success", .output = "{}" });
+        var takes_buf: [256]u8 = undefined;
+        var tw: schema.Writer = .{ .buf = &takes_buf };
+        for (spec.takes) |t| try Take.encode(&tw, .{ .type = t });
         const value: Step.Value = .{
             .rev = spec.rev,
             .step = spec.at,
@@ -1064,6 +1104,7 @@ const Fixture = struct {
             .output = if (spec.ends != null) "out" else "",
             .tags = "",
             .call = spec.call,
+            .takes = .{ .bytes = tw.written(), .count = @intCast(spec.takes.len) },
         };
         var vb: [32 * 1024]u8 = undefined;
         return f.command(.workflow_step, view_mod.idKey(&kb, .default, run_id) catch unreachable, try Step.encodeInto(&vb, value), 1);
@@ -1121,6 +1162,7 @@ const StepSpec = struct {
     call: []const u8 = "",
     workflow: []const u8 = "wf",
     output_step: []const u8 = "",
+    takes: []const []const u8 = &.{},
 };
 
 fn startValue(buf: []u8, wf: []const u8, event: []const u8, idem: []const u8) []const u8 {
@@ -1370,6 +1412,48 @@ test "workflow runs machine: a wait decided before its signal applied, on a sign
     try testing.expectEqual(@as(u64, 0), run.rev);
     // A wait on another type still applies.
     try testing.expect((try f.step("r1", .{ .rev = 0, .wait = .signal, .wait_on = "other" })).refused() == null);
+}
+
+test "workflow runs machine: a wait takes the oldest signal of its type, so two waits need two, and a step taking one the run doesn't hold is refused" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    var kb: [64]u8 = undefined;
+    const key = view_mod.idKey(&kb, .default, "r1") catch unreachable;
+    var sb: [128]u8 = undefined;
+    try testing.expect((try f.command(.workflow_signal, key, try Signal.encodeInto(&sb, .{ .type = "approve", .payload = "one" }), 2)).refused() == null);
+    try testing.expect((try f.command(.workflow_signal, key, try Signal.encodeInto(&sb, .{ .type = "approve", .payload = "two" }), 3)).refused() == null);
+    // Its first wait takes the older; the second is still held.
+    try testing.expect((try f.step("r1", .{ .rev = 0, .takes = &.{"approve"} })).refused() == null);
+    try testing.expectEqual(@as(u64, 1), f.get("r1").?.sig_held);
+    var it = (ReadView{ .store = &f.store }).range(SigFam, "");
+    try testing.expectEqualStrings("two", (try it.next()).?.value.v.payload);
+    try testing.expect((try it.next()) == null);
+    // Two more waits, one signal: refused, nothing taken.
+    const short = try f.step("r1", .{ .rev = 1, .takes = &.{ "approve", "approve" } });
+    try testing.expectEqualStrings("conflict: the run holds no such signal", short.refused().?.refusal.message);
+    try testing.expectEqual(@as(u64, 1), f.get("r1").?.sig_held);
+    // The second wait takes the other, and a third waits.
+    try testing.expect((try f.step("r1", .{ .rev = 1, .takes = &.{"approve"}, .wait = .signal, .wait_on = "approve" })).refused() == null);
+    try testing.expectEqual(@as(u64, 0), f.get("r1").?.sig_held);
+    try testing.expectEqual(Wait.signal, f.get("r1").?.wait);
+}
+
+test "workflow runs machine: a run that takes each signal it is sent never fills up" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    var kb: [64]u8 = undefined;
+    const key = view_mod.idKey(&kb, .default, "r1") catch unreachable;
+    var sb: [128]u8 = undefined;
+    const value = try Signal.encodeInto(&sb, .{ .type = "go", .payload = "" });
+    for (0..100) |i| {
+        try testing.expect((try f.command(.workflow_signal, key, value, 2)).refused() == null);
+        try testing.expect((try f.step("r1", .{ .rev = i, .takes = &.{"go"} })).refused() == null);
+    }
+    const run = f.get("r1").?;
+    try testing.expectEqual(@as(u64, 100), run.sig_next);
+    try testing.expectEqual(@as(u64, 0), run.sig_held);
 }
 
 test "workflow runs machine: a run takes 64 signals and refuses the next; an ended or missing run refuses one" {

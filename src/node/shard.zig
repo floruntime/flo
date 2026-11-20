@@ -30316,6 +30316,7 @@ fn proposeCallOf(s: *Shard, kind: action_entries.CallKind, target: []const u8, w
         .wait_timeout_to = "",
         .progress = "",
         .settles = "",
+        .takes = .{ .bytes = "", .count = 0 },
         .caller_slot = calls_machine.callerSlot(.default, workflow),
         .workflow = workflow,
         .ends = 0,
