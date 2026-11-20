@@ -152,9 +152,6 @@ pub const WorkflowHandler = struct {
     /// The cancel this leader proposed last for a run, by key, owned: its
     /// end is counted when that entry applies. Leader memory.
     ending: std.StringHashMapUnmanaged(Ending) = .empty,
-    /// Signals sent to each run, not yet logged, by key, owned: a wait for
-    /// one already here ends at once. Leader memory.
-    signals: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(Signal)) = .empty,
     /// Logs a cancel's completion. A seam so a test can make the log refuse.
     propose: *const fn (shard: *Shard, run_ns_key: []const u8, value: []const u8) anyerror!persistence_mod.ProposeResult = proposeCompletion,
     /// When this leader next looks for calls whose workflow run has ended,
@@ -494,16 +491,6 @@ pub const WorkflowHandler = struct {
         }
         self.clearStepping();
         self.stepping.deinit(self.allocator);
-        var sig_it = self.signals.iterator();
-        while (sig_it.next()) |e| {
-            for (e.value_ptr.items) |sig| {
-                self.allocator.free(sig.signal_type_owned);
-                if (sig.payload_owned) |p| self.allocator.free(p);
-            }
-            e.value_ptr.deinit(self.allocator);
-            self.allocator.free(e.key_ptr.*);
-        }
-        self.signals.deinit(self.allocator);
         while (self.timers.pop()) |t| self.allocator.free(t.ns_key);
         self.timers.deinit(self.allocator);
 
@@ -718,7 +705,7 @@ pub const WorkflowHandler = struct {
         switch (op) {
             .workflow_create => return self.handleCreate(shard, conn, req),
             .workflow_start => return self.handleStart(shard, conn, req),
-            .workflow_signal => self.handleSignal(shard, conn, req),
+            .workflow_signal => return self.handleSignal(shard, conn, req),
             .workflow_cancel => return self.handleCancel(shard, conn, req),
             .workflow_status => self.handleStatus(shard, conn, req),
             .workflow_history => self.handleHistory(shard, conn, req),
@@ -1048,116 +1035,61 @@ pub const WorkflowHandler = struct {
 
     // ── SIGNAL ──────────────────────────────────────────────────────────
 
-    fn handleSignal(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
+    /// A client's signal, logged (`workflow_signal`): the client is
+    /// answered once it applies, and a run waiting on its type wakes there.
+    fn handleSignal(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) ?persistence_mod.ProposeResult {
         const run_id = req.key;
-
         if (run_id.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run_id is required");
-            return;
+            return null;
         }
-
         const run_ns_key = self.nsKey(req.ns_id, run_id) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
+            return null;
         };
         defer self.allocator.free(run_ns_key);
-
+        // What apply refuses, answered at once where this node can tell.
         const applied = self.appliedRun(run_ns_key) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
-            return;
+            return null;
         };
         if (appliedStatus(applied).isTerminal()) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run already finished");
-            return;
-        }
-        if (self.endingInFlight(shard, run_ns_key) or self.steppingAt(shard, run_ns_key) != null) {
-            // Retried, it's delivered once what's in flight applies, and
-            // told the run finished if that ended it.
-            shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun("run is taking a step — retry"));
-            return;
+            return null;
         }
 
-        // Parse signal: [signal_len:u16][signal_type][payload...]
+        // [signal_len:u16][signal_type][payload...]
         if (req.value.len < 2) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "signal type is required");
-            return;
+            return null;
         }
         const sig_len: usize = std.mem.readInt(u16, req.value[0..2], .little);
         if (req.value.len - 2 < sig_len) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "malformed signal");
-            return;
+            return null;
         }
         const signal_type = req.value[2 .. 2 + sig_len];
         // A leading '_' is reserved for types the server makes.
         if (signal_type.len > 0 and signal_type[0] == '_') {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "reserved signal type: a leading '_' is the system's");
-            return;
+            return null;
         }
-        const payload_data = if (2 + sig_len < req.value.len) req.value[2 + sig_len ..] else null;
-        const now_ms: i64 = @import("stdx").time.milliTimestamp();
-        self.keepSignal(run_ns_key, signal_type, payload_data, now_ms) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "signal store failed");
-            return;
+        const payload = req.value[2 + sig_len ..];
+        const buf = self.allocator.alloc(u8, runs_machine.Signal.max_size) catch {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+            return null;
         };
-
-        // Logged with a step: its history says it came, and a run waiting
-        // for it goes on.
-        const run = self.takeRun(shard, run_ns_key) orelse {
-            shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun("run is taking a step — retry"));
-            return;
+        defer self.allocator.free(buf);
+        const value = runs_machine.Signal.encodeInto(buf, .{ .type = signal_type, .payload = payload }) catch {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "signal too large");
+            return null;
         };
-        self.addHistoryEvent(run, "signal_received", signal_type, now_ms);
+        const proposed = persistence_mod.proposeEntryIn(shard, .workflow_signal, entry_mod.Flags.NONE, req.ns_id, run_ns_key, value) catch |err| {
+            shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "signal not persisted"));
+            return null;
+        };
         if (shard.metrics_registry) |m| m.workflow.recordSignalDelivered();
-        if (run.ending == null and run.status == .waiting) {
-            if (run.wait_signal_type_owned) |expected| {
-                if (std.mem.eql(u8, expected, signal_type)) {
-                    run.status = .running;
-                    self.allocator.free(expected);
-                    run.wait_signal_type_owned = null;
-                    self.addHistoryEvent(run, "signal_matched", signal_type, now_ms);
-                    // Follow the "success" transition from the current wait step.
-                    self.advanceWorkflow(shard, run_ns_key);
-                }
-            }
-        }
-        self.commitRun(shard, run_ns_key);
-        shard.sendOkResponse(conn, req.header.request_id, "");
-    }
-
-    /// A signal kept for run `run_key` until signals are logged: a wait for
-    /// its type ends at once. Kept on this node alone, and dropped when the
-    /// run ends.
-    fn keepSignal(self: *WorkflowHandler, run_key: []const u8, signal_type: []const u8, payload: ?[]const u8, now_ms: i64) !void {
-        const gop = try self.signals.getOrPut(self.allocator, run_key);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = self.allocator.dupe(u8, run_key) catch |err| {
-                self.signals.removeByPtr(gop.key_ptr);
-                return err;
-            };
-            gop.value_ptr.* = .empty;
-        }
-        const owned_type = try self.allocator.dupe(u8, signal_type);
-        errdefer self.allocator.free(owned_type);
-        const owned_payload: ?[]const u8 = if (payload) |p| try self.allocator.dupe(u8, p) else null;
-        errdefer if (owned_payload) |p| self.allocator.free(p);
-        try gop.value_ptr.append(self.allocator, .{ .signal_type_owned = owned_type, .payload_owned = owned_payload, .received_at_ms = now_ms });
-    }
-
-    fn dropSignals(self: *WorkflowHandler, run_key: []const u8) void {
-        var kv = self.signals.fetchRemove(run_key) orelse return;
-        for (kv.value.items) |sig| {
-            self.allocator.free(sig.signal_type_owned);
-            if (sig.payload_owned) |p| self.allocator.free(p);
-        }
-        kv.value.deinit(self.allocator);
-        self.allocator.free(kv.key);
-    }
-
-    /// Whether a signal of `signal_type` came for run `run_key`.
-    fn hasSignal(self: *const WorkflowHandler, run_key: []const u8, signal_type: []const u8) bool {
-        const list = self.signals.get(run_key) orelse return false;
-        for (list.items) |sig| if (std.mem.eql(u8, sig.signal_type_owned, signal_type)) return true;
-        return false;
+        return proposed;
     }
 
     // ── CANCEL ──────────────────────────────────────────────────────────
@@ -1182,12 +1114,6 @@ pub const WorkflowHandler = struct {
         };
         if (appliedStatus(run).isTerminal()) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run already finished");
-            return null;
-        }
-        if (self.steppingAt(shard, run_ns_key) != null) {
-            // Retried, it's cancelled if the step leaves the run going, and
-            // told the run finished if the step ended it.
-            shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun("run is taking a step — retry"));
             return null;
         }
         if (req.value.len > MAX_CANCEL_REASON) {
@@ -1818,7 +1744,7 @@ pub const WorkflowHandler = struct {
                     self.addHistoryEvent(run, "waiting_for_signal", wait_step.signal_type, now_ms);
 
                     // Check if a matching signal has already been received
-                    const signal_found = self.hasSignal(run_ns_key, wait_step.signal_type);
+                    const signal_found = runs_machine.hasSignal(self.defsRead(), run_ns_key, wait_step.signal_type);
 
                     // A signal's match brings the run back here, so this is
                     // how any wait ends too.
@@ -2452,32 +2378,6 @@ pub const WorkflowHandler = struct {
                 // Still waiting, nothing changed: nothing to log.
                 self.dropRun(ns_key);
                 continue;
-            }
-            self.commitRun(shard, ns_key);
-        }
-
-        // A signal kept here for a run whose logged wait wants it: the step
-        // that took it may have been cut with a leadership.
-        var sig_keys: [64][]const u8 = undefined;
-        var sig_count: usize = 0;
-        defer for (sig_keys[0..sig_count]) |k| self.allocator.free(k);
-        var sit = self.signals.keyIterator();
-        while (sit.next()) |k| {
-            if (sig_count == sig_keys.len) break;
-            const rec = self.appliedRun(k.*) orelse continue;
-            if (appliedStatus(rec).isTerminal() or rec.wait != .signal or !self.hasSignal(k.*, rec.wait_on)) continue;
-            if (self.steppingAt(shard, k.*) != null or self.endingInFlight(shard, k.*)) continue;
-            sig_keys[sig_count] = self.allocator.dupe(u8, k.*) catch break;
-            sig_count += 1;
-        }
-        for (sig_keys[0..sig_count]) |ns_key| {
-            const run = self.takeRun(shard, ns_key) orelse continue;
-            if (run.wait_signal_type_owned) |expected| {
-                self.addHistoryEvent(run, "signal_matched", expected, now_ms);
-                self.allocator.free(expected);
-                run.wait_signal_type_owned = null;
-                run.status = .running;
-                self.advanceWorkflow(shard, ns_key);
             }
             self.commitRun(shard, ns_key);
         }
@@ -3974,7 +3874,7 @@ pub const WorkflowHandler = struct {
         const etype = std.enums.fromInt(entry_mod.EntryType, entry.header.entry_type) orelse return error.Halt;
         const m: *const contract_machine.Machine = switch (etype) {
             .workflow_create, .workflow_enabled => &defs_machine.machine,
-            .workflow_start, .workflow_step, .workflow_complete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done => &runs_machine.machine,
+            .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done => &runs_machine.machine,
             else => return error.Halt,
         };
         try contract_machine.applyEntry(m, self.defsRead().store, &self.def_scratch, entry, out);
@@ -4050,7 +3950,7 @@ pub const WorkflowHandler = struct {
         if (out.refused() != null) return;
         const t = std.enums.fromInt(entry_mod.EntryType, e.header.entry_type) orelse return;
         switch (t) {
-            .workflow_create, .workflow_enabled, .workflow_start, .workflow_step, .workflow_complete => {},
+            .workflow_create, .workflow_enabled, .workflow_start, .workflow_step, .workflow_signal, .workflow_complete => {},
             else => return,
         }
         const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return;
@@ -4066,7 +3966,6 @@ pub const WorkflowHandler = struct {
         if (live and run.wait == .none) self.indexToStep(run_key) else self.unindexToStep(run_key);
         if (live and run.wait == .call) self.indexKey(&self.parked, run_key) else unindexKey(self, &self.parked, run_key);
         if (live and (run.wait == .timer or (run.wait == .signal and run.wait_due_ms > 0))) self.armTimer(run_key, run.wait_due_ms);
-        if (!live) self.dropSignals(run_key);
         if (t == .workflow_start) {
             self.followFired(keyNamespace(run_key), run.workflow);
             self.followTrigger(keyNamespace(run_key), run.workflow, run.idempotency_key);

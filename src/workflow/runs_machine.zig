@@ -116,6 +116,27 @@ pub const Run = Record(&.{
     .{ .name = "wait_timeout_to", .T = Bytes(MAX_PERSIST_PAYLOAD) },
     // The step's own counters, as its leader encoded them; kept verbatim.
     .{ .name = "progress", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+    // The seq the next signal takes (`workflow.sig`): every signal it was
+    // sent, which `MAX_SIGNALS` bounds.
+    .{ .name = "sig_next", .T = Int(u64) },
+});
+
+/// The most signals one run is sent; one past it is refused. A signal
+/// stays once a wait took it (a later wait of its type ends at once), so
+/// every one counts.
+pub const MAX_SIGNALS: u64 = 64;
+
+/// A `workflow_signal` value: a client's signal to the run its key names.
+pub const Signal = Record(&.{
+    .{ .name = "type", .T = Bytes(MAX_NAME) },
+    .{ .name = "payload", .T = Bytes(MAX_BODY) },
+});
+
+/// A signal a run was sent, at its entry's stamp.
+pub const Sig = Record(&.{
+    .{ .name = "type", .T = Bytes(MAX_NAME) },
+    .{ .name = "payload", .T = Bytes(MAX_BODY) },
+    .{ .name = "at_ms", .T = Int(i64) },
 });
 
 /// What a run waits for between steps.
@@ -233,6 +254,12 @@ pub const HistFam = view_mod.Family(29, "workflow.hist", .id, Stored(Hist));
 pub const IdemFam = view_mod.Family(64, "workflow.idem", .id, Stored(Idem));
 pub const PerDefFam = view_mod.Family(65, "workflow.per_def", .id, Stored(PerDef));
 pub const OutFam = view_mod.Family(66, "workflow.out", .id, Stored(Out));
+pub const SigFam = view_mod.Family(67, "workflow.sig", .id, Stored(Sig));
+
+/// `ns ‖ len ‖ run ‖ seq`, a signal's key.
+pub fn sigKey(a: std.mem.Allocator, ns: NamespaceId, run: []const u8, seq: u64) error{OutOfMemory}![]u8 {
+    return histKey(a, ns, run, seq);
+}
 
 const KEY_PREFIX = @sizeOf(u32);
 
@@ -449,7 +476,7 @@ fn named(e: *const Entry) ?Named {
             const p = ae.ChildRefuse.decodeAll(e.payload, &diag) catch return null;
             break :blk .{ .ns = .of(p.ns), .run = p.run };
         },
-        .workflow_start, .workflow_step, .workflow_complete => blk: {
+        .workflow_start, .workflow_step, .workflow_signal, .workflow_complete => blk: {
             const cmd = command(e) orelse return null;
             break :blk .{ .ns = cmd.namespace_id, .run = cmd.key[KEY_PREFIX..] };
         },
@@ -497,6 +524,12 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
                 if (try calls_mod.recordKey(arena, p)) |k| try out.addIn(calls_mod.Calls.ID, n.ns, k[KEY_PREFIX..]);
             }
         },
+        .workflow_signal => {
+            try out.addIn(RunFam.ID, n.ns, n.run);
+            const range = (try runRange(arena, n.ns, n.run))[KEY_PREFIX..];
+            out.addRangeIn(HistFam.ID, n.ns, range) catch return error.OutOfMemory;
+            out.addRangeIn(SigFam.ID, n.ns, range) catch return error.OutOfMemory;
+        },
         .workflow_complete => {
             const cmd = command(e).?;
             try out.addIn(RunFam.ID, n.ns, n.run);
@@ -530,6 +563,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         .child_start, .child_refuse => return applyParent(view, e, n),
         .workflow_start => return applyStart(view, n, command(e).?, stamp_ms, out),
         .workflow_step => return applyStep(view, n, command(e).?, stamp_ms, out),
+        .workflow_signal => return applySignal(view, n, command(e).?, stamp_ms, out),
         .workflow_complete => return applyComplete(view, n, command(e).?, stamp_ms, out),
         else => return error.Halt,
     }
@@ -593,6 +627,7 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i6
         .search_tags = if (def) |d| try searchTags(arena, d.yaml, s.input, n.run) else "",
         .hist_next = 0,
         .hist_dropped = 0,
+        .sig_next = 0,
         .step = "",
         .rev = 0,
         .wait = .none,
@@ -651,6 +686,45 @@ fn refuseChild(view: *View, n: Named) ApplyError!void {
     if (p.v.state != .pending) return;
     try reply(view, n.ns, n.run, p.v.parent_slot, .refused, "workflow is disabled");
     try view.delete(Parents, k);
+}
+
+/// A client's signal: kept, said in its run's history, and, when the run
+/// waits on a signal of its type, the wake: the run is runnable, and its
+/// `rev` moves on, so a step decided from that wait (its timeout) is
+/// refused rather than also moving it.
+fn applySignal(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64, out: *Result) ApplyError!void {
+    var diag: schema.Diagnostic = .{};
+    // Its handler encoded it: one that doesn't decode is a Flo bug.
+    const sig = Signal.decodeAll(cmd.value, &diag) catch return error.Halt;
+    var run = ((try view.get(RunFam, cmd.key)) orelse return out.refuse(.not_found, .not_found, "")).v;
+    if (statusOf(run).isTerminal()) return out.refuse(.bad_request, .unclassified, "run already finished");
+    if (run.sig_next >= MAX_SIGNALS) return out.refuse(.bad_request, .unclassified, "run's signals are full");
+    try view.put(SigFam, try sigKey(view.arena, n.ns, n.run, run.sig_next), .{ .v = .{ .type = sig.type, .payload = sig.payload, .at_ms = stamp_ms } });
+    run.sig_next += 1;
+    try appendHist(view, n, &run, "signal_received", sig.type, stamp_ms);
+    if (run.wait == .signal and std.mem.eql(u8, run.wait_on, sig.type)) {
+        try appendHist(view, n, &run, "signal_matched", sig.type, stamp_ms);
+        run.wait = .none;
+        run.wait_on = "";
+        run.wait_due_ms = 0;
+        run.wait_timeout_to = "";
+        run.status = @backingInt(RunStatus.running);
+        run.rev += 1;
+    }
+    try view.put(RunFam, cmd.key, .{ .v = run });
+}
+
+/// Whether run `run_key` was sent a signal of `signal_type`, as applied.
+pub fn hasSignal(read: ReadView, run_key: []const u8, signal_type: []const u8) bool {
+    var kb: [KEY_PREFIX + 2 + 1024]u8 = undefined;
+    const run = run_key[KEY_PREFIX..];
+    if (run.len > 1024) return false;
+    @memcpy(kb[0..KEY_PREFIX], run_key[0..KEY_PREFIX]);
+    std.mem.writeInt(u16, kb[KEY_PREFIX..][0..2], @intCast(run.len), .big);
+    @memcpy(kb[KEY_PREFIX + 2 ..][0..run.len], run);
+    var it = read.range(SigFam, kb[0 .. KEY_PREFIX + 2 + run.len]);
+    while (it.next() catch return false) |item| if (std.mem.eql(u8, item.value.v.type, signal_type)) return true;
+    return false;
 }
 
 /// One event onto `run`'s history at its next seq; past `HIST_KEEP` the
@@ -889,7 +963,7 @@ fn writeJsonEscaped(w: *std.Io.Writer, s: []const u8) !void {
 
 pub const machine: machine_mod.Machine = .{
     .name = "workflow runs",
-    .entry_types = &.{ .workflow_start, .workflow_step, .workflow_complete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done },
+    .entry_types = &.{ .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done },
     .families = &.{
         machine_mod.info(calls_mod.Calls),
         machine_mod.info(Parents),
@@ -898,6 +972,7 @@ pub const machine: machine_mod.Machine = .{
         machine_mod.info(IdemFam),
         machine_mod.info(PerDefFam),
         machine_mod.info(OutFam),
+        machine_mod.info(SigFam),
     },
     .keys = keys,
     .apply = apply,
