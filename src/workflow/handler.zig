@@ -1741,10 +1741,16 @@ pub const WorkflowHandler = struct {
 
                 .wait_for_signal => |wait_step| {
                     const step_label = run.current_step_name_owned orelse "start";
+                    // Whether a signal of its type applied already. Out of
+                    // memory: the run stops at this step, taken again later.
+                    const signal_found = runs_machine.hasSignal(self.allocator, self.defsRead(), run_ns_key, wait_step.signal_type) catch |err| switch (err) {
+                        error.OutOfMemory => return,
+                        error.Malformed => {
+                            self.completeRun(shard, run_ns_key, run, .failed, "the run's signals won't decode", now_ms);
+                            return;
+                        },
+                    };
                     self.addHistoryEvent(run, "waiting_for_signal", wait_step.signal_type, now_ms);
-
-                    // Check if a matching signal has already been received
-                    const signal_found = runs_machine.hasSignal(self.defsRead(), run_ns_key, wait_step.signal_type);
 
                     // A signal's match brings the run back here, so this is
                     // how any wait ends too.
@@ -6539,7 +6545,7 @@ test "a client signal with a reserved type is refused and doesn't move a run par
     const after = handler.inspect(testKey(.default, "r")).?;
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, after.status);
     try testing.expectEqualStrings(callee, after.pending_action_run_id_owned.?);
-    try testing.expect(!runs_machine.hasSignal(handler.defsRead(), testKey(.default, "r"), forged));
+    try testing.expect(!try runs_machine.hasSignal(testing.allocator, handler.defsRead(), testKey(.default, "r"), forged));
     try testing.expectEqual(events, after.history.items.len);
 
     var conn = try Connection.init(allocator, -1, 0, 0);
@@ -6547,7 +6553,7 @@ test "a client signal with a reserved type is refused and doesn't move a run par
     const value = [_]u8{ 8, 0 } ++ "approval".*;
     try testing.expect(handler.handleSignal(&shard, &conn, makeRequest(.workflow_signal, "r", &value)) != null);
     settleTest(&shard);
-    try testing.expect(runs_machine.hasSignal(handler.defsRead(), testKey(.default, "r"), "approval"));
+    try testing.expect(try runs_machine.hasSignal(testing.allocator, handler.defsRead(), testKey(.default, "r"), "approval"));
     // A signal to a run waiting on a call wakes nothing: it waits on its call.
     try testing.expectEqualStrings(callee, handler.inspect(testKey(.default, "r")).?.pending_action_run_id_owned.?);
 }
@@ -6675,6 +6681,33 @@ test "a signal that wakes a run is the log's: a leader with none of the old one'
     try testing.expectEqualStrings("second", run.wait_signal_type_owned.?);
 }
 
+test "a signal that commits between a wait's decision and its step is taken: the step is refused and the run decided again" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    shard.workflow_handler = &handler;
+    var conn = try Connection.init(allocator, -1, 0, 0);
+    defer conn.deinit();
+    createTestDef(&handler, testKey(.default, "two-waits"), "two-waits", test_two_waits_json);
+    createTestRun(&handler, testKey(.default, "r"), "r", "two-waits");
+    // The signal is logged first; the wait is decided before it applies.
+    const value = [_]u8{ 5, 0 } ++ "first".*;
+    try testing.expect(handler.handleSignal(&shard, &conn, makeRequest(.workflow_signal, "r", &value)) != null);
+    handler.advanceWorkflow(&shard, testKey(.default, "r"));
+    settleTest(&shard);
+    try testing.expect(try runs_machine.hasSignal(testing.allocator, handler.defsRead(), testKey(.default, "r"), "first"));
+    handler.advanceStartedRuns(&shard);
+    settleTest(&shard);
+    const run = handler.inspect(testKey(.default, "r")).?;
+    try testing.expectEqualStrings("second", run.current_step_name_owned.?);
+    try testing.expectEqualStrings("second", run.wait_signal_type_owned.?);
+}
+
 test "a signal to a finished run is refused and leaves its history alone" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
@@ -6698,7 +6731,7 @@ test "a signal to a finished run is refused and leaves its history alone" {
     try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), answer.header.status);
     try testing.expectEqualStrings("run already finished", (try answer.refused()).message);
     try testing.expectEqual(events, handler.inspect(testKey(.default, "r")).?.history.items.len);
-    try testing.expect(!runs_machine.hasSignal(handler.defsRead(), testKey(.default, "r"), "go"));
+    try testing.expect(!try runs_machine.hasSignal(testing.allocator, handler.defsRead(), testKey(.default, "r"), "go"));
 }
 
 test "workflow handler: a trigger cursor restored inside an append resumes with its next record" {
