@@ -54,6 +54,17 @@ pub const Plant = enum {
     runs_any_start_fires,
     /// Any start of a child's run tells its pending parent it started.
     runs_any_start_answers_parent,
+    /// A step applies at any rev, not only its run's.
+    runs_step_rev_unchecked,
+    /// A step takes its run's call's end before the call has ended.
+    runs_settle_before_call_ends,
+    /// A step leaves its run's call without taking its end.
+    runs_call_left_unsettled,
+    /// A step that takes its run's call's end keeps the call's record.
+    runs_settled_call_kept,
+    /// A call's run ending overwrites a call already settled refused or
+    /// with no action.
+    runs_done_overrides_settled,
 };
 
 pub const active: Plant = std.meta.stringToEnum(Plant, @import("build_options").vopr_plant) orelse

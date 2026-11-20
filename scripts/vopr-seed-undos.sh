@@ -8,9 +8,11 @@
 #       Build with each undo, and check its seeds fail as the table says.
 #   scripts/vopr-seed-undos.sh compile
 #       Only check each undo still compiles.
-#   scripts/vopr-seed-undos.sh record <seed file> [iterations]
+#   scripts/vopr-seed-undos.sh record <seed file> [iterations] [first seed]
 #       Swarm with the seed's undo until a seed fails as the table says, check
 #       it passes without the undo, and write that scenario over the seed file.
+#       Start each file at its own first seed, so one change to the workload
+#       doesn't move them all.
 #
 # Run from the repository root. Env: ZIG (default zig), SEED_TIMEOUT (default 60),
 # JOBS (plant builds at once; default the CPU count).
@@ -124,7 +126,7 @@ scenario() {
 }
 
 record() {
-  local file=$1 iterations=${2:-200} row plant flag values want says seed got
+  local file=$1 iterations=${2:-200} first=${3:-1} row plant flag values want says seed got
   row=$(rows | awk -F'\t' -v f="$file" '$1 == f') || true
   [ -n "$row" ] || { echo "$file has no row in $TABLE" >&2; return 2; }
   IFS=$'\t' read -r _ plant flag values want says <<< "$row"
@@ -132,7 +134,7 @@ record() {
   build_all "$plant" none
   build "$plant" || return 1
   build none || return 1
-  for seed in $(seq 1 "$iterations"); do
+  for seed in $(seq "$first" $((first + iterations - 1))); do
     scenario "$seed" "$flag" "$values"
     got=$(run "$WORK/$plant/bin/vopr" --scenario-in="$WORK/try.json")
     [ "$got" = "$want" ] && grep -qaE -- "$says" "$WORK/run.log" || continue
@@ -144,7 +146,7 @@ record() {
     echo "$file: seed $seed${flag:+ $flag}, $want with $plant, ok without"
     return 0
   done
-  echo "no seed in 1..$iterations${flag:+ of $flag} fails with $plant as $want" >&2
+  echo "no seed in $first..$((first + iterations - 1))${flag:+ of $flag} fails with $plant as $want" >&2
   return 1
 }
 
@@ -152,5 +154,5 @@ case "${1:-}" in
   check) shift; check "$@" ;;
   compile) compile ;;
   record) shift; record "$@" ;;
-  *) sed -n '2,14p' "$0"; exit 2 ;;
+  *) sed -n '2,16p' "$0"; exit 2 ;;
 esac

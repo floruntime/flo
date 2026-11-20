@@ -11,15 +11,26 @@
 //!   and is refused to its parent without the entry being refused;
 //! - a schedule start fires its slot, which never moves back; no other
 //!   start moves it, whatever its key;
-//! - a run's first step is taken once, and never after it ends;
+//! - a step applies only at its run's rev, and never after the run ends;
+//!   it sets what the run waits for, and may end it;
+//! - a step leaves its run's call only by taking its end (once the call
+//!   has ended or is gone, its record going with it) or by ending the run;
+//!   a step's call is recorded, and its start sent, once per (workflow's
+//!   slot, callee);
+//! - a call settles once: a reply answers only a sent call; its run's end
+//!   moves it to done only from sent or started, never over a refusal or
+//!   no action; a retry asks again only for one no action took, sending
+//!   its start again; a clear drops it;
 //! - a completion ends its run once, with its history (the last 256) and
 //!   step outputs; another with the same status changes nothing, one with
 //!   another status is refused;
 //! - a child's parent hears its start (only a child start's), its refusal,
 //!   a disabled workflow, and its end, each once;
 //! - the store holds what the ledger holds, and on its own: each workflow's
-//!   count is its runs not ended, each run's history is its last seqs, and
-//!   each idempotency key names a run of that workflow with that key.
+//!   count is its runs not ended, each run's history is its last seqs, each
+//!   idempotency key names a run of that workflow with that key, a run
+//!   waits exactly when its status says so, and each recorded call's caller
+//!   has ended or waits on it.
 
 const std = @import("std");
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -30,7 +41,9 @@ const view_mod = @import("../contract/view.zig");
 const channels = @import("../contract/channels.zig");
 const schema = @import("../protocol/schema.zig");
 const ae = @import("../protocol/action_entries.zig");
+const router = @import("../node/router.zig");
 const rm = @import("../workflow/runs_machine.zig");
+const calls_mod = @import("../actions/calls_machine.zig");
 const defs_family = @import("workflow_defs_family.zig");
 
 const Allocator = std.mem.Allocator;
@@ -62,9 +75,23 @@ const PARENT_SLOTS = [_]u16{ 3, 700 };
 const ENDS = [_]RunStatus{ .completed, .failed, .cancelled, .timed_out };
 const INPUT = "{}";
 /// The whole store is checked at every index this divides, as the
-/// checksums are sampled; the run an entry names, at every index.
+/// checksums are sampled; the run an entry names, at every one.
 const SWEEP_EVERY = 16;
 const DISABLED_WHY = "workflow is disabled";
+
+/// A step's callees: few, so two runs of a workflow (or of two workflows
+/// on one slot) call one now and then, and share its record.
+const CALLEES = [_][]const u8{ "c0", "c1", "c2", "c3", "c4", "c5" };
+const ACTION_TARGET = "act";
+const CHILD_TARGET = "cw";
+const SIGNAL = "sig";
+const WAIT_ONS = CALLEES ++ [_][]const u8{SIGNAL};
+const PROGRESS = [_][]const u8{ "", "{\"n\":1}" };
+/// Past what a step's counters may hold: refused.
+const OVERSIZED: [rm.MAX_PROGRESS + 1]u8 = @splat('x');
+const WHYS = [_][]const u8{"lost"};
+const DONE_OUTCOMES = [_][]const u8{ "", "ok" };
+const RESULTS = [_][]const u8{ "", "r0" };
 
 /// A run's history past its start's event: a step's events are "e" at 0
 /// ms, a cancel's is "c" at its entry's stamp. Not named by seq: a step
@@ -72,9 +99,49 @@ const DISABLED_WHY = "workflow is disabled";
 const STEP_EVENT = "e";
 const CANCEL_EVENT = "c";
 
+/// The one of `list` equal to `s`, so the ledger holds no entry's bytes.
+fn static(comptime list: []const []const u8, s: []const u8) ?[]const u8 {
+    for (list) |x| if (std.mem.eql(u8, x, s)) return x;
+    return null;
+}
+
+fn targetOf(kind: ae.CallKind) []const u8 {
+    return switch (kind) {
+        .action => ACTION_TARGET,
+        .workflow => CHILD_TARGET,
+    };
+}
+
+/// A name's slot: a call's target's, and a workflow's, which its runs'
+/// calls are keyed under and answered on.
+fn slotOf(name: []const u8) u16 {
+    return @intCast(router.nsKeySlot(NS, name));
+}
+
+/// The first workflow whose runs share `w`'s slot, which its calls are
+/// keyed under.
+fn slotOwner(w: usize) usize {
+    return slotOwnerOf(slotOf(NAMES[w])).?;
+}
+
+fn slotOwnerOf(slot: u16) ?usize {
+    for (NAMES, 0..) |name, i| if (slotOf(name) == slot) return i;
+    return null;
+}
+
 pub const WorkflowRuns = struct {
     scratch: std.heap.ArenaAllocator,
     ledger: Ledger = .{},
+
+    /// What a run waits for, as its last step set it.
+    const WaitL = struct {
+        wait: rm.Wait = .none,
+        kind: ae.CallKind = .action,
+        slot: u16 = 0,
+        on: []const u8 = "",
+        due_ms: i64 = 0,
+        timeout_to: []const u8 = "",
+    };
 
     const RunL = struct {
         wf: usize,
@@ -92,21 +159,41 @@ pub const WorkflowRuns = struct {
         /// The seq of a cancel's event, at `completed_ms`.
         ended_at: ?u64 = null,
         outs: [STEPS.len]?usize = @splat(null),
+        step: ?usize = null,
+        wait: WaitL = .{},
+        progress: []const u8 = "",
     };
     const PerDefL = struct { active: u32, fired_ms: i64 };
     const ParentL = struct { slot: usize, parent_run: usize, started: bool };
+    /// A step's call, under its workflow's slot and its callee.
+    const CallL = struct {
+        kind: ae.CallKind,
+        caller: usize,
+        wf: usize,
+        step: usize,
+        can_wait: bool,
+        state: calls_mod.State,
+        attempts: u32,
+        first_ns: u64,
+        last_ns: u64,
+        status: u8 = 0,
+        outcome: []const u8 = "",
+        result: []const u8 = "",
+    };
 
     const Ledger = struct {
         runs: [RUNS.len]?RunL = @splat(null),
         per_def: [NAMES.len]?PerDefL = @splat(null),
         idem: [NAMES.len][IDEMS.len]?usize = @splat(@splat(null)),
         parents: [RUNS.len]?ParentL = @splat(null),
+        /// By `slotOwner` of the caller's workflow, then callee.
+        calls: [NAMES.len][CALLEES.len]?CallL = @splat(@splat(null)),
     };
 
-    pub const FAMILIES = [_]u16{ rm.RunFam.ID, rm.HistFam.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID };
-    pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "workflow.hist", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents" };
+    pub const FAMILIES = [_]u16{ rm.RunFam.ID, rm.HistFam.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID, calls_mod.Calls.ID };
+    pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "workflow.hist", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents", "step.calls" };
 
-    pub const Kind = enum { start, step, complete, child_start, child_refuse };
+    pub const Kind = enum { start, step, complete, child_start, child_refuse, reply, done, retry, clear };
 
     pub const Effect = struct {
         kind: Kind,
@@ -140,6 +227,7 @@ pub const WorkflowRuns = struct {
     pub fn owns(entry_type: u8) bool {
         return switch (@as(EntryType, @fromBackingInt(entry_type))) {
             .workflow_start, .workflow_step, .workflow_complete, .child_start, .child_refuse => true,
+            .call_reply, .call_done, .step_call_retry, .step_call_clear => true,
             else => false,
         };
     }
@@ -154,9 +242,34 @@ pub const WorkflowRuns = struct {
         return null;
     }
 
-    /// A message the ledger says the entry sends a parent.
-    const Send = struct { entry_type: EntryType, slot: usize, run: usize, answer: ?ae.Answer = null, why: ?[]const u8 = null, done: ?ae.DoneStatus = null, result: []const u8 = "" };
-    const Want = struct { refused: bool = false, sends: [2]?Send = @splat(null) };
+    /// A message the ledger says the entry sends: a parent's answer, or a
+    /// call's start.
+    const Send = struct {
+        entry_type: EntryType,
+        to: u16,
+        run: []const u8,
+        answer: ?ae.Answer = null,
+        why: ?[]const u8 = null,
+        done: ?ae.DoneStatus = null,
+        result: []const u8 = "",
+        /// A start's caller run, and a child start's parent slot.
+        caller: []const u8 = "",
+        parent_slot: u16 = 0,
+    };
+    /// What an entry does: its sends, or refused, with why the ledger
+    /// refuses it, which a failure names.
+    const Want = struct { refused: ?[]const u8 = null, sends: [2]?Send = @splat(null) };
+
+    fn refuse(comptime kind: Kind, comptime why: []const u8) Want {
+        return .{ .refused = "the runs machine applied a " ++ @tagName(kind) ++ " the ledger refuses: " ++ why };
+    }
+
+    /// Why a machine's refusal of an entry the ledger applies fails.
+    const REFUSED_APPLIES = blk: {
+        var out: [std.enums.values(Kind).len][]const u8 = undefined;
+        for (std.enums.values(Kind), &out) |k, *x| x.* = "the runs machine refused a " ++ @tagName(k) ++ " the ledger applies";
+        break :blk out;
+    };
 
     fn doneOf(s: RunStatus) ae.DoneStatus {
         return switch (s) {
@@ -165,6 +278,32 @@ pub const WorkflowRuns = struct {
             .timed_out => .timed_out,
             else => .failed,
         };
+    }
+
+    /// The start a call sends to its target's slot.
+    fn startOf(c: CallL, callee: usize) Send {
+        return .{
+            .entry_type = if (c.kind == .action) .action_invoke else .child_start,
+            .to = slotOf(targetOf(c.kind)),
+            .run = CALLEES[callee],
+            .caller = RUNS[c.caller],
+            .parent_slot = slotOf(NAMES[c.wf]),
+        };
+    }
+
+    /// `run` ended `status`: no longer counted, its wait gone, and a
+    /// child's parent told, in `want.sends[at]`.
+    fn endL(l: *Ledger, r: usize, run: *RunL, status: RunStatus, output: ?usize, stamp_ms: i64, want: *Want, at: usize) void {
+        run.status = status;
+        run.completed_ms = stamp_ms;
+        run.output = output;
+        run.wait = .{};
+        run.progress = "";
+        if (l.per_def[run.wf]) |*per| per.active -|= 1;
+        if (l.parents[r]) |f| {
+            want.sends[at] = .{ .entry_type = .call_done, .to = PARENT_SLOTS[f.slot], .run = RUNS[r], .done = doneOf(status), .result = if (output) |o| OUTPUTS[o] else "" };
+            l.parents[r] = null;
+        }
     }
 
     /// What the ledger says `e` does, made so in the ledger: a refusal
@@ -183,7 +322,7 @@ pub const WorkflowRuns = struct {
                 if (l.parents[r]) |f| {
                     // The same call sent again: the first stands.
                     if (f.slot == slot and f.parent_run == pr) return want;
-                    want.sends[0] = .{ .entry_type = .call_reply, .slot = slot, .run = r, .answer = .conflict };
+                    want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[slot], .run = RUNS[r], .answer = .conflict };
                     return want;
                 }
                 l.parents[r] = .{ .slot = slot, .parent_run = pr, .started = false };
@@ -193,18 +332,67 @@ pub const WorkflowRuns = struct {
                 const r = indexOf(&RUNS, p.run) orelse return null;
                 const f = l.parents[r] orelse return want;
                 if (f.started) return want;
-                want.sends[0] = .{ .entry_type = .call_reply, .slot = f.slot, .run = r, .answer = p.answer };
+                want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[f.slot], .run = RUNS[r], .answer = p.answer };
                 l.parents[r] = null;
             },
+            .reply, .done, .retry, .clear => return self.predictCall(e, kind),
             .start, .step, .complete => {
                 const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return null;
                 const r = indexOf(&RUNS, cmd.key[4..]) orelse return null;
                 switch (kind) {
                     .step => {
                         const st = rm.Step.decodeAll(cmd.value, &diag) catch return null;
-                        var run = l.runs[r] orelse return .{ .refused = true };
+                        var run = l.runs[r] orelse return refuse(.step, "the run isn't there");
                         if (!std.mem.eql(u8, st.workflow, NAMES[run.wf])) return null;
-                        if (run.status.isTerminal() or st.rev != run.rev) return .{ .refused = true };
+                        const ends: ?RunStatus = if (st.ends == 0) null else blk: {
+                            const s = std.enums.fromInt(RunStatus, st.ends) orelse return null;
+                            if (!s.isTerminal()) return null;
+                            break :blk s;
+                        };
+                        if (run.status.isTerminal()) return refuse(.step, "the run has ended");
+                        if (st.rev != run.rev) return refuse(.step, "the run moved on from that rev");
+                        if (st.progress.len > rm.MAX_PROGRESS) return refuse(.step, "its counters are past their bound");
+                        const leaves = run.wait.wait == .call and !(st.wait == .call and std.mem.eql(u8, st.wait_on, run.wait.on));
+                        if (leaves and ends == null and st.settles.len == 0) return refuse(.step, "it leaves its run's call without taking its end");
+                        const so = slotOwner(run.wf);
+                        var settled: ?usize = null;
+                        if (st.settles.len > 0) {
+                            if (run.wait.wait != .call or !std.mem.eql(u8, run.wait.on, st.settles)) return refuse(.step, "it takes the end of a call its run doesn't wait on");
+                            if (st.caller_slot != slotOf(NAMES[run.wf])) return null;
+                            const c = indexOf(&CALLEES, st.settles) orelse return null;
+                            if (l.calls[so][c]) |call| switch (call.state) {
+                                .sent, .started => return refuse(.step, "it takes its run's call's end before the call has one"),
+                                .done, .refused, .no_action => {},
+                            };
+                            settled = c;
+                        }
+                        // It applies: the settled call's record goes, then
+                        // its own is recorded.
+                        if (settled) |c| l.calls[so][c] = null;
+                        var sends: usize = 0;
+                        if (st.call.len > 0) {
+                            const p = ae.Call.decodeAll(st.call, &diag) catch return null;
+                            const c = indexOf(&CALLEES, p.run) orelse return null;
+                            if (st.wait != .call or !std.mem.eql(u8, p.run, st.wait_on) or !std.mem.eql(u8, p.caller_run, RUNS[r]) or
+                                !std.mem.eql(u8, p.caller_workflow, NAMES[run.wf]) or !std.mem.eql(u8, p.target, targetOf(p.kind))) return null;
+                            if (l.calls[so][c] == null) {
+                                const at: u64 = @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms;
+                                const call: CallL = .{
+                                    .kind = p.kind,
+                                    .caller = r,
+                                    .wf = run.wf,
+                                    .step = indexOf(&STEPS, p.step) orelse return null,
+                                    .can_wait = p.can_wait,
+                                    .state = .sent,
+                                    .attempts = 1,
+                                    .first_ns = at,
+                                    .last_ns = at,
+                                };
+                                l.calls[so][c] = call;
+                                want.sends[sends] = startOf(call, c);
+                                sends += 1;
+                            }
+                        }
                         run.hist_next += st.events.count;
                         var outs = st.outputs.iterator();
                         while (outs.next() catch return null) |o| {
@@ -212,6 +400,21 @@ pub const WorkflowRuns = struct {
                         }
                         run.rev += 1;
                         run.stepped = true;
+                        run.step = if (st.step.len == 0) null else indexOf(&STEPS, st.step) orelse return null;
+                        run.wait = .{
+                            .wait = st.wait,
+                            .kind = st.wait_kind,
+                            .slot = st.wait_slot,
+                            .on = if (st.wait_on.len == 0) "" else static(&WAIT_ONS, st.wait_on) orelse return null,
+                            .due_ms = st.wait_due_ms,
+                            .timeout_to = if (st.wait_timeout_to.len == 0) "" else static(&STEPS, st.wait_timeout_to) orelse return null,
+                        };
+                        run.progress = static(&PROGRESS, st.progress) orelse return null;
+                        run.status = if (st.wait == .none) .running else .waiting;
+                        if (ends) |s| {
+                            const output: ?usize = if (st.has_output) indexOf(&OUTPUTS, st.output) orelse return null else null;
+                            endL(l, r, &run, s, output, stamp_ms, &want, sends);
+                        }
                         l.runs[r] = run;
                     },
                     .start => {
@@ -221,17 +424,17 @@ pub const WorkflowRuns = struct {
                         const k: ?usize = if (s.idem) |key| indexOf(&IDEMS, key) orelse return null else null;
                         // A key that started a run answers with it.
                         if (k) |ki| if (l.idem[w][ki] != null) return want;
-                        if (l.runs[r] != null) return .{ .refused = true };
+                        if (l.runs[r] != null) return refuse(.start, "its run exists");
                         const disabled = if (defs.ledger[w]) |d| !d.enabled else false;
                         if (disabled) {
                             if (ev == CHILD) {
                                 const f = l.parents[r] orelse return want;
                                 if (f.started) return want;
-                                want.sends[0] = .{ .entry_type = .call_reply, .slot = f.slot, .run = r, .answer = .refused, .why = DISABLED_WHY };
+                                want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[f.slot], .run = RUNS[r], .answer = .refused, .why = DISABLED_WHY };
                                 l.parents[r] = null;
                                 return want;
                             }
-                            if (ev != TRIGGER) return .{ .refused = true };
+                            if (ev != TRIGGER) return refuse(.start, "its workflow is disabled");
                         }
                         l.runs[r] = .{ .wf = w, .status = s.status, .stepped = false, .idem = k, .created_ms = stamp_ms, .hist_next = 1, .started = ev };
                         if (k) |ki| l.idem[w][ki] = r;
@@ -243,7 +446,7 @@ pub const WorkflowRuns = struct {
                         l.per_def[w] = per;
                         if (ev == CHILD) if (l.parents[r]) |f| if (!f.started) {
                             l.parents[r].?.started = true;
-                            want.sends[0] = .{ .entry_type = .call_reply, .slot = f.slot, .run = r, .answer = .started };
+                            want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[f.slot], .run = RUNS[r], .answer = .started };
                         };
                     },
                     .complete => {
@@ -251,19 +454,13 @@ pub const WorkflowRuns = struct {
                         var run = l.runs[r] orelse return null;
                         if (run.status.isTerminal()) {
                             if (run.status == c.status) return want;
-                            return .{ .refused = true };
+                            return refuse(.complete, "its run ended otherwise");
                         }
-                        run.status = c.status;
-                        run.completed_ms = stamp_ms;
-                        run.output = if (c.output) |o| indexOf(&OUTPUTS, o) orelse return null else null;
+                        const output: ?usize = if (c.output) |o| indexOf(&OUTPUTS, o) orelse return null else null;
                         run.ended_at = run.hist_next;
                         run.hist_next += 1;
+                        endL(l, r, &run, c.status, output, stamp_ms, &want, 0);
                         l.runs[r] = run;
-                        if (l.per_def[run.wf]) |*per| per.active -|= 1;
-                        if (l.parents[r]) |f| {
-                            want.sends[0] = .{ .entry_type = .call_done, .slot = f.slot, .run = r, .done = doneOf(c.status), .result = if (run.output) |o| OUTPUTS[o] else "" };
-                            l.parents[r] = null;
-                        }
                     },
                     else => unreachable,
                 }
@@ -272,12 +469,94 @@ pub const WorkflowRuns = struct {
         return want;
     }
 
-    /// The run `e` names.
+    /// The call an answer, retry or clear names: its workflow's slot owner
+    /// and its callee, null for one no step records.
+    const CallAt = struct { slot: u16, at: ?struct { so: usize, c: usize } };
+
+    fn callAt(e: *const entry_mod.Entry, kind: Kind) ?CallAt {
+        var diag: schema.Diagnostic = .{};
+        const slot: u16, const run: []const u8 = switch (kind) {
+            .reply => blk: {
+                const p = ae.Reply.decodeAll(e.payload, &diag) catch return null;
+                break :blk .{ p.slot, p.run };
+            },
+            .done => blk: {
+                const p = ae.Done.decodeAll(e.payload, &diag) catch return null;
+                break :blk .{ p.slot, p.run };
+            },
+            .retry => blk: {
+                const p = ae.CallRetry.decodeAll(e.payload, &diag) catch return null;
+                break :blk .{ p.slot, p.run };
+            },
+            .clear => blk: {
+                const p = ae.CallClear.decodeAll(e.payload, &diag) catch return null;
+                break :blk .{ p.slot, p.run };
+            },
+            else => unreachable,
+        };
+        const so = slotOwnerOf(slot) orelse return .{ .slot = slot, .at = null };
+        const c = indexOf(&CALLEES, run) orelse return .{ .slot = slot, .at = null };
+        return .{ .slot = slot, .at = .{ .so = so, .c = c } };
+    }
+
+    /// How a call moves. Its step records it sent. Its callee's reply
+    /// answers only a sent call: the run is there (started), no action
+    /// took it (no action), or it has no run and won't (refused, saying
+    /// why when the reply does). A call settles once, so its run's end
+    /// moves it to done only from sent or started; one done, refused or
+    /// with no action stays as it is. A retry asks again only for a call no
+    /// action took, sending its start again. A clear drops it. Every move
+    /// stamps the entry's time; an answer for a call that isn't there
+    /// moves nothing.
+    fn predictCall(self: *WorkflowRuns, e: *const entry_mod.Entry, kind: Kind) ?Want {
+        var want: Want = .{};
+        var diag: schema.Diagnostic = .{};
+        const at = callAt(e, kind) orelse return null;
+        const stamp = e.header.timestamp_ns;
+        const held: ?*?CallL = if (at.at) |x| &self.ledger.calls[x.so][x.c] else null;
+        // A moved answer is refused whatever it names: nothing sends one.
+        if (kind == .reply) if ((ae.Reply.decodeAll(e.payload, &diag) catch return null).answer == .moved) return refuse(.reply, "no answer is moved yet");
+        const slot = held orelse return want;
+        if (kind == .clear) {
+            slot.* = null;
+            return want;
+        }
+        const c: *CallL = if (slot.*) |*x| x else return want;
+        switch (kind) {
+            .reply => {
+                if (c.state != .sent) return want;
+                const p = ae.Reply.decodeAll(e.payload, &diag) catch return null;
+                c.state = if (p.answer == .started) .started else if (p.answer == .no_action) .no_action else .refused;
+                if (p.why) |w| c.outcome = static(&WHYS, w) orelse return null;
+            },
+            .done => {
+                const open = c.state == .sent or c.state == .started;
+                if (!open) return want;
+                const p = ae.Done.decodeAll(e.payload, &diag) catch return null;
+                c.state = .done;
+                c.status = @backingInt(p.status);
+                c.outcome = if (p.outcome.len == 0) "" else static(&DONE_OUTCOMES, p.outcome) orelse return null;
+                c.result = if (p.result.len == 0) "" else static(&RESULTS, p.result) orelse return null;
+            },
+            .retry => {
+                if (c.state != .no_action) return want;
+                c.state = .sent;
+                c.attempts += 1;
+                want.sends[0] = startOf(c.*, at.at.?.c);
+            },
+            else => unreachable,
+        }
+        c.last_ns = stamp;
+        return want;
+    }
+
+    /// The run `e` names; null for a call's answer, which names its callee.
     fn runOf(e: *const entry_mod.Entry, kind: Kind) ?usize {
         var diag: schema.Diagnostic = .{};
         return switch (kind) {
             .child_start => indexOf(&RUNS, (ae.ChildStart.decodeAll(e.payload, &diag) catch return null).run),
             .child_refuse => indexOf(&RUNS, (ae.ChildRefuse.decodeAll(e.payload, &diag) catch return null).run),
+            .reply, .done, .retry, .clear => null,
             else => indexOf(&RUNS, (entry_mod.CommandPayload.deserialize(e.payload) orelse return null).key[4..]),
         };
     }
@@ -288,6 +567,10 @@ pub const WorkflowRuns = struct {
             .workflow_step => .step,
             .workflow_complete => .complete,
             .child_start => .child_start,
+            .call_reply => .reply,
+            .call_done => .done,
+            .step_call_retry => .retry,
+            .step_call_clear => .clear,
             else => .child_refuse,
         };
     }
@@ -308,16 +591,16 @@ pub const WorkflowRuns = struct {
         if (effect.refused) {
             for (FAMILIES, before[0..FAMILIES.len]) |fam, b| if (b != store.families[fam].commits) return error.RefusalChangedState;
             if (before[FAMILIES.len] != store.families[channels.OutFam.ID].commits) return error.RefusalChangedState;
-            if (!want.refused) effect.broke = "the runs machine refused an entry the ledger applies";
-        } else if (want.refused) effect.broke = "the runs machine applied an entry the ledger refuses";
+            if (want.refused == null) effect.broke = REFUSED_APPLIES[@backingInt(kind)];
+        } else if (want.refused) |why| effect.broke = why;
         if (effect.broke == null) effect.broke = sentRule(store, seqs, want.sends);
         // The whole store at the indices the checksums are sampled at; the
-        // run the entry names at every one.
-        if (effect.broke == null) effect.broke = self.rule(store, runOf(e, kind).?, e.header.index % SWEEP_EVERY == 0);
+        // run the entry names, and the calls, at every one.
+        if (effect.broke == null) effect.broke = self.rule(store, runOf(e, kind), e.header.index % SWEEP_EVERY == 0);
         return effect;
     }
 
-    /// The groups a parent's slot can be in, under the store's place.
+    /// The groups a message's slot can be in, under the store's place.
     const GROUPS = 2;
 
     /// Each group's next outbox seq: the outbox is never drained here, so
@@ -334,57 +617,87 @@ pub const WorkflowRuns = struct {
 
     /// The messages the entry left in the outbox, against the ledger's.
     fn sentRule(store: *store_mod.Store, before: [GROUPS]u64, wanted: [2]?Send) ?[]const u8 {
+        var got: [2]?channels.Out.Value = @splat(null);
         var n: usize = 0;
         const after = nextSeqs(store);
+        // In the order sent: a group's seqs are, but two groups' aren't
+        // ordered between them, so each message is matched to the ledger's
+        // by its type.
         for (before, after, 0..) |from, to, g| for (from..to) |seq| {
             var kb: [channels.OUT_KEY]u8 = undefined;
             const item = ((view_mod.ReadView{ .store = store }).get(channels.OutFam, channels.outKey(&kb, @intCast(g), seq)) catch null) orelse
                 return "an entry's message is missing from the outbox";
-            const m = item.v;
-            if (n >= wanted.len) return "an entry sent a parent more than the ledger's messages";
-            const w = wanted[n] orelse return "an entry sent a parent a message the ledger doesn't";
+            if (n >= got.len) return "an entry sent a parent more than the ledger's messages";
+            got[n] = item.v;
             n += 1;
-            if (m.entry_type != @backingInt(w.entry_type) or m.slot != PARENT_SLOTS[w.slot]) return "a parent's message is not the ledger's";
-            var diag: schema.Diagnostic = .{};
-            switch (w.entry_type) {
-                .call_reply => {
-                    const rp = ae.Reply.decodeAll(m.payload, &diag) catch return "a parent's reply doesn't decode";
-                    if (!std.mem.eql(u8, rp.run, RUNS[w.run]) or rp.answer != w.answer.?) return "a parent's reply is not the ledger's";
-                    if (w.why) |why| if (rp.why == null or !std.mem.eql(u8, rp.why.?, why)) return "a parent's refusal doesn't say why";
-                },
-                .call_done => {
-                    const d = ae.Done.decodeAll(m.payload, &diag) catch return "a parent's call_done doesn't decode";
-                    if (!std.mem.eql(u8, d.run, RUNS[w.run]) or d.status != w.done.? or !std.mem.eql(u8, d.result, w.result)) return "a parent's call_done is not the ledger's";
-                },
-                else => unreachable,
-            }
         };
-        if (n < wanted.len and wanted[n] != null) return "a parent the ledger tells heard nothing";
+        var matched: [2]bool = @splat(false);
+        for (got[0..n]) |maybe| {
+            const m = maybe.?;
+            const i = for (wanted, 0..) |w, i| {
+                if (w != null and !matched[i] and m.entry_type == @backingInt(w.?.entry_type)) break i;
+            } else return "an entry sent a parent a message the ledger doesn't";
+            matched[i] = true;
+            if (whyNot(m, wanted[i].?)) |why| return why;
+        }
+        for (wanted, matched) |w, m| if (w != null and !m) return "a parent the ledger tells heard nothing";
+        return null;
+    }
+
+    fn whyNot(m: channels.Out.Value, w: Send) ?[]const u8 {
+        if (m.slot != w.to) return "a parent's message is not the ledger's";
+        var diag: schema.Diagnostic = .{};
+        switch (w.entry_type) {
+            .call_reply => {
+                const rp = ae.Reply.decodeAll(m.payload, &diag) catch return "a parent's reply doesn't decode";
+                if (!std.mem.eql(u8, rp.run, w.run) or rp.answer != w.answer.?) return "a parent's reply is not the ledger's";
+                if (w.why) |why| if (rp.why == null or !std.mem.eql(u8, rp.why.?, why)) return "a parent's refusal doesn't say why";
+            },
+            .call_done => {
+                const d = ae.Done.decodeAll(m.payload, &diag) catch return "a parent's call_done doesn't decode";
+                if (!std.mem.eql(u8, d.run, w.run) or d.status != w.done.? or !std.mem.eql(u8, d.result, w.result)) return "a parent's call_done is not the ledger's";
+            },
+            .action_invoke => {
+                const p = ae.Invoke.decodeAll(m.payload, &diag) catch return "a call's start doesn't decode";
+                if (!std.mem.eql(u8, p.run, w.run) or !std.mem.eql(u8, p.action, ACTION_TARGET) or p.caller_run == null or
+                    !std.mem.eql(u8, p.caller_run.?, w.caller)) return "a call's start is not the ledger's";
+            },
+            .child_start => {
+                const p = ae.ChildStart.decodeAll(m.payload, &diag) catch return "a call's start doesn't decode";
+                if (!std.mem.eql(u8, p.run, w.run) or !std.mem.eql(u8, p.workflow, CHILD_TARGET) or
+                    !std.mem.eql(u8, p.parent_run, w.caller) or p.parent_slot != w.parent_slot) return "a call's start is not the ledger's";
+            },
+            else => unreachable,
+        }
         return null;
     }
 
     /// The families against the ledger, and the invariants that hold of the
     /// store alone; a run's history and step outputs only for `touched`, the
     /// one run the entry names.
-    fn rule(self: *WorkflowRuns, store: *store_mod.Store, touched: usize, sweep: bool) ?[]const u8 {
+    fn rule(self: *WorkflowRuns, store: *store_mod.Store, touched: ?usize, sweep: bool) ?[]const u8 {
         return self.ruleOrOom(store, touched, sweep) catch "out of memory checking the runs";
     }
 
-    fn ruleOrOom(self: *WorkflowRuns, store: *store_mod.Store, touched: usize, sweep: bool) error{OutOfMemory}!?[]const u8 {
+    fn ruleOrOom(self: *WorkflowRuns, store: *store_mod.Store, touched: ?usize, sweep: bool) error{OutOfMemory}!?[]const u8 {
         _ = self.scratch.reset(.retain_capacity);
         const a = self.scratch.allocator();
         const rv: view_mod.ReadView = .{ .store = store };
         const l = &self.ledger;
 
-        if (!sweep) return self.runRule(store, a, touched, true);
-        // On the store alone: counts, and idempotency keys naming their run.
+        if (try self.callsRule(store, a)) |why| return why;
+        if (!sweep) return if (touched) |t| self.runRule(store, a, t, true) else null;
+        // On the store alone: counts, idempotency keys naming their run, and
+        // a run's wait agreeing with its status.
         var active: [NAMES.len]u32 = @splat(0);
         var runs = rv.range(rm.RunFam, "");
         var stored: usize = 0;
         while (runs.next() catch return "a run could not be read") |item| : (stored += 1) {
-            const w = indexOf(&NAMES, item.value.v.workflow) orelse return "a run of a workflow the workload never names";
-            const s = std.enums.fromInt(RunStatus, item.value.v.status) orelse return "a run's status is not a status";
+            const v = item.value.v;
+            const w = indexOf(&NAMES, v.workflow) orelse return "a run of a workflow the workload never names";
+            const s = std.enums.fromInt(RunStatus, v.status) orelse return "a run's status is not a status";
             if (!s.isTerminal()) active[w] += 1;
+            if (if (s.isTerminal()) v.wait != .none else (s == .waiting) != (v.wait != .none)) return "a run's status and its wait disagree";
         }
         for (NAMES, active, l.per_def) |name, n, want| {
             const got = rm.perDefOf(rv, view_mod.idKey(try a.alloc(u8, 4 + name.len), NS, name) catch unreachable);
@@ -413,6 +726,40 @@ pub const WorkflowRuns = struct {
             if (l.runs[r] != null) want_runs += 1;
         }
         if (stored != want_runs) return "the runs are not the ledger's";
+        return null;
+    }
+
+    /// `step.calls` against the ledger, and on the store alone: each call's
+    /// caller has ended or waits on it. Few enough to check at every entry.
+    fn callsRule(self: *WorkflowRuns, store: *store_mod.Store, a: Allocator) error{OutOfMemory}!?[]const u8 {
+        const rv: view_mod.ReadView = .{ .store = store };
+        const l = &self.ledger;
+        var it = rv.range(calls_mod.Calls, "");
+        var held: usize = 0;
+        while (it.next() catch return "a call could not be read") |item| : (held += 1) {
+            const k = item.key;
+            if (k.len < 6) return "a call's key is not (slot, callee)";
+            const callee = k[6..];
+            const so = slotOwnerOf(std.mem.readInt(u16, k[4..6], .big)) orelse return "a call is recorded under a slot no workflow's runs are on";
+            const c = indexOf(&CALLEES, callee) orelse return "a call is recorded of a callee no step names";
+            const want = l.calls[so][c] orelse return "a call the ledger doesn't hold is recorded";
+            const v = item.value.v;
+            if (v.kind != want.kind or !std.mem.eql(u8, v.caller_run, RUNS[want.caller]) or !std.mem.eql(u8, v.caller_workflow, NAMES[want.wf]) or
+                !std.mem.eql(u8, v.step, STEPS[want.step]) or !std.mem.eql(u8, v.target, targetOf(want.kind)) or v.can_wait != want.can_wait)
+                return "a call's record is not its step's";
+            if (v.state != want.state or v.attempts != want.attempts or v.first_ns != want.first_ns or v.last_ns != want.last_ns or
+                v.status != want.status or !std.mem.eql(u8, v.outcome, want.outcome) or !std.mem.eql(u8, v.result, want.result))
+                return "a call's state is not the ledger's";
+            const caller = rm.runOf(rv, view_mod.idKey(try a.alloc(u8, 4 + v.caller_run.len), NS, v.caller_run) catch unreachable) orelse
+                return "a call's caller run is gone";
+            const s = std.enums.fromInt(RunStatus, caller.status) orelse return "a run's status is not a status";
+            if (!s.isTerminal() and !(caller.wait == .call and std.mem.eql(u8, caller.wait_on, callee))) return "a call is recorded that its caller doesn't wait on";
+        }
+        var want_held: usize = 0;
+        for (l.calls) |row| for (row) |x| {
+            if (x != null) want_held += 1;
+        };
+        if (held != want_held) return "the calls are not the ledger's";
         return null;
     }
 
@@ -446,6 +793,11 @@ pub const WorkflowRuns = struct {
         if (g.created_at_ms != run.created_ms or g.completed_at_ms != run.completed_ms) return "a run's stamps are not the ledger's";
         if (!std.mem.eql(u8, g.idempotency_key, if (run.idem) |k| IDEMS[k] else "")) return "a run's idempotency key is not its start's";
         if ((g.has_output != 0) != (run.output != null) or !std.mem.eql(u8, g.output, if (run.output) |o| OUTPUTS[o] else "")) return "a run's output is not its completion's";
+        if (!std.mem.eql(u8, g.step, if (run.step) |s| STEPS[s] else "")) return "a run's step is not its last step's";
+        const w = run.wait;
+        if (g.wait != w.wait or g.wait_kind != w.kind or g.wait_slot != w.slot or !std.mem.eql(u8, g.wait_on, w.on) or
+            g.wait_due_ms != w.due_ms or !std.mem.eql(u8, g.wait_timeout_to, w.timeout_to)) return "a run's wait is not its last step's";
+        if (!std.mem.eql(u8, g.progress, run.progress)) return "a run's counters are not its last step's";
         const kept = @min(run.hist_next, rm.HIST_KEEP);
         if (g.hist_next != run.hist_next or g.hist_dropped != run.hist_next - kept) return "a run's history counts are not the ledger's";
         // Its workflow's record, whatever the sweep finds of the rest.
@@ -495,12 +847,13 @@ pub const WorkflowRuns = struct {
 
 pub const Made = struct { entry_type: EntryType, payload: []const u8 };
 
-/// A runs entry, as the workflows handler and a parent's call make them,
-/// from the leader's own applied ledger: starts of every kind (some of a
-/// disabled workflow, some repeating a key or a run), steps at a run's
-/// rev (some at one another leader moved past, some carrying enough
-/// events that a run's history passes what it keeps), child calls and
-/// refusals, and cancels of runs it holds.
+/// A runs entry, as the workflows handler, a parent's call and a call's
+/// callee make them, from the leader's own applied ledger: starts of every
+/// kind (some of a disabled workflow, some repeating a key or a run), steps
+/// at a run's rev (some at one another leader moved past, some carrying
+/// enough events that a run's history passes what it keeps, some waiting
+/// or calling, some taking a call's end before it has one), child calls
+/// and refusals, a call's answers, and cancels of runs it holds.
 pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
     const l = &leader.ledger;
     // The runs as the leader holds them, so most entries find what they
@@ -524,7 +877,7 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
     const any = r.uintLessThan(usize, RUNS.len);
     var kb: [16]u8 = undefined;
     const roll = r.uintLessThan(u8, 100);
-    if (roll < 15) {
+    if (roll < 12) {
         const run = free.or_(r, 50, any);
         const p = ae.ChildStart.encodeInto(buf, .{
             .ns = NS.int(),
@@ -538,7 +891,7 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
         }) catch return null;
         return .{ .entry_type = .child_start, .payload = p };
     }
-    if (roll < 22) {
+    if (roll < 17) {
         const answers = [_]ae.Answer{ .no_action, .conflict };
         const p = ae.ChildRefuse.encodeInto(buf, .{ .ns = NS.int(), .run = RUNS[pending.or_(r, 70, any)], .answer = answers[r.uintLessThan(usize, answers.len)] }) catch return null;
         return .{ .entry_type = .child_refuse, .payload = p };
@@ -553,14 +906,14 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
             if (longest == null or l.runs[i].?.hist_next > l.runs[longest.?].?.hist_next) longest = i;
         }
         const c = if (longest != null and r.uintLessThan(u8, 100) < 25) longest.? else live.or_(r, 80, unstepped.or_(r, 30, held.at(r)));
-        const run = l.runs[c].?;
-        const rev = if (r.uintLessThan(u8, 100) < 10) run.rev +% 1 else run.rev;
         const vb = buf[buf.len / 2 ..];
-        const value = stepValue(r, vb, rev, NAMES[run.wf], run.hist_next) orelse return null;
+        const value = stepValue(r, vb, c, l.runs[c].?) orelse return null;
         return command(buf[0 .. buf.len / 2], .workflow_step, view_mod.idKey(&kb, NS, RUNS[c]) catch unreachable, value);
     }
+    // A call's answer, retry or clear: mostly of a call the leader holds.
+    if (roll < 48) return callAnswer(r, buf, l);
     // A completion names a run the leader holds, and its workflow.
-    if (roll < 60 and held.n > 0) {
+    if (roll < 62 and held.n > 0) {
         const c = live.or_(r, 75, held.at(r));
         const vb = buf[buf.len / 2 ..];
         const value = completeValue(r, vb, ENDS[r.uintLessThan(usize, ENDS.len)], NAMES[l.runs[c].?.wf]) orelse return null;
@@ -571,6 +924,58 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
     const idem: []const u8 = if (ev == CHILD or r.boolean()) "" else IDEMS[r.uintLessThan(usize, IDEMS.len)];
     var vb: [128]u8 = undefined;
     return command(buf, .workflow_start, view_mod.idKey(&kb, NS, RUNS[run]) catch unreachable, startValue(&vb, NAMES[r.uintLessThan(usize, NAMES.len)], EVENTS[ev], idem));
+}
+
+/// A callee's answer to a call (a reply or its end), its step's retry, or
+/// its clear: of a call the leader holds 80% of the time, a retry mostly of
+/// one no action took.
+fn callAnswer(r: std.Random, buf: []u8, l: *const WorkflowRuns.Ledger) ?Made {
+    const At = struct { so: usize, c: usize };
+    var calls: [NAMES.len * CALLEES.len]At = undefined;
+    var no_action: [NAMES.len * CALLEES.len]At = undefined;
+    var n: usize = 0;
+    var na: usize = 0;
+    for (l.calls, 0..) |row, so| for (row, 0..) |x, c| if (x) |call| {
+        calls[n] = .{ .so = so, .c = c };
+        n += 1;
+        if (call.state == .no_action) {
+            no_action[na] = .{ .so = so, .c = c };
+            na += 1;
+        }
+    };
+    const k = r.uintLessThan(u8, 100);
+    var at: At = .{ .so = r.uintLessThan(usize, NAMES.len), .c = r.uintLessThan(usize, CALLEES.len) };
+    if (k >= 70 and k < 90 and na > 0 and r.uintLessThan(u8, 100) < 70) {
+        at = no_action[r.uintLessThan(usize, na)];
+    } else if (n > 0 and r.uintLessThan(u8, 100) < 80) at = calls[r.uintLessThan(usize, n)];
+    const slot = slotOf(NAMES[at.so]);
+    const run = CALLEES[at.c];
+    if (k < 35) {
+        const answers = [_]ae.Answer{ .started, .started, .started, .no_action, .no_action, .conflict, .refused, .skipped };
+        // A moved answer is refused: nothing sends one until slots move.
+        const answer: ae.Answer = if (r.uintLessThan(u8, 100) < 3) .moved else answers[r.uintLessThan(usize, answers.len)];
+        const why: ?[]const u8 = if (r.uintLessThan(u8, 100) < 30) WHYS[0] else null;
+        const p = ae.Reply.encodeInto(buf, .{ .ns = NS.int(), .slot = slot, .run = run, .answer = answer, .why = why }) catch return null;
+        return .{ .entry_type = .call_reply, .payload = p };
+    }
+    if (k < 70) {
+        const statuses = std.enums.values(ae.DoneStatus);
+        const p = ae.Done.encodeInto(buf, .{
+            .ns = NS.int(),
+            .slot = slot,
+            .run = run,
+            .status = statuses[r.uintLessThan(usize, statuses.len)],
+            .outcome = DONE_OUTCOMES[r.uintLessThan(usize, DONE_OUTCOMES.len)],
+            .result = RESULTS[r.uintLessThan(usize, RESULTS.len)],
+        }) catch return null;
+        return .{ .entry_type = .call_done, .payload = p };
+    }
+    if (k < 90) {
+        const p = ae.CallRetry.encodeInto(buf, .{ .ns = NS.int(), .slot = slot, .run = run }) catch return null;
+        return .{ .entry_type = .step_call_retry, .payload = p };
+    }
+    const p = ae.CallClear.encodeInto(buf, .{ .ns = NS.int(), .slot = slot, .run = run }) catch return null;
+    return .{ .entry_type = .step_call_clear, .payload = p };
 }
 
 /// Run ids to pick from.
@@ -615,13 +1020,18 @@ fn startValue(buf: []u8, wf: []const u8, event: []const u8, idem: []const u8) []
     return w.buffered();
 }
 
-/// A step at `rev`: some
-/// events, now and then nearly a step's most, so a run's history passes
-/// what it keeps; maybe some step outputs; no wait.
-fn stepValue(r: std.Random, buf: []u8, rev: u64, wf: []const u8, hist_next: u64) ?[]const u8 {
+/// A step of run `c` at its rev (now and then the next one): some events,
+/// now and then nearly a step's most, so a run's history passes what it
+/// keeps; maybe some step outputs. A run waiting on a call mostly takes
+/// its end (refused while the call hasn't one), or keeps waiting, ends, or
+/// now and then leaves it unsettled or takes another call's end (both
+/// refused). Any other run waits for nothing, a call, a signal or a timer,
+/// or ends.
+fn stepValue(r: std.Random, buf: []u8, c: usize, run: WorkflowRuns.RunL) ?[]const u8 {
+    const wf = NAMES[run.wf];
     // Long steps are rare, but likelier for a run already long: every
     // replica's checksums walk them all.
-    const long_percent: u8 = if (hist_next >= rm.MAX_STEP_EVENTS) 50 else 4;
+    const long_percent: u8 = if (run.hist_next >= rm.MAX_STEP_EVENTS) 50 else 4;
     const events: u32 = if (r.uintLessThan(u8, 100) < long_percent) r.intRangeAtMost(u32, 56, rm.MAX_STEP_EVENTS) else r.uintLessThan(u32, 4);
     var eb: [rm.MAX_STEP_EVENTS * 24]u8 = undefined;
     var ew: schema.Writer = .{ .buf = &eb };
@@ -634,9 +1044,9 @@ fn stepValue(r: std.Random, buf: []u8, rev: u64, wf: []const u8, hist_next: u64)
         rm.StepOutput.encode(&ow, .{ .step = step, .outcome = OUTCOMES[o], .output = OUTPUTS[o] }) catch return null;
         outs += 1;
     };
-    const value: rm.Step.Value = .{
-        .rev = rev,
-        .step = "",
+    var value: rm.Step.Value = .{
+        .rev = if (r.uintLessThan(u8, 100) < 10) run.rev +% 1 else run.rev,
+        .step = STEPS[r.uintLessThan(usize, STEPS.len)],
         .events = .{ .bytes = ew.written(), .count = events },
         .outputs = .{ .bytes = ow.written(), .count = outs },
         .wait = .none,
@@ -645,7 +1055,7 @@ fn stepValue(r: std.Random, buf: []u8, rev: u64, wf: []const u8, hist_next: u64)
         .wait_on = "",
         .wait_due_ms = 0,
         .wait_timeout_to = "",
-        .progress = "",
+        .progress = if (r.uintLessThan(u8, 100) < 3) &OVERSIZED else PROGRESS[r.uintLessThan(usize, PROGRESS.len)],
         .settles = "",
         .takes = .{ .bytes = "", .count = 0 },
         .caller_slot = 0,
@@ -656,7 +1066,66 @@ fn stepValue(r: std.Random, buf: []u8, rev: u64, wf: []const u8, hist_next: u64)
         .tags = "",
         .call = "",
     };
+    var next = true;
+    const roll = r.uintLessThan(u8, 100);
+    if (run.wait.wait == .call) {
+        if (roll < 55 or roll >= 91) {
+            // Its call's end, or another callee's (refused).
+            value.settles = if (roll < 55) run.wait.on else CALLEES[r.uintLessThan(usize, CALLEES.len)];
+            value.caller_slot = slotOf(wf);
+        } else if (roll < 70) {
+            setWait(&value, run.wait);
+            next = false;
+        } else if (roll < 82) {
+            next = false;
+            endStep(r, &value);
+        } else next = false;
+    } else if (roll < 6) {
+        next = false;
+        endStep(r, &value);
+    }
+    var cb: [256]u8 = undefined;
+    if (next) {
+        const w = r.uintLessThan(u8, 100);
+        if (w < 30) {
+            const kind: ae.CallKind = if (r.boolean()) .action else .workflow;
+            const callee = CALLEES[r.uintLessThan(usize, CALLEES.len)];
+            value.call = ae.Call.encodeInto(&cb, .{
+                .ns = NS.int(),
+                .kind = kind,
+                .caller_run = RUNS[c],
+                .caller_workflow = wf,
+                .step = value.step,
+                .target = targetOf(kind),
+                .version = "",
+                .run = callee,
+                .input = INPUT,
+                .can_wait = r.boolean(),
+            }) catch return null;
+            setWait(&value, .{ .wait = .call, .kind = kind, .slot = slotOf(targetOf(kind)), .on = callee });
+        } else if (w < 47) {
+            setWait(&value, .{ .wait = .signal, .on = SIGNAL, .due_ms = if (r.boolean()) 0 else 5000, .timeout_to = if (r.boolean()) "" else STEPS[r.uintLessThan(usize, STEPS.len)] });
+        } else if (w < 62) {
+            setWait(&value, .{ .wait = .timer, .due_ms = r.intRangeAtMost(i64, 1000, 9000) });
+        }
+    }
     return rm.Step.encodeInto(buf, value) catch null;
+}
+
+fn setWait(v: *rm.Step.Value, w: WorkflowRuns.WaitL) void {
+    v.wait = w.wait;
+    v.wait_kind = w.kind;
+    v.wait_slot = w.slot;
+    v.wait_on = w.on;
+    v.wait_due_ms = w.due_ms;
+    v.wait_timeout_to = w.timeout_to;
+}
+
+/// The step ends its run, maybe with an output.
+fn endStep(r: std.Random, v: *rm.Step.Value) void {
+    v.ends = @backingInt(ENDS[r.uintLessThan(usize, ENDS.len)]);
+    v.has_output = r.boolean();
+    if (v.has_output) v.output = OUTPUTS[r.uintLessThan(usize, OUTPUTS.len)];
 }
 
 /// A cancel's completion, as `Complete.parse` reads it: maybe an output.
