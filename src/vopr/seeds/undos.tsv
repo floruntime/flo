@@ -14,3 +14,13 @@ replay-watermark-past-mark.json	replay_watermark_off_by_one	--catching-up	-	lead
 stale-member-wedge-consumer-groups.json	no_vouches	--consumer-groups	-	convergence	vouches_taken=0 stranger_frames=[1-9]
 workflow-defs-redefine-enables.json	defs_redefine_enables	--workflows	-	workflow_rule	whether a workflow is enabled is not the ledger.s
 workflow-defs-enable-anchor.json	defs_enable_moves_anchor	--workflows	-	workflow_rule	schedule anchor is not the ledger.s
+workflow-runs-cancel-keeps-active.json	runs_cancel_keeps_active	--workflows	-	workflow_run_rule	count is not its runs not ended
+workflow-runs-hist-257.json	runs_hist_keeps_257	--workflows	-	workflow_run_rule	history counts are not the ledger.s
+workflow-runs-ended-step.json	runs_ended_takes_step	--workflows	-	workflow_run_rule	applied an entry the ledger refuses
+workflow-runs-fired-back.json	runs_fired_moves_back	--workflows	-	workflow_run_rule	count or fired slot is not the ledger.s
+workflow-runs-idem-unwritten.json	runs_idem_unwritten	--workflows	-	workflow_run_rule	idempotency keys are not the ledger.s
+workflow-runs-idem-unchecked.json	runs_idem_unchecked	--workflows	-	workflow_run_rule	(count or fired slot is not the ledger.s|refused an entry the ledger applies)
+workflow-runs-disabled-child-created.json	runs_disabled_child_created	--workflows	-	workflow_run_rule	(reply is not the ledger.s|count or fired slot|record is not the ledger.s)
+workflow-runs-disabled-child-refused.json	runs_disabled_child_refused	--workflows	-	workflow_run_rule	refused an entry the ledger applies
+workflow-runs-any-start-fires.json	runs_any_start_fires	--workflows	-	workflow_run_rule	count or fired slot is not the ledger.s
+workflow-runs-any-start-answers.json	runs_any_start_answers_parent	--workflows	-	workflow_run_rule	sent a parent a message the ledger doesn.t

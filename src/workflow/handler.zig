@@ -1124,8 +1124,9 @@ pub const WorkflowHandler = struct {
         shard.sendOkResponse(conn, req.header.request_id, "");
     }
 
-    /// A signal kept for run `run_key` until PR 3's log takes signals: a
-    /// wait for its type ends at once.
+    /// A signal kept for run `run_key` until signals are logged: a wait for
+    /// its type ends at once. Kept on this node alone, and dropped when the
+    /// run ends.
     fn keepSignal(self: *WorkflowHandler, run_key: []const u8, signal_type: []const u8, payload: ?[]const u8, now_ms: i64) !void {
         const gop = try self.signals.getOrPut(self.allocator, run_key);
         if (!gop.found_existing) {
@@ -1140,6 +1141,16 @@ pub const WorkflowHandler = struct {
         const owned_payload: ?[]const u8 = if (payload) |p| try self.allocator.dupe(u8, p) else null;
         errdefer if (owned_payload) |p| self.allocator.free(p);
         try gop.value_ptr.append(self.allocator, .{ .signal_type_owned = owned_type, .payload_owned = owned_payload, .received_at_ms = now_ms });
+    }
+
+    fn dropSignals(self: *WorkflowHandler, run_key: []const u8) void {
+        var kv = self.signals.fetchRemove(run_key) orelse return;
+        for (kv.value.items) |sig| {
+            self.allocator.free(sig.signal_type_owned);
+            if (sig.payload_owned) |p| self.allocator.free(p);
+        }
+        kv.value.deinit(self.allocator);
+        self.allocator.free(kv.key);
     }
 
     /// Whether a signal of `signal_type` came for run `run_key`.
@@ -4055,6 +4066,7 @@ pub const WorkflowHandler = struct {
         if (live and run.wait == .none) self.indexToStep(run_key) else self.unindexToStep(run_key);
         if (live and run.wait == .call) self.indexKey(&self.parked, run_key) else unindexKey(self, &self.parked, run_key);
         if (live and (run.wait == .timer or (run.wait == .signal and run.wait_due_ms > 0))) self.armTimer(run_key, run.wait_due_ms);
+        if (!live) self.dropSignals(run_key);
         if (t == .workflow_start) {
             self.followFired(keyNamespace(run_key), run.workflow);
             self.followTrigger(keyNamespace(run_key), run.workflow, run.idempotency_key);
@@ -6634,6 +6646,10 @@ test "a client signal with a reserved type is refused and doesn't move a run par
     handler.handleSignal(&shard, &conn, makeRequest(.workflow_signal, "r", &value));
     try testing.expectEqual(@backingInt(proto.StatusCode.ok), (try queuedAnswer(&conn)).header.status);
     try testing.expectEqual(@as(usize, 1), handler.signals.get(testKey(.default, "r")).?.items.len);
+    // The run ends: what it kept goes with it.
+    settleTest(&shard);
+    testEnd(&handler, &shard, testKey(.default, "r"), .cancelled, "stop");
+    try testing.expect(handler.signals.get(testKey(.default, "r")) == null);
 }
 
 test "a step's call at the most an entry holds is logged with it, and one a byte over fails the step, saying so" {

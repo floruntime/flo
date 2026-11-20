@@ -58,6 +58,7 @@ const Stored = delivery.Stored;
 const MAX_PERSIST_PAYLOAD = persistence.MAX_PERSIST_PAYLOAD;
 
 const log = @import("stdx").log;
+const plant = @import("../plant.zig");
 
 pub const RunStatus = enum(u8) {
     pending = 0,
@@ -548,7 +549,7 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i6
     // Checked before the run id, as the handler does: a retry carrying both
     // its key and its own run id is the same start.
     const idem_key: ?[]const u8 = if (s.idem) |k| try idemKey(arena, n.ns, s.workflow, k) else null;
-    if (idem_key) |k| if (try view.get(IdemFam, k)) |earlier| {
+    if (comptime plant.active != .runs_idem_unchecked) if (idem_key) |k| if (try view.get(IdemFam, k)) |earlier| {
         out.putInt(u8, 0);
         out.putBytes(earlier.v.run);
         return;
@@ -569,7 +570,8 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i6
     const client_start = std.mem.eql(u8, s.event, "workflow_started");
     const disabled = if (def) |d| d.enabled == 0 else false;
     if (s.isChild()) {
-        if (disabled) return refuseChild(view, n);
+        if (comptime plant.active == .runs_disabled_child_refused) if (disabled) return out.refuse(.bad_request, .unclassified, "workflow is disabled");
+        if (comptime plant.active != .runs_disabled_child_created) if (disabled) return refuseChild(view, n);
     } else if (client_start or std.mem.eql(u8, s.event, "schedule_started")) {
         if (disabled) return out.refuse(.bad_request, .unclassified, "workflow is disabled");
         if (client_start and s.idem == null) if (def) |d| {
@@ -604,7 +606,7 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i6
     // The run's first history event, as the start path recorded it.
     if (s.event.len > 0) try appendHist(view, n, &run, s.event, s.input, stamp_ms);
     try view.put(RunFam, cmd.key, .{ .v = run });
-    if (idem_key) |k| try view.put(IdemFam, k, .{ .v = .{ .run = n.run } });
+    if (comptime plant.active != .runs_idem_unwritten) if (idem_key) |k| try view.put(IdemFam, k, .{ .v = .{ .run = n.run } });
 
     var per = if (try view.get(PerDefFam, def_key)) |p| p.v else PerDef.Value{ .active = 0, .fired_ms = 0 };
     if (!s.status.isTerminal()) per.active +|= 1;
@@ -615,7 +617,7 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i6
     // of another kind holding its id leaves the record pending, and this
     // shard's leader refuses the child, a conflict.
     var pk: [KEY_PREFIX + ae.MAX_RUN_ID]u8 = undefined;
-    if (s.isChild() and n.run.len <= ae.MAX_RUN_ID) {
+    if ((s.isChild() or comptime plant.active == .runs_any_start_answers_parent) and n.run.len <= ae.MAX_RUN_ID) {
         const k = view_mod.idKey(&pk, n.ns, n.run) catch unreachable;
         if (try view.get(Parents, k)) |found| if (found.v.state == .pending) {
             var p = found;
@@ -632,10 +634,11 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i6
 /// A schedule's start fired its slot, the key's last part. It never moves
 /// back.
 fn noteFired(per: *PerDef.Value, event: []const u8, idem: []const u8) void {
-    if (!std.mem.eql(u8, event, "schedule_started") or !std.mem.startsWith(u8, idem, "schedule:")) return;
+    const any_fires = comptime plant.active == .runs_any_start_fires;
+    if ((!any_fires and !std.mem.eql(u8, event, "schedule_started")) or !std.mem.startsWith(u8, idem, "schedule:")) return;
     const colon = std.mem.lastIndexOfScalar(u8, idem, ':') orelse return;
     const slot = std.fmt.parseInt(i64, idem[colon + 1 ..], 10) catch return;
-    per.fired_ms = @max(per.fired_ms, slot);
+    per.fired_ms = if (comptime plant.active == .runs_fired_moves_back) slot else @max(per.fired_ms, slot);
 }
 
 /// A disabled child's start: no run, and its parent's call is refused,
@@ -655,8 +658,9 @@ fn refuseChild(view: *View, n: Named) ApplyError!void {
 fn appendHist(view: *View, n: Named, run: *Run.Value, event: []const u8, detail: []const u8, at_ms: i64) ApplyError!void {
     const arena = view.arena;
     try view.put(HistFam, try histKey(arena, n.ns, n.run, run.hist_next), .{ .v = .{ .event = event, .detail = detail, .at_ms = at_ms } });
-    if (run.hist_next >= HIST_KEEP) {
-        try view.delete(HistFam, try histKey(arena, n.ns, n.run, run.hist_next - HIST_KEEP));
+    const keep: u64 = if (comptime plant.active == .runs_hist_keeps_257) HIST_KEEP + 1 else HIST_KEEP;
+    if (run.hist_next >= keep) {
+        try view.delete(HistFam, try histKey(arena, n.ns, n.run, run.hist_next - keep));
         run.hist_dropped += 1;
     }
     run.hist_next += 1;
@@ -677,7 +681,8 @@ fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64
         if (!status.isTerminal()) return error.Halt;
         break :blk status;
     };
-    if (statusOf(run).isTerminal()) return out.refuse(.conflict, .unclassified, "conflict: the run has ended");
+    const ended_steps = comptime plant.active == .runs_ended_takes_step;
+    if (!ended_steps and statusOf(run).isTerminal()) return out.refuse(.conflict, .unclassified, "conflict: the run has ended");
     if (st.rev != run.rev) return out.refuse(.conflict, .unclassified, "conflict: the run moved on from that step");
     if (st.progress.len > MAX_PROGRESS) return out.refuse(.bad_request, .unclassified, "a step's counters are past their bound");
     // A step leaves its run's call only by taking its end, or by ending the
@@ -762,7 +767,8 @@ fn endRun(view: *View, n: Named, run_key: []const u8, run: *Run.Value, status: R
     const def_key = try idKeyAlloc(arena, n.ns, run.workflow);
     if (try view.get(PerDefFam, def_key)) |found| {
         var per = found;
-        per.v.active -|= 1;
+        const cancel_keeps = comptime plant.active == .runs_cancel_keeps_active;
+        if (!cancel_keeps or status != .cancelled) per.v.active -|= 1;
         try view.put(PerDefFam, def_key, per);
     }
 
