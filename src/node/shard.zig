@@ -24491,19 +24491,22 @@ test "a workflow cancel is answered when its entry applies, and the run ends the
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status());
     try std.testing.expect(run.inFlight());
 
-    // A signal meanwhile is refused as retryable, and doesn't move it.
+    // A signal meanwhile is logged after it: it applies to an ended run,
+    // and is told so.
     var sig: [4]u8 = undefined;
     std.mem.writeInt(u16, sig[0..2], 2, .little);
     @memcpy(sig[2..4], "go");
     t.send(.workflow_signal, 43, id, &sig);
-    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expectEqual(@as(u32, 2), t.shard.pending_count);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status());
 
     try ParkTest.ack(&t.shard);
-    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
-    try std.testing.expectEqual(@as(u64, 42), one[0].header.request_id);
+    var two: [2]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &two);
+    try std.testing.expectEqual(@as(u64, 42), two[0].header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), two[0].header.status);
+    try std.testing.expectEqual(@as(u64, 43), two[1].header.request_id);
+    try std.testing.expectEqualStrings("run already finished", (try two[1].refused()).message);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status());
 }
 
@@ -24590,8 +24593,12 @@ fn raceTestEndingRun(t: *RaceTest, buf: []u8, one: []proto.Response, id_buf: *[3
     std.mem.writeInt(u16, sig[0..2], 2, .little);
     @memcpy(sig[2..4], "go");
     t.send(.workflow_signal, 50, id, &sig);
+    // Answered once it commits; the run wakes there, and its leader logs
+    // the step that ends it.
+    try ParkTest.ack(&t.shard);
     try ParkTest.responses(&t.shard, t.conn, t.pair[1], buf, one);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    t.shard.workflow_handler.advanceStartedRuns(&t.shard);
     return id;
 }
 
@@ -24627,19 +24634,19 @@ test "a workflow completion a later leader's log drops leaves the run unfinished
     try std.testing.expect(!run.inFlight());
     try std.testing.expectEqual(@as(u64, 0), registry.workflow.completed_total.load(.monotonic));
 
-    // Elected again, it proposes the completion again; once that commits
+    // Elected again, it takes the step again from what applied; once that commits
     // the run has ended, counted once.
     r.current_term = term + 2;
     r.role = .leader;
     r.ready_index = r.log.lastIndex();
-    t.shard.workflow_handler.checkPendingActions(&t.shard);
+    t.shard.workflow_handler.advanceStartedRuns(&t.shard);
     try std.testing.expect(run.inFlight());
     try ParkTest.ack(&t.shard);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status());
     try std.testing.expectEqual(@as(u64, 1), registry.workflow.completed_total.load(.monotonic));
 }
 
-test "a cancel or signal while a workflow's completion is in flight is told to retry, and after it commits, that the run finished" {
+test "a cancel and a signal while a run's ending step is in flight apply after it: one moves the run, and each other is told it finished" {
     var t: RaceTest = undefined;
     try t.init();
     defer t.deinit();
@@ -24649,24 +24656,25 @@ test "a cancel or signal while a workflow's completion is in flight is told to r
     const id = try raceTestEndingRun(&t, &buf, &one, &id_buf);
     const run = raceTestRun(&t, id);
 
+    // Neither is told to retry: each is logged behind the step.
     t.send(.workflow_cancel, 51, id, "");
-    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
-    try std.testing.expectEqualStrings("run is taking a step — retry", (try one[0].refused()).message);
     var sig: [4]u8 = undefined;
     std.mem.writeInt(u16, sig[0..2], 2, .little);
     @memcpy(sig[2..4], "go");
     t.send(.workflow_signal, 52, id, &sig);
-    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
-    try std.testing.expectEqual(@as(u32, 0), t.shard.pending_count);
+    try std.testing.expectEqual(@as(u32, 2), t.shard.pending_count);
 
+    // One ack commits all three: the step ends the run, and the cancel and
+    // the signal, applied after it, are refused, applied never.
     try ParkTest.ack(&t.shard);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status());
-    t.send(.workflow_cancel, 53, id, "");
-    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
-    try std.testing.expectEqualStrings("run already finished", (try one[0].refused()).message);
+    var two: [2]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &two);
+    for (two, [_]u64{ 51, 52 }) |a, want| {
+        try std.testing.expectEqual(want, a.header.request_id);
+        try std.testing.expectEqualStrings("run already finished", (try a.refused()).message);
+    }
+    try std.testing.expectEqual(@as(u32, 0), t.shard.pending_count);
 }
 
 test "a halted shard's duties stop, and one with work counts as held until the shard serves again" {
