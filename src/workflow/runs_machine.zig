@@ -548,6 +548,8 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             // Not the invalid namespace, checked above.
             out.addRangeIn(HistFam.ID, n.ns, range) catch return error.OutOfMemory;
             out.addRangeIn(OutFam.ID, n.ns, range) catch return error.OutOfMemory;
+            // An ended run's signals go with it.
+            out.addRangeIn(SigFam.ID, n.ns, range) catch return error.OutOfMemory;
             const c = Complete.parse(cmd.value) orelse return;
             try out.addIn(PerDefFam.ID, n.ns, c.workflow);
         },
@@ -883,6 +885,9 @@ fn endRun(view: *View, n: Named, run_key: []const u8, run: *Run.Value, status: R
     run.wait_due_ms = 0;
     run.wait_timeout_to = "";
     run.progress = "";
+    // Signals no wait took: none can now.
+    try view.deleteRange(SigFam, try runRange(arena, n.ns, n.run), null);
+    run.sig_held = 0;
     try view.put(RunFam, run_key, .{ .v = run.* });
 
     const def_key = try idKeyAlloc(arena, n.ns, run.workflow);
@@ -1459,7 +1464,7 @@ test "workflow runs machine: a wait takes the oldest signal of its type, so two 
     try testing.expectEqual(Wait.signal, f.get("r1").?.wait);
 }
 
-test "workflow runs machine: a step that takes a signal, refused because the run moved on first, takes nothing" {
+test "workflow runs machine: a step that takes a signal, refused because the run moved on first or ended, takes nothing" {
     var f = Fixture.init();
     defer f.deinit();
     _ = try f.start("r1", "wf", "workflow_started", "", 1);
@@ -1473,13 +1478,31 @@ test "workflow runs machine: a step that takes a signal, refused because the run
     try testing.expectEqualStrings("conflict: the run moved on from that step", stale.refused().?.refusal.message);
     try testing.expectEqual(@as(u64, 1), f.get("r1").?.sig_held);
     try testing.expect(try hasSignal(testing.allocator, .{ .store = &f.store }, key, "go"));
-    // And a cancel: the run ends with the signal still held.
+    // A cancel ends it holding two no wait took: they go with it, and a
+    // step taking one is refused.
+    try testing.expect((try f.command(.workflow_signal, key, try Signal.encodeInto(&sb, .{ .type = "go", .payload = "" }), 3)).refused() == null);
+    try testing.expectEqual(@as(u64, 2), f.get("r1").?.sig_held);
     var vb: [512]u8 = undefined;
-    _ = try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 3);
+    _ = try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 4);
     const ended = try f.step("r1", .{ .rev = 1, .takes = &.{"go"} });
     try testing.expectEqualStrings("conflict: the run has ended", ended.refused().?.refusal.message);
-    try testing.expectEqual(@as(u64, 1), f.get("r1").?.sig_held);
-    try testing.expect(try hasSignal(testing.allocator, .{ .store = &f.store }, key, "go"));
+    try testing.expectEqual(@as(u64, 0), f.get("r1").?.sig_held);
+    var it = (ReadView{ .store = &f.store }).range(SigFam, "");
+    try testing.expect((try it.next()) == null);
+}
+
+test "workflow runs machine: a run its own step ends drops the signals it holds" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    var kb: [64]u8 = undefined;
+    const key = view_mod.idKey(&kb, .default, "r1") catch unreachable;
+    var sb: [128]u8 = undefined;
+    for ([_][]const u8{ "a", "b" }) |t| try testing.expect((try f.command(.workflow_signal, key, try Signal.encodeInto(&sb, .{ .type = t, .payload = "x" }), 2)).refused() == null);
+    try testing.expect((try f.step("r1", .{ .rev = 0, .ends = .completed })).refused() == null);
+    try testing.expectEqual(@as(u64, 0), f.get("r1").?.sig_held);
+    var it = (ReadView{ .store = &f.store }).range(SigFam, "");
+    try testing.expect((try it.next()) == null);
 }
 
 test "workflow runs machine: a run that takes each signal it is sent never fills up" {
