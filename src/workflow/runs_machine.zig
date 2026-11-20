@@ -1315,3 +1315,55 @@ test "workflow runs machine: a schedule's fired slot never moves back" {
     _ = try f.start("c", "wf", "workflow_started", "schedule:16:wf:9000", 1);
     try testing.expectEqual(@as(i64, 4000), f.active("wf").?.fired_ms);
 }
+
+test "workflow runs machine: a signal is kept and said; one a run waits for wakes it and moves its rev, so a step decided from the wait is refused" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    var kb: [64]u8 = undefined;
+    const key = view_mod.idKey(&kb, .default, "r1") catch unreachable;
+    var sb: [128]u8 = undefined;
+    // One it doesn't wait for: kept, and nothing else moves.
+    var r = try f.command(.workflow_signal, key, try Signal.encodeInto(&sb, .{ .type = "early", .payload = "p" }), 5);
+    try testing.expect(r.refused() == null);
+    try testing.expectEqual(@as(u64, 0), f.get("r1").?.rev);
+    try testing.expect(hasSignal(.{ .store = &f.store }, key, "early"));
+    try testing.expect(!hasSignal(.{ .store = &f.store }, key, "late"));
+
+    // It waits on "go", with a deadline: a signal of it wakes the run.
+    try testing.expect((try f.step("r1", .{ .rev = 0, .wait = .signal, .wait_on = "go" })).refused() == null);
+    try testing.expectEqual(@as(u8, @backingInt(RunStatus.waiting)), f.get("r1").?.status);
+    r = try f.command(.workflow_signal, key, try Signal.encodeInto(&sb, .{ .type = "go", .payload = "" }), 6);
+    try testing.expect(r.refused() == null);
+    const woken = f.get("r1").?;
+    try testing.expectEqual(Wait.none, woken.wait);
+    try testing.expectEqual(@as(u8, @backingInt(RunStatus.running)), woken.status);
+    try testing.expectEqual(@as(u64, 2), woken.rev);
+    try testing.expectEqual(@as(u64, 2), woken.sig_next);
+    // Its timeout, decided from the wait at rev 1: refused, not applied too.
+    const stale = try f.step("r1", .{ .rev = 1, .ends = .timed_out });
+    try testing.expectEqualStrings("conflict: the run moved on from that step", stale.refused().?.refusal.message);
+    try testing.expectEqual(@as(u8, @backingInt(RunStatus.running)), f.get("r1").?.status);
+}
+
+test "workflow runs machine: a run takes 64 signals and refuses the next; an ended or missing run refuses one" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    var kb: [64]u8 = undefined;
+    const key = view_mod.idKey(&kb, .default, "r1") catch unreachable;
+    var sb: [128]u8 = undefined;
+    const value = try Signal.encodeInto(&sb, .{ .type = "same", .payload = "" });
+    // Every one counts, however many share a type.
+    for (0..MAX_SIGNALS) |_| try testing.expect((try f.command(.workflow_signal, key, value, 2)).refused() == null);
+    const full = try f.command(.workflow_signal, key, value, 2);
+    try testing.expectEqualStrings("run's signals are full", full.refused().?.refusal.message);
+    try testing.expectEqual(MAX_SIGNALS, f.get("r1").?.sig_next);
+
+    var vb: [512]u8 = undefined;
+    _ = try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 3);
+    const ended = try f.command(.workflow_signal, key, value, 4);
+    try testing.expectEqualStrings("run already finished", ended.refused().?.refusal.message);
+    const missing = try f.command(.workflow_signal, view_mod.idKey(&kb, .default, "nope") catch unreachable, value, 4);
+    try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, missing.refused().?.status);
+}
