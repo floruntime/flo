@@ -63,6 +63,24 @@ pub const Plant = enum {
     runs_trigger_made_unchecked,
     /// A trigger's start of an earlier event moves its place back.
     runs_trigger_place_moves_back,
+    /// A signal that wakes its run leaves the run's rev where it was.
+    runs_signal_wake_keeps_rev,
+    /// A step's takes leave the signals it took held.
+    runs_take_keeps_signal,
+    /// A run's end keeps the signals it holds.
+    runs_end_keeps_signals,
+    /// A run's signal bound counts every signal it was sent, taken or not.
+    runs_signal_bound_counts_all,
+    /// A step waiting on a signal its run holds applies.
+    runs_stale_wait_unchecked,
+    /// A wait takes the newest signal of its type, not the oldest.
+    runs_take_newest,
+    /// A signal of any type wakes a run waiting on a signal.
+    runs_wake_any_type,
+    /// A step's takes naming one type twice resolve to one signal.
+    runs_take_ignores_picked,
+    /// A signal to an ended run is held.
+    runs_signal_after_end,
     /// A step takes its run's call's end before the call has ended.
     runs_settle_before_call_ends,
     /// A step leaves its run's call without taking its end.

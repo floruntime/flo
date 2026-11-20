@@ -552,13 +552,42 @@ fn printJobCounts(c: vopr.families.Jobs.Counts) void {
 }
 
 /// The workflow runs machine's entries, applied/refused by kind.
-fn printWorkflowRunCounts(c: vopr.workflow_runs_family.WorkflowRuns.Counts) void {
-    var buf: [512]u8 = undefined;
+fn printWorkflowRunCounts(c: WorkflowRunCounts) void {
+    var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     w.writeAll("[vopr] workflow runs:") catch {};
-    for (std.enums.values(vopr.workflow_runs_family.WorkflowRuns.Kind), c.applied, c.refused) |k, a, r| w.print(" {t}={d}/{d}", .{ k, a, r }) catch {};
+    for (WORKFLOW_RUN_KINDS, c.applied, c.refused) |k, a, r| w.print(" {t}={d}/{d}", .{ k, a, r }) catch {};
+    for (WORKFLOW_RUN_CLASSES, c.classes) |k, n| w.print(" {t}={d}", .{ k, n }) catch {};
     w.writeAll("\n") catch {};
     std.debug.print("{s}", .{w.buffered()});
+}
+
+const WorkflowRunCounts = vopr.workflow_runs_family.WorkflowRuns.Counts;
+const WORKFLOW_RUN_KINDS = std.enums.values(vopr.workflow_runs_family.WorkflowRuns.Kind);
+const WORKFLOW_RUN_CLASSES = std.enums.values(vopr.workflow_runs_family.WorkflowRuns.Class);
+
+/// A child's workflow run counts, from its log.
+fn readWorkflowRunCounts(allocator: std.mem.Allocator, log_path: []const u8) ?WorkflowRunCounts {
+    const text = stdx.fs.readFileAlloc(allocator, log_path, 4 * 1024 * 1024) catch return null;
+    defer allocator.free(text);
+    const at = std.mem.indexOf(u8, text, "[vopr] workflow runs:") orelse return null;
+    const line = text[at..(std.mem.indexOfScalarPos(u8, text, at, '\n') orelse text.len)];
+    var c: WorkflowRunCounts = .{};
+    var it = std.mem.tokenizeScalar(u8, line["[vopr] workflow runs:".len..], ' ');
+    while (it.next()) |field| {
+        const eq = std.mem.indexOfScalar(u8, field, '=') orelse return null;
+        const name = field[0..eq];
+        const value = field[eq + 1 ..];
+        if (std.meta.stringToEnum(vopr.workflow_runs_family.WorkflowRuns.Class, name)) |k| {
+            c.classes[@backingInt(k)] = std.fmt.parseInt(u64, value, 10) catch return null;
+            continue;
+        }
+        const k = std.meta.stringToEnum(vopr.workflow_runs_family.WorkflowRuns.Kind, name) orelse return null;
+        const slash = std.mem.indexOfScalar(u8, value, '/') orelse return null;
+        c.applied[@backingInt(k)] = std.fmt.parseInt(u64, value[0..slash], 10) catch return null;
+        c.refused[@backingInt(k)] = std.fmt.parseInt(u64, value[slash + 1 ..], 10) catch return null;
+    }
+    return c;
 }
 
 /// The workflow definitions machine's entries, applied/refused by kind.
@@ -768,6 +797,7 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
     var excused_seeds: std.ArrayListUnmanaged(u64) = .empty;
     defer excused_seeds.deinit(allocator);
     var action_totals: ActionCounts = .{};
+    var wf_run_totals: WorkflowRunCounts = .{};
     var queue_totals: QueueCounts = .{};
     var group_totals: GroupCounts = .{};
     var settle_seeds: u64 = 0;
@@ -835,6 +865,9 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
                                 if (c.cross_term_settles > 0) settle_seeds += 1;
                                 if (c.cross_term_expires > 0) expire_seeds += 1;
                             } else unread_counts += 1;
+                        }
+                        if (args.workflows) {
+                            if (readWorkflowRunCounts(allocator, r.log_path)) |c| wf_run_totals.add(c) else unread_counts += 1;
                         }
                         if (args.txn_limits) {
                             if (readTxnCounts(allocator, r.log_path)) |c| {
@@ -960,6 +993,22 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
             std.debug.print("[vopr] FAILED: fewer than {d} seeds settled and expired group leases from an earlier term\n", .{want});
             covered = false;
         }
+    }
+    // A race the workload never reached was never checked: the swarm fails.
+    if (args.workflows) {
+        std.debug.print("[vopr] workflow runs, applied/refused:", .{});
+        for (WORKFLOW_RUN_KINDS, wf_run_totals.applied, wf_run_totals.refused) |k, a, rf| std.debug.print(" {t}={d}/{d}", .{ k, a, rf });
+        std.debug.print("\n[vopr] workflow runs, reached:", .{});
+        for (WORKFLOW_RUN_CLASSES, wf_run_totals.classes) |k, n| std.debug.print(" {t}={d}", .{ k, n });
+        std.debug.print("\n", .{});
+        if (unread_counts > 0) {
+            std.debug.print("[vopr] FAILED: {d} passing seeds printed no workflow run counts\n", .{unread_counts});
+            covered = false;
+        }
+        for (WORKFLOW_RUN_CLASSES, wf_run_totals.classes) |k, n| if (n == 0 and ok_count > 0) {
+            std.debug.print("[vopr] FAILED: no seed reached {t}\n", .{k});
+            covered = false;
+        };
     }
     // Limits that no batch ever went past tested nothing: it fails, as above.
     if (args.txn_limits) {

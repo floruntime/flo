@@ -826,20 +826,22 @@ fn applySignal(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i
     // Its handler encoded it: one that doesn't decode is a Flo bug.
     const sig = Signal.decodeAll(cmd.value, &diag) catch return error.Halt;
     var run = ((try view.get(RunFam, cmd.key)) orelse return out.refuse(.not_found, .not_found, "")).v;
-    if (statusOf(run).isTerminal()) return out.refuse(.bad_request, .unclassified, "run already finished");
-    if (run.sig_held >= MAX_SIGNALS) return out.refuse(.bad_request, .unclassified, "run's signals are full");
+    if (comptime plant.active != .runs_signal_after_end) if (statusOf(run).isTerminal()) return out.refuse(.bad_request, .unclassified, "run already finished");
+    const held = if (comptime plant.active == .runs_signal_bound_counts_all) run.sig_next else run.sig_held;
+    if (held >= MAX_SIGNALS) return out.refuse(.bad_request, .unclassified, "run's signals are full");
     try view.put(SigFam, try sigKey(view.arena, n.ns, n.run, run.sig_next), .{ .v = .{ .type = sig.type, .payload = sig.payload, .at_ms = stamp_ms } });
     run.sig_next += 1;
     run.sig_held += 1;
     try appendHist(view, n, &run, "signal_received", sig.type, stamp_ms);
-    if (run.wait == .signal and std.mem.eql(u8, run.wait_on, sig.type)) {
+    const any_type = comptime plant.active == .runs_wake_any_type;
+    if (run.wait == .signal and (any_type or std.mem.eql(u8, run.wait_on, sig.type))) {
         try appendHist(view, n, &run, "signal_matched", sig.type, stamp_ms);
         run.wait = .none;
         run.wait_on = "";
         run.wait_due_ms = 0;
         run.wait_timeout_to = "";
         run.status = @backingInt(RunStatus.running);
-        run.rev += 1;
+        if (comptime plant.active != .runs_signal_wake_keeps_rev) run.rev += 1;
     }
     try view.put(RunFam, cmd.key, .{ .v = run });
 }
@@ -867,12 +869,17 @@ pub fn signalsHeld(a: std.mem.Allocator, read: ReadView, run_key: []const u8, si
 /// in `taken`, if any.
 fn oldestHeld(view: *View, n: Named, signal_type: []const u8, taken: []const []const u8) ApplyError!?[]const u8 {
     var it = try view.range(SigFam, try runRange(view.arena, n.ns, n.run));
+    var newest: ?[]const u8 = null;
     next: while (try it.next()) |item| {
         if (!std.mem.eql(u8, item.value.v.type, signal_type)) continue;
-        for (taken) |k| if (std.mem.eql(u8, k, item.key)) continue :next;
+        if (comptime plant.active != .runs_take_ignores_picked) for (taken) |k| if (std.mem.eql(u8, k, item.key)) continue :next;
+        if (comptime plant.active == .runs_take_newest) {
+            newest = try view.arena.dupe(u8, item.key);
+            continue;
+        }
         return item.key;
     }
-    return null;
+    return newest;
 }
 
 /// One event onto `run`'s history at its next seq; past `HIST_KEEP` the
@@ -916,7 +923,7 @@ fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64
     // A signal of its type applied after the wait was decided and before
     // it: the run would wait on what it holds, which wakes nothing. Refused,
     // so its next step is decided with the signal there.
-    if (st.wait == .signal and try oldestHeld(view, n, st.wait_on, taken.items) != null) return out.refuse(.conflict, .unclassified, "conflict: the run holds that signal already");
+    if (comptime plant.active != .runs_stale_wait_unchecked) if (st.wait == .signal and try oldestHeld(view, n, st.wait_on, taken.items) != null) return out.refuse(.conflict, .unclassified, "conflict: the run holds that signal already");
     if (st.progress.len > MAX_PROGRESS) return out.refuse(.bad_request, .unclassified, "a step's counters are past their bound");
     // A step leaves its run's call only by taking its end, or by ending the
     // run (the call then goes with the run, unanswered).
@@ -937,7 +944,7 @@ fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64
         }
     }
 
-    for (taken.items) |k| try view.delete(SigFam, k);
+    if (comptime plant.active != .runs_take_keeps_signal) for (taken.items) |k| try view.delete(SigFam, k);
     run.sig_held -= @intCast(taken.items.len);
 
     if (st.call.len > 0) {
@@ -1001,8 +1008,10 @@ fn endRun(view: *View, n: Named, run_key: []const u8, run: *Run.Value, status: R
     run.wait_timeout_to = "";
     run.progress = "";
     // Signals no wait took: none can now.
-    try view.deleteRange(SigFam, try runRange(arena, n.ns, n.run), null);
-    run.sig_held = 0;
+    if (comptime plant.active != .runs_end_keeps_signals) {
+        try view.deleteRange(SigFam, try runRange(arena, n.ns, n.run), null);
+        run.sig_held = 0;
+    }
     try view.put(RunFam, run_key, .{ .v = run.* });
 
     const def_key = try idKeyAlloc(arena, n.ns, run.workflow);

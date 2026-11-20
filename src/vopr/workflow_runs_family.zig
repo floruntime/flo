@@ -26,6 +26,13 @@
 //!   another status is refused;
 //! - a child's parent hears its start (only a child start's), its refusal,
 //!   a disabled workflow, and its end, each once;
+//! - a signal is held by its run, refused when the run is gone, has ended
+//!   or holds 64 no wait took; one of the type the run waits on wakes it,
+//!   moving its rev, and is still held. A step names the types its waits
+//!   took, each the earliest held of its type not already named; a step
+//!   naming one the run doesn't hold, or waiting on a type the run still
+//!   holds after its takes, is refused, and only a step that applies takes
+//!   anything. A run's end drops every signal it holds;
 //! - the store holds what the ledger holds, and on its own: each workflow's
 //!   count is its runs not ended, each run's history is its last seqs, each
 //!   idempotency key names a run of that workflow with that key, a run
@@ -63,8 +70,6 @@ const RUNS = blk: {
 /// later start can carry an earlier slot.
 const IDEMS = [_][]const u8{ "k0", "k1", "_schedule:16:w:3000", "_schedule:16:w:1000", "_schedule:16:w:2000", "_trigger:16:1:ev@1:0", "_trigger:16:2:ev@3:1" };
 const SLOT_OF = [_]?i64{ null, null, 3000, 1000, 2000, null, null };
-/// Keys the server makes begin with '_': only a schedule's or a trigger's
-/// start may carry one, whatever comes after it.
 /// Where a trigger's start says it read: a few namespaces, makings and
 /// streams, so its place moves on, is replaced, and holds against a start
 /// read from an older making.
@@ -93,7 +98,10 @@ const CALLEES = [_][]const u8{ "c0", "c1", "c2", "c3", "c4", "c5" };
 const ACTION_TARGET = "act";
 const CHILD_TARGET = "cw";
 const SIGNAL = "sig";
-const WAIT_ONS = CALLEES ++ [_][]const u8{SIGNAL};
+/// Signal types: a run waits on one of these, and is sent them.
+const SIG_TYPES = [_][]const u8{ SIGNAL, "go", "stop" };
+const SIG_PAYLOADS = [_][]const u8{ "", "p1" };
+const WAIT_ONS = CALLEES ++ SIG_TYPES;
 const PROGRESS = [_][]const u8{ "", "{\"n\":1}" };
 /// Past what a step's counters may hold: refused.
 const OVERSIZED: [rm.MAX_PROGRESS + 1]u8 = @splat('x');
@@ -170,6 +178,37 @@ pub const WorkflowRuns = struct {
         step: ?usize = null,
         wait: WaitL = .{},
         progress: []const u8 = "",
+        /// Signals it holds that no wait took, earliest first, and the
+        /// seq the next one is given.
+        held: [rm.MAX_SIGNALS]SigL = undefined,
+        held_n: usize = 0,
+        sig_next: u64 = 0,
+        /// Its rev after a signal woke it, while no step has moved it since.
+        woken_rev: ?u64 = null,
+        /// What each of its last `HIST_KEEP` events is, by seq: a step's,
+        /// or a signal's.
+        hist: [rm.HIST_KEEP]HistL = undefined,
+    };
+    const SigL = struct { type: usize, payload: usize, seq: u64, at_ms: i64 };
+    const HistL = struct { kind: enum(u8) { step, received, matched }, type: u8 = 0, at_ms: i64 = 0 };
+
+    /// What happened, by class: each is reached by some seed of a swarm,
+    /// or the swarm fails.
+    pub const Class = enum {
+        /// A step decided before a signal woke its run, refused for the rev.
+        wake_moved_rev,
+        /// A step taking a signal its run doesn't hold.
+        takes_missing,
+        /// A step waiting on a signal its run holds.
+        stale_wait,
+        /// A signal to a run holding as many as it may.
+        signal_full,
+        signal_to_ended,
+        signal_to_unknown,
+        /// A run ending while it holds signals.
+        ended_holding,
+        /// A step taking two of one type, applied.
+        takes_repeat,
     };
     const PerDefL = struct { active: u32, fired_ms: i64, place: ?PlaceL = null };
     /// A trigger's place: the stream (namespace, making, name) and how far in.
@@ -213,24 +252,33 @@ pub const WorkflowRuns = struct {
         calls: [NAMES.len][CALLEES.len]?CallL = @splat(@splat(null)),
     };
 
-    pub const FAMILIES = [_]u16{ rm.RunFam.ID, rm.HistFam.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID, calls_mod.Calls.ID };
-    pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "workflow.hist", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents", "step.calls" };
+    pub const FAMILIES = [_]u16{ rm.RunFam.ID, rm.HistFam.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID, calls_mod.Calls.ID, rm.SigFam.ID };
+    pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "workflow.hist", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents", "step.calls", "workflow.sig" };
 
-    pub const Kind = enum { start, step, complete, child_start, child_refuse, reply, done, retry, clear };
+    pub const Kind = enum { start, step, complete, child_start, child_refuse, reply, done, retry, clear, signal };
 
     pub const Effect = struct {
         kind: Kind,
         refused: bool,
         broke: ?[]const u8 = null,
+        class: ?Class = null,
     };
 
     pub const Counts = struct {
         applied: [std.enums.values(Kind).len]u64 = @splat(0),
         refused: [std.enums.values(Kind).len]u64 = @splat(0),
+        classes: [std.enums.values(Class).len]u64 = @splat(0),
 
         pub fn count(self: *Counts, o: Effect) void {
             const k = @backingInt(o.kind);
             if (o.refused) self.refused[k] += 1 else self.applied[k] += 1;
+            if (o.class) |c| self.classes[@backingInt(c)] += 1;
+        }
+
+        pub fn add(self: *Counts, o: Counts) void {
+            for (&self.applied, o.applied) |*a, b| a.* += b;
+            for (&self.refused, o.refused) |*a, b| a.* += b;
+            for (&self.classes, o.classes) |*a, b| a.* += b;
         }
     };
 
@@ -249,7 +297,7 @@ pub const WorkflowRuns = struct {
 
     pub fn owns(entry_type: u8) bool {
         return switch (@as(EntryType, @fromBackingInt(entry_type))) {
-            .workflow_start, .workflow_step, .workflow_complete, .child_start, .child_refuse => true,
+            .workflow_start, .workflow_step, .workflow_complete, .child_start, .child_refuse, .workflow_signal => true,
             .call_reply, .call_done, .step_call_retry, .step_call_clear => true,
             else => false,
         };
@@ -281,10 +329,16 @@ pub const WorkflowRuns = struct {
     };
     /// What an entry does: its sends, or refused, with why the ledger
     /// refuses it, which a failure names.
-    const Want = struct { refused: ?[]const u8 = null, sends: [2]?Send = @splat(null) };
+    const Want = struct { refused: ?[]const u8 = null, sends: [2]?Send = @splat(null), class: ?Class = null };
 
     fn refuse(comptime kind: Kind, comptime why: []const u8) Want {
         return .{ .refused = "the runs machine applied a " ++ @tagName(kind) ++ " the ledger refuses: " ++ why };
+    }
+
+    fn refuseAs(comptime kind: Kind, comptime why: []const u8, class: Class) Want {
+        var w = refuse(kind, why);
+        w.class = class;
+        return w;
     }
 
     /// Why a machine's refusal of an entry the ledger applies fails.
@@ -322,6 +376,10 @@ pub const WorkflowRuns = struct {
         run.output = output;
         run.wait = .{};
         run.progress = "";
+        // Its signals go with it.
+        if (run.held_n > 0) want.class = .ended_holding;
+        run.held_n = 0;
+        run.woken_rev = null;
         if (l.per_def[run.wf]) |*per| per.active -|= 1;
         if (l.parents[r]) |f| {
             want.sends[at] = .{ .entry_type = .call_done, .to = PARENT_SLOTS[f.slot], .run = RUNS[r], .done = doneOf(status), .result = if (output) |o| OUTPUTS[o] else "" };
@@ -359,7 +417,7 @@ pub const WorkflowRuns = struct {
                 l.parents[r] = null;
             },
             .reply, .done, .retry, .clear => return self.predictCall(e, kind),
-            .start, .step, .complete => {
+            .start, .step, .complete, .signal => {
                 const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return null;
                 const r = indexOf(&RUNS, cmd.key[4..]) orelse return null;
                 switch (kind) {
@@ -373,7 +431,30 @@ pub const WorkflowRuns = struct {
                             break :blk s;
                         };
                         if (run.status.isTerminal()) return refuse(.step, "the run has ended");
-                        if (st.rev != run.rev) return refuse(.step, "the run moved on from that rev");
+                        if (st.rev != run.rev) {
+                            // Decided before a signal woke the run.
+                            if (run.woken_rev == run.rev and st.rev +% 1 == run.rev) return refuseAs(.step, "the run moved on from that rev", .wake_moved_rev);
+                            return refuse(.step, "the run moved on from that rev");
+                        }
+                        // The signals its waits took: each the earliest held
+                        // of its type that this step hasn't named already.
+                        var picked: [rm.MAX_SIGNALS]usize = undefined;
+                        var np: usize = 0;
+                        var repeats = false;
+                        var takes = st.takes.iterator();
+                        while (takes.next() catch return null) |t| {
+                            const ty = indexOf(&SIG_TYPES, t.type) orelse return null;
+                            for (picked[0..np]) |i| {
+                                if (run.held[i].type == ty) repeats = true;
+                            }
+                            const i = earliestHeld(&run, ty, picked[0..np]) orelse return refuseAs(.step, "its takes name a signal its run doesn't hold", .takes_missing);
+                            if (np == picked.len) return null;
+                            picked[np] = i;
+                            np += 1;
+                        }
+                        // Waiting on a type it would still hold: stale.
+                        if (st.wait == .signal) if (indexOf(&SIG_TYPES, st.wait_on)) |ty| if (earliestHeld(&run, ty, picked[0..np]) != null)
+                            return refuseAs(.step, "it waits on a signal its run holds", .stale_wait);
                         if (st.progress.len > rm.MAX_PROGRESS) return refuse(.step, "its counters are past their bound");
                         const leaves = run.wait.wait == .call and !(st.wait == .call and std.mem.eql(u8, st.wait_on, run.wait.on));
                         if (leaves and ends == null and st.settles.len == 0) return refuse(.step, "it leaves its run's call without taking its end");
@@ -389,8 +470,18 @@ pub const WorkflowRuns = struct {
                             };
                             settled = c;
                         }
-                        // It applies: the settled call's record goes, then
-                        // its own is recorded.
+                        // It applies: the signals it took go, the settled
+                        // call's record goes, then its own is recorded.
+                        if (np > 0) {
+                            var kept: usize = 0;
+                            for (run.held[0..run.held_n], 0..) |h, i| {
+                                if (std.mem.indexOfScalar(usize, picked[0..np], i) != null) continue;
+                                run.held[kept] = h;
+                                kept += 1;
+                            }
+                            run.held_n = kept;
+                            if (repeats) want.class = .takes_repeat;
+                        }
                         if (settled) |c| l.calls[so][c] = null;
                         var sends: usize = 0;
                         if (st.call.len > 0) {
@@ -416,12 +507,16 @@ pub const WorkflowRuns = struct {
                                 sends += 1;
                             }
                         }
-                        run.hist_next += st.events.count;
+                        for (0..st.events.count) |_| {
+                            run.hist[run.hist_next % rm.HIST_KEEP] = .{ .kind = .step };
+                            run.hist_next += 1;
+                        }
                         var outs = st.outputs.iterator();
                         while (outs.next() catch return null) |o| {
                             run.outs[indexOf(&STEPS, o.step) orelse return null] = indexOf(&OUTCOMES, o.outcome) orelse return null;
                         }
                         run.rev += 1;
+                        run.woken_rev = null;
                         run.stepped = true;
                         run.step = if (st.step.len == 0) null else indexOf(&STEPS, st.step) orelse return null;
                         run.wait = .{
@@ -504,11 +599,42 @@ pub const WorkflowRuns = struct {
                         endL(l, r, &run, c.status, output, stamp_ms, &want, 0);
                         l.runs[r] = run;
                     },
+                    .signal => {
+                        const sg = rm.Signal.decodeAll(cmd.value, &diag) catch return null;
+                        const ty = indexOf(&SIG_TYPES, sg.type) orelse return null;
+                        const pl = indexOf(&SIG_PAYLOADS, sg.payload) orelse return null;
+                        var run = l.runs[r] orelse return refuseAs(.signal, "its run isn't there", .signal_to_unknown);
+                        if (run.status.isTerminal()) return refuseAs(.signal, "its run has ended", .signal_to_ended);
+                        if (run.held_n >= rm.MAX_SIGNALS) return refuseAs(.signal, "its run holds as many signals as it may", .signal_full);
+                        run.held[run.held_n] = .{ .type = ty, .payload = pl, .seq = run.sig_next, .at_ms = stamp_ms };
+                        run.held_n += 1;
+                        run.sig_next += 1;
+                        run.hist[run.hist_next % rm.HIST_KEEP] = .{ .kind = .received, .type = @intCast(ty), .at_ms = stamp_ms };
+                        run.hist_next += 1;
+                        // Its type is the one the run waits on: it wakes.
+                        if (run.wait.wait == .signal and std.mem.eql(u8, run.wait.on, SIG_TYPES[ty])) {
+                            run.hist[run.hist_next % rm.HIST_KEEP] = .{ .kind = .matched, .type = @intCast(ty), .at_ms = stamp_ms };
+                            run.hist_next += 1;
+                            run.wait = .{};
+                            run.status = .running;
+                            run.rev += 1;
+                            run.woken_rev = run.rev;
+                        }
+                        l.runs[r] = run;
+                    },
                     else => unreachable,
                 }
             },
         }
         return want;
+    }
+
+    /// The earliest signal of type `ty` the run holds, past those `picked`.
+    fn earliestHeld(run: *const RunL, ty: usize, picked: []const usize) ?usize {
+        for (run.held[0..run.held_n], 0..) |h, i| {
+            if (h.type == ty and std.mem.indexOfScalar(usize, picked, i) == null) return i;
+        }
+        return null;
     }
 
     /// The call an answer, retry or clear names: its workflow's slot owner
@@ -613,6 +739,7 @@ pub const WorkflowRuns = struct {
             .call_done => .done,
             .step_call_retry => .retry,
             .step_call_clear => .clear,
+            .workflow_signal => .signal,
             else => .child_refuse,
         };
     }
@@ -629,7 +756,7 @@ pub const WorkflowRuns = struct {
         var out: persistence.Result = .{};
         out.reset(e);
         try machine_mod.applyEntry(&rm.machine, store, &self.scratch, e, &out);
-        var effect: Effect = .{ .kind = kind, .refused = out.refused() != null };
+        var effect: Effect = .{ .kind = kind, .refused = out.refused() != null, .class = want.class };
         if (effect.refused) {
             for (FAMILIES, before[0..FAMILIES.len]) |fam, b| if (b != store.families[fam].commits) return error.RefusalChangedState;
             if (before[FAMILIES.len] != store.families[channels.OutFam.ID].commits) return error.RefusalChangedState;
@@ -825,13 +952,17 @@ pub const WorkflowRuns = struct {
             if ((g.state == .started) != p.started) return "whether a child started is not the ledger's";
             if (g.state == .started and got == null) return "a started child's run is gone";
         }
+        const prefix = try rm.runRange(a, NS, name);
         const run = want orelse {
             if (got != null) return "a run the ledger doesn't hold is stored";
+            var none = rv.range(rm.SigFam, prefix);
+            if ((none.next() catch return "a signal could not be read") != null) return "a run the ledger doesn't hold has signals";
             return null;
         };
         const g = got orelse return "a run the ledger holds is gone";
         if (!std.mem.eql(u8, g.workflow, NAMES[run.wf])) return "a run's workflow is not its start's";
         if (g.status != @backingInt(run.status)) return "a run's status is not the ledger's";
+        if (run.woken_rev != null and g.rev != run.rev) return "a woken run's rev is not the ledger's";
         if ((g.rev > 0) != run.stepped or g.rev != run.rev) return "whether a run's first step was taken is not the ledger's";
         if (g.created_at_ms != run.created_ms or g.completed_at_ms != run.completed_ms) return "a run's stamps are not the ledger's";
         if (!std.mem.eql(u8, g.idempotency_key, if (run.idem) |k| IDEMS[k] else "")) return "a run's idempotency key is not its start's";
@@ -853,8 +984,24 @@ pub const WorkflowRuns = struct {
             const got_idem = (rv.get(rm.IdemFam, try rm.idemKey(a, NS, wname, IDEMS[k])) catch return "an idempotency key could not be read") orelse return "the idempotency keys are not the ledger's";
             if (!std.mem.eql(u8, got_idem.v.run, RUNS[l.idem[run.wf][k].?])) return "the idempotency keys are not the ledger's";
         }
+        // Its signals, at every entry naming it.
+        if (run.status.isTerminal()) {
+            var after = rv.range(rm.SigFam, prefix);
+            if ((after.next() catch return "a signal could not be read") != null or g.sig_held != 0) return "an ended run holds signals";
+        }
+        if (g.sig_next != run.sig_next) return "a run's signal seq is not the ledger's";
+        if (g.sig_held != run.held_n) return "a run's held signal count is not the ledger's";
+        var sigs = rv.range(rm.SigFam, prefix);
+        var si: usize = 0;
+        while (sigs.next() catch return "a signal could not be read") |item| : (si += 1) {
+            if (si >= run.held_n) return "a run holds signals the ledger doesn't";
+            const h = run.held[si];
+            const v = item.value.v;
+            if (std.mem.readInt(u64, item.key[item.key.len - 8 ..][0..8], .big) != h.seq or !std.mem.eql(u8, v.type, SIG_TYPES[h.type]) or
+                !std.mem.eql(u8, v.payload, SIG_PAYLOADS[h.payload]) or v.at_ms != h.at_ms) return "a run's held signals are not the ledger's";
+        }
+        if (si != run.held_n) return "a run's held signals are not the ledger's";
         if (!walk) return null;
-        const prefix = try rm.runRange(a, NS, name);
         var hist = rv.range(rm.HistFam, prefix);
         var seq = run.hist_next - kept;
         while (hist.next() catch return "a history event could not be read") |item| : (seq += 1) {
@@ -865,8 +1012,13 @@ pub const WorkflowRuns = struct {
                 if (!std.mem.eql(u8, h.event, EVENTS[run.started]) or !std.mem.eql(u8, h.detail, INPUT) or h.at_ms != run.created_ms) return "a run's first event is not its start's";
             } else if (run.ended_at == seq) {
                 if (!std.mem.eql(u8, h.event, CANCEL_EVENT) or h.at_ms != run.completed_ms) return "a run's last event is not its cancel's";
-            } else {
-                if (!std.mem.eql(u8, h.event, STEP_EVENT) or h.at_ms != 0 or h.detail.len != 0) return "a run's history is not its steps'";
+            } else switch (run.hist[seq % rm.HIST_KEEP].kind) {
+                .step => if (!std.mem.eql(u8, h.event, STEP_EVENT) or h.at_ms != 0 or h.detail.len != 0) return "a run's history is not its steps'",
+                .received, .matched => |k| {
+                    const hl = run.hist[seq % rm.HIST_KEEP];
+                    const event = if (k == .received) "signal_received" else "signal_matched";
+                    if (!std.mem.eql(u8, h.event, event) or !std.mem.eql(u8, h.detail, SIG_TYPES[hl.type]) or h.at_ms != hl.at_ms) return "a run's history is not its signals'";
+                },
             }
         }
         if (seq != run.hist_next) return "a run's history is missing events";
@@ -921,6 +1073,13 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
     const any = r.uintLessThan(usize, RUNS.len);
     var kb: [16]u8 = undefined;
     const roll = r.uintLessThan(u8, 100);
+    // The live run holding the most signals: pressed on until it holds as
+    // many as it may, and mostly spared ending and taking meanwhile.
+    var most: ?usize = null;
+    for (live.ids[0..live.n]) |i| {
+        if (most == null or l.runs[i].?.held_n > l.runs[most.?].?.held_n) most = i;
+    }
+    const hoard: ?usize = if (most) |m| if (l.runs[m].?.held_n >= 8) m else null else null;
     if (roll < 12) {
         const run = free.or_(r, 50, any);
         const p = ae.ChildStart.encodeInto(buf, .{
@@ -949,16 +1108,42 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
         for (live.ids[0..live.n]) |i| {
             if (longest == null or l.runs[i].?.hist_next > l.runs[longest.?].?.hist_next) longest = i;
         }
-        const c = if (longest != null and r.uintLessThan(u8, 100) < 25) longest.? else live.or_(r, 80, unstepped.or_(r, 30, held.at(r)));
+        // Now and then a run waiting on a signal: a signal may wake it
+        // before this step applies.
+        var waiting: Pick = .{};
+        for (live.ids[0..live.n]) |i| if (l.runs[i].?.wait.wait == .signal) waiting.add(i);
+        const pick = r.uintLessThan(u8, 100);
+        const c = if (longest != null and pick < 25) longest.? else if (pick < 45) waiting.or_(r, 100, live.or_(r, 80, held.at(r))) else live.or_(r, 80, unstepped.or_(r, 30, held.at(r)));
         const vb = buf[buf.len / 2 ..];
-        const value = stepValue(r, vb, c, l.runs[c].?) orelse return null;
+        const spare = hoard == c and r.uintLessThan(u8, 100) < 90;
+        const value = stepValue(r, vb, c, l.runs[c].?, spare) orelse return null;
         return command(buf[0 .. buf.len / 2], .workflow_step, view_mod.idKey(&kb, NS, RUNS[c]) catch unreachable, value);
     }
     // A call's answer, retry or clear: mostly of a call the leader holds.
     if (roll < 48) return callAnswer(r, buf, l);
+    // A signal: a quarter of them, or most once it holds many, to the live
+    // run holding the most, so its bound is reached; the rest mostly to a
+    // live run, now and then to an ended or an unknown one.
+    if (roll < 64) {
+        // Once it holds many, mostly to it: runs end and steps take
+        // signals, so the bound is reached only by pressing on one.
+        const k = r.uintLessThan(u8, 100);
+        const press: u8 = if (hoard != null) 85 else 25;
+        const c = if (most != null and k < press) most.? else if (k < 85) live.or_(r, 90, held.or_(r, 50, any)) else held.or_(r, 50, any);
+        // To a run waiting on a signal, mostly its type: it wakes, and a
+        // step decided from the wait meets the moved rev.
+        var ty = SIG_TYPES[r.uintLessThan(usize, SIG_TYPES.len)];
+        if (l.runs[c]) |run| if (run.wait.wait == .signal and r.uintLessThan(u8, 100) < 60) {
+            ty = run.wait.on;
+        };
+        var sb: [64]u8 = undefined;
+        const value = rm.Signal.encodeInto(&sb, .{ .type = ty, .payload = SIG_PAYLOADS[r.uintLessThan(usize, SIG_PAYLOADS.len)] }) catch return null;
+        return command(buf, .workflow_signal, view_mod.idKey(&kb, NS, RUNS[c]) catch unreachable, value);
+    }
     // A completion names a run the leader holds, and its workflow.
-    if (roll < 62 and held.n > 0) {
-        const c = live.or_(r, 75, held.at(r));
+    if (roll < 76 and held.n > 0) {
+        var c = live.or_(r, 75, held.at(r));
+        if (hoard == c and r.uintLessThan(u8, 100) < 95) c = held.at(r);
         const vb = buf[buf.len / 2 ..];
         const value = completeValue(r, vb, ENDS[r.uintLessThan(usize, ENDS.len)], NAMES[l.runs[c].?.wf]) orelse return null;
         return command(buf[0 .. buf.len / 2], .workflow_complete, view_mod.idKey(&kb, NS, RUNS[c]) catch unreachable, value);
@@ -1074,7 +1259,8 @@ fn samePlace(g: rm.PerDef.Value, want: ?WorkflowRuns.PlaceL) bool {
 /// now and then leaves it unsettled or takes another call's end (both
 /// refused). Any other run waits for nothing, a call, a signal or a timer,
 /// or ends.
-fn stepValue(r: std.Random, buf: []u8, c: usize, run: WorkflowRuns.RunL) ?[]const u8 {
+/// A `spare` step neither ends its run nor takes its signals.
+fn stepValue(r: std.Random, buf: []u8, c: usize, run: WorkflowRuns.RunL, spare: bool) ?[]const u8 {
     const wf = NAMES[run.wf];
     // Long steps are rare, but likelier for a run already long: every
     // replica's checksums walk them all.
@@ -1092,7 +1278,10 @@ fn stepValue(r: std.Random, buf: []u8, c: usize, run: WorkflowRuns.RunL) ?[]cons
         outs += 1;
     };
     var value: rm.Step.Value = .{
-        .rev = if (r.uintLessThan(u8, 100) < 10) run.rev +% 1 else run.rev,
+        // Now and then a rev another leader moved past; for a run a signal
+        // woke, often the rev from before the wake, as a step decided from
+        // the wait and applied after the signal is.
+        .rev = if (run.woken_rev == run.rev and r.uintLessThan(u8, 100) < 40) run.rev -% 1 else if (r.uintLessThan(u8, 100) < 10) run.rev +% 1 else run.rev,
         .step = STEPS[r.uintLessThan(usize, STEPS.len)],
         .events = .{ .bytes = ew.written(), .count = events },
         .outputs = .{ .bytes = ow.written(), .count = outs },
@@ -1125,12 +1314,26 @@ fn stepValue(r: std.Random, buf: []u8, c: usize, run: WorkflowRuns.RunL) ?[]cons
             next = false;
         } else if (roll < 82) {
             next = false;
-            endStep(r, &value);
+            if (!spare) endStep(r, &value);
         } else next = false;
-    } else if (roll < 6) {
+    } else if (roll < 6 and !spare) {
         next = false;
         endStep(r, &value);
     }
+    // Signals its waits took: mostly ones it holds, now and then one more
+    // than it holds of a type, or one it holds none of.
+    var tb: [rm.MAX_SIGNALS * 8]u8 = undefined;
+    var tw: schema.Writer = .{ .buf = &tb };
+    var takes: u32 = 0;
+    if (!spare and r.uintLessThan(u8, 100) < 35) {
+        const want_n = r.intRangeAtMost(usize, 1, 3);
+        for (0..want_n) |_| {
+            const ty = if (run.held_n > 0 and r.uintLessThan(u8, 100) < 85) run.held[r.uintLessThan(usize, run.held_n)].type else r.uintLessThan(usize, SIG_TYPES.len);
+            rm.Take.encode(&tw, .{ .type = SIG_TYPES[ty] }) catch return null;
+            takes += 1;
+        }
+    }
+    value.takes = .{ .bytes = tw.written(), .count = takes };
     var cb: [256]u8 = undefined;
     if (next) {
         const w = r.uintLessThan(u8, 100);
@@ -1151,7 +1354,7 @@ fn stepValue(r: std.Random, buf: []u8, c: usize, run: WorkflowRuns.RunL) ?[]cons
             }) catch return null;
             setWait(&value, .{ .wait = .call, .kind = kind, .slot = slotOf(targetOf(kind)), .on = callee });
         } else if (w < 47) {
-            setWait(&value, .{ .wait = .signal, .on = SIGNAL, .due_ms = if (r.boolean()) 0 else 5000, .timeout_to = if (r.boolean()) "" else STEPS[r.uintLessThan(usize, STEPS.len)] });
+            setWait(&value, .{ .wait = .signal, .on = SIG_TYPES[r.uintLessThan(usize, SIG_TYPES.len)], .due_ms = if (r.boolean()) 0 else 5000, .timeout_to = if (r.boolean()) "" else STEPS[r.uintLessThan(usize, STEPS.len)] });
         } else if (w < 62) {
             setWait(&value, .{ .wait = .timer, .due_ms = r.intRangeAtMost(i64, 1000, 9000) });
         }
