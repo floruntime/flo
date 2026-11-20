@@ -4747,6 +4747,9 @@ fn deliverToSelf(shard: *Shard) bool {
     const e: @import("../storage/ual/entry.zig").Entry = .{ .header = h, .payload = inbound };
     var out = persistence_mod.Result.start(&e);
     @import("../contract/machine.zig").applyEntry(&@import("../contract/machines.zig").Channels.machine, &part.store, &part.apply_scratch, &e, &out) catch unreachable;
+    // Each message is then an entry applied to the workflows, as the
+    // shard's applier has it: a reply wakes its parked caller.
+    for (part.store.messages.items) |*m| shard.workflow_handler.entryApplied(&m.entry, &m.result);
     return true;
 }
 
