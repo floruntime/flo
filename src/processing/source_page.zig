@@ -124,9 +124,9 @@ pub const TsPoint = struct { timestamp_ns: u64, ual: u64, value: f64, tags: []co
 /// The owner's answer: the read's own header, then where the read reached
 /// and the records.
 ///
-/// `[term u64][seq u64][kind u8][asker u8][key len u16][key][from_a u64]
-/// [from_b u64][status u8][made_ns u64][last_a u64][last_b u64][late u64]
-/// [count u32]` then each
+/// `[term u64][seq u64][kind u8][asker u8][key len u16][key][source len u16]
+/// [source][from_a u64][from_b u64][status u8][made_ns u64][ns u32][last_a u64]
+/// [last_b u64][late u64][count u32]` then each
 /// stream record `[ms u64][seq u64][len u32][payload]` or TS point
 /// `[ns u64][ual u64][value u64][tags len u16][tags]`.
 pub const Page = struct {
@@ -135,6 +135,9 @@ pub const Page = struct {
     kind: Kind,
     asker: Asker,
     key: []const u8,
+    /// The source the read named, as asked: an asker whose source has
+    /// changed since it asked takes nothing from it.
+    source: []const u8,
     from_a: u64,
     from_b: u64,
     status: Status,
@@ -142,6 +145,9 @@ pub const Page = struct {
     /// asker whose cursor is in one since deleted and made again starts
     /// over. 0 for TS.
     made_ns: u64,
+    /// The id of the namespace the owner read the source in; 0 when it
+    /// read nothing.
+    ns: u32,
     /// Stream: the id the read reached, past appends it couldn't read, so
     /// the cursor still moves past them. TS: the field's newest time and
     /// its write count (0 when it has no series).
@@ -161,6 +167,7 @@ pub const Page = struct {
         count: u32 = 0,
         status: Status = .ok,
         made_ns: u64 = 0,
+        ns: u32 = 0,
 
         pub fn begin(b: *Builder, allocator: Allocator, r: Read) !void {
             const w = &b.list;
@@ -170,11 +177,14 @@ pub const Page = struct {
             try appendInt(w, allocator, u8, @backingInt(r.asker));
             try appendInt(w, allocator, u16, @intCast(r.key.len));
             try w.appendSlice(allocator, r.key);
+            try appendInt(w, allocator, u16, @intCast(r.source.len));
+            try w.appendSlice(allocator, r.source);
             try appendInt(w, allocator, u64, r.from_a);
             try appendInt(w, allocator, u64, r.from_b);
             b.last_at = w.items.len;
             try appendInt(w, allocator, u8, 0);
             try appendInt(w, allocator, u64, 0);
+            try appendInt(w, allocator, u32, 0);
             try appendInt(w, allocator, u64, 0);
             try appendInt(w, allocator, u64, 0);
             try appendInt(w, allocator, u64, 0);
@@ -208,9 +218,10 @@ pub const Page = struct {
             std.debug.assert(b.status == .ok or b.count == 0);
             s[b.last_at] = @backingInt(b.status);
             std.mem.writeInt(u64, s[b.last_at + 1 ..][0..8], b.made_ns, .little);
-            std.mem.writeInt(u64, s[b.last_at + 9 ..][0..8], last_a, .little);
-            std.mem.writeInt(u64, s[b.last_at + 17 ..][0..8], last_b, .little);
-            std.mem.writeInt(u64, s[b.last_at + 25 ..][0..8], late, .little);
+            std.mem.writeInt(u32, s[b.last_at + 9 ..][0..4], b.ns, .little);
+            std.mem.writeInt(u64, s[b.last_at + 13 ..][0..8], last_a, .little);
+            std.mem.writeInt(u64, s[b.last_at + 21 ..][0..8], last_b, .little);
+            std.mem.writeInt(u64, s[b.last_at + 29 ..][0..8], late, .little);
             std.mem.writeInt(u32, s[b.count_at..][0..4], b.count, .little);
             return b.list.toOwnedSlice(allocator);
         }
@@ -231,15 +242,17 @@ pub const Page = struct {
         const kind = std.enums.fromInt(Kind, r.int(u8) orelse return null) orelse return null;
         const asker = std.enums.fromInt(Asker, r.int(u8) orelse return null) orelse return null;
         const key = r.take(r.int(u16) orelse return null) orelse return null;
+        const source = r.take(r.int(u16) orelse return null) orelse return null;
         const from_a = r.int(u64) orelse return null;
         const from_b = r.int(u64) orelse return null;
         const status = std.enums.fromInt(Status, r.int(u8) orelse return null) orelse return null;
         const made_ns = r.int(u64) orelse return null;
+        const ns = r.int(u32) orelse return null;
         const last_a = r.int(u64) orelse return null;
         const last_b = r.int(u64) orelse return null;
         const late = r.int(u64) orelse return null;
         const count = r.int(u32) orelse return null;
-        return .{ .term = term, .seq = seq, .kind = kind, .asker = asker, .key = key, .from_a = from_a, .from_b = from_b, .status = status, .made_ns = made_ns, .last_a = last_a, .last_b = last_b, .late = late, .count = count, .items = bytes[r.at..] };
+        return .{ .term = term, .seq = seq, .kind = kind, .asker = asker, .key = key, .source = source, .from_a = from_a, .from_b = from_b, .status = status, .made_ns = made_ns, .ns = ns, .last_a = last_a, .last_b = last_b, .late = late, .count = count, .items = bytes[r.at..] };
     }
 
     pub const Record = struct { ms: u64, seq: u64, payload: []const u8 };
@@ -367,7 +380,7 @@ test "source read and page: fields come back as sent; a cut one doesn't decode" 
     const rs = page.records(&recs).?;
     try std.testing.expectEqualStrings("x", rs[0].payload);
     try std.testing.expectEqual(@as(u64, 1), rs[1].seq);
-    try std.testing.expectEqual(@as(?[]Page.Record, null), (Page{ .term = 0, .seq = 0, .kind = .stream, .asker = .pipeline, .key = "", .from_a = 0, .from_b = 0, .status = .ok, .made_ns = 0, .last_a = 0, .last_b = 0, .late = 0, .count = 2, .items = page.items[0 .. page.items.len - 1] }).records(&recs));
+    try std.testing.expectEqual(@as(?[]Page.Record, null), (Page{ .term = 0, .seq = 0, .kind = .stream, .asker = .pipeline, .key = "", .source = "", .from_a = 0, .from_b = 0, .status = .ok, .made_ns = 0, .ns = 0, .last_a = 0, .last_b = 0, .late = 0, .count = 2, .items = page.items[0 .. page.items.len - 1] }).records(&recs));
 }
 
 test "readTsPage: pages may end among points sharing a time, and together read each point once" {

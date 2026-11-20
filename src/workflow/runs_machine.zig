@@ -8,10 +8,11 @@
 //! - `workflow.idem`: the run each (workflow, idempotency key) started, so
 //!   a later start with that key is answered with it.
 //! - `workflow.per_def`, per workflow: its runs not yet ended (what a
-//!   schedule's `max_concurrent` counts) and the last schedule slot a start
-//!   fired. A trigger's cursor is its producer's, moved by each start
-//!   applied (`WorkflowHandler.followTrigger`): a redefinition onto another
-//!   stream reads that stream from the start.
+//!   schedule's `max_concurrent` counts), the last schedule slot a start
+//!   fired, and its trigger's place: the stream (namespace id, name, the
+//!   stamp that made it) and the last event a trigger's start applied from.
+//!   A place in another stream is replaced, so a redefinition onto another
+//!   stream, or a stream made again, reads that stream from its start.
 //! - `workflow.parents`: a child run's parent, from the parent's call
 //!   (`child_start`) until the child ends.
 //! - `step.calls`: each step's call of an action's run or a child's, kept
@@ -237,7 +238,17 @@ pub const PerDef = Record(&.{
     .{ .name = "active", .T = Int(u32) },
     // The latest schedule slot a start fired; 0 for none.
     .{ .name = "fired_ms", .T = Int(i64) },
+    // Its trigger's place: the stream a trigger's start last read (its
+    // namespace id, its made stamp and name; 0 and "" for none), and the
+    // latest event in it a start applied from.
+    .{ .name = "trig_ns", .T = Int(u32) },
+    .{ .name = "trig_made", .T = Int(u64) },
+    .{ .name = "trig_stream", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+    .{ .name = "trig_ts", .T = Int(u64) },
+    .{ .name = "trig_seq", .T = Int(u64) },
 });
+
+pub const PER_DEF_NONE: PerDef.Value = .{ .active = 0, .fired_ms = 0, .trig_ns = 0, .trig_made = 0, .trig_stream = "", .trig_ts = 0, .trig_seq = 0 };
 
 pub const ParentState = enum(u8) {
     /// Not started yet: this shard's leader starts it, or refuses it.
@@ -351,14 +362,18 @@ pub fn perDefOf(read: ReadView, def_key: []const u8) ?PerDef.Value {
 // ─── Entry values ────────────────────────────────────────────────────────────
 
 /// A `workflow_start` value:
-/// `[wf_len:u16][wf][ver_len:u16][ver][status:u8][evt_len:u16][evt][idem_len:u16][idem][input]`,
-/// little-endian lengths. The input is "{}" when none follows.
+/// `[wf_len:u16][wf][ver_len:u16][ver][status:u8][evt_len:u16][evt][idem_len:u16][idem]`
+/// `[has_trigger:u8]([ns:u32][made:u64][stream_len:u16][stream][ts:u64][seq:u64])?[input]`,
+/// little-endian. The input is "{}" when none follows.
 pub const Start = struct {
     workflow: []const u8,
     version: []const u8,
     status: RunStatus,
     event: []const u8,
     idem: ?[]const u8,
+    /// A trigger's start: the stream its poll read, and the event (a
+    /// batch's last) the run starts from.
+    trigger: ?TriggerAt = null,
     input: []const u8,
 
     pub fn parse(value: []const u8) ?Start {
@@ -368,6 +383,18 @@ pub const Start = struct {
         const status = std.enums.fromInt(RunStatus, (c.take(1) orelse return null)[0]) orelse return null;
         const event = c.take(c.int(u16) orelse return null) orelse return null;
         const idem = c.take(c.int(u16) orelse return null) orelse return null;
+        const has_trigger = (c.take(1) orelse return null)[0];
+        const trigger: ?TriggerAt = switch (has_trigger) {
+            0 => null,
+            1 => .{
+                .ns = c.int(u32) orelse return null,
+                .made = c.int(u64) orelse return null,
+                .stream = c.take(c.int(u16) orelse return null) orelse return null,
+                .ts = c.int(u64) orelse return null,
+                .seq = c.int(u64) orelse return null,
+            },
+            else => return null,
+        };
         const rest = value[c.off..];
         return .{
             .workflow = workflow,
@@ -375,14 +402,69 @@ pub const Start = struct {
             .status = status,
             .event = event,
             .idem = if (idem.len > 0) idem else null,
+            .trigger = trigger,
             .input = if (rest.len > 0) rest else "{}",
         };
+    }
+
+    /// The value into `buf`; null when it doesn't fit, or a length doesn't
+    /// fit its u16.
+    pub fn encode(s: Start, buf: []u8) ?[]const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        for ([_][]const u8{ s.workflow, s.version }) |p| {
+            if (p.len > std.math.maxInt(u16)) return null;
+            w.writeInt(u16, @intCast(p.len), .little) catch return null;
+            w.writeAll(p) catch return null;
+        }
+        w.writeByte(@backingInt(s.status)) catch return null;
+        for ([_][]const u8{ s.event, s.idem orelse "" }) |p| {
+            if (p.len > std.math.maxInt(u16)) return null;
+            w.writeInt(u16, @intCast(p.len), .little) catch return null;
+            w.writeAll(p) catch return null;
+        }
+        if (s.trigger) |t| {
+            if (t.stream.len > std.math.maxInt(u16)) return null;
+            w.writeByte(1) catch return null;
+            w.writeInt(u32, t.ns, .little) catch return null;
+            w.writeInt(u64, t.made, .little) catch return null;
+            w.writeInt(u16, @intCast(t.stream.len), .little) catch return null;
+            w.writeAll(t.stream) catch return null;
+            w.writeInt(u64, t.ts, .little) catch return null;
+            w.writeInt(u64, t.seq, .little) catch return null;
+        } else w.writeByte(0) catch return null;
+        w.writeAll(s.input) catch return null;
+        return w.buffered();
     }
 
     fn isChild(s: *const Start) bool {
         return std.mem.eql(u8, s.event, "child_started");
     }
 };
+
+/// Where a trigger's start read: the stream, and the event.
+pub const TriggerAt = struct {
+    ns: u32,
+    made: u64,
+    stream: []const u8,
+    ts: u64,
+    seq: u64,
+};
+
+/// Whether an idempotency key is the server's: a leading '_', as for
+/// signal types. A schedule's start keys its slot ("_schedule:..."), a
+/// trigger's its event ("_trigger:...").
+pub fn serverKey(key: []const u8) bool {
+    return key.len > 0 and key[0] == '_';
+}
+
+/// Whether a start of `event` may carry a server's key: a schedule's or a
+/// trigger's, which the server makes. Decided by the start's event, never
+/// by the key.
+fn carriesServerKeys(event: []const u8) bool {
+    return std.mem.eql(u8, event, "schedule_started") or std.mem.eql(u8, event, "trigger_started");
+}
+
+pub const SERVER_KEY_REFUSED = "reserved idempotency key: a leading '_' is the server's";
 
 /// A `workflow_complete` value:
 ///   [status:u8]
@@ -589,6 +671,11 @@ fn statusOf(r: Run.Value) RunStatus {
 fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64, out: *Result) ApplyError!void {
     const s = Start.parse(cmd.value) orelse return error.Halt;
     const arena = view.arena;
+    // Only a trigger's start says where it read, and every one does.
+    if ((s.trigger != null) != std.mem.eql(u8, s.event, "trigger_started")) return error.Halt;
+    // A server's key on a start the server didn't make: refused.
+    if (s.idem) |k| if (serverKey(k)) if (comptime plant.active != .runs_reserved_key_taken) if (!carriesServerKeys(s.event))
+        return out.refuse(.bad_request, .unclassified, SERVER_KEY_REFUSED);
 
     // Two starts with one idempotency key can both pass the handler's
     // check before either applies; the log's order decides. The later one
@@ -597,6 +684,13 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i6
     // its key and its own run id is the same start.
     const idem_key: ?[]const u8 = if (s.idem) |k| try idemKey(arena, n.ns, s.workflow, k) else null;
     if (comptime plant.active != .runs_idem_unchecked) if (idem_key) |k| if (try view.get(IdemFam, k)) |earlier| {
+        // A trigger's start read again: its event is still read.
+        if (s.trigger) |t| {
+            const def_key = try idKeyAlloc(arena, n.ns, s.workflow);
+            var per = if (try view.get(PerDefFam, def_key)) |p| p.v else PER_DEF_NONE;
+            notePlace(&per, t);
+            try view.put(PerDefFam, def_key, .{ .v = per });
+        }
         out.putInt(u8, 0);
         out.putBytes(earlier.v.run);
         return;
@@ -657,9 +751,10 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i6
     try view.put(RunFam, cmd.key, .{ .v = run });
     if (comptime plant.active != .runs_idem_unwritten) if (idem_key) |k| try view.put(IdemFam, k, .{ .v = .{ .run = n.run } });
 
-    var per = if (try view.get(PerDefFam, def_key)) |p| p.v else PerDef.Value{ .active = 0, .fired_ms = 0 };
+    var per = if (try view.get(PerDefFam, def_key)) |p| p.v else PER_DEF_NONE;
     if (!s.status.isTerminal()) per.active +|= 1;
     if (s.idem) |k| noteFired(&per, s.event, k);
+    if (s.trigger) |t| notePlace(&per, t);
     try view.put(PerDefFam, def_key, .{ .v = per });
 
     // A child's parent hears it started. Only the child's own start: one
@@ -684,10 +779,30 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i6
 /// back.
 fn noteFired(per: *PerDef.Value, event: []const u8, idem: []const u8) void {
     const any_fires = comptime plant.active == .runs_any_start_fires;
-    if ((!any_fires and !std.mem.eql(u8, event, "schedule_started")) or !std.mem.startsWith(u8, idem, "schedule:")) return;
+    if ((!any_fires and !std.mem.eql(u8, event, "schedule_started")) or !std.mem.startsWith(u8, idem, "_schedule:")) return;
     const colon = std.mem.lastIndexOfScalar(u8, idem, ':') orelse return;
     const slot = std.fmt.parseInt(i64, idem[colon + 1 ..], 10) catch return;
     per.fired_ms = if (comptime plant.active == .runs_fired_moves_back) slot else @max(per.fired_ms, slot);
+}
+
+/// A trigger's start moves its place: on in the stream it read, or to that
+/// stream when it is another. Made stamps rise in one stream's log, so a
+/// start read from an older making of the stream (applied after a newer
+/// one's) moves nothing.
+fn notePlace(per: *PerDef.Value, t: TriggerAt) void {
+    const same_stream = per.trig_ns == t.ns and std.mem.eql(u8, per.trig_stream, t.stream);
+    if (same_stream and comptime plant.active != .runs_trigger_made_unchecked) {
+        if (t.made < per.trig_made) return;
+        if (t.made == per.trig_made) {
+            const later = t.ts > per.trig_ts or (t.ts == per.trig_ts and t.seq > per.trig_seq);
+            if (later or comptime plant.active == .runs_trigger_place_moves_back) {
+                per.trig_ts = t.ts;
+                per.trig_seq = t.seq;
+            }
+            return;
+        }
+    }
+    per.* = .{ .active = per.active, .fired_ms = per.fired_ms, .trig_ns = t.ns, .trig_made = t.made, .trig_stream = t.stream, .trig_ts = t.ts, .trig_seq = t.seq };
 }
 
 /// A disabled child's start: no run, and its parent's call is refused,
@@ -1173,17 +1288,9 @@ const StepSpec = struct {
 };
 
 fn startValue(buf: []u8, wf: []const u8, event: []const u8, idem: []const u8) []const u8 {
-    var w: std.Io.Writer = .fixed(buf);
-    w.writeInt(u16, @intCast(wf.len), .little) catch unreachable;
-    w.writeAll(wf) catch unreachable;
-    w.writeInt(u16, 1, .little) catch unreachable;
-    w.writeAll("1") catch unreachable;
-    w.writeByte(@backingInt(RunStatus.running)) catch unreachable;
-    w.writeInt(u16, @intCast(event.len), .little) catch unreachable;
-    w.writeAll(event) catch unreachable;
-    w.writeInt(u16, @intCast(idem.len), .little) catch unreachable;
-    w.writeAll(idem) catch unreachable;
-    return w.buffered();
+    // A trigger's start says where it read.
+    const at: ?TriggerAt = if (std.mem.eql(u8, event, "trigger_started")) .{ .ns = NamespaceId.default.int(), .made = 1, .stream = "ev", .ts = 1, .seq = 0 } else null;
+    return (Start{ .workflow = wf, .version = "1", .status = .running, .event = event, .idem = if (idem.len > 0) idem else null, .trigger = at, .input = "" }).encode(buf).?;
 }
 
 /// A cancel's completion of a run of `wf`.
@@ -1348,10 +1455,10 @@ test "workflow runs machine: a disabled workflow refuses a client or schedule st
     try f.disable("wf");
     var r = try f.start("c", "wf", "workflow_started", "", 3);
     try testing.expectEqualStrings("workflow is disabled", r.refused().?.refusal.message);
-    r = try f.start("s", "wf", "schedule_started", "schedule:16:wf:4000", 3);
+    r = try f.start("s", "wf", "schedule_started", "_schedule:16:wf:4000", 3);
     try testing.expect(r.refused() != null);
     try testing.expect(f.active("wf") == null);
-    r = try f.start("t", "wf", "trigger_started", "trigger:ev@5:2", 3);
+    r = try f.start("t", "wf", "trigger_started", "_trigger:ev@5:2", 3);
     try testing.expect(r.refused() == null);
     try testing.expectEqual(@as(u32, 1), f.active("wf").?.active);
 
@@ -1380,14 +1487,121 @@ test "workflow runs machine: a disabled workflow refuses a client or schedule st
     try testing.expectEqualStrings("workflow is disabled", told.?.why.?);
 }
 
+/// A trigger's start of run `run_id` from where `at` says it read.
+fn triggerStart(f: *Fixture, run_id: []const u8, idem: []const u8, at: TriggerAt) !Result {
+    var kb: [64]u8 = undefined;
+    var vb: [512]u8 = undefined;
+    const value = (Start{ .workflow = "wf", .version = "1", .status = .running, .event = "trigger_started", .idem = if (idem.len > 0) idem else null, .trigger = at, .input = "" }).encode(&vb).?;
+    return f.command(.workflow_start, view_mod.idKey(&kb, .default, run_id) catch unreachable, value, 1);
+}
+
+fn placeOf(f: *Fixture) [5]u64 {
+    const p = f.active("wf").?;
+    return .{ p.trig_ns, p.trig_made, if (std.mem.eql(u8, p.trig_stream, "ev")) 1 else if (p.trig_stream.len == 0) 0 else 2, p.trig_ts, p.trig_seq };
+}
+
+test "workflow runs machine: a trigger's place goes on in its stream, never back, and a start read from an older making of it moves nothing" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try triggerStart(&f, "a", "", .{ .ns = 16, .made = 5, .stream = "ev", .ts = 10, .seq = 2 });
+    try testing.expectEqual([5]u64{ 16, 5, 1, 10, 2 }, placeOf(&f));
+    // An earlier event, its start applied later: the place stays.
+    _ = try triggerStart(&f, "b", "", .{ .ns = 16, .made = 5, .stream = "ev", .ts = 10, .seq = 1 });
+    try testing.expectEqual([5]u64{ 16, 5, 1, 10, 2 }, placeOf(&f));
+    _ = try triggerStart(&f, "c", "", .{ .ns = 16, .made = 5, .stream = "ev", .ts = 11, .seq = 0 });
+    try testing.expectEqual([5]u64{ 16, 5, 1, 11, 0 }, placeOf(&f));
+    // The stream made again: its events from its start.
+    _ = try triggerStart(&f, "d", "", .{ .ns = 16, .made = 9, .stream = "ev", .ts = 1, .seq = 0 });
+    try testing.expectEqual([5]u64{ 16, 9, 1, 1, 0 }, placeOf(&f));
+    // A start read from the making before: stale, nothing moves.
+    _ = try triggerStart(&f, "e", "", .{ .ns = 16, .made = 5, .stream = "ev", .ts = 50, .seq = 0 });
+    try testing.expectEqual([5]u64{ 16, 9, 1, 1, 0 }, placeOf(&f));
+    // Another stream, or one of its name in another namespace: a new place.
+    _ = try triggerStart(&f, "g", "", .{ .ns = 16, .made = 3, .stream = "other", .ts = 7, .seq = 0 });
+    try testing.expectEqual([5]u64{ 16, 3, 2, 7, 0 }, placeOf(&f));
+    _ = try triggerStart(&f, "h", "", .{ .ns = 17, .made = 1, .stream = "ev", .ts = 2, .seq = 0 });
+    try testing.expectEqual([5]u64{ 17, 1, 1, 2, 0 }, placeOf(&f));
+    // A start refused (its run exists) moves nothing.
+    const r = try triggerStart(&f, "h", "", .{ .ns = 17, .made = 1, .stream = "ev", .ts = 99, .seq = 0 });
+    try testing.expect(r.refused() != null);
+    try testing.expectEqual([5]u64{ 17, 1, 1, 2, 0 }, placeOf(&f));
+}
+
+test "workflow runs machine: a trigger's start read again, its run already started, still moves the place" {
+    var f = Fixture.init();
+    defer f.deinit();
+    const key = "_trigger:16:5:ev@10:2";
+    _ = try triggerStart(&f, "a", key, .{ .ns = 16, .made = 5, .stream = "ev", .ts = 3, .seq = 0 });
+    const again = try triggerStart(&f, "b", key, .{ .ns = 16, .made = 5, .stream = "ev", .ts = 10, .seq = 2 });
+    try testing.expect(again.refused() == null);
+    try testing.expectEqual(@as(?Run.Value, null), f.get("b"));
+    try testing.expectEqual([5]u64{ 16, 5, 1, 10, 2 }, placeOf(&f));
+    try testing.expectEqual(@as(u32, 1), f.active("wf").?.active);
+}
+
+test "workflow runs machine: a key with a leading '_' is the server's: refused on any start but a schedule's or a trigger's, by its event, and moves nothing" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try triggerStart(&f, "t", "_trigger:16:5:ev@10:2", .{ .ns = 16, .made = 5, .stream = "ev", .ts = 10, .seq = 2 });
+    _ = try f.start("s", "wf", "schedule_started", "_schedule:16:wf:4000", 1);
+    const before = f.active("wf").?;
+    for ([_][2][]const u8{
+        .{ "workflow_started", "_trigger:16:5:ev@99:0" },
+        .{ "workflow_started", "_trigger:16:5:ev@10:2" },
+        .{ "workflow_started", "_schedule:16:wf:9000" },
+        .{ "workflow_started", "_schedule:16:wf:4000" },
+        .{ "workflow_started", "_anything" },
+        .{ "child_started", "_schedule:16:wf:9000" },
+    }) |c| {
+        const r = try f.start("x", "wf", c[0], c[1], 2);
+        try testing.expectEqualStrings(SERVER_KEY_REFUSED, r.refused().?.refusal.message);
+        try testing.expectEqual(@as(?Run.Value, null), f.get("x"));
+    }
+    const after = f.active("wf").?;
+    try testing.expectEqual(before.fired_ms, after.fired_ms);
+    try testing.expectEqual(before.trig_ts, after.trig_ts);
+    try testing.expectEqual(before.active, after.active);
+    // The gate is the start's event: a schedule's start with a key of any
+    // shape applies.
+    try testing.expect((try f.start("y", "wf", "schedule_started", "_anything", 2)).refused() == null);
+}
+
+test "workflow runs machine: keys without a leading '_' are a client's or a child's as ever" {
+    var f = Fixture.init();
+    defer f.deinit();
+    for ([_][3][]const u8{
+        .{ "c", "workflow_started", "order-17" },
+        .{ "d", "workflow_started", "trigger:16:5:ev@10:2" },
+        .{ "e", "workflow_started", "schedule:16:wf:4000" },
+        .{ "k", "child_started", "kid-key" },
+    }) |c| {
+        try testing.expect((try f.start(c[0], "wf", c[1], c[2], 2)).refused() == null);
+        try testing.expect(f.get(c[0]) != null);
+    }
+    // Neither moves a schedule's slot or a trigger's place.
+    try testing.expectEqual(@as(i64, 0), f.active("wf").?.fired_ms);
+    try testing.expectEqual(@as(u64, 0), f.active("wf").?.trig_made);
+}
+
+test "workflow runs machine: a trigger's start that doesn't say where it read, or another start that does, halts" {
+    var f = Fixture.init();
+    defer f.deinit();
+    var kb: [64]u8 = undefined;
+    var vb: [256]u8 = undefined;
+    const bare = (Start{ .workflow = "wf", .version = "1", .status = .running, .event = "trigger_started", .idem = null, .input = "" }).encode(&vb).?;
+    try testing.expectError(error.Halt, f.command(.workflow_start, view_mod.idKey(&kb, .default, "a") catch unreachable, bare, 1));
+    const said = (Start{ .workflow = "wf", .version = "1", .status = .running, .event = "workflow_started", .idem = null, .trigger = .{ .ns = 16, .made = 1, .stream = "ev", .ts = 1, .seq = 0 }, .input = "" }).encode(&vb).?;
+    try testing.expectError(error.Halt, f.command(.workflow_start, view_mod.idKey(&kb, .default, "b") catch unreachable, said, 1));
+}
+
 test "workflow runs machine: a schedule's fired slot never moves back" {
     var f = Fixture.init();
     defer f.deinit();
-    _ = try f.start("a", "wf", "schedule_started", "schedule:16:wf:4000", 1);
-    _ = try f.start("b", "wf", "schedule_started", "schedule:16:wf:2000", 1);
+    _ = try f.start("a", "wf", "schedule_started", "_schedule:16:wf:4000", 1);
+    _ = try f.start("b", "wf", "schedule_started", "_schedule:16:wf:2000", 1);
     try testing.expectEqual(@as(i64, 4000), f.active("wf").?.fired_ms);
     // A client's start with a key of that shape fires nothing.
-    _ = try f.start("c", "wf", "workflow_started", "schedule:16:wf:9000", 1);
+    _ = try f.start("c", "wf", "workflow_started", "_schedule:16:wf:9000", 1);
     try testing.expectEqual(@as(i64, 4000), f.active("wf").?.fired_ms);
 }
 

@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 49;
+pub const CURRENT: u32 = 50;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -178,6 +178,10 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // A client's signal is logged (`workflow_signal`), kept in
     // `workflow.sig`, and wakes a run waiting on its type where it applies.
     .{ .format = 49, .segment_version = 33, .entries = 0x3c67c9e3c68aaa5f },
+    // A trigger's start says the stream it read and its event, and moves
+    // its workflow's place in `workflow.per_def`; reserved idempotency
+    // prefixes are refused for client starts.
+    .{ .format = 50, .segment_version = 34, .entries = 0x3c67c9e3c68aaa5f },
 };
 
 comptime {

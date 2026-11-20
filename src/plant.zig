@@ -56,6 +56,13 @@ pub const Plant = enum {
     runs_any_start_answers_parent,
     /// A step applies at any rev, not only its run's.
     runs_step_rev_unchecked,
+    /// A client's start may carry a key only a producer's start may.
+    runs_reserved_key_taken,
+    /// A trigger's start read from an older making of its stream moves its
+    /// place, like one from the stream made since.
+    runs_trigger_made_unchecked,
+    /// A trigger's start of an earlier event moves its place back.
+    runs_trigger_place_moves_back,
     /// A step takes its run's call's end before the call has ended.
     runs_settle_before_call_ends,
     /// A step leaves its run's call without taking its end.

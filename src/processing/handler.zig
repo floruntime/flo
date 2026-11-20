@@ -2114,7 +2114,9 @@ pub const ProcessingHandler = struct {
         switch (r.kind) {
             .stream => {
                 const sh = shard.stream_handler;
-                b.made_ns = sh.madeAt(shard.namespaceId(r.namespace), r.source) orelse return refusedPage(shard, r, b, .no_stream);
+                const ns = shard.namespaceId(r.namespace);
+                b.made_ns = sh.madeAt(ns, r.source) orelse return refusedPage(shard, r, b, .no_stream);
+                b.ns = ns.int();
                 try b.begin(shard.allocator, r);
                 const from: StreamID = .{ .timestamp_ms = r.from_a, .sequence = r.from_b };
                 // A read that stops before an append being read back from
