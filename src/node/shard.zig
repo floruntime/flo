@@ -31557,6 +31557,38 @@ test "Shard: a trigger moved to another stream while its first read is out takes
     try std.testing.expectEqual(t.trigger().stream_made_ns.?, t.place().trig_made);
 }
 
+test "Shard: a trigger's page answering its read, but naming another stream or namespace, is not taken" {
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    const a = &t.two.shards[0];
+    const alloc = std.testing.allocator;
+    const Case = struct { source: []const u8, ns: u32, runs: usize };
+    for ([_]Case{
+        .{ .source = "elsewhere", .ns = ns_table.Id.default.int(), .runs = 0 },
+        .{ .source = t.stream, .ns = 99, .runs = 0 },
+        // The page this read asked for: taken.
+        .{ .source = t.stream, .ns = ns_table.Id.default.int(), .runs = 1 },
+    }) |c| {
+        // A read of the trigger's stream is out, and a page comes with its
+        // number and term.
+        const trig = t.trigger();
+        trig.next_read_seq += 1;
+        trig.read_seq = trig.next_read_seq;
+        trig.read_term = a.raft_node.current_term;
+        trig.read_ns = .default;
+        var b: source_page_mod.Page.Builder = .{ .made_ns = 1, .ns = c.ns };
+        defer b.deinit(alloc);
+        try b.begin(alloc, .{ .term = trig.read_term, .seq = trig.read_seq, .kind = .stream, .asker = .trigger, .key = t.key, .namespace = "default", .source = c.source, .from_a = 0, .from_b = 0, .limit = 10 });
+        try b.record(alloc, 1, 0, "{}");
+        const bytes = try b.finish(alloc, 1, 0, 0);
+        defer alloc.free(bytes);
+        a.workflow_handler.takeTriggerPage(a, source_page_mod.Page.decode(bytes).?);
+        t.two.settle();
+        try std.testing.expectEqual(c.runs, t.runs());
+    }
+}
+
 test "Shard: a trigger whose stream is deleted and made again reads the new one from its start" {
     var t: TriggerPair = .{};
     try t.init();
