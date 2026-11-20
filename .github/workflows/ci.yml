@@ -337,6 +337,24 @@ jobs:
           echo "running $mode"
           scripts/vopr-seed-undos.sh "$mode"
         timeout-minutes: 25
+  vopr-workflows:
+    # Its own job, beside the others: workflow runs and definitions entries
+    # made from the leader's own state, each checked against the families'
+    # ledgers. It fails if any race the workload aims at (a step a wake
+    # moved past, a stale wait, a signal at its run's bound, ...) was never
+    # reached by a seed.
+    name: vopr swarm with workflow entries (20 seeds, ReleaseSafe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Build the simulator (ReleaseSafe)
+        run: zig build vopr-build --release=safe
+      - name: Swarm with workflow entries
+        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --workflows --seed-timeout=120 --out-dir=/tmp/vopr-workflows
+        timeout-minutes: 20
   # The simulator runs ReleaseSafe (-Drelease selects it) so any UB in the
   # unit under test traps instead of silently corrupting a run. Seeds 1-20
   # are the known-green set; the wider swarm finds real bugs and is run

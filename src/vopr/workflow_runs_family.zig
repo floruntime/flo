@@ -101,6 +101,11 @@ const SIGNAL = "sig";
 /// Signal types: a run waits on one of these, and is sent them.
 const SIG_TYPES = [_][]const u8{ SIGNAL, "go", "stop" };
 const SIG_PAYLOADS = [_][]const u8{ "", "p1" };
+/// A run holds at most this many signals no wait took.
+const SIGNAL_BOUND = 64;
+comptime {
+    if (rm.MAX_SIGNALS != SIGNAL_BOUND) @compileError("the runs machine's signal bound is not the specification's 64");
+}
 const WAIT_ONS = CALLEES ++ SIG_TYPES;
 const PROGRESS = [_][]const u8{ "", "{\"n\":1}" };
 /// Past what a step's counters may hold: refused.
@@ -180,7 +185,7 @@ pub const WorkflowRuns = struct {
         progress: []const u8 = "",
         /// Signals it holds that no wait took, earliest first, and the
         /// seq the next one is given.
-        held: [rm.MAX_SIGNALS]SigL = undefined,
+        held: [SIGNAL_BOUND]SigL = undefined,
         held_n: usize = 0,
         sig_next: u64 = 0,
         /// Its rev after a signal woke it, while no step has moved it since.
@@ -261,8 +266,10 @@ pub const WorkflowRuns = struct {
         kind: Kind,
         refused: bool,
         broke: ?[]const u8 = null,
-        class: ?Class = null,
+        classes: Classes = .empty,
     };
+
+    pub const Classes = std.EnumSet(Class);
 
     pub const Counts = struct {
         applied: [std.enums.values(Kind).len]u64 = @splat(0),
@@ -272,7 +279,8 @@ pub const WorkflowRuns = struct {
         pub fn count(self: *Counts, o: Effect) void {
             const k = @backingInt(o.kind);
             if (o.refused) self.refused[k] += 1 else self.applied[k] += 1;
-            if (o.class) |c| self.classes[@backingInt(c)] += 1;
+            var it = o.classes.iterator();
+            while (it.next()) |c| self.classes[@backingInt(c)] += 1;
         }
 
         pub fn add(self: *Counts, o: Counts) void {
@@ -329,7 +337,7 @@ pub const WorkflowRuns = struct {
     };
     /// What an entry does: its sends, or refused, with why the ledger
     /// refuses it, which a failure names.
-    const Want = struct { refused: ?[]const u8 = null, sends: [2]?Send = @splat(null), class: ?Class = null };
+    const Want = struct { refused: ?[]const u8 = null, sends: [2]?Send = @splat(null), classes: Classes = .empty };
 
     fn refuse(comptime kind: Kind, comptime why: []const u8) Want {
         return .{ .refused = "the runs machine applied a " ++ @tagName(kind) ++ " the ledger refuses: " ++ why };
@@ -337,7 +345,7 @@ pub const WorkflowRuns = struct {
 
     fn refuseAs(comptime kind: Kind, comptime why: []const u8, class: Class) Want {
         var w = refuse(kind, why);
-        w.class = class;
+        w.classes.insert(class);
         return w;
     }
 
@@ -377,7 +385,7 @@ pub const WorkflowRuns = struct {
         run.wait = .{};
         run.progress = "";
         // Its signals go with it.
-        if (run.held_n > 0) want.class = .ended_holding;
+        if (run.held_n > 0) want.classes.insert(.ended_holding);
         run.held_n = 0;
         run.woken_rev = null;
         if (l.per_def[run.wf]) |*per| per.active -|= 1;
@@ -438,7 +446,7 @@ pub const WorkflowRuns = struct {
                         }
                         // The signals its waits took: each the earliest held
                         // of its type that this step hasn't named already.
-                        var picked: [rm.MAX_SIGNALS]usize = undefined;
+                        var picked: [SIGNAL_BOUND]usize = undefined;
                         var np: usize = 0;
                         var repeats = false;
                         var takes = st.takes.iterator();
@@ -480,7 +488,7 @@ pub const WorkflowRuns = struct {
                                 kept += 1;
                             }
                             run.held_n = kept;
-                            if (repeats) want.class = .takes_repeat;
+                            if (repeats) want.classes.insert(.takes_repeat);
                         }
                         if (settled) |c| l.calls[so][c] = null;
                         var sends: usize = 0;
@@ -605,7 +613,7 @@ pub const WorkflowRuns = struct {
                         const pl = indexOf(&SIG_PAYLOADS, sg.payload) orelse return null;
                         var run = l.runs[r] orelse return refuseAs(.signal, "its run isn't there", .signal_to_unknown);
                         if (run.status.isTerminal()) return refuseAs(.signal, "its run has ended", .signal_to_ended);
-                        if (run.held_n >= rm.MAX_SIGNALS) return refuseAs(.signal, "its run holds as many signals as it may", .signal_full);
+                        if (run.held_n >= SIGNAL_BOUND) return refuseAs(.signal, "its run holds as many signals as it may", .signal_full);
                         run.held[run.held_n] = .{ .type = ty, .payload = pl, .seq = run.sig_next, .at_ms = stamp_ms };
                         run.held_n += 1;
                         run.sig_next += 1;
@@ -756,7 +764,7 @@ pub const WorkflowRuns = struct {
         var out: persistence.Result = .{};
         out.reset(e);
         try machine_mod.applyEntry(&rm.machine, store, &self.scratch, e, &out);
-        var effect: Effect = .{ .kind = kind, .refused = out.refused() != null, .class = want.class };
+        var effect: Effect = .{ .kind = kind, .refused = out.refused() != null, .classes = want.classes };
         if (effect.refused) {
             for (FAMILIES, before[0..FAMILIES.len]) |fam, b| if (b != store.families[fam].commits) return error.RefusalChangedState;
             if (before[FAMILIES.len] != store.families[channels.OutFam.ID].commits) return error.RefusalChangedState;
@@ -1074,12 +1082,14 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
     var kb: [16]u8 = undefined;
     const roll = r.uintLessThan(u8, 100);
     // The live run holding the most signals: pressed on until it holds as
-    // many as it may, and mostly spared ending and taking meanwhile.
+    // many as it may, and mostly spared ending and taking meanwhile; once
+    // full, it is a run like any other.
     var most: ?usize = null;
     for (live.ids[0..live.n]) |i| {
         if (most == null or l.runs[i].?.held_n > l.runs[most.?].?.held_n) most = i;
     }
-    const hoard: ?usize = if (most) |m| if (l.runs[m].?.held_n >= 8) m else null else null;
+    const most_held: usize = if (most) |m| l.runs[m].?.held_n else 0;
+    const hoard: ?usize = if (most_held >= 8 and most_held < SIGNAL_BOUND) most else null;
     if (roll < 12) {
         const run = free.or_(r, 50, any);
         const p = ae.ChildStart.encodeInto(buf, .{
@@ -1108,10 +1118,13 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
         for (live.ids[0..live.n]) |i| {
             if (longest == null or l.runs[i].?.hist_next > l.runs[longest.?].?.hist_next) longest = i;
         }
-        // Now and then a run waiting on a signal: a signal may wake it
-        // before this step applies.
+        // Now and then a run waiting on a signal, or one a signal just woke:
+        // a step decided from the wait may meet the moved rev.
         var waiting: Pick = .{};
-        for (live.ids[0..live.n]) |i| if (l.runs[i].?.wait.wait == .signal) waiting.add(i);
+        for (live.ids[0..live.n]) |i| {
+            const run = l.runs[i].?;
+            if (run.wait.wait == .signal or run.woken_rev == run.rev) waiting.add(i);
+        }
         const pick = r.uintLessThan(u8, 100);
         const c = if (longest != null and pick < 25) longest.? else if (pick < 45) waiting.or_(r, 100, live.or_(r, 80, held.at(r))) else live.or_(r, 80, unstepped.or_(r, 30, held.at(r)));
         const vb = buf[buf.len / 2 ..];
@@ -1124,11 +1137,12 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
     // A signal: a quarter of them, or most once it holds many, to the live
     // run holding the most, so its bound is reached; the rest mostly to a
     // live run, now and then to an ended or an unknown one.
-    if (roll < 64) {
+    if (roll < 60) {
         // Once it holds many, mostly to it: runs end and steps take
-        // signals, so the bound is reached only by pressing on one.
+        // signals, so the bound is reached only by pressing on one. A full
+        // one gets a few more, refused.
         const k = r.uintLessThan(u8, 100);
-        const press: u8 = if (hoard != null) 85 else 25;
+        const press: u8 = if (hoard != null) 85 else if (most_held >= SIGNAL_BOUND) 8 else 25;
         const c = if (most != null and k < press) most.? else if (k < 85) live.or_(r, 90, held.or_(r, 50, any)) else held.or_(r, 50, any);
         // To a run waiting on a signal, mostly its type: it wakes, and a
         // step decided from the wait meets the moved rev.
@@ -1141,7 +1155,7 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
         return command(buf, .workflow_signal, view_mod.idKey(&kb, NS, RUNS[c]) catch unreachable, value);
     }
     // A completion names a run the leader holds, and its workflow.
-    if (roll < 76 and held.n > 0) {
+    if (roll < 68 and held.n > 0) {
         var c = live.or_(r, 75, held.at(r));
         if (hoard == c and r.uintLessThan(u8, 100) < 95) c = held.at(r);
         const vb = buf[buf.len / 2 ..];
@@ -1322,7 +1336,7 @@ fn stepValue(r: std.Random, buf: []u8, c: usize, run: WorkflowRuns.RunL, spare: 
     }
     // Signals its waits took: mostly ones it holds, now and then one more
     // than it holds of a type, or one it holds none of.
-    var tb: [rm.MAX_SIGNALS * 8]u8 = undefined;
+    var tb: [SIGNAL_BOUND * 8]u8 = undefined;
     var tw: schema.Writer = .{ .buf = &tb };
     var takes: u32 = 0;
     if (!spare and r.uintLessThan(u8, 100) < 35) {
