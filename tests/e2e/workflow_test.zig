@@ -4170,6 +4170,55 @@ test "e2e/workflow/cluster: a schedule's slot that fired doesn't fire again on t
     try testing.expectEqual(@as(usize, 1), try slottedRunsOn(&cluster, next));
 }
 
+fn runsOfOn(c: *stdx.testing.ClusterContext, node: usize, name: []const u8) !usize {
+    const out = try c.execCaptureOn(node, &.{ "workflow", "list-runs", "-w", name, "--limit", "1000" });
+    defer c.allocator.free(out);
+    return std.mem.count(u8, out, name) -| 1;
+}
+
+test "e2e/workflow/cluster: a stream trigger moved to a new leader mid-stream starts one run for each event" {
+    var cluster = try stdx.testing.ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+    errdefer cluster.printLogs();
+    const first = try clusterLeader(&cluster, null);
+    const def =
+        \\kind: Workflow
+        \\name: fo-trig
+        \\version: 1.0.0
+        \\trigger.stream: fo-events
+        \\start.wait_for_signal.type: never
+        \\start.transitions.success: flo.Completed
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, def, "fo-trig.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try cluster.execOn(first, &.{ "workflow", "create", "-f", path });
+
+    // Three events taken on the first leader, their runs on every node.
+    for ([_][]const u8{ "{\"n\":1}", "{\"n\":2}", "{\"n\":3}" }) |ev| try cluster.execOn(first, &.{ "stream", "append", "fo-events", ev });
+    for (0..100) |_| {
+        var all = true;
+        for (0..cluster.node_count) |i| {
+            if (try runsOfOn(&cluster, i, "fo-trig") != 3) all = false;
+        }
+        if (all) break;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    for (0..cluster.node_count) |i| try testing.expectEqual(@as(usize, 3), try runsOfOn(&cluster, i, "fo-trig"));
+
+    // The next leader builds the trigger from what applied: it takes only
+    // the events after them.
+    cluster.killNode(first);
+    const next = try clusterLeader(&cluster, first);
+    for ([_][]const u8{ "{\"n\":4}", "{\"n\":5}", "{\"n\":6}" }) |ev| try cluster.execOn(next, &.{ "stream", "append", "fo-events", ev });
+    for (0..100) |_| {
+        if (try runsOfOn(&cluster, next, "fo-trig") >= 6) break;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    // Settled: not three more for the first three events taken again.
+    stdx.time.sleep(1500 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 6), try runsOfOn(&cluster, next, "fo-trig"));
+}
+
 test "e2e/workflow: a cron schedule fires on the minute, from the first minute after it's created" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
@@ -4307,4 +4356,71 @@ test "e2e/workflow: a channel carries a step's call to an action on another shar
     try ctx.restartServer();
     const id = try takeTask(ctx, action, "15000");
     defer testing.allocator.free(id);
+}
+
+test "e2e/workflow/cluster: a node that missed a schedule and a timer run while down leads again later, and both go on there" {
+    var cluster = try stdx.testing.ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+    errdefer cluster.printLogs();
+    const first = try clusterLeader(&cluster, null);
+    cluster.killNode(first);
+    var leader = try clusterLeader(&cluster, first);
+
+    // Logged while `first` is down: a schedule, and a run whose wait
+    // times out well after `first` leads again.
+    const sched = try writeDottedToTempYaml(testing.allocator,
+        \\kind: Workflow
+        \\name: back-sched
+        \\version: 1.0.0
+        \\schedule.interval: 1000
+        \\schedule.max_concurrent: 1000
+        \\start.wait_for_signal.type: never
+        \\start.transitions.success: flo.Completed
+    , "back-sched.yaml");
+    defer cleanupTempFile(testing.allocator, sched);
+    const timed = try writeDottedToTempYaml(testing.allocator,
+        \\kind: Workflow
+        \\name: back-timed
+        \\version: 1.0.0
+        \\start.wait_for_signal.type: go
+        \\start.wait_for_signal.timeout_ms: 60000
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.timeout: flo.Completed
+    , "back-timed.yaml");
+    defer cleanupTempFile(testing.allocator, timed);
+    try cluster.execOn(leader, &.{ "workflow", "create", "-f", sched });
+    try cluster.execOn(leader, &.{ "workflow", "create", "-f", timed });
+    try cluster.execOn(leader, &.{ "workflow", "start", "back-timed", "{}", "--run-id", "back-tw" });
+
+    // `first` comes back as a follower and catches up on what it missed.
+    try cluster.restartNode(first);
+    for (0..100) |_| {
+        if (try runsOfOn(&cluster, first, "back-timed") == 1) break;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(usize, 1), try runsOfOn(&cluster, first, "back-timed"));
+
+    // Leadership moves to `first`: each other leader in turn is stopped
+    // and brought back, until `first` wins an election.
+    var tries: usize = 0;
+    while (leader != first) : (tries += 1) {
+        if (tries == 8) return error.LeadershipNeverMoved;
+        cluster.killNode(leader);
+        const was = leader;
+        leader = try clusterLeader(&cluster, was);
+        try cluster.restartNode(was);
+    }
+
+    // Still waiting when `first` takes over: the timer is its to fire.
+    const before = try cluster.execCaptureOn(first, &.{ "workflow", "status", "back-tw" });
+    defer testing.allocator.free(before);
+    try testing.expect(std.mem.indexOf(u8, before, "Status:   waiting") != null);
+    // The schedule fires there: new slots past the ones already started.
+    const slots = try runsOfOn(&cluster, first, "back-sched");
+    stdx.time.sleep(3000 * std.time.ns_per_ms);
+    try testing.expect(try runsOfOn(&cluster, first, "back-sched") > slots);
+    // And the timed run ends on its timeout, there.
+    const after = try cluster.pollUntilContains(first, &.{ "workflow", "status", "back-tw" }, "Status:   timed_out", 250, 400);
+    testing.allocator.free(after);
+    try testing.expectEqual(first, try clusterLeader(&cluster, null));
 }
