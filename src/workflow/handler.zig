@@ -128,9 +128,9 @@ pub const WorkflowHandler = struct {
     allocator: Allocator,
 
     /// Runs not ended that wait on nothing (`workflow.run`'s wait), by key,
-    /// owned: an index of applied state, kept as each run entry applies on
-    /// every replica (`entryApplied`), so whichever node leads steps them.
-    /// They go in this map's order, not their starts'.
+    /// owned: a leader's index of applied state (`leadCaches`), kept as
+    /// each run entry applies on it (`entryApplied`). They go in this map's
+    /// order, not their starts'.
     to_step: std.StringHashMapUnmanaged(void) = .empty,
     /// Where the last pass over `to_step` stopped, so a burst of starts is
     /// walked once rather than from the top each pass.
@@ -160,7 +160,8 @@ pub const WorkflowHandler = struct {
     /// owned. An entry is checked against the run's wait as applied when it
     /// comes due, so one the run moved past is dropped then.
     timers: std.PriorityQueue(Timer, void, timerCompare) = .empty,
-    /// An index couldn't keep an entry: all are rebuilt from the log.
+    /// An index couldn't keep an entry: the runs are walked again
+    /// (`leadCaches`).
     rewatch: bool = false,
     /// The cancel this leader proposed last for a run, by key, owned: its
     /// end is counted when that entry applies. Leader memory.
@@ -188,8 +189,26 @@ pub const WorkflowHandler = struct {
     /// What a definition applied here directly (`replayEntry`) stages in.
     def_scratch: std.heap.ArenaAllocator,
     /// The create index each definition's schedule and trigger were last
-    /// built from (`syncProducers`), by definition key. Node memory.
+    /// built from (`syncProducers`), by definition key. A leader's cache.
     producers_built: std.StringHashMapUnmanaged(u64) = .empty,
+    /// The term this node built its leader caches in (`leadCaches`); 0
+    /// while it holds none.
+    caches_term: u64 = 0,
+    /// The store walk that builds the caches, a chunk a tick
+    /// (`stepWalk`): the definitions, then the runs.
+    walk: Walk = .idle,
+    /// The key the walk goes on after; empty for the first chunk.
+    walk_after: std.ArrayListUnmanaged(u8) = .empty,
+    /// Whether the runs are walked after the definitions: not when only
+    /// the definitions are read again (`producers_lost`).
+    walk_runs_next: bool = false,
+    /// The term's first walk finished. Until then the leader steps no run
+    /// and fires no trigger or schedule: what it hasn't read yet it would
+    /// pass over, or fire again.
+    caches_built: bool = false,
+    /// A definition's trigger or schedule couldn't be built (out of
+    /// memory): the definitions are walked again.
+    producers_lost: bool = false,
 
     /// The runs this node has stepped while leading, by key (namespace id ‖
     /// run id): a working copy built from `workflow.run` when it takes one
@@ -504,6 +523,7 @@ pub const WorkflowHandler = struct {
         self.child_scan_after.deinit(self.allocator);
         self.own_store.deinit();
         self.def_scratch.deinit();
+        self.walk_after.deinit(self.allocator);
         var pk = self.producers_built.keyIterator();
         while (pk.next()) |k| self.allocator.free(k.*);
         self.producers_built.deinit(self.allocator);
@@ -1021,7 +1041,7 @@ pub const WorkflowHandler = struct {
     }
 
     pub fn hasDutyWork(self: *const WorkflowHandler) bool {
-        return self.to_step.count() > 0 or self.parked.count() > 0 or self.timers.count() > 0 or self.rewatch;
+        return self.to_step.count() > 0 or self.parked.count() > 0 or self.timers.count() > 0 or self.rewatch or self.walk != .idle;
     }
 
     /// Most step_started entries one pass proposes, and most runs it looks
@@ -1034,7 +1054,6 @@ pub const WorkflowHandler = struct {
     /// proposes.
     pub fn advanceStartedRuns(self: *WorkflowHandler, shard: *Shard) void {
         if (shard.raft_node.role != .leader) return;
-        if (self.rewatch) self.rewatchRuns();
         if (self.to_step.count() == 0) return;
         var keys: [STEPS_PER_PASS][]const u8 = undefined;
         var n: usize = 0;
@@ -1068,16 +1087,137 @@ pub const WorkflowHandler = struct {
     }
 
     /// This node stopped leading: what it proposed and is yet to apply is
-    /// decided again by whichever node leads, from what applied.
+    /// decided again by whichever node leads, from what applied, and its
+    /// caches go (`clearCaches`): it builds them again when it next leads.
     pub fn dropStartedRuns(self: *WorkflowHandler, shard: *Shard) void {
         _ = shard;
         self.clearStepping();
-        // Looked at again when this node next leads.
-        var pit = self.parked.keyIterator();
-        while (pit.next()) |k| self.indexKey(&self.call_dirty, k.*);
         var it = self.ending.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.ending.clearRetainingCapacity();
+        self.clearCaches();
+    }
+
+    /// A leader's caches of applied state: the runs it steps (`to_step`,
+    /// `parked`, `call_dirty`, `call_timer`, `timers`) and the definitions'
+    /// schedules and stream triggers. Built from the store once this node
+    /// leads in `term`, and kept from then on by `entryApplied` as each
+    /// entry applies on it. A follower keeps none, and nothing a leader
+    /// held outlives its term: every term starts from the store. Called
+    /// every tick the node leads: the store is walked a chunk a tick
+    /// (`stepWalk`), so a large one doesn't hold up the Raft tick and the
+    /// leader's heartbeats with it. An entry that applies mid-walk is seen
+    /// by `entryApplied` against the store as it then is; the walk reaching
+    /// its key later reads the same, so either order builds the same.
+    pub fn leadCaches(self: *WorkflowHandler, term: u64) void {
+        if (self.caches_term != term) {
+            self.clearCaches();
+            self.caches_term = term;
+            self.startWalk(.defs, true);
+        }
+        if (self.walk == .idle) {
+            if (self.producers_lost) self.startWalk(.defs, false) else if (self.rewatch) self.startWalk(.runs, false);
+        }
+        self.stepWalk();
+    }
+
+    const Walk = enum { idle, defs, runs };
+    /// Most definitions a tick's walk reads: each is parsed.
+    const DEFS_PER_TICK: usize = 64;
+    /// Most runs a tick's walk reads.
+    const RUNS_PER_TICK: usize = 1024;
+
+    fn startWalk(self: *WorkflowHandler, w: Walk, runs_next: bool) void {
+        self.walk = w;
+        self.walk_runs_next = runs_next;
+        self.walk_after.clearRetainingCapacity();
+        switch (w) {
+            .idle => {},
+            .defs => self.producers_lost = false,
+            .runs => {
+                self.rewatch = false;
+                // A call's timer that couldn't be armed may be one of these.
+                var ct = self.call_timer.keyIterator();
+                while (ct.next()) |k| self.allocator.free(k.*);
+                self.call_timer.clearRetainingCapacity();
+            },
+        }
+    }
+
+    fn stepWalk(self: *WorkflowHandler) void {
+        switch (self.walk) {
+            .idle => {},
+            .defs => if (self.walkChunk(defs_machine.DefFam, DEFS_PER_TICK)) {
+                if (!self.walk_runs_next) return self.endWalk();
+                // The runs' first chunk in the same tick: a small store is
+                // built in one.
+                self.startWalk(.runs, false);
+                self.stepWalk();
+            },
+            .runs => if (self.walkChunk(runs_machine.RunFam, RUNS_PER_TICK)) self.endWalk(),
+        }
+    }
+
+    fn endWalk(self: *WorkflowHandler) void {
+        self.walk = .idle;
+        self.walk_after.clearRetainingCapacity();
+        self.caches_built = true;
+    }
+
+    /// Up to `max` more of family `F`'s keys into the caches; whether the
+    /// walk reached the end. One that can't be read is logged and passed
+    /// over, so the rest are still built.
+    fn walkChunk(self: *WorkflowHandler, comptime F: type, max: usize) bool {
+        const read = self.defsRead();
+        var it = if (self.walk_after.items.len == 0) read.range(F, "") else read.rangeAfter(F, "", self.walk_after.items);
+        var n: usize = 0;
+        while (true) {
+            const item = (it.next() catch {
+                log.err("a stored workflow {s} could not be read; this leader goes on without it", .{if (F == defs_machine.DefFam) "definition" else "run"});
+                continue;
+            }) orelse return true;
+            if (F == defs_machine.DefFam) self.syncProducers(item.key) else self.runApplied(.workflow_step, item.key);
+            n += 1;
+            if (n < max) continue;
+            self.walk_after.clearRetainingCapacity();
+            // Out of memory: this walk starts again from its first key.
+            self.walk_after.appendSlice(self.allocator, item.key) catch self.walk_after.clearRetainingCapacity();
+            return false;
+        }
+    }
+
+    /// Every leader cache gone (`leadCaches`).
+    fn clearCaches(self: *WorkflowHandler) void {
+        self.caches_term = 0;
+        self.walk = .idle;
+        self.walk_after.clearRetainingCapacity();
+        self.caches_built = false;
+        self.producers_lost = false;
+        inline for (.{ &self.parked, &self.call_dirty, &self.call_timer, &self.to_step }) |map| {
+            var k = map.keyIterator();
+            while (k.next()) |key| self.allocator.free(key.*);
+            map.clearRetainingCapacity();
+        }
+        self.to_step_cursor = 0;
+        self.call_dirty_cursor = 0;
+        while (self.timers.pop()) |t| self.allocator.free(t.ns_key);
+        self.rewatch = false;
+        var tit = self.stream_triggers.iterator();
+        while (tit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.freeTriggerState(entry.value_ptr);
+            _ = global_stream_trigger_count.fetchSub(1, .monotonic);
+        }
+        self.stream_triggers.clearRetainingCapacity();
+        var sit = self.schedules.iterator();
+        while (sit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.freeScheduleState(entry.value_ptr);
+        }
+        self.schedules.clearRetainingCapacity();
+        var pk = self.producers_built.keyIterator();
+        while (pk.next()) |k| self.allocator.free(k.*);
+        self.producers_built.clearRetainingCapacity();
     }
 
     fn clearStepping(self: *WorkflowHandler) void {
@@ -2400,7 +2540,6 @@ pub const WorkflowHandler = struct {
         self.sweepCalls(shard, now_ms);
         self.startChildren(shard);
         if (shard.raft_node.role != .leader) return;
-        if (self.rewatch) self.rewatchRuns();
 
         // What's due and can't be taken this pass stays for the next.
         var due_keys: [64][]const u8 = undefined;
@@ -3261,6 +3400,11 @@ pub const WorkflowHandler = struct {
         return global_stream_trigger_count.load(.monotonic) > 0;
     }
 
+    /// How many stream triggers the node's leaders hold. For tests.
+    pub fn streamTriggerCount() u32 {
+        return global_stream_trigger_count.load(.monotonic);
+    }
+
     /// Register a stream trigger for a workflow definition.
     /// Called from handleCreate when the parsed definition has a `trigger:` block.
     fn registerStreamTrigger(
@@ -3268,8 +3412,8 @@ pub const WorkflowHandler = struct {
         ns: NamespaceId,
         workflow_name: []const u8,
         trigger: definition.StreamTriggerDef,
-    ) void {
-        const trigger_key = self.nsKey(ns, workflow_name) orelse return;
+    ) error{OutOfMemory}!void {
+        const trigger_key = self.nsKey(ns, workflow_name) orelse return error.OutOfMemory;
 
         // The place in the stream is logged (`workflow.per_def`), so a
         // re-created definition keeps it, and one moved to another stream
@@ -3295,18 +3439,18 @@ pub const WorkflowHandler = struct {
 
         const owned_wf = self.allocator.dupe(u8, workflow_name) catch {
             self.allocator.free(trigger_key);
-            return;
+            return error.OutOfMemory;
         };
         const owned_stream = self.allocator.dupe(u8, trigger.stream) catch {
             self.allocator.free(trigger_key);
             self.allocator.free(owned_wf);
-            return;
+            return error.OutOfMemory;
         };
         const owned_stream_ns: ?[]const u8 = if (stream_ns) |n| self.allocator.dupe(u8, n) catch {
             self.allocator.free(trigger_key);
             self.allocator.free(owned_wf);
             self.allocator.free(owned_stream);
-            return;
+            return error.OutOfMemory;
         } else null;
 
         self.stream_triggers.put(trigger_key, .{
@@ -3325,7 +3469,7 @@ pub const WorkflowHandler = struct {
             self.allocator.free(owned_wf);
             self.allocator.free(owned_stream);
             if (owned_stream_ns) |n| self.allocator.free(n);
-            return;
+            return error.OutOfMemory;
         };
         _ = global_stream_trigger_count.fetchAdd(1, .monotonic);
     }
@@ -3346,8 +3490,8 @@ pub const WorkflowHandler = struct {
     }
 
     /// Remove the stream trigger for a workflow definition.
-    fn unregisterStreamTrigger(self: *WorkflowHandler, ns: NamespaceId, workflow_name: []const u8) void {
-        const trigger_key = self.nsKey(ns, workflow_name) orelse return;
+    fn unregisterStreamTrigger(self: *WorkflowHandler, ns: NamespaceId, workflow_name: []const u8) error{OutOfMemory}!void {
+        const trigger_key = self.nsKey(ns, workflow_name) orelse return error.OutOfMemory;
         defer self.allocator.free(trigger_key);
 
         if (self.stream_triggers.fetchRemove(trigger_key)) |old| {
@@ -3366,7 +3510,7 @@ pub const WorkflowHandler = struct {
         workflow_name: []const u8,
         schedule: definition.ScheduleDef,
         anchor_ms: i64,
-    ) void {
+    ) error{OutOfMemory}!void {
         if (schedule.paused) return;
         // The validator lets through exactly one of a valid cron or an
         // interval; a stored definition holds the same.
@@ -3377,7 +3521,7 @@ pub const WorkflowHandler = struct {
         } else schedule.interval_ms orelse return;
         if (parsed == null and interval_ms <= 0) return;
 
-        const sched_key = self.nsKey(ns, workflow_name) orelse return;
+        const sched_key = self.nsKey(ns, workflow_name) orelse return error.OutOfMemory;
 
         // A redefinition replaces the schedule; the slots it fired stay
         // fired.
@@ -3391,12 +3535,13 @@ pub const WorkflowHandler = struct {
 
         const owned_wf = self.allocator.dupe(u8, workflow_name) catch {
             self.allocator.free(sched_key);
-            return;
+            return error.OutOfMemory;
         };
-        const owned_input: ?[]const u8 = if (schedule.input) |inp|
-            self.allocator.dupe(u8, inp) catch null
-        else
-            null;
+        const owned_input: ?[]const u8 = if (schedule.input) |inp| self.allocator.dupe(u8, inp) catch {
+            self.allocator.free(sched_key);
+            self.allocator.free(owned_wf);
+            return error.OutOfMemory;
+        } else null;
 
         self.schedules.put(sched_key, .{
             .workflow_name_owned = owned_wf,
@@ -3411,11 +3556,12 @@ pub const WorkflowHandler = struct {
             self.allocator.free(sched_key);
             self.allocator.free(owned_wf);
             if (owned_input) |inp| self.allocator.free(inp);
+            return error.OutOfMemory;
         };
     }
 
-    fn unregisterSchedule(self: *WorkflowHandler, ns: NamespaceId, workflow_name: []const u8) void {
-        const sched_key = self.nsKey(ns, workflow_name) orelse return;
+    fn unregisterSchedule(self: *WorkflowHandler, ns: NamespaceId, workflow_name: []const u8) error{OutOfMemory}!void {
+        const sched_key = self.nsKey(ns, workflow_name) orelse return error.OutOfMemory;
         defer self.allocator.free(sched_key);
 
         if (self.schedules.fetchRemove(sched_key)) |old| {
@@ -4086,11 +4232,11 @@ pub const WorkflowHandler = struct {
         return self.applyDirect(.workflow_complete, 0, ns_key, value, stamp_ms, out);
     }
 
-    /// After a workflow entry applied, on every replica, live and at boot
-    /// replay alike (`PartitionReplay`). A definition's schedule and trigger
-    /// follow its record, in log order. A run's entry keeps `to_step`, the
-    /// producers' fired slot and cursor, and this node's working copy of the
-    /// run, if it holds one, as `workflow.run` now says.
+    /// After a workflow entry applied on the leader (`Shard.afterApply`),
+    /// its caches (`leadCaches`) follow it: a definition's schedule and
+    /// trigger follow its record, and a run's entry keeps `to_step`, the
+    /// parked index and the timers, and the schedule's fired slot, as
+    /// `workflow.run` now says. A follower keeps none of them.
     pub fn entryApplied(self: *WorkflowHandler, e: *const entry_mod.Entry, out: *const Result) void {
         const t = std.enums.fromInt(entry_mod.EntryType, e.header.entry_type) orelse return;
         // A call's message a repair skipped is refused, and its call settled
@@ -4202,18 +4348,6 @@ pub const WorkflowHandler = struct {
 
     fn dropCallTimer(self: *WorkflowHandler, run_key: []const u8) void {
         if (self.call_timer.fetchRemove(run_key)) |kv| self.allocator.free(kv.key);
-    }
-
-    /// Every index rebuilt from the runs as applied, after one couldn't
-    /// keep an entry.
-    fn rewatchRuns(self: *WorkflowHandler) void {
-        self.rewatch = false;
-        // A call's timer that couldn't be armed may be one of these.
-        var ct = self.call_timer.keyIterator();
-        while (ct.next()) |k| self.allocator.free(k.*);
-        self.call_timer.clearRetainingCapacity();
-        var it = self.defsRead().range(runs_machine.RunFam, "");
-        while (it.next() catch null) |item| self.runApplied(.workflow_step, item.key);
     }
 
     fn indexToStep(self: *WorkflowHandler, run_key: []const u8) void {
@@ -4415,28 +4549,40 @@ pub const WorkflowHandler = struct {
     /// `def_key`'s schedule and stream trigger as its record says: built,
     /// rebuilt after a redefinition (keeping the slots fired and the
     /// cursor, `registerSchedule`/`registerStreamTrigger`), or dropped
-    /// when the definition has none. Node memory on every replica; only a
-    /// ready leader fires them (`Shard.tick` runs producers only when it `leads`).
+    /// when the definition has none. A leader's cache (`leadCaches`); only
+    /// a ready leader fires them (`Shard.tick` runs producers only when it
+    /// `leads`).
     fn syncProducers(self: *WorkflowHandler, def_key: []const u8) void {
         const d = self.defOf(def_key) orelse return;
         const ns = keyNamespace(def_key);
         const name = keyName(def_key);
         const built = self.producers_built.get(def_key);
         if (built == null or built.? != d.created_index) {
-            var def = self.parseStored(d.yaml, def_key) catch return;
-            defer def.deinit(self.allocator);
-            if (def.trigger) |named| {
-                var trigger = named;
-                if (d.own_namespace) trigger.namespace = null;
-                self.registerStreamTrigger(ns, name, trigger);
-            } else self.unregisterStreamTrigger(ns, name);
-            if (def.schedule) |schedule| self.registerSchedule(ns, name, schedule, d.anchor_ms) else self.unregisterSchedule(ns, name);
+            self.buildProducers(def_key, d) catch |err| {
+                // Not noted as built: the definitions are walked again.
+                if (err == error.OutOfMemory) self.producers_lost = true;
+                return;
+            };
             self.noteBuilt(def_key, d.created_index);
         }
         // An enable after a disable moves the anchor without a create.
         if (self.schedules.getPtr(def_key)) |schedule| schedule.anchor_ms = d.anchor_ms;
         // The slots the starts applied so far fired.
         self.followFired(ns, name);
+    }
+
+    fn buildProducers(self: *WorkflowHandler, def_key: []const u8, d: DefinitionRecord) parser.ParseError!void {
+        const ns = keyNamespace(def_key);
+        const name = keyName(def_key);
+        var def = try self.parseStored(d.yaml, def_key);
+        defer def.deinit(self.allocator);
+        errdefer log.err("workflow {f}: its trigger or schedule could not be built (out of memory); built again from the store", .{shown(def_key)});
+        if (def.trigger) |named| {
+            var trigger = named;
+            if (d.own_namespace) trigger.namespace = null;
+            try self.registerStreamTrigger(ns, name, trigger);
+        } else try self.unregisterStreamTrigger(ns, name);
+        if (def.schedule) |schedule| try self.registerSchedule(ns, name, schedule, d.anchor_ms) else try self.unregisterSchedule(ns, name);
     }
 
     fn noteBuilt(self: *WorkflowHandler, def_key: []const u8, index: u64) void {
@@ -4574,13 +4720,13 @@ test "workflow handler: a re-created trigger keeps the stream it read on the sam
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
 
-    handler.registerStreamTrigger(TEST_NS, "wf", .{ .stream = "events" });
+    try handler.registerStreamTrigger(TEST_NS, "wf", .{ .stream = "events" });
     const key = try allocator.dupe(u8, testKey(TEST_NS, "wf"));
     defer allocator.free(key);
     handler.stream_triggers.getPtr(key).?.stream_made_ns = 1700;
     handler.stream_triggers.getPtr(key).?.next_read_seq = 3;
 
-    handler.registerStreamTrigger(TEST_NS, "wf", .{ .stream = "events", .batch_size = 2 });
+    try handler.registerStreamTrigger(TEST_NS, "wf", .{ .stream = "events", .batch_size = 2 });
     const same = handler.stream_triggers.getPtr(key).?;
     try testing.expectEqual(@as(?u64, 1700), same.stream_made_ns);
     try testing.expectEqual(@as(u64, 3), same.next_read_seq);
@@ -4588,7 +4734,7 @@ test "workflow handler: a re-created trigger keeps the stream it read on the sam
 
     // Another stream: its own made stamp, from its first read. A page
     // asked for the old one carries a read number this one never asks with.
-    handler.registerStreamTrigger(TEST_NS, "wf", .{ .stream = "other" });
+    try handler.registerStreamTrigger(TEST_NS, "wf", .{ .stream = "other" });
     const moved = handler.stream_triggers.getPtr(key).?;
     try testing.expectEqual(@as(?u64, null), moved.stream_made_ns);
     try testing.expectEqual(@as(u64, 3), moved.next_read_seq);
@@ -4605,16 +4751,16 @@ test "workflow handler: a re-created trigger naming its own namespace, or none, 
     handler.namespaces = &namespaces;
     const ns = namespaces.idOf("team-a").?;
 
-    handler.registerStreamTrigger(ns, "wf", .{ .stream = "events", .batch_size = 4 });
+    try handler.registerStreamTrigger(ns, "wf", .{ .stream = "events", .batch_size = 4 });
     const key = handler.nsKey(ns, "wf").?;
     defer allocator.free(key);
     for ([_]?[]const u8{ "team-a", null, "", "team-a" }) |named| {
         handler.stream_triggers.getPtr(key).?.stream_made_ns = 1700;
-        handler.registerStreamTrigger(ns, "wf", .{ .stream = "events", .namespace = named, .batch_size = 4 });
+        try handler.registerStreamTrigger(ns, "wf", .{ .stream = "events", .namespace = named, .batch_size = 4 });
         try testing.expectEqual(@as(?u64, 1700), handler.stream_triggers.getPtr(key).?.stream_made_ns);
     }
 
-    handler.registerStreamTrigger(ns, "wf", .{ .stream = "events", .namespace = "team-b", .batch_size = 4 });
+    try handler.registerStreamTrigger(ns, "wf", .{ .stream = "events", .namespace = "team-b", .batch_size = 4 });
     try testing.expectEqual(@as(?u64, null), handler.stream_triggers.getPtr(key).?.stream_made_ns);
     try testing.expectEqualStrings("team-b", handler.stream_triggers.getPtr(key).?.stream_namespace_owned.?);
 }
@@ -5691,7 +5837,7 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
 
     // A start's entry carries its namespace's id: "a" is created first.
     try testing.expectEqual(.created, shard.namespace_handler.applyCreate("a"));
-    handler.registerSchedule(TEST_NS_A, "wf", .{ .interval_ms = 1, .max_concurrent = 2 }, 0);
+    try handler.registerSchedule(TEST_NS_A, "wf", .{ .interval_ms = 1, .max_concurrent = 2 }, 0);
     const runsOf = struct {
         fn count(h: *WorkflowHandler, shard_: *Shard) usize {
             const sched = h.schedules.getPtr(testKey(TEST_NS_A, "wf")).?;
@@ -5918,7 +6064,7 @@ test "workflow schedule: a slot starts one run however many leaders propose it, 
     const now = @import("stdx").time.milliTimestamp();
     const anchor = now - 10 * interval;
     try testing.expectEqual(.created, shard.namespace_handler.applyCreate("a"));
-    handler.registerSchedule(TEST_NS_A, "wf", .{ .interval_ms = interval, .max_concurrent = 0 }, anchor);
+    try handler.registerSchedule(TEST_NS_A, "wf", .{ .interval_ms = interval, .max_concurrent = 0 }, anchor);
     var buf: [256]u8 = undefined;
     var key_buf: [128]u8 = undefined;
     var out: Result = .{};
@@ -6849,7 +6995,9 @@ test "a signal that wakes a run is the log's: a leader with none of the old one'
     fresh.store = handler.store;
     shard.workflow_handler = &fresh;
     defer shard.workflow_handler = &handler;
-    fresh.rewatch = true;
+    // What it steps it reads from the store, as it does when it leads.
+    fresh.leadCaches(shard.raft_node.current_term + 1);
+    try testing.expect(fresh.caches_built);
     fresh.advanceStartedRuns(&shard);
     settleTest(&shard);
     const run = fresh.inspect(testKey(.default, "r")).?;
@@ -7072,7 +7220,7 @@ test "workflow handler: a trigger cursor restored inside an append resumes with 
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
-    handler.registerStreamTrigger(TEST_NS, "wf", .{ .stream = "events" });
+    try handler.registerStreamTrigger(TEST_NS, "wf", .{ .stream = "events" });
 
     var partition = try Partition.init(allocator, 0, 1 << 20, 0);
     defer partition.deinit();
@@ -7160,7 +7308,7 @@ test "workflow handler: a trigger's place is read from what applied, so a handle
     var fresh = WorkflowHandler.init(allocator);
     defer fresh.deinit();
     fresh.store = &partition.store;
-    fresh.registerStreamTrigger(TEST_NS, "wf", .{ .stream = "events" });
+    try fresh.registerStreamTrigger(TEST_NS, "wf", .{ .stream = "events" });
     const at = fresh.triggerCursor(testKey(TEST_NS, "wf"), TEST_NS);
     try testing.expectEqual(@as(u64, 1700), at.timestamp_ms);
     try testing.expectEqual(@as(u64, 3), at.sequence);
@@ -7574,4 +7722,92 @@ test "a shard with no walk context lists definitions in the walk's entry form, w
     // Disabled, then the trailer: no more, no cursor.
     try testing.expectEqual(@as(u8, 0), body[pos]);
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, body[pos + 1 ..]);
+}
+
+fn createTestScheduled(handler: *WorkflowHandler, name: []const u8) !void {
+    var key_buf: [64]u8 = undefined;
+    var yaml_buf: [256]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&yaml_buf,
+        \\kind: Workflow
+        \\name: {s}
+        \\version: 1.0.0
+        \\schedule:
+        \\  interval: 1000
+        \\start:
+        \\  wait_for_signal:
+        \\    type: never
+        \\  transitions:
+        \\    success: flo.Completed
+    , .{name});
+    var out: Result = .{};
+    try handler.replayCreate(writeKey(&key_buf, .default, name), yaml, 1000, 0, &out);
+}
+
+test "workflow leader caches: a large store is built over several ticks, and the leader steps nothing until it is all read" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    const defs = WorkflowHandler.DEFS_PER_TICK + 1;
+    const runs = WorkflowHandler.RUNS_PER_TICK + 1;
+    var name_buf: [32]u8 = undefined;
+    for (0..defs) |i| try createTestScheduled(&handler, try std.fmt.bufPrint(&name_buf, "wf-{d}", .{i}));
+    for (0..runs) |i| try createTestRunAt(&handler, try std.fmt.bufPrint(&name_buf, "r-{d}", .{i}), "wf-0", 0, .running);
+
+    // A chunk of the definitions, then the rest of them and a chunk of the
+    // runs, then the last run.
+    handler.leadCaches(3);
+    try testing.expect(!handler.caches_built);
+    try testing.expectEqual(WorkflowHandler.DEFS_PER_TICK, handler.schedules.count());
+    try testing.expectEqual(@as(usize, 0), handler.to_step.count());
+    handler.leadCaches(3);
+    try testing.expect(!handler.caches_built);
+    try testing.expectEqual(defs, handler.schedules.count());
+    try testing.expectEqual(WorkflowHandler.RUNS_PER_TICK, handler.to_step.count());
+    handler.leadCaches(3);
+    try testing.expect(handler.caches_built);
+    try testing.expectEqual(runs, handler.to_step.count());
+    // Built: the same term reads nothing again.
+    handler.leadCaches(3);
+    try testing.expect(handler.caches_built);
+
+    // A new term starts from the store again.
+    handler.leadCaches(4);
+    try testing.expect(!handler.caches_built);
+    try testing.expectEqual(WorkflowHandler.DEFS_PER_TICK, handler.schedules.count());
+}
+
+test "workflow leader caches: a run the store can't decode is passed over, and those after it are still built" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    try createTestScheduled(&handler, "wf");
+    for ([_][]const u8{ "a", "b", "c" }) |id| try createTestRunAt(&handler, id, "wf", 0, .running);
+    var key_buf: [64]u8 = undefined;
+    const store = handler.defsRead().store;
+    const node = store.find(runs_machine.RunFam.ID, writeKey(&key_buf, .default, "b")).?;
+    store.replace(runs_machine.RunFam.ID, node, try allocator.dupe(u8, &.{0xff}));
+
+    handler.leadCaches(1);
+    try testing.expect(handler.caches_built);
+    try testing.expect(handler.to_step.contains(writeKey(&key_buf, .default, "a")));
+    try testing.expect(!handler.to_step.contains(writeKey(&key_buf, .default, "b")));
+    try testing.expect(handler.to_step.contains(writeKey(&key_buf, .default, "c")));
+}
+
+test "workflow leader caches: a schedule that couldn't be built for want of memory is built on a later tick, wherever the allocation failed" {
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        var handler = WorkflowHandler.init(testing.allocator);
+        defer handler.deinit();
+        try createTestScheduled(&handler, "wf");
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_at });
+        handler.allocator = failing.allocator();
+        handler.leadCaches(1);
+        handler.allocator = testing.allocator;
+        // A few more ticks of the same term: whatever was lost is read again.
+        for (0..3) |_| handler.leadCaches(1);
+        var key_buf: [64]u8 = undefined;
+        try testing.expect(handler.schedules.contains(writeKey(&key_buf, .default, "wf")));
+        if (!failing.has_induced_failure) break;
+    }
 }

@@ -1247,7 +1247,7 @@ pub const Shard = struct {
                     boot_damage = try collectSkips(allocator, files, watermark, &skips, shard_id);
                     if (boot_damage != null) break :replay;
                     if (marker.crashed) |*c| if (skips.namesEntry(c.index, c.term, c.entry_crc)) marker.skipped();
-                    const replayed = replaySegments(allocator, files, partition, raft_node, if (cold_boot) 0 else watermark, &raft_node.log, shard_id, &losses, &marker, &skips, boot, workflow_handler);
+                    const replayed = replaySegments(allocator, files, partition, raft_node, if (cold_boot) 0 else watermark, &raft_node.log, shard_id, &losses, &marker, &skips, boot);
                     if (replayed.cancelled) return error.BootCancelled;
                     if (replayed.blocked) |b| return refuseBlockedRead(shard_id, b.name, b.err);
                     boot_damage = replayed.damage;
@@ -6234,7 +6234,9 @@ pub const Shard = struct {
             self.recordApplied(entry, result);
         }
         self.namespace_handler.afterApply(entry);
-        self.workflow_handler.entryApplied(entry, result);
+        // The leader's workflow caches follow what applied; a follower,
+        // and a replay at boot, keep none (`WorkflowHandler.leadCaches`).
+        if (self.raft_node.role == .leader) self.workflow_handler.entryApplied(entry, result);
         self.wakeApplied(entry);
         // The leader's own action steps: the await a deliver answers,
         // workers woken for a run ready again (once a pass: each wake is a
@@ -6795,6 +6797,10 @@ pub const Shard = struct {
         // A halted shard's leader is never ready (its applied index stops
         // short of the halt), yet its duties are still its own: held.
         const holds = self.raft_node.role == .leader and self.offline == null and self.halted != null;
+        // A leader's workflow caches, built from the store a chunk a tick
+        // once it leads in a term: a halted one too, whose held duties
+        // count them.
+        if (leads or holds) self.workflow_handler.leadCaches(self.raft_node.current_term);
         if (leads or holds) self.runProducers() else {
             self.duties.clear();
             self.processing_handler.stopLeading(self);
@@ -6845,6 +6851,11 @@ pub const Shard = struct {
             return;
         }
         self.duties.note(.workflow_steps, null, nowMs());
+        // The caches are still being built: no sleep until they are.
+        if (!self.workflow_handler.caches_built) {
+            self.more_work = true;
+            return;
+        }
         // Take the first step of runs whose start has applied, then
         // resume waiting runs whose action or child finished (both
         // propose the run's next entries, so leader-only too). On a
@@ -6880,14 +6891,15 @@ pub const Shard = struct {
         if (!self.heldIfHalted(.processing, self.processing_handler.hasRunningJob())) {
             self.duties.note(.processing, if (self.processing_handler.tickPipelines(self)) .sink_halted else null, now);
         } else self.processing_handler.stopLeading(self);
-        // Drive workflow stream triggers (poll streams → start runs)
+        // Drive workflow stream triggers (poll streams → start runs) and
+        // scheduled ones (interval → start runs), once the caches are built.
+        const built = self.workflow_handler.caches_built;
         if (!self.heldIfHalted(.stream_triggers, self.workflow_handler.stream_triggers.count() > 0)) {
-            self.workflow_handler.tickStreamTriggers(self);
+            if (built) self.workflow_handler.tickStreamTriggers(self);
             self.duties.note(.stream_triggers, null, now);
         }
-        // Drive workflow scheduled triggers (interval → start runs)
         if (!self.heldIfHalted(.schedules, self.workflow_handler.schedules.count() > 0)) {
-            self.workflow_handler.tickSchedules(self);
+            if (built) self.workflow_handler.tickSchedules(self);
             self.duties.note(.schedules, null, now);
         }
     }
@@ -9611,9 +9623,6 @@ const PartitionReplay = struct {
     marker: *apply_marker.Marker,
     losses: *silent_loss.Counts,
     shard_id: u16,
-    /// Builds a definition's schedule and trigger as each create or enable
-    /// replays, in log order, as the live path does (`afterApply`).
-    workflow: *WorkflowHandler,
     result: persistence_mod.Result = .{},
 
     fn applier(self: *PartitionReplay) ReplayApply {
@@ -9637,7 +9646,6 @@ const PartitionReplay = struct {
         defer apply_marker.end(prev);
         self.result.reset(entry);
         const verdict = verdictOf(self.losses, self.shard_id, Shard.nowMs(), entry, applyEntryCore(self.partition, self.raft, entry, &self.result));
-        if (verdict == .applied) self.workflow.entryApplied(entry, &self.result);
         return verdict;
     }
 
@@ -9667,7 +9675,6 @@ fn replaySegments(
     marker: *apply_marker.Marker,
     skips: *const repair.Skips,
     boot: Shard.Boot,
-    workflow: *WorkflowHandler,
 ) ReplayOutcome {
     // Listed in Raft index order so the projection router's applied_index
     // guard does not skip lower-index entries.
@@ -9676,7 +9683,7 @@ fn replaySegments(
     var last: u64 = 0;
     for (files) |sf| last = @max(last, sf.last_index);
     if (boot.health) |slot| slot.replay_last.store(last, .monotonic);
-    var prod: PartitionReplay = .{ .partition = partition, .raft = raft, .marker = marker, .losses = losses, .shard_id = shard_id, .workflow = workflow };
+    var prod: PartitionReplay = .{ .partition = partition, .raft = raft, .marker = marker, .losses = losses, .shard_id = shard_id };
     const ctx: ReplayCtx = .{ .raft_log = raft_log, .watermark = watermark, .skips = skips, .shard_id = shard_id, .apply = prod.applier() };
     for (files) |sf| {
         // Before reading and checksumming a whole segment it would not use.
@@ -16372,14 +16379,16 @@ test "Shard: a start leaves its run to step on every replica; the leader logs it
     var pbuf: [128]u8 = undefined;
     const e = entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, 0, .default, wf_test_key(.default, "r1"), &start, &pbuf).?;
 
-    // A follower holds the run as one to step, and queues nothing.
+    // A follower applies the run and keeps no index of it: the leader
+    // builds its own from the store (`WorkflowHandler.leadCaches`).
     var t: FollowerTest = undefined;
     try t.init();
     defer t.deinit();
     try std.testing.expect(t.shard.raft_node.role != .leader);
     var out = persistence_mod.Result.start(&e);
     try std.testing.expect(t.shard.applyEntry(&e, &out));
-    try std.testing.expect(t.shard.workflow_handler.to_step.contains(wf_test_key(.default, "r1")));
+    try std.testing.expect(t.shard.workflow_handler.appliedRun(wf_test_key(.default, "r1")) != null);
+    try std.testing.expectEqual(@as(u32, 0), t.shard.workflow_handler.to_step.count());
     try std.testing.expectEqual(@as(u32, 0), t.shard.workflow_handler.stepping.count());
 
     // The leader of a group of one.
@@ -16440,6 +16449,9 @@ test "Shard: a run whose leader stepped down before its first step takes it when
     r.current_term += 1;
     r.ready_index = r.log.lastIndex();
 
+    // Step-down cleared the caches; the tick builds them for the new term.
+    try std.testing.expect(!shard.workflow_handler.to_step.contains(key));
+    shard.workflow_handler.leadCaches(r.current_term);
     shard.runStepping();
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, shard.workflow_handler.inspect(key).?.status);
     try std.testing.expect(!shard.workflow_handler.to_step.contains(key));
@@ -20949,7 +20961,130 @@ test "Shard: a trigger moved to another stream and back goes on from its logged 
     again.wireHandlerShardPtrs();
     _ = again.applyCommitted();
     try std.testing.expectEqual(@as(usize, 3), again.workflow_handler.runCount());
+    // Its trigger is built from the store once it leads, as its first tick
+    // does.
+    again.workflow_handler.leadCaches(again.raft_node.current_term);
     try std.testing.expect(again.workflow_handler.triggerCursor(key, .default).eql(cursor_at));
+}
+
+test "Shard: a node keeps its workflow caches only while it leads: built from the store in each term, cleared when it stops" {
+    // A follower applies a start and indexes nothing; leading, it builds the
+    // index from the store.
+    {
+        const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0, 0 };
+        var pbuf: [128]u8 = undefined;
+        const e = entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, 0, .default, wf_test_key(.default, "r1"), &start, &pbuf).?;
+        var t: FollowerTest = undefined;
+        try t.init();
+        defer t.deinit();
+        var out = persistence_mod.Result.start(&e);
+        try std.testing.expect(t.shard.applyEntry(&e, &out));
+        const h = t.shard.workflow_handler;
+        try std.testing.expectEqual(@as(u32, 0), h.to_step.count());
+        h.leadCaches(7);
+        try std.testing.expect(h.to_step.contains(wf_test_key(.default, "r1")));
+        // Again in the same term: nothing changes.
+        h.leadCaches(7);
+        try std.testing.expectEqual(@as(u32, 1), h.to_step.count());
+    }
+
+    // A leader with a stream trigger: stopping drops it, and the node's
+    // count of triggers with it; the next term builds it again.
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    const def = "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1.0.0\",\"trigger\":{\"stream\":\"events\"},\"start\":{\"wait_for_signal\":{\"type\":\"never\"},\"transitions\":{\"success\":\"flo.Completed\"}}}";
+    try ParkTest.send(&shard, conn, .workflow_create, 1, "wf", def);
+    _ = shard.applyCommitted();
+    const h = shard.workflow_handler;
+    const term = shard.raft_node.current_term;
+    h.leadCaches(term);
+    try std.testing.expectEqual(@as(u32, 1), h.stream_triggers.count());
+    const triggers = WorkflowHandler.streamTriggerCount();
+    shard.stoppedLeading("test");
+    try std.testing.expectEqual(@as(u32, 0), h.stream_triggers.count());
+    try std.testing.expectEqual(@as(u32, 0), h.to_step.count());
+    try std.testing.expectEqual(triggers - 1, WorkflowHandler.streamTriggerCount());
+    h.leadCaches(term + 1);
+    try std.testing.expectEqual(@as(u32, 1), h.stream_triggers.count());
+    try std.testing.expectEqual(triggers, WorkflowHandler.streamTriggerCount());
+}
+
+test "Shard: a leader that built its workflow caches while halted keeps what applies after the repair, and steps it once ready" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    const h = shard.workflow_handler;
+    const term = shard.raft_node.current_term;
+
+    // Halted, it leads and holds its duties: its caches are built then, as
+    // its first tick in the term does (`leads or holds`), over what applied.
+    shard.halted = .{ .index = 1, .term = term, .crc = 0 };
+    h.leadCaches(term);
+    try std.testing.expectEqual(@as(u32, 0), h.to_step.count());
+
+    // Repaired in the same term: a run that waits on nothing, one parked on
+    // a call, one on a timer, all applied after the rebuild.
+    shard.halted = null;
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    try ParkTest.send(&shard, conn, .workflow_create, 1, "wf", "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1.0.0\",\"start\":{\"wait_for_signal\":{\"type\":\"never\"},\"transitions\":{\"success\":\"flo.Completed\"}}}");
+    var vb: [96]u8 = undefined;
+    const start = (@import("../workflow/runs_machine.zig").Start{ .workflow = "wf", .version = "1", .status = .running, .event = "", .idem = null, .input = "" }).encode(&vb).?;
+    _ = try persistence_mod.proposeEntryIn(&shard, .workflow_start, entry_mod.Flags.NONE, .default, wf_test_key(.default, "r1"), start);
+    try proposeCall(&shard, "act", "wf", "a1", false);
+    _ = try persistence_mod.proposeEntryIn(&shard, .workflow_start, entry_mod.Flags.NONE, .default, wf_test_key(.default, "r3"), start);
+    const runs_machine = @import("../workflow/runs_machine.zig");
+    const timer: runs_machine.Step.Value = .{
+        .rev = 0,
+        .step = "s",
+        .events = .{ .bytes = "", .count = 0 },
+        .outputs = .{ .bytes = "", .count = 0 },
+        .wait = .timer,
+        .wait_kind = .action,
+        .wait_slot = 0,
+        .wait_on = "",
+        .wait_due_ms = std.math.maxInt(i32),
+        .wait_timeout_to = "",
+        .progress = "",
+        .settles = "",
+        .takes = .{ .bytes = "", .count = 0 },
+        .caller_slot = 0,
+        .workflow = "wf",
+        .ends = 0,
+        .has_output = false,
+        .output = "",
+        .tags = "",
+        .call = "",
+    };
+    var sb: [512]u8 = undefined;
+    _ = try persistence_mod.proposeEntryIn(&shard, .workflow_step, entry_mod.Flags.NONE, .default, wf_test_key(.default, "r3"), try runs_machine.Step.encodeInto(&sb, timer));
+    try std.testing.expect(shard.applyCommitted());
+
+    // Each is in its cache, though the rebuild ran before it applied.
+    try std.testing.expect(h.to_step.contains(wf_test_key(.default, "r1")));
+    try std.testing.expect(h.parked.contains(wf_test_key(.default, "c-a1")));
+    try std.testing.expect(h.timers.count() > 0);
+    // Ready in the same term: no second rebuild, and the run steps.
+    h.leadCaches(term);
+    try std.testing.expect(h.to_step.contains(wf_test_key(.default, "r1")));
+    const before = shard.raft_node.log.lastIndex();
+    h.advanceStartedRuns(&shard);
+    try std.testing.expect(shard.raft_node.log.lastIndex() > before);
 }
 
 test "Shard: a namespace create is published, and answered, only once its segment and directory are on disk" {
@@ -25026,6 +25161,9 @@ test "a halted shard's duties stop, and one with work counts as held until the s
         \\"start":{"wait_for_signal":{"type":"never"},"transitions":{"success":"flo.Completed"}}}
     ;
     try ParkTest.send(&shard, conn, .workflow_create, 1, "tick", def);
+    // Its caches built, as the tick does once it leads.
+    shard.workflow_handler.leadCaches(shard.raft_node.current_term);
+    try std.testing.expect(shard.workflow_handler.caches_built);
     try std.testing.expectEqual(@as(u32, 1), shard.workflow_handler.schedules.count());
 
     shard.halted = .{ .index = 1, .term = 1, .crc = 0 };
@@ -30953,7 +31091,7 @@ test "Shard: a workflow run whose action ended just before a leader change finis
     const old = shard.workflow_handler;
     shard.workflow_handler = &fresh;
     defer shard.workflow_handler = old;
-    fresh.rewatch = true;
+    fresh.leadCaches(shard.raft_node.current_term + 1);
     fresh.checkPendingActions(shard);
     try ParkTest.ack(shard);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, fresh.inspect(key).?.status);
@@ -31043,7 +31181,7 @@ test "Shard: a workflow step its leader logged and lost with its leadership is t
     const old = shard.workflow_handler;
     shard.workflow_handler = &fresh;
     defer shard.workflow_handler = old;
-    fresh.rewatch = true;
+    fresh.leadCaches(shard.raft_node.current_term + 1);
     fresh.checkPendingActions(shard);
     try ParkTest.ack(shard);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, fresh.inspect(key).?.status);
