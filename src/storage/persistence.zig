@@ -1,17 +1,14 @@
 //! Shared persistence interface for durable handlers.
 //!
-//! `ReplayRegistry` maps an entry type to its applier: the one function that
-//! mutates a subsystem's state from a committed entry, whether that entry was
-//! written here, replicated from a peer, or read back from a segment at boot.
-//! `proposeEntry` builds a command entry and proposes it; the caller parks
-//! the client on it, and the client is answered from what the applier
-//! recorded in its `Result` once the entry has applied. Nothing waits for a commit: a producer that needs the
+//! An entry is applied by the contract machine that owns its type
+//! (`contract/machines.zig`), whether it was written here, replicated from a
+//! peer, or read back from a segment at boot. `proposeEntry` builds a
+//! command entry and proposes it; the caller parks the client on it, and the
+//! client is answered from what the apply recorded in its `Result` once the
+//! entry has applied. Nothing waits for a commit: a producer that needs the
 //! applied state picks it up once the entry applies.
 //!
 //! ## Usage
-//!
-//! Handler registration (in Shard.init, before segment replay):
-//!   handler.registerReplay(&replay_registry);
 //!
 //! Client write: propose, then park with the op's answer function, which
 //! reads only the entry's `Result`:
@@ -37,10 +34,6 @@ pub const MAX_PERSIST_PAYLOAD: usize = @import("../protocol/limits.zig").MAX_PER
 /// keys. Streams, series, queues, groups, actions and workflows propose
 /// through here, so they get it even where they don't check their own.
 pub const MAX_ENTRY_KEY: usize = ns_keys.MAX_QUALIFIED_KEY;
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ReplayRegistry
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Why an applier could not apply an entry. Not a refusal: a refused
 /// entry applied (it changed nothing, the same way on every node) and its
@@ -180,48 +173,6 @@ pub const Result = struct {
 
 /// A refusal and the status it goes with.
 pub const Refused = struct { status: proto.StatusCode, refusal: proto.Refusal };
-
-/// An applier: called for every committed entry of a registered type, on
-/// every node, live or at boot. It records the entry's answer in `result`.
-/// It validates before it mutates: an entry it halts on (`error.Halt`)
-/// leaves no trace.
-pub const ReplayFn = *const fn (ctx: *anyopaque, entry: *const Entry, result: *Result) ApplyError!void;
-
-/// Maps EntryType → applier. Handlers register their owned entry types
-/// during init; every committed entry of such a type is dispatched here.
-pub const ReplayRegistry = struct {
-    callbacks: [256]?ReplayEntry = @as([256]?ReplayEntry, @splat(null)),
-    /// A type registered twice. The first applier is kept; the shard
-    /// refuses to start, since one of the two would never run.
-    duplicate: ?EntryType = null,
-
-    const ReplayEntry = struct {
-        ctx: *anyopaque,
-        func: ReplayFn,
-    };
-
-    /// Register a handler for a specific entry type.
-    pub fn register(self: *ReplayRegistry, etype: EntryType, ctx: *anyopaque, func: ReplayFn) void {
-        const slot = &self.callbacks[@backingInt(etype)];
-        if (slot.* != null) {
-            if (self.duplicate == null) self.duplicate = etype;
-            return;
-        }
-        slot.* = .{ .ctx = ctx, .func = func };
-    }
-
-    pub fn has(self: *const ReplayRegistry, etype: EntryType) bool {
-        return self.callbacks[@backingInt(etype)] != null;
-    }
-
-    /// Dispatch an entry to its registered handler. False when its type
-    /// has none.
-    pub fn dispatch(self: *const ReplayRegistry, entry: *const Entry, result: *Result) ApplyError!bool {
-        const cb = self.callbacks[entry.header.entry_type] orelse return false;
-        try cb.func(cb.ctx, entry, result);
-        return true;
-    }
-};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // proposeEntry

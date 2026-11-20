@@ -62,10 +62,6 @@ pub const Partition = struct {
     current_term: u64,
     committed_index: u64,
 
-    /// The highest allocated namespace id an entry applied here named:
-    /// state here may be keyed by it.
-    highest_namespace: u32 = 0,
-
     /// Warm store — payload copies for entries evicted from the hot ring buffer.
     /// Holds what the ring holds (`keptInRing`), so a stream read falls back
     /// to it when the ring has evicted a record.
@@ -213,8 +209,8 @@ pub const Partition = struct {
         // (`StreamHandler.getPayloadAndTier`). A type a contract machine
         // owns otherwise keeps its data in the machine's families, and the
         // router passes over one applied already, so it skips both copies.
-        // A type the registry applies stays in the ring: its refusal of an
-        // index applied already is what keeps one from applying twice.
+        // A type no machine owns (a config) stays in the ring: its refusal
+        // of an index applied already is what keeps one from applying twice.
         const kept = keptInRing(@fromBackingInt(@intCast(e.header.entry_type)));
         const index = if (kept) try self.ual.append(e) else e.header.index;
 
@@ -818,12 +814,13 @@ test "partition: a KV index taken and then passed over by a repair counts once, 
     try testing.expectEqual(@as(u64, entry_mod.HEADER_SIZE + e.payload.len), live.bar_bytes);
 }
 
-test "Partition: only stream reads' entries and the registry's stay in the hot ring" {
+test "Partition: only stream reads' entries and those no machine owns stay in the hot ring" {
     // What a stream read fetches by index.
     for ([_]EntryType{ .stream_append, .channel_inbound }) |t| try testing.expect(Partition.keptInRing(t));
-    // Applied by the registry: the ring's refusal of a repeated index keeps
-    // one from applying twice.
-    for ([_]EntryType{ .raft_noop, .raft_config, .action_abandon }) |t| try testing.expect(Partition.keptInRing(t));
+    // Applied by no machine: the ring's refusal of a repeated index keeps a
+    // config from applying twice.
+    for ([_]EntryType{ .raft_noop, .raft_config }) |t| try testing.expect(Partition.keptInRing(t));
     // Held by a machine's families, passed over by the router when repeated.
-    for ([_]EntryType{ .kv_put, .ts_write, .queue_enqueue, .action_invoke, .group_deliver, .stream_trim, .workflow_start, .workflow_complete }) |t| try testing.expect(!Partition.keptInRing(t));
+    // A hand-back comes only inside an inbound, which the ring keeps.
+    for ([_]EntryType{ .kv_put, .ts_write, .queue_enqueue, .action_invoke, .action_abandon, .group_deliver, .stream_trim, .workflow_start, .workflow_complete }) |t| try testing.expect(!Partition.keptInRing(t));
 }

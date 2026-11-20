@@ -915,6 +915,8 @@ pub fn stoppedLeading(shard: *Shard) void {
     self.pending.clearRetainingCapacity();
     self.claimed.clearRetainingCapacity();
     self.expiring = null;
+    // `expiring_full` stays: it is read only by the apply of the expire
+    // `expiring` names, cleared here, and set again by the next one.
     self.cleaning = null;
     self.duty_term = 0;
 }

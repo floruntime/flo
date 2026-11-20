@@ -157,7 +157,6 @@ const stream_handler_mod = @import("../stream/handler.zig");
 const queue_handler_mod = @import("../queue/handler.zig");
 const Partition = @import("../storage/partition.zig").Partition;
 const persistence_mod = @import("../storage/persistence.zig");
-const ReplayRegistry = persistence_mod.ReplayRegistry;
 pub const run_id_mod = @import("run_id.zig");
 const source_page_mod = @import("../processing/source_page.zig");
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
@@ -732,11 +731,6 @@ pub const Shard = struct {
     /// threaded and `drainInbox` processes one message at a time.
     forward_proxy: *Connection,
 
-    /// Replay registry — maps EntryType → handler apply callback for the
-    /// entry types no projection owns. Used by the one applier, whether the
-    /// entry comes from this node's Raft log, a peer, or a segment at boot.
-    replay_registry: ReplayRegistry,
-
     /// Copy buffer for committed entries, sized for the largest entry any
     /// handler proposes. Allocated at boot so an out-of-memory is a boot
     /// failure, not a committed write that never reaches the projection.
@@ -1137,16 +1131,7 @@ pub const Shard = struct {
             allocator.destroy(dl);
         };
 
-        // Build replay registry — handlers register their entry types
-        // so replaySegments and handleInboxMessage can dispatch without
-        // hardcoded type checks. Created before data_dir block so it's
-        // always available for the Shard struct.
-        var replay_registry: ReplayRegistry = .{};
-        // A committed config is the membership a truncation falls back to;
-        // the Raft node is on the heap, so it is the applier's context.
-        replay_registry.register(.raft_config, @ptrCast(raft_node), applyRaftConfig);
-        replay_registry.register(.action_abandon, @ptrCast(actions_handler), ActionsHandler.applyAbandonMessage);
-        try checkAppliers(shard_id, &replay_registry);
+        try checkAppliers(shard_id);
 
         const apply_buf = try large_buffer.alloc(allocator, u8, limits.MAX_LOG_ENTRY_PAYLOAD);
         errdefer large_buffer.free(allocator, u8, apply_buf);
@@ -1262,7 +1247,7 @@ pub const Shard = struct {
                     boot_damage = try collectSkips(allocator, files, watermark, &skips, shard_id);
                     if (boot_damage != null) break :replay;
                     if (marker.crashed) |*c| if (skips.namesEntry(c.index, c.term, c.entry_crc)) marker.skipped();
-                    const replayed = replaySegments(allocator, files, partition, &replay_registry, if (cold_boot) 0 else watermark, &raft_node.log, shard_id, &losses, &marker, &skips, boot, workflow_handler);
+                    const replayed = replaySegments(allocator, files, partition, raft_node, if (cold_boot) 0 else watermark, &raft_node.log, shard_id, &losses, &marker, &skips, boot, workflow_handler);
                     if (replayed.cancelled) return error.BootCancelled;
                     if (replayed.blocked) |b| return refuseBlockedRead(shard_id, b.name, b.err);
                     boot_damage = replayed.damage;
@@ -1473,7 +1458,6 @@ pub const Shard = struct {
             .peer_shards = null,
             .peer_mailboxes = null,
             .forward_proxy = forward_proxy,
-            .replay_registry = replay_registry,
             .apply_buf = apply_buf,
             .read_buf = read_buf,
             .parse_buf = parse_buf,
@@ -5858,7 +5842,7 @@ pub const Shard = struct {
         const verdict = v: {
             const prev = apply_marker.begin(&self.marker, entry);
             defer apply_marker.end(prev);
-            break :v verdictOf(&self.losses, self.id, nowMs(), entry, applyEntryCore(self.defaultPartition(), &self.replay_registry, entry, out));
+            break :v verdictOf(&self.losses, self.id, nowMs(), entry, applyEntryCore(self.defaultPartition(), self.raft_node, entry, out));
         };
         if (verdict == .applied) self.afterApply(entry, out);
         return verdict;
@@ -9195,8 +9179,7 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
 
 /// The config entry committed: what it names is the membership a
 /// truncation falls back to.
-fn applyRaftConfig(ctx: *anyopaque, entry: *const entry_mod.Entry, _: *persistence_mod.Result) persistence_mod.ApplyError!void {
-    const raft: *RaftNode = @ptrCast(@alignCast(ctx));
+fn applyRaftConfig(raft: *RaftNode, entry: *const entry_mod.Entry) persistence_mod.ApplyError!void {
     const cfg = membership.decode(entry.payload) orelse return error.Halt;
     raft.commitMembership(&cfg, entry.header.index);
     // The membership as of this apply: `committed_config` can already be ahead
@@ -9227,19 +9210,60 @@ pub fn raiseNamespaceIdFloor(shards: []Shard) error{OutOfMemory}!void {
     try shards[0].namespace_handler.publishAll();
     shards[0].namespace_handler.publish_from_store = false;
     for (shards[1..]) |*s| {
-        const named = s.defaultPartition().highest_namespace;
+        const named = highestNamespaceIn(&s.defaultPartition().store);
         if (named != 0) shards[0].namespace_handler.raiseIdFloor(named);
     }
     shards[0].reportUnknownNamespaces();
 }
 
-/// Raise `partition.highest_namespace` by the entry's namespace ids.
-/// The fixed ids sit below every allocated one, and an id past the table
-/// was never allocated, so neither can collide with a later create.
-fn noteNamespace(partition: *Partition, entry: *const entry_mod.Entry) void {
-    const id = entryNamespaceId(entry) orelse return;
-    if (id < ns_table.FIRST_ALLOCATED.int() or id >= ns_table.CAPACITY) return;
-    partition.highest_namespace = @max(partition.highest_namespace, id);
+/// The highest allocated namespace id `store` holds state under, or will:
+/// each `.id` family's last key, every key of a family that names its
+/// namespace further in, the namespaces its outbox holds messages of, and
+/// those of the messages parked here. Read from the store, so a store
+/// restored from a snapshot counts as one replayed does. Only ids that still
+/// have state count: an entry refused, or one whose state has gone, leaves
+/// nothing keyed by its id, and no apply reads the namespace table, so
+/// reissuing it can't land on anything. The fixed ids sit
+/// below every allocated one, and an id past the table was never
+/// allocated, so neither can collide with a later create: both are left
+/// out. 0 for none.
+pub fn highestNamespaceIn(store: *contract_store.Store) u32 {
+    var top: u32 = 0;
+    const note = struct {
+        fn f(t: *u32, id: u32) void {
+            if (id < ns_table.FIRST_ALLOCATED.int() or id >= ns_table.CAPACITY) return;
+            t.* = @max(t.*, id);
+        }
+    }.f;
+    inline for (contract_machines.list) |m| inline for (m.families) |fam| switch (fam.scope) {
+        // Keys lead with the id, so the last is the highest.
+        .id => {
+            var r = store.rangeBefore(fam.id, "", "\xff");
+            if (r.next()) |rec| if (rec.key().len >= 4) note(&top, std.mem.readInt(u32, rec.key()[0..4], .big));
+        },
+        .naming => |at| {
+            var r = store.range(fam.id, "");
+            while (r.next()) |rec| {
+                const k = rec.key();
+                if (k.len >= 1 + at + 4 and k[0] == 0) note(&top, std.mem.readInt(u32, k[1 + at ..][0..4], .big));
+            }
+        },
+        .shard, .aggregate => {},
+    };
+    const read: view_mod.ReadView = .{ .store = store };
+    // An outbox record per (receiver, namespace): its last four bytes.
+    var outs = read.range(channels_mod.OutNsFam, "");
+    while (outs.next() catch null) |item| if (item.key.len >= 4) note(&top, std.mem.readInt(u32, item.key[item.key.len - 4 ..][0..4], .big));
+    // A parked message names its namespace as its payload's layout does.
+    var parked = read.range(channels_mod.ParkFam, "");
+    while (parked.next() catch null) |item| {
+        const v = item.value.v;
+        if (v.payload.len == 0) continue;
+        var e: entry_mod.Entry = .{ .header = std.mem.zeroes(entry_mod.Header), .payload = v.payload };
+        e.header.entry_type = v.entry_type;
+        if (entryNamespaceId(&e)) |id| note(&top, id);
+    }
+    return top;
 }
 
 /// The highest namespace id an entry names, or null for none. Read by
@@ -9377,17 +9401,16 @@ fn listed(list: []const entry_mod.EntryType, etype: entry_mod.EntryType) bool {
 }
 
 /// The one apply path: the partition (its hot ring, and the router's
-/// index), then a contract machine for the types one owns (KV's, actions',
-/// queues', groups', time series'), then the registry appliers for every
-/// other entry type.
-pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry, out: *persistence_mod.Result) ApplyResult {
-    return applyEntryCoreWith(&contract_machines.list, partition, registry, entry, out);
+/// index), then the contract machine that owns the type, or for a
+/// committed config the Raft node (`raft`; null applies none).
+pub fn applyEntryCore(partition: *Partition, raft: ?*RaftNode, entry: *const entry_mod.Entry, out: *persistence_mod.Result) ApplyResult {
+    return applyEntryCoreWith(&contract_machines.list, partition, raft, entry, out);
 }
 
 /// `applyEntryCore` over `machines`. A machine reads the partition's
 /// streams as this entry finds them: every entry below it applied, in
 /// index order, through this same function.
-fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry, out: *persistence_mod.Result) ApplyResult {
+fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, partition: *Partition, raft: ?*RaftNode, entry: *const entry_mod.Entry, out: *persistence_mod.Result) ApplyResult {
     if (comptime build_options.test_faults) {
         if (@import("test_faults.zig").of(entry)) |f| {
             if (f == .halt) return .{ .applier_failed = error.Halt };
@@ -9398,7 +9421,6 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
     // The messages an inbound applied are this entry's alone: one skipped
     // as applied already, or any other, must not find the last one's.
     partition.store.messages.clearRetainingCapacity();
-    noteNamespace(partition, entry);
     const applied = partition.applyRouted(entry) catch |err| taken: {
         // An inbound a live halt stopped in: the ring took it before its
         // messages halted, and a repair's skip applies it again. Only the
@@ -9420,23 +9442,16 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
         // is counted and answered as one.
         if (applied) |a| if (a.route == .skipped_already_applied) return .{ .partition_reject = error.IndexNotIncreasing };
         contract_machine.applyEntry(m, &partition.store, &partition.apply_scratch, entry, out) catch |err| return .{ .applier_failed = err };
-        if (etype == .channel_inbound or etype == .channel_unpark) for (partition.store.messages.items) |*msg| {
-            // A refused message took no effect: its bytes, maybe a sender's
-            // garbage, name no namespace this shard holds.
-            if (msg.result.refused() == null) noteNamespace(partition, &msg.entry);
-            if (!msg.after_commit) continue;
-            const had = registry.dispatch(&msg.entry, &msg.result) catch |err| return .{ .applier_failed = err };
-            if (!had) return .no_applier;
-            // Followed as the same entry applied alone would be.
-            if (msg.result.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, &msg.entry, .message) catch |err| return .{ .applier_failed = err };
-        };
         return .applied;
     }
-    const had = registry.dispatch(entry, out) catch |err| return .{ .applier_failed = err };
-    if (!had) return if (listed(&APPLIES_NOTHING, etype)) .applied else .no_applier;
+    if (listed(&APPLIES_NOTHING, etype)) return .applied;
+    // The replica's own entry. The ring took it above, so a second delivery
+    // was refused there (`IndexNotIncreasing`) and never reaches here.
+    if (etype != .raft_config) return .no_applier;
+    applyRaftConfig(raft orelse return .no_applier, entry) catch |err| return .{ .applier_failed = err };
     // The machines that follow this entry (a removed job's sinks, a child's
     // parent), after its owner, unless the owner refused it.
-    if (out.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, entry, .entry) catch |err| return .{ .applier_failed = err };
+    if (out.refused() == null) contract_machine.observeAll(machines, &partition.store, &partition.apply_scratch, entry) catch |err| return .{ .applier_failed = err };
     return .applied;
 }
 
@@ -9448,30 +9463,25 @@ fn applyErrorName(err: persistence_mod.ApplyError) []const u8 {
     };
 }
 
-/// Every entry type has exactly one applier (a contract machine, the
-/// projection router or one registry callback) or is listed as needing none. Two appliers is how a
-/// replayed entry gets inserted twice; none, how it is dropped; a second
-/// registration, how one handler's applier never runs. Each is a bug in
-/// this build, not in the data directory.
-fn checkAppliers(shard_id: u16, registry: *const ReplayRegistry) !void {
-    return checkAppliersWith(&contract_machines.list, shard_id, registry);
+/// Every entry type has exactly one applier (a contract machine, or the
+/// Raft node for a committed config) or is listed as needing none. Two
+/// appliers is how a replayed entry gets inserted twice; none, how it is
+/// dropped. Each is a bug in this build, not in the data directory.
+fn checkAppliers(shard_id: u16) !void {
+    return checkAppliersWith(&contract_machines.list, shard_id);
 }
 
-fn checkAppliersWith(comptime machines: []const contract_machine.Machine, shard_id: u16, registry: *const ReplayRegistry) !void {
-    if (registry.duplicate) |etype| {
-        log.err("shard {d}: entry type {s} was registered twice; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, @tagName(etype) });
-        return error.EntryTypeRegisteredTwice;
-    }
+fn checkAppliersWith(comptime machines: []const contract_machine.Machine, shard_id: u16) !void {
     const einfo = @typeInfo(entry_mod.EntryType).@"enum";
     inline for (einfo.field_names, einfo.field_values) |fname, fvalue| {
         const etype: entry_mod.EntryType = @fromBackingInt(@intCast(fvalue));
         // A machine's type has no other applier.
         const owner = contract_machine.ownerOf(machines, etype);
-        if (owner) |m| if (registry.has(etype)) {
+        if (owner) |m| if (etype == .raft_config) {
             log.err("shard {d}: entry type {s} is owned by the {s} machine and has another applier too; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, fname, m.name });
             return error.EntryTypeHasTwoAppliers;
         };
-        if (owner == null and !registry.has(etype) and !listed(&APPLIES_NOTHING, etype) and !listed(&NEVER_WRITTEN, etype)) {
+        if (owner == null and etype != .raft_config and !listed(&APPLIES_NOTHING, etype) and !listed(&NEVER_WRITTEN, etype)) {
             log.err("shard {d}: entry type {s} has no applier; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, fname });
             return error.EntryTypeHasNoApplier;
         }
@@ -9558,7 +9568,8 @@ fn collectSkips(allocator: std.mem.Allocator, files: []const durable_log_mod.Seg
 /// crash marker and `verdictOf`, and `passOverSkipped` for a repair skip.
 const PartitionReplay = struct {
     partition: *Partition,
-    registry: *const ReplayRegistry,
+    /// The Raft node a committed config is applied to.
+    raft: *RaftNode,
     marker: *apply_marker.Marker,
     losses: *silent_loss.Counts,
     shard_id: u16,
@@ -9587,7 +9598,7 @@ const PartitionReplay = struct {
         const prev = apply_marker.begin(self.marker, entry);
         defer apply_marker.end(prev);
         self.result.reset(entry);
-        const verdict = verdictOf(self.losses, self.shard_id, Shard.nowMs(), entry, applyEntryCore(self.partition, self.registry, entry, &self.result));
+        const verdict = verdictOf(self.losses, self.shard_id, Shard.nowMs(), entry, applyEntryCore(self.partition, self.raft, entry, &self.result));
         if (verdict == .applied) self.workflow.entryApplied(entry, &self.result);
         return verdict;
     }
@@ -9610,7 +9621,7 @@ fn replaySegments(
     allocator: std.mem.Allocator,
     files: []const durable_log_mod.SegmentFile,
     partition: *Partition,
-    replay_registry: *const ReplayRegistry,
+    raft: *RaftNode,
     watermark: u64,
     raft_log: *RaftLog,
     shard_id: u16,
@@ -9627,7 +9638,7 @@ fn replaySegments(
     var last: u64 = 0;
     for (files) |sf| last = @max(last, sf.last_index);
     if (boot.health) |slot| slot.replay_last.store(last, .monotonic);
-    var prod: PartitionReplay = .{ .partition = partition, .registry = replay_registry, .marker = marker, .losses = losses, .shard_id = shard_id, .workflow = workflow };
+    var prod: PartitionReplay = .{ .partition = partition, .raft = raft, .marker = marker, .losses = losses, .shard_id = shard_id, .workflow = workflow };
     const ctx: ReplayCtx = .{ .raft_log = raft_log, .watermark = watermark, .skips = skips, .shard_id = shard_id, .apply = prod.applier() };
     for (files) |sf| {
         // Before reading and checksumming a whole segment it would not use.
@@ -12329,7 +12340,7 @@ test "Shard: a write on shard 1 to a namespace nobody created is answered once, 
     try std.testing.expect(!b.namespace_handler.known("fresh"));
     try std.testing.expectEqual(from, entryAt(b, .kv_put, from).?);
     try std.testing.expectEqual(b.raft_node.log.lastIndex(), from);
-    try std.testing.expectEqual(id.int(), b.defaultPartition().highest_namespace);
+    try std.testing.expectEqual(id.int(), highestNamespaceIn(&b.defaultPartition().store));
     // Answered once: nothing more on the socket, no slot or gather left.
     try std.testing.expectError(error.IncompleteResponse, nextAnswer(c, b, &out));
     try std.testing.expectEqual(@as(usize, 0), b.gathers.inUse());
@@ -15940,6 +15951,62 @@ test "Shard: at boot, shard 0 proposes no id another shard's entry names, though
     try std.testing.expect(a.halted == null);
 }
 
+test "Shard: at boot, shard 0 proposes no id another shard's store holds data under, though nothing replayed there named it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const lost: u32 = a.namespace_handler.nextId() + 7;
+    // A key under an id shard 0's log lost, as a store restored from a
+    // snapshot holds it: written by its machine, no entry applied here.
+    var key: [5]u8 = undefined;
+    key[0..4].* = ns_table.Id.of(lost).bytes();
+    key[4] = 'k';
+    var pbuf: [128]u8 = undefined;
+    const e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 1, 1, try kv_entries.Put.encodeInto(&pbuf, .{ .key = &key, .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null }));
+    var out = persistence_mod.Result.start(&e);
+    const part = b.defaultPartition();
+    try contract_machine.applyEntry(&kv_machine.machine, &part.store, &part.apply_scratch, &e, &out);
+    try raiseNamespaceIdFloor(&two.shards);
+    // Each create after takes an id past it, and none takes one twice.
+    try std.testing.expect(a.namespace_handler.proposeCreateOn(a.raft_node, "fresh") == .proposed);
+    try std.testing.expect(a.namespace_handler.proposeCreateOn(a.raft_node, "fresher") == .proposed);
+    try std.testing.expectEqual(@as(?ns_table.Id, .of(lost + 1)), a.namespace_handler.idOf("fresh"));
+    try std.testing.expectEqual(@as(?ns_table.Id, .of(lost + 2)), a.namespace_handler.idOf("fresher"));
+}
+
+test "Shard: at boot, shard 0 proposes no id a message parked on another shard names, with nothing stored under it yet" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const lost: u32 = a.namespace_handler.nextId() + 5;
+    var key: [5]u8 = undefined;
+    key[0..4].* = ns_table.Id.of(lost).bytes();
+    key[4] = 'k';
+    var pbuf: [128]u8 = undefined;
+    const put = try kv_entries.Put.encodeInto(&pbuf, .{ .key = &key, .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null });
+    // A parked KV put, as a full target leaves one: keyed by its target and
+    // sender, the namespace only in its payload.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const part = b.defaultPartition();
+    var raw: [1 + @import("../protocol/channel_entries.zig").TARGET_LEN + 2 + 8]u8 = @splat(0);
+    raw[0] = 'p';
+    var ks = view_mod.KeySet.init(arena.allocator());
+    try ks.add(channels_mod.ParkFam.ID, channels_mod.PARK_NS, &raw);
+    var v = view_mod.View.init(&part.store, arena.allocator(), &ks);
+    var kb: [64]u8 = undefined;
+    try v.put(channels_mod.ParkFam, try view_mod.key(&kb, channels_mod.PARK_NS, &raw), .{ .v = .{ .entry_type = @backingInt(entry_mod.EntryType.kv_put), .flags = 0, .since_ns = 1, .count = 1, .bytes = put.len, .payload = put } });
+    try v.commit();
+    try std.testing.expectEqual(lost, highestNamespaceIn(&part.store));
+    try raiseNamespaceIdFloor(&two.shards);
+    try std.testing.expect(a.namespace_handler.proposeCreateOn(a.raft_node, "fresh") == .proposed);
+    try std.testing.expectEqual(@as(?ns_table.Id, .of(lost + 1)), a.namespace_handler.idOf("fresh"));
+}
+
 /// Apply, on `shard`, a group read's deliver under namespace id `ns`: an
 /// entry that names the id without shard 0 creating anything.
 fn applyEntryUnder(shard: *Shard, ns: u32, index: u64) !void {
@@ -15948,7 +16015,7 @@ fn applyEntryUnder(shard: *Shard, ns: u32, index: u64) !void {
     var e = entry_mod.buildEntry(.group_deliver, entry_mod.Flags.NONE, 1, index, index, body);
     e.header.crc32c = e.computeCrc();
     var out = persistence_mod.Result{ .index = index };
-    try std.testing.expect(applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &e, &out) == .applied);
+    try std.testing.expect(applyEntryCore(shard.defaultPartition(), shard.raft_node, &e, &out) == .applied);
 }
 
 test "Shard: ids another shard holds data under, past shard 0's creates, are logged as errors when they rise and once at info when none are left, listed in /status and counted, and nothing is refused" {
@@ -19195,74 +19262,31 @@ test "the Raft ring floor holds the largest transaction batch" {
 }
 
 test "every entry type has exactly one applier, or is listed as needing none, or the shard refuses to start" {
-    const Noop = struct {
-        fn apply(_: *anyopaque, _: *const entry_mod.Entry, _: *persistence_mod.Result) persistence_mod.ApplyError!void {}
-    };
-    var ctx: u8 = 0;
-    // Every type the router does not own and no list excuses.
-    var full: ReplayRegistry = .{};
-    inline for (@typeInfo(entry_mod.EntryType).@"enum".field_values) |value| {
-        const t: entry_mod.EntryType = @fromBackingInt(@intCast(value));
-        if (contract_machine.ownerOf(&contract_machines.list, t) == null and !listed(&APPLIES_NOTHING, t) and !listed(&NEVER_WRITTEN, t)) full.register(t, @ptrCast(&ctx), Noop.apply);
-    }
-    try checkAppliers(0, &full);
-
-    // One of them missing: dropped at apply, so refused at boot.
-    var missing = full;
-    missing.callbacks[@backingInt(entry_mod.EntryType.raft_config)] = null;
-    try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliers(0, &missing));
-
-    // Registered twice: one handler's applier would never run.
-    var twice = full;
-    twice.register(.raft_config, @ptrCast(&ctx), Noop.apply);
-    try std.testing.expectError(error.EntryTypeRegisteredTwice, checkAppliers(0, &twice));
-
-    // A router-owned type with a callback as well: applied twice.
-    var both = full;
-    both.register(.ts_write, @ptrCast(&ctx), Noop.apply);
-    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliers(0, &both));
+    // This build's machines, the Raft node's config and the two lists cover
+    // every type once; the cases that refuse are under `checkAppliersWith`.
+    try checkAppliers(0);
 }
 
-test "applyCommitted: an applier that proposes does not re-enter the drain" {
+test "applyCommitted: a drain that finds one already running applies nothing, and leaves it to that one" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-
     var shard = try Shard.init(std.testing.allocator, 0, 4, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
-
-    // An applier that proposes in turn, the way a dequeue's auto-ack does
-    // from inside a notification. It records what it observes.
-    const Probe = struct {
-        var shard_ptr: *Shard = undefined;
-        var last_applied_seen: u64 = 0;
-        var nested_saw_kv: bool = false;
-        var calls: u32 = 0;
-        fn apply(_: *anyopaque, _: *const entry_mod.Entry, _: *persistence_mod.Result) persistence_mod.ApplyError!void {
-            calls += 1;
-            const shard_inner = shard_ptr;
-            last_applied_seen = shard_inner.raft_node.last_applied;
-            _ = kv_handler_mod.KVHandler.testProposePut(shard_inner, "nested", "v") catch unreachable;
-            _ = shard_inner.applyCommitted();
-            nested_saw_kv = shard_inner.kv_handler.kv.getIn(.default, "nested") != null;
-        }
-    };
-    Probe.shard_ptr = &shard;
-    var ctx: u8 = 0;
-    shard.replay_registry.register(.raft_snapshot, @ptrCast(&ctx), Probe.apply);
-
-    const idx = (try persistence_mod.proposeEntry(&shard, .raft_snapshot, entry_mod.Flags.NONE, "", "probe", "")).index;
     try std.testing.expect(shard.applyCommitted());
-
-    // The entry in hand was marked applied before its applier ran, so a
-    // nested drain had nothing to take twice; and that drain was a no-op,
-    // leaving the nested proposal to the outer loop.
-    try std.testing.expectEqual(idx, Probe.last_applied_seen);
-    try std.testing.expect(!Probe.nested_saw_kv);
+    const before = shard.raft_node.last_applied;
+    // As from inside an apply's after-steps: the outer drain is running.
+    shard.applying = true;
+    _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "nested", "v");
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expectEqual(before, shard.raft_node.last_applied);
+    try std.testing.expect(shard.kv_handler.kv.getIn(.default, "nested") == null);
+    // The outer drain takes it.
+    shard.applying = false;
+    try std.testing.expect(shard.applyCommitted());
     try std.testing.expect(shard.kv_handler.kv.getIn(.default, "nested") != null);
     try std.testing.expectEqual(shard.raft_node.commit_index, shard.raft_node.last_applied);
-    try std.testing.expectEqual(@as(u32, 1), Probe.calls);
 }
 
 test "Shard: the reap duty keeps up with more keys going a second than one reap names, and waits for its reaps to apply" {
@@ -26536,9 +26560,9 @@ test "an entry repeating an index the partition holds is counted as a duplicate,
     var e = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
     e.header.crc32c = e.computeCrc();
     var out = persistence_mod.Result.start(&e);
-    const first = applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &e, &out);
+    const first = applyEntryCore(shard.defaultPartition(), shard.raft_node, &e, &out);
     try std.testing.expect(first == .applied);
-    const again = applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &e, &out);
+    const again = applyEntryCore(shard.defaultPartition(), shard.raft_node, &e, &out);
     try std.testing.expect(again == .partition_reject);
     try std.testing.expect(verdictOf(&shard.losses, shard.id, Shard.nowMs(), &e, again) == .duplicate);
 
@@ -26551,10 +26575,10 @@ test "an entry repeating an index the partition holds is counted as a duplicate,
     var k = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 2, 1, put);
     k.header.crc32c = k.computeCrc();
     var kout = persistence_mod.Result.start(&k);
-    const kfirst = applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &k, &kout);
+    const kfirst = applyEntryCore(shard.defaultPartition(), shard.raft_node, &k, &kout);
     try std.testing.expect(kfirst == .applied);
     kout = persistence_mod.Result.start(&k);
-    const kagain = applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &k, &kout);
+    const kagain = applyEntryCore(shard.defaultPartition(), shard.raft_node, &k, &kout);
     try std.testing.expect(verdictOf(&shard.losses, shard.id, Shard.nowMs(), &k, kagain) == .duplicate);
 
     try std.testing.expectEqual(@as(u64, 0), shard.losses.total(.partition_reject));
@@ -27122,13 +27146,13 @@ test "checkAppliers: a type a contract machine owns may have no other applier, a
         }
     };
     const listed_now = contract_machines.list;
-    try checkAppliersWith(&listed_now, 0, &shard.replay_registry);
+    try checkAppliersWith(&listed_now, 0);
     // A type nothing else applies: the machine is its applier.
-    try checkAppliersWith(&(listed_now ++ .{Toy.owning(.raft_snapshot)}), 0, &shard.replay_registry);
-    // Registered by a handler too: refused.
-    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.raft_config)}), 0, &shard.replay_registry));
+    try checkAppliersWith(&(listed_now ++ .{Toy.owning(.raft_snapshot)}), 0);
+    // The Raft node's config, owned by a machine too: refused.
+    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.raft_config)}), 0));
     // KV's types are its machine's: without it, they have no applier.
-    try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliersWith(&.{}, 0, &shard.replay_registry));
+    try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliersWith(&.{}, 0));
 }
 
 test "applyEntryCore: a machine reads the streams every entry below its own left" {
@@ -27164,7 +27188,7 @@ test "applyEntryCore: a machine reads the streams every entry below its own left
     var out: persistence_mod.Result = .{};
     out.reset(&e);
     const machines = contract_machines.list ++ .{Reader.machine};
-    try std.testing.expect(applyEntryCoreWith(&machines, shard.defaultPartition(), &shard.replay_registry, &e, &out) == .applied);
+    try std.testing.expect(applyEntryCoreWith(&machines, shard.defaultPartition(), shard.raft_node, &e, &out) == .applied);
     try std.testing.expectEqual(@as(usize, 2), Reader.n);
     try std.testing.expect(Reader.seen[0].eql(shard.stream_handler.stream.streamFirstId(Reader.hash)));
     try std.testing.expect(Reader.seen[1].eql(shard.stream_handler.stream.streamLastId(Reader.hash)));
@@ -27191,7 +27215,7 @@ test "applyEntryCore: a forced delete of a stream with groups moves their genera
     index += 1;
     var out: persistence_mod.Result = .{};
     out.reset(&create);
-    try std.testing.expect(applyEntryCore(p, &shard.replay_registry, &create, &out) == .applied);
+    try std.testing.expect(applyEntryCore(p, shard.raft_node, &create, &out) == .applied);
 
     const hash = stream_mod.streamKey(.default, "s");
     const genOf = struct {
@@ -27210,7 +27234,7 @@ test "applyEntryCore: a forced delete of a stream with groups moves their genera
         index += 1;
         const del = entry_mod.buildEntry(.stream_delete, flags, shard.raft_node.current_term, index, 2, buf[0..cmd.serialize(&buf).?]);
         out.reset(&del);
-        try std.testing.expect(applyEntryCore(p, &shard.replay_registry, &del, &out) == .applied);
+        try std.testing.expect(applyEntryCore(p, shard.raft_node, &del, &out) == .applied);
         try std.testing.expectEqual(flags == entry_mod.Flags.NONE, out.refused() != null);
         try std.testing.expectEqual(gen, genOf(p, hash));
     }
@@ -27220,13 +27244,12 @@ test "applyEntryCore: a KV entry delivered twice applies once, and is a duplicat
     var part = try Partition.init(std.testing.allocator, 0, 8192, 0);
     defer part.deinit();
     part.wireProjections();
-    var registry: ReplayRegistry = .{};
     var buf: [64]u8 = undefined;
     const e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 1, 0, try kv_entries.Put.encodeInto(&buf, .{ .key = TEST_KV_K, .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null }));
     for (0..2) |i| {
         var out: persistence_mod.Result = .{};
         out.reset(&e);
-        const got = applyEntryCore(&part, &registry, &e, &out);
+        const got = applyEntryCore(&part, null, &e, &out);
         if (i == 0) try std.testing.expect(got == .applied) else try std.testing.expect(got == .partition_reject and got.partition_reject == error.IndexNotIncreasing);
     }
     try std.testing.expectEqual(@as(u64, 1), part.kv.getIn(.default, "k").?.version);
@@ -29266,17 +29289,14 @@ test "Shard: two replicas applying the same log find the same bars, the state a 
         var part = try Partition.init(allocator, 0, 8192, 0);
         defer part.deinit();
         part.wireProjections();
-        var registry: ReplayRegistry = .{};
         var last: u64 = 0;
         var since: u64 = 0;
         for (&entries) |*e| {
             var out: persistence_mod.Result = .{};
             out.reset(e);
             const before = part.store.encodedBytes();
-            // A stream append has no applier in a bare registry; the
-            // partition takes and counts it all the same.
-            const res = applyEntryCore(&part, &registry, e, &out);
-            try std.testing.expect(res == .applied or (res == .no_applier and e.header.entry_type == @backingInt(entry_mod.EntryType.stream_append)));
+            const res = applyEntryCore(&part, null, e, &out);
+            try std.testing.expect(res == .applied);
             // A bar is the first index whose bytes since the last reach the
             // larger of the minimum and the state before it.
             since += entry_mod.HEADER_SIZE + e.payload.len;
@@ -29862,14 +29882,14 @@ test "Shard: a carried stream append its client path would refuse is refused as 
     try ce.Message.encode(&w, .{ .slot = 1, .entry_type = @backingInt(entry_mod.EntryType.stream_append), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = unnamed });
     var ib: [2048]u8 = undefined;
     const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
-    const highest = b.defaultPartition().highest_namespace;
+    const highest = highestNamespaceIn(&b.defaultPartition().store);
     const e = entry_mod.buildEntry(.channel_inbound, 0, b.raft_node.current_term, b.raft_node.last_applied + 1, 1, inbound);
     var out = persistence_mod.Result.start(&e);
     try std.testing.expect(b.applyEntry(&e, &out));
     try std.testing.expectEqual(@as(u64, 2), channels_mod.inOf(.{ .store = &b.defaultPartition().store }, 0).?.applied);
     try std.testing.expectEqual(@as(u64, 2), b.channel.sender_bugs[0][@backingInt(contract_store.SenderBug.bad_payload)]);
     try std.testing.expect(stream_machine.metaOf(.{ .store = &b.defaultPartition().store }, .default, "") == null);
-    try std.testing.expectEqual(highest, b.defaultPartition().highest_namespace);
+    try std.testing.expectEqual(highest, highestNamespaceIn(&b.defaultPartition().store));
     var sm: @import("../metrics/registry.zig").ShardMetrics = .{ .shard_id = 1 };
     b.shard_metrics = &sm;
     defer b.shard_metrics = null;

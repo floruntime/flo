@@ -14,9 +14,6 @@ pub const AppliedMessage = struct {
     result: @import("../storage/persistence.zig").Result,
     /// Its place in the inbound.
     ordinal: u8,
-    /// Its type's applier runs once the inbound has committed: the
-    /// channels machine only took its seq.
-    after_commit: bool = false,
     /// The group that sent it, and its seq there.
     from: u16 = 0,
     seq: u64 = 0,
@@ -65,8 +62,8 @@ pub const Applying = struct { from: u16, seq: u64 };
 pub const SenderBug = enum(u8) {
     /// For a slot this group doesn't own.
     wrong_slot,
-    /// A message applied after the commit that wouldn't apply, or that its
-    /// client path refuses (`channels.AfterCommit`).
+    /// A payload its machine says can't apply (`Machine.malformed`), or
+    /// naming a namespace no namespace could have (`Machine.namespace`).
     bad_payload,
     /// Sent with no origin kind or for no namespace, for a reserved one by
     /// a user, with a payload naming a namespace other than its origin's,
