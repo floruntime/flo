@@ -683,12 +683,12 @@ fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64
     };
     const ended_steps = comptime plant.active == .runs_ended_takes_step;
     if (!ended_steps and statusOf(run).isTerminal()) return out.refuse(.conflict, .unclassified, "conflict: the run has ended");
-    if (st.rev != run.rev) return out.refuse(.conflict, .unclassified, "conflict: the run moved on from that step");
+    if (comptime plant.active != .runs_step_rev_unchecked) if (st.rev != run.rev) return out.refuse(.conflict, .unclassified, "conflict: the run moved on from that step");
     if (st.progress.len > MAX_PROGRESS) return out.refuse(.bad_request, .unclassified, "a step's counters are past their bound");
     // A step leaves its run's call only by taking its end, or by ending the
     // run (the call then goes with the run, unanswered).
     const leaves_call = run.wait == .call and !(st.wait == .call and std.mem.eql(u8, st.wait_on, run.wait_on));
-    if (leaves_call and ends == null and st.settles.len == 0) return out.refuse(.conflict, .unclassified, "conflict: the step leaves its run's call unsettled");
+    if (comptime plant.active != .runs_call_left_unsettled) if (leaves_call and ends == null and st.settles.len == 0) return out.refuse(.conflict, .unclassified, "conflict: the step leaves its run's call unsettled");
     if (st.settles.len > 0) {
         if (run.wait != .call or !std.mem.eql(u8, run.wait_on, st.settles)) return out.refuse(.conflict, .unclassified, "conflict: the run waits on another call");
         if (st.caller_slot != calls_mod.callerSlot(n.ns, run.workflow)) return error.Halt;
@@ -698,9 +698,9 @@ fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64
         if (try view.get(calls_mod.Calls, k)) |call| {
             switch (call.v.state) {
                 .done, .refused, .no_action => {},
-                .sent, .started => return out.refuse(.conflict, .unclassified, "conflict: the run's call hasn't ended"),
+                .sent, .started => if (comptime plant.active != .runs_settle_before_call_ends) return out.refuse(.conflict, .unclassified, "conflict: the run's call hasn't ended"),
             }
-            try view.delete(calls_mod.Calls, k);
+            if (comptime plant.active != .runs_settled_call_kept) try view.delete(calls_mod.Calls, k);
         }
     }
 
@@ -758,6 +758,8 @@ fn endRun(view: *View, n: Named, run_key: []const u8, run: *Run.Value, status: R
     run.output = output orelse "";
     if (tags.len > 0) run.search_tags = tags;
     run.wait = .none;
+    run.wait_kind = .action;
+    run.wait_slot = 0;
     run.wait_on = "";
     run.wait_due_ms = 0;
     run.wait_timeout_to = "";
@@ -1178,6 +1180,24 @@ test "workflow runs machine: a step's call is recorded and its start sent with i
     try testing.expectEqual(Wait.none, f.get("r1").?.wait);
     // Its record went with it.
     try testing.expect(calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1") == null);
+}
+
+test "workflow runs machine: a call settled refused stays refused when its run's end arrives after" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    var cb: [ae.Call.max_size]u8 = undefined;
+    const call = try ae.Call.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .kind = .action, .caller_run = "r1", .caller_workflow = "wf", .step = "s", .target = "act", .version = "", .run = "a1", .input = "{}", .can_wait = false });
+    _ = try f.step("r1", .{ .rev = 0, .wait = .call, .wait_on = "a1", .call = call });
+    const slot = calls_mod.callerSlot(.default, "wf");
+    var rb: [ae.Reply.max_size]u8 = undefined;
+    _ = try f.answer(.call_reply, try ae.Reply.encodeInto(&rb, .{ .ns = NamespaceId.default.int(), .slot = slot, .run = "a1", .answer = .skipped, .why = "repaired" }));
+    var db: [ae.Done.max_size]u8 = undefined;
+    _ = try f.answer(.call_done, try ae.Done.encodeInto(&db, .{ .ns = NamespaceId.default.int(), .slot = slot, .run = "a1", .status = .completed, .outcome = "", .result = "{}" }));
+    const c = calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1").?;
+    try testing.expectEqual(calls_mod.State.refused, c.state);
+    try testing.expectEqualStrings("repaired", c.outcome);
+    try testing.expectEqualStrings("", c.result);
 }
 
 test "workflow runs machine: a step whose counters are past their bound is refused, writing nothing" {
