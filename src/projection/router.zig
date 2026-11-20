@@ -104,7 +104,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
 
         // Workflows: their contract machines (workflow/defs_machine.zig,
         // workflow/runs_machine.zig).
-        .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step => .none,
+        .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step, .workflow_signal => .none,
         .namespace_create => .none,
         // Actions: their contract machine (actions/machine.zig).
         .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => .none,

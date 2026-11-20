@@ -1057,6 +1057,7 @@ fn stepValue(r: std.Random, buf: []u8, c: usize, run: WorkflowRuns.RunL) ?[]cons
         .wait_timeout_to = "",
         .progress = if (r.uintLessThan(u8, 100) < 3) &OVERSIZED else PROGRESS[r.uintLessThan(usize, PROGRESS.len)],
         .settles = "",
+        .takes = .{ .bytes = "", .count = 0 },
         .caller_slot = 0,
         .workflow = wf,
         .ends = 0,

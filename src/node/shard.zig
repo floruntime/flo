@@ -24491,19 +24491,22 @@ test "a workflow cancel is answered when its entry applies, and the run ends the
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status());
     try std.testing.expect(run.inFlight());
 
-    // A signal meanwhile is refused as retryable, and doesn't move it.
+    // A signal meanwhile is logged after it: it applies to an ended run,
+    // and is told so.
     var sig: [4]u8 = undefined;
     std.mem.writeInt(u16, sig[0..2], 2, .little);
     @memcpy(sig[2..4], "go");
     t.send(.workflow_signal, 43, id, &sig);
-    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expectEqual(@as(u32, 2), t.shard.pending_count);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status());
 
     try ParkTest.ack(&t.shard);
-    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
-    try std.testing.expectEqual(@as(u64, 42), one[0].header.request_id);
+    var two: [2]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &two);
+    try std.testing.expectEqual(@as(u64, 42), two[0].header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), two[0].header.status);
+    try std.testing.expectEqual(@as(u64, 43), two[1].header.request_id);
+    try std.testing.expectEqualStrings("run already finished", (try two[1].refused()).message);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status());
 }
 
@@ -24590,9 +24593,46 @@ fn raceTestEndingRun(t: *RaceTest, buf: []u8, one: []proto.Response, id_buf: *[3
     std.mem.writeInt(u16, sig[0..2], 2, .little);
     @memcpy(sig[2..4], "go");
     t.send(.workflow_signal, 50, id, &sig);
+    // Answered once it commits; the run wakes there, and its leader logs
+    // the step that ends it.
+    try ParkTest.ack(&t.shard);
     try ParkTest.responses(&t.shard, t.conn, t.pair[1], buf, one);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    t.shard.workflow_handler.advanceStartedRuns(&t.shard);
     return id;
+}
+
+test "a workflow signal a later leader's log drops is answered as not run, and neither kept nor waking its run" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    const r = t.shard.raft_node;
+    var id_buf: [32]u8 = undefined;
+    const data = try raceTestWaitingRun(&t, &buf, &one);
+    const id = id_buf[0..data.len];
+    @memcpy(id, data);
+    const run = raceTestRun(&t, id);
+    var sig: [4]u8 = undefined;
+    std.mem.writeInt(u16, sig[0..2], 2, .little);
+    @memcpy(sig[2..4], "go");
+    t.send(.workflow_signal, 50, id, &sig);
+    const before = r.log.lastIndex() - 1;
+    const term = r.current_term;
+    try std.testing.expectEqual(@as(u32, 1), t.shard.pending_count);
+
+    // Node 2 leads term + 1, replaces the signal with its no-op and
+    // commits it.
+    var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, term + 1, before + 1, r.log.last_stamp + 1, "");
+    noop.header.crc32c = noop.computeCrc();
+    _ = try r.handleAppendEntries(.{ .term = term + 1, .leader_id = 2, .prev_log_index = before, .prev_log_term = term, .entries = (&noop)[0..1], .leader_commit = before + 1 });
+    _ = t.shard.applyCommitted();
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expect(std.mem.indexOf(u8, (try one[0].refused()).message, "leader changed") != null);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status());
+    try std.testing.expect(!try @import("../workflow/runs_machine.zig").hasSignal(std.testing.allocator, .{ .store = &t.shard.defaultPartition().store }, run.key(), "go"));
 }
 
 test "a workflow completion a later leader's log drops leaves the run unfinished, and the node ends it once it leads again" {
@@ -24627,19 +24667,19 @@ test "a workflow completion a later leader's log drops leaves the run unfinished
     try std.testing.expect(!run.inFlight());
     try std.testing.expectEqual(@as(u64, 0), registry.workflow.completed_total.load(.monotonic));
 
-    // Elected again, it proposes the completion again; once that commits
+    // Elected again, it takes the step again from what applied; once that commits
     // the run has ended, counted once.
     r.current_term = term + 2;
     r.role = .leader;
     r.ready_index = r.log.lastIndex();
-    t.shard.workflow_handler.checkPendingActions(&t.shard);
+    t.shard.workflow_handler.advanceStartedRuns(&t.shard);
     try std.testing.expect(run.inFlight());
     try ParkTest.ack(&t.shard);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status());
     try std.testing.expectEqual(@as(u64, 1), registry.workflow.completed_total.load(.monotonic));
 }
 
-test "a cancel or signal while a workflow's completion is in flight is told to retry, and after it commits, that the run finished" {
+test "a cancel and a signal while a run's ending step is in flight apply after it: one moves the run, and each other is told it finished" {
     var t: RaceTest = undefined;
     try t.init();
     defer t.deinit();
@@ -24649,24 +24689,25 @@ test "a cancel or signal while a workflow's completion is in flight is told to r
     const id = try raceTestEndingRun(&t, &buf, &one, &id_buf);
     const run = raceTestRun(&t, id);
 
+    // Neither is told to retry: each is logged behind the step.
     t.send(.workflow_cancel, 51, id, "");
-    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
-    try std.testing.expectEqualStrings("run is taking a step — retry", (try one[0].refused()).message);
     var sig: [4]u8 = undefined;
     std.mem.writeInt(u16, sig[0..2], 2, .little);
     @memcpy(sig[2..4], "go");
     t.send(.workflow_signal, 52, id, &sig);
-    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
-    try std.testing.expectEqual(@as(u32, 0), t.shard.pending_count);
+    try std.testing.expectEqual(@as(u32, 2), t.shard.pending_count);
 
+    // One ack commits all three: the step ends the run, and the cancel and
+    // the signal, applied after it, are refused, applied never.
     try ParkTest.ack(&t.shard);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status());
-    t.send(.workflow_cancel, 53, id, "");
-    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
-    try std.testing.expectEqualStrings("run already finished", (try one[0].refused()).message);
+    var two: [2]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &two);
+    for (two, [_]u64{ 51, 52 }) |a, want| {
+        try std.testing.expectEqual(want, a.header.request_id);
+        try std.testing.expectEqualStrings("run already finished", (try a.refused()).message);
+    }
+    try std.testing.expectEqual(@as(u32, 0), t.shard.pending_count);
 }
 
 test "a halted shard's duties stop, and one with work counts as held until the shard serves again" {
@@ -30275,6 +30316,7 @@ fn proposeCallOf(s: *Shard, kind: action_entries.CallKind, target: []const u8, w
         .wait_timeout_to = "",
         .progress = "",
         .settles = "",
+        .takes = .{ .bytes = "", .count = 0 },
         .caller_slot = calls_machine.callerSlot(.default, workflow),
         .workflow = workflow,
         .ends = 0,
@@ -30580,6 +30622,96 @@ test "Shard: a workflow run whose action ended just before a leader change finis
 
     // Another node leads now: the same log and applied state, none of the
     // old leader's memory. It finds the run from the log, and ends it.
+    var fresh = WorkflowHandler.init(std.testing.allocator);
+    defer fresh.deinit();
+    fresh.store = &shard.defaultPartition().store;
+    fresh.namespaces = shard.workflow_handler.namespaces;
+    const old = shard.workflow_handler;
+    shard.workflow_handler = &fresh;
+    defer shard.workflow_handler = old;
+    fresh.rewatch = true;
+    fresh.checkPendingActions(shard);
+    try ParkTest.ack(shard);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, fresh.inspect(key).?.status);
+}
+
+test "Shard: a workflow step its leader logged and lost with its leadership is taken again by the next leader, once" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const shard = &t.shard;
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [1024]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    _ = try proposeAction(shard, .action_register, testRegister("act"));
+    try ParkTest.ack(shard);
+    const def =
+        \\{"kind":"Workflow","name":"flow","version":"1.0.0",
+        \\"start":{"run":"@actions/act","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+    ;
+    try ParkTest.send(shard, conn, .workflow_create, 20, "flow", def);
+    try ParkTest.ack(shard);
+    try ParkTest.responses(shard, conn, pair[1], &buf, &one);
+    try ParkTest.send(shard, conn, .workflow_start, 21, "flow", "");
+    try ParkTest.ack(shard);
+    try ParkTest.responses(shard, conn, pair[1], &buf, &one);
+    var id_buf: [32]u8 = undefined;
+    const run_id = id_buf[0..one[0].data.len];
+    @memcpy(run_id, one[0].data);
+    // Its first step calls the action, whose run starts.
+    shard.workflow_handler.advanceStartedRuns(shard);
+    try ParkTest.ack(shard);
+    shard.workflow_handler.advanceStartedRuns(shard);
+    try ParkTest.deliverOwn(shard);
+    var rid_buf: [64]u8 = undefined;
+    const rid = blk: {
+        var rit = shard.defaultPartition().store.range(action_machine.Runs.ID, "");
+        const k = rit.next().?.key();
+        @memcpy(rid_buf[0 .. k.len - 4], k[4..]);
+        break :blk rid_buf[0 .. k.len - 4];
+    };
+    // The action's run is taken and completed, and its end reaches the
+    // call: all logged. The step hasn't resumed when the leader changes.
+    const ready = ActionsHandler.for_tests.run(shard, .default, rid).?;
+    _ = try proposeAction(shard, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = rid, .due_ns = ready.due_ns, .holder = "w", .request_key = null, .lease_ms = 300_000 });
+    try ParkTest.ack(shard);
+    const held = ActionsHandler.for_tests.run(shard, .default, rid).?;
+    _ = try proposeAction(shard, .action_settle, action_entries.Settle.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = rid, .holder = "w", .request_key = null, .deliveries = held.deliveries, .token = held.token, .expiry_ns = held.expiry_ns, .outcome = "", .result = "" });
+    try ParkTest.ack(shard);
+    try ParkTest.deliverOwn(shard);
+    try std.testing.expectEqual(calls_machine.State.done, callIn(shard, "flow", rid).?.state);
+
+    // Every node holds the run as the leader does: waiting on that call.
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var r = try replicaOf(shard, pipe_fds[0]);
+    defer r.deinit();
+    var kb: [64]u8 = undefined;
+    @memcpy(kb[0..4], &ns_table.Id.default.bytes());
+    @memcpy(kb[4..][0..run_id.len], run_id);
+    const key = kb[0 .. 4 + run_id.len];
+    try std.testing.expectEqual(calls_machine.State.done, callIn(&r, "flow", rid).?.state);
+    const there = r.workflow_handler.inspect(key).?;
+    const here = shard.workflow_handler.inspect(key).?;
+    try std.testing.expectEqual(here.status, there.status);
+    try std.testing.expectEqual(here.rev, there.rev);
+    try std.testing.expectEqualStrings(here.pending_action_run_id_owned.?, there.pending_action_run_id_owned.?);
+
+    // The old leader takes the run's next step: logged, not committed, and
+    // cut from the log with its leadership.
+    const before = shard.raft_node.log.lastIndex();
+    shard.workflow_handler.checkPendingActions(shard);
+    try std.testing.expectEqual(before + 1, shard.raft_node.log.lastIndex());
+    try std.testing.expectEqual(@as(u32, 1), shard.workflow_handler.stepping.count());
+    shard.raft_node.log.truncateAfter(before);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, shard.workflow_handler.inspect(key).?.status);
+
+    // Another node leads now: none of the old leader's memory. It takes the
+    // step again from what applied, and ends the run, once.
     var fresh = WorkflowHandler.init(std.testing.allocator);
     defer fresh.deinit();
     fresh.store = &shard.defaultPartition().store;

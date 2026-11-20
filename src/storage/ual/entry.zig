@@ -130,6 +130,8 @@ pub const EntryType = enum(u8) {
     workflow_enabled = 0x53,
     /// A step a run's leader took (`runs_machine.Step`), keyed by the run.
     workflow_step = 0x57,
+    /// A client's signal to a run (`runs_machine.Signal`), keyed by the run.
+    workflow_signal = 0x58,
     /// A child workflow's start, a message from its parent's call; and a
     /// child its shard couldn't start.
     child_start = 0x55,
@@ -195,7 +197,7 @@ pub const EntryType = enum(u8) {
             .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean, .group_steal, .group_requeue, .group_drop => false,
             .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,
             .cg_create => true,
-            .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step => true,
+            .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step, .workflow_signal => true,
             .processing_submit, .processing_stop, .processing_cancel, .processing_remove => true,
             // A sink batch's payload is a schema (`protocol/processing_entries.zig`).
             .processing_sink_batch => false,
