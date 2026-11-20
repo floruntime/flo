@@ -26,6 +26,7 @@ const store_mod = @import("../contract/store.zig");
 const machine_mod = @import("../contract/machine.zig");
 const kv_machine = @import("../kv/machine.zig");
 const view_mod = @import("../contract/view.zig");
+const kv_reap_workload = @import("kv_reap_workload.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
 const Workload = @import("workload.zig").Workload;
 const limits = @import("../protocol/limits.zig");
@@ -336,6 +337,11 @@ pub const Counter = struct {
 pub const Kv = struct {
     store: store_mod.Store,
     scratch: std.heap.ArenaAllocator,
+    /// The highest version each of the reap workload's keys has had, in any
+    /// of its lives: a key written after it went must start past it.
+    reap_versions: [kv_reap_workload.KEYS]?u64 = @splat(null),
+    /// What `ReapRuleBroken` broke.
+    reap_broke: ?[]const u8 = null,
     /// What an entry did, for a run's counts (`Counts`).
     pub const Effect = enum {
         other,
@@ -353,6 +359,8 @@ pub const Kv = struct {
         merged,
         /// A JSON patch that deleted a field.
         field_deleted,
+        /// A reap that dropped one of the keys it names.
+        reaped,
     };
 
     /// Entries by outcome, each counted once however many replicas apply it.
@@ -366,6 +374,7 @@ pub const Kv = struct {
         batch_condition_refusals: u64 = 0,
         /// Counted by the simulator, which knows what a batch asked.
         batch_conditions_held: u64 = 0,
+        reaps: u64 = 0,
 
         pub fn count(self: *Counts, o: Effect) void {
             switch (o) {
@@ -388,6 +397,7 @@ pub const Kv = struct {
                 .condition_held => self.conditions_held += 1,
                 .merged => self.merges += 1,
                 .field_deleted => self.field_deletes += 1,
+                .reaped => self.reaps += 1,
             }
         }
     };
@@ -408,6 +418,7 @@ pub const Kv = struct {
 
     /// Empty, as a restarted replica starts; still strict.
     pub fn reset(self: *Kv) void {
+        self.reap_versions = @splat(null);
         self.store.clear();
         std.debug.assert(self.store.strict_keys);
     }
@@ -422,7 +433,70 @@ pub const Kv = struct {
     /// than the key as it stood says, and `BatchRefusedWrong` if a batch that
     /// asks what can't hold was refused for another reason or op. Any other
     /// error (a halt, out of memory) is one a workload entry must never meet.
-    pub fn apply(self: *Kv, e: *const entry_mod.Entry, r: Replica) (persistence.ApplyError || error{ RefusalChangedState, ConditionDecidedWrong, BatchRefusedWrong })!Effect {
+    pub fn apply(self: *Kv, e: *const entry_mod.Entry, r: Replica) (persistence.ApplyError || error{ RefusalChangedState, ConditionDecidedWrong, BatchRefusedWrong, ReapRuleBroken })!Effect {
+        // Each key as it stood, its value left out: the store's bytes may
+        // not outlive the apply.
+        var before: [kv_reap_workload.KEYS]?kv_machine.Current = undefined;
+        for (&before, 0..) |*b, i| b.* = if (self.reapKey(i)) |c| blk: {
+            var copy = c;
+            copy.value = "";
+            break :blk copy;
+        } else null;
+        const effect = try self.applyEntry(e, r);
+        self.reap_broke = self.reapRule(e, before);
+        if (self.reap_broke != null) return error.ReapRuleBroken;
+        const named = reapNamed(e);
+        for (named, before, 0..) |n, b, i| if (n and b != null and self.reapKey(i) == null) return .reaped;
+        return effect;
+    }
+
+    fn reapKey(self: *Kv, i: usize) ?kv_machine.Current {
+        return (view_mod.ReadView{ .store = &self.store }).get(kv_machine.Values, kv_reap_workload.key(i)) catch null;
+    }
+
+    /// The reap workload's keys after `e`, which found each as `before`
+    /// says: a reap drops each key it names that had gone by its stamp and
+    /// leaves every other one as it was (the leader names what had gone by
+    /// its clock, and a write may apply in between), a tombstone keeps no
+    /// history, and a key written after it went starts past every version
+    /// it had, or a CAS read before it went could match.
+    fn reapRule(self: *Kv, e: *const entry_mod.Entry, before: [kv_reap_workload.KEYS]?kv_machine.Current) ?[]const u8 {
+        const named = reapNamed(e);
+        const stamp = e.header.timestamp_ns;
+        for (0..kv_reap_workload.KEYS) |i| {
+            const was = before[i];
+            const now = self.reapKey(i);
+            if (named[i]) if (was) |b| {
+                if (kv_reap_workload.gone(b, stamp)) {
+                    if (now != null) return "a reap left a key it names that had gone by its stamp";
+                } else {
+                    const n = now orelse return "a reap dropped a key it names that hadn't gone by its stamp";
+                    if (n.version != b.version or n.lsn != b.lsn or n.timestamp_ns != b.timestamp_ns or n.expiry_ns != b.expiry_ns or n.tombstone != b.tombstone)
+                        return "a reap changed a key it names that hadn't gone by its stamp";
+                }
+            };
+            const cur = now orelse continue;
+            if (cur.tombstone and cur.history_count != 0) return "a tombstone keeps its key's history";
+            if (was == null) if (self.reap_versions[i]) |had| if (cur.version <= had) return "a key written after it went repeats a version it had: a CAS read before it went would match";
+            self.reap_versions[i] = @max(self.reap_versions[i] orelse 0, cur.version);
+        }
+        return null;
+    }
+
+    /// Which of the reap workload's keys `e` reaps.
+    fn reapNamed(e: *const entry_mod.Entry) [kv_reap_workload.KEYS]bool {
+        var out: [kv_reap_workload.KEYS]bool = @splat(false);
+        if (e.header.entry_type != @backingInt(entry_mod.EntryType.kv_reap)) return out;
+        var diag: schema.Diagnostic = .{};
+        const p = kv_entries.Reap.decodeAll(e.payload, &diag) catch return out;
+        var it = p.keys.iterator();
+        while (it.next() catch return out) |k| for (0..kv_reap_workload.KEYS) |i| {
+            if (std.mem.eql(u8, k.key, kv_reap_workload.key(i))) out[i] = true;
+        };
+        return out;
+    }
+
+    fn applyEntry(self: *Kv, e: *const entry_mod.Entry, r: Replica) (persistence.ApplyError || error{ RefusalChangedState, ConditionDecidedWrong, BatchRefusedWrong })!Effect {
         // Every replica may agree on a wrong decision, so no checksum sees it.
         const holds: ?bool = if (r.mutant == .kv_condition_local) null else if (conditionalPut(e)) |p| self.conditionHolds(p, e.header.timestamp_ns) else null;
         if (r.mutant == .kv_replay_skips_batches and !r.live and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) return .other;

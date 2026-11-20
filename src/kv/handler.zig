@@ -909,6 +909,18 @@ pub const KVHandler = struct {
         return try shard.raft_node.propose(entry_type, flags, bytes);
     }
 
+    /// The leader's reap of `keys`, each stored (`id ‖ key`): proposed;
+    /// each key goes when it commits if it has gone by the entry's stamp.
+    pub fn proposeReap(shard: *Shard, keys: []const kv_entries.ReapKey.Value) !@import("../raft/node.zig").ProposeResult {
+        // The shard's scratch: a reap's bound is too large for the stack a
+        // safe build fills on every call.
+        const buf = shard.scratch.borrow(kv_entries.Reap.max_size);
+        defer shard.scratch.release(buf);
+        var w: schema.Writer = .{ .buf = buf };
+        kv_entries.encodeReap(&w, keys) catch |err| return encodeError(err);
+        return try shard.raft_node.propose(.kv_reap, entry_mod.Flags.NONE, w.written());
+    }
+
     /// For tests: propose a put of `value` at `key` in the default
     /// namespace, as kv.set would.
     pub fn testProposePut(shard: *Shard, key: []const u8, value: []const u8) !@import("../raft/node.zig").ProposeResult {
