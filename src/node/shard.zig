@@ -4350,7 +4350,7 @@ pub const Shard = struct {
         };
         const index = at orelse self.edge.knownIndex(name);
         const asked = index != null or self.askingAbout(name);
-        w.* = .{ .active = true, .reply_to = conn.replyTo(), .origin = origin, .request_id = req.header.request_id, .bytes = bytes, .name = owned, .index = index, .local = at != null, .deadline_ms = now + edge_mod.WAIT_MS };
+        w.* = .{ .active = true, .seq = self.edge.takeSeq(), .reply_to = conn.replyTo(), .origin = origin, .request_id = req.header.request_id, .bytes = bytes, .name = owned, .index = index, .local = at != null, .deadline_ms = now + edge_mod.WAIT_MS };
         self.edge.count += 1;
         // One of the connection's requests waiting elsewhere, as a gather's.
         conn.forwards_in_flight += 1;
@@ -4409,12 +4409,26 @@ pub const Shard = struct {
     /// leader's index, so the name is resolved here, or the wait ran out.
     fn sweepEdge(self: *Shard, now: u64) void {
         const t = self.namespace_handler.table;
+        // Those resolved now run in the order they began waiting, not their
+        // slots': a slot freed earlier may hold a later request.
+        var ready: [edge_mod.WAITS]*edge_mod.Wait = undefined;
+        var n: usize = 0;
         for (&self.edge.waits) |*w| {
             if (!w.active) continue;
             if (w.index) |index| if (t.publishedIndex() >= index) {
-                self.resolveAtEdge(w, now);
-                continue;
+                ready[n] = w;
+                n += 1;
             };
+        }
+        std.mem.sortUnstable(*edge_mod.Wait, ready[0..n], {}, struct {
+            fn lessThan(_: void, a: *edge_mod.Wait, b: *edge_mod.Wait) bool {
+                return a.seq < b.seq;
+            }
+        }.lessThan);
+        for (ready[0..n]) |w| self.resolveAtEdge(w, now);
+        for (&self.edge.waits) |*w| {
+            if (!w.active) continue;
+            if (w.index) |index| if (t.publishedIndex() >= index) continue;
             if (now >= w.deadline_ms) {
                 self.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, proto.notRun(if (w.local)
                     "unavailable: the namespace is created but not yet on disk; the request was not run — retry"
@@ -12345,6 +12359,34 @@ test "Shard: a write on shard 1 to a namespace nobody created is answered once, 
     try std.testing.expectError(error.IncompleteResponse, nextAnswer(c, b, &out));
     try std.testing.expectEqual(@as(usize, 0), b.gathers.inUse());
     try std.testing.expectEqual(@as(usize, 0), b.reply_pool.taken());
+}
+
+test "Shard: pipelined writes to one key in a namespace nobody created apply in the order they were sent" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, nextNamespaceId(&two.shards[0]), 1, &kbuf);
+    // All three wait on the one create, and run as it is answered.
+    for ([_][]const u8{ "v1", "v2", "v3" }, 0..) |v, i| b.runRequest(c.conn, try ParkTest.request(.kv_put, 10 + i, "fresh", k, v, ""), .client);
+    for (0..4) |_| {
+        _ = try two.shards[0].tick(0);
+        two.settle();
+    }
+    var out: [512]u8 = undefined;
+    var answers: [3]proto.Response = undefined;
+    try ParkTest.responses(b, c.conn, c.pair[1], &out, &answers);
+    for (answers) |a| try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), a.header.status);
+    var body: [64]u8 = undefined;
+    b.runRequest(c.conn, edgeGet(&body, 20, "fresh", k), .client);
+    two.settle();
+    const got = try nextAnswer(c, b, &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), got.header.status);
+    var diag: schema.Diagnostic = .{};
+    try std.testing.expectEqualStrings("v3", (try table_run.op("kv.get").response.decodeAll(got.data, &diag)).value);
 }
 
 test "Shard: a write another shard forwards here, to a namespace nobody created, is answered once to that shard's client" {
@@ -27334,6 +27376,43 @@ test "Shard: a read resolved before shard 0 published its namespace routes by th
     // Published by the time the edge looks: let through, with that id.
     try std.testing.expect(!b.edgeMiss(c.conn, &req, .client));
     try std.testing.expectEqual(id, req.ns_id);
+}
+
+test "Shard: requests held at shard 0's edge until their namespace publishes run in the order they were sent, whatever slots they hold" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const a = &two.shards[0];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [2048]u8 = undefined;
+    // Applied on shard 0, not yet published to the node's table.
+    a.runRequest(c.conn, try ParkTest.request(.namespace_create, 1, "", "fresh", "", ""), .client);
+    _ = a.applyCommitted();
+    try std.testing.expect(two.namespaces.lookup("fresh") == null);
+    var bodies: [3][64]u8 = undefined;
+    for (&bodies, 0..) |*body, i| a.runRequest(c.conn, edgeGet(body, 10 + i, "fresh", "k"), .client);
+    // Held, each in a slot; a freed slot reused would put a later request
+    // in an earlier slot.
+    var held: [3]usize = undefined;
+    var n: usize = 0;
+    for (&a.edge.waits, 0..) |*w, i| if (w.active and std.mem.eql(u8, w.name, "fresh")) {
+        held[n] = i;
+        n += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 3), n);
+    std.mem.swap(edge_mod.Wait, &a.edge.waits[held[0]], &a.edge.waits[held[2]]);
+    for (0..4) |_| {
+        _ = try a.tick(0);
+        two.settle();
+    }
+    // The create's answer, then the three reads in the order sent.
+    var answers: [4]proto.Response = undefined;
+    try ParkTest.responses(a, c.conn, c.pair[1], &out, &answers);
+    try std.testing.expectEqual(@as(u64, 1), answers[0].header.request_id);
+    for (answers[1..], 10..) |r, id| try std.testing.expectEqual(@as(u64, id), r.header.request_id);
 }
 
 /// A first life of two shards under `data_dir`: namespace "xs" created,

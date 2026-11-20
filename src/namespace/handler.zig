@@ -708,7 +708,7 @@ pub const NamespaceHandler = struct {
                 i += 1;
                 continue;
             }
-            _ = self.waiters.swapRemove(i);
+            _ = self.waiters.orderedRemove(i);
             defer self.freeWaiter(w);
             if (w.kind == .published)
                 shard.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, proto.notRun(READ_UNSETTLED))
@@ -746,7 +746,9 @@ pub const NamespaceHandler = struct {
                 i += 1;
                 continue;
             }
-            _ = self.waiters.swapRemove(i);
+            // In the order they came: a client's pipelined writes waiting
+            // on one create run as it sent them.
+            _ = self.waiters.orderedRemove(i);
             defer self.freeWaiter(w);
             switch (how) {
                 // A read waiting on the create: refused, there is no
