@@ -4,10 +4,23 @@
 //! - `kv.value`: each key's current version (value, version, lsn, term,
 //!   stamp, expiry, tombstone, type) and its history's count and bytes.
 //! - `kv.history`: each key's older versions, keyed by version so a key's
-//!   chain is oldest first; past either bound the oldest go.
+//!   chain is oldest first; past either bound the oldest go. Best effort:
+//!   a delete, or an overwrite with a smaller value, drops the chain, so
+//!   what a key holds is never more than it held before.
 //! - `kv.ns_counts`: per namespace, its live keys, the bytes it stores,
-//!   its history's charge and the versions evicted. Kept by the same
-//!   entries that change the keys, so every replica counts the same.
+//!   its history's charge, the versions evicted, and its version floor.
+//!   Kept by the same entries that change the keys, so every replica counts
+//!   the same.
+//!
+//! The leader's reap (`kv_reap`) drops a key whose TTL ran out, and a
+//! tombstone once it is `kv_ops.TOMBSTONE_KEEP_MS` old, with its history.
+//! A key's versions never repeat: the reap raises its namespace's floor to
+//! the dropped key's version, and a key written where none is starts past
+//! the floor, so a CAS read before the key went can't match its next life.
+//! Versions grow per namespace, not per key's life. The floor is the
+//! shard's, in its namespace's counts: a key lives on one shard, so that
+//! holds; a logged move or split of keys between shards must carry the
+//! namespace's floor with them.
 //!
 //! Every key leads with its namespace's id (`id ‖ key`), in every family
 //! and every namespace, so a namespace's keys are one prefix and a key in
@@ -23,6 +36,7 @@ const limits = @import("../protocol/limits.zig");
 const time_units = @import("../util/time_units.zig");
 const view_mod = @import("../contract/view.zig");
 const machine_mod = @import("../contract/machine.zig");
+const plant = @import("../plant.zig");
 
 const Entry = entry_mod.Entry;
 const View = view_mod.View;
@@ -86,6 +100,14 @@ pub const Current = struct {
     pub fn expiredAt(self: Current, at_ns: u64) bool {
         return self.expiry_ns > 0 and self.expiry_ns <= at_ns;
     }
+
+    /// Whether a reap stamped `at_ns` drops it: its TTL ran out, or it is a
+    /// tombstone deleted `TOMBSTONE_KEEP_MS` before.
+    pub fn reapableAt(self: Current, at_ns: u64) bool {
+        if (self.tombstone) return at_ns >= self.timestamp_ns +| kv_ops.TOMBSTONE_KEEP_MS * std.time.ns_per_ms;
+        if (comptime plant.active == .kv_reap_keeps_expired) return false;
+        return self.expiredAt(at_ns);
+    }
 };
 
 /// An older version of a key.
@@ -144,23 +166,28 @@ pub const Counts = struct {
     history_bytes: u64 = 0,
     /// Older versions evicted by either bound, ever.
     history_evicted: u64 = 0,
+    /// The highest version a reaped key had: a key written where none is
+    /// starts past it.
+    version_floor: u64 = 0,
 
     pub fn encode(self: Counts, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        var b: [32]u8 = undefined;
+        var b: [40]u8 = undefined;
         std.mem.writeInt(u64, b[0..8], self.live, .little);
         std.mem.writeInt(u64, b[8..16], self.bytes, .little);
         std.mem.writeInt(u64, b[16..24], self.history_bytes, .little);
         std.mem.writeInt(u64, b[24..32], self.history_evicted, .little);
+        std.mem.writeInt(u64, b[32..40], self.version_floor, .little);
         try w.writeAll(&b);
     }
 
     pub fn decode(bytes: []const u8) error{Malformed}!Counts {
-        if (bytes.len != 32) return error.Malformed;
+        if (bytes.len != 40) return error.Malformed;
         return .{
             .live = std.mem.readInt(u64, bytes[0..8], .little),
             .bytes = std.mem.readInt(u64, bytes[8..16], .little),
             .history_bytes = std.mem.readInt(u64, bytes[16..24], .little),
             .history_evicted = std.mem.readInt(u64, bytes[24..32], .little),
+            .version_floor = std.mem.readInt(u64, bytes[32..40], .little),
         };
     }
 };
@@ -272,6 +299,11 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         .kv_incr => try declareStored(out, (kv_entries.Incr.decodeAll(e.payload, &diag) catch return).key),
         .kv_expire => try declareStored(out, (kv_entries.Expire.decodeAll(e.payload, &diag) catch return).key),
         .kv_json_patch => try declareStored(out, (kv_entries.JsonPatch.decodeAll(e.payload, &diag) catch return).key),
+        .kv_reap => {
+            const p = kv_entries.Reap.decodeAll(e.payload, &diag) catch return;
+            var it = p.keys.iterator();
+            while (it.next() catch return) |k| try declareStored(out, k.key);
+        },
         .kv_batch => {
             const batch = kv_entries.Batch.decodeAll(e.payload, &diag) catch return;
             const ns: NamespaceId = .of(batch.ns);
@@ -315,7 +347,7 @@ fn split(stored: []const u8) ApplyError!Key {
 
 /// Answers: put, the key's version; delete, whether the key was there
 /// (u8); incr, its version and value; expire, nothing; batch, its op
-/// count (u16); a JSON patch, the key's new version, 0 when it deleted the
+/// count (u16); reap, how many keys it dropped (u16); a JSON patch, the key's new version, 0 when it deleted the
 /// key. A payload that won't decode is a bug in the proposer, and
 /// halts. An incr that overflows or meets a non-counter, and an expire of a
 /// key that's gone, are refused; inside a batch they refuse the whole
@@ -350,6 +382,13 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         .kv_json_patch => {
             const p = kv_entries.JsonPatch.decodeAll(e.payload, &diag) catch return error.Halt;
             out.putInt(u64, try jsonPatch(view, try split(p.key), p.path, p.document, at, out));
+        },
+        .kv_reap => {
+            const p = kv_entries.Reap.decodeAll(e.payload, &diag) catch return error.Halt;
+            var it = p.keys.iterator();
+            var n: u16 = 0;
+            while (it.next() catch return error.Halt) |k| n += @intFromBool(try reap(view, try split(k.key), at));
+            out.putInt(u16, n);
         },
         .kv_batch => {
             // Decoded and checked whole before any op applies.
@@ -475,13 +514,20 @@ fn put(view: *View, q: Key, value: []const u8, value_type: ValueType, at: Stamp,
     if (try view.get(Values, vk)) |cur| {
         if (cur.tombstone) c.live += 1;
         c.bytes -|= cur.value.len;
-        const h = try pushVersion(view, q, cur, &c);
         next.version = cur.version + 1;
-        next.history_count = h.count;
-        next.history_bytes = h.bytes;
+        // A smaller value drops the history rather than keep the larger
+        // one: what the key holds never grows when its value shrinks.
+        if (value.len < cur.value.len) {
+            try dropHistory(view, q, cur, &c);
+        } else {
+            const h = try pushVersion(view, q, cur, &c);
+            next.history_count = h.count;
+            next.history_bytes = h.bytes;
+        }
     } else {
         c.live += 1;
         c.bytes += q.raw.len;
+        next.version = c.version_floor + 1;
     }
     c.bytes += value.len;
     try view.put(Values, vk, next);
@@ -499,13 +545,44 @@ fn delete(view: *View, q: Key, at: Stamp) ApplyError!bool {
     var next: Current = .{ .version = 1, .lsn = at.index, .term = at.term, .timestamp_ns = at.ns, .expiry_ns = 0, .tombstone = true, .value_type = .string, .history_count = 0, .history_bytes = 0, .value = "" };
     c.live -|= 1;
     c.bytes -|= cur.value.len;
-    const h = try pushVersion(view, q, cur, &c);
     next.version = cur.version + 1;
     next.expiry_ns = cur.expiry_ns;
     next.value_type = cur.value_type;
-    next.history_count = h.count;
-    next.history_bytes = h.bytes;
+    // A tombstone keeps nothing of the value: its bytes and its history go.
+    if (comptime plant.active == .kv_delete_keeps_history) {
+        const h = try pushVersion(view, q, cur, &c);
+        next.history_count = h.count;
+        next.history_bytes = h.bytes;
+    } else try dropHistory(view, q, cur, &c);
     try view.put(Values, vk, next);
+    try putCounts(view, q.ns, c);
+    return true;
+}
+
+/// Drop `q`'s history, all of it.
+fn dropHistory(view: *View, q: Key, cur: Current, c: *Counts) ApplyError!void {
+    for (0..cur.history_count) |_| {
+        var pb: [MAX_KEY]u8 = undefined;
+        var r = try view.range(History, historyPrefix(&pb, q));
+        const oldest = (try r.next()) orelse return error.Halt;
+        try view.delete(History, oldest.key);
+    }
+    c.history_bytes -|= cur.history_bytes;
+}
+
+/// Drop `q` if it has gone by the reap's stamp (`Current.reapableAt`),
+/// with its history, raising its namespace's version floor to its version.
+/// Returns whether it dropped it.
+fn reap(view: *View, q: Key, at: Stamp) ApplyError!bool {
+    const vk = valueKey(q);
+    const cur = (try view.get(Values, vk)) orelse return false;
+    if (comptime plant.active != .kv_reap_trusts_leader) if (!cur.reapableAt(at.ns)) return false;
+    var c = try counts(view, q.ns);
+    try dropHistory(view, q, cur, &c);
+    if (!cur.tombstone) c.live -|= 1;
+    c.bytes -|= q.raw.len + cur.value.len;
+    if (comptime plant.active != .kv_reap_floor_unraised) c.version_floor = @max(c.version_floor, cur.version);
+    try view.delete(Values, vk);
     try putCounts(view, q.ns, c);
     return true;
 }
@@ -588,7 +665,7 @@ pub fn owns(t: entry_mod.EntryType) bool {
 
 pub const machine: machine_mod.Machine = .{
     .name = "kv",
-    .entry_types = &.{ .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch },
+    .entry_types = &.{ .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch, .kv_reap },
     .families = &.{ machine_mod.info(Values), machine_mod.info(History), machine_mod.info(NsCounts) },
     .keys = keys,
     .apply = apply,

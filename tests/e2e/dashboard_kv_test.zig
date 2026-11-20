@@ -188,14 +188,11 @@ test "e2e/dashboard: a kv key's value carries its expiry, and its history marks 
     const hv = try std.json.parseFromSlice(std.json.Value, testing.allocator, hist.bodyTrimmed(), .{});
     defer hv.deinit();
     const versions = hv.value.object.get("versions").?.array.items;
-    try testing.expectEqual(@as(usize, 3), versions.len);
-    try testing.expectEqual(@as(i64, 3), hv.value.object.get("version_count").?.integer);
-    // Newest first: the delete, then "two", then "one".
+    // The delete alone: the values before it went with it.
+    try testing.expectEqual(@as(usize, 1), versions.len);
+    try testing.expectEqual(@as(i64, 1), hv.value.object.get("version_count").?.integer);
     try testing.expect(versions[0].object.get("tombstone").?.bool);
-    for (versions[1..], [_]i64{ 3, 3 }) |ver, size| {
-        try testing.expect(!ver.object.get("tombstone").?.bool);
-        try testing.expectEqual(size, ver.object.get("size").?.integer);
-    }
+    try testing.expectEqual(@as(i64, 3), versions[0].object.get("version").?.integer);
 
     var one = try http.get("/api/v1/kv/namespaces/default/keys/h/history?limit=1");
     defer one.deinit();

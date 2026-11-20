@@ -147,19 +147,20 @@ test "kv machine: history is the current version, then the older ones newest fir
     try testing.expectEqual(@as(usize, 3), historyOf(&kv, dk("k"), null, &hist));
 }
 
-test "kv machine: a delete keeps the history, the live value before it included" {
+test "kv machine: a delete drops the history: its tombstone is all the key keeps" {
     var kv = TestKv.init(testing.allocator);
     defer kv.deinit();
     var buf: [64]u8 = undefined;
     try kv.put(dk("k"), "v1", 100);
-    _ = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = dk("k"), .cas_version = null }, 2, 200));
+    try kv.put(dk("k"), "v2", 100);
+    _ = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = dk("k"), .cas_version = null }, 3, 200));
 
     var hist: [10]Version = undefined;
-    try testing.expectEqual(@as(usize, 2), historyOf(&kv, dk("k"), null, &hist));
+    try testing.expectEqual(@as(usize, 1), historyOf(&kv, dk("k"), null, &hist));
     try testing.expect(hist[0].tombstone);
-    try testing.expectEqual(@as(u64, 2), hist[0].version);
-    try testing.expectEqualStrings("v1", hist[1].value);
-    try testing.expect(!hist[1].tombstone);
+    try testing.expectEqual(@as(u64, 3), hist[0].version);
+    try testing.expectEqual(@as(usize, 0), kv.store.family(machine.History.ID).count);
+    try testing.expectEqual(machine.Counts{ .live = 0, .bytes = 1 }, kv.state().countsOf(.default));
 }
 
 test "kv machine: history keeps at most HISTORY_MAX_VERSIONS older versions, oldest evicted first" {
@@ -204,11 +205,20 @@ test "kv machine: history keeps at most HISTORY_MAX_BYTES, but always the newest
     var buf: [kv_ops.HISTORY_MAX_BYTES + 64]u8 = undefined;
     _ = try kv.apply(&putEntry(&buf, dk("k"), big, kv.index + 1, 0, 0));
     try testing.expectEqual(@as(u64, 20 - kept), kv.state().countsOf(.default).history_evicted);
-    try kv.put(dk("k"), "after", 0);
+    const bigger = try testing.allocator.alloc(u8, big.len + 1);
+    defer testing.allocator.free(bigger);
+    @memset(bigger, 'a');
+    _ = try kv.apply(&putEntry(&buf, dk("k"), bigger, kv.index + 1, 0, 0));
     try testing.expectEqual(@as(u64, 20), kv.state().countsOf(.default).history_evicted);
     try testing.expectEqual(@as(usize, 2), historyOf(&kv, dk("k"), null, &hist));
     try testing.expectEqual(big.len, hist[1].value.len);
     try testing.expectEqual(@as(u64, big.len + kv_ops.HISTORY_ENTRY_COST), kv.state().countsOf(.default).history_bytes);
+
+    // A smaller value drops the history, evicting nothing by the bounds.
+    try kv.put(dk("k"), "after", 0);
+    try testing.expectEqual(@as(usize, 1), historyOf(&kv, dk("k"), null, &hist));
+    try testing.expectEqual(@as(u64, 0), kv.state().countsOf(.default).history_bytes);
+    try testing.expectEqual(@as(u64, 20), kv.state().countsOf(.default).history_evicted);
 }
 
 test "kv machine: a namespace's counts follow its keys: live keys, bytes and history" {
@@ -218,10 +228,13 @@ test "kv machine: a namespace's counts follow its keys: live keys, bytes and his
     // A key counts its bytes as the client named it, not its namespace's id.
     try kv.put(at(NS, "a"), "123456", 0);
     try testing.expectEqual(machine.Counts{ .live = 1, .bytes = 7 }, kv.state().countsOf(NS));
+    try kv.put(at(NS, "a"), "1234567", 0);
+    try testing.expectEqual(machine.Counts{ .live = 1, .bytes = 8, .history_bytes = 6 + kv_ops.HISTORY_ENTRY_COST }, kv.state().countsOf(NS));
+    // A smaller value keeps no history.
     try kv.put(at(NS, "a"), "x", 0);
-    try testing.expectEqual(machine.Counts{ .live = 1, .bytes = 2, .history_bytes = 6 + kv_ops.HISTORY_ENTRY_COST }, kv.state().countsOf(NS));
-    _ = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = at(NS, "a"), .cas_version = null }, 3, 0));
-    try testing.expectEqual(machine.Counts{ .live = 0, .bytes = 1, .history_bytes = 7 + 2 * kv_ops.HISTORY_ENTRY_COST }, kv.state().countsOf(NS));
+    try testing.expectEqual(machine.Counts{ .live = 1, .bytes = 2 }, kv.state().countsOf(NS));
+    _ = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = at(NS, "a"), .cas_version = null }, 4, 0));
+    try testing.expectEqual(machine.Counts{ .live = 0, .bytes = 1 }, kv.state().countsOf(NS));
     try testing.expectEqual(machine.Counts{}, kv.state().countsOf(.default));
 }
 
@@ -915,4 +928,144 @@ test "kv machine: replaying conditional entries refuses the same ones and holds 
     try testing.expectEqual(n, historyOf(&b, dk("k"), null, &hb));
     // Only the two writes that passed left a version.
     try testing.expectEqual(@as(usize, 2), n);
+}
+
+fn reapEntry(buf: []u8, keys: []const []const u8, index: u64, stamp: u64) Entry {
+    var named: [kv_entries.MAX_REAP_KEYS]kv_entries.ReapKey.Value = undefined;
+    for (keys, 0..) |k, i| named[i] = .{ .key = k };
+    var w: schema.Writer = .{ .buf = buf };
+    kv_entries.encodeReap(&w, named[0..keys.len]) catch unreachable;
+    return entry_mod.buildEntry(.kv_reap, entry_mod.Flags.NONE, 1, index, stamp, w.written());
+}
+
+fn reaped(r: @import("../storage/persistence.zig").Result) u16 {
+    var rd = r.reader();
+    return rd.int(u16).?;
+}
+
+const HOUR_NS = kv_ops.TOMBSTONE_KEEP_MS * std.time.ns_per_ms;
+
+test "kv machine: a reap drops a key whose TTL ran out, with its history, and leaves one live or written again since" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    var buf: [1024]u8 = undefined;
+    _ = try kv.apply(&putEntry(&buf, dk("old"), "v1", 1, STAMP, 0));
+    _ = try kv.apply(&putEntry(&buf, dk("old"), "v22", 2, STAMP, 1_000));
+    _ = try kv.apply(&putEntry(&buf, dk("live"), "v", 3, STAMP, 60_000));
+    _ = try kv.apply(&putEntry(&buf, dk("again"), "v", 4, STAMP, 1_000));
+    // Written again without a TTL before the reap applies.
+    _ = try kv.apply(&putEntry(&buf, dk("again"), "w", 5, STAMP + 1, 0));
+    const r = try kv.apply(&reapEntry(&buf, &.{ dk("old"), dk("live"), dk("again"), dk("never") }, 6, STAMP + 2 * std.time.ns_per_s));
+    try testing.expectEqual(@as(u16, 1), reaped(r));
+    try testing.expect(kv.state().getRaw(dk("old")) == null);
+    try testing.expect(kv.state().getRaw(dk("live")) != null);
+    try testing.expect(kv.state().getRaw(dk("again")) != null);
+    var hist: [4]Version = undefined;
+    try testing.expectEqual(@as(usize, 0), historyOf(&kv, dk("old"), null, &hist));
+    // Only "again"'s older version stays in history.
+    try testing.expectEqual(@as(usize, 1), kv.store.family(machine.History.ID).count);
+    try testing.expectEqual(machine.Counts{
+        .live = 2,
+        .bytes = "live".len + 1 + "again".len + 1,
+        .history_bytes = 1 + kv_ops.HISTORY_ENTRY_COST,
+        .version_floor = 2,
+    }, kv.state().countsOf(.default));
+}
+
+test "kv machine: a reap drops a tombstone once it is TOMBSTONE_KEEP_MS old by the reap's stamp, not before" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    var buf: [256]u8 = undefined;
+    _ = try kv.apply(&putEntry(&buf, dk("k"), "v", 1, STAMP, 0));
+    _ = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = dk("k"), .cas_version = null }, 2, STAMP));
+    try testing.expectEqual(@as(u16, 0), reaped(try kv.apply(&reapEntry(&buf, &.{dk("k")}, 3, STAMP + HOUR_NS - 1))));
+    try testing.expect(kv.state().getRaw(dk("k")) != null);
+    try testing.expectEqual(@as(u16, 1), reaped(try kv.apply(&reapEntry(&buf, &.{dk("k")}, 4, STAMP + HOUR_NS))));
+    try testing.expect(kv.state().getRaw(dk("k")) == null);
+    try testing.expectEqual(machine.Counts{ .version_floor = 2 }, kv.state().countsOf(.default));
+}
+
+test "kv machine: a key's versions never repeat across a reap: a CAS read before it went is refused after it is written again" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    var buf: [256]u8 = undefined;
+    // A tombstone's key and an expired key, each at version 3 when it went.
+    for ([_][]const u8{ dk("t"), dk("e") }, 0..) |k, i| {
+        const base: u64 = @as(u64, i) * 10;
+        _ = try kv.apply(&putEntry(&buf, k, "v1", base + 1, STAMP, 0));
+        _ = try kv.apply(&putEntry(&buf, k, "v2", base + 2, STAMP, 0));
+        if (i == 0) {
+            _ = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = k, .cas_version = null }, base + 3, STAMP));
+        } else {
+            _ = try kv.apply(&putEntry(&buf, k, "v3", base + 3, STAMP, 1_000));
+        }
+        try testing.expectEqual(@as(u64, 3), kv.state().getRaw(k).?.version);
+    }
+    _ = try kv.apply(&reapEntry(&buf, &.{ dk("t"), dk("e") }, 30, STAMP + HOUR_NS));
+    try testing.expectEqual(@as(u64, 3), kv.state().countsOf(.default).version_floor);
+    for ([_][]const u8{ dk("t"), dk("e") }, 0..) |k, i| {
+        const base: u64 = 40 + @as(u64, i) * 10;
+        // Written again: past the floor, and on past the version it went at.
+        _ = try kv.apply(&putEntry(&buf, k, "n1", base, STAMP + HOUR_NS, 0));
+        try testing.expectEqual(@as(u64, 4), kv.state().getRaw(k).?.version);
+        _ = try kv.apply(&putEntry(&buf, k, "n2", base + 1, STAMP + HOUR_NS, 0));
+        // A CAS at 3, read before the key went, can't match its new life.
+        const stale = try kv.apply(&testEntry(&buf, .kv_put, .{ .key = k, .value = "late", .ttl_ms = null, .condition = .always, .cas_version = 3 }, base + 2, STAMP + HOUR_NS));
+        try testing.expectEqualStrings(machine.CAS_MISMATCH, stale.refused().?.refusal.message);
+    }
+    // Any other key in the namespace starts past the floor too.
+    _ = try kv.apply(&putEntry(&buf, dk("fresh"), "v", 70, STAMP + HOUR_NS, 0));
+    try testing.expectEqual(@as(u64, 4), kv.state().getRaw(dk("fresh")).?.version);
+    // Another namespace's floor is its own.
+    _ = try kv.apply(&putEntry(&buf, at(NS, "fresh"), "v", 71, STAMP + HOUR_NS, 0));
+    try testing.expectEqual(@as(u64, 1), kv.state().getRaw(at(NS, "fresh")).?.version);
+}
+
+test "kv machine: put and delete churn of unique keys over more than an hour, reaped as it goes, stays bounded" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    var buf: [1024]u8 = undefined;
+    var index: u64 = 0;
+    var peak: u64 = 0;
+    // A thousand keys a minute for two hours: each put, then deleted.
+    for (0..120) |minute| {
+        const now = STAMP + @as(u64, minute) * 60 * std.time.ns_per_s;
+        for (0..1000) |i| {
+            var kb: [32]u8 = undefined;
+            const k = std.fmt.bufPrint(&kb, "\x00\x00\x00\x01k{d}-{d}", .{ minute, i }) catch unreachable;
+            index += 1;
+            _ = try kv.apply(&putEntry(&buf, k, "a value of some length", index, now, 0));
+            index += 1;
+            _ = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = k, .cas_version = null }, index, now));
+        }
+        // The reap duty's pass: every tombstone an hour old.
+        var it = (@import("../contract/view.zig").ReadView{ .store = &kv.store }).range(machine.Values, "");
+        var batch: [kv_entries.MAX_REAP_KEYS][]const u8 = undefined;
+        var n: usize = 0;
+        var gone: std.ArrayList([]u8) = .empty;
+        defer {
+            for (gone.items) |g| testing.allocator.free(g);
+            gone.deinit(testing.allocator);
+        }
+        while (it.next() catch null) |item| if (item.value.reapableAt(now)) try gone.append(testing.allocator, try testing.allocator.dupe(u8, item.key));
+        for (gone.items) |g| {
+            batch[n] = g;
+            n += 1;
+            if (n == batch.len) {
+                index += 1;
+                _ = try kv.apply(&reapEntry(&buf, batch[0..n], index, now));
+                n = 0;
+            }
+        }
+        if (n > 0) {
+            index += 1;
+            _ = try kv.apply(&reapEntry(&buf, batch[0..n], index, now));
+        }
+        peak = @max(peak, kv.store.family(machine.Values.ID).count);
+    }
+    // At most the last hour's tombstones (and the minute's), never the two
+    // hours' worth.
+    try testing.expect(peak <= 61 * 1000);
+    try testing.expect(kv.store.family(machine.Values.ID).count <= 61 * 1000);
+    try testing.expectEqual(@as(u64, 0), kv.state().countsOf(.default).history_bytes);
 }

@@ -65,6 +65,16 @@ pub const Plant = enum {
     /// A call's run ending overwrites a call already settled refused or
     /// with no action.
     runs_done_overrides_settled,
+    /// A KV delete still moves the value to the key's history.
+    kv_delete_keeps_history,
+    /// A KV reap keeps a key whose TTL ran out.
+    kv_reap_keeps_expired,
+    /// A KV reap leaves its namespace's version floor where it was, so a
+    /// key's next life repeats its versions.
+    kv_reap_floor_unraised,
+    /// A KV reap drops every key it names, gone or not: it trusts the
+    /// leader's clock over the entry's stamp.
+    kv_reap_trusts_leader,
 };
 
 pub const active: Plant = std.meta.stringToEnum(Plant, @import("build_options").vopr_plant) orelse

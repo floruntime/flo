@@ -67,6 +67,7 @@ pub const EntryType = enum(u8) {
     kv_incr = 0x04,
     kv_expire = 0x05,
     kv_json_patch = 0x06,
+    kv_reap = 0x07,
 
     // ── Stream ──
     stream_append = 0x10,
@@ -187,7 +188,7 @@ pub const EntryType = enum(u8) {
     /// entries don't: their payloads are schemas (`protocol/kv_entries.zig`).
     pub fn hasKeyValue(self: EntryType) bool {
         return switch (self) {
-            .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch => false,
+            .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch, .kv_reap => false,
             .namespace_create => false,
             .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => false,
             .step_call_retry, .step_call_clear, .call_reply, .call_done, .action_abandon_send, .action_abandon => false,
