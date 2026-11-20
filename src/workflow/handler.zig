@@ -657,7 +657,7 @@ pub const WorkflowHandler = struct {
     /// Never on a follower.
     pub fn startApplied(self: *WorkflowHandler, shard: *Shard, entry: *const entry_mod.Entry, result: *const Result) void {
         const etype = std.enums.fromInt(entry_mod.EntryType, entry.header.entry_type) orelse return;
-        if (etype != .workflow_start and etype != .workflow_step and etype != .workflow_complete) return;
+        if (etype != .workflow_start and etype != .workflow_step and etype != .workflow_signal and etype != .workflow_complete) return;
         if (shard.raft_node.role != .leader) return;
         // A cancel is counted against the one this leader recorded, of any
         // term it led (it may be elected again with it in its log); the
@@ -665,6 +665,10 @@ pub const WorkflowHandler = struct {
         if (etype != .workflow_complete and entry.header.term != shard.raft_node.current_term) return;
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
         switch (etype) {
+            .workflow_signal => {
+                if (result.refused() == null) if (shard.metrics_registry) |m| m.workflow.recordSignalDelivered();
+                return;
+            },
             .workflow_start => {
                 if (result.refused() != null) return;
                 var r = result.reader();
@@ -1088,7 +1092,6 @@ pub const WorkflowHandler = struct {
             shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "signal not persisted"));
             return null;
         };
-        if (shard.metrics_registry) |m| m.workflow.recordSignalDelivered();
         return proposed;
     }
 

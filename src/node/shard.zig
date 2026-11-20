@@ -24602,6 +24602,39 @@ fn raceTestEndingRun(t: *RaceTest, buf: []u8, one: []proto.Response, id_buf: *[3
     return id;
 }
 
+test "a workflow signal a later leader's log drops is answered as not run, and neither kept nor waking its run" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    const r = t.shard.raft_node;
+    var id_buf: [32]u8 = undefined;
+    const data = try raceTestWaitingRun(&t, &buf, &one);
+    const id = id_buf[0..data.len];
+    @memcpy(id, data);
+    const run = raceTestRun(&t, id);
+    var sig: [4]u8 = undefined;
+    std.mem.writeInt(u16, sig[0..2], 2, .little);
+    @memcpy(sig[2..4], "go");
+    t.send(.workflow_signal, 50, id, &sig);
+    const before = r.log.lastIndex() - 1;
+    const term = r.current_term;
+    try std.testing.expectEqual(@as(u32, 1), t.shard.pending_count);
+
+    // Node 2 leads term + 1, replaces the signal with its no-op and
+    // commits it.
+    var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, term + 1, before + 1, r.log.last_stamp + 1, "");
+    noop.header.crc32c = noop.computeCrc();
+    _ = try r.handleAppendEntries(.{ .term = term + 1, .leader_id = 2, .prev_log_index = before, .prev_log_term = term, .entries = (&noop)[0..1], .leader_commit = before + 1 });
+    _ = t.shard.applyCommitted();
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expect(std.mem.indexOf(u8, (try one[0].refused()).message, "leader changed") != null);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status());
+    try std.testing.expect(!try @import("../workflow/runs_machine.zig").hasSignal(std.testing.allocator, .{ .store = &t.shard.defaultPartition().store }, run.key(), "go"));
+}
+
 test "a workflow completion a later leader's log drops leaves the run unfinished, and the node ends it once it leads again" {
     var t: RaceTest = undefined;
     try t.init();
