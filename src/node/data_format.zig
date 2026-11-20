@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 50;
+pub const CURRENT: u32 = 51;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -182,6 +182,10 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // leader's reap (`kv_reap`) drops expired keys and old tombstones; a
     // namespace's counts carry its version floor.
     .{ .format = 50, .segment_version = 34, .entries = 0xcfbf4b10fbb9d7aa },
+    // A trigger's start says the stream it read and its event, and moves
+    // its workflow's place in `workflow.per_def`; idempotency keys with a
+    // leading '_' are the server's.
+    .{ .format = 51, .segment_version = 35, .entries = 0xcfbf4b10fbb9d7aa },
 };
 
 comptime {

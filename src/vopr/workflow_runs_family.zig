@@ -61,8 +61,16 @@ const RUNS = blk: {
 };
 /// Client keys, and a schedule's (its slot last): slots out of order, so a
 /// later start can carry an earlier slot.
-const IDEMS = [_][]const u8{ "k0", "k1", "schedule:16:w:3000", "schedule:16:w:1000", "schedule:16:w:2000" };
-const SLOT_OF = [_]?i64{ null, null, 3000, 1000, 2000 };
+const IDEMS = [_][]const u8{ "k0", "k1", "_schedule:16:w:3000", "_schedule:16:w:1000", "_schedule:16:w:2000", "_trigger:16:1:ev@1:0", "_trigger:16:2:ev@3:1" };
+const SLOT_OF = [_]?i64{ null, null, 3000, 1000, 2000, null, null };
+/// Keys the server makes begin with '_': only a schedule's or a trigger's
+/// start may carry one, whatever comes after it.
+/// Where a trigger's start says it read: a few namespaces, makings and
+/// streams, so its place moves on, is replaced, and holds against a start
+/// read from an older making.
+const T_NS = [_]u32{ 16, 17 };
+const T_MADE = [_]u64{ 1, 2 };
+const T_STREAMS = [_][]const u8{ "ev", "other" };
 const EVENTS = [_][]const u8{ "workflow_started", "schedule_started", "trigger_started", "child_started" };
 const SCHEDULE = 1;
 const TRIGGER = 2;
@@ -163,7 +171,22 @@ pub const WorkflowRuns = struct {
         wait: WaitL = .{},
         progress: []const u8 = "",
     };
-    const PerDefL = struct { active: u32, fired_ms: i64 };
+    const PerDefL = struct { active: u32, fired_ms: i64, place: ?PlaceL = null };
+    /// A trigger's place: the stream (namespace, making, name) and how far in.
+    const PlaceL = struct { ns: u32, made: u64, stream: usize, ts: u64, seq: u64 };
+
+    /// Where a trigger's start read moves its workflow's place. Another
+    /// stream, or a later making of this one, is a new place; an earlier
+    /// making is a stale read and changes nothing; in this making the place
+    /// only goes forward.
+    fn placeAfter(was: ?PlaceL, at: PlaceL) PlaceL {
+        const p = was orelse return at;
+        if (p.ns != at.ns or p.stream != at.stream) return at;
+        if (at.made > p.made) return at;
+        if (at.made < p.made) return p;
+        if (at.ts < p.ts or (at.ts == p.ts and at.seq <= p.seq)) return p;
+        return at;
+    }
     const ParentL = struct { slot: usize, parent_run: usize, started: bool };
     /// A step's call, under its workflow's slot and its callee.
     const CallL = struct {
@@ -422,8 +445,26 @@ pub const WorkflowRuns = struct {
                         const w = indexOf(&NAMES, s.workflow) orelse return null;
                         const ev = indexOf(&EVENTS, s.event) orelse return null;
                         const k: ?usize = if (s.idem) |key| indexOf(&IDEMS, key) orelse return null else null;
-                        // A key that started a run answers with it.
-                        if (k) |ki| if (l.idem[w][ki] != null) return want;
+                        // The server's key on a start the server doesn't make:
+                        // refused first.
+                        if (k) |ki| if (IDEMS[ki][0] == '_' and ev != SCHEDULE and ev != TRIGGER) return refuse(.start, "its key is the server's");
+                        const at: ?PlaceL = if (s.trigger) |t| .{
+                            .ns = t.ns,
+                            .made = t.made,
+                            .stream = indexOf(&T_STREAMS, t.stream) orelse return null,
+                            .ts = t.ts,
+                            .seq = t.seq,
+                        } else null;
+                        // A key that started a run answers with it; a
+                        // trigger's start read again still moves its place.
+                        if (k) |ki| if (l.idem[w][ki] != null) {
+                            if (at) |p| {
+                                var per = l.per_def[w] orelse PerDefL{ .active = 0, .fired_ms = 0 };
+                                per.place = placeAfter(per.place, p);
+                                l.per_def[w] = per;
+                            }
+                            return want;
+                        };
                         if (l.runs[r] != null) return refuse(.start, "its run exists");
                         const disabled = if (defs.ledger[w]) |d| !d.enabled else false;
                         if (disabled) {
@@ -443,6 +484,7 @@ pub const WorkflowRuns = struct {
                         if (ev == SCHEDULE) if (k) |ki| if (SLOT_OF[ki]) |slot| {
                             per.fired_ms = @max(per.fired_ms, slot);
                         };
+                        if (at) |p| per.place = placeAfter(per.place, p);
                         l.per_def[w] = per;
                         if (ev == CHILD) if (l.parents[r]) |f| if (!f.started) {
                             l.parents[r].?.started = true;
@@ -704,6 +746,7 @@ pub const WorkflowRuns = struct {
             if ((if (got) |g| g.active else 0) != n) return "a workflow's count is not its runs not ended";
             if ((got == null) != (want == null)) return "a workflow's record is not the ledger's";
             if (got) |g| if (g.active != want.?.active or g.fired_ms != want.?.fired_ms) return "a workflow's count or fired slot is not the ledger's";
+            if (got) |g| if (!samePlace(g, want.?.place)) return "a workflow's trigger place is not the ledger's";
         }
         var idems = rv.range(rm.IdemFam, "");
         var held_idems: usize = 0;
@@ -805,6 +848,7 @@ pub const WorkflowRuns = struct {
         const per = rm.perDefOf(rv, view_mod.idKey(try a.alloc(u8, 4 + wname.len), NS, wname) catch unreachable);
         const per_want = l.per_def[run.wf].?;
         if (per == null or per.?.active != per_want.active or per.?.fired_ms != per_want.fired_ms) return "a workflow's count or fired slot is not the ledger's";
+        if (!samePlace(per.?, per_want.place)) return "a workflow's trigger place is not the ledger's";
         if (run.idem) |k| {
             const got_idem = (rv.get(rm.IdemFam, try rm.idemKey(a, NS, wname, IDEMS[k])) catch return "an idempotency key could not be read") orelse return "the idempotency keys are not the ledger's";
             if (!std.mem.eql(u8, got_idem.v.run, RUNS[l.idem[run.wf][k].?])) return "the idempotency keys are not the ledger's";
@@ -922,8 +966,16 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
     const ev = r.uintLessThan(usize, EVENTS.len);
     const run = if (ev == CHILD) pending.or_(r, 70, any) else free.or_(r, 75, any);
     const idem: []const u8 = if (ev == CHILD or r.boolean()) "" else IDEMS[r.uintLessThan(usize, IDEMS.len)];
-    var vb: [128]u8 = undefined;
-    return command(buf, .workflow_start, view_mod.idKey(&kb, NS, RUNS[run]) catch unreachable, startValue(&vb, NAMES[r.uintLessThan(usize, NAMES.len)], EVENTS[ev], idem));
+    // A trigger's start says where it read.
+    const at: ?rm.TriggerAt = if (ev == TRIGGER) .{
+        .ns = T_NS[r.uintLessThan(usize, T_NS.len)],
+        .made = T_MADE[r.uintLessThan(usize, T_MADE.len)],
+        .stream = T_STREAMS[r.uintLessThan(usize, T_STREAMS.len)],
+        .ts = r.uintLessThan(u64, 4),
+        .seq = r.uintLessThan(u64, 2),
+    } else null;
+    var vb: [160]u8 = undefined;
+    return command(buf, .workflow_start, view_mod.idKey(&kb, NS, RUNS[run]) catch unreachable, startValue(&vb, NAMES[r.uintLessThan(usize, NAMES.len)], EVENTS[ev], idem, at));
 }
 
 /// A callee's answer to a call (a reply or its end), its step's retry, or
@@ -1005,19 +1057,14 @@ fn command(buf: []u8, t: EntryType, key: []const u8, value: []const u8) ?Made {
     return .{ .entry_type = t, .payload = buf[0..n] };
 }
 
-fn startValue(buf: []u8, wf: []const u8, event: []const u8, idem: []const u8) []const u8 {
-    var w: std.Io.Writer = .fixed(buf);
-    w.writeInt(u16, @intCast(wf.len), .little) catch unreachable;
-    w.writeAll(wf) catch unreachable;
-    w.writeInt(u16, 1, .little) catch unreachable;
-    w.writeAll("1") catch unreachable;
-    w.writeByte(@backingInt(RunStatus.running)) catch unreachable;
-    w.writeInt(u16, @intCast(event.len), .little) catch unreachable;
-    w.writeAll(event) catch unreachable;
-    w.writeInt(u16, @intCast(idem.len), .little) catch unreachable;
-    w.writeAll(idem) catch unreachable;
-    w.writeAll(INPUT) catch unreachable;
-    return w.buffered();
+fn startValue(buf: []u8, wf: []const u8, event: []const u8, idem: []const u8, at: ?rm.TriggerAt) []const u8 {
+    return (rm.Start{ .workflow = wf, .version = "1", .status = .running, .event = event, .idem = if (idem.len > 0) idem else null, .trigger = at, .input = INPUT }).encode(buf).?;
+}
+
+/// Whether the machine's place is the ledger's (none: nothing recorded).
+fn samePlace(g: rm.PerDef.Value, want: ?WorkflowRuns.PlaceL) bool {
+    const p = want orelse return g.trig_ns == 0 and g.trig_made == 0 and g.trig_stream.len == 0 and g.trig_ts == 0 and g.trig_seq == 0;
+    return g.trig_ns == p.ns and g.trig_made == p.made and std.mem.eql(u8, g.trig_stream, T_STREAMS[p.stream]) and g.trig_ts == p.ts and g.trig_seq == p.seq;
 }
 
 /// A step of run `c` at its rev (now and then the next one): some events,

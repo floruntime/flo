@@ -16261,7 +16261,7 @@ const FollowerTest = struct {
 };
 
 test "Shard: a start leaves its run to step on every replica; the leader logs its step once while it may apply" {
-    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
+    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0, 0 };
     var pbuf: [128]u8 = undefined;
     const e = entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, 0, .default, wf_test_key(.default, "r1"), &start, &pbuf).?;
 
@@ -20785,7 +20785,7 @@ test "Shard: alone with async_flush, a gap held open never lets channelDurable p
     try std.testing.expect(s.shard.channelDurable() >= gap_at);
 }
 
-test "Shard: a trigger moved to another stream and back reads its stream from the start, live and after a restart alike" {
+test "Shard: a trigger moved to another stream and back goes on from its logged place, live and after a restart alike" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const data_dir = try testDataDir(&tmp);
@@ -20799,6 +20799,7 @@ test "Shard: a trigger moved to another stream and back reads its stream from th
         }
     };
     const key = wf_test_key(.default, "wf");
+    var cursor_at: StreamID = undefined;
     {
         var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
         defer shard.deinit();
@@ -20819,21 +20820,29 @@ test "Shard: a trigger moved to another stream and back reads its stream from th
         shard.workflow_handler.tickStreamTriggers(&shard);
         _ = shard.applyCommitted();
         try std.testing.expectEqual(@as(usize, 3), shard.workflow_handler.runCount());
-        try std.testing.expect(shard.workflow_handler.stream_triggers.getPtr(key).?.stream_cursor_ts != 0);
-        // Moved to another stream, then back: no start between them.
+        const at = shard.workflow_handler.triggerCursor(key, .default);
+        try std.testing.expect(at.timestamp_ms != 0);
+        // Moved to another stream, then back, with no start between them:
+        // the place is still in this stream.
         try ParkTest.send(&shard, conn, .workflow_create, 2, "wf", on.def("other"));
         _ = shard.applyCommitted();
         try ParkTest.send(&shard, conn, .workflow_create, 3, "wf", on.def("events"));
         _ = shard.applyCommitted();
-        try std.testing.expectEqual(@as(u64, 0), shard.workflow_handler.stream_triggers.getPtr(key).?.stream_cursor_ts);
+        try std.testing.expect(shard.workflow_handler.triggerCursor(key, .default).eql(at));
+        // Polled again: nothing it took already starts again.
+        shard.workflow_handler.triggers_dirty = true;
+        shard.workflow_handler.tickStreamTriggers(&shard);
+        _ = shard.applyCommitted();
+        try std.testing.expectEqual(@as(usize, 3), shard.workflow_handler.runCount());
         try shard.flushSegmentToDisk();
+        cursor_at = at;
     }
     var again = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer again.deinit();
     again.wireHandlerShardPtrs();
     _ = again.applyCommitted();
     try std.testing.expectEqual(@as(usize, 3), again.workflow_handler.runCount());
-    try std.testing.expectEqual(@as(u64, 0), again.workflow_handler.stream_triggers.getPtr(key).?.stream_cursor_ts);
+    try std.testing.expect(again.workflow_handler.triggerCursor(key, .default).eql(cursor_at));
 }
 
 test "Shard: a namespace create is published, and answered, only once its segment and directory are on disk" {
@@ -27825,8 +27834,8 @@ test "Shard: a start's chosen run id is read from its value, and a start with no
 
 /// A run of "wf" started at `key`, applied on `wh`'s store as its shard applies one.
 fn wfTestStart(wh: *WorkflowHandler, key: []const u8) !void {
-    // [wf_len][wf][ver_len][ver][status: running][evt_len][idem_len]
-    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1, 0, 0, 0, 0 };
+    // [wf_len][wf][ver_len][ver][status: running][evt_len][idem_len][no trigger]
+    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1, 0, 0, 0, 0, 0 };
     var out: persistence_mod.Result = .{};
     try wh.replayStart(key, &start, 1, &out);
     try std.testing.expect(out.refused() == null);
@@ -30466,16 +30475,9 @@ fn proposeCallOf(s: *Shard, kind: action_entries.CallKind, target: []const u8, w
     @memcpy(kb[0..4], &ns_table.Id.default.bytes());
     @memcpy(kb[4..][0..caller.len], caller);
     const key = kb[0 .. 4 + caller.len];
-    // [wf_len][wf][ver_len][ver][status: running][evt_len][idem_len]
     var vb: [96]u8 = undefined;
-    std.mem.writeInt(u16, vb[0..2], @intCast(workflow.len), .little);
-    @memcpy(vb[2..][0..workflow.len], workflow);
-    var off = 2 + workflow.len;
-    @memcpy(vb[off..][0..4], &[_]u8{ 1, 0, '1', @backingInt(WorkflowHandler.RunStatus.running) });
-    off += 4;
-    @memset(vb[off..][0..4], 0);
-    off += 4;
-    _ = try persistence_mod.proposeEntryIn(s, .workflow_start, entry_mod.Flags.NONE, .default, key, vb[0..off]);
+    const value = (@import("../workflow/runs_machine.zig").Start{ .workflow = workflow, .version = "1", .status = .running, .event = "", .idem = null, .input = "" }).encode(&vb).?;
+    _ = try persistence_mod.proposeEntryIn(s, .workflow_start, entry_mod.Flags.NONE, .default, key, value);
 
     const call_buf = try a.alloc(u8, action_entries.Call.max_size);
     defer a.free(call_buf);
@@ -31613,6 +31615,17 @@ const TriggerPair = struct {
         return t.two.shards[0].workflow_handler.runCount();
     }
 
+    /// Where the trigger reads on from, as its logged place has it.
+    fn cursor(t: *TriggerPair) StreamID {
+        return t.two.shards[0].workflow_handler.triggerCursor(t.key, .default);
+    }
+
+    /// The trigger's logged place.
+    fn place(t: *TriggerPair) @import("../workflow/runs_machine.zig").PerDef.Value {
+        const h = t.two.shards[0].workflow_handler;
+        return @import("../workflow/runs_machine.zig").perDefOf(h.defsRead(), t.key) orelse @import("../workflow/runs_machine.zig").PER_DEF_NONE;
+    }
+
     fn lastId(t: *TriggerPair) !StreamID {
         const sh = t.two.shards[1].stream_handler;
         const r = sh.readPayloadsForStreamIn(t.stream, .default, .{ .timestamp_ms = 0, .sequence = 0 }, 100);
@@ -31629,8 +31642,10 @@ test "Shard: a trigger over a stream another shard owns asks that shard, and sta
     t.round();
     try std.testing.expectEqual(@as(usize, 3), t.runs());
     const last = try t.lastId();
-    try std.testing.expectEqual(last.timestamp_ms, t.trigger().stream_cursor_ts);
-    try std.testing.expectEqual(last.sequence, t.trigger().stream_cursor_seq);
+    try std.testing.expect(t.cursor().eql(last));
+    // The place names the stream the page read.
+    try std.testing.expectEqualStrings(t.stream, t.place().trig_stream);
+    try std.testing.expectEqual(t.trigger().stream_made_ns.?, t.place().trig_made);
     try std.testing.expectEqual(@as(u64, 0), t.trigger().read_seq);
     // Nothing new: the next page starts nothing and leaves the cursor.
     t.round();
@@ -31647,8 +31662,7 @@ test "Shard: an owner that doesn't serve reads says so, the trigger's cursor sta
     r.ready_index = r.last_applied + 1000;
     t.round();
     try std.testing.expectEqual(@as(usize, 0), t.runs());
-    try std.testing.expectEqual(@as(u64, 0), t.trigger().stream_cursor_ts);
-    try std.testing.expectEqual(@as(u64, 0), t.trigger().stream_cursor_seq);
+    try std.testing.expectEqual(@as(u64, 0), t.cursor().timestamp_ms);
     // Answered, so asked again at once, not after the deadline; and the
     // refusal told it nothing about the stream.
     try std.testing.expectEqual(@as(u64, 0), t.trigger().read_seq);
@@ -31670,15 +31684,14 @@ test "Shard: a trigger's page is dropped after a term change, a moved cursor or 
     a.raft_node.ready_index = a.raft_node.last_applied;
     t.two.settle();
     try std.testing.expectEqual(@as(usize, 0), t.runs());
-    // The cursor moved while the read was out (a start applied, say): the
-    // page answers a read from elsewhere.
+    // The cursor moved while the read was out (this leader read on, say):
+    // the page answers a read from elsewhere.
     const sh = t.two.shards[1].stream_handler;
     const read = sh.readPayloadsForStreamIn(t.stream, .default, .{ .timestamp_ms = 0, .sequence = 0 }, 1);
     const first = read.ids[0];
     read.deinit(sh.allocator);
     t.ask();
-    t.trigger().stream_cursor_ts = first.timestamp_ms;
-    t.trigger().stream_cursor_seq = first.sequence;
+    t.trigger().proposed = .{ .at = first, .term = a.raft_node.current_term };
     t.two.settle();
     try std.testing.expectEqual(@as(usize, 0), t.runs());
     // Read again from where the cursor is: the two events after it.
@@ -31692,6 +31705,66 @@ test "Shard: a trigger's page is dropped after a term change, a moved cursor or 
     t.two.settle();
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(t.c, a, &out)).header.status);
     try std.testing.expectEqual(@as(usize, 2), t.runs());
+}
+
+test "Shard: a trigger moved to another stream while its first read is out takes nothing from that read's page" {
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    try t.append(3);
+    const a = &t.two.shards[0];
+    // The read of the first stream is out when the definition moves.
+    t.ask();
+    var nb: [16]u8 = undefined;
+    const moved = try workflowOn(&t.two, 1, "fx", &nb);
+    _ = try t.two.shards[1].stream_handler.appendPayloadToStream(moved, "default", "{}");
+    var yb: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&yb, "{{\"kind\":\"Workflow\",\"name\":\"{s}\",\"version\":\"2.0.0\",\"trigger\":{{\"stream\":\"{s}\"}},\"start\":{{\"wait_for_signal\":{{\"type\":\"never\"}},\"transitions\":{{\"success\":\"flo.Completed\"}}}}}}", .{ t.wf, moved });
+    a.runRequest(t.c.conn, try ParkTest.request(.workflow_create, 2, proto.DEFAULT_NAMESPACE, t.wf, yaml, ""), .client);
+    try ParkTest.ack(a);
+    // Its first read of the new stream goes out before the old page comes.
+    t.ask();
+    t.two.settle();
+    // The old page started nothing.
+    try std.testing.expectEqual(@as(usize, 0), t.runs());
+    // The new stream's one event does, and the place is the new stream's
+    // alone.
+    t.round();
+    try std.testing.expectEqual(@as(usize, 1), t.runs());
+    try std.testing.expectEqualStrings(moved, t.place().trig_stream);
+    try std.testing.expectEqual(t.trigger().stream_made_ns.?, t.place().trig_made);
+}
+
+test "Shard: a trigger's page answering its read, but naming another stream or namespace, is not taken" {
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    const a = &t.two.shards[0];
+    const alloc = std.testing.allocator;
+    const Case = struct { source: []const u8, ns: u32, runs: usize };
+    for ([_]Case{
+        .{ .source = "elsewhere", .ns = ns_table.Id.default.int(), .runs = 0 },
+        .{ .source = t.stream, .ns = 99, .runs = 0 },
+        // The page this read asked for: taken.
+        .{ .source = t.stream, .ns = ns_table.Id.default.int(), .runs = 1 },
+    }) |c| {
+        // A read of the trigger's stream is out, and a page comes with its
+        // number and term.
+        const trig = t.trigger();
+        trig.next_read_seq += 1;
+        trig.read_seq = trig.next_read_seq;
+        trig.read_term = a.raft_node.current_term;
+        trig.read_ns = .default;
+        var b: source_page_mod.Page.Builder = .{ .made_ns = 1, .ns = c.ns };
+        defer b.deinit(alloc);
+        try b.begin(alloc, .{ .term = trig.read_term, .seq = trig.read_seq, .kind = .stream, .asker = .trigger, .key = t.key, .namespace = "default", .source = c.source, .from_a = 0, .from_b = 0, .limit = 10 });
+        try b.record(alloc, 1, 0, "{}");
+        const bytes = try b.finish(alloc, 1, 0, 0);
+        defer alloc.free(bytes);
+        a.workflow_handler.takeTriggerPage(a, source_page_mod.Page.decode(bytes).?);
+        t.two.settle();
+        try std.testing.expectEqual(c.runs, t.runs());
+    }
 }
 
 test "Shard: a trigger whose stream is deleted and made again reads the new one from its start" {
@@ -31710,8 +31783,8 @@ test "Shard: a trigger whose stream is deleted and made again reads the new one 
     // read takes the new stream's event.
     t.round();
     try std.testing.expect(t.trigger().stream_made_ns.? != made0);
-    try std.testing.expectEqual(@as(u64, 0), t.trigger().stream_cursor_ts);
-    try std.testing.expectEqual(@as(u64, 0), t.trigger().stream_cursor_seq);
+    try std.testing.expectEqual(@as(u64, 0), t.cursor().timestamp_ms);
+    try std.testing.expectEqual(@as(u64, 0), t.cursor().sequence);
     try std.testing.expectEqual(@as(usize, 2), t.runs());
     t.round();
     try std.testing.expectEqual(@as(usize, 3), t.runs());
@@ -31724,8 +31797,7 @@ test "Shard: a trigger's page from a replica behind a remake of its stream is dr
     try t.append(2);
     t.round();
     try std.testing.expectEqual(@as(usize, 2), t.runs());
-    const cursor_ts = t.trigger().stream_cursor_ts;
-    const cursor_seq = t.trigger().stream_cursor_seq;
+    const placed = t.place();
     // The trigger has read a stream made later than the one the owner
     // holds: as after it moved to a node whose replica hasn't applied a
     // delete and remake yet.
@@ -31734,8 +31806,9 @@ test "Shard: a trigger's page from a replica behind a remake of its stream is dr
     try t.append(1);
     t.round();
     try std.testing.expectEqual(@as(usize, 2), t.runs());
-    try std.testing.expectEqual(cursor_ts, t.trigger().stream_cursor_ts);
-    try std.testing.expectEqual(cursor_seq, t.trigger().stream_cursor_seq);
+    try std.testing.expectEqual(placed.trig_ts, t.place().trig_ts);
+    try std.testing.expectEqual(placed.trig_seq, t.place().trig_seq);
+    try std.testing.expectEqual(placed.trig_made, t.place().trig_made);
     try std.testing.expectEqual(newer, t.trigger().stream_made_ns.?);
 }
 

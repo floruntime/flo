@@ -29,6 +29,9 @@ workflow-runs-settle-early.json	runs_settle_before_call_ends	--workflows	-	workf
 workflow-runs-call-unsettled.json	runs_call_left_unsettled	--workflows	-	workflow_run_rule	applied a step the ledger refuses: it leaves its run.s call without taking its end
 workflow-runs-settled-call-kept.json	runs_settled_call_kept	--workflows	-	workflow_run_rule	call the ledger doesn.t hold is recorded
 workflow-runs-done-overrides.json	runs_done_overrides_settled	--workflows	-	workflow_run_rule	a call.s state is not the ledger.s
+workflow-runs-server-key.json	runs_reserved_key_taken	--workflows	-	workflow_run_rule	applied a start the ledger refuses: its key is the server.s
+workflow-runs-trigger-made.json	runs_trigger_made_unchecked	--workflows	-	workflow_run_rule	trigger place is not the ledger.s
+workflow-runs-trigger-back.json	runs_trigger_place_moves_back	--workflows	-	workflow_run_rule	trigger place is not the ledger.s
 kv-delete-keeps-history.json	kv_delete_keeps_history	--kv-reaps	-	kv_reap_rule	tombstone keeps its key.s history
 kv-reap-keeps-expired.json	kv_reap_keeps_expired	--kv-reaps	-	kv_reap_rule	reap left a key it names that had gone
 kv-reap-floor-unraised.json	kv_reap_floor_unraised	--kv-reaps	-	kv_reap_rule	repeats a version it had
