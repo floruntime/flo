@@ -119,7 +119,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         // Its contract machine (processing/sinks_machine.zig).
         .processing_sink_batch => .none,
         // Cluster settings: their contract machine (settings/machine.zig).
-        .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean => .none,
+        .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean, .settings_budget_bind => .none,
         .channel_inbound, .channel_trim, .channel_probe, .channel_unpark => .none,
     };
 }
