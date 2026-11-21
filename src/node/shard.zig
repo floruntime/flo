@@ -1611,8 +1611,8 @@ pub const Shard = struct {
     /// or history write, and a sink's write waits on the sink lane's alone.
     pub fn sendWait(self: *Shard, to: u16, lane: channels_mod.Lane, ns: node_router.NamespaceId) ?SendWait {
         const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
-        const caps = self.outbox_caps;
         const class = channels_mod.Class.of(lane);
+        const caps = self.outbox_caps.forClass(class);
         const now_ms = @import("stdx").time.monotonicMs();
         const total = self.outboxBytes(class);
         if (total >= caps.shard) return .{ .outbox = .{ .to = null, .bytes = total, .cap = caps.shard } };
@@ -1649,7 +1649,7 @@ pub const Shard = struct {
     }
 
     /// Payload bytes this shard's channel outboxes hold on `class`'s
-    /// lanes, over every channel: what `outbox_caps.shard` bounds.
+    /// lanes, over every channel: what that class's shard cap bounds.
     pub fn outboxBytes(self: *Shard, class: channels_mod.Class) u64 {
         const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
         var n: u64 = 0;
@@ -14374,7 +14374,7 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
     _ = try a.stream_handler.appendPayloadToStream(source, "default", "r0");
     two.settle();
     // One byte a channel: the first batch fills it.
-    a.outbox_caps = .{ .shard = 1 << 30, .channel = 1 };
+    a.outbox_caps = .{ .sink = .{ .shard = 1 << 30, .channel = 1 } };
     const c = try TestClient.open(a);
     defer _ = std.c.close(c.pair[1]);
     var yb: [128]u8 = undefined;
@@ -14425,7 +14425,7 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
     try std.testing.expect(pipe.wait == .none);
     try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
     // The shard's cap, over all its outboxes, holds it the same way.
-    a.outbox_caps = .{ .shard = 1, .channel = 1 << 30 };
+    a.outbox_caps = .{ .sink = .{ .shard = 1, .channel = 1 << 30 } };
     _ = try a.stream_handler.appendPayloadToStream(source, "default", try std.fmt.bufPrint(&rb, "r{d}", .{2}));
     two.settle();
     tickNow(a, pipe);
@@ -14465,7 +14465,7 @@ test "Shard: a pipeline whose namespace holds three quarters of a channel's outb
     const held = channels_mod.nsBytesOf(read, 1, .sink, .default);
     try std.testing.expectEqual(channels_mod.metaOf(read, 1, .sink).bytes, held);
     // A cap the outbox is under, but whose three quarters the namespace holds.
-    a.outbox_caps = .{ .shard = 1 << 30, .channel = held + held / 4 + 1 };
+    a.outbox_caps = .{ .sink = .{ .shard = 1 << 30, .channel = held + held / 4 + 1 } };
     _ = try a.stream_handler.appendPayloadToStream(source, "default", "r1");
     two.settle();
     tickNow(a, pipe);
@@ -14527,7 +14527,7 @@ test "Shard: a namespace holding three quarters of all this shard's outboxes wai
     two.settle();
     // Each channel has room, and so do the outboxes together; but the
     // default namespace holds three quarters of the shard's cap.
-    a.outbox_caps = .{ .shard = held + held / 4 + 1, .channel = 1 << 30 };
+    a.outbox_caps = .{ .sink = .{ .shard = held + held / 4 + 1, .channel = 1 << 30 } };
     _ = try a.stream_handler.appendPayloadToStream(source, "default", "r1");
     two.settle();
     tickNow(a, pipelineOf(a, "default"));
@@ -32635,7 +32635,7 @@ test "Shard: a worker's complete of a run a step called is refused while the cal
     two.settle();
     const task = (try ActionsHandler.for_tests.task((try nextAnswer(c, b, &out)).data)).?;
     // No room on b's outboxes: its end can't be sent, so it isn't made.
-    b.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    b.outbox_caps = .{ .other = .{ .shard = 0, .channel = 1 << 30 } };
     var done: [512]u8 = undefined;
     const body = try ActionsHandler.for_tests.completeBody(&done, task, "w", "", "{}");
     b.runRequest(c.conn, try ParkTest.request(.action_complete, 32, proto.DEFAULT_NAMESPACE, task.run, body, ""), .client);
@@ -32674,7 +32674,7 @@ test "actions: an expire that would end a run a step called waits while the call
     _ = actions.expireDue(&t.shard);
     actions.duty_since_ns = 0;
     // No room: only the client's run's lease is ended.
-    t.shard.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    t.shard.outbox_caps = .{ .other = .{ .shard = 0, .channel = 1 << 30 } };
     try std.testing.expectEqual(@as(u64, 1), actions.expireDue(&t.shard));
     try ParkTest.ack(&t.shard);
     try std.testing.expectEqual(action_machine.Status.timed_out, ActionsHandler.for_tests.run(&t.shard, .default, "r2").?.status);
@@ -32781,7 +32781,7 @@ test "Shard: a worker's fail that ends a run a step called is refused while the 
     b.runRequest(c.conn, try ParkTest.request(.action_await, 31, proto.DEFAULT_NAMESPACE, "w", try ActionsHandler.for_tests.awaitBody(&aw, &.{n.action}, 0, null), ""), .client);
     two.settle();
     const task = (try ActionsHandler.for_tests.task((try nextAnswer(c, b, &out)).data)).?;
-    b.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    b.outbox_caps = .{ .other = .{ .shard = 0, .channel = 1 << 30 } };
     var fb: [512]u8 = undefined;
     // A fail with no retry ends the run: refused.
     b.runRequest(c.conn, try ParkTest.request(.action_fail, 32, proto.DEFAULT_NAMESPACE, task.run, try ActionsHandler.for_tests.failBody(&fb, task, "w", false, "boom"), ""), .client);
@@ -32808,7 +32808,7 @@ test "Shard: a task handed back to another shard's run past the outbox caps is d
     var wb: [16]u8 = undefined;
     const n = try callNames(&two, 1, 0, &ab, &wb);
     const task: action_ops_mod.Task.Value = .{ .run = "r-x", .namespace = "default", .deliveries = 1, .term = 1, .index = 5, .action = n.action, .created_at_ms = 0, .attempt = 1, .lease_ms = 5000, .caller_run = null, .caller_workflow = null, .input = "" };
-    a.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    a.outbox_caps = .{ .other = .{ .shard = 0, .channel = 1 << 30 } };
     const before = a.raft_node.log.lastIndex();
     a.actions_handler.handBack(a, .default, "", task);
     try std.testing.expectEqual(before, a.raft_node.log.lastIndex());
@@ -32837,7 +32837,7 @@ test "actions: a called run's lease isn't ended on any attempt while its end has
     const actions = t.shard.actions_handler;
     _ = actions.expireDue(&t.shard);
     actions.duty_since_ns = 0;
-    t.shard.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    t.shard.outbox_caps = .{ .other = .{ .shard = 0, .channel = 1 << 30 } };
     try std.testing.expectEqual(@as(u64, 0), actions.expireDue(&t.shard));
     try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(&t.shard, .default, "r1").?.status);
     try std.testing.expectEqual(@as(u64, 1), metrics.workflow.action_expires_held.load(.monotonic));
@@ -32893,7 +32893,7 @@ test "actions: more held leases than one expire pass looks at don't keep an ordi
     _ = actions.expireDue(&t.shard);
     actions.duty_since_ns = 0;
     // No room for any called run's end.
-    t.shard.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    t.shard.outbox_caps = .{ .other = .{ .shard = 0, .channel = 1 << 30 } };
     var passes: usize = 0;
     while (passes < 4 and ActionsHandler.for_tests.run(&t.shard, .default, "plain").?.status == .leased) : (passes += 1) {
         _ = actions.expireDue(&t.shard);
@@ -33052,7 +33052,7 @@ test "Shard: a child's end waits while its own parent's outbox is full, and anot
         two.shards[1].channel.peers[1].lanes[0].last_trim_ms = 0;
         _ = b.applyCommitted();
     }
-    b.outbox_caps = .{ .shard = 1 << 30, .channel = 1 };
+    b.outbox_caps = .{ .other = .{ .shard = 1 << 30, .channel = 1 } };
     const rd: contract_view.ReadView = .{ .store = &b.defaultPartition().store };
     try std.testing.expect(channels_mod.metaOf(rd, 0, .main).bytes > 0);
     try std.testing.expectEqual(@as(u64, 0), channels_mod.metaOf(rd, 1, .main).bytes);

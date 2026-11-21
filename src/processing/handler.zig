@@ -1588,7 +1588,7 @@ pub const ProcessingHandler = struct {
         // stops adding to one at its cap, and each pipeline's batch passes
         // it by at most its own size. It goes on below the cap: no
         // hysteresis, since one batch is the most it overshoots by.
-        const caps = shard.outbox_caps;
+        const caps = shard.outbox_caps.sink;
         // The driver's clock moves only while it ticks; pressure is read
         // against the time now, so it expires though nothing is sent.
         const now_ms = @import("stdx").time.monotonicMs();

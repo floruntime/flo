@@ -1113,8 +1113,10 @@ pub const Runtime = struct {
         var mb: [96]u8 = undefined;
         var sb: [16]u8 = undefined;
         var cb: [16]u8 = undefined;
+        var ssb: [16]u8 = undefined;
+        var scb: [16]u8 = undefined;
         const driver = @import("../contract/channel_driver.zig");
-        log.info("channel outboxes: {s} a shard, {s} a channel, from {s} over {d} shards", .{ driver.bytesText(&sb, caps.shard), driver.bytesText(&cb, caps.channel), memory.describe(&mb), n });
+        log.info("channel outboxes: {s} a shard and {s} a channel, and for sinks' messages {s} a shard and {s} a channel besides, from {s} over {d} shards", .{ driver.bytesText(&sb, caps.other.shard), driver.bytesText(&cb, caps.other.channel), driver.bytesText(&ssb, caps.sink.shard), driver.bytesText(&scb, caps.sink.channel), memory.describe(&mb), n });
         for (0..n) |i| {
             shards[i].peer_mailboxes = mailboxes;
             shards[i].stopping = &self.stopping;

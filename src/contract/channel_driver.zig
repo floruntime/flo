@@ -37,20 +37,36 @@ pub const WINDOW = 1024;
 
 /// How much each class of a shard's channel outboxes may hold before the
 /// edge stops adding to it: per channel and in all. The two classes
-/// (`channels.Class`) are held apart, each to these caps, so sink bytes a
-/// full target holds back never hold a workflow's or an action's sends,
-/// and all of it is bounded by twice them. Sized per node, from its
-/// memory, and read only by its leaders at the edge, so two nodes may size
-/// them differently; never in state.
+/// (`channels.Class`) are held apart, so sink bytes a full target holds
+/// back never hold a workflow's or an action's sends. The rest keep what
+/// the whole outbox had; a sink's get half that again on top. Sized per
+/// node, from its memory, and read only by its leaders at the edge, so two
+/// nodes may size them differently; never in state.
 pub const OutboxCaps = struct {
-    shard: u64 = 1 << 30,
-    channel: u64 = 128 << 20,
+    pub const Caps = struct { shard: u64, channel: u64 };
 
-    /// A sixteenth of the node's memory over its shards for each class, so
-    /// both together take an eighth, within their ceilings.
+    other: Caps = .{ .shard = 1 << 30, .channel = 128 << 20 },
+    sink: Caps = .{ .shard = 512 << 20, .channel = 64 << 20 },
+
+    /// The rest: an eighth of the node's memory over its shards, a quarter
+    /// of that a channel. A sink's: half of each. Within their ceilings,
+    /// so all of it takes at most three sixteenths of memory, and outbox
+    /// rows count toward the memory pool besides.
     pub fn of(memory: u64, shards: u16) OutboxCaps {
-        const shard = @min(@as(u64, 512 << 20), memory / 16 / @max(shards, 1));
-        return .{ .shard = shard, .channel = @min(@as(u64, 64 << 20), shard / 4) };
+        const per = memory / 8 / @max(shards, 1);
+        const other = @min(@as(u64, 1 << 30), per);
+        const sink = @min(@as(u64, 512 << 20), per / 2);
+        return .{
+            .other = .{ .shard = other, .channel = @min(@as(u64, 128 << 20), other / 4) },
+            .sink = .{ .shard = sink, .channel = @min(@as(u64, 64 << 20), sink / 4) },
+        };
+    }
+
+    pub fn forClass(self: OutboxCaps, class: channels.Class) Caps {
+        return switch (class) {
+            .other => self.other,
+            .sink => self.sink,
+        };
     }
 };
 /// Most payload bytes in one batch.
@@ -831,10 +847,10 @@ pub const Driver = struct {
     }
 };
 
-test "channel driver: each class's outbox caps are a sixteenth of the node's memory over its shards, a quarter of that a channel, within their ceilings" {
-    try std.testing.expectEqual(OutboxCaps{ .shard = 128 << 20, .channel = 32 << 20 }, OutboxCaps.of(16 << 30, 8));
-    try std.testing.expectEqual(OutboxCaps{ .shard = 512 << 20, .channel = 64 << 20 }, OutboxCaps.of(256 << 30, 4));
-    try std.testing.expectEqual(OutboxCaps{ .shard = 16 << 20, .channel = 4 << 20 }, OutboxCaps.of(1 << 30, 4));
+test "channel driver: outbox caps are an eighth of the node's memory over its shards for most messages, half that again for a sink's, a quarter of each a channel, within their ceilings" {
+    try std.testing.expectEqual(OutboxCaps{ .other = .{ .shard = 256 << 20, .channel = 64 << 20 }, .sink = .{ .shard = 128 << 20, .channel = 32 << 20 } }, OutboxCaps.of(16 << 30, 8));
+    try std.testing.expectEqual(OutboxCaps{ .other = .{ .shard = 1 << 30, .channel = 128 << 20 }, .sink = .{ .shard = 512 << 20, .channel = 64 << 20 } }, OutboxCaps.of(256 << 30, 4));
+    try std.testing.expectEqual(OutboxCaps{ .other = .{ .shard = 32 << 20, .channel = 8 << 20 }, .sink = .{ .shard = 16 << 20, .channel = 4 << 20 } }, OutboxCaps.of(1 << 30, 4));
 }
 
 test "channel driver: byte counts read in the largest unit that keeps them whole" {

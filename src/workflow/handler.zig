@@ -5506,7 +5506,7 @@ test "step executor: a step whose action's outbox is at its cap waits for room, 
     try testing.expect(handler.inspect(testKey(.default, "run-1")).?.pending_action_run_id_owned != null);
     // One byte a channel: the second's step waits on its timer, its step
     // logged with no call.
-    shard.outbox_caps = .{ .shard = 1 << 30, .channel = 1 };
+    shard.outbox_caps = .{ .other = .{ .shard = 1 << 30, .channel = 1 } };
     const before = shard.raft_node.log.lastIndex();
     handler.advanceWorkflow(&shard, testKey(.default, "run-2"));
     try testing.expectEqual(before + 1, shard.raft_node.log.lastIndex());
@@ -5613,7 +5613,7 @@ test "step executor: a call asked for again waits while its action's outbox has 
     const rid = run.pending_action_run_id_owned.?;
     try testing.expectEqual(calls_mod.State.no_action, WorkflowHandler.callOf(&shard, run, rid).?.state);
     // No room: nothing is proposed.
-    shard.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    shard.outbox_caps = .{ .other = .{ .shard = 0, .channel = 1 << 30 } };
     const before = shard.raft_node.log.lastIndex();
     handler.retryCall(&shard, run, rid, WorkflowHandler.callOf(&shard, run, rid).?, @import("stdx").time.milliTimestamp());
     try testing.expectEqual(before, shard.raft_node.log.lastIndex());
