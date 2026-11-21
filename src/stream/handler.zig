@@ -2146,7 +2146,29 @@ test "stream handler: a trigger's or job's read of a stream the server keeps rea
     defer handler.deinit();
     var vb: [64]u8 = undefined;
     _ = handler.handleCommand(makeRequest(.stream_append, "_flo", makeBatchValue(&vb, "data"), ""));
-    const from: StreamID = .{ .timestamp_ms = 7, .sequence = 3 };
+    // A reserved stream holding that same append, as no handler or apply
+    // would make one: its meta and record written straight into the store.
+    for ([_]router.NamespaceId{ .default, .of(9) }) |ns| {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const read: @import("../contract/view.zig").ReadView = .{ .store = &partition.store };
+        const sk = stream_mod.streamKey(.default, "_flo");
+        const meta = stream_machine.metaAt(read, sk).?;
+        var rit = read.range(stream_machine.Records, &sk);
+        const rec = (try rit.next()).?;
+        const to = stream_mod.streamKey(ns, "_flo:history");
+        var keys = @import("../contract/view.zig").KeySet.init(arena.allocator());
+        try keys.addIn(stream_machine.Metas.ID, ns, to[4..12]);
+        try keys.addRangeIn(stream_machine.Records.ID, ns, to[4..12]);
+        var view = @import("../contract/view.zig").View.init(&partition.store, arena.allocator(), &keys);
+        var m = meta;
+        m.name = "_flo:history";
+        try view.put(stream_machine.Metas, &to, .{ .v = m });
+        var kb: [stream_machine.RECORD_KEY_LEN]u8 = undefined;
+        try view.put(stream_machine.Records, try arena.allocator().dupe(u8, stream_machine.recordKey(&kb, to, stream_machine.idOfKey(rec.key))), .{ .v = rec.value.v });
+        try view.commit();
+    }
+    const from: StreamID = StreamID.MIN;
     for ([_]router.NamespaceId{ .default, .of(9) }) |ns| {
         const got = handler.readPayloadsForStreamIn("_flo:history", ns, from, 10);
         defer got.deinit(allocator);

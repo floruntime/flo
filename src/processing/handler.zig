@@ -727,6 +727,10 @@ pub const ProcessingHandler = struct {
             return;
         };
         defer def.deinit(self.allocator);
+        if (def.namesReservedStream()) {
+            shard.sendRefusal(conn, req.header.request_id, .unauthorized, .{ .reason = .reserved_key, .ran = .no, .message = @import("../stream/names.zig").RESERVED });
+            return;
+        }
         if (def.namespaceRefusal()) |why| {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
             return;

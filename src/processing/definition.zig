@@ -400,6 +400,14 @@ pub const JobDefinition = struct {
         return names.reservedStreamName(name);
     }
 
+    /// Whether the job reads or writes a stream the server keeps: refused
+    /// at submit as unauthorized, and by `namespaceRefusal` wherever else.
+    pub fn namesReservedStream(self: *const JobDefinition) bool {
+        for (self.sources.items) |src| if (reservedStreamName(src.stream)) return true;
+        for (self.sinks.items) |snk| if (snk.kind == .stream and reservedStreamName(snk.target)) return true;
+        return false;
+    }
+
     fn resourceRefusal(name: []const u8) ?[]const u8 {
         if (name.len == 0) return null; // kv and ts endpoints name no stream or queue
         if (std.mem.indexOfScalar(u8, name, 0) != null) return "stream or queue name must not contain NUL";

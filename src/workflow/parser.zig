@@ -658,7 +658,6 @@ fn parseTrigger(allocator: Allocator, root: JsonValue, d: D) ParseError!?StreamT
     if (stream.len == 0) return d.fail(ParseError.InvalidFieldType, "\"stream\" must not be empty", .{});
     // No stream has a longer name; the runs it starts carry it in their key.
     if (stream.len > MAX_TRIGGER_STREAM) return d.fail(ParseError.InvalidFieldType, "a stream name is at most {d} bytes, not {d}", .{ MAX_TRIGGER_STREAM, stream.len });
-    if (@import("../stream/names.zig").reservedStreamName(stream)) return d.fail(ParseError.InvalidFieldType, "{s}", .{@import("../stream/names.zig").RESERVED_WHY});
     const namespace = try optString(d, trig_obj, "namespace");
     const batch_size = try optIntAs(u32, d, trig_obj, "batch_size") orelse 1;
     if (batch_size == 0) return d.fail(ParseError.InvalidFieldType, "\"batch_size\" must be at least 1", .{});
@@ -1249,12 +1248,6 @@ test "parseWorkflow: a trigger's consumer_group or mode is refused, naming why" 
 test "parseWorkflow: a trigger naming a stream longer than any stream is refused" {
     const name = comptime stdx.repeat("s", (MAX_TRIGGER_STREAM + 1));
     try expectRefused(wrap("", "\"trigger\": { \"stream\": \"" ++ name ++ "\" },"), ParseError.InvalidFieldType, std.fmt.comptimePrint("a stream name is at most {d} bytes, not {d} at trigger", .{ MAX_TRIGGER_STREAM, MAX_TRIGGER_STREAM + 1 }));
-}
-
-test "parseWorkflow: a trigger naming a stream the server keeps is refused, in its own namespace or another" {
-    const why = @import("../stream/names.zig").RESERVED_WHY ++ " at trigger";
-    try expectRefused(wrap("", "\"trigger\": { \"stream\": \"_flo:history\" },"), ParseError.InvalidFieldType, why);
-    try expectRefused(wrap("", "\"trigger\": { \"stream\": \"_flo:history\", \"namespace\": \"other\" },"), ParseError.InvalidFieldType, why);
 }
 
 test "parseWorkflow: a transition's outcome longer than a worker can complete with is refused" {
