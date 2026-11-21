@@ -2,8 +2,10 @@
 //! committed on shard 0. One record holds `pool_share`; one row per node,
 //! keyed by node id, holds its `{ram_bytes, reserve}`. The node-level budget is
 //! derived from these rows joined with the data-holding membership at apply
-//! (`node/memory_budget.zig`); this machine only keeps the rows. It enforces
-//! nothing — a settings entry never charges the pool (`entry.zig hasKeyValue`).
+//! (`node/memory_budget.zig`); this machine only keeps the rows. Every shard
+//! also keeps the share of that budget its own leader bound (`settings.bind`),
+//! which the pool is held to. A settings entry never charges the pool
+//! (`entry.zig hasKeyValue`).
 //!
 //! These are the first node-level (not per-namespace) families: their keys are
 //! built with an empty namespace, so the composite key is just a length byte
@@ -50,14 +52,25 @@ pub const BudgetClean = Record(&.{
     .{ .name = "governing_node", .T = Int(u32) },
 });
 
+/// The share this shard holds, as its leader last bound it. Absent until the
+/// first bind applies: no share is enforced then.
+pub const Bind = Record(&.{
+    .{ .name = "share_bytes", .T = Int(u64) },
+    .{ .name = "budget_bytes", .T = Int(u64) },
+});
+
 pub const PolicyFam = view_mod.Family(50, "settings.policy", .shard, Stored(Policy));
 pub const NodeFam = view_mod.Family(51, "settings.node", .shard, Stored(NodeMem));
 pub const BudgetFam = view_mod.Family(52, "settings.budget", .shard, Stored(BudgetClean));
+// Its own family: `BudgetFam` decodes every key there as a `BudgetClean`.
+pub const BindFam = view_mod.Family(68, "settings.bind", .shard, Stored(Bind));
 
 /// The single key the policy record lives under.
 pub const POLICY_KEY = "share";
 /// The single key the clean-budget record lives under.
 pub const BUDGET_KEY = "clean";
+/// The single key the bound share lives under.
+pub const BIND_KEY = "share";
 
 // ─── Wire payloads (the entry values a proposer encodes) ───────────────────
 // The logged layouts live in `protocol/settings_entries.zig`, where they are
@@ -67,6 +80,7 @@ pub const SetShare = settings_entries.Share;
 pub const SetNodeMem = settings_entries.NodeMem;
 pub const DelNode = settings_entries.DelNode;
 pub const SetBudgetClean = settings_entries.BudgetClean;
+pub const SetBudgetBind = settings_entries.BudgetBind;
 
 // ─── Keys ──────────────────────────────────────────────────────────────────
 
@@ -83,6 +97,17 @@ fn policyKey(buf: *[1 + POLICY_KEY.len]u8) []const u8 {
 
 fn budgetKey(buf: *[1 + BUDGET_KEY.len]u8) []const u8 {
     return view_mod.key(buf, "", BUDGET_KEY) catch unreachable;
+}
+
+fn bindKey(buf: *[1 + BIND_KEY.len]u8) []const u8 {
+    return view_mod.key(buf, "", BIND_KEY) catch unreachable;
+}
+
+/// The share bound on the store `read` reads, or null when none is.
+pub fn boundShare(read: view_mod.ReadView) ?Bind.Value {
+    var kb: [1 + BIND_KEY.len]u8 = undefined;
+    const rec = (read.get(BindFam, bindKey(&kb)) catch null) orelse return null;
+    return rec.v;
 }
 
 fn typeOf(e: *const Entry) EntryType {
@@ -107,6 +132,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             try out.add(NodeFam.ID, "", &idb);
         },
         .settings_budget_clean => try out.add(BudgetFam.ID, "", BUDGET_KEY),
+        .settings_budget_bind => try out.add(BindFam.ID, "", BIND_KEY),
         else => {},
     }
 }
@@ -140,14 +166,20 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             var kb: [1 + BUDGET_KEY.len]u8 = undefined;
             try view.put(BudgetFam, budgetKey(&kb), .{ .v = .{ .budget_bytes = p.budget_bytes, .governing_node = p.governing_node } });
         },
+        .settings_budget_bind => {
+            const p = SetBudgetBind.decodeAll(e.payload, &diag) catch return out.refuse(.bad_request, .malformed, BAD);
+            if (p.share_bytes == 0) return out.refuse(.bad_request, .malformed, "bad request: a memory share of 0 bytes");
+            var kb: [1 + BIND_KEY.len]u8 = undefined;
+            try view.put(BindFam, bindKey(&kb), .{ .v = .{ .share_bytes = p.share_bytes, .budget_bytes = p.budget_bytes } });
+        },
         else => {},
     }
 }
 
 pub const machine: machine_mod.Machine = .{
     .name = "settings",
-    .entry_types = &.{ .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean },
-    .families = &.{ machine_mod.info(PolicyFam), machine_mod.info(NodeFam), machine_mod.info(BudgetFam) },
+    .entry_types = &.{ .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean, .settings_budget_bind },
+    .families = &.{ machine_mod.info(PolicyFam), machine_mod.info(NodeFam), machine_mod.info(BudgetFam), machine_mod.info(BindFam) },
     .keys = keys,
     .apply = apply,
 };
