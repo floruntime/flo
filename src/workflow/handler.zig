@@ -2223,7 +2223,7 @@ pub const WorkflowHandler = struct {
         // Its start goes to the callee's shard: held, as for a full log,
         // while that outbox, this shard's, or the namespace's share of
         // either has no room, so one tenant's calls can't fill them.
-        if (shard.sendWait(shard.router.slotToShard(slot), ns) != null) return self.holdStepForRoom(run, step_label, now_ms);
+        if (shard.sendWait(shard.router.slotToShard(slot), .main, ns) != null) return self.holdStepForRoom(run, step_label, now_ms);
         var run_id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
         const run_id = shard.run_id_gen.next(if (kind == .action) .action else .workflow, slot, shard.raft_node.current_term, &run_id_buf);
         const buf = self.allocator.alloc(u8, ae.Call.max_size) catch return definition.StepOutcome.execution_failure;
@@ -2340,7 +2340,7 @@ pub const WorkflowHandler = struct {
         run.call_retry_at_ms = now_ms +| 1_000;
         const ns = keyNamespace(run.ns_key);
         // Its start is sent again: not while its outbox has no room.
-        if (shard.sendWait(shard.router.slotToShard(router.nsKeySlot(ns, c.target)), ns) != null) return;
+        if (shard.sendWait(shard.router.slotToShard(router.nsKeySlot(ns, c.target)), .main, ns) != null) return;
         var buf: [ae.CallRetry.max_size]u8 = undefined;
         const payload = ae.CallRetry.encodeInto(&buf, .{ .ns = ns.int(), .slot = calls_mod.callerSlot(ns, run.workflow_name_owned), .run = action_rid }) catch return;
         run.call_retry_index = (proposeCharged(shard, ns, .step_call_retry, payload) catch return).index;
@@ -2361,7 +2361,7 @@ pub const WorkflowHandler = struct {
     fn parentWait(shard: *Shard, ns: NamespaceId, run_id: []const u8) bool {
         const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
         const p = children_mod.parentOf(read, ns, run_id) orelse return false;
-        return shard.sendWait(shard.router.slotToShard(p.parent_slot), ns) != null;
+        return shard.sendWait(shard.router.slotToShard(p.parent_slot), .main, ns) != null;
     }
 
     /// Parent records one pass looks at, at most.
@@ -2435,7 +2435,7 @@ pub const WorkflowHandler = struct {
         const taken = self.appliedRun(run_key) != null;
         if (!held or taken) {
             // A refusal is told to the parent: not past its outbox's room.
-            if (shard.sendWait(shard.router.slotToShard(p.parent_slot), ns) != null) return error.Overloaded;
+            if (shard.sendWait(shard.router.slotToShard(p.parent_slot), .main, ns) != null) return error.Overloaded;
             var buf: [ae.ChildRefuse.max_size]u8 = undefined;
             const payload = try ae.ChildRefuse.encodeInto(&buf, .{ .ns = ns.int(), .run = run_id, .answer = if (taken) .conflict else .no_action });
             return shard.raft_node.propose(.child_refuse, entry_mod.Flags.NONE, payload);

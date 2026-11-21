@@ -1604,7 +1604,9 @@ pub const Shard = struct {
         share: struct { to: ?u16, bytes: u64, cap: u64 },
     };
 
-    pub fn sendWait(self: *Shard, to: u16, ns: node_router.NamespaceId) ?SendWait {
+    /// `lane` is the lane the write's messages ride: only its pressure
+    /// holds it, so a full sink target holds no other lane's writes.
+    pub fn sendWait(self: *Shard, to: u16, lane: channels_mod.Lane, ns: node_router.NamespaceId) ?SendWait {
         const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
         const caps = self.outbox_caps;
         const now_ms = @import("stdx").time.monotonicMs();
@@ -1612,9 +1614,9 @@ pub const Shard = struct {
         if (total >= caps.shard) return .{ .outbox = .{ .to = null, .bytes = total, .cap = caps.shard } };
         const ns_total = self.nsOutboxBytes(ns);
         if (raft_node_mod.shareHeld(ns_total, total, caps.shard)) return .{ .share = .{ .to = null, .bytes = ns_total, .cap = caps.shard } };
-        if (self.channel.pressureOf(to, now_ms)) |stall| return .{ .pressure = stall };
+        if (self.channel.pressureOf(to, lane, now_ms)) |stall| return .{ .pressure = stall };
         const bytes = channels_mod.bytesTo(read, to);
-        if (bytes >= caps.channel) return .{ .outbox = .{ .to = to, .bytes = bytes, .cap = caps.channel, .cause = self.channel.causeOf(to, now_ms) } };
+        if (bytes >= caps.channel) return .{ .outbox = .{ .to = to, .bytes = bytes, .cap = caps.channel, .cause = self.channel.causeOf(to, lane, now_ms) } };
         const held = channels_mod.nsBytesTo(read, to, ns);
         if (raft_node_mod.shareHeld(held, bytes, caps.channel)) return .{ .share = .{ .to = to, .bytes = held, .cap = caps.channel } };
         return null;
@@ -14377,7 +14379,7 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
     two.settle();
     try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
     const read: contract_view.ReadView = .{ .store = &a.defaultPartition().store };
-    const held = channels_mod.metaOf(read, 1, .main).bytes;
+    const held = channels_mod.metaOf(read, 1, .sink).bytes;
     try std.testing.expect(held > 0);
     _ = try a.stream_handler.appendPayloadToStream(source, "default", try std.fmt.bufPrint(&rb, "r{d}", .{1}));
     two.settle();
@@ -14400,7 +14402,7 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
             var out = persistence_mod.Result.start(&e);
             try std.testing.expect(r.applyEntry(&e, &out));
         }
-        try std.testing.expectEqual(held, channels_mod.metaOf(.{ .store = &r.defaultPartition().store }, 1, .main).bytes);
+        try std.testing.expectEqual(held, channels_mod.metaOf(.{ .store = &r.defaultPartition().store }, 1, .sink).bytes);
         try std.testing.expectEqual(held, r.outboxBytes());
     }
     const job = a.processing_handler.firstJob().?;
@@ -14408,7 +14410,7 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
     try std.testing.expectEqualStrings("waiting: the outbox to shard 1 is full (46 B of 1 B)", a.processing_handler.liveNote(&job, &lb).?);
     // Delivered, acked and trimmed: room again, and the next record goes.
     pumpChannels(&two);
-    try std.testing.expectEqual(@as(u64, 0), channels_mod.metaOf(read, 1, .main).bytes);
+    try std.testing.expectEqual(@as(u64, 0), channels_mod.metaOf(read, 1, .sink).bytes);
     tickNow(a, pipe);
     two.settle();
     try std.testing.expect(pipe.wait == .none);
@@ -14421,7 +14423,7 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
     try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
     try std.testing.expectEqual(@as(?u16, null), pipe.wait.outbox.to);
     // Trims are spaced 100 ms apart; this one is due now.
-    a.channel.peers[1].lanes[0].last_trim_ms = 0;
+    a.channel.peers[1].lanes[@backingInt(channels_mod.Lane.sink)].last_trim_ms = 0;
     pumpChannels(&two);
     try std.testing.expectEqual(@as(u64, 0), a.outboxBytes());
     tickNow(a, pipe);
@@ -14451,8 +14453,8 @@ test "Shard: a pipeline whose namespace holds three quarters of a channel's outb
     tickNow(a, pipe);
     two.settle();
     const read: contract_view.ReadView = .{ .store = &a.defaultPartition().store };
-    const held = channels_mod.nsBytesOf(read, 1, .main, .default);
-    try std.testing.expectEqual(channels_mod.metaOf(read, 1, .main).bytes, held);
+    const held = channels_mod.nsBytesOf(read, 1, .sink, .default);
+    try std.testing.expectEqual(channels_mod.metaOf(read, 1, .sink).bytes, held);
     // A cap the outbox is under, but whose three quarters the namespace holds.
     a.outbox_caps = .{ .shard = 1 << 30, .channel = held + held / 4 + 1 };
     _ = try a.stream_handler.appendPayloadToStream(source, "default", "r1");
@@ -14462,9 +14464,9 @@ test "Shard: a pipeline whose namespace holds three quarters of a channel's outb
     try std.testing.expectEqual(@as(?u16, 1), pipe.wait.share.to);
     try std.testing.expectEqual(held, pipe.wait.share.bytes);
     // Taken and trimmed: its share is free, and it reads on.
-    a.channel.peers[1].lanes[0].last_trim_ms = 0;
+    a.channel.peers[1].lanes[2].last_trim_ms = 0;
     pumpChannels(&two);
-    try std.testing.expectEqual(@as(u64, 0), channels_mod.nsBytesOf(read, 1, .main, .default));
+    try std.testing.expectEqual(@as(u64, 0), channels_mod.nsBytesOf(read, 1, .sink, .default));
     tickNow(a, pipe);
     two.settle();
     try std.testing.expect(pipe.wait == .none);
@@ -14497,7 +14499,7 @@ test "Shard: a namespace holding three quarters of all this shard's outboxes wai
     tickNow(a, pipelineOf(a, "default"));
     two.settle();
     const read: contract_view.ReadView = .{ .store = &a.defaultPartition().store };
-    const held = channels_mod.nsBytesOf(read, 1, .main, .default);
+    const held = channels_mod.nsBytesOf(read, 1, .sink, .default);
     try std.testing.expect(held > 0);
     // A second job, in its own namespace, reading the same stream.
     var ybuf: [256]u8 = undefined;
@@ -14549,7 +14551,7 @@ test "Shard: pressure that arrived as a send-only shard's outbox emptied still e
     const pipe = try sinkJob(&two, c, source, try std.fmt.bufPrint(&yb, "  - name: out\n    queue: {{ name: {s} }}", .{q.name}));
     tickNow(a, pipe);
     two.settle();
-    a.channel.peers[1].lanes[0].last_trim_ms = 0;
+    a.channel.peers[1].lanes[@backingInt(channels_mod.Lane.sink)].last_trim_ms = 0;
     pumpChannels(&two);
     // Everything sent is taken and trimmed: nothing left for a's channels.
     const fams = &a.defaultPartition().store.families;
@@ -14558,13 +14560,17 @@ test "Shard: pressure that arrived as a send-only shard's outbox emptied still e
     // Time is set, not waited for: each phase stamps the pressure as of
     // the clock it is read against.
     if (Shard.nowMs() <= 2 * channel_driver.PRESSURE_EXPIRY_MS) return error.SkipZigTest;
-    const p = &a.channel.peers[1];
+    const p = &a.channel.peers[1].lanes[@backingInt(channels_mod.Lane.sink)];
     p.pressure[0] = .{ .shard = 1, .cause = @backingInt(channel_driver.Cause.halted) };
     p.pressure_len = 1;
     p.probe_ms = 0;
     _ = try a.stream_handler.appendPayloadToStream(source, "default", "r1");
     two.settle();
     p.pressure_ms = Shard.nowMs();
+    // It holds a's sink sends to shard 1, and no other lane's.
+    try std.testing.expect(a.sendWait(1, .sink, .default) != null);
+    try std.testing.expect(a.sendWait(1, .main, .default) == null);
+    try std.testing.expect(a.sendWait(1, .history, .default) == null);
     tickNow(a, pipe);
     try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
     try std.testing.expect(pipe.wait == .pressure);
@@ -22943,7 +22949,7 @@ test "queues: a dequeue waiting on a queue is answered when a sink's enqueue par
     var w: schema.Writer = .{ .buf = &mb };
     try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, "q"))), .entry_type = @backingInt(entry_mod.EntryType.queue_enqueue), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = try oneSlotEnqueue(&eb, "q", "parked") });
     var ib: [1024]u8 = undefined;
-    _ = try s.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } }));
+    _ = try s.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = @backingInt(channels_mod.Lane.sink), .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } }));
     try std.testing.expect(s.applyCommitted());
     const st = &s.defaultPartition().store;
     try std.testing.expectEqual(@as(u64, 1), channels_mod.shardParked(.{ .store = st }).count);
@@ -27007,7 +27013,7 @@ test "Shard: a second skip of an inbound's halt, committed with the first, skips
             try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, key[ns_table.DEFAULT.bytes().len..]))), .entry_type = @backingInt(entry_mod.EntryType.kv_put), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = put });
         }
         var ib: [2048]u8 = undefined;
-        h = (try shard.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 1, .lane = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 3 } }))).index;
+        h = (try shard.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 1, .lane = @backingInt(channels_mod.Lane.sink), .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 3 } }))).index;
         try std.testing.expect(!shard.applyCommitted());
         try std.testing.expectEqual(@as(u64, 1), shard.halted.?.message.?.seq);
         const kv_before = shard.kv_handler.kv.countLive();
@@ -27021,7 +27027,7 @@ test "Shard: a second skip of an inbound's halt, committed with the first, skips
         // The first took it past; the second skipped nothing.
         try std.testing.expectEqual(@as(usize, 1), shard.skips.named.items.len);
         try std.testing.expectEqual(kv_before + 2, shard.kv_handler.kv.countLive());
-        try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1, .main).?.applied);
+        try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1, .sink).?.applied);
         live = SkipState.of(&shard, h);
         try shard.flushSegmentToDisk();
     }
@@ -27031,7 +27037,7 @@ test "Shard: a second skip of an inbound's halt, committed with the first, skips
     try std.testing.expect(shard.halted == null and shard.offline == null);
     try std.testing.expectEqual(@as(usize, 1), shard.skips.named.items.len);
     try std.testing.expectEqual(live, SkipState.of(&shard, h));
-    try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1, .main).?.applied);
+    try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1, .sink).?.applied);
 }
 
 test "Shard: a second skip of an inbound's halt doesn't take it past the next message that halts it" {
@@ -31473,12 +31479,12 @@ test "Shard: a sink's enqueue naming a namespace id none could have is refused a
         try ce.Message.encode(&w, .{ .slot = q.slot, .entry_type = @backingInt(entry_mod.EntryType.queue_enqueue), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = enq });
     }
     var ib: [2048]u8 = undefined;
-    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
+    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = @backingInt(channels_mod.Lane.sink), .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
     const e = entry_mod.buildEntry(.channel_inbound, 0, b.raft_node.current_term, b.raft_node.last_applied + 1, 1, inbound);
     var out = persistence_mod.Result.start(&e);
     try std.testing.expect(b.applyEntry(&e, &out));
     const read: contract_view.ReadView = .{ .store = &b.defaultPartition().store };
-    try std.testing.expectEqual(@as(u64, 2), channels_mod.inOf(read, 0, .main).?.applied);
+    try std.testing.expectEqual(@as(u64, 2), channels_mod.inOf(read, 0, .sink).?.applied);
     try std.testing.expectEqual(@as(u64, 2), b.channel.sender_bugs[0][@backingInt(contract_store.SenderBug.bad_payload)]);
     try std.testing.expectEqual(@as(u64, 0), channels_mod.shardParked(read).count);
 }
@@ -31508,7 +31514,7 @@ test "Shard: a sink's write its target refuses for good is counted by the shard 
         try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, key))), .entry_type = @backingInt(entry_mod.EntryType.kv_put), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = put });
     }
     var ib: [2048]u8 = undefined;
-    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
+    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = @backingInt(channels_mod.Lane.sink), .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
     const e = entry_mod.buildEntry(.channel_inbound, 0, b.raft_node.current_term, b.raft_node.last_applied + 1, 1, inbound);
     var out = persistence_mod.Result.start(&e);
     try std.testing.expect(b.applyEntry(&e, &out));
@@ -31543,7 +31549,7 @@ test "Shard: a stream append a channel carries to a new stream makes its stream.
     const append = entry_mod.buildCommandEntry(.stream_append, 0, 1, 1, 0, .default, name, "\x00\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00x\x00\x00", &cb).?.payload;
     try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, name))), .entry_type = @backingInt(entry_mod.EntryType.stream_append), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = append });
     var ib: [1024]u8 = undefined;
-    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } });
+    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = @backingInt(channels_mod.Lane.sink), .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } });
     const e = entry_mod.buildEntry(.channel_inbound, 0, b.raft_node.current_term, b.raft_node.last_applied + 1, 1, inbound);
     var out = persistence_mod.Result.start(&e);
     try std.testing.expect(b.applyEntry(&e, &out));
@@ -31678,7 +31684,9 @@ test "Shard: a sink's enqueues to a full queue on another shard park, a KV write
     pumpChannels(&two);
 
     const read: contract_view.ReadView = .{ .store = &b.defaultPartition().store };
-    try std.testing.expectEqual(@as(u64, 4), channels_mod.inOf(read, 0, .main).?.applied);
+    // The sink's three on the sink lane, the KV write on the main lane.
+    try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(read, 0, .sink).?.applied);
+    try std.testing.expectEqual(@as(u64, 1), channels_mod.inOf(read, 0, .main).?.applied);
     try std.testing.expectEqualStrings("v", b.kv_handler.kv.getIn(.default, key).?.value);
     try std.testing.expectEqual(@as(u64, 2), channels_mod.shardParked(read).count);
     var bodies: [8][]const u8 = undefined;
@@ -31696,7 +31704,8 @@ test "Shard: a sink's enqueues to a full queue on another shard park, a KV write
     try std.testing.expectEqual(@as(u64, 1), sm.channel_parked_targets.load(.monotonic));
     // The sender's outbox is trimmed: parked, the messages are the
     // receiver's to keep.
-    try std.testing.expectEqual(@as(u64, 4), channels_mod.metaOf(.{ .store = &a.defaultPartition().store }, 1, .main).acked);
+    try std.testing.expectEqual(@as(u64, 3), channels_mod.metaOf(.{ .store = &a.defaultPartition().store }, 1, .sink).acked);
+    try std.testing.expectEqual(@as(u64, 1), channels_mod.metaOf(.{ .store = &a.defaultPartition().store }, 1, .main).acked);
 
     // Room for one: the next parked message, and only it.
     try purgeQueue(b, q.name);

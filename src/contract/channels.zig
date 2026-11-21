@@ -22,11 +22,12 @@
 //!   deliveries in one inbound still differ; a record located by index
 //!   takes `(index, view.message.ordinal)`.
 //! - **Trims** drop what the receiver durably applied.
-//! - **Lanes.** Each pair of groups has two channels, each its own seqs,
-//!   outbox, marks and trims: `main`, and `history` for the messages a
-//!   run's history rides (`Flags.HISTORY`), so history is never held
-//!   behind a sink's message its target is full for. A history message
-//!   only ever goes to its sender's own group, and never parks.
+//! - **Lanes.** Each pair of groups has three channels, each its own seqs,
+//!   outbox, marks and trims: `sink` for a sink's messages (`Flags.SINK`),
+//!   the only ones that park and the only ones a full target holds back;
+//!   `history` for the messages a run's history rides (`Flags.HISTORY`),
+//!   only ever to its sender's own group; and `main` for the rest. So no
+//!   message waits behind a sink's whose target is full.
 //!
 //! Delivering, acks and resends are the leader's (`channel_driver.zig`):
 //! nothing here is node-local, so every replica and every replay agree.
@@ -281,19 +282,25 @@ pub const CHAN_LEN = PEER_LEN + 1;
 pub const CHAN_KEY = 1 + CHAN_LEN;
 pub const OUT_KEY = 1 + CHAN_LEN + 8;
 
-/// A channel's lane. Each has its own seqs, outbox and marks, so the two
-/// never wait on each other.
+/// A channel's lane. Each has its own seqs, outbox and marks, so none
+/// waits on another.
 pub const Lane = enum(u8) {
     main = 0,
     /// A run's history, and nothing else: only `Flags.HISTORY` messages,
     /// only to the sender's own group, and none parks.
     history = 1,
+    /// A sink's writes (`Flags.SINK`): the only messages that park, and the
+    /// only ones a full target's pressure holds back.
+    sink = 2,
 
-    pub const all = [_]Lane{ .main, .history };
+    pub const all = [_]Lane{ .main, .history, .sink };
 
-    /// The lane a message with `flags` rides.
+    /// The lane a message with `flags` rides. One flagged both a history's
+    /// and a sink's is a Flo bug, refused where it is sent and taken.
     pub fn of(flags: u16) Lane {
-        return if (flags & entry_mod.Flags.HISTORY != 0) .history else .main;
+        if (flags & entry_mod.Flags.HISTORY != 0) return .history;
+        if (flags & entry_mod.Flags.SINK != 0) return .sink;
+        return .main;
     }
 
     pub fn from(byte: u8) ?Lane {
@@ -1064,7 +1071,7 @@ const Group = struct {
     }
 
     fn outRecord(g: *Group, to: u16, seq: u64) ?Out.Value {
-        return g.outOn(to, .main, seq);
+        return g.outOn(to, .sink, seq);
     }
 
     fn outOn(g: *Group, to: u16, lane: Lane, seq: u64) ?Out.Value {
@@ -1084,7 +1091,7 @@ const Got = struct { from: u16, seq: u64 };
 
 /// An inbound entry from `from`'s outbox to `to`, seqs `first..first+n-1`.
 fn inboundFrom(sender: *Group, from: u16, to: u16, first: u64, n: u64, buf: []u8) ![]const u8 {
-    return inboundOn(sender, from, to, .main, first, n, buf);
+    return inboundOn(sender, from, to, .sink, first, n, buf);
 }
 
 /// `inboundFrom`, from `lane`'s outbox, on that lane.
@@ -1109,10 +1116,10 @@ test "channels: a history message rides its own lane, with its own seqs, outbox,
     try a.probeTo(2, "hist-one-000000H");
     try a.probeTo(2, "message-two-0002");
     try a.probeTo(2, "hist-two-000000H");
-    try testing.expectEqual(@as(u64, 3), metaOf(a.read(), 0, .main).next_seq);
+    try testing.expectEqual(@as(u64, 3), metaOf(a.read(), 0, .sink).next_seq);
     try testing.expectEqual(@as(u64, 3), metaOf(a.read(), 0, .history).next_seq);
     try testing.expectEqual(entry_mod.Flags.HISTORY, a.outOn(0, .history, 1).?.flags);
-    try testing.expectEqual(entry_mod.Flags.SINK, a.outOn(0, .main, 1).?.flags);
+    try testing.expectEqual(entry_mod.Flags.SINK, a.outOn(0, .sink, 1).?.flags);
     // Their namespace's bytes are counted per lane.
     const one = a.outOn(0, .history, 1).?.payload.len;
     try testing.expectEqual(2 * one, nsBytesOf(a.read(), 0, .history, probe.PROBE_ORIGIN.ns));
@@ -1122,19 +1129,19 @@ test "channels: a history message rides its own lane, with its own seqs, outbox,
     var buf: [8192]u8 = undefined;
     _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .history, 1, 2, &buf));
     try testing.expectEqual(@as(u64, 2), inOf(a.read(), 0, .history).?.applied);
-    try testing.expect(inOf(a.read(), 0, .main) == null);
+    try testing.expect(inOf(a.read(), 0, .sink) == null);
     try testing.expectEqual(@as(u64, 2), a.got("hist-two-000000H").?.seq);
     try testing.expect(a.got("message-one-0001") == null);
-    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .main, 1, 1, &buf));
-    try testing.expectEqual(@as(u64, 1), inOf(a.read(), 0, .main).?.applied);
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .sink, 1, 1, &buf));
+    try testing.expectEqual(@as(u64, 1), inOf(a.read(), 0, .sink).?.applied);
     // A trim of one lane leaves the other's outbox as it was.
     var tb: [64]u8 = undefined;
     _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&tb, .{ .to = 0, .lane = @backingInt(Lane.history), .first = 1, .through = 2 }));
     try testing.expectEqual(@as(u64, 2), metaOf(a.read(), 0, .history).acked);
     try testing.expectEqual(@as(u64, 0), metaOf(a.read(), 0, .history).bytes);
     try testing.expectEqual(@as(u64, 0), nsBytesOf(a.read(), 0, .history, probe.PROBE_ORIGIN.ns));
-    try testing.expectEqual(@as(u64, 0), metaOf(a.read(), 0, .main).acked);
-    try testing.expect(a.outOn(0, .main, 1) != null and a.outOn(0, .main, 2) != null);
+    try testing.expectEqual(@as(u64, 0), metaOf(a.read(), 0, .sink).acked);
+    try testing.expect(a.outOn(0, .sink, 1) != null and a.outOn(0, .sink, 2) != null);
 }
 
 test "channels: a history message to another group, or a history message that is also a sink's, halts its sender's apply" {
@@ -1183,13 +1190,13 @@ test "channels: a repair's skip of a history inbound names its lane, and takes o
     _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .history, 1, 1, &buf));
     a.store.inbound_skip = null;
     try testing.expectEqual(@as(u64, 1), inOf(a.read(), 0, .history).?.applied);
-    try testing.expect(inOf(a.read(), 0, .main) == null);
+    try testing.expect(inOf(a.read(), 0, .sink) == null);
     try testing.expect(a.got("hist-one-000000H") == null);
     const skipped = a.store.messages.items[0];
     try testing.expect(skipped.skipped);
     try testing.expect(std.mem.endsWith(u8, skipped.result.refused().?.refusal.message, "from shard 0, history lane)"));
     // The main lane's seq 1 is untouched by it.
-    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .main, 1, 1, &buf));
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .sink, 1, 1, &buf));
     try testing.expectEqual(@as(u64, 1), a.got("message-one-0001").?.seq);
 }
 
@@ -1201,14 +1208,14 @@ test "channels: an inbound whose message's flags are the other lane's, or naming
     var buf: [8192]u8 = undefined;
     const before = replicaState(&a);
     // The main lane's message, said to be on the history lane.
-    const main_on_history = @constCast(try inboundOn(&a, 0, 0, .main, 1, 1, &buf));
+    const main_on_history = @constCast(try inboundOn(&a, 0, 0, .sink, 1, 1, &buf));
     main_on_history[2] = @backingInt(Lane.history);
     try testing.expectError(error.Halt, a.run(&Probed.machine, .channel_inbound, main_on_history));
     // And the other way.
     const history_on_main = @constCast(try inboundOn(&a, 0, 0, .history, 1, 1, &buf));
-    history_on_main[2] = @backingInt(Lane.main);
+    history_on_main[2] = @backingInt(Lane.sink);
     try testing.expectError(error.Halt, a.run(&Probed.machine, .channel_inbound, history_on_main));
-    const no_lane = @constCast(try inboundOn(&a, 0, 0, .main, 1, 1, &buf));
+    const no_lane = @constCast(try inboundOn(&a, 0, 0, .sink, 1, 1, &buf));
     no_lane[2] = 7;
     try testing.expectError(error.Halt, a.run(&Probed.machine, .channel_inbound, no_lane));
     try testing.expectEqual(before, replicaState(&a));
@@ -1221,8 +1228,8 @@ test "channels: a send is written to the outbox with its entry, in seq order per
     try a.probeTo(1, "message-one-0001");
     try a.probeTo(3, "message-two-0002");
     try a.probeTo(2, "message-own-0003");
-    try testing.expectEqual(@as(u64, 3), metaOf(a.read(), 1, .main).next_seq);
-    try testing.expectEqual(@as(u64, 2), metaOf(a.read(), 0, .main).next_seq);
+    try testing.expectEqual(@as(u64, 3), metaOf(a.read(), 1, .sink).next_seq);
+    try testing.expectEqual(@as(u64, 2), metaOf(a.read(), 0, .sink).next_seq);
     const first = a.outRecord(1, 1).?;
     try testing.expectEqual(@as(u64, 1), first.sent_at);
     try testing.expectEqual(@as(u16, 1), first.slot);
@@ -1242,20 +1249,20 @@ test "channels: a receiver applies each message once and in order, and halts on 
     var buf: [8192]u8 = undefined;
     // 1..2, then 1..3 again (a resend): 3 is new, 1 and 2 are skipped.
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 2, &buf));
-    try testing.expectEqual(@as(u64, 2), inOf(b.read(), 0, .main).?.applied);
+    try testing.expectEqual(@as(u64, 2), inOf(b.read(), 0, .sink).?.applied);
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .main).?.applied);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .sink).?.applied);
     try testing.expectEqual(Got{ .from = 0, .seq = 1 }, b.got("message-one-0001").?);
     try testing.expectEqual(Got{ .from = 0, .seq = 3 }, b.got("message-thr-0003").?);
     // An all-duplicate batch changes nothing.
-    const index_before = inOf(b.read(), 0, .main).?;
+    const index_before = inOf(b.read(), 0, .sink).?;
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 2, 2, &buf));
-    try testing.expectEqual(index_before.applied, inOf(b.read(), 0, .main).?.applied);
+    try testing.expectEqual(index_before.applied, inOf(b.read(), 0, .sink).?.applied);
     // A batch past a gap halts, and changes nothing.
     try a.probeTo(1, "message-fou-0004");
     try a.probeTo(1, "message-fiv-0005");
     try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 5, 1, &buf)));
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .main).?.applied);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .sink).?.applied);
     try testing.expect(b.got("message-fiv-0005") == null);
 }
 
@@ -1269,7 +1276,7 @@ test "channels: a refused message undoes only its own writes, and still takes it
     try a.probeTo(1, "message-thr-0003");
     var buf: [8192]u8 = undefined;
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .main).?.applied);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .sink).?.applied);
     try testing.expect(b.got("message-one-0001") != null);
     try testing.expect(b.got("refuse-this-0002") == null);
     // The target's own refusal: not the sender's bug.
@@ -1288,13 +1295,13 @@ test "channels: a repair's skip of an inbound takes every seq it holds, answers 
     var buf: [8192]u8 = undefined;
     // Unrepaired, the inbound halts at its second message, naming it.
     try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf)));
-    try testing.expectEqual(store_mod.Applying{ .from = 0, .seq = 2 }, b.store.applying.?);
-    try testing.expect(inOf(b.read(), 0, .main) == null);
+    try testing.expectEqual(store_mod.Applying{ .from = 0, .seq = 2, .lane = .sink }, b.store.applying.?);
+    try testing.expect(inOf(b.read(), 0, .sink) == null);
     // Skipped whole: no message applies, every seq is taken and answered.
     b.store.inbound_skip = .all(77);
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
     b.store.inbound_skip = null;
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .main).?.applied);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .sink).?.applied);
     try testing.expect(b.got("message-one-0001") == null and b.got("message-thr-0003") == null);
     try testing.expectEqual(@as(usize, 3), b.store.messages.items.len);
     for (b.store.messages.items) |*m| {
@@ -1305,7 +1312,7 @@ test "channels: a repair's skip of an inbound takes every seq it holds, answers 
     }
     // Sent again, they are duplicates: nothing more applies.
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .main).?.applied);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .sink).?.applied);
     try testing.expect(b.got("message-one-0001") == null);
 }
 
@@ -1347,7 +1354,7 @@ test "channels: a skipped inbound leaves every replica the same, whether it halt
     try testing.expectEqual(want, replicaState(&halted_first));
     try testing.expectEqual(want, replicaState(&booted));
     for ([_]*Group{ &halted_first, &booted }) |g| {
-        try testing.expectEqual(inOf(live.read(), 0, .main).?.applied, inOf(g.read(), 0, .main).?.applied);
+        try testing.expectEqual(inOf(live.read(), 0, .sink).?.applied, inOf(g.read(), 0, .sink).?.applied);
         try testing.expectEqual(live.store.messages.items.len, g.store.messages.items.len);
         for (live.store.messages.items, g.store.messages.items) |*x, *y| {
             try testing.expectEqual(x.skipped, y.skipped);
@@ -1368,7 +1375,7 @@ test "channels: a repair's skip of one message of an inbound applies the others"
     b.store.inbound_skip = .one(77, 2);
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
     b.store.inbound_skip = null;
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .main).?.applied);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .sink).?.applied);
     try testing.expect(b.got("message-one-0001") != null);
     try testing.expect(b.got("message-thr-0003") != null);
     try testing.expect(!b.store.messages.items[0].skipped);
@@ -1393,15 +1400,15 @@ test "channels: an inbound whose messages halt it in turn is skipped a message a
     var skip = store_mod.InboundSkip.one(77, 2);
     b.store.inbound_skip = skip;
     try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, inbound));
-    try testing.expectEqual(store_mod.Applying{ .from = 0, .seq = 3 }, b.store.applying.?);
-    try testing.expect(inOf(b.read(), 0, .main) == null);
+    try testing.expectEqual(store_mod.Applying{ .from = 0, .seq = 3, .lane = .sink }, b.store.applying.?);
+    try testing.expect(inOf(b.read(), 0, .sink) == null);
     // 2 and 3 skipped: it halts at 4.
     b.index -= 1;
     skip.seqs[1] = 3;
     skip.n = 2;
     b.store.inbound_skip = skip;
     try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, inbound));
-    try testing.expectEqual(store_mod.Applying{ .from = 0, .seq = 4 }, b.store.applying.?);
+    try testing.expectEqual(store_mod.Applying{ .from = 0, .seq = 4, .lane = .sink }, b.store.applying.?);
     // Then the whole entry, the group halted at 4: every message is skipped,
     // and one that didn't halt it says which did.
     b.index -= 1;
@@ -1410,7 +1417,7 @@ test "channels: an inbound whose messages halt it in turn is skipped a message a
     b.store.inbound_skip = skip;
     _ = try b.run(&Probed.machine, .channel_inbound, inbound);
     b.store.inbound_skip = null;
-    try testing.expectEqual(@as(u64, 5), inOf(b.read(), 0, .main).?.applied);
+    try testing.expectEqual(@as(u64, 5), inOf(b.read(), 0, .sink).?.applied);
     try testing.expect(b.got("message-one-0001") == null and b.got("message-fiv-0005") == null);
     try testing.expectEqual(@as(usize, 5), b.store.messages.items.len);
     try testing.expectEqualStrings("skipped by repair (entry 77, halted at message 4; message 1 from shard 0)", b.store.messages.items[0].result.refused().?.refusal.message);
@@ -1427,13 +1434,13 @@ test "channels: a message's sends are held to an apply's limits on their own: pa
     try a.probeTo(1, "message-thr-0003");
     var buf: [8192]u8 = undefined;
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .main).?.applied);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .sink).?.applied);
     try testing.expect(b.got("relay-this-00001") != null);
     try testing.expect(b.got("flood-this-00002") == null);
     try testing.expect(b.got("message-thr-0003") != null);
     // The relay's one send is in b's outbox, under the inbound's index;
     // the flood sent nothing.
-    try testing.expectEqual(@as(u64, 2), metaOf(b.read(), 1, .main).next_seq);
+    try testing.expectEqual(@as(u64, 2), metaOf(b.read(), 1, .sink).next_seq);
     try testing.expectEqual(b.index, b.outRecord(1, 1).?.sent_at);
     // Each message was reported with its result, the flood's refused.
     const reported = b.store.messages.items;
@@ -1444,7 +1451,7 @@ test "channels: a message's sends are held to an apply's limits on their own: pa
     // The next inbound follows on, with no halt.
     try a.probeTo(1, "message-fou-0004");
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 4, 1, &buf));
-    try testing.expectEqual(@as(u64, 4), inOf(b.read(), 0, .main).?.applied);
+    try testing.expectEqual(@as(u64, 4), inOf(b.read(), 0, .sink).?.applied);
 }
 
 test "channels: a message for a slot its receiver doesn't own is refused, and takes its seq" {
@@ -1457,7 +1464,7 @@ test "channels: a message for a slot its receiver doesn't own is refused, and ta
     try a.probeTo(3, "message-two-0002");
     var buf: [8192]u8 = undefined;
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 2, &buf));
-    try testing.expectEqual(@as(u64, 2), inOf(b.read(), 0, .main).?.applied);
+    try testing.expectEqual(@as(u64, 2), inOf(b.read(), 0, .sink).?.applied);
     try testing.expect(b.got("message-one-0001") != null);
     try testing.expect(b.got("message-two-0002") == null);
     try testing.expect(b.store.messages.items[1].result.refused() != null);
@@ -1499,10 +1506,10 @@ test "channels: a message carrying a flag no message may carry halts its inbound
     try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload });
     try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = 0, .flags = entry_mod.Flags.FORCE, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload });
     var buf: [2048]u8 = undefined;
-    const inbound = try ce.Inbound.encodeInto(&buf, .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 2 } });
+    const inbound = try ce.Inbound.encodeInto(&buf, .{ .from = 0, .lane = 2, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 2 } });
     try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, inbound));
     try testing.expect(b.got("message-one-0001") == null);
-    try testing.expect(inOf(b.read(), 0, .main) == null);
+    try testing.expect(inOf(b.read(), 0, .sink) == null);
 }
 
 /// The inbound of `a`'s outbox to `b` from `first` through `last`, applied
@@ -1540,7 +1547,7 @@ test "channels: a sink's message to a full target parks, later ones for it park 
     try a.probeTo(1, "message-fou-0004");
     try deliver(&a, &b, 1, 4);
     // Every message took its seq: the channel goes on.
-    try testing.expectEqual(@as(u64, 4), inOf(b.read(), 0, .main).?.applied);
+    try testing.expectEqual(@as(u64, 4), inOf(b.read(), 0, .sink).?.applied);
     try testing.expect(b.got("message-two-0002") == null);
     try testing.expect(b.got("message-fou-0004") == null);
     // Slot 3 is another target: applied at once.
@@ -1658,7 +1665,7 @@ test "channels: past the shard's parked cap, a sink's message to any target wait
     try testing.expect(Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = 0, .origin_kind = other.origin_kind, .origin_ns = other.origin_ns, .payload = other.payload }, .{}));
 }
 
-test "channels: only a sink's message parks behind; another for the same target goes to it" {
+test "channels: only a sink's message parks behind; another for the same target, on the main lane, goes to it" {
     var a = Group.init(0, 2);
     defer a.deinit();
     var b = Group.init(1, 2);
@@ -1666,18 +1673,15 @@ test "channels: only a sink's message parks behind; another for the same target 
     try a.probeTo(1, "fill-slot1-00001");
     try a.probeTo(1, "message-two-0002");
     try a.probeTo(1, "drain-slot1-0003");
-    try a.probeTo(1, "message-fou-0004");
-    // Seq 4 again, sent without the sink flag.
-    var mb: [1024]u8 = undefined;
-    var mw: schema.Writer = .{ .buf = &mb };
-    for (1..5) |seq| {
-        const o = a.outRecord(1, seq).?;
-        try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = o.layout_epoch, .flags = if (seq == 4) 0 else o.flags, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload });
-    }
     var buf: [4096]u8 = undefined;
-    _ = try b.run(&Probed.machine, .channel_inbound, try ce.Inbound.encodeInto(&buf, .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 4 } }));
+    _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
     try testing.expectEqual(@as(u64, 1), targetParked(b.read(), probeTarget(1)).count);
-    try testing.expectEqual(Got{ .from = 0, .seq = 4 }, b.got("message-fou-0004").?);
+    // A message to the same target that isn't a sink's rides the main lane,
+    // and applies with the sink's parked.
+    try a.probeTo(1, "message-fou-000M");
+    _ = try b.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 1, .main, 1, 1, &buf));
+    try testing.expectEqual(@as(u64, 1), targetParked(b.read(), probeTarget(1)).count);
+    try testing.expectEqual(Got{ .from = 0, .seq = 1 }, b.got("message-fou-000M").?);
     try testing.expect(b.got("message-two-0002") == null);
 }
 
@@ -1727,7 +1731,7 @@ test "channels: a durable ack names what was applied as of a durable index" {
         try a.probeTo(1, &name);
         _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, seq, 1, &buf));
     }
-    const in = inOf(b.read(), 0, .main).?;
+    const in = inOf(b.read(), 0, .sink).?;
     try testing.expectEqual(@as(u64, RING + 6), in.applied);
     // b's index n applied seq n.
     try testing.expectEqual(@as(u64, RING + 6), appliedAsOf(in, RING + 6));
@@ -1744,13 +1748,13 @@ test "channels: a trim drops what was acked; a stale one is a no-op, and one pas
     try a.probeTo(1, "message-two-0002");
     try a.probeTo(1, "message-thr-0003");
     var buf: [64]u8 = undefined;
-    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 0, .first = 1, .through = 2 }));
-    try testing.expectEqual(@as(u64, 2), metaOf(a.read(), 1, .main).acked);
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 2, .first = 1, .through = 2 }));
+    try testing.expectEqual(@as(u64, 2), metaOf(a.read(), 1, .sink).acked);
     try testing.expect(a.outRecord(1, 1) == null and a.outRecord(1, 2) == null);
     try testing.expect(a.outRecord(1, 3) != null);
-    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 0, .first = 1, .through = 1 }));
-    try testing.expectEqual(@as(u64, 2), metaOf(a.read(), 1, .main).acked);
-    try testing.expectError(error.Halt, a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 0, .first = 3, .through = 4 })));
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 2, .first = 1, .through = 1 }));
+    try testing.expectEqual(@as(u64, 2), metaOf(a.read(), 1, .sink).acked);
+    try testing.expectError(error.Halt, a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 2, .first = 3, .through = 4 })));
 }
 
 test "channels: an outbox counts the payload bytes it holds, from its sends to its trims" {
@@ -1760,15 +1764,15 @@ test "channels: an outbox counts the payload bytes it holds, from its sends to i
     const one = a.outRecord(1, 1).?.payload.len;
     try a.probeTo(1, "message-two-0002");
     try a.probeTo(1, "message-thr-0003");
-    try testing.expectEqual(3 * one, metaOf(a.read(), 1, .main).bytes);
+    try testing.expectEqual(3 * one, metaOf(a.read(), 1, .sink).bytes);
     // And its origin's namespace holds all of it.
-    try testing.expectEqual(3 * one, nsBytesOf(a.read(), 1, .main, probe.PROBE_ORIGIN.ns));
+    try testing.expectEqual(3 * one, nsBytesOf(a.read(), 1, .sink, probe.PROBE_ORIGIN.ns));
     var buf: [64]u8 = undefined;
-    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 0, .first = 1, .through = 2 }));
-    try testing.expectEqual(one, metaOf(a.read(), 1, .main).bytes);
-    try testing.expectEqual(one, nsBytesOf(a.read(), 1, .main, probe.PROBE_ORIGIN.ns));
-    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 0, .first = 3, .through = 3 }));
-    try testing.expectEqual(@as(u64, 0), metaOf(a.read(), 1, .main).bytes);
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 2, .first = 1, .through = 2 }));
+    try testing.expectEqual(one, metaOf(a.read(), 1, .sink).bytes);
+    try testing.expectEqual(one, nsBytesOf(a.read(), 1, .sink, probe.PROBE_ORIGIN.ns));
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 2, .first = 3, .through = 3 }));
+    try testing.expectEqual(@as(u64, 0), metaOf(a.read(), 1, .sink).bytes);
     // Emptied, its record goes.
     try testing.expectEqual(@as(usize, 0), a.store.family(OutNsFam.ID).count);
 }
@@ -1875,7 +1879,7 @@ test "channels: two namespaces' bytes in one outbox are counted apart, and each 
     try tenantSend(&a, seven, 1, "message-one-0001");
     try tenantSend(&a, seven, 1, "message-two-0002");
     try tenantSend(&a, eight, 1, "message-thr-0003");
-    const one = a.outRecord(1, 1).?.payload.len;
+    const one = a.outOn(1, .main, 1).?.payload.len;
     try testing.expectEqual(3 * one, metaOf(a.read(), 1, .main).bytes);
     try testing.expectEqual(2 * one, nsBytesOf(a.read(), 1, .main, seven));
     try testing.expectEqual(one, nsBytesOf(a.read(), 1, .main, eight));

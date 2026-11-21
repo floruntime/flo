@@ -197,22 +197,23 @@ const LaneState = struct {
     recv_gen: struct { term: u64 = 0, counter: u32 = 0 } = .{},
     told_applied: u64 = 0,
     told_durable: u64 = 0,
-};
-
-const Peer = struct {
-    lanes: [LANES]LaneState = @splat(.{}),
-    /// The pressure its last answer carried, and when: kept until
-    /// `PRESSURE_EXPIRY_MS` after that, probed for every
-    /// `PRESSURE_PROBE_MS` meanwhile.
+    /// The pressure its last answer on this lane carried, and when: kept
+    /// until `PRESSURE_EXPIRY_MS` after that, probed for every
+    /// `PRESSURE_PROBE_MS` meanwhile. Per lane, so a full target, which
+    /// only the sink lane's answers name, holds no other lane's sends.
     pressure: [MAX_PRESSURE]Stall.Value = undefined,
     pressure_len: u8 = 0,
     pressure_ms: u64 = 0,
     probe_ms: u64 = 0,
+};
+
+const Peer = struct {
+    lanes: [LANES]LaneState = @splat(.{}),
     /// When it last answered this leader.
     answered_ms: u64 = 0,
     /// Its sink messages proposed and not yet applied that may park, in
-    /// seq order: what `Driver.target_bytes` counts. Only the main lane's:
-    /// no history message parks.
+    /// seq order: what `Driver.target_bytes` counts. Only the sink lane's:
+    /// no other message parks.
     in_flight: std.ArrayListUnmanaged(InFlightMessage) = .empty,
     /// This shard's parked bytes when a target over its cap last refused
     /// its batch, or null: while they are no fewer, every answer to it,
@@ -357,31 +358,31 @@ pub const Driver = struct {
         self.allocator.free(self.stamp_buf);
     }
 
-    /// What writes to group `to` are queued behind, as its last answers
-    /// said, or null: what holds a pipeline sending to it.
-    pub fn pressureOf(self: *const Driver, to: u16, now_ms: u64) ?Stall.Value {
+    /// What writes to group `to` on `lane` are queued behind, as its last
+    /// answers on that lane said, or null: what holds a sender to it.
+    pub fn pressureOf(self: *const Driver, to: u16, lane: Lane, now_ms: u64) ?Stall.Value {
         if (to >= self.peers.len) return null;
-        const p = &self.peers[to];
+        const p = &self.peers[to].lanes[@backingInt(lane)];
         if (!pressureLive(p, now_ms)) return null;
         return p.pressure[0];
     }
 
-    fn pressureLive(p: *const Peer, now_ms: u64) bool {
+    fn pressureLive(p: *const LaneState, now_ms: u64) bool {
         return p.pressure_len > 0 and now_ms -| p.pressure_ms < PRESSURE_EXPIRY_MS;
     }
 
-    /// Whether any peer's pressure is live: the driver keeps ticking while
-    /// it is, so it probes and lets it expire.
+    /// Whether any peer's pressure is live, on any lane: the driver keeps
+    /// ticking while it is, so it probes and lets it expire.
     pub fn pressured(self: *const Driver, now_ms: u64) bool {
-        for (self.peers) |*p| if (pressureLive(p, now_ms)) return true;
+        for (self.peers) |*p| for (&p.lanes) |*l| if (pressureLive(l, now_ms)) return true;
         return false;
     }
 
-    /// Why writes to `to` are held, as this leader sees it: silent for
-    /// `NO_LEADER_MS`, else what its live pressure names, else null. A
-    /// halted or full peer that goes quiet reads as quiet once its
-    /// pressure expires.
-    pub fn causeOf(self: *const Driver, to: u16, now_ms: u64) ?Cause {
+    /// Why writes to `to` on `lane` are held, as this leader sees it:
+    /// silent for `NO_LEADER_MS`, else what that lane's live pressure
+    /// names, else null. A halted or full peer that goes quiet reads as
+    /// quiet once its pressure expires.
+    pub fn causeOf(self: *const Driver, to: u16, lane: Lane, now_ms: u64) ?Cause {
         if (to >= self.peers.len) return null;
         const p = &self.peers[to];
         // Silence counts from this term's first tick here, or from the
@@ -389,8 +390,9 @@ pub const Driver = struct {
         // blames no one.
         const since = @max(p.answered_ms, self.started_ms);
         if (since != 0 and now_ms -| since >= NO_LEADER_MS) return .no_leader;
-        if (!pressureLive(p, now_ms)) return null;
-        return std.enums.fromInt(Cause, p.pressure[0].cause);
+        const l = &p.lanes[@backingInt(lane)];
+        if (!pressureLive(l, now_ms)) return null;
+        return std.enums.fromInt(Cause, l.pressure[0].cause);
     }
 
     /// The batch buffers, allocated once; false when there's no memory for
@@ -474,8 +476,8 @@ pub const Driver = struct {
     /// Takes back what `track` counted for `from` past `seq`: a batch
     /// whose inbound wasn't proposed.
     fn untrackAfter(self: *Driver, from: u16, lane: Lane, seq: u64) void {
-        // Only the main lane's messages park, so only its are tracked.
-        if (lane != .main) return;
+        // Only the sink lane's messages park, so only its are tracked.
+        if (lane != .sink) return;
         const p = &self.peers[from];
         while (p.in_flight.items.len > 0 and p.in_flight.items[p.in_flight.items.len - 1].seq > seq) self.forget(p.in_flight.pop().?);
     }
@@ -493,13 +495,13 @@ pub const Driver = struct {
         var quiet = true;
         for (0..self.count) |b_| {
             const b: u16 = @intCast(b_);
-            // Pressure is a peer's, not a lane's: ask again while it holds.
-            const p = &self.peers[b];
-            if (pressureLive(p, now_ms) and now_ms -| p.probe_ms >= PRESSURE_PROBE_MS) {
-                if (self.sendEmpty(b, .main, p, io)) p.probe_ms = now_ms;
-            }
-            if (pressureLive(p, now_ms)) quiet = false;
             for (Lane.all) |lane| {
+                // Pressure is kept only while answers carry it: ask again.
+                const p = self.peers[b].lane(lane);
+                if (pressureLive(p, now_ms) and now_ms -| p.probe_ms >= PRESSURE_PROBE_MS) {
+                    if (self.sendEmpty(b, lane, &self.peers[b], io)) p.probe_ms = now_ms;
+                }
+                if (pressureLive(p, now_ms)) quiet = false;
                 self.tickSend(b, lane, now_ms, read, durable, io);
                 self.tickAnswer(b, lane, read, durable, io);
                 if (!self.settled(b, lane, read, durable)) quiet = false;
@@ -614,21 +616,22 @@ pub const Driver = struct {
     fn tickAnswer(self: *Driver, a: u16, lane: Lane, read: ReadView, durable: u64, io: anytype) void {
         const p = self.peers[a].lane(lane);
         const in = channels.inOf(read, a, lane) orelse return;
-        if (lane == .main) self.releaseApplied(a, in.applied);
+        if (lane == .sink) self.releaseApplied(a, in.applied);
         const dur = self.durableAck(a, in, durable);
         if (in.applied <= p.told_applied and dur <= p.told_durable) return;
         self.answer(a, lane, in.applied, dur, 0, .ok, read, io);
     }
 
-    /// What writes to this group are queued behind, written to `w`, and
-    /// how many: its own state, and a full target while nothing has
-    /// unparked since one refused `to`'s batch. None of it reaches an
-    /// apply: it only tells senders' leaders to wait.
-    fn pressure(self: *const Driver, status: Status, to: *const Peer, read: ReadView, w: *schema.Writer) u32 {
+    /// What writes to this group on `lane` are queued behind, written to
+    /// `w`, and how many: its own state, on every lane, and on the sink
+    /// lane a full target while nothing has unparked since one refused
+    /// `to`'s batch. None of it reaches an apply: it only tells senders'
+    /// leaders to wait.
+    fn pressure(self: *const Driver, status: Status, lane: Lane, to: *const Peer, read: ReadView, w: *schema.Writer) u32 {
         var n: u32 = 0;
         const own: ?Cause = if (status == .halted) .halted else self.own_cause;
         if (own) |c| n += @intFromBool(addStall(w, self.group, c));
-        if (to.refused_parked) |at| if (channels.shardParked(read).bytes >= at) {
+        if (lane == .sink) if (to.refused_parked) |at| if (channels.shardParked(read).bytes >= at) {
             n += @intFromBool(addStall(w, self.group, .target_full));
         };
         return n;
@@ -650,7 +653,7 @@ pub const Driver = struct {
         const p = peer.lane(lane);
         var pb: [Pressure.max_size]u8 = undefined;
         var pw: schema.Writer = .{ .buf = &pb };
-        const n = self.pressure(status, peer, read, &pw);
+        const n = self.pressure(status, lane, peer, read, &pw);
         if (n > 0) self.counts.pressured += 1;
         var buf: [128]u8 = undefined;
         const f = encodeFrame(&buf, .answer, Answer.Value{
@@ -693,7 +696,7 @@ pub const Driver = struct {
         const applied = if (in) |x| x.applied else 0;
         const dur = if (in) |x| self.durableAck(from, x, durable) else 0;
         if (p.accepted == null or p.accepted.? < applied) p.accepted = applied;
-        if (lane == .main) self.releaseApplied(from, applied);
+        if (lane == .sink) self.releaseApplied(from, applied);
         p.recv_gen = .{ .term = b.gen_term, .counter = b.gen_counter };
         if (halted) return self.answer(from, lane, applied, dur, 0, .halted, read, io);
         if (b.messages.count == 0) return self.answer(from, lane, applied, dur, 0, .ok, read, io);
@@ -728,9 +731,9 @@ pub const Driver = struct {
             // after it: the batch's prefix goes. It is stamped with this
             // node's caps before it is logged, so every replica applies it
             // under the same ones, and counted as it is logged.
-            // Only the main lane's may park: a sink's on the history lane
-            // was dropped above (`laneFits`).
-            const target = if (lane != .main) null else if (self.sink_target) |f| f(m) else null;
+            // Only the sink lane's may park: a sink's on another lane was
+            // dropped above (`laneFits`).
+            const target = if (lane != .sink) null else if (self.sink_target) |f| f(m) else null;
             if (self.admits) |admits| if (!admits(read, m, self.inFlight(target))) {
                 target_full = true;
                 break;
@@ -751,7 +754,7 @@ pub const Driver = struct {
             if (target_full) peer.refused_parked = channels.shardParked(read).bytes;
             return self.answer(from, lane, applied, dur, 0, .busy, read, io);
         }
-        if (lane == .main) peer.refused_parked = null;
+        if (lane == .sink) peer.refused_parked = null;
         const entry = ce.Inbound.encodeInto(self.buf, .{ .from = from, .lane = @backingInt(lane), .first_seq = accepted + 1, .messages = .{ .bytes = w.written(), .count = n } }) catch {
             self.untrackAfter(from, lane, accepted);
             return;
@@ -808,17 +811,18 @@ pub const Driver = struct {
             if (st != .ok) p.backoff_ms = @min(p.backoff_ms * 2, RESEND_MAX_MS);
         }
         peer.answered_ms = now_ms;
-        // The pressure it reports now, if any, replaces what it reported.
+        // The pressure it reports now on this lane, if any, replaces what
+        // it reported on it.
         var it = a.pressure.iterator();
         var n: u8 = 0;
         while (it.next() catch null) |st| {
             if (n == MAX_PRESSURE) break;
             if (std.enums.fromInt(Cause, st.cause) == null) continue;
-            peer.pressure[n] = st;
+            p.pressure[n] = st;
             n += 1;
         }
-        peer.pressure_len = n;
-        if (n > 0) peer.pressure_ms = now_ms;
+        p.pressure_len = n;
+        if (n > 0) p.pressure_ms = now_ms;
     }
 };
 
@@ -849,17 +853,17 @@ test "channel driver: a peer silent for twice the longest resend backoff reads a
         }
     };
     d.tick(10_000, .{ .store = &store }, 0, Quiet{});
-    try std.testing.expectEqual(@as(?Cause, null), d.causeOf(1, 10_000));
+    try std.testing.expectEqual(@as(?Cause, null), d.causeOf(1, .main, 10_000));
     // It answers halted.
     d.peers[1].answered_ms = 11_000;
-    d.peers[1].pressure[0] = .{ .shard = 1, .cause = @backingInt(Cause.halted) };
-    d.peers[1].pressure_len = 1;
-    d.peers[1].pressure_ms = 11_000;
-    try std.testing.expectEqual(@as(?Cause, .halted), d.causeOf(1, 11_500));
+    d.peers[1].lanes[0].pressure[0] = .{ .shard = 1, .cause = @backingInt(Cause.halted) };
+    d.peers[1].lanes[0].pressure_len = 1;
+    d.peers[1].lanes[0].pressure_ms = 11_000;
+    try std.testing.expectEqual(@as(?Cause, .halted), d.causeOf(1, .main, 11_500));
     // Then nothing: a second on, its pressure is gone; ten, it is silent.
-    try std.testing.expectEqual(@as(?Cause, null), d.causeOf(1, 12_000));
-    try std.testing.expectEqual(@as(?Cause, null), d.causeOf(1, 11_000 + NO_LEADER_MS - 1));
-    try std.testing.expectEqual(@as(?Cause, .no_leader), d.causeOf(1, 11_000 + NO_LEADER_MS));
+    try std.testing.expectEqual(@as(?Cause, null), d.causeOf(1, .main, 12_000));
+    try std.testing.expectEqual(@as(?Cause, null), d.causeOf(1, .main, 11_000 + NO_LEADER_MS - 1));
+    try std.testing.expectEqual(@as(?Cause, .no_leader), d.causeOf(1, .main, 11_000 + NO_LEADER_MS));
 }
 
 test "channel driver: what a leader proposed and hasn't applied is released when it applies, and all of it with the term" {
@@ -913,24 +917,27 @@ fn batchOf(buf: []u8, lane: Lane, first: u64, msgs: []const u8, n: u32) []const 
     return encodeFrame(buf, .batch, Batch.Value{ .lane = @backingInt(lane), .gen_term = 1, .gen_counter = 0, .first_seq = first, .messages = .{ .bytes = msgs, .count = n } }).?;
 }
 
-test "channel driver: what the history lane applied releases nothing the main lane has in flight" {
+test "channel driver: what another lane applied releases nothing the sink lane has in flight" {
     var d = try Driver.init(std.testing.allocator, 0, 2);
     defer d.deinit();
     var store = store_mod.Store.init(std.testing.allocator);
     defer store.deinit();
     const t: channels.Target = @splat(1);
     try std.testing.expect(d.track(0, 1, t, 100));
-    // Group 0's own history lane has applied seq 5; its main lane, nothing.
+    // Group 0's own history and main lanes have applied seq 5; its sink
+    // lane, nothing.
     try appliedIn(&store, 0, .history, 5);
+    try appliedIn(&store, 0, .main, 5);
     var frames: u32 = 0;
     var proposals: u32 = 0;
     const io = Taking{ .frames = &frames, .proposals = &proposals };
     var fb: [64]u8 = undefined;
     d.onFrame(0, batchOf(&fb, .history, 6, "", 0), 1, .{ .store = &store }, 0, false, io);
+    d.onFrame(0, batchOf(&fb, .main, 6, "", 0), 1, .{ .store = &store }, 0, false, io);
     d.tick(1, .{ .store = &store }, 0, io);
     try std.testing.expectEqual(channels.InFlight{ .target = 100, .total = 100 }, d.inFlight(t));
-    // The main lane's applied releases it.
-    try appliedIn(&store, 0, .main, 1);
+    // The sink lane's applied releases it.
+    try appliedIn(&store, 0, .sink, 1);
     d.tick(2, .{ .store = &store }, 0, io);
     try std.testing.expectEqual(channels.InFlight{}, d.inFlight(t));
 }
@@ -943,7 +950,7 @@ test "channel driver: a history batch taken leaves a full target named, and one 
     var frames: u32 = 0;
     var proposals: u32 = 0;
     const io = Taking{ .frames = &frames, .proposals = &proposals };
-    // A target over its cap refused group 0's main-lane batch.
+    // A target over its cap refused group 0's sink-lane batch.
     d.peers[0].refused_parked = 7;
     var mb: [256]u8 = undefined;
     var fb: [512]u8 = undefined;
@@ -954,7 +961,7 @@ test "channel driver: a history batch taken leaves a full target named, and one 
         try std.testing.expectEqual(proposed, proposals);
         try std.testing.expectEqual(dropped, d.counts.batches_dropped);
     }
-    // Taken on the history lane, the main lane's full target is still named.
+    // Taken on the history lane, the sink lane's full target is still named.
     try std.testing.expectEqual(@as(?u64, 7), d.peers[0].refused_parked);
     // From another group, history is dropped whatever it carries.
     var w: schema.Writer = .{ .buf = &mb };
