@@ -94,3 +94,46 @@ test "e2e/memory_budget: the pool's use rises with what a client writes and fall
     const now = try poolUse(http);
     try testing.expect(now.node >= now.shard0);
 }
+
+test "e2e/memory_budget: each shard binds its equal share of the budget" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true, .shards = 4 },
+    });
+    defer ctx.deinit();
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+
+    // Each shard's leader binds once shard 0 has recorded a clean budget, in
+    // the server's own ticks: poll until every shard shows a share.
+    var bound = false;
+    for (0..100) |_| {
+        var resp = try http.get("/api/v1/metrics");
+        defer resp.deinit();
+        const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, resp.body, .{}) catch {
+            stdx.time.sleep(50 * std.time.ns_per_ms);
+            continue;
+        };
+        defer parsed.deinit();
+        const mb = parsed.value.object.get("memory_budget").?.object;
+        const budget = mb.get("budget_bytes").?.integer;
+        const shares = mb.get("shares").?.array.items;
+        try testing.expectEqual(@as(usize, 4), shares.len);
+        var all = budget > 0;
+        for (shares) |sh| {
+            const share = sh.object.get("share_bytes") orelse {
+                // Unbound says so, and claims no share.
+                try testing.expectEqualStrings("off: no budget bound", sh.object.get("enforcement").?.string);
+                all = false;
+                continue;
+            };
+            try testing.expectEqual(@divFloor(budget, @as(i64, @intCast(shares.len))), share.integer);
+            try testing.expect(!sh.object.get("over_share").?.bool);
+        }
+        if (all) {
+            bound = true;
+            break;
+        }
+        stdx.time.sleep(50 * std.time.ns_per_ms);
+    }
+    try testing.expect(bound);
+}

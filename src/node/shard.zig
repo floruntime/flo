@@ -916,6 +916,10 @@ pub const Shard = struct {
     /// duplicates up to the outstanding cap and starve clients. Cleared when it
     /// applies or its term is lost.
     budget_propose_pending: ?BudgetPropose = null,
+    /// This shard's share bind in flight, one at a time (`proposeBudgetBind`).
+    bind_pending: ?BudgetPropose = null,
+    /// A budget too small to share among the shards was logged once.
+    bind_zero_warned: bool = false,
 
     /// The node's live count of held client connections, for the acceptor's
     /// connection cap. A shard releases a slot here when it closes a client
@@ -5949,6 +5953,8 @@ pub const Shard = struct {
             sm.ts_points.store(self.ts_handler.ts.pointCount(), .monotonic);
             sm.ts_point_bytes.store(self.ts_handler.ts.pointBytes(), .monotonic);
             sm.pool_use_bytes.store(pool.useOf(&self.defaultPartition().store), .monotonic);
+            const bound = settings_machine.boundShare(.{ .store = &self.defaultPartition().store });
+            sm.pool_share_bytes.store(if (bound) |b| b.share_bytes else 0, .monotonic);
             for (&sm.ts_late, self.defaultPartition().store.ts_late_points) |*m, n| m.store(n, .monotonic);
             // Summed over senders: the log names each sender.
             for (&sm.channel_sender_bugs, 0..) |*total, reason| {
@@ -6741,6 +6747,12 @@ pub const Shard = struct {
         if (self.budget.provisional_node) |pn| if (was_provisional != pn and pn != self.cluster_node_id) {
             log.info("shard 0: memory budget provisional: node {d} has not reported its memory; the budget is frozen until it reports or is removed", .{pn});
         };
+        // The committed clean budget, never a provisional one, for every
+        // shard's leader to bind its share from.
+        if (self.node_health.len > 0) {
+            const clean = if (self.readCleanBudget(read)) |r| r.budget_bytes else 0;
+            self.node_health[0].clean_budget_bytes.store(clean, .release);
+        }
         if (self.metrics_registry) |mr| mr.memory_budget.set(
             self.budget.budget_bytes,
             self.budget.governing_node orelse 0,
@@ -6877,6 +6889,43 @@ pub const Shard = struct {
             .governing_node = governing,
         }) catch return;
         self.budget_propose_pending = proposeOrNull(self.raft_node, .settings_budget_clean, bytes);
+    }
+
+    /// Bind this shard's share of the node's budget: shard 0's committed clean
+    /// budget split equally over the shards, logged on this shard so every
+    /// replica holds it to the same figure. What shard 0 published is a
+    /// propose-time input only; the logged value is what binds. Proposes
+    /// nothing while no clean budget is published or the share would be 0
+    /// (apply refuses a 0 share), and nothing when the bound share is current.
+    /// More than one shard means a single node today, so shard 0's figure is
+    /// always local.
+    fn proposeBudgetBind(self: *Shard) void {
+        const raft = self.raft_node;
+        if (self.bind_pending) |p| {
+            if (p.term == raft.current_term and p.index > raft.last_applied) return;
+            self.bind_pending = null;
+        }
+        if (self.node_health.len == 0) return;
+        const budget = self.node_health[0].clean_budget_bytes.load(.acquire);
+        if (budget == 0) return;
+        const shards = self.router.shard_count;
+        const share = budget / shards;
+        if (share == 0) {
+            if (!self.bind_zero_warned) log.warn("shard {d}: a memory budget of {d} bytes over {d} shards leaves no share; no share is bound", .{ self.id, budget, shards });
+            self.bind_zero_warned = true;
+            return;
+        }
+        self.bind_zero_warned = false;
+        const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
+        if (settings_machine.boundShare(read)) |b| {
+            if (b.share_bytes == share and b.budget_bytes == budget) return;
+        }
+        var buf: [settings_machine.SetBudgetBind.max_size]u8 = undefined;
+        const bytes = settings_machine.SetBudgetBind.encodeInto(&buf, .{
+            .share_bytes = share,
+            .budget_bytes = budget,
+        }) catch return;
+        self.bind_pending = proposeOrNull(raft, .settings_budget_bind, bytes);
     }
 
     /// Propose a settings entry; return its term and index to mark it in
@@ -7206,6 +7255,8 @@ pub const Shard = struct {
         // single node is the main mode, and its budget must appear. A halted
         // shard appends nothing, so it proposes nothing even if it still leads.
         if (self.id == 0 and leads and self.halted == null) self.proposeBudgetRows();
+        // Every shard's leader logs the share it is held to.
+        if (leads and self.halted == null) self.proposeBudgetBind();
 
         // Every shard-0 node, leader or not, tells its linked peers its own
         // memory so whichever node leads can write its row.
@@ -10554,6 +10605,8 @@ test "memory budget: the leader records the clean budget once it has moved, and 
     shard.wireHandlerShardPtrs();
     _ = shard.applyCommitted();
     try std.testing.expect(shard.raft_node.role == .leader);
+    var slots = [_]health_mod.ShardSlot{.{}};
+    shard.node_health = &slots;
 
     const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
     var bk: [1 + settings_machine.BUDGET_KEY.len]u8 = undefined;
@@ -10570,6 +10623,8 @@ test "memory budget: the leader records the clean budget once it has moved, and 
     try std.testing.expect(shard.budget.seen);
     try std.testing.expectEqual(shard.budget.budget_bytes, rec.v.budget_bytes); // the record is the derived budget
     try std.testing.expectEqual(@as(u32, 1), rec.v.governing_node); // node 1 governs, and names itself
+    // Published for every shard's leader to bind from.
+    try std.testing.expectEqual(rec.v.budget_bytes, slots[0].clean_budget_bytes.load(.acquire));
 
     // Steady state: the record matches the budget, so nothing more is proposed.
     const before = shard.raft_node.log.lastIndex();
@@ -10675,6 +10730,67 @@ test "memory budget: the leader records no clean budget while it is provisional"
     shard.proposeBudgetRows();
     try std.testing.expectEqual(before, r.log.lastIndex());
     try std.testing.expect((read.get(settings_machine.BudgetFam, bkey) catch null) == null);
+}
+
+test "memory budget: a shard's leader binds its share from shard 0's clean budget, once, and again when it moves" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 1, 4, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    var slots = [_]health_mod.ShardSlot{ .{}, .{}, .{}, .{} };
+    shard.node_health = &slots;
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    const log_ = &shard.raft_node.log;
+
+    // Nothing published: nothing bound, nothing proposed.
+    var before = log_.lastIndex();
+    shard.proposeBudgetBind();
+    try std.testing.expectEqual(before, log_.lastIndex());
+    try std.testing.expect(settings_machine.boundShare(read) == null);
+
+    // A budget too small to share among the four shards binds nothing.
+    slots[0].clean_budget_bytes.store(3, .release);
+    shard.proposeBudgetBind();
+    try std.testing.expectEqual(before, log_.lastIndex());
+
+    // Shard 0's clean budget: the share is a quarter of it, and binds once.
+    slots[0].clean_budget_bytes.store(4000, .release);
+    shard.proposeBudgetBind();
+    _ = shard.applyCommitted();
+    const b = settings_machine.boundShare(read) orelse return error.TestNotBound;
+    try std.testing.expectEqual(@as(u64, 1000), b.share_bytes);
+    try std.testing.expectEqual(@as(u64, 4000), b.budget_bytes);
+    before = log_.lastIndex();
+    shard.proposeBudgetBind();
+    try std.testing.expectEqual(before, log_.lastIndex());
+
+    // A lowered budget re-binds.
+    slots[0].clean_budget_bytes.store(2000, .release);
+    shard.proposeBudgetBind();
+    _ = shard.applyCommitted();
+    try std.testing.expectEqual(@as(u64, 500), settings_machine.boundShare(read).?.share_bytes);
+}
+
+test "settings: a bind of a 0 share is refused at apply, binding nothing" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const r = shard.raft_node;
+
+    var buf: [settings_machine.SetBudgetBind.max_size]u8 = undefined;
+    const bytes = try settings_machine.SetBudgetBind.encodeInto(&buf, .{ .share_bytes = 0, .budget_bytes = 0 });
+    const e = entry_mod.buildEntry(.settings_budget_bind, entry_mod.Flags.NONE, r.current_term, r.last_applied + 1, 0, bytes);
+    var out = persistence_mod.Result.start(&e);
+    _ = shard.applyEntry(&e, &out);
+    try std.testing.expect(out.refused() != null);
+    try std.testing.expect(settings_machine.boundShare(.{ .store = &shard.defaultPartition().store }) == null);
 }
 
 test "settings: a pool share over 1000 per-mille is refused at apply, writing no row" {

@@ -112,6 +112,12 @@ pub const Record = struct {
     }
 };
 
+// The memory pool's per-record figure (`budget/pool.zig RESIDENT_RECORD`) adds
+// this size and is replicated: every target must lay a record out the same.
+comptime {
+    std.debug.assert(@sizeOf(Record) == 64);
+}
+
 pub const FamilyState = struct {
     tree: Tree = .{},
     count: u64 = 0,
