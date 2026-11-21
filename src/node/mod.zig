@@ -2,6 +2,7 @@
 // See: NODE_NETWORK_DESIGN.md
 
 pub const inbox = @import("inbox.zig");
+pub const reentry = @import("reentry.zig");
 pub const mailbox = @import("mailbox.zig");
 pub const manifest = @import("manifest.zig");
 pub const data_format = @import("data_format.zig");

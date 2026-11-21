@@ -48,6 +48,8 @@ pub const HeldForward = struct {
 
 pub const Wait = struct {
     active: bool = false,
+    /// When its client's request was first read.
+    since_ms: u64 = 0,
     /// The client's own connection, on this shard.
     reply_to: ReplyTo = undefined,
     origin: Origin = .client,

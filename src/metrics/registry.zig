@@ -701,6 +701,9 @@ pub const ShardMetrics = struct {
     /// Requests to another shard refused at once, before they ran, for want
     /// of a reply slot or of room in its inbox, by class (`CrossShardClass`).
     cross_shard_overloaded: [3]Atomic(u64) = @splat(Atomic(u64).init(0)),
+    /// Client requests refused before they were sent to another shard, by
+    /// which bound stopped them (`ForwardRefused`).
+    forward_refused: [3]Atomic(u64) = @splat(Atomic(u64).init(0)),
     /// Reads a follower found no stream or series for, by op and by how
     /// they were answered (`ReadMiss`).
     read_misses: [2][2]Atomic(u64) = @splat(@splat(Atomic(u64).init(0))),
@@ -921,6 +924,15 @@ pub const ShardMetrics = struct {
         self.cross_shard_in_flight.store(count, .monotonic);
     }
 
+    /// Why a client request wasn't sent to another shard: its reply slots
+    /// there were taken, this shard's share of that shard's inbox was
+    /// unread, or that inbox's ring was full.
+    pub const ForwardRefused = enum(u2) { target_busy, share_spent, ring_full };
+
+    pub fn recordForwardRefused(self: *ShardMetrics, why: ForwardRefused) void {
+        _ = self.forward_refused[@backingInt(why)].fetchAdd(1, .monotonic);
+    }
+
     pub fn recordCrossShardOverloaded(self: *ShardMetrics, class: CrossShardClass) void {
         _ = self.cross_shard_overloaded[@backingInt(class)].fetchAdd(1, .monotonic);
     }
@@ -1007,6 +1019,7 @@ pub const ShardMetrics = struct {
         inbox_pending: u64,
         cross_shard_in_flight: u64,
         cross_shard_overloaded: [3]u64,
+        forward_refused: [3]u64,
         read_misses: [2][2]u64,
         handbacks: [2][2]u64,
         replies_dropped: u64,
@@ -1073,6 +1086,7 @@ pub const ShardMetrics = struct {
             .inbox_pending = if (self.live_pending) |lp| lp.read(lp.ctx) else self.inbox_pending.load(.monotonic),
             .cross_shard_in_flight = self.cross_shard_in_flight.load(.monotonic),
             .cross_shard_overloaded = .{ self.cross_shard_overloaded[0].load(.monotonic), self.cross_shard_overloaded[1].load(.monotonic), self.cross_shard_overloaded[2].load(.monotonic) },
+            .forward_refused = .{ self.forward_refused[0].load(.monotonic), self.forward_refused[1].load(.monotonic), self.forward_refused[2].load(.monotonic) },
             .read_misses = .{ .{ self.read_misses[0][0].load(.monotonic), self.read_misses[0][1].load(.monotonic) }, .{ self.read_misses[1][0].load(.monotonic), self.read_misses[1][1].load(.monotonic) } },
             .handbacks = .{ .{ self.handbacks[0][0].load(.monotonic), self.handbacks[0][1].load(.monotonic) }, .{ self.handbacks[1][0].load(.monotonic), self.handbacks[1][1].load(.monotonic) } },
             .replies_dropped = self.replies_dropped.load(.monotonic),
@@ -1950,6 +1964,10 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     const cinfo = @typeInfo(ShardMetrics.CrossShardClass).@"enum";
     inline for (cinfo.field_names, cinfo.field_values) |cname, cvalue| {
         try writer.print("flo_shard_cross_shard_overloaded_total{{shard_id=\"{d}\",class=\"" ++ cname ++ "\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_overloaded[cvalue] });
+    }
+    const finfo = @typeInfo(ShardMetrics.ForwardRefused).@"enum";
+    inline for (finfo.field_names, finfo.field_values) |fname, fvalue| {
+        try writer.print("flo_shard_forward_refused_total{{shard_id=\"{d}\",reason=\"" ++ fname ++ "\"}} {d}\n", .{ snap.shard_id, snap.forward_refused[fvalue] });
     }
     const minfo = @typeInfo(ShardMetrics.ReadMissOp).@"enum";
     const hinfo = @typeInfo(ShardMetrics.ReadMiss).@"enum";
