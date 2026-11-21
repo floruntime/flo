@@ -1584,40 +1584,44 @@ pub const Shard = struct {
         log.err("shard {d}: a channel message from shard {d} was refused as that shard's bug ({s}): {s}; this is a bug in this build, not in the data", .{ self.id, m.from, @tagName(bug), why });
     }
 
-    /// What namespace `ns`'s messages hold of this shard's outboxes, over
-    /// every peer.
-    pub fn nsOutboxBytes(self: *Shard, ns: node_router.NamespaceId) u64 {
+    /// What namespace `ns`'s messages hold of this shard's outboxes on
+    /// `class`'s lanes, over every peer.
+    pub fn nsOutboxBytes(self: *Shard, class: channels_mod.Class, ns: node_router.NamespaceId) u64 {
         const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
         var n: u64 = 0;
-        for (0..self.channel.count) |to| n += channels_mod.nsBytesTo(read, @intCast(to), ns);
+        for (0..self.channel.count) |to| n += channels_mod.nsBytesTo(read, @intCast(to), class, ns);
         return n;
     }
 
-    /// Why a write for namespace `ns` that sends to shard `to` waits at this
-    /// leader's edge: pressure from `to`, its outbox's cap or the shard's,
-    /// or `ns`'s share of either. Writes are never refused at apply for an
-    /// outbox's sake, so each edge that sends checks this first, as a
-    /// pipeline does.
+    /// Why a write for namespace `ns` that sends to shard `to` on a lane
+    /// waits at this leader's edge: pressure from `to` on that lane, the
+    /// cap of its outbox or of all the shard's, or `ns`'s share of either,
+    /// each over the lane's class of outbox bytes alone (`channels.Class`).
+    /// Writes are never refused at apply for an outbox's sake, so each edge
+    /// that sends checks this first, as a pipeline does.
     pub const SendWait = union(enum) {
         pressure: channel_driver.Stall.Value,
         outbox: struct { to: ?u16, bytes: u64, cap: u64, cause: ?channel_driver.Cause = null },
         share: struct { to: ?u16, bytes: u64, cap: u64 },
     };
 
-    /// `lane` is the lane the write's messages ride: only its pressure
-    /// holds it, so a full sink target holds no other lane's writes.
+    /// `lane` is the lane the write's messages ride. Only that lane's
+    /// pressure holds it, and only its class's bytes (`channels.Class`):
+    /// a full sink target, and the sink bytes it holds back, hold no main
+    /// or history write, and a sink's write waits on the sink lane's alone.
     pub fn sendWait(self: *Shard, to: u16, lane: channels_mod.Lane, ns: node_router.NamespaceId) ?SendWait {
         const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
         const caps = self.outbox_caps;
+        const class = channels_mod.Class.of(lane);
         const now_ms = @import("stdx").time.monotonicMs();
-        const total = self.outboxBytes();
+        const total = self.outboxBytes(class);
         if (total >= caps.shard) return .{ .outbox = .{ .to = null, .bytes = total, .cap = caps.shard } };
-        const ns_total = self.nsOutboxBytes(ns);
+        const ns_total = self.nsOutboxBytes(class, ns);
         if (raft_node_mod.shareHeld(ns_total, total, caps.shard)) return .{ .share = .{ .to = null, .bytes = ns_total, .cap = caps.shard } };
         if (self.channel.pressureOf(to, lane, now_ms)) |stall| return .{ .pressure = stall };
-        const bytes = channels_mod.bytesTo(read, to);
+        const bytes = channels_mod.bytesTo(read, to, class);
         if (bytes >= caps.channel) return .{ .outbox = .{ .to = to, .bytes = bytes, .cap = caps.channel, .cause = self.channel.causeOf(to, lane, now_ms) } };
-        const held = channels_mod.nsBytesTo(read, to, ns);
+        const held = channels_mod.nsBytesTo(read, to, class, ns);
         if (raft_node_mod.shareHeld(held, bytes, caps.channel)) return .{ .share = .{ .to = to, .bytes = held, .cap = caps.channel } };
         return null;
     }
@@ -1644,12 +1648,12 @@ pub const Shard = struct {
         };
     }
 
-    /// Payload bytes this shard's channel outboxes hold, over every
-    /// channel: what `outbox_caps.shard` bounds.
-    pub fn outboxBytes(self: *Shard) u64 {
+    /// Payload bytes this shard's channel outboxes hold on `class`'s
+    /// lanes, over every channel: what `outbox_caps.shard` bounds.
+    pub fn outboxBytes(self: *Shard, class: channels_mod.Class) u64 {
         const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
         var n: u64 = 0;
-        for (0..self.channel.count) |to| n += channels_mod.bytesTo(read, @intCast(to));
+        for (0..self.channel.count) |to| n += channels_mod.bytesTo(read, @intCast(to), class);
         return n;
     }
 
@@ -5964,7 +5968,7 @@ pub const Shard = struct {
                 for (self.channel.sender_bugs) |by_reason| n += by_reason[reason];
                 total.store(n, .monotonic);
             }
-            sm.channel_outbox_bytes.store(self.outboxBytes(), .monotonic);
+            sm.channel_outbox_bytes.store(self.outboxBytes(.other) + self.outboxBytes(.sink), .monotonic);
             for (std.enums.values(proto.Reason)) |k| {
                 var n: u64 = 0;
                 for (self.channel.sink_refusals) |by_reason| n += by_reason.get(k);
@@ -14387,6 +14391,11 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
     try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
     try std.testing.expectEqual(@as(?u16, 1), pipe.wait.outbox.to);
     try std.testing.expectEqual(held, pipe.wait.outbox.bytes);
+    // The sink's bytes are counted against the sink's caps alone: a main or
+    // history write to shard 1 isn't held by them, a sink's is.
+    try std.testing.expect(a.sendWait(1, .main, .default) == null);
+    try std.testing.expect(a.sendWait(1, .history, .default) == null);
+    try std.testing.expect(a.sendWait(1, .sink, .default).? == .outbox);
     {
         // A replica of shard 0, as a restart or a new leader holds it: the
         // same log, applied, holds the same outbox bytes.
@@ -14403,7 +14412,7 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
             try std.testing.expect(r.applyEntry(&e, &out));
         }
         try std.testing.expectEqual(held, channels_mod.metaOf(.{ .store = &r.defaultPartition().store }, 1, .sink).bytes);
-        try std.testing.expectEqual(held, r.outboxBytes());
+        try std.testing.expectEqual(held, r.outboxBytes(.sink));
     }
     const job = a.processing_handler.firstJob().?;
     var lb: [512]u8 = undefined;
@@ -14425,7 +14434,7 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
     // Trims are spaced 100 ms apart; this one is due now.
     a.channel.peers[1].lanes[@backingInt(channels_mod.Lane.sink)].last_trim_ms = 0;
     pumpChannels(&two);
-    try std.testing.expectEqual(@as(u64, 0), a.outboxBytes());
+    try std.testing.expectEqual(@as(u64, 0), a.outboxBytes(.sink));
     tickNow(a, pipe);
     two.settle();
     try std.testing.expectEqual(@as(u64, 3), pipe.records_in);

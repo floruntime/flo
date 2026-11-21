@@ -35,17 +35,22 @@ const Record = schema.Record;
 /// Most messages in flight past the receiver's applied ack.
 pub const WINDOW = 1024;
 
-/// How much a shard's channel outboxes may hold before the edge stops
-/// adding to them: per channel and in all. Sized per node, from its
-/// memory, and read only by its leaders at the edge, so two nodes may
-/// size them differently; never in state.
+/// How much each class of a shard's channel outboxes may hold before the
+/// edge stops adding to it: per channel and in all. The two classes
+/// (`channels.Class`) are held apart, each to these caps, so sink bytes a
+/// full target holds back never hold a workflow's or an action's sends,
+/// and all of it is bounded by twice them. Sized per node, from its
+/// memory, and read only by its leaders at the edge, so two nodes may size
+/// them differently; never in state.
 pub const OutboxCaps = struct {
     shard: u64 = 1 << 30,
     channel: u64 = 128 << 20,
 
+    /// A sixteenth of the node's memory over its shards for each class, so
+    /// both together take an eighth, within their ceilings.
     pub fn of(memory: u64, shards: u16) OutboxCaps {
-        const shard = @min(@as(u64, 1 << 30), memory / 8 / @max(shards, 1));
-        return .{ .shard = shard, .channel = @min(@as(u64, 128 << 20), shard / 4) };
+        const shard = @min(@as(u64, 512 << 20), memory / 16 / @max(shards, 1));
+        return .{ .shard = shard, .channel = @min(@as(u64, 64 << 20), shard / 4) };
     }
 };
 /// Most payload bytes in one batch.
@@ -826,10 +831,10 @@ pub const Driver = struct {
     }
 };
 
-test "channel driver: outbox caps are an eighth of the node's memory over its shards, a quarter of that a channel, within their ceilings" {
-    try std.testing.expectEqual(OutboxCaps{ .shard = 256 << 20, .channel = 64 << 20 }, OutboxCaps.of(16 << 30, 8));
-    try std.testing.expectEqual(OutboxCaps{ .shard = 1 << 30, .channel = 128 << 20 }, OutboxCaps.of(256 << 30, 4));
-    try std.testing.expectEqual(OutboxCaps{ .shard = 32 << 20, .channel = 8 << 20 }, OutboxCaps.of(1 << 30, 4));
+test "channel driver: each class's outbox caps are a sixteenth of the node's memory over its shards, a quarter of that a channel, within their ceilings" {
+    try std.testing.expectEqual(OutboxCaps{ .shard = 128 << 20, .channel = 32 << 20 }, OutboxCaps.of(16 << 30, 8));
+    try std.testing.expectEqual(OutboxCaps{ .shard = 512 << 20, .channel = 64 << 20 }, OutboxCaps.of(256 << 30, 4));
+    try std.testing.expectEqual(OutboxCaps{ .shard = 16 << 20, .channel = 4 << 20 }, OutboxCaps.of(1 << 30, 4));
 }
 
 test "channel driver: byte counts read in the largest unit that keeps them whole" {

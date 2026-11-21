@@ -412,19 +412,36 @@ pub fn metaOf(read: ReadView, to: u16, lane: Lane) Meta.Value {
     return if (m) |v| v.v else .{ .next_seq = 1, .acked = 0, .bytes = 0 };
 }
 
-/// The payload bytes the outbox to `to` holds, over both lanes: what its
+/// What an outbox's bytes are held to the caps as: a sink's, which a full
+/// target can hold back, apart from the rest, so the rest never waits on
+/// them.
+pub const Class = enum {
+    /// The main and history lanes.
+    other,
+    sink,
+
+    pub fn of(lane: Lane) Class {
+        return if (lane == .sink) .sink else .other;
+    }
+};
+
+/// The payload bytes the outbox to `to` holds on `class`'s lanes: what its
 /// caps are held to.
-pub fn bytesTo(read: ReadView, to: u16) u64 {
+pub fn bytesTo(read: ReadView, to: u16, class: Class) u64 {
     var n: u64 = 0;
-    for (Lane.all) |lane| n += metaOf(read, to, lane).bytes;
+    for (Lane.all) |lane| if (Class.of(lane) == class) {
+        n += metaOf(read, to, lane).bytes;
+    };
     return n;
 }
 
-/// What namespace `ns`'s messages to `to` hold of its outbox, over both
+/// What namespace `ns`'s messages to `to` hold of its outbox on `class`'s
 /// lanes.
-pub fn nsBytesTo(read: ReadView, to: u16, ns: ns_table.Id) u64 {
+pub fn nsBytesTo(read: ReadView, to: u16, class: Class, ns: ns_table.Id) u64 {
     var n: u64 = 0;
-    for (Lane.all) |lane| n += nsBytesOf(read, to, lane, ns);
+    for (Lane.all) |lane| if (Class.of(lane) == class) {
+        n += nsBytesOf(read, to, lane, ns);
+    };
     return n;
 }
 
@@ -727,12 +744,12 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
             var buf: [@import("../protocol/action_entries.zig").MAX_SKIP_WHY]u8 = undefined;
             // A message skipped with the rest of its inbound says which one
             // halted the group, so its caller can tell it wasn't the cause.
-            // A history message's seq is its lane's, so the lane is named.
-            const on: []const u8 = if (lane == .history) ", history lane" else "";
+            // A message's seq is its lane's, so the lane is named.
+            const on = @tagName(lane);
             const why = (if (sk.whole and sk.halt_seq != 0 and sk.halt_seq != seq)
-                std.fmt.bufPrint(&buf, "skipped by repair (entry {d}, halted at message {d}; message {d} from shard {d}{s})", .{ sk.index, sk.halt_seq, seq, from, on })
+                std.fmt.bufPrint(&buf, "skipped by repair (entry {d}, halted at message {d}; message {d} from shard {d}, {s} lane)", .{ sk.index, sk.halt_seq, seq, from, on })
             else
-                std.fmt.bufPrint(&buf, "skipped by repair (entry {d}, message {d} from shard {d}{s})", .{ sk.index, seq, from, on })) catch "skipped by repair";
+                std.fmt.bufPrint(&buf, "skipped by repair (entry {d}, message {d} from shard {d}, {s} lane)", .{ sk.index, seq, from, on })) catch "skipped by repair";
             r.refuse(.conflict, .skipped_by_repair, why);
             const t = std.enums.fromInt(EntryType, m.entry_type);
             const owner = if (t) |x| machine_mod.ownerOf(targets, x) else null;
@@ -1420,8 +1437,8 @@ test "channels: an inbound whose messages halt it in turn is skipped a message a
     try testing.expectEqual(@as(u64, 5), inOf(b.read(), 0, .sink).?.applied);
     try testing.expect(b.got("message-one-0001") == null and b.got("message-fiv-0005") == null);
     try testing.expectEqual(@as(usize, 5), b.store.messages.items.len);
-    try testing.expectEqualStrings("skipped by repair (entry 77, halted at message 4; message 1 from shard 0)", b.store.messages.items[0].result.refused().?.refusal.message);
-    try testing.expectEqualStrings("skipped by repair (entry 77, message 4 from shard 0)", b.store.messages.items[3].result.refused().?.refusal.message);
+    try testing.expectEqualStrings("skipped by repair (entry 77, halted at message 4; message 1 from shard 0, sink lane)", b.store.messages.items[0].result.refused().?.refusal.message);
+    try testing.expectEqualStrings("skipped by repair (entry 77, message 4 from shard 0, sink lane)", b.store.messages.items[3].result.refused().?.refusal.message);
 }
 
 test "channels: a message's sends are held to an apply's limits on their own: past them, only it is refused, and the channel goes on" {

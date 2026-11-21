@@ -465,6 +465,9 @@ test "channel driver: past a target's parked cap its messages wait at their send
     try sim.probeBody(a, 3, "unheld-00000001M");
     for (0..200) |_| try sim.step();
     try testing.expect(hasGot(b, "unheld-00000001M"));
+    // b's answers to it, on the main lane, name no full target either.
+    try testing.expect(a.driver.pressureOf(1, .main, sim.now) == null);
+    try testing.expect(a.driver.pressureOf(1, .sink, sim.now) != null);
     try testing.expectEqual(@as(u64, 2), channels.inOf(.{ .store = &b.store }, 0, .sink).?.applied);
     // b drains slot 1 by its own channel; the unpark empties it, and the
     // rest go, in order.

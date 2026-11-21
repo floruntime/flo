@@ -5522,6 +5522,44 @@ test "step executor: a step whose action's outbox is at its cap waits for room, 
     try testing.expect(handler.inspect(testKey(.default, "run-2")).?.pending_action_run_id_owned != null);
 }
 
+test "step executor: a full sink target on its action's shard holds no step; the step's own lane's pressure does" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    shard.workflow_handler = &handler;
+    registerTestAction(&shard, "step-a");
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    createTestRun(&handler, testKey(.default, "run-1"), "run-1", "test-wf");
+    createTestRun(&handler, testKey(.default, "run-2"), "run-2", "test-wf");
+    const now = @import("stdx").time.monotonicMs();
+    const Lane = @import("../contract/channels.zig").Lane;
+    // The action's shard (this one) has a sink target full, as its answers
+    // on the sink lane say: a step's call starts on the main lane, so it
+    // calls.
+    const sink = &shard.channel.peers[0].lanes[@backingInt(Lane.sink)];
+    sink.pressure[0] = .{ .shard = 0, .cause = @backingInt(@import("../contract/channel_driver.zig").Cause.target_full) };
+    sink.pressure_len = 1;
+    sink.pressure_ms = now;
+    handler.advanceWorkflow(&shard, testKey(.default, "run-1"));
+    settleTest(&shard);
+    try testing.expect(handler.inspect(testKey(.default, "run-1")).?.pending_action_run_id_owned != null);
+    // The same said on the main lane holds the next step.
+    const main = &shard.channel.peers[0].lanes[@backingInt(Lane.main)];
+    main.pressure = sink.pressure;
+    main.pressure_len = 1;
+    main.pressure_ms = now;
+    handler.advanceWorkflow(&shard, testKey(.default, "run-2"));
+    settleTest(&shard);
+    const held = handler.inspect(testKey(.default, "run-2")).?;
+    try testing.expect(held.waiting_for_room);
+    try testing.expect(held.pending_action_run_id_owned == null);
+}
+
 test "step executor: a step whose action isn't registered doesn't give up while it asks again" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);

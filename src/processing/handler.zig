@@ -1592,12 +1592,12 @@ pub const ProcessingHandler = struct {
         // The driver's clock moves only while it ticks; pressure is read
         // against the time now, so it expires though nothing is sent.
         const now_ms = @import("stdx").time.monotonicMs();
-        const total = shard.outboxBytes();
+        const total = shard.outboxBytes(.sink);
         if (total >= caps.shard) return .{ .outbox = .{ .to = null, .bytes = total, .cap = caps.shard } };
         // One namespace's sinks may send to every shard, so its share of
         // the shard's cap is over all its outboxes together.
         for (pipe.sinks) |snk| {
-            const held = shard.nsOutboxBytes(self.namespaceIdOf(snk.namespace));
+            const held = shard.nsOutboxBytes(.sink, self.namespaceIdOf(snk.namespace));
             if (raft_node_mod.shareHeld(held, total, caps.shard)) return .{ .share = .{ .to = null, .namespace = snk.namespace, .bytes = held, .cap = caps.shard } };
         }
         var to: u16 = 0;
@@ -1607,11 +1607,11 @@ pub const ProcessingHandler = struct {
             const meta = channels_mod.metaOf(read, to, .sink);
             if (shard.channel.pressureOf(to, .sink, now_ms)) |stall|
                 return .{ .pressure = .{ .shard = to, .stall = stall, .target = self.waitingSink(read, pipe, to, meta.acked + 1) } };
-            const bytes = channels_mod.bytesTo(read, to);
+            const bytes = channels_mod.bytesTo(read, to, .sink);
             if (bytes >= caps.channel) return .{ .outbox = .{ .to = to, .bytes = bytes, .cap = caps.channel, .cause = shard.channel.causeOf(to, .sink, now_ms) } };
             for (pipe.sinks) |snk| {
                 if (self.sinkShard(snk)) |s_to| if (s_to != to) continue;
-                const held = channels_mod.nsBytesTo(read, to, self.namespaceIdOf(snk.namespace));
+                const held = channels_mod.nsBytesTo(read, to, .sink, self.namespaceIdOf(snk.namespace));
                 if (raft_node_mod.shareHeld(held, bytes, caps.channel)) return .{ .share = .{ .to = to, .namespace = snk.namespace, .bytes = held, .cap = caps.channel } };
             }
         }

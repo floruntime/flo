@@ -12,7 +12,8 @@
 //! (`Flags.HISTORY`), whatever it starts with: it rides the history lane,
 //! may go only to its sender's own group, and is never parked; its slot's
 //! full mark refuses it like any other. One whose name ends 'M' carries no
-//! flag: it rides the main lane, and is never parked either.
+//! flag: it rides the main lane, and has its slot for a target like a
+//! sink's, but isn't a sink's, so it never parks.
 //!
 //! A probe is a sink's write (`Flags.SINK`), and its target is its slot,
 //! which can be full: one starting "fill" makes its slot full at its
@@ -97,7 +98,7 @@ fn isMark(body: []const u8) bool {
 fn targetOf(e: *const Entry) ?[machine_mod.TARGET_LEN]u8 {
     var diag: schema.Diagnostic = .{};
     const p = ce.Probe.decodeAll(e.payload, &diag) catch return null;
-    if (isMark(p.body) or isHistory(p.body) or isMain(p.body)) return null;
+    if (isMark(p.body) or isHistory(p.body)) return null;
     var t: [machine_mod.TARGET_LEN]u8 = @splat(0);
     t[0..5].* = "probe".*;
     std.mem.writeInt(u16, t[5..7], p.slot, .big);
