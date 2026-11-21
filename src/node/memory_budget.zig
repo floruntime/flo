@@ -107,8 +107,6 @@ pub const Observation = struct {
     /// The node that set the shown budget — named by a refusal and raised to
     /// lift the budget. Null before the first clean derive.
     governing_node: ?u32 = null,
-    /// The pool's use. Nothing charges the pool yet, so always 0.
-    pool_use_bytes: u64 = 0,
     /// The data-holder with no row yet that froze the budget, or null when none.
     provisional_node: ?u32 = null,
     /// When the current freeze began, for the provisional-duration gauge. This

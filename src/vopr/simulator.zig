@@ -26,6 +26,8 @@ const repair = @import("../node/repair.zig");
 const replay = @import("../node/replay.zig");
 const silent_loss = @import("../node/silent_loss.zig");
 const plant = @import("../plant.zig");
+const pool_mod = @import("../budget/pool.zig");
+const store_mod = @import("../contract/store.zig");
 const scenario_mod = @import("scenario.zig");
 const workload_mod = @import("workload.zig");
 const network_mod = @import("network.zig");
@@ -122,6 +124,10 @@ pub const Invariant = enum {
     /// leased other records, ended or counted a delivery otherwise, left a
     /// record, a key, a count or a floor the ledger doesn't hold.
     group_rule,
+    /// A store's memory-pool use, read from its counters, isn't what its
+    /// charged records hold, or two replicas whose families hold the same
+    /// show different use after the same history.
+    pool_use_recount,
     /// A leader proposed a KV batch above its own transaction limit.
     txn_gate,
     /// More messages than a run has any reason to send: replication is going
@@ -634,7 +640,7 @@ const Canon = struct { term: u64, hash: u64, op_id: ?u64, recorded_at: u64 };
 /// queues', groups', then the namespaces.
 const SAMPLED = families.Kv.FAMILIES.len + families.Actions.FAMILIES.len + families.Queues.FAMILIES.len + group_family.SUMS + families.Jobs.FAMILIES.len + workflow_defs_family.WorkflowDefs.FAMILIES.len + workflow_runs_family.WorkflowRuns.FAMILIES.len + 1;
 const Sums = [SAMPLED]u64;
-const StateCanon = struct { history: u64, checksum: u64, rebuilt: bool, sums: ?Sums };
+const StateCanon = struct { history: u64, checksum: u64, rebuilt: bool, sums: ?Sums, pool: u64 = 0 };
 
 /// The machines' families are compared at every index this divides: a
 /// checksum walks a whole family, so one at every index would cost the
@@ -783,10 +789,10 @@ const Checker = struct {
         }
     }
 
-    fn onState(self: *Checker, node: NodeId, idx: u64, history: u64, checksum: u64, sums: ?Sums, rebuilt: bool, tick: u64) void {
+    fn onState(self: *Checker, node: NodeId, idx: u64, history: u64, checksum: u64, sums: ?Sums, pool: u64, rebuilt: bool, tick: u64) void {
         while (self.states.items.len < idx) self.states.append(self.allocator, null) catch @panic("checker OOM");
         const slot = &self.states.items[idx - 1];
-        const here: StateCanon = .{ .history = history, .checksum = checksum, .rebuilt = rebuilt, .sums = sums };
+        const here: StateCanon = .{ .history = history, .checksum = checksum, .rebuilt = rebuilt, .sums = sums, .pool = pool };
         const canon = slot.* orelse {
             slot.* = here;
             return;
@@ -800,9 +806,11 @@ const Checker = struct {
         }
         self.state_checks += 1;
         if (canon.rebuilt != rebuilt) self.rebuilt_checks += 1;
+        var contents_match = canon.sums != null and sums != null;
         if (canon.sums != null and sums != null) {
             self.family_checks += 1;
             for (canon.sums.?, sums.?, MISMATCH) |want, got, why| {
+                if (want != got) contents_match = false;
                 if (want != got) self.fail(.{
                     .invariant = .state_checksum,
                     .node = node,
@@ -812,8 +820,7 @@ const Checker = struct {
                 });
             }
         }
-        if (canon.checksum == checksum) return;
-        self.fail(.{
+        if (canon.checksum != checksum) return self.fail(.{
             .invariant = .state_checksum,
             .node = node,
             .index = idx,
@@ -822,6 +829,19 @@ const Checker = struct {
                 "a replica rebuilt by replay holds other state than one that applied the same history live"
             else
                 "two replicas hold different state after applying the same history",
+        });
+        // Only where both replicas' families are known to hold the same:
+        // a divergence in them is `state_checksum`'s, and pool use differing
+        // too is its symptom. Here it means the counters drifted alone.
+        if (contents_match and canon.pool != pool) self.fail(.{
+            .invariant = .pool_use_recount,
+            .node = node,
+            .index = idx,
+            .tick = tick,
+            .detail = if (canon.rebuilt != rebuilt)
+                "a replica rebuilt by replay shows other pool use than one that applied the same history live, its families the same"
+            else
+                "two replicas show different pool use after the same history, their families the same",
         });
     }
 
@@ -2722,7 +2742,9 @@ pub const Simulator = struct {
         });
         const sampled = idx % SAMPLE_EVERY == 0;
         if (sampled) if (node.actions.danglingRequest()) |why| self.checker.fail(.{ .invariant = .action_rule, .node = node.id, .index = idx, .tick = self.now, .detail = why });
-        self.checker.onState(node.id, idx, node.history, node.counter.checksum(mutant), if (sampled) sumsOf(node) else null, !live, self.now);
+        if (comptime plant.active == .pool_load_bypasses_link) loadBypassingLink(&node.kv.store, idx);
+        if (sampled) if (poolRecountBroke(node)) |why| self.checker.fail(.{ .invariant = .pool_use_recount, .node = node.id, .index = idx, .tick = self.now, .detail = why });
+        self.checker.onState(node.id, idx, node.history, node.counter.checksum(mutant), if (sampled) sumsOf(node) else null, poolUseOf(node), !live, self.now);
     }
 
     // ── Log durability (runs before fault injection) ───────────────────
@@ -3114,6 +3136,41 @@ pub const Simulator = struct {
             if (node.families_index % SAMPLE_EVERY == 0) continue;
             self.checker.onFinalSums(node.id, node.families_index, node.history, sumsOf(node), node.families_index <= node.replay_through, self.now);
         }
+    }
+
+    /// The stores a node's server machines write, each counted once (groups
+    /// share the queues', runs the workflow definitions').
+    fn poolStores(node: *SimNode) [6]*store_mod.Store {
+        return .{ &node.kv.store, &node.actions.store, &node.queues.store, &node.jobs.store, &node.wf_defs.store, node.ns.handler.store };
+    }
+
+    /// The node's memory-pool use, from its stores' counters.
+    fn poolUseOf(node: *SimNode) u64 {
+        var total: u64 = 0;
+        for (poolStores(node)) |s| total += pool_mod.useOf(s);
+        return total;
+    }
+
+    /// Why a store's counted pool use isn't what a walk of its records
+    /// finds, or null when every store's is.
+    fn poolRecountBroke(node: *SimNode) ?[]const u8 {
+        for (poolStores(node)) |s| if (pool_mod.useOf(s) != pool_mod.recount(s)) return "a store's pool use, read from its counters, isn't what its charged records hold";
+        return null;
+    }
+
+    /// A record put straight into a store's tree, past `link` and its
+    /// counters: what a loader that skipped them would leave. The same on
+    /// every replica, so no checksum sees it.
+    fn loadBypassingLink(store: *store_mod.Store, idx: u64) void {
+        var kb: [16]u8 = undefined;
+        const key = std.fmt.bufPrint(&kb, "loaded-{d}", .{idx}) catch unreachable;
+        const fam = &store.families[61];
+        if (fam.tree.getEntryFor(key).node != null) return;
+        const rec = store.allocRecord(key) catch @panic("sim OOM");
+        rec.value = store.allocator.dupe(u8, "point") catch @panic("sim OOM");
+        // Found by the record's own key: the tree keeps the key it was found by.
+        var entry = fam.tree.getEntryFor(rec.node.key);
+        entry.set(&rec.node);
     }
 
     fn sumsOf(node: *SimNode) Sums {
@@ -3510,8 +3567,8 @@ test "vopr sim: KV's families are compared at a run's last index even when sampl
     defer checker.deinit();
     const idx = SAMPLE_EVERY + 3;
     // Applied at an unsampled index: no KV checksums yet.
-    checker.onState(1, idx, 42, 7, null, false, 0);
-    checker.onState(2, idx, 42, 7, null, false, 0);
+    checker.onState(1, idx, 42, 7, null, 0, false, 0);
+    checker.onState(2, idx, 42, 7, null, 0, false, 0);
     // The first final records them, the next compares.
     const same: Sums = .{ 1, 2, 3 } ++ @as([families.Actions.FAMILIES.len]u64, @splat(4)) ++ @as([families.Queues.FAMILIES.len]u64, @splat(6)) ++ @as([group_family.SUMS]u64, @splat(7)) ++ @as([families.Jobs.FAMILIES.len]u64, @splat(8)) ++ @as([workflow_defs_family.WorkflowDefs.FAMILIES.len]u64, @splat(10)) ++ @as([workflow_runs_family.WorkflowRuns.FAMILIES.len]u64, @splat(11)) ++ [1]u64{5};
     var other = same;

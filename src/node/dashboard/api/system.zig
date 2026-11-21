@@ -140,12 +140,22 @@ pub fn getMetricsJson(allocator: Allocator, ctx: *DashboardContext) ![]const u8 
     // The node's memory budget: while a data-holder hasn't reported
     // (provisional_ms > 0) the figure shown is the last committed record. The
     // provisional duration is computed here, at scrape, so it grows with time.
-    // Nothing is charged against it yet, so pool_use_bytes is 0.
+    // The pool's use is each shard's, summed; nothing is enforced against the
+    // budget yet.
     const mb = ctx.metrics.memory_budget.snapshot();
     var mb_obj = try obj.objectField("memory_budget");
     try mb_obj.begin();
     try mb_obj.intField("budget_bytes", mb.budget_bytes);
-    try mb_obj.intField("pool_use_bytes", mb.pool_use_bytes);
+    try mb_obj.intField("pool_use_bytes", ctx.metrics.poolUseBytes());
+    // Each shard's, by shard id: the share a shard is held to is its own.
+    var by_shard = try mb_obj.arrayField("pool_use_by_shard");
+    try by_shard.begin();
+    for (0..ctx.metrics.shardCount()) |i| {
+        const sm = ctx.metrics.shardMetrics(@intCast(i)) orelse break;
+        try by_shard.next();
+        try by_shard.writer.print("{d}", .{sm.pool_use_bytes.load(.monotonic)});
+    }
+    try by_shard.end();
     try mb_obj.intField("governing_node", mb.governing_node);
     try mb_obj.intField("provisional_ms", mb.provisionalMs(@import("stdx").time.monotonicMs()));
     try mb_obj.intField("provisional_node", mb.provisional_node);
@@ -219,4 +229,19 @@ test "getClusterStats says whether the node is ready, and each shard's state" {
     const shards = root.get("shards").?.array.items;
     try std.testing.expectEqualStrings("ok", shards[0].object.get("state").?.string);
     try std.testing.expectEqualStrings("replaying", shards[1].object.get("state").?.string);
+}
+
+test "getMetricsJson: the pool's use is each shard's, and the node's is their sum" {
+    const allocator = std.testing.allocator;
+    var metrics = h.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    try metrics.initShards(2);
+    metrics.shardMetrics(0).?.pool_use_bytes.store(300, .monotonic);
+    metrics.shardMetrics(1).?.pool_use_bytes.store(45, .monotonic);
+    var ctx = DashboardContext.init(allocator, &metrics, 2);
+
+    const result = try getMetricsJson(allocator, &ctx);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"pool_use_bytes\":345") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"pool_use_by_shard\":[300,45]") != null);
 }
