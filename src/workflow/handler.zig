@@ -36,6 +36,7 @@ const dispatcher_mod = @import("../node/dispatcher.zig");
 const system_ops = @import("../protocol/system_ops.zig");
 const list_runs = @import("list_runs.zig");
 const parser = @import("parser.zig");
+const stream_names = @import("../stream/names.zig");
 
 const definition = @import("definition.zig");
 const cron_mod = @import("cron.zig");
@@ -821,6 +822,12 @@ pub const WorkflowHandler = struct {
         // request check, so the namespace it names is checked here.
         if (def.trigger) |t| if (t.namespace) |ns| if (ns.len > 0) if (@import("../namespace/handler.zig").nameRefusal(ns)) |why| {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+            return null;
+        };
+        // And so is its stream's name. Here, not in the parser: a create
+        // is parsed again where it applies, and halts there if it doesn't.
+        if (def.trigger) |t| if (stream_names.reservedStreamName(t.stream)) {
+            shard.sendRefusal(conn, req.header.request_id, .unauthorized, .{ .reason = .reserved_key, .ran = .no, .message = stream_names.RESERVED });
             return null;
         };
 

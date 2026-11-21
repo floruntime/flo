@@ -53,6 +53,7 @@ const GroupMembersResponse = table_run.op("stream.group.members").response;
 
 const CommandResult = result_mod.CommandResult;
 const disk_reads = @import("disk_reads.zig");
+const stream_names = @import("names.zig");
 const StreamProjection = stream_mod.StreamProjection;
 const StreamKey = stream_mod.StreamKey;
 const StreamID = stream_mod.StreamID;
@@ -222,6 +223,7 @@ pub const StreamHandler = struct {
     fn runGroupList(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(GroupListResponse) {
         const self = shard.stream_handler;
         if (req.key.len > group_entries.StreamName.max_size) return error.NameTooLong;
+        if (stream_names.reservedStreamName(req.key)) return .{ .refused = group_handler.Operator.RESERVED_REFUSAL };
         const sk = group_machine.streamOf(req.ns_id, req.key);
         const hb = sk[4..12];
         var kb: [12]u8 = undefined;
@@ -296,6 +298,7 @@ pub const StreamHandler = struct {
     fn runGroupMembers(shard: *Shard, _: *Connection, req: Request, group: []const u8) Error!table_run.Outcome(GroupMembersResponse) {
         const self = shard.stream_handler;
         if (req.key.len > group_entries.StreamName.max_size or group.len > group_entries.MAX_GROUP_NAME) return error.NameTooLong;
+        if (stream_names.reservedStreamName(req.key)) return .{ .refused = group_handler.Operator.RESERVED_REFUSAL };
         _ = group_handler.metaOf(shard, req.ns_id, req.key, group) orelse
             return .{ .refused = .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = "not found: no such consumer group" } } };
         const read: @import("../contract/view.zig").ReadView = .{ .store = &self.partition.store };
@@ -552,6 +555,7 @@ pub const StreamHandler = struct {
     }
 
     const NAME_TOO_LONG: CommandResult = .{ .err = .{ .code = .invalid_request, .message = "stream name too long" } };
+    const RESERVED: CommandResult = .{ .err = .{ .code = .unauthorized, .message = stream_names.RESERVED, .reason = .reserved_key } };
 
     /// An append through this handler's own entry point, for tests in other
     /// files; it fails to compile outside tests, so nothing reaches the
@@ -566,6 +570,7 @@ pub const StreamHandler = struct {
         self.beginRead();
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         if (nameRefusal(op, req)) |why| return .{ .err = .{ .code = .invalid_request, .message = why } };
+        if (op != .stream_list and stream_names.reservedStreamName(req.key)) return RESERVED;
         return switch (op) {
             // Stream operations
             .stream_append => self.handleAppend(req),
@@ -1414,6 +1419,9 @@ pub const StreamHandler = struct {
 
     /// `readPayloadsForStream` for a caller that holds the namespace's id.
     pub fn readPayloadsForStreamIn(self: *StreamHandler, stream_name: []const u8, ns: router.NamespaceId, after_id: StreamID, limit: usize) PayloadRead {
+        // A name the server keeps reads as empty, whoever asks (a trigger
+        // or a job, in any namespace): no definition reaches one anyway.
+        if (stream_names.reservedStreamName(stream_name)) return .{ .payloads = &.{}, .ids = &.{}, .last_id = after_id };
         var results: [MAX_READ_BATCH][]const u8 = undefined;
         var result_ids: [MAX_READ_BATCH]StreamID = undefined;
         var count: usize = 0;
@@ -2129,6 +2137,50 @@ test "stream handler: a read returns whole appends and its cursor passes them" {
     try testing.expectEqualStrings("abc", &seen);
 }
 
+test "stream handler: a trigger's or job's read of a stream the server keeps reads nothing and keeps its cursor" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+    var vb: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "_flo", makeBatchValue(&vb, "data"), ""));
+    // A reserved stream holding that same append, as no handler or apply
+    // would make one: its meta and record written straight into the store.
+    for ([_]router.NamespaceId{ .default, .of(9) }) |ns| {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const read: @import("../contract/view.zig").ReadView = .{ .store = &partition.store };
+        const sk = stream_mod.streamKey(.default, "_flo");
+        const meta = stream_machine.metaAt(read, sk).?;
+        var rit = read.range(stream_machine.Records, &sk);
+        const rec = (try rit.next()).?;
+        const to = stream_mod.streamKey(ns, "_flo:history");
+        var keys = @import("../contract/view.zig").KeySet.init(arena.allocator());
+        try keys.addIn(stream_machine.Metas.ID, ns, to[4..12]);
+        try keys.addRangeIn(stream_machine.Records.ID, ns, to[4..12]);
+        var view = @import("../contract/view.zig").View.init(&partition.store, arena.allocator(), &keys);
+        var m = meta;
+        m.name = "_flo:history";
+        try view.put(stream_machine.Metas, &to, .{ .v = m });
+        var kb: [stream_machine.RECORD_KEY_LEN]u8 = undefined;
+        try view.put(stream_machine.Records, try arena.allocator().dupe(u8, stream_machine.recordKey(&kb, to, stream_machine.idOfKey(rec.key))), .{ .v = rec.value.v });
+        try view.commit();
+    }
+    const from: StreamID = StreamID.MIN;
+    for ([_]router.NamespaceId{ .default, .of(9) }) |ns| {
+        const got = handler.readPayloadsForStreamIn("_flo:history", ns, from, 10);
+        defer got.deinit(allocator);
+        try testing.expectEqual(@as(usize, 0), got.payloads.len);
+        try testing.expectEqual(from, got.last_id);
+    }
+    // A name only like it reads as any stream does.
+    const near = handler.readPayloadsForStream("_flo", "default", StreamID.MIN, 10);
+    defer near.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), near.payloads.len);
+}
+
 test "stream handler: the processing source resumes after whole appends" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 1 << 20, 0);
@@ -2794,6 +2846,34 @@ test "stream handler: a stream name is refused when empty, holding a NUL, or too
     try testing.expectEqualStrings("stream name too long", StreamHandler.nameRefusal(.stream_append, makeRequest(.stream_append, &long, "", "")).?);
     try testing.expect(StreamHandler.nameRefusal(.stream_append, makeRequest(.stream_append, long[0..ns_keys.MAX_QUALIFIED_KEY], "", "")) == null);
     try testing.expect(StreamHandler.nameRefusal(.stream_list, makeRequest(.stream_list, "a\x00b", "", "")) == null);
+}
+
+test "stream handler: every stream op refuses a reserved name, as unauthorized, before it runs" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+    var vb: [64]u8 = undefined;
+    const batch = makeBatchValue(&vb, "data");
+    var pc: [4]u8 = undefined;
+    std.mem.writeInt(u32, &pc, 1, .little);
+    const value = [_][]const u8{ batch, "", "", "", &pc, "", "" };
+    for ([_]OpCode{ .stream_append, .stream_read, .stream_trim, .stream_info, .stream_create, .stream_alter, .stream_delete }, value) |op, v| {
+        switch (handler.handleCommand(makeRequest(op, "_flo:history", v, ""))) {
+            .err => |e| {
+                try testing.expectEqual(CommandResult.ErrorCode.unauthorized, e.code);
+                try testing.expectEqual(proto.Reason.reserved_key, e.refusal().reason);
+                try testing.expectEqualStrings(stream_names.RESERVED, e.message);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    // Nothing was made, and a name that only looks like it is a stream.
+    try testing.expectEqual(@as(u64, 0), partition.store.family(stream_machine.Metas.ID).count);
+    try testing.expectEqual(CommandResult.ok, handler.handleCommand(makeRequest(.stream_create, "_flo", &pc, "")));
+    try testing.expectEqual(@as(u64, 1), partition.store.family(stream_machine.Metas.ID).count);
 }
 
 test "stream handler: a stream's existence and settings live in the contract's state: a created stream with no records, and its retention, read from its families alone" {

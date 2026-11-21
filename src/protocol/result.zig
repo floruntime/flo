@@ -348,11 +348,13 @@ pub const CommandResult = union(enum) {
         /// Whether the request took effect, when the site knows; otherwise
         /// it is judged from the status.
         ran: ?flo_proto.Ran = null,
+        /// The reason a client reads, when the code alone doesn't say it.
+        reason: ?flo_proto.Reason = null,
 
         pub fn refusal(e: Error) flo_proto.Refusal {
             const status = e.code.toStatus();
             return .{
-                .reason = switch (e.code) {
+                .reason = e.reason orelse switch (e.code) {
                     .committed_not_applied => .committed_not_applied,
                     .too_many_actions => .too_many_actions,
                     // What a client tells apart from a refusal to look:

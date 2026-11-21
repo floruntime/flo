@@ -53,6 +53,7 @@ const wire = @import("../util/wire.zig");
 const stream_mod = @import("../projection/stream.zig");
 const machine = @import("group_machine.zig");
 const StreamHandler = @import("handler.zig").StreamHandler;
+const stream_names = @import("names.zig");
 
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
@@ -237,6 +238,10 @@ fn check(shard: *Shard, conn: *Connection, req: Request) bool {
     }
     if (req.key.len > ge.StreamName.max_size) {
         refuse(shard, conn, req.header.request_id, .bad_request, "bad request: stream name too long");
+        return false;
+    }
+    if (stream_names.reservedStreamName(req.key)) {
+        shard.sendRefusal(conn, req.header.request_id, Operator.RESERVED_REFUSAL.status, Operator.RESERVED_REFUSAL.refusal);
         return false;
     }
     // Names hold no NUL, as streams' and every other resource's don't.
@@ -939,6 +944,9 @@ pub const Operator = struct {
         };
     }
 
+    /// A stream name the server keeps for itself, as every group op refuses it.
+    pub const RESERVED_REFUSAL: table_run.Refused = .{ .status = .unauthorized, .refusal = .{ .reason = .reserved_key, .ran = .no, .message = stream_names.RESERVED } };
+
     const NO_GROUP_REFUSAL: table_run.Refused = .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = machine.NO_GROUP } };
 
     /// The checks every operator command makes before it reads the group.
@@ -946,6 +954,7 @@ pub const Operator = struct {
         if (req.key.len == 0) return error.NoStream;
         if (group.len == 0) return error.NoGroupName;
         if (req.key.len > ge.StreamName.max_size or group.len > ge.MAX_GROUP_NAME) return error.NameTooLong;
+        if (stream_names.reservedStreamName(req.key)) return RESERVED_REFUSAL;
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
         if (req.ns_id == .invalid) return .{ .status = persistence_mod.failureStatus(error.NamespaceUnknown), .refusal = persistence_mod.failureRefusal(error.NamespaceUnknown, "not run") };
         if (metaOf(shard, req.ns_id, req.key, group) == null) return NO_GROUP_REFUSAL;
