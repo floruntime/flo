@@ -4350,7 +4350,7 @@ pub const Shard = struct {
         };
         const index = at orelse self.edge.knownIndex(name);
         const asked = index != null or self.askingAbout(name);
-        w.* = .{ .active = true, .reply_to = conn.replyTo(), .origin = origin, .request_id = req.header.request_id, .bytes = bytes, .name = owned, .index = index, .local = at != null, .deadline_ms = now + edge_mod.WAIT_MS };
+        w.* = .{ .active = true, .seq = self.edge.takeSeq(), .reply_to = conn.replyTo(), .origin = origin, .request_id = req.header.request_id, .bytes = bytes, .name = owned, .index = index, .local = at != null, .deadline_ms = now + edge_mod.WAIT_MS };
         self.edge.count += 1;
         // One of the connection's requests waiting elsewhere, as a gather's.
         conn.forwards_in_flight += 1;
@@ -4409,12 +4409,28 @@ pub const Shard = struct {
     /// leader's index, so the name is resolved here, or the wait ran out.
     fn sweepEdge(self: *Shard, now: u64) void {
         const t = self.namespace_handler.table;
+        // Those resolved now run in the order they began waiting, not their
+        // slots': a slot freed earlier may hold a later request.
+        const Ready = struct { w: *edge_mod.Wait, seq: u64 };
+        var ready: [edge_mod.WAITS]Ready = undefined;
+        var n: usize = 0;
         for (&self.edge.waits) |*w| {
             if (!w.active) continue;
             if (w.index) |index| if (t.publishedIndex() >= index) {
-                self.resolveAtEdge(w, now);
-                continue;
+                ready[n] = .{ .w = w, .seq = w.seq };
+                n += 1;
             };
+        }
+        std.mem.sortUnstable(Ready, ready[0..n], {}, struct {
+            fn lessThan(_: void, a: Ready, b: Ready) bool {
+                return a.seq < b.seq;
+            }
+        }.lessThan);
+        // Ended, or its slot taken again, by what ran before it: skipped.
+        for (ready[0..n]) |r| if (r.w.active and r.w.seq == r.seq) self.resolveAtEdge(r.w, now);
+        for (&self.edge.waits) |*w| {
+            if (!w.active) continue;
+            if (w.index) |index| if (t.publishedIndex() >= index) continue;
             if (now >= w.deadline_ms) {
                 self.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, proto.notRun(if (w.local)
                     "unavailable: the namespace is created but not yet on disk; the request was not run — retry"
@@ -4589,6 +4605,7 @@ pub const Shard = struct {
             return self.sendForwardReply(frame.source_node, id, proto.Response.serializeRefusal(.internal_error, request_id, proto.notRun("internal error: out of memory"), &err_buf), 0);
         h.* = .{
             .active = true,
+            .seq = self.edge.takeSeq(),
             .payload = payload,
             .source_node = frame.source_node,
             .group_id = frame.group_id,
@@ -4604,16 +4621,37 @@ pub const Shard = struct {
     /// forwarder's index, so the write is checked again and runs or is
     /// refused as on arrival, or the wait ran out and it never ran.
     fn sweepHeldForwards(self: *Shard, now: u64) void {
+        // Those the table has caught up for run in the order they were held,
+        // not their slots': a slot freed earlier may hold a later write.
+        const Ready = struct { h: *edge_mod.HeldForward, seq: u64 };
+        var ready: [edge_mod.HELD_FORWARDS]Ready = undefined;
+        var n: usize = 0;
+        for (&self.edge.held) |*h| {
+            if (h.active and self.namespace_handler.table.publishedIndex() >= h.published) {
+                ready[n] = .{ .h = h, .seq = h.seq };
+                n += 1;
+            }
+        }
+        std.mem.sortUnstable(Ready, ready[0..n], {}, struct {
+            fn lessThan(_: void, a: Ready, b: Ready) bool {
+                return a.seq < b.seq;
+            }
+        }.lessThan);
+        for (ready[0..n]) |r| {
+            const h = r.h;
+            // Ended, or its slot taken again, by what ran before it.
+            if (!h.active or h.seq != r.seq) continue;
+            const payload = h.payload;
+            h.payload = &.{};
+            const frame: RaftFrame = .{ .source_node = h.source_node, .group_id = h.group_id, .msg_type = .forward_write, .payload = payload };
+            self.edge.dropHeld(self.allocator, h);
+            defer self.allocator.free(payload);
+            self.runForwardedWrite(frame);
+        }
         for (&self.edge.held) |*h| {
             if (!h.active) continue;
-            if (self.namespace_handler.table.publishedIndex() >= h.published) {
-                const payload = h.payload;
-                h.payload = &.{};
-                const frame: RaftFrame = .{ .source_node = h.source_node, .group_id = h.group_id, .msg_type = .forward_write, .payload = payload };
-                self.edge.dropHeld(self.allocator, h);
-                defer self.allocator.free(payload);
-                self.runForwardedWrite(frame);
-            } else if (now >= h.deadline_ms) {
+            if (self.namespace_handler.table.publishedIndex() >= h.published) continue;
+            if (now >= h.deadline_ms) {
                 var err_buf: [256]u8 = undefined;
                 self.sendForwardReply(h.source_node, h.forward_id, proto.Response.serializeRefusal(.unavailable, h.request_id, FORWARD_NOT_CAUGHT_UP, &err_buf), 0);
                 self.edge.dropHeld(self.allocator, h);
@@ -12354,6 +12392,34 @@ test "Shard: a write on shard 1 to a namespace nobody created is answered once, 
     try std.testing.expectEqual(@as(usize, 0), b.reply_pool.taken());
 }
 
+test "Shard: pipelined writes to one key in a namespace nobody created apply in the order they were sent" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, nextNamespaceId(&two.shards[0]), 1, &kbuf);
+    // All three wait on the one create, and run as it is answered.
+    for ([_][]const u8{ "v1", "v2", "v3" }, 0..) |v, i| b.runRequest(c.conn, try ParkTest.request(.kv_put, 10 + i, "fresh", k, v, ""), .client);
+    for (0..4) |_| {
+        _ = try two.shards[0].tick(0);
+        two.settle();
+    }
+    var out: [512]u8 = undefined;
+    var answers: [3]proto.Response = undefined;
+    try ParkTest.responses(b, c.conn, c.pair[1], &out, &answers);
+    for (answers) |a| try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), a.header.status);
+    var body: [64]u8 = undefined;
+    b.runRequest(c.conn, edgeGet(&body, 20, "fresh", k), .client);
+    two.settle();
+    const got = try nextAnswer(c, b, &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), got.header.status);
+    var diag: schema.Diagnostic = .{};
+    try std.testing.expectEqualStrings("v3", (try table_run.op("kv.get").response.decodeAll(got.data, &diag)).value);
+}
+
 test "Shard: a write another shard forwards here, to a namespace nobody created, is answered once to that shard's client" {
     var two: TwoShards = undefined;
     try two.init();
@@ -15705,7 +15771,11 @@ const HeldForwardTest = struct {
     /// Member 2 forwards a put to `ns`, resolved there as `id`, from a table
     /// published through `published`.
     fn forward(t: *HeldForwardTest, forward_id: u32, ns: []const u8, id: ns_table.Id, published: u64) !void {
-        const wire = try Shard.serializeRequest(std.testing.allocator, testReq(.kv_put, 900 + forward_id, ns, "k", "v", ""));
+        return t.forwardPut(forward_id, ns, id, published, "v");
+    }
+
+    fn forwardPut(t: *HeldForwardTest, forward_id: u32, ns: []const u8, id: ns_table.Id, published: u64, value: []const u8) !void {
+        const wire = try Shard.serializeRequest(std.testing.allocator, testReq(.kv_put, 900 + forward_id, ns, "k", value, ""));
         defer std.testing.allocator.free(wire);
         const frame = try std.testing.allocator.alloc(u8, FORWARD_PREFIX + FORWARD_FIELDS + wire.len);
         defer std.testing.allocator.free(frame);
@@ -15807,6 +15877,43 @@ test "Shard: a held forward whose id the leader publishes under another name is 
     const resp = (try t.reply(9)).?;
     try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
     try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
+}
+
+test "Shard: forwarded writes held until this node's table catches up run in the order they came, though a later one took an earlier slot" {
+    var t: HeldForwardTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    const nh = t.shard.namespace_handler;
+    const a_id: ns_table.Id = .of(nh.nextId());
+    const b_id: ns_table.Id = .of(a_id.int() + 1);
+    const next = raft.log.lastIndex() + 1;
+    // One for "aa", held in the first slot; a write of "bb" in the next.
+    try t.forward(1, "aa", a_id, next);
+    try t.forwardPut(2, "bb", b_id, next + 1, "v1");
+    // "aa" published: its write runs, and its slot is free.
+    try t.create("aa");
+    t.shard.sweepHeldForwards(Shard.nowMs());
+    try std.testing.expect(!t.shard.edge.held[0].active);
+    // The second write of "bb" takes that first slot.
+    try t.forwardPut(3, "bb", b_id, next + 1, "v2");
+    try std.testing.expect(t.shard.edge.held[0].active);
+    const from = raft.log.lastIndex() + 1;
+    try t.create("bb");
+    t.shard.sweepHeldForwards(Shard.nowMs());
+    try std.testing.expectEqual(@as(u32, 0), t.shard.edge.held_count);
+    // Proposed v1, then v2.
+    var order: [2]u8 = undefined;
+    var n: usize = 0;
+    var i = from;
+    while (i <= raft.log.lastIndex()) : (i += 1) {
+        const e = raft.log.getEntry(i).?;
+        if (e.header.entry_type != @backingInt(entry_mod.EntryType.kv_put)) continue;
+        if (std.mem.indexOf(u8, e.payload, "v1") != null) order[n] = 1 else if (std.mem.indexOf(u8, e.payload, "v2") != null) order[n] = 2 else continue;
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, &order);
 }
 
 test "Shard: a forward carries a namespace's id only once this node's table has published it" {
@@ -27472,6 +27579,43 @@ test "Shard: a read resolved before shard 0 published its namespace routes by th
     // Published by the time the edge looks: let through, with that id.
     try std.testing.expect(!b.edgeMiss(c.conn, &req, .client));
     try std.testing.expectEqual(id, req.ns_id);
+}
+
+test "Shard: requests held at shard 0's edge until their namespace publishes run in the order they were sent, whatever slots they hold" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const a = &two.shards[0];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [2048]u8 = undefined;
+    // Applied on shard 0, not yet published to the node's table.
+    a.runRequest(c.conn, try ParkTest.request(.namespace_create, 1, "", "fresh", "", ""), .client);
+    _ = a.applyCommitted();
+    try std.testing.expect(two.namespaces.lookup("fresh") == null);
+    var bodies: [3][64]u8 = undefined;
+    for (&bodies, 0..) |*body, i| a.runRequest(c.conn, edgeGet(body, 10 + i, "fresh", "k"), .client);
+    // Held, each in a slot; a freed slot reused would put a later request
+    // in an earlier slot.
+    var held: [3]usize = undefined;
+    var n: usize = 0;
+    for (&a.edge.waits, 0..) |*w, i| if (w.active and std.mem.eql(u8, w.name, "fresh")) {
+        held[n] = i;
+        n += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 3), n);
+    std.mem.swap(edge_mod.Wait, &a.edge.waits[held[0]], &a.edge.waits[held[2]]);
+    for (0..4) |_| {
+        _ = try a.tick(0);
+        two.settle();
+    }
+    // The create's answer, then the three reads in the order sent.
+    var answers: [4]proto.Response = undefined;
+    try ParkTest.responses(a, c.conn, c.pair[1], &out, &answers);
+    try std.testing.expectEqual(@as(u64, 1), answers[0].header.request_id);
+    for (answers[1..], 10..) |r, id| try std.testing.expectEqual(@as(u64, id), r.header.request_id);
 }
 
 /// A first life of two shards under `data_dir`: namespace "xs" created,

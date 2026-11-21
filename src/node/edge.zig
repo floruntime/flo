@@ -35,6 +35,9 @@ pub const FORWARD_WAIT_MS: u64 = 1000;
 
 pub const HeldForward = struct {
     active: bool = false,
+    /// When it was held, in this edge's order: forwards run together run
+    /// in it.
+    seq: u64 = 0,
     /// The forward as it came, run again once the table has caught up.
     payload: []u8 = &.{},
     source_node: u32 = 0,
@@ -48,6 +51,9 @@ pub const HeldForward = struct {
 
 pub const Wait = struct {
     active: bool = false,
+    /// When it began waiting, in this edge's order: waits resolved together
+    /// run in it, not in the order of the slots they hold.
+    seq: u64 = 0,
     /// The client's own connection, on this shard.
     reply_to: ReplyTo = undefined,
     origin: Origin = .client,
@@ -71,6 +77,7 @@ const Miss = struct {
 pub const Edge = struct {
     waits: [WAITS]Wait = @splat(.{}),
     count: u32 = 0,
+    next_seq: u64 = 0,
     /// A ring: the oldest name is the one replaced.
     misses: ?*[MISSES]Miss = null,
     next_miss: usize = 0,
@@ -82,6 +89,12 @@ pub const Edge = struct {
         for (&self.held) |*h| if (h.active) self.dropHeld(allocator, h);
         if (self.misses) |m| allocator.destroy(m);
         self.misses = null;
+    }
+
+    /// The next wait's place in the order waits are resolved in.
+    pub fn takeSeq(self: *Edge) u64 {
+        self.next_seq += 1;
+        return self.next_seq;
     }
 
     pub fn free(self: *Edge) ?*Wait {
