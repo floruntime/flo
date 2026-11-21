@@ -304,8 +304,10 @@ pub const RepairSkipAnswer = struct {
     first_seq: u64 = 0,
     last_seq: u64 = 0,
     halt_seq: u64 = 0,
+    /// The lane those seqs count in (`channels.Lane`).
+    lane: u8 = 0,
 
-    const FIXED = 1 + 8 + 8 + 8 + 4 + 1 + 4 + 1 + 1 + 2 + 8 + 8 + 8;
+    const FIXED = 1 + 8 + 8 + 8 + 4 + 1 + 4 + 1 + 1 + 2 + 8 + 8 + 8 + 1;
 
     pub fn maxSize(halted: usize) usize {
         return FIXED + halted * 4;
@@ -326,6 +328,7 @@ pub const RepairSkipAnswer = struct {
         std.mem.writeInt(u64, buf[38..46], self.first_seq, .little);
         std.mem.writeInt(u64, buf[46..54], self.last_seq, .little);
         std.mem.writeInt(u64, buf[54..62], self.halt_seq, .little);
+        buf[62] = self.lane;
         for (self.halted, 0..) |id, i| std.mem.writeInt(u32, buf[FIXED + i * 4 ..][0..4], id, .little);
         return buf[0 .. FIXED + self.halted.len * 4];
     }
@@ -352,6 +355,7 @@ pub const RepairSkipAnswer = struct {
             .first_seq = std.mem.readInt(u64, data[38..46], .little),
             .last_seq = std.mem.readInt(u64, data[46..54], .little),
             .halt_seq = std.mem.readInt(u64, data[54..62], .little),
+            .lane = data[62],
         };
     }
 };

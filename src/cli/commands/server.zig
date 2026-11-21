@@ -935,7 +935,8 @@ fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
         }
         const first = if (p) |pp| pp.first_seq else 0;
         const last = if (n == 0) first else first + n - 1;
-        ctx.print("a channel inbound from shard {d}, carrying messages {d}..{d}\n", .{ if (p) |pp| pp.from else 0, first, last });
+        const lane: []const u8 = if (p) |pp| (if (@import("../../contract/channels.zig").Lane.from(pp.lane)) |l| @tagName(l) else "unknown") else "unknown";
+        ctx.print("a channel inbound from shard {d} on its {s} lane, carrying messages {d}..{d}\n", .{ if (p) |pp| pp.from else 0, lane, first, last });
         if (seq == 0 and !whole) return outcome.usage(ctx, "choose the repair: --seq <n> skips the message the shard halted at (its /status says, as halt_message) and the others apply; --whole-entry skips every message, {d}..{d}", .{ first, last });
         if (seq != 0 and (seq < first or seq > last)) return outcome.usage(ctx, "entry {d} carries messages {d}..{d}; it has no message {d}", .{ index, first, last, seq });
     } else if (seq != 0) return outcome.usage(ctx, "--seq names a message of a channel inbound; entry {d} isn't one, and is skipped whole", .{index});

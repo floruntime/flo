@@ -371,7 +371,7 @@ const T = struct {
     }
 
     fn sent(t: *T) u64 {
-        return channels.metaOf(t.read(), 1).next_seq - 1;
+        return channels.metaOf(t.read(), 1, .main).next_seq - 1;
     }
 };
 

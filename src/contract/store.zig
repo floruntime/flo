@@ -56,7 +56,7 @@ pub const InboundSkip = struct {
 };
 
 /// The inbound message being applied, so a halt in its applier can name it.
-pub const Applying = struct { from: u16, seq: u64 };
+pub const Applying = struct { from: u16, seq: u64, lane: @import("channels.zig").Lane = .main };
 
 /// Why a message was refused as its sender's bug.
 pub const SenderBug = enum(u8) {

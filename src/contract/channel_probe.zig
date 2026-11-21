@@ -8,6 +8,11 @@
 //! One starting "relay" is sent on again by its receiver, to the same slot;
 //! one starting "flood" is sent on more times than an apply may send.
 //!
+//! One whose 16-byte name ends 'H' is a run's history's instead
+//! (`Flags.HISTORY`), whatever it starts with: it rides the history lane,
+//! may go only to its sender's own group, and is never parked; its slot's
+//! full mark refuses it like any other.
+//!
 //! A probe is a sink's write (`Flags.SINK`), and its target is its slot,
 //! which can be full: one starting "fill" makes its slot full at its
 //! receiver, one starting "drai" (drain) makes it take probes again, and neither
@@ -91,7 +96,7 @@ fn isMark(body: []const u8) bool {
 fn targetOf(e: *const Entry) ?[machine_mod.TARGET_LEN]u8 {
     var diag: schema.Diagnostic = .{};
     const p = ce.Probe.decodeAll(e.payload, &diag) catch return null;
-    if (isMark(p.body)) return null;
+    if (isMark(p.body) or isHistory(p.body)) return null;
     var t: [machine_mod.TARGET_LEN]u8 = @splat(0);
     t[0..5].* = "probe".*;
     std.mem.writeInt(u16, t[5..7], p.slot, .big);
@@ -120,7 +125,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     if (view.message == null and std.mem.startsWith(u8, p.body, "drai")) if (view.place) |pl| if (@import("channels.zig").ownerOf(pl, p.slot) == pl.group) {
         return view.delete(GotFam, full_key);
     };
-    const m = view.message orelse return view.sendFlagged(PROBE_ORIGIN, p.slot, @backingInt(entry_mod.EntryType.channel_probe), entry_mod.Flags.SINK, e.payload);
+    const m = view.message orelse return view.sendFlagged(PROBE_ORIGIN, p.slot, @backingInt(entry_mod.EntryType.channel_probe), flagsOf(p.body), e.payload);
     if (std.mem.startsWith(u8, p.body, "fill")) {
         try view.put(GotFam, full_key, .{ .v = .{ .from = 0, .seq = 0, .hash = 0 } });
     } else if (std.mem.startsWith(u8, p.body, "drai")) {
@@ -132,7 +137,16 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     try view.put(GotFam, gotKey(&kb, p.body[0..NAME_LEN]), .{ .v = .{ .from = m.from, .seq = m.seq, .hash = hashOf(p.body) } });
     if (std.mem.startsWith(u8, p.body, "refuse")) out.refuse(.bad_request, .malformed, "refused, as asked");
     const again: usize = if (std.mem.startsWith(u8, p.body, "relay")) 1 else if (std.mem.startsWith(u8, p.body, "flood")) @import("channels.zig").MAX_SENDS + 1 else 0;
-    for (0..again) |_| try view.sendFlagged(PROBE_ORIGIN, p.slot, @backingInt(entry_mod.EntryType.channel_probe), entry_mod.Flags.SINK, e.payload);
+    for (0..again) |_| try view.sendFlagged(PROBE_ORIGIN, p.slot, @backingInt(entry_mod.EntryType.channel_probe), flagsOf(p.body), e.payload);
+}
+
+/// The flags a probe with `body` is sent with: a history's, or a sink's.
+fn flagsOf(body: []const u8) u16 {
+    return if (isHistory(body)) entry_mod.Flags.HISTORY else entry_mod.Flags.SINK;
+}
+
+pub fn isHistory(body: []const u8) bool {
+    return body.len >= NAME_LEN and body[NAME_LEN - 1] == 'H';
 }
 
 pub const machine: machine_mod.Machine = .{

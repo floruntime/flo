@@ -632,7 +632,7 @@ test "time series: two writes at one timestamp in one channel inbound are two po
     var w: schema.Writer = .{ .buf = &mb };
     for (log.entries.items) |e| try ce.Message.encode(&w, .{ .slot = 0, .entry_type = e.header.entry_type, .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = 7, .payload = e.payload });
     var ib: [8192]u8 = undefined;
-    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
+    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
     var h = std.mem.zeroes(entry_mod.Header);
     h.entry_type = @backingInt(EntryType.channel_inbound);
     h.index = 9;

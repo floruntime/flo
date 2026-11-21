@@ -22,6 +22,11 @@
 //!   deliveries in one inbound still differ; a record located by index
 //!   takes `(index, view.message.ordinal)`.
 //! - **Trims** drop what the receiver durably applied.
+//! - **Lanes.** Each pair of groups has two channels, each its own seqs,
+//!   outbox, marks and trims: `main`, and `history` for the messages a
+//!   run's history rides (`Flags.HISTORY`), so history is never held
+//!   behind a sink's message its target is full for. A history message
+//!   only ever goes to its sender's own group, and never parks.
 //!
 //! Delivering, acks and resends are the leader's (`channel_driver.zig`):
 //! nothing here is node-local, so every replica and every replay agree.
@@ -132,26 +137,27 @@ pub const families = [_]machine_mod.FamilyInfo{ machine_mod.info(OutFam), machin
 /// Per-namespace outbox keys live under a namespace of their own, so a trim
 /// can declare the range of one peer's.
 pub const OUT_NS = "~outns";
-const OUT_NS_KEY = 1 + OUT_NS.len + PEER_LEN + 4;
+const OUT_NS_KEY = 1 + OUT_NS.len + CHAN_LEN + 4;
 
-fn outNsKey(buf: *[OUT_NS_KEY]u8, to: u16, ns: ns_table.Id) []const u8 {
-    var raw: [PEER_LEN + 4]u8 = undefined;
-    raw[0..PEER_LEN].* = peerBytes(to);
-    raw[PEER_LEN..].* = ns.bytes();
+fn outNsKey(buf: *[OUT_NS_KEY]u8, to: u16, lane: Lane, ns: ns_table.Id) []const u8 {
+    var raw: [CHAN_LEN + 4]u8 = undefined;
+    raw[0..CHAN_LEN].* = chanBytes(to, lane);
+    raw[CHAN_LEN..].* = ns.bytes();
     return view_mod.key(buf, OUT_NS, &raw) catch unreachable;
 }
 
-/// The prefix of every per-namespace outbox record to `to`; the namespace
-/// id is the key's last four bytes.
-pub fn outNsPrefix(buf: *[1 + OUT_NS.len + PEER_LEN]u8, to: u16) []const u8 {
-    const b = peerBytes(to);
+/// The prefix of every per-namespace outbox record to `to` on `lane`; the
+/// namespace id is the key's last four bytes.
+pub fn outNsPrefix(buf: *[1 + OUT_NS.len + CHAN_LEN]u8, to: u16, lane: Lane) []const u8 {
+    const b = chanBytes(to, lane);
     return view_mod.key(buf, OUT_NS, &b) catch unreachable;
 }
 
-/// The payload bytes namespace `ns`'s messages to `to` hold of its outbox.
-pub fn nsBytesOf(read: ReadView, to: u16, ns: ns_table.Id) u64 {
+/// The payload bytes namespace `ns`'s messages to `to` on `lane` hold of
+/// its outbox.
+pub fn nsBytesOf(read: ReadView, to: u16, lane: Lane, ns: ns_table.Id) u64 {
     var kb: [OUT_NS_KEY]u8 = undefined;
-    const v = read.get(OutNsFam, outNsKey(&kb, to, ns)) catch null;
+    const v = read.get(OutNsFam, outNsKey(&kb, to, lane, ns)) catch null;
     return if (v) |x| x.v.bytes else 0;
 }
 
@@ -270,8 +276,31 @@ fn addParked(view: *View, target: Target, n: i64, bytes: i64, stamp: u64) ApplyE
 /// A peer group as a key names it: the group, then its incarnation, which
 /// is 0 until a split gives a group a new one.
 pub const PEER_LEN = 4;
-pub const GROUP_KEY = 1 + PEER_LEN;
-pub const OUT_KEY = 1 + PEER_LEN + 8;
+/// A channel: its peer group, then its lane.
+pub const CHAN_LEN = PEER_LEN + 1;
+pub const CHAN_KEY = 1 + CHAN_LEN;
+pub const OUT_KEY = 1 + CHAN_LEN + 8;
+
+/// A channel's lane. Each has its own seqs, outbox and marks, so the two
+/// never wait on each other.
+pub const Lane = enum(u8) {
+    main = 0,
+    /// A run's history, and nothing else: only `Flags.HISTORY` messages,
+    /// only to the sender's own group, and none parks.
+    history = 1,
+
+    pub const all = [_]Lane{ .main, .history };
+
+    /// The lane a message with `flags` rides.
+    pub fn of(flags: u16) Lane {
+        return if (flags & entry_mod.Flags.HISTORY != 0) .history else .main;
+    }
+
+    pub fn from(byte: u8) ?Lane {
+        return std.enums.fromInt(Lane, byte);
+    }
+};
+pub const LANES = Lane.all.len;
 
 pub fn peerBytes(peer: u16) [PEER_LEN]u8 {
     var b: [PEER_LEN]u8 = undefined;
@@ -280,29 +309,36 @@ pub fn peerBytes(peer: u16) [PEER_LEN]u8 {
     return b;
 }
 
-/// An outbox record's key after its namespace: the receiver, then the seq,
-/// big-endian so a range is in seq order.
-pub fn outBytes(to: u16, seq: u64) [PEER_LEN + 8]u8 {
-    var b: [PEER_LEN + 8]u8 = undefined;
-    b[0..PEER_LEN].* = peerBytes(to);
-    std.mem.writeInt(u64, b[PEER_LEN..][0..8], seq, .big);
+pub fn chanBytes(peer: u16, lane: Lane) [CHAN_LEN]u8 {
+    var b: [CHAN_LEN]u8 = undefined;
+    b[0..PEER_LEN].* = peerBytes(peer);
+    b[PEER_LEN] = @backingInt(lane);
     return b;
 }
 
-/// A channel's peer group, under no namespace.
-pub fn groupKey(buf: *[GROUP_KEY]u8, peer: u16) []const u8 {
-    const b = peerBytes(peer);
+/// An outbox record's key after its namespace: the receiver and lane,
+/// then the seq, big-endian so a range is in seq order.
+pub fn outBytes(to: u16, lane: Lane, seq: u64) [CHAN_LEN + 8]u8 {
+    var b: [CHAN_LEN + 8]u8 = undefined;
+    b[0..CHAN_LEN].* = chanBytes(to, lane);
+    std.mem.writeInt(u64, b[CHAN_LEN..][0..8], seq, .big);
+    return b;
+}
+
+/// A channel's peer group and lane, under no namespace.
+pub fn chanKey(buf: *[CHAN_KEY]u8, peer: u16, lane: Lane) []const u8 {
+    const b = chanBytes(peer, lane);
     return view_mod.key(buf, "", &b) catch unreachable;
 }
 
-pub fn outKey(buf: *[OUT_KEY]u8, to: u16, seq: u64) []const u8 {
-    const b = outBytes(to, seq);
+pub fn outKey(buf: *[OUT_KEY]u8, to: u16, lane: Lane, seq: u64) []const u8 {
+    const b = outBytes(to, lane, seq);
     return view_mod.key(buf, "", &b) catch unreachable;
 }
 
-/// The prefix of every outbox record to `to`.
-pub fn outPrefix(buf: *[GROUP_KEY]u8, to: u16) []const u8 {
-    return groupKey(buf, to);
+/// The prefix of every outbox record to `to` on `lane`.
+pub fn outPrefix(buf: *[CHAN_KEY]u8, to: u16, lane: Lane) []const u8 {
+    return chanKey(buf, to, lane);
 }
 
 // ─── Sending ───────────────────────────────────────────────────────────────
@@ -332,11 +368,15 @@ pub fn writeSends(view: *View, index: u64) ApplyError!void {
         // A slot past the table is a Flo bug in the sender.
         if (s.slot >= node_router.SLOTS) return error.Halt;
         const to = ownerOf(place, s.slot);
-        var mk: [GROUP_KEY]u8 = undefined;
-        const meta_key = groupKey(&mk, to);
+        const lane = Lane.of(s.flags);
+        // History stays on its own group, and never parks: a history
+        // message to another, or one that is also a sink's, is a Flo bug.
+        if (lane == .history and (to != place.group or s.flags & entry_mod.Flags.SINK != 0)) return error.Halt;
+        var mk: [CHAN_KEY]u8 = undefined;
+        const meta_key = chanKey(&mk, to, lane);
         var meta: Meta.Value = if (try view.getOwn(MetaFam, meta_key)) |m| m.v else .{ .next_seq = 1, .acked = 0, .bytes = 0 };
         var ok: [OUT_KEY]u8 = undefined;
-        try view.putOwn(OutFam, outKey(&ok, to, meta.next_seq), .{ .v = .{
+        try view.putOwn(OutFam, outKey(&ok, to, lane, meta.next_seq), .{ .v = .{
             .slot = s.slot,
             .entry_type = s.entry_type,
             .layout_epoch = 0,
@@ -350,7 +390,7 @@ pub fn writeSends(view: *View, index: u64) ApplyError!void {
         meta.bytes += s.payload.len;
         try view.putOwn(MetaFam, meta_key, .{ .v = meta });
         var nk: [OUT_NS_KEY]u8 = undefined;
-        const ns_key = outNsKey(&nk, to, s.origin.ns);
+        const ns_key = outNsKey(&nk, to, lane, s.origin.ns);
         const held: u64 = if (try view.getOwn(OutNsFam, ns_key)) |v| v.v.bytes else 0;
         try view.putOwn(OutNsFam, ns_key, .{ .v = .{ .bytes = held + s.payload.len } });
     }
@@ -359,15 +399,31 @@ pub fn writeSends(view: *View, index: u64) ApplyError!void {
 
 // ─── Reading, for the driver ───────────────────────────────────────────────
 
-pub fn metaOf(read: ReadView, to: u16) Meta.Value {
-    var mk: [GROUP_KEY]u8 = undefined;
-    const m = read.get(MetaFam, groupKey(&mk, to)) catch null;
+pub fn metaOf(read: ReadView, to: u16, lane: Lane) Meta.Value {
+    var mk: [CHAN_KEY]u8 = undefined;
+    const m = read.get(MetaFam, chanKey(&mk, to, lane)) catch null;
     return if (m) |v| v.v else .{ .next_seq = 1, .acked = 0, .bytes = 0 };
 }
 
-pub fn inOf(read: ReadView, from: u16) ?In.Value {
-    var ik: [GROUP_KEY]u8 = undefined;
-    const v = read.get(InFam, groupKey(&ik, from)) catch null;
+/// The payload bytes the outbox to `to` holds, over both lanes: what its
+/// caps are held to.
+pub fn bytesTo(read: ReadView, to: u16) u64 {
+    var n: u64 = 0;
+    for (Lane.all) |lane| n += metaOf(read, to, lane).bytes;
+    return n;
+}
+
+/// What namespace `ns`'s messages to `to` hold of its outbox, over both
+/// lanes.
+pub fn nsBytesTo(read: ReadView, to: u16, ns: ns_table.Id) u64 {
+    var n: u64 = 0;
+    for (Lane.all) |lane| n += nsBytesOf(read, to, lane, ns);
+    return n;
+}
+
+pub fn inOf(read: ReadView, from: u16, lane: Lane) ?In.Value {
+    var ik: [CHAN_KEY]u8 = undefined;
+    const v = read.get(InFam, chanKey(&ik, from, lane)) catch null;
     return if (v) |x| x.v else null;
 }
 
@@ -488,7 +544,7 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
             switch (typeOf(e) orelse return) {
                 .channel_inbound => {
                     const p = ce.Inbound.decodeAll(e.payload, &diag) catch return;
-                    const b = peerBytes(p.from);
+                    const b = chanBytes(p.from, Lane.from(p.lane) orelse return);
                     try out.add(InFam.ID, "", &b);
                     var it = p.messages.iterator();
                     var seq = p.first_seq;
@@ -525,7 +581,8 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 },
                 .channel_trim => {
                     const p = ce.Trim.decodeAll(e.payload, &diag) catch return;
-                    const b = peerBytes(p.to);
+                    const lane = Lane.from(p.lane) orelse return;
+                    const b = chanBytes(p.to, lane);
                     try out.add(MetaFam.ID, "", &b);
                     // Each namespace's share of what it deletes.
                     out.addRange(OutNsFam.ID, OUT_NS, &b) catch |err| switch (err) {
@@ -535,7 +592,7 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                     if (p.through < p.first or p.through - p.first >= ce.MAX_TRIM_SPAN) return;
                     var seq = p.first;
                     while (seq <= p.through) : (seq += 1) {
-                        const k = outBytes(p.to, seq);
+                        const k = outBytes(p.to, lane, seq);
                         try out.add(OutFam.ID, "", &k);
                     }
                 },
@@ -563,8 +620,11 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
             // Only a leader makes these, from its own outbox's frames: one that
             // doesn't decode is a Flo bug.
             const p = ce.Inbound.decodeAll(e.payload, &diag) catch return error.Halt;
-            var ik: [GROUP_KEY]u8 = undefined;
-            const in_key = groupKey(&ik, p.from);
+            const lane = Lane.from(p.lane) orelse return error.Halt;
+            // History only ever comes from this group itself (`writeSends`).
+            if (lane == .history and p.from != place.group) return error.Halt;
+            var ik: [CHAN_KEY]u8 = undefined;
+            const in_key = chanKey(&ik, p.from, lane);
             const before: ?In.Value = if (try view.get(InFam, in_key)) |v| v.v else null;
             var applied = if (before) |b| b.applied else 0;
             var seq = p.first_seq;
@@ -579,14 +639,18 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 // A repair skipped it: answered, never applied, and its seq
                 // is taken, so a resend is a duplicate.
                 if (skip) |*sk| if (sk.skips(seq)) {
-                    try skipMessage(view, e, m, p.from, seq, ordinal, sk);
+                    try skipMessage(view, e, m, p.from, lane, seq, ordinal, sk);
                     applied = seq;
                     continue;
                 };
-                store.applying = .{ .from = p.from, .seq = seq };
+                store.applying = .{ .from = p.from, .seq = seq, .lane = lane };
                 // Only a leader's own frames make these: a flag no message
-                // may carry is a Flo bug in the sender.
+                // may carry, one on the other lane's, or a sink's on the
+                // history lane (where nothing parks: parked keys carry no
+                // lane) is a Flo bug in the sender.
                 if (m.flags & ~view_mod.MESSAGE_FLAGS != 0) return error.Halt;
+                if (Lane.of(m.flags) != lane) return error.Halt;
+                if (lane == .history and m.flags & entry_mod.Flags.SINK != 0) return error.Halt;
                 const t = std.enums.fromInt(EntryType, m.entry_type) orelse return error.Halt;
                 const owner = machine_mod.ownerOf(targets, t);
                 if (owner == null) return error.Halt;
@@ -649,17 +713,19 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
         /// (`Machine.skipped`): a request's sender is told, an answer to this
         /// shard's own call settles it. Its sends leave under the inbound's
         /// index, as an applied message's do.
-        fn skipMessage(view: *View, e: *const Entry, m: ce.Message.Value, from: u16, seq: u64, ordinal: u8, sk: *const store_mod.InboundSkip) ApplyError!void {
+        fn skipMessage(view: *View, e: *const Entry, m: ce.Message.Value, from: u16, lane: Lane, seq: u64, ordinal: u8, sk: *const store_mod.InboundSkip) ApplyError!void {
             const store = view.store;
             const as = asEntry(e, m);
             var r = Result.start(&as);
             var buf: [@import("../protocol/action_entries.zig").MAX_SKIP_WHY]u8 = undefined;
             // A message skipped with the rest of its inbound says which one
             // halted the group, so its caller can tell it wasn't the cause.
+            // A history message's seq is its lane's, so the lane is named.
+            const on: []const u8 = if (lane == .history) ", history lane" else "";
             const why = (if (sk.whole and sk.halt_seq != 0 and sk.halt_seq != seq)
-                std.fmt.bufPrint(&buf, "skipped by repair (entry {d}, halted at message {d}; message {d} from shard {d})", .{ sk.index, sk.halt_seq, seq, from })
+                std.fmt.bufPrint(&buf, "skipped by repair (entry {d}, halted at message {d}; message {d} from shard {d}{s})", .{ sk.index, sk.halt_seq, seq, from, on })
             else
-                std.fmt.bufPrint(&buf, "skipped by repair (entry {d}, message {d} from shard {d})", .{ sk.index, seq, from })) catch "skipped by repair";
+                std.fmt.bufPrint(&buf, "skipped by repair (entry {d}, message {d} from shard {d}{s})", .{ sk.index, seq, from, on })) catch "skipped by repair";
             r.refuse(.conflict, .skipped_by_repair, why);
             const t = std.enums.fromInt(EntryType, m.entry_type);
             const owner = if (t) |x| machine_mod.ownerOf(targets, x) else null;
@@ -879,8 +945,9 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
         fn applyTrim(view: *View, e: *const Entry) ApplyError!void {
             var diag: schema.Diagnostic = .{};
             const p = ce.Trim.decodeAll(e.payload, &diag) catch return error.Halt;
-            var mk: [GROUP_KEY]u8 = undefined;
-            const meta_key = groupKey(&mk, p.to);
+            const lane = Lane.from(p.lane) orelse return error.Halt;
+            var mk: [CHAN_KEY]u8 = undefined;
+            const meta_key = chanKey(&mk, p.to, lane);
             var meta: Meta.Value = if (try view.get(MetaFam, meta_key)) |m| m.v else .{ .next_seq = 1, .acked = 0, .bytes = 0 };
             // A trim an earlier leader proposed may be stale: a no-op.
             if (p.through <= meta.acked) return;
@@ -890,11 +957,11 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
             var seq = meta.acked + 1;
             while (seq <= p.through) : (seq += 1) {
                 var ok: [OUT_KEY]u8 = undefined;
-                const key = outKey(&ok, p.to, seq);
+                const key = outKey(&ok, p.to, lane, seq);
                 const out = (try view.get(OutFam, key)) orelse return error.Halt;
                 meta.bytes -= out.v.payload.len;
                 var nk: [OUT_NS_KEY]u8 = undefined;
-                const ns_key = outNsKey(&nk, p.to, .of(out.v.origin_ns));
+                const ns_key = outNsKey(&nk, p.to, lane, .of(out.v.origin_ns));
                 const held = (try view.get(OutNsFam, ns_key)) orelse return error.Halt;
                 if (held.v.bytes < out.v.payload.len) return error.Halt;
                 if (held.v.bytes == out.v.payload.len) try view.delete(OutNsFam, ns_key) else try view.put(OutNsFam, ns_key, .{ .v = .{ .bytes = held.v.bytes - out.v.payload.len } });
@@ -997,8 +1064,12 @@ const Group = struct {
     }
 
     fn outRecord(g: *Group, to: u16, seq: u64) ?Out.Value {
+        return g.outOn(to, .main, seq);
+    }
+
+    fn outOn(g: *Group, to: u16, lane: Lane, seq: u64) ?Out.Value {
         var k: [OUT_KEY]u8 = undefined;
-        const v = g.read().get(OutFam, outKey(&k, to, seq)) catch return null;
+        const v = g.read().get(OutFam, outKey(&k, to, lane, seq)) catch return null;
         return if (v) |x| x.v else null;
     }
 
@@ -1013,16 +1084,134 @@ const Got = struct { from: u16, seq: u64 };
 
 /// An inbound entry from `from`'s outbox to `to`, seqs `first..first+n-1`.
 fn inboundFrom(sender: *Group, from: u16, to: u16, first: u64, n: u64, buf: []u8) ![]const u8 {
+    return inboundOn(sender, from, to, .main, first, n, buf);
+}
+
+/// `inboundFrom`, from `lane`'s outbox, on that lane.
+fn inboundOn(sender: *Group, from: u16, to: u16, lane: Lane, first: u64, n: u64, buf: []u8) ![]const u8 {
     const S = struct {
         var messages: [8192]u8 = undefined;
     };
     var mw: schema.Writer = .{ .buf = &S.messages };
     var seq = first;
     while (seq < first + n) : (seq += 1) {
-        const o = sender.outRecord(to, seq).?;
+        const o = sender.outOn(to, lane, seq).?;
         try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = o.layout_epoch, .flags = o.flags, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload });
     }
-    return ce.Inbound.encodeInto(buf, .{ .from = from, .first_seq = first, .messages = .{ .bytes = mw.written(), .count = @intCast(n) } }) catch unreachable;
+    return ce.Inbound.encodeInto(buf, .{ .from = from, .lane = @backingInt(lane), .first_seq = first, .messages = .{ .bytes = mw.written(), .count = @intCast(n) } }) catch unreachable;
+}
+
+test "channels: a history message rides its own lane, with its own seqs, outbox, mark and trims; the main lane's go on beside it" {
+    // Group 0 of 2 owns the even slots: these go to itself.
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    try a.probeTo(2, "message-one-0001");
+    try a.probeTo(2, "hist-one-000000H");
+    try a.probeTo(2, "message-two-0002");
+    try a.probeTo(2, "hist-two-000000H");
+    try testing.expectEqual(@as(u64, 3), metaOf(a.read(), 0, .main).next_seq);
+    try testing.expectEqual(@as(u64, 3), metaOf(a.read(), 0, .history).next_seq);
+    try testing.expectEqual(entry_mod.Flags.HISTORY, a.outOn(0, .history, 1).?.flags);
+    try testing.expectEqual(entry_mod.Flags.SINK, a.outOn(0, .main, 1).?.flags);
+    // Their namespace's bytes are counted per lane.
+    const one = a.outOn(0, .history, 1).?.payload.len;
+    try testing.expectEqual(2 * one, nsBytesOf(a.read(), 0, .history, probe.PROBE_ORIGIN.ns));
+    try testing.expectEqual(2 * one, metaOf(a.read(), 0, .history).bytes);
+    // The history lane's second message applies with nothing from the main
+    // lane applied: each lane keeps its own mark.
+    var buf: [8192]u8 = undefined;
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .history, 1, 2, &buf));
+    try testing.expectEqual(@as(u64, 2), inOf(a.read(), 0, .history).?.applied);
+    try testing.expect(inOf(a.read(), 0, .main) == null);
+    try testing.expectEqual(@as(u64, 2), a.got("hist-two-000000H").?.seq);
+    try testing.expect(a.got("message-one-0001") == null);
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .main, 1, 1, &buf));
+    try testing.expectEqual(@as(u64, 1), inOf(a.read(), 0, .main).?.applied);
+    // A trim of one lane leaves the other's outbox as it was.
+    var tb: [64]u8 = undefined;
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&tb, .{ .to = 0, .lane = @backingInt(Lane.history), .first = 1, .through = 2 }));
+    try testing.expectEqual(@as(u64, 2), metaOf(a.read(), 0, .history).acked);
+    try testing.expectEqual(@as(u64, 0), metaOf(a.read(), 0, .history).bytes);
+    try testing.expectEqual(@as(u64, 0), nsBytesOf(a.read(), 0, .history, probe.PROBE_ORIGIN.ns));
+    try testing.expectEqual(@as(u64, 0), metaOf(a.read(), 0, .main).acked);
+    try testing.expect(a.outOn(0, .main, 1) != null and a.outOn(0, .main, 2) != null);
+}
+
+test "channels: a history message to another group, or a history message that is also a sink's, halts its sender's apply" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    // Slot 1 is group 1's.
+    try testing.expectError(error.Halt, a.run(&probe.machine, .channel_probe, try ce.Probe.encodeInto(&a.buf, .{ .slot = 1, .body = "hist-other-0000H" })));
+    try testing.expectEqual(@as(u64, 0), a.store.family(OutFam.ID).count);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var keys = KeySet.init(arena.allocator());
+    var view = View.init(&a.store, arena.allocator(), &keys);
+    try view.sendFlagged(probe.PROBE_ORIGIN, 2, @backingInt(EntryType.channel_probe), entry_mod.Flags.HISTORY | entry_mod.Flags.SINK, "x");
+    try testing.expectError(error.Halt, writeSends(&view, 1));
+}
+
+test "channels: a history inbound from another group, or carrying a sink's message, halts and commits nothing" {
+    var b = Group.init(1, 2);
+    defer b.deinit();
+    const before = replicaState(&b);
+    var mb: [256]u8 = undefined;
+    var buf: [512]u8 = undefined;
+    var pb: [64]u8 = undefined;
+    const probe_payload = try ce.Probe.encodeInto(&pb, .{ .slot = 1, .body = "hist-other-0000H" });
+    for ([_]struct { from: u16, flags: u16 }{
+        // From group 0, on group 1's history lane: history is a group's own.
+        .{ .from = 0, .flags = entry_mod.Flags.HISTORY },
+        // Its own, but a sink's too: nothing parks on the history lane.
+        .{ .from = 1, .flags = entry_mod.Flags.HISTORY | entry_mod.Flags.SINK },
+    }) |c| {
+        var w: schema.Writer = .{ .buf = &mb };
+        try ce.Message.encode(&w, .{ .slot = 1, .entry_type = @backingInt(EntryType.channel_probe), .layout_epoch = 0, .flags = c.flags, .origin_kind = @backingInt(probe.PROBE_ORIGIN.kind), .origin_ns = probe.PROBE_ORIGIN.ns.int(), .payload = probe_payload });
+        const inbound = try ce.Inbound.encodeInto(&buf, .{ .from = c.from, .lane = @backingInt(Lane.history), .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } });
+        try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, inbound));
+    }
+    try testing.expectEqual(before, replicaState(&b));
+}
+
+test "channels: a repair's skip of a history inbound names its lane, and takes only that lane's seq" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    try a.probeTo(2, "hist-one-000000H");
+    try a.probeTo(2, "message-one-0001");
+    var buf: [8192]u8 = undefined;
+    a.store.inbound_skip = .all(a.index + 1);
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .history, 1, 1, &buf));
+    a.store.inbound_skip = null;
+    try testing.expectEqual(@as(u64, 1), inOf(a.read(), 0, .history).?.applied);
+    try testing.expect(inOf(a.read(), 0, .main) == null);
+    try testing.expect(a.got("hist-one-000000H") == null);
+    const skipped = a.store.messages.items[0];
+    try testing.expect(skipped.skipped);
+    try testing.expect(std.mem.endsWith(u8, skipped.result.refused().?.refusal.message, "from shard 0, history lane)"));
+    // The main lane's seq 1 is untouched by it.
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .main, 1, 1, &buf));
+    try testing.expectEqual(@as(u64, 1), a.got("message-one-0001").?.seq);
+}
+
+test "channels: an inbound whose message's flags are the other lane's, or naming a lane there isn't, halts and commits nothing" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    try a.probeTo(2, "message-one-0001");
+    try a.probeTo(2, "hist-one-000000H");
+    var buf: [8192]u8 = undefined;
+    const before = replicaState(&a);
+    // The main lane's message, said to be on the history lane.
+    const main_on_history = @constCast(try inboundOn(&a, 0, 0, .main, 1, 1, &buf));
+    main_on_history[2] = @backingInt(Lane.history);
+    try testing.expectError(error.Halt, a.run(&Probed.machine, .channel_inbound, main_on_history));
+    // And the other way.
+    const history_on_main = @constCast(try inboundOn(&a, 0, 0, .history, 1, 1, &buf));
+    history_on_main[2] = @backingInt(Lane.main);
+    try testing.expectError(error.Halt, a.run(&Probed.machine, .channel_inbound, history_on_main));
+    const no_lane = @constCast(try inboundOn(&a, 0, 0, .main, 1, 1, &buf));
+    no_lane[2] = 7;
+    try testing.expectError(error.Halt, a.run(&Probed.machine, .channel_inbound, no_lane));
+    try testing.expectEqual(before, replicaState(&a));
 }
 
 test "channels: a send is written to the outbox with its entry, in seq order per receiver" {
@@ -1032,8 +1221,8 @@ test "channels: a send is written to the outbox with its entry, in seq order per
     try a.probeTo(1, "message-one-0001");
     try a.probeTo(3, "message-two-0002");
     try a.probeTo(2, "message-own-0003");
-    try testing.expectEqual(@as(u64, 3), metaOf(a.read(), 1).next_seq);
-    try testing.expectEqual(@as(u64, 2), metaOf(a.read(), 0).next_seq);
+    try testing.expectEqual(@as(u64, 3), metaOf(a.read(), 1, .main).next_seq);
+    try testing.expectEqual(@as(u64, 2), metaOf(a.read(), 0, .main).next_seq);
     const first = a.outRecord(1, 1).?;
     try testing.expectEqual(@as(u64, 1), first.sent_at);
     try testing.expectEqual(@as(u16, 1), first.slot);
@@ -1053,20 +1242,20 @@ test "channels: a receiver applies each message once and in order, and halts on 
     var buf: [8192]u8 = undefined;
     // 1..2, then 1..3 again (a resend): 3 is new, 1 and 2 are skipped.
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 2, &buf));
-    try testing.expectEqual(@as(u64, 2), inOf(b.read(), 0).?.applied);
+    try testing.expectEqual(@as(u64, 2), inOf(b.read(), 0, .main).?.applied);
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .main).?.applied);
     try testing.expectEqual(Got{ .from = 0, .seq = 1 }, b.got("message-one-0001").?);
     try testing.expectEqual(Got{ .from = 0, .seq = 3 }, b.got("message-thr-0003").?);
     // An all-duplicate batch changes nothing.
-    const index_before = inOf(b.read(), 0).?;
+    const index_before = inOf(b.read(), 0, .main).?;
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 2, 2, &buf));
-    try testing.expectEqual(index_before.applied, inOf(b.read(), 0).?.applied);
+    try testing.expectEqual(index_before.applied, inOf(b.read(), 0, .main).?.applied);
     // A batch past a gap halts, and changes nothing.
     try a.probeTo(1, "message-fou-0004");
     try a.probeTo(1, "message-fiv-0005");
     try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 5, 1, &buf)));
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .main).?.applied);
     try testing.expect(b.got("message-fiv-0005") == null);
 }
 
@@ -1080,7 +1269,7 @@ test "channels: a refused message undoes only its own writes, and still takes it
     try a.probeTo(1, "message-thr-0003");
     var buf: [8192]u8 = undefined;
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .main).?.applied);
     try testing.expect(b.got("message-one-0001") != null);
     try testing.expect(b.got("refuse-this-0002") == null);
     // The target's own refusal: not the sender's bug.
@@ -1100,12 +1289,12 @@ test "channels: a repair's skip of an inbound takes every seq it holds, answers 
     // Unrepaired, the inbound halts at its second message, naming it.
     try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf)));
     try testing.expectEqual(store_mod.Applying{ .from = 0, .seq = 2 }, b.store.applying.?);
-    try testing.expect(inOf(b.read(), 0) == null);
+    try testing.expect(inOf(b.read(), 0, .main) == null);
     // Skipped whole: no message applies, every seq is taken and answered.
     b.store.inbound_skip = .all(77);
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
     b.store.inbound_skip = null;
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .main).?.applied);
     try testing.expect(b.got("message-one-0001") == null and b.got("message-thr-0003") == null);
     try testing.expectEqual(@as(usize, 3), b.store.messages.items.len);
     for (b.store.messages.items) |*m| {
@@ -1116,7 +1305,7 @@ test "channels: a repair's skip of an inbound takes every seq it holds, answers 
     }
     // Sent again, they are duplicates: nothing more applies.
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .main).?.applied);
     try testing.expect(b.got("message-one-0001") == null);
 }
 
@@ -1158,7 +1347,7 @@ test "channels: a skipped inbound leaves every replica the same, whether it halt
     try testing.expectEqual(want, replicaState(&halted_first));
     try testing.expectEqual(want, replicaState(&booted));
     for ([_]*Group{ &halted_first, &booted }) |g| {
-        try testing.expectEqual(inOf(live.read(), 0).?.applied, inOf(g.read(), 0).?.applied);
+        try testing.expectEqual(inOf(live.read(), 0, .main).?.applied, inOf(g.read(), 0, .main).?.applied);
         try testing.expectEqual(live.store.messages.items.len, g.store.messages.items.len);
         for (live.store.messages.items, g.store.messages.items) |*x, *y| {
             try testing.expectEqual(x.skipped, y.skipped);
@@ -1179,7 +1368,7 @@ test "channels: a repair's skip of one message of an inbound applies the others"
     b.store.inbound_skip = .one(77, 2);
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
     b.store.inbound_skip = null;
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .main).?.applied);
     try testing.expect(b.got("message-one-0001") != null);
     try testing.expect(b.got("message-thr-0003") != null);
     try testing.expect(!b.store.messages.items[0].skipped);
@@ -1205,7 +1394,7 @@ test "channels: an inbound whose messages halt it in turn is skipped a message a
     b.store.inbound_skip = skip;
     try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, inbound));
     try testing.expectEqual(store_mod.Applying{ .from = 0, .seq = 3 }, b.store.applying.?);
-    try testing.expect(inOf(b.read(), 0) == null);
+    try testing.expect(inOf(b.read(), 0, .main) == null);
     // 2 and 3 skipped: it halts at 4.
     b.index -= 1;
     skip.seqs[1] = 3;
@@ -1221,7 +1410,7 @@ test "channels: an inbound whose messages halt it in turn is skipped a message a
     b.store.inbound_skip = skip;
     _ = try b.run(&Probed.machine, .channel_inbound, inbound);
     b.store.inbound_skip = null;
-    try testing.expectEqual(@as(u64, 5), inOf(b.read(), 0).?.applied);
+    try testing.expectEqual(@as(u64, 5), inOf(b.read(), 0, .main).?.applied);
     try testing.expect(b.got("message-one-0001") == null and b.got("message-fiv-0005") == null);
     try testing.expectEqual(@as(usize, 5), b.store.messages.items.len);
     try testing.expectEqualStrings("skipped by repair (entry 77, halted at message 4; message 1 from shard 0)", b.store.messages.items[0].result.refused().?.refusal.message);
@@ -1238,13 +1427,13 @@ test "channels: a message's sends are held to an apply's limits on their own: pa
     try a.probeTo(1, "message-thr-0003");
     var buf: [8192]u8 = undefined;
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 3, &buf));
-    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0).?.applied);
+    try testing.expectEqual(@as(u64, 3), inOf(b.read(), 0, .main).?.applied);
     try testing.expect(b.got("relay-this-00001") != null);
     try testing.expect(b.got("flood-this-00002") == null);
     try testing.expect(b.got("message-thr-0003") != null);
     // The relay's one send is in b's outbox, under the inbound's index;
     // the flood sent nothing.
-    try testing.expectEqual(@as(u64, 2), metaOf(b.read(), 1).next_seq);
+    try testing.expectEqual(@as(u64, 2), metaOf(b.read(), 1, .main).next_seq);
     try testing.expectEqual(b.index, b.outRecord(1, 1).?.sent_at);
     // Each message was reported with its result, the flood's refused.
     const reported = b.store.messages.items;
@@ -1255,7 +1444,7 @@ test "channels: a message's sends are held to an apply's limits on their own: pa
     // The next inbound follows on, with no halt.
     try a.probeTo(1, "message-fou-0004");
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 4, 1, &buf));
-    try testing.expectEqual(@as(u64, 4), inOf(b.read(), 0).?.applied);
+    try testing.expectEqual(@as(u64, 4), inOf(b.read(), 0, .main).?.applied);
 }
 
 test "channels: a message for a slot its receiver doesn't own is refused, and takes its seq" {
@@ -1268,7 +1457,7 @@ test "channels: a message for a slot its receiver doesn't own is refused, and ta
     try a.probeTo(3, "message-two-0002");
     var buf: [8192]u8 = undefined;
     _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, 1, 2, &buf));
-    try testing.expectEqual(@as(u64, 2), inOf(b.read(), 0).?.applied);
+    try testing.expectEqual(@as(u64, 2), inOf(b.read(), 0, .main).?.applied);
     try testing.expect(b.got("message-one-0001") != null);
     try testing.expect(b.got("message-two-0002") == null);
     try testing.expect(b.store.messages.items[1].result.refused() != null);
@@ -1310,10 +1499,10 @@ test "channels: a message carrying a flag no message may carry halts its inbound
     try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload });
     try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = 0, .flags = entry_mod.Flags.FORCE, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload });
     var buf: [2048]u8 = undefined;
-    const inbound = try ce.Inbound.encodeInto(&buf, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 2 } });
+    const inbound = try ce.Inbound.encodeInto(&buf, .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 2 } });
     try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, inbound));
     try testing.expect(b.got("message-one-0001") == null);
-    try testing.expect(inOf(b.read(), 0) == null);
+    try testing.expect(inOf(b.read(), 0, .main) == null);
 }
 
 /// The inbound of `a`'s outbox to `b` from `first` through `last`, applied
@@ -1351,7 +1540,7 @@ test "channels: a sink's message to a full target parks, later ones for it park 
     try a.probeTo(1, "message-fou-0004");
     try deliver(&a, &b, 1, 4);
     // Every message took its seq: the channel goes on.
-    try testing.expectEqual(@as(u64, 4), inOf(b.read(), 0).?.applied);
+    try testing.expectEqual(@as(u64, 4), inOf(b.read(), 0, .main).?.applied);
     try testing.expect(b.got("message-two-0002") == null);
     try testing.expect(b.got("message-fou-0004") == null);
     // Slot 3 is another target: applied at once.
@@ -1486,7 +1675,7 @@ test "channels: only a sink's message parks behind; another for the same target 
         try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = o.layout_epoch, .flags = if (seq == 4) 0 else o.flags, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload });
     }
     var buf: [4096]u8 = undefined;
-    _ = try b.run(&Probed.machine, .channel_inbound, try ce.Inbound.encodeInto(&buf, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 4 } }));
+    _ = try b.run(&Probed.machine, .channel_inbound, try ce.Inbound.encodeInto(&buf, .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = mw.written(), .count = 4 } }));
     try testing.expectEqual(@as(u64, 1), targetParked(b.read(), probeTarget(1)).count);
     try testing.expectEqual(Got{ .from = 0, .seq = 4 }, b.got("message-fou-0004").?);
     try testing.expect(b.got("message-two-0002") == null);
@@ -1538,7 +1727,7 @@ test "channels: a durable ack names what was applied as of a durable index" {
         try a.probeTo(1, &name);
         _ = try b.run(&Probed.machine, .channel_inbound, try inboundFrom(&a, 0, 1, seq, 1, &buf));
     }
-    const in = inOf(b.read(), 0).?;
+    const in = inOf(b.read(), 0, .main).?;
     try testing.expectEqual(@as(u64, RING + 6), in.applied);
     // b's index n applied seq n.
     try testing.expectEqual(@as(u64, RING + 6), appliedAsOf(in, RING + 6));
@@ -1555,13 +1744,13 @@ test "channels: a trim drops what was acked; a stale one is a no-op, and one pas
     try a.probeTo(1, "message-two-0002");
     try a.probeTo(1, "message-thr-0003");
     var buf: [64]u8 = undefined;
-    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 1, .through = 2 }));
-    try testing.expectEqual(@as(u64, 2), metaOf(a.read(), 1).acked);
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 0, .first = 1, .through = 2 }));
+    try testing.expectEqual(@as(u64, 2), metaOf(a.read(), 1, .main).acked);
     try testing.expect(a.outRecord(1, 1) == null and a.outRecord(1, 2) == null);
     try testing.expect(a.outRecord(1, 3) != null);
-    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 1, .through = 1 }));
-    try testing.expectEqual(@as(u64, 2), metaOf(a.read(), 1).acked);
-    try testing.expectError(error.Halt, a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 3, .through = 4 })));
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 0, .first = 1, .through = 1 }));
+    try testing.expectEqual(@as(u64, 2), metaOf(a.read(), 1, .main).acked);
+    try testing.expectError(error.Halt, a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 0, .first = 3, .through = 4 })));
 }
 
 test "channels: an outbox counts the payload bytes it holds, from its sends to its trims" {
@@ -1571,15 +1760,15 @@ test "channels: an outbox counts the payload bytes it holds, from its sends to i
     const one = a.outRecord(1, 1).?.payload.len;
     try a.probeTo(1, "message-two-0002");
     try a.probeTo(1, "message-thr-0003");
-    try testing.expectEqual(3 * one, metaOf(a.read(), 1).bytes);
+    try testing.expectEqual(3 * one, metaOf(a.read(), 1, .main).bytes);
     // And its origin's namespace holds all of it.
-    try testing.expectEqual(3 * one, nsBytesOf(a.read(), 1, probe.PROBE_ORIGIN.ns));
+    try testing.expectEqual(3 * one, nsBytesOf(a.read(), 1, .main, probe.PROBE_ORIGIN.ns));
     var buf: [64]u8 = undefined;
-    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 1, .through = 2 }));
-    try testing.expectEqual(one, metaOf(a.read(), 1).bytes);
-    try testing.expectEqual(one, nsBytesOf(a.read(), 1, probe.PROBE_ORIGIN.ns));
-    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 3, .through = 3 }));
-    try testing.expectEqual(@as(u64, 0), metaOf(a.read(), 1).bytes);
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 0, .first = 1, .through = 2 }));
+    try testing.expectEqual(one, metaOf(a.read(), 1, .main).bytes);
+    try testing.expectEqual(one, nsBytesOf(a.read(), 1, .main, probe.PROBE_ORIGIN.ns));
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 0, .first = 3, .through = 3 }));
+    try testing.expectEqual(@as(u64, 0), metaOf(a.read(), 1, .main).bytes);
     // Emptied, its record goes.
     try testing.expectEqual(@as(usize, 0), a.store.family(OutNsFam.ID).count);
 }
@@ -1635,7 +1824,7 @@ test "channels: a message naming one namespace that reaches another's keys, or a
         try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(EntryType.kv_put), .layout_epoch = 0, .flags = 0, .origin_kind = @backingInt(view_mod.Origin.Kind.user), .origin_ns = p.origin.int(), .payload = put });
     }
     var ib: [8192]u8 = undefined;
-    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = puts.len } });
+    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = puts.len } });
     var h = std.mem.zeroes(entry_mod.Header);
     h.entry_type = @backingInt(EntryType.channel_inbound);
     h.index = 9;
@@ -1687,21 +1876,21 @@ test "channels: two namespaces' bytes in one outbox are counted apart, and each 
     try tenantSend(&a, seven, 1, "message-two-0002");
     try tenantSend(&a, eight, 1, "message-thr-0003");
     const one = a.outRecord(1, 1).?.payload.len;
-    try testing.expectEqual(3 * one, metaOf(a.read(), 1).bytes);
-    try testing.expectEqual(2 * one, nsBytesOf(a.read(), 1, seven));
-    try testing.expectEqual(one, nsBytesOf(a.read(), 1, eight));
+    try testing.expectEqual(3 * one, metaOf(a.read(), 1, .main).bytes);
+    try testing.expectEqual(2 * one, nsBytesOf(a.read(), 1, .main, seven));
+    try testing.expectEqual(one, nsBytesOf(a.read(), 1, .main, eight));
     var buf: [64]u8 = undefined;
     // Trimming one of each namespace's, then the rest of the first's.
-    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 1, .through = 1 }));
-    try testing.expectEqual(one, nsBytesOf(a.read(), 1, seven));
-    try testing.expectEqual(one, nsBytesOf(a.read(), 1, eight));
-    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 2, .through = 2 }));
-    try testing.expectEqual(@as(u64, 0), nsBytesOf(a.read(), 1, seven));
-    try testing.expectEqual(one, nsBytesOf(a.read(), 1, eight));
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 0, .first = 1, .through = 1 }));
+    try testing.expectEqual(one, nsBytesOf(a.read(), 1, .main, seven));
+    try testing.expectEqual(one, nsBytesOf(a.read(), 1, .main, eight));
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 0, .first = 2, .through = 2 }));
+    try testing.expectEqual(@as(u64, 0), nsBytesOf(a.read(), 1, .main, seven));
+    try testing.expectEqual(one, nsBytesOf(a.read(), 1, .main, eight));
     try testing.expectEqual(@as(usize, 1), a.store.family(OutNsFam.ID).count);
-    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .first = 3, .through = 3 }));
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&buf, .{ .to = 1, .lane = 0, .first = 3, .through = 3 }));
     try testing.expectEqual(@as(usize, 0), a.store.family(OutNsFam.ID).count);
-    try testing.expectEqual(@as(u64, 0), metaOf(a.read(), 1).bytes);
+    try testing.expectEqual(@as(u64, 0), metaOf(a.read(), 1, .main).bytes);
 }
 
 const TestMessage = struct { entry_type: EntryType, kind: view_mod.Origin.Kind, ns: ns_table.Id, payload: []const u8 };
@@ -1713,7 +1902,7 @@ fn deliverAll(m: *const machine_mod.Machine, st: *store_mod.Store, scratch: *std
     var w: schema.Writer = .{ .buf = &mb };
     for (msgs) |x| try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(x.entry_type), .layout_epoch = 0, .flags = 0, .origin_kind = @backingInt(x.kind), .origin_ns = x.ns.int(), .payload = x.payload });
     var ib: [16384]u8 = undefined;
-    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = @intCast(msgs.len) } });
+    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = @intCast(msgs.len) } });
     var h = std.mem.zeroes(entry_mod.Header);
     h.entry_type = @backingInt(EntryType.channel_inbound);
     h.index = 9;

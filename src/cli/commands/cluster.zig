@@ -400,7 +400,8 @@ fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
     ctx.print("halted there: node(s) {any}, of {d} voters\n", .{ would.halted, would.voters });
     const inbound = would.entry_type == @backingInt(EntryType.channel_inbound);
     if (inbound) {
-        ctx.print("a channel inbound from shard {d}, carrying messages {d}..{d}", .{ would.from, would.first_seq, would.last_seq });
+        const lane: []const u8 = if (@import("../../contract/channels.zig").Lane.from(would.lane)) |l| @tagName(l) else "unknown";
+        ctx.print("a channel inbound from shard {d} on its {s} lane, carrying messages {d}..{d}", .{ would.from, lane, would.first_seq, would.last_seq });
         if (would.halt_seq != 0) ctx.print("; halted at message {d}", .{would.halt_seq});
         ctx.print("\n", .{});
     }

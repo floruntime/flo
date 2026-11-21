@@ -1072,7 +1072,7 @@ fn inboundEntry(buf: []u8, index: u64, streams: []const []const u8) !Entry {
         try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.stream_append), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = cmd.payload });
     }
     try ce.Message.encode(&w, .{ .slot = 0, .entry_type = @backingInt(entry_mod.EntryType.kv_put), .layout_epoch = 0, .flags = 0, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = "not an append" });
-    const payload = try ce.Inbound.encodeInto(buf[512..], .{ .from = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = @intCast(streams.len + 1) } });
+    const payload = try ce.Inbound.encodeInto(buf[512..], .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = @intCast(streams.len + 1) } });
     var e = entry_mod.buildEntry(.channel_inbound, 0, 1, index, index * 1000, payload);
     e.header.crc32c = e.computeCrc();
     return e;

@@ -107,7 +107,7 @@ pub fn main() !void {
     // message is applied and trimmed.
     start = stdx.time.nanoTimestamp();
     var now: u64 = 1;
-    while (channels.metaOf(.{ .store = &a.store }, 1).acked < MESSAGES) : (now += 1) {
+    while (channels.metaOf(.{ .store = &a.store }, 1, .main).acked < MESSAGES) : (now += 1) {
         for (&groups) |*g| g.driver.tick(now, .{ .store = &g.store }, g.index, Io{ .net = &net, .me = g.id });
         while (net.frames.items.len > 0) {
             const f = net.frames.orderedRemove(0);

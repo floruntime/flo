@@ -166,7 +166,11 @@ pub const ChannelViolation = struct {
     to: GroupId,
     seq: u64,
     detail: []const u8,
+    lane: Lane = .main,
 };
+
+const Lane = channels_mod.Lane;
+const LANES = channels_mod.LANES;
 
 /// What crossed each channel, told by the machines: each send as its sender
 /// applies it, and each apply as its receiver applies it, both with the log
@@ -182,7 +186,8 @@ pub const ChannelViolation = struct {
 /// would have to allow it: such a group promises nothing across a crash.
 pub const ChannelOracle = struct {
     allocator: Allocator,
-    channels: [MAX_GROUPS][MAX_GROUPS]Channel = @splat(@splat(.{})),
+    /// Each lane of each channel is held to the rules on its own.
+    channels: [MAX_GROUPS][MAX_GROUPS][LANES]Channel = @splat(@splat(@splat(.{}))),
     violations: std.ArrayListUnmanaged(ChannelViolation) = .empty,
     applies: u64 = 0,
     /// Reports of what a group already reported, as its restart replays its
@@ -213,7 +218,7 @@ pub const ChannelOracle = struct {
     }
 
     pub fn deinit(self: *ChannelOracle) void {
-        for (&self.channels) |*row| for (row) |*c| {
+        for (&self.channels) |*row| for (row) |*lanes| for (lanes) |*c| {
             c.sent.deinit(self.allocator);
             c.applied.deinit(self.allocator);
             c.delivered.deinit(self.allocator);
@@ -222,30 +227,43 @@ pub const ChannelOracle = struct {
     }
 
     pub fn fail(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, detail: []const u8) void {
-        self.violations.append(self.allocator, .{ .from = from, .to = to, .seq = seq, .detail = detail }) catch @panic("oracle OOM");
+        self.failOn(from, to, .main, seq, detail);
+    }
+
+    pub fn failOn(self: *ChannelOracle, from: GroupId, to: GroupId, lane: Lane, seq: u64, detail: []const u8) void {
+        self.violations.append(self.allocator, .{ .from = from, .to = to, .seq = seq, .detail = detail, .lane = lane }) catch @panic("oracle OOM");
+    }
+
+    fn chan(self: *ChannelOracle, from: GroupId, to: GroupId, lane: Lane) *Channel {
+        return &self.channels[from][to][@backingInt(lane)];
     }
 
     /// The sender applied a send at `index`: seqs go up by one per channel.
     /// One already recorded is the sender's restart replaying its log, and
     /// must be the same send at the same index.
     pub fn sent(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, hash: u64, index: u64, target: ?u16) !void {
-        const c = &self.channels[from][to];
+        return self.sentOn(from, to, .main, seq, hash, index, target);
+    }
+
+    pub fn sentOn(self: *ChannelOracle, from: GroupId, to: GroupId, lane: Lane, seq: u64, hash: u64, index: u64, target: ?u16) !void {
+        const c = self.chan(from, to, lane);
         if (seq >= 1 and seq <= c.sent.items.len) {
             const was = c.sent.items[seq - 1];
             if (was.index == index and was.hash == hash) {
                 self.replays += 1;
                 return;
             }
-            return self.fail(from, to, seq, "a sender's seqs skipped or repeated");
+            return self.failOn(from, to, lane, seq, "a sender's seqs skipped or repeated");
         }
-        if (seq != c.sent.items.len + 1) return self.fail(from, to, seq, "a sender's seqs skipped or repeated");
+        if (seq != c.sent.items.len + 1) return self.failOn(from, to, lane, seq, "a sender's seqs skipped or repeated");
         try c.sent.append(self.allocator, .{ .hash = hash, .index = index, .target = target });
     }
 
     /// A message with a target reached it at the receiver's `index`: once,
     /// and after every earlier message from its sender to the same target.
     pub fn delivered(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, index: u64) !void {
-        const c = &self.channels[from][to];
+        // Only the main lane's messages have targets.
+        const c = self.chan(from, to, .main);
         if (c.delivered.get(seq)) |was| {
             if (was == index) {
                 self.replays += 1;
@@ -265,7 +283,11 @@ pub const ChannelOracle = struct {
     /// that index is its restart replaying its log; at any other index it
     /// is the message applied again.
     pub fn applied(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, hash: u64, index: u64) !void {
-        const c = &self.channels[from][to];
+        return self.appliedOn(from, to, .main, seq, hash, index);
+    }
+
+    pub fn appliedOn(self: *ChannelOracle, from: GroupId, to: GroupId, lane: Lane, seq: u64, hash: u64, index: u64) !void {
+        const c = self.chan(from, to, lane);
         const through = c.appliedThrough();
         if (seq >= 1 and seq <= through) {
             const was = c.applied.items[seq - 1];
@@ -273,12 +295,12 @@ pub const ChannelOracle = struct {
                 self.replays += 1;
                 return;
             }
-            return self.fail(from, to, seq, "applied a message twice");
+            return self.failOn(from, to, lane, seq, "applied a message twice");
         }
         self.applies += 1;
-        if (seq != through + 1) return self.fail(from, to, seq, "applied a message past a gap");
-        if (seq > c.sent.items.len) return self.fail(from, to, seq, "applied a message its sender doesn't hold");
-        if (c.sent.items[seq - 1].hash != hash) return self.fail(from, to, seq, "applied another message than the one sent at its seq");
+        if (seq != through + 1) return self.failOn(from, to, lane, seq, "applied a message past a gap");
+        if (seq > c.sent.items.len) return self.failOn(from, to, lane, seq, "applied a message its sender doesn't hold");
+        if (c.sent.items[seq - 1].hash != hash) return self.failOn(from, to, lane, seq, "applied another message than the one sent at its seq");
         try c.applied.append(self.allocator, .{ .hash = hash, .index = index });
     }
 
@@ -296,8 +318,7 @@ pub const ChannelOracle = struct {
     /// whichever group is numbered first. A receiver still holding the
     /// apply of a send now gone applied a message whose cause is gone.
     pub fn recoveredAll(self: *ChannelOracle, kept: []const ?u64) void {
-        for (kept, 0..) |k, g| if (k) |keep| for (0..MAX_GROUPS) |peer| {
-            const in = &self.channels[peer][g];
+        for (kept, 0..) |k, g| if (k) |keep| for (0..MAX_GROUPS) |peer| for (&self.channels[peer][g]) |*in| {
             var m = in.applied.items.len;
             while (m > 0 and in.applied.items[m - 1].index > keep) m -= 1;
             in.applied.shrinkRetainingCapacity(m);
@@ -307,15 +328,15 @@ pub const ChannelOracle = struct {
             while (it.next()) |d| if (d.value_ptr.* > keep) gone.append(self.allocator, d.key_ptr.*) catch @panic("oracle OOM");
             for (gone.items) |s| _ = in.delivered.remove(s);
         };
-        for (kept, 0..) |k, g_| if (k) |keep| for (0..MAX_GROUPS) |peer_| {
+        for (kept, 0..) |k, g_| if (k) |keep| for (0..MAX_GROUPS) |peer_| for (Lane.all) |lane| {
             const g: GroupId = @intCast(g_);
             const peer: GroupId = @intCast(peer_);
-            const out = &self.channels[g][peer];
+            const out = self.chan(g, peer, lane);
             var n = out.sent.items.len;
             while (n > 0 and out.sent.items[n - 1].index > keep) n -= 1;
             if (n == out.sent.items.len) continue;
             if (out.appliedThrough() > n) {
-                self.fail(g, peer, out.appliedThrough(), "applied a message its sender lost");
+                self.failOn(g, peer, lane, out.appliedThrough(), "applied a message its sender lost");
                 // Reported; the channel starts over from what both hold, so
                 // the run goes on past it.
                 out.applied.shrinkRetainingCapacity(n);
@@ -333,7 +354,7 @@ pub const ChannelOracle = struct {
     /// is halted, where messages wait for its repair: once the channels
     /// have drained, at the end.
     pub fn drained(self: *const ChannelOracle, halted: []const bool) bool {
-        for (&self.channels) |*row| for (row, 0..) |*c, to| {
+        for (&self.channels) |*row| for (row, 0..) |*lanes, to| for (lanes) |*c| {
             if (to < halted.len and halted[to]) continue;
             if (c.appliedThrough() < c.sent.items.len) return false;
             for (c.sent.items[0..c.appliedThrough()], 1..) |s, seq| {
@@ -346,16 +367,17 @@ pub const ChannelOracle = struct {
     /// Fails each channel whose receiver isn't halted and didn't apply all
     /// its sender holds; counts what waits on a halted one.
     pub fn finish(self: *ChannelOracle, halted: []const bool) void {
-        for (&self.channels, 0..) |*row, from| for (row, 0..) |*c, to| {
+        for (&self.channels, 0..) |*row, from| for (row, 0..) |*lanes, to| for (lanes, Lane.all) |*c, lane| {
             if (c.appliedThrough() >= c.sent.items.len) continue;
             if (to < halted.len and halted[to]) {
                 self.held_by_halts += c.sent.items.len - c.appliedThrough();
                 continue;
             }
-            self.fail(@intCast(from), @intCast(to), c.appliedThrough() + 1, "a message its sender holds was never applied");
+            self.failOn(@intCast(from), @intCast(to), lane, c.appliedThrough() + 1, "a message its sender holds was never applied");
         };
         // Taken in and parked, but never reached its target.
-        for (&self.channels, 0..) |*row, from| for (row, 0..) |*c, to| {
+        for (&self.channels, 0..) |*row, from| for (row, 0..) |*lanes, to| {
+            const c = &lanes[@backingInt(Lane.main)];
             if (to < halted.len and halted[to]) continue;
             for (c.sent.items[0..c.appliedThrough()], 1..) |s, seq| {
                 if (s.target == null or c.delivered.contains(seq)) continue;
@@ -404,7 +426,7 @@ const channel_machines = [_]machine_mod.Machine{ probe.machine, Probed.machine }
 fn probeTarget(payload: []const u8) ?u16 {
     var diag: @import("../protocol/schema.zig").Diagnostic = .{};
     const p = ce.Probe.decodeAll(payload, &diag) catch return null;
-    if (std.mem.startsWith(u8, p.body, "fill") or std.mem.startsWith(u8, p.body, "drai")) return null;
+    if (std.mem.startsWith(u8, p.body, "fill") or std.mem.startsWith(u8, p.body, "drai") or probe.isHistory(p.body)) return null;
     return p.slot;
 }
 
@@ -482,24 +504,25 @@ pub const GroupChannel = struct {
         const etype = std.enums.fromInt(entry_mod.EntryType, e.header.entry_type) orelse return error.Halt;
         const count = c.groups.sims.len;
         const o = &c.groups.oracle;
-        var sent_before: [MAX_GROUPS]u64 = undefined;
+        var sent_before: [MAX_GROUPS][LANES]u64 = undefined;
         var diag: @import("../protocol/schema.zig").Diagnostic = .{};
         const inbound: ?ce.Inbound.Value = if (etype == .channel_inbound) try ce.Inbound.decodeAll(e.payload, &diag) else null;
-        if (etype == .channel_probe) for (0..count) |b| {
-            sent_before[b] = channels_mod.metaOf(c.read(), @intCast(b)).next_seq;
+        const in_lane: Lane = if (inbound) |p| Lane.from(p.lane) orelse return error.Halt else .main;
+        if (etype == .channel_probe) for (0..count) |b| for (Lane.all) |lane| {
+            sent_before[b][@backingInt(lane)] = channels_mod.metaOf(c.read(), @intCast(b), lane).next_seq;
         };
-        const applied_before = if (inbound) |p| if (channels_mod.inOf(c.read(), p.from)) |x| x.applied else 0 else 0;
+        const applied_before = if (inbound) |p| if (channels_mod.inOf(c.read(), p.from, in_lane)) |x| x.applied else 0 else 0;
         const m = machine_mod.ownerOf(&channel_machines, etype) orelse return error.Halt;
         var r = persistence.Result.start(e);
         try machine_mod.applyEntry(m, &c.store, &c.scratch, e, &r);
-        if (etype == .channel_probe) for (0..count) |b_| {
+        if (etype == .channel_probe) for (0..count) |b_| for (Lane.all) |lane| {
             const b: GroupId = @intCast(b_);
-            const now_next = channels_mod.metaOf(c.read(), b).next_seq;
-            var seq = sent_before[b];
+            const now_next = channels_mod.metaOf(c.read(), b, lane).next_seq;
+            var seq = sent_before[b][@backingInt(lane)];
             while (seq < now_next) : (seq += 1) {
                 var k: [channels_mod.OUT_KEY]u8 = undefined;
-                const out = (try c.read().get(channels_mod.OutFam, channels_mod.outKey(&k, b, seq))) orelse return error.Halt;
-                try o.sent(c.g, b, seq, std.hash.Wyhash.hash(0, out.v.payload), e.header.index, probeTarget(out.v.payload));
+                const out = (try c.read().get(channels_mod.OutFam, channels_mod.outKey(&k, b, lane, seq))) orelse return error.Halt;
+                try o.sentOn(c.g, b, lane, seq, std.hash.Wyhash.hash(0, out.v.payload), e.header.index, probeTarget(out.v.payload));
             }
         };
         // What reached its target: a message applied on arrival, or one an
@@ -510,11 +533,11 @@ pub const GroupChannel = struct {
             try o.delivered(@intCast(msg.from), c.g, msg.seq, e.header.index);
         };
         if (inbound) |p| {
-            const after = if (channels_mod.inOf(c.read(), p.from)) |x| x.applied else 0;
+            const after = if (channels_mod.inOf(c.read(), p.from, in_lane)) |x| x.applied else 0;
             var it = p.messages.iterator();
             var seq = p.first_seq;
             while (try it.next()) |msg| : (seq += 1) {
-                if (seq > applied_before and seq <= after) try o.applied(@intCast(p.from), c.g, seq, std.hash.Wyhash.hash(0, msg.payload), e.header.index);
+                if (seq > applied_before and seq <= after) try o.appliedOn(@intCast(p.from), c.g, in_lane, seq, std.hash.Wyhash.hash(0, msg.payload), e.header.index);
             }
         }
     }
@@ -593,7 +616,30 @@ pub const GroupChannel = struct {
         const roll = r.uintLessThan(u8, 100);
         if (roll < 3) return c.proposeMark("fill", POOL[r.uintLessThan(usize, POOL.len)]);
         if (roll < 8) return c.proposeMark("drai", POOL[r.uintLessThan(usize, POOL.len)]);
-        const slot = if (r.uintLessThan(u8, 4) == 0) r.uintLessThan(u16, 4096) else POOL[r.uintLessThan(usize, POOL.len)];
+        var slot = if (r.uintLessThan(u8, 4) == 0) r.uintLessThan(u16, 4096) else POOL[r.uintLessThan(usize, POOL.len)];
+        // Every fifth is a run's history's, on the history lane: to a slot
+        // of its own group's, chosen without a draw, so the workload's
+        // draws are as before. Some of those its receiver refuses, or that
+        // send more than an apply may, so a refusal on that lane takes its
+        // seq too.
+        if (c.probes_proposed % 5 == 4) {
+            const n: u16 = @intCast(c.groups.sims.len);
+            const kinds = [_][]const u8{ "hist-", "refuse", "flood-", "hist-" };
+            const kind = kinds[(c.probes_proposed / 5) % kinds.len];
+            var name: [16]u8 = @splat('0');
+            @memcpy(name[0..kind.len], kind);
+            _ = std.fmt.bufPrint(name[kind.len..15], "{d:0>2}", .{c.g}) catch return;
+            var tail = c.probes_proposed;
+            var i: usize = 14;
+            while (i >= kind.len + 2 and tail > 0) : (i -= 1) {
+                name[i] = '0' + @as(u8, @intCast(tail % 10));
+                tail /= 10;
+            }
+            name[15] = 'H';
+            body[0..16].* = name;
+            slot = slot - slot % n + c.g;
+            if (slot >= 4096) slot -= n;
+        }
         var buf: [body.len + 64]u8 = undefined;
         const payload = ce.Probe.encodeInto(&buf, .{ .slot = slot, .body = body[0 .. 16 + extra] }) catch return;
         if (c.groups.sims[c.g].proposeOn(NODE, .channel_probe, payload)) c.probes_proposed += 1;
@@ -766,12 +812,12 @@ pub const Groups = struct {
     /// it holds: a count every replica gets wrong the same way agrees with
     /// itself, so it is checked against what it counts.
     fn checkOutboxBytes(self: *Groups) void {
-        for (self.chans) |*c| for (0..self.chans.len) |to_| {
+        for (self.chans) |*c| for (0..self.chans.len) |to_| for (Lane.all) |lane| {
             const to: u16 = @intCast(to_);
             const read = c.read();
-            const meta = channels_mod.metaOf(read, to);
-            var pb: [channels_mod.GROUP_KEY]u8 = undefined;
-            var it = read.range(channels_mod.OutFam, channels_mod.outPrefix(&pb, to));
+            const meta = channels_mod.metaOf(read, to, lane);
+            var pb: [channels_mod.CHAN_KEY]u8 = undefined;
+            var it = read.range(channels_mod.OutFam, channels_mod.outPrefix(&pb, to, lane));
             var held: u64 = 0;
             // And by namespace: the few the run's messages are for.
             var nss: [16]u32 = undefined;
@@ -789,18 +835,18 @@ pub const Groups = struct {
                 } else continue;
                 by_ns[i] += rec.value.v.payload.len;
             }
-            if (held != meta.bytes) self.oracle.fail(c.g, @intCast(to), meta.acked + 1, "an outbox's recorded bytes are not what it holds");
-            for (nss[0..n], by_ns[0..n]) |ns, bytes| if (channels_mod.nsBytesOf(read, to, .of(ns)) != bytes)
-                self.oracle.fail(c.g, @intCast(to), meta.acked + 1, "a namespace's recorded share of an outbox is not what it holds");
+            if (held != meta.bytes) self.oracle.failOn(c.g, @intCast(to), lane, meta.acked + 1, "an outbox's recorded bytes are not what it holds");
+            for (nss[0..n], by_ns[0..n]) |ns, bytes| if (channels_mod.nsBytesOf(read, to, lane, .of(ns)) != bytes)
+                self.oracle.failOn(c.g, @intCast(to), lane, meta.acked + 1, "a namespace's recorded share of an outbox is not what it holds");
             // And no namespace keeps a share of what it no longer holds.
-            var nb: [1 + channels_mod.OUT_NS.len + 4]u8 = undefined;
-            var nit = read.range(channels_mod.OutNsFam, channels_mod.outNsPrefix(&nb, to));
+            var nb: [1 + channels_mod.OUT_NS.len + channels_mod.CHAN_LEN]u8 = undefined;
+            var nit = read.range(channels_mod.OutNsFam, channels_mod.outNsPrefix(&nb, to, lane));
             while (nit.next() catch null) |rec| {
                 const ns = std.mem.readInt(u32, rec.key[rec.key.len - 4 ..][0..4], .big);
                 const holds = for (nss[0..n], by_ns[0..n]) |x, bytes| {
                     if (x == ns) break bytes;
                 } else 0;
-                if (rec.value.v.bytes != holds) self.oracle.fail(c.g, @intCast(to), meta.acked + 1, "a namespace's recorded share of an outbox is not what it holds");
+                if (rec.value.v.bytes != holds) self.oracle.failOn(c.g, @intCast(to), lane, meta.acked + 1, "a namespace's recorded share of an outbox is not what it holds");
             }
         };
     }
@@ -1155,7 +1201,7 @@ test "vopr groups: channel traffic between groups is applied once and in order t
         defer groups.deinit();
         const s = try groups.run();
         defer testing.allocator.free(s.groups);
-        if (!s.ok) for (groups.oracle.violations.items) |v| std.debug.print("channel {d}->{d} seq {d}: {s}\n", .{ v.from, v.to, v.seq, v.detail });
+        if (!s.ok) for (groups.oracle.violations.items) |v| std.debug.print("channel {d}->{d} seq {d}: {s} ({s} lane)\n", .{ v.from, v.to, v.seq, v.detail, @tagName(v.lane) });
         try testing.expect(s.ok);
         try testing.expect(s.crashes > 0);
         try testing.expect(s.probes_proposed > 50);

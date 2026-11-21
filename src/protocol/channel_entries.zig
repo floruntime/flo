@@ -50,9 +50,11 @@ pub const Message = Record(&.{
 
 pub const Messages = schema.BoundedList(Message, MAX_BATCH, @intCast(limits.MAX_LOG_ENTRY_PAYLOAD - 16));
 
-/// `channel_inbound`: messages from one sender, consecutive from `first_seq`.
+/// `channel_inbound`: messages from one sender on one lane, consecutive
+/// from `first_seq`, which counts in that lane's seqs.
 pub const Inbound = Record(&.{
     .{ .name = "from", .T = Int(u16) },
+    .{ .name = "lane", .T = Int(u8) },
     .{ .name = "first_seq", .T = Int(u64) },
     .{ .name = "messages", .T = Messages },
 });
@@ -60,11 +62,12 @@ pub const Inbound = Record(&.{
 /// Most seqs one trim drops, so its keys are few enough to declare.
 pub const MAX_TRIM_SPAN = 1024;
 
-/// `channel_trim`: the sender drops its outbox to `to` from `first` through
+/// `channel_trim`: the sender drops its outbox to `to` on `lane` from `first` through
 /// `through`, which the receiver has durably applied. `first` is the
 /// proposer's `acked + 1`; the span is at most `MAX_TRIM_SPAN`.
 pub const Trim = Record(&.{
     .{ .name = "to", .T = Int(u16) },
+    .{ .name = "lane", .T = Int(u8) },
     .{ .name = "first", .T = Int(u64) },
     .{ .name = "through", .T = Int(u64) },
 });

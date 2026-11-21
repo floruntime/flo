@@ -205,10 +205,11 @@ const Op = struct {
 /// view is partial (a write staged but not indexed) and must not be read
 /// or committed: the machine drops the entry and its view.
 /// One send an entry makes: its target's slot, entry type and payload.
-/// The entry flags a channel message may carry: a sink's mark, and nothing
-/// a receiver's applier would act on otherwise (`FORCE`, say), so a type
-/// that reads one never gets it from another group by accident.
-pub const MESSAGE_FLAGS: u16 = @import("../storage/ual/entry.zig").Flags.SINK;
+/// The entry flags a channel message may carry: a sink's mark and a run's
+/// history's, and nothing a receiver's applier would act on otherwise
+/// (`FORCE`, say), so a type that reads one never gets it from another
+/// group by accident.
+pub const MESSAGE_FLAGS: u16 = @import("../storage/ual/entry.zig").Flags.SINK | @import("../storage/ual/entry.zig").Flags.HISTORY;
 
 pub const Send = struct { origin: Origin, slot: u16, entry_type: u8, flags: u16 = 0, payload: []const u8 };
 
