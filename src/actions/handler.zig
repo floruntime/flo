@@ -966,8 +966,13 @@ pub const ActionsHandler = struct {
             if (got.task) |task| return table_run.answer(AwaitResponse, shard, conn, request_id, .{ .task = task });
             const req = try Request.parse(a.req_bytes);
             if (a.nextName()) |name| {
-                // The state moves to the next ask, which frees it.
-                return startAsk(shard, conn, req, name, try a.clone(shard.allocator));
+                // The state moves to the next ask, which frees it. No room
+                // to ask now: it waits, and a wake asks again.
+                startAsk(shard, conn, req, name, try a.clone(shard.allocator)) catch |err| switch (err) {
+                    error.GatherBusy => return settle(shard, conn, request_id, try shard.actions_handler.waitForTask(shard, conn, req, a.asWant())),
+                    else => |e| return e,
+                };
+                return;
             }
             const self = shard.actions_handler;
             // Only a wake it could use: from another shard, or for runs
@@ -979,6 +984,11 @@ pub const ActionsHandler = struct {
                 try awaitPass(shard, conn, req, a.asWant(), false)
             else
                 try self.waitForTask(shard, conn, req, a.asWant());
+            settle(shard, conn, request_id, outcome);
+        }
+
+        /// The await's next step, from a merge: answered, waiting, or refused.
+        fn settle(shard: *Shard, conn: *Connection, request_id: u64, outcome: anytype) void {
             switch (outcome) {
                 .answer => |v| table_run.answer(AwaitResponse, shard, conn, request_id, v),
                 .wait => conn.response_deferred = true,

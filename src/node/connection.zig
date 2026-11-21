@@ -352,6 +352,10 @@ pub const Connection = struct {
     /// Read interest is off for `waiting`; on again once the head goes or
     /// is refused (`Shard.processRequests`).
     reads_held: bool = false,
+    /// Its requests held for room on another shard after running again from
+    /// an answer (`Shard.reentries`): while any is held, nothing more of
+    /// this connection's is read or run, so nothing overtakes it.
+    reentries_held: u16 = 0,
     /// The head waited `Shard.ASK_WAIT_MS`: it, and every request buffered
     /// behind it then (these bytes' worth) that would wait, is answered
     /// `overloaded`, unrun, rather than each waiting its turn.

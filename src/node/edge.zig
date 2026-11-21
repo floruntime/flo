@@ -54,6 +54,8 @@ pub const Wait = struct {
     /// When it began waiting, in this edge's order: waits resolved together
     /// run in it, not in the order of the slots they hold.
     seq: u64 = 0,
+    /// When its client's request was first read.
+    since_ms: u64 = 0,
     /// The client's own connection, on this shard.
     reply_to: ReplyTo = undefined,
     origin: Origin = .client,

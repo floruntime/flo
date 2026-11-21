@@ -182,18 +182,26 @@ pub const Mailbox = struct {
         return self.shares[from].unread.load(.seq_cst) < self.share;
     }
 
+    /// What a send on a share did.
+    pub const ShareSend = enum { sent, share_spent, ring_full };
+
     /// Sender: put a client request in the inbox on its sender's share.
     /// False when the share is spent or the ring is full: nothing was sent.
     pub fn sendOnShare(self: *Mailbox, m: inbox_mod.Message) bool {
+        return self.sendOnShareWhy(m) == .sent;
+    }
+
+    /// `sendOnShare`, saying which bound stopped it.
+    pub fn sendOnShareWhy(self: *Mailbox, m: inbox_mod.Message) ShareSend {
         const s = &self.shares[m.src_shard];
         // Only its sender raises a count, so none passes the share.
-        if (s.unread.load(.seq_cst) >= self.share) return false;
+        if (s.unread.load(.seq_cst) >= self.share) return .share_spent;
         _ = s.unread.fetchAdd(1, .seq_cst);
         var shared = m;
         shared.setOnShare();
-        if (self.inbox.send(shared)) return true;
+        if (self.inbox.send(shared)) return .sent;
         _ = s.unread.fetchSub(1, .seq_cst);
-        return false;
+        return .ring_full;
     }
 
     /// Sender `from`, its share spent: ask to be told when some is drained,

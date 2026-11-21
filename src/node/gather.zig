@@ -97,6 +97,9 @@ pub fn GatherTable(comptime Context: type) type {
             arrived: u16 = 0,
             /// A part read a halted shard's state: the answer is stale.
             stale: bool = false,
+            /// When its client's request was first read: what runs again from
+            /// its answer waits counting from then.
+            since_ms: u64 = 0,
             context: Context = undefined,
         };
 

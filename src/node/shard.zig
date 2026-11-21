@@ -108,6 +108,7 @@ const TSHandler = @import("../ts/handler.zig").TSHandler;
 const handler_mod = @import("../namespace/handler.zig");
 const ns_table = @import("../namespace/table.zig");
 const edge_mod = @import("edge.zig");
+const reentry_mod = @import("reentry.zig");
 const NamespaceHandler = handler_mod.NamespaceHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const WorkerHandler = @import("../worker/handler.zig").WorkerHandler;
@@ -582,6 +583,14 @@ pub const Shard = struct {
     /// Reads of a namespace this follower's table doesn't have yet, held
     /// while it asks the leader (`edgeMiss`).
     edge: edge_mod.Edge = .{},
+    /// Requests run again from an answer that found no room on the shard
+    /// they are bound for, held until it has some (`resumeReentries`).
+    reentries: reentry_mod.Table = .{},
+    /// Set while a request runs again from an answer or from its hold:
+    /// what it may wait for here, and since when (`Reentry`).
+    reentry: ?Reentry = null,
+    /// The first read of the request whose gather is merging now.
+    merging_since_ms: ?u64 = null,
     /// Of those, blocking reads, which may wait there for minutes: they hold
     /// at most FORWARD_SLOTS - FORWARD_WRITE_RESERVE slots, so writes always
     /// find one.
@@ -2059,6 +2068,7 @@ pub const Shard = struct {
             if (f.ask) |a| self.allocator.free(a);
         };
         self.edge.deinit(self.allocator);
+        for (&self.reentries.entries) |*e| if (e.active) self.allocator.free(self.reentries.take(e));
         self.allocator.free(self.forwards);
         self.allocator.free(self.pending);
         self.respond_proxy.deinit();
@@ -2177,6 +2187,9 @@ pub const Shard = struct {
         }
         if (self.edge.count > 0) {
             if (self.connections.get(fd)) |conn| self.dropEdgeFor(fd, conn.id);
+        }
+        if (self.reentries.count > 0) {
+            if (self.connections.get(fd)) |conn| self.dropReentriesFor(fd, conn.id, conn);
         }
         if (self.connections.get(fd)) |conn| {
             if (conn.blocking_in_flight > 0) self.releaseForwardsFor(conn);
@@ -2320,13 +2333,16 @@ pub const Shard = struct {
     /// shards unless the pre-route names a key, which narrows them to its
     /// slot's shard.
     fn route(self: *Shard, conn: *Connection, req: proto.Request, auth: run_mod.Authorized) void {
-        conn.recordRequest();
-        self.requests_dispatched += 1;
-        // Count every dispatched request for the cluster command counter (drives
-        // Overview's commands_total + rps). Other server counters (connections,
-        // bytes) are not yet wired — see the metrics gap log.
-        if (self.metrics_registry) |m| m.server.recordCommand();
-        if (self.shard_metrics) |sm| sm.recordCommand();
+        // A request run again was counted when it was first read.
+        if (self.reentryFor(conn, req.header.request_id) == null) {
+            conn.recordRequest();
+            self.requests_dispatched += 1;
+            // Count every dispatched request for the cluster command counter (drives
+            // Overview's commands_total + rps). Other server counters (connections,
+            // bytes) are not yet wired — see the metrics gap log.
+            if (self.metrics_registry) |m| m.server.recordCommand();
+            if (self.shard_metrics) |sm| sm.recordCommand();
+        }
 
         const op = req.header.op_code;
 
@@ -2482,7 +2498,7 @@ pub const Shard = struct {
     /// `start_home` is its workflow's shard: another shard holding the id
     /// refuses it, and its own shard decides as for any start there (a
     /// retried start with its idempotency key answers its run).
-    const RunFind = struct {
+    pub const RunFind = struct {
         /// The request, serialized, and who may run it.
         bytes: []u8,
         auth: run_mod.Authorized,
@@ -2506,6 +2522,11 @@ pub const Shard = struct {
                         return shard.sendRefusal(conn, request_id, .conflict, proto.notRun(RUN_ID_TAKEN));
                 }
                 const req = try proto.Request.parse(self.bytes);
+                // Held for room, a start runs its find again: another run
+                // may take its id meanwhile.
+                const prev = shard.reentry;
+                shard.reentry = Reentry.of(conn, req.header.request_id, shard.merging_since_ms orelse nowMs(), self.auth.origin, .rerun);
+                defer shard.reentry = prev;
                 return if (home == shard.id) shard.dispatchLocal(conn, req, self.auth) else shard.forwardToShard(home, conn, req, self.auth);
             }
             var owner: ?u16 = null;
@@ -2519,6 +2540,10 @@ pub const Shard = struct {
             }
             const req = try proto.Request.parse(self.bytes);
             const to = owner orelse return shard.sendErrorResponse(conn, request_id, .not_found, "");
+            // Held for room, it goes on to the shard found for it.
+            const prev = shard.reentry;
+            shard.reentry = Reentry.of(conn, req.header.request_id, shard.merging_since_ms orelse nowMs(), self.auth.origin, .forward);
+            defer shard.reentry = prev;
             if (to == shard.id) shard.dispatchLocal(conn, req, self.auth) else shard.forwardToShard(to, conn, req, self.auth);
         }
     };
@@ -2919,7 +2944,11 @@ pub const Shard = struct {
             if (known == .invalid or known.int() != ensured.id) {
                 return shard.sendRefusal(conn, request_id, .unavailable, proto.notRun("unavailable: the namespace was created but this node doesn't show it yet; the write was not run — retry"));
             }
-            shard.runRequest(conn, req, if (self.origin == .client or self.origin == .admin) self.origin else .held);
+            const origin: run_mod.Origin = if (self.origin == .client or self.origin == .admin) self.origin else .held;
+            const prev = shard.reentry;
+            shard.reentry = Reentry.of(conn, req.header.request_id, shard.merging_since_ms orelse nowMs(), origin, .rerun);
+            defer shard.reentry = prev;
+            shard.runRequest(conn, req, origin);
         }
 
         fn free(state: *anyopaque, allocator: std.mem.Allocator) void {
@@ -2998,6 +3027,11 @@ pub const Shard = struct {
         // cannot be sent.
         const block = blockingWait(req);
         const blocking = block != null;
+        // Run again from an answer: it had its turn when first read, and
+        // waits here for room rather than being refused for none.
+        const reentry = self.reentryFor(conn, req.header.request_id);
+        if (reentry) |ctx| if (self.reentryWaits(conn, target_shard_id, blocking, ctx)) |why|
+            return self.holdReentry(conn, req, auth, target_shard_id, blocking, why);
         const op = req.header.op_code;
         const claims = takesItems(op);
         const writes = claims or requestWrites(req);
@@ -3006,7 +3040,7 @@ pub const Shard = struct {
         // request waits for it as long as the slot is held.
         const class: reply_pool_mod.Class = if (blocking) .blocking else .ordinary;
         const now = nowMs();
-        const since = if (claims) now else conn.head_since_ms orelse now;
+        const since = if (claims) now else if (reentry) |ctx| ctx.since_ms else conn.head_since_ms orelse now;
         const allowance = if (claims) reply_pool_mod.SLOT_DEADLINE_MS else reply_pool_mod.DEADLINE_MS;
         const ticket = self.reply_pool.take(class, target_shard_id, conn.fd, conn.id, req.header.request_id, writes, since, now, allowance, if (claims) 0 else block orelse 0) catch
             return self.refuseForward(conn, req, target_shard_id, .target_busy);
@@ -3032,10 +3066,13 @@ pub const Shard = struct {
             .payload_ptr = buf.ptr,
         };
         msg.setReplySlot(ticket.slot, ticket.gen);
-        if (!target.sendOnShare(msg)) {
-            self.allocator.free(buf);
-            _ = self.reply_pool.release(ticket, target_shard_id);
-            return self.refuseForward(conn, req, target_shard_id, .inbox_full);
+        switch (target.sendOnShareWhy(msg)) {
+            .sent => {},
+            else => |why| {
+                self.allocator.free(buf);
+                _ = self.reply_pool.release(ticket, target_shard_id);
+                return self.refuseForward(conn, req, target_shard_id, if (why == .share_spent) .share_spent else .ring_full);
+            },
         }
         conn.forwards_in_flight += 1;
         if (blocking) {
@@ -3052,7 +3089,232 @@ pub const Shard = struct {
         conn.response_deferred = true;
     }
 
-    const ForwardRefusal = enum { target_busy, inbox_full };
+    /// A request running again from an answer (a namespace made, a run
+    /// found, an edge wait over) or from its hold (`resumeReentries`).
+    pub const Reentry = struct {
+        /// When its client's request was first read.
+        since_ms: u64,
+        origin: run_mod.Origin,
+        kind: reentry_mod.Kind = .rerun,
+        /// Resumed from its hold: it goes ahead of the line it held its
+        /// place in.
+        turn: bool = false,
+        /// Its place, kept should it be held again.
+        seq: ?u64 = null,
+        /// The request it is: another run while it runs — an await woken by
+        /// what it applies — is not it (`reentryFor`).
+        fd: i32,
+        conn_id: u32,
+        request_id: u64,
+
+        fn of(conn: *const Connection, request_id: u64, since_ms: u64, origin: run_mod.Origin, kind: reentry_mod.Kind) Reentry {
+            return .{ .since_ms = since_ms, .origin = origin, .kind = kind, .fd = conn.fd, .conn_id = conn.id, .request_id = request_id };
+        }
+    };
+
+    /// The re-entry running, if it is `request_id` on `conn`. Never a
+    /// proxy's: only a client's own request is held for room.
+    fn reentryFor(self: *const Shard, conn: *const Connection, request_id: u64) ?Reentry {
+        const ctx = self.reentry orelse return null;
+        if (conn.proxy_for != null or ctx.fd != conn.fd or ctx.conn_id != conn.id or ctx.request_id != request_id) return null;
+        return ctx;
+    }
+
+    /// When the request being run was first read: from its re-entry, or
+    /// its connection's head, or now.
+    fn firstRead(self: *const Shard, conn: *const Connection, request_id: u64, now: u64) u64 {
+        if (self.reentryFor(conn, request_id)) |ctx| return ctx.since_ms;
+        return conn.head_since_ms orelse now;
+    }
+
+    const REENTRIES_FULL: proto.Refusal = .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many requests are waiting here for room on other shards; this request was not run — retry" };
+    const SHARE_SPENT = "overloaded: shard {d} has not drained this shard's share of its inbox; this request was not run — back off and retry";
+
+    /// What a request running again waits for before it can go to `target`,
+    /// or null. Not its connection's in-flight limit: it was let in when it
+    /// was first read, and is still counted. Behind what its connection
+    /// holds already and anyone waiting for this target's room, unless it
+    /// is resumed with its turn.
+    fn reentryWaits(self: *Shard, conn: *Connection, target: u16, blocking: bool, ctx: Reentry) ?Connection.WaitReason {
+        if (!ctx.turn) {
+            if (conn.reentries_held > 0) return .inbox;
+            if (self.queued[@intFromBool(blocking)][target] > 0) return .reply_capacity;
+        }
+        if (blocking and self.blockingOut(conn) >= Connection.MAX_BLOCKING_IN_FLIGHT) return .blocking_reads;
+        if (!self.reply_pool.canTake(if (blocking) .blocking else .ordinary, target)) return .reply_capacity;
+        const mailbox = self.peer_mailboxes.?[target];
+        if (mailbox.hasShare(@intCast(self.id))) return null;
+        // Told of the next drain before looking again, so none is missed.
+        mailbox.wantShare(@intCast(self.id));
+        return if (mailbox.hasShare(@intCast(self.id))) null else .inbox;
+    }
+
+    /// Hold `req`, running again, until `target` has room for it. It stays
+    /// one of its connection's requests in flight, and its connection reads
+    /// nothing more until it goes.
+    fn holdReentry(self: *Shard, conn: *Connection, req: proto.Request, auth: ?run_mod.Authorized, target: u16, blocking: bool, why: Connection.WaitReason) void {
+        const ctx = self.reentryFor(conn, req.header.request_id).?;
+        const e = self.reentries.free() orelse return self.sendRefusal(conn, req.header.request_id, .overloaded, REENTRIES_FULL);
+        const bytes = serializeRequest(self.allocator, req) catch return self.sendRefusal(conn, req.header.request_id, .internal_error, proto.notRun("internal error: out of memory"));
+        const counted = why == .reply_capacity or why == .inbox;
+        self.reentries.hold(e, .{
+            .active = true,
+            .seq = ctx.seq orelse self.reentries.takeSeq(),
+            .fd = conn.fd,
+            .conn_id = conn.id,
+            .bytes = bytes,
+            .origin = ctx.origin,
+            // A gather held for its parts' room starts again from the top;
+            // a found run's forward goes on where it was going.
+            .kind = if (auth == null) .rerun else ctx.kind,
+            .target = target,
+            .blocking = blocking,
+            .since_ms = ctx.since_ms,
+            .counted = counted,
+        });
+        conn.reentries_held += 1;
+        conn.forwards_in_flight += 1;
+        if (counted) self.queued[@intFromBool(blocking)][target] += 1;
+        self.holdReads(conn.fd, conn);
+        conn.response_deferred = true;
+    }
+
+    /// Stop reading `conn`'s socket while it holds requests. A paused one
+    /// is not read already, and `resumeReads` keeps it so while it holds.
+    fn holdReads(self: *Shard, fd: i32, conn: *Connection) void {
+        if (conn.reads_held or conn.reads_paused or conn.closing) return;
+        self.reactor.modifyInterests(fd, .{ .readable = false, .writable = conn.hasPendingWrites() }) catch |err| {
+            log.err("shard {d}: could not stop reading connection fd={d}: {s}; closing it", .{ self.id, fd, @errorName(err) });
+            return self.markClosing(fd);
+        };
+        conn.reads_held = true;
+    }
+
+    /// `e` is no longer held: its counts come back, and its bytes are the
+    /// caller's.
+    fn unholdReentry(self: *Shard, e: *reentry_mod.Entry, conn: ?*Connection) []u8 {
+        if (e.counted) self.queued[@intFromBool(e.blocking)][e.target] -= 1;
+        if (conn) |c| {
+            c.reentries_held -= 1;
+            c.forwards_in_flight -= 1;
+        }
+        return self.reentries.take(e);
+    }
+
+    /// Run again what was held, oldest first, as far as each target has
+    /// room; refuse what waited `ASK_WAIT_MS` since it was first read. A
+    /// connection's later holds wait while an earlier one does.
+    fn resumeReentries(self: *Shard) void {
+        if (self.reentries.count == 0) return;
+        const now = nowMs();
+        const MAX = @import("../config/server.zig").MAX_SHARDS;
+        var slot_room: [2][MAX]i32 = .{ @splat(-1), @splat(-1) };
+        var inbox_room: [MAX]i32 = @splat(-1);
+        var stuck: [reentry_mod.MAX]i32 = undefined;
+        var n_stuck: usize = 0;
+        var order: [reentry_mod.MAX]*reentry_mod.Entry = undefined;
+        for (self.reentries.ordered(&order)) |e| {
+            if (!e.active) continue; // run or dropped by one before it
+            const conn = self.getConnection(e.fd) orelse {
+                self.allocator.free(self.unholdReentry(e, null));
+                continue;
+            };
+            if (conn.id != e.conn_id) {
+                self.allocator.free(self.unholdReentry(e, null));
+                continue;
+            }
+            if (conn.closing) continue; // dropped as it closes
+            if (std.mem.indexOfScalar(i32, stuck[0..n_stuck], e.fd) != null) continue;
+            const class: reply_pool_mod.Class = if (e.blocking) .blocking else .ordinary;
+            const slots = &slot_room[@backingInt(class)][e.target];
+            const inbox = &inbox_room[e.target];
+            const mailbox = self.peer_mailboxes.?[e.target];
+            if (slots.* < 0) slots.* = self.reply_pool.room(class, e.target);
+            if (inbox.* < 0) inbox.* = mailbox.shareRoom(@intCast(self.id));
+            // Its wait is bounded with room or without: one held again for
+            // what room doesn't show (its connection's blocking reads, a
+            // gather's slots) would otherwise run every tick.
+            if (now -| e.since_ms >= ASK_WAIT_MS) {
+                self.refuseReentry(conn, e, inbox.* > 0 or slots.* <= 0);
+                continue;
+            }
+            if (slots.* <= 0 or inbox.* <= 0) {
+                if (inbox.* <= 0) mailbox.wantShare(@intCast(self.id));
+                stuck[n_stuck] = e.fd;
+                n_stuck += 1;
+                continue;
+            }
+            slots.* -= 1;
+            inbox.* -= 1;
+            if (!self.runReentry(conn, e)) {
+                stuck[n_stuck] = e.fd;
+                n_stuck += 1;
+            }
+        }
+    }
+
+    /// Run `e` again with its turn. False when it was held again (it keeps
+    /// its place).
+    fn runReentry(self: *Shard, conn: *Connection, e: *reentry_mod.Entry) bool {
+        var ctx = Reentry.of(conn, 0, e.since_ms, e.origin, e.kind);
+        ctx.turn = true;
+        ctx.seq = e.seq;
+        const kind = e.kind;
+        const target = e.target;
+        const bytes = self.unholdReentry(e, conn);
+        defer self.allocator.free(bytes);
+        const req = proto.Request.parse(bytes) catch unreachable; // serialized here
+        ctx.request_id = req.header.request_id;
+        const held_before = conn.reentries_held;
+        const prev = self.reentry;
+        self.reentry = ctx;
+        defer self.reentry = prev;
+        const queued_before = conn.bytes_queued - conn.deferred_queued;
+        conn.response_deferred = false;
+        var answered_deferred = false;
+        switch (kind) {
+            // Authorized again as it was where it came from.
+            .forward => switch (run_mod.authorize(conn.principal, ctx.origin, req)) {
+                .ok => |auth| self.forwardToShard(target, conn, req, auth),
+                .refused => |r| self.sendRefusal(conn, req.header.request_id, r.status, r.refusal),
+            },
+            .rerun => answered_deferred = self.dispatchNoted(conn, req, ctx.origin),
+        }
+        const held_again = conn.reentries_held > held_before;
+        if (!held_again and conn.bytes_queued - conn.deferred_queued == queued_before and !conn.response_deferred and !conn.write_overflow and !conn.closing) {
+            if (answered_deferred) self.answeredAsDeferred(req.header.request_id, req.header.op_code) else self.sendErrorResponse(conn, req.header.request_id, .internal_error, self.noAnswer(req));
+        }
+        if (self.dispatching == null) conn.response_deferred = false;
+        self.flushToClient(conn.fd);
+        if (conn.reentries_held == 0) self.queueResume(conn.fd, conn);
+        return !held_again;
+    }
+
+    /// `e` waited too long for room: refused, not run.
+    fn refuseReentry(self: *Shard, conn: *Connection, e: *reentry_mod.Entry, slots: bool) void {
+        const target = e.target;
+        const bytes = self.unholdReentry(e, conn);
+        defer self.allocator.free(bytes);
+        const req = proto.Request.parse(bytes) catch unreachable; // serialized here
+        var msg_buf: [160]u8 = undefined;
+        const message = (if (slots) std.fmt.bufPrint(&msg_buf, NOT_KEEPING_UP, .{target}) else std.fmt.bufPrint(&msg_buf, SHARE_SPENT, .{target})) catch "overloaded: this request was not run — back off and retry";
+        self.sendErrorResponse(conn, req.header.request_id, .overloaded, message);
+        if (self.shard_metrics) |sm| {
+            sm.recordCrossShardOverloaded(.client_forward);
+            sm.recordForwardRefused(if (slots) .target_busy else .share_spent);
+        }
+        self.forwards_refused += 1;
+        self.flushToClient(conn.fd);
+        if (conn.reentries_held == 0) self.queueResume(conn.fd, conn);
+    }
+
+    /// A connection closing: what it held goes, unanswered.
+    fn dropReentriesFor(self: *Shard, fd: i32, conn_id: u32, conn: *Connection) void {
+        for (&self.reentries.entries) |*e| if (e.active and e.fd == fd and e.conn_id == conn_id) self.allocator.free(self.unholdReentry(e, conn));
+        std.debug.assert(conn.reentries_held == 0);
+    }
+
+    const ForwardRefusal = enum { target_busy, share_spent, ring_full };
 
     const NOT_KEEPING_UP = "overloaded: shard {d} is not keeping up; this request was not run — back off and retry";
 
@@ -3060,7 +3322,14 @@ pub const Shard = struct {
     /// `overloaded` (it did not run, so resending is safe), counted, and
     /// said once per interval.
     fn refuseForward(self: *Shard, conn: *Connection, req: proto.Request, target: u16, why: ForwardRefusal) void {
-        if (self.shard_metrics) |sm| sm.recordCrossShardOverloaded(.client_forward);
+        if (self.shard_metrics) |sm| {
+            sm.recordCrossShardOverloaded(.client_forward);
+            sm.recordForwardRefused(switch (why) {
+                .target_busy => .target_busy,
+                .share_spent => .share_spent,
+                .ring_full => .ring_full,
+            });
+        }
         var msg_buf: [128]u8 = undefined;
         const message = std.fmt.bufPrint(&msg_buf, NOT_KEEPING_UP, .{target}) catch "overloaded: this request was not run — back off and retry";
         self.sendErrorResponse(conn, req.header.request_id, .overloaded, message);
@@ -3070,7 +3339,8 @@ pub const Shard = struct {
         self.refuse_warn_ms = now;
         const reason = switch (why) {
             .target_busy => "it holds its full share of this shard's requests",
-            .inbox_full => "its inbox is full of messages sent on no share",
+            .share_spent => "this shard's share of its inbox is unread",
+            .ring_full => "its inbox ring is full",
         };
         log.warn("shard {d}: refusing client requests for shard {d}: {s} ({d} refused so far; {d} in flight to other shards, {d} ordinary and {d} blocking to shard {d})", .{ self.id, target, reason, self.forwards_refused, self.reply_pool.taken(), self.reply_pool.heldBy(.ordinary, target), self.reply_pool.heldBy(.blocking, target), target });
     }
@@ -3114,12 +3384,34 @@ pub const Shard = struct {
         // gathers on a node of one.
         const mailboxes: []const *Mailbox = if (remote == 0) &.{} else self.peer_mailboxes orelse return error.GatherBusy;
         if (remote > 0) std.debug.assert(self.raft_network == null); // a cluster member runs one shard
-        const busy = !self.gathers.hasRoom() or conn.forwards_in_flight >= Connection.MAX_FORWARDS_IN_FLIGHT or
-            self.reply_pool.freeCount(.ordinary) < remote or for (parts) |p|
-        {
+        // Run again from an answer, it was let in when first read and is
+        // still counted: it waits for its parts' room rather than being
+        // refused for none. A full gather table refuses it: nothing wakes
+        // on that.
+        const rerun = self.reentryFor(conn, req.header.request_id) != null;
+        var short: ?u16 = null;
+        if (self.reply_pool.freeCount(.ordinary) < remote) {
+            for (parts) |p| if (p.owner != self.id) {
+                short = p.owner;
+                break;
+            };
+        } else for (parts) |p| {
             if (p.owner == self.id) continue;
-            if (!self.reply_pool.canTake(.ordinary, p.owner) or !mailboxes[p.owner].hasShare(@intCast(self.id))) break true;
-        } else false;
+            if (!self.reply_pool.canTake(.ordinary, p.owner) or !mailboxes[p.owner].hasShare(@intCast(self.id))) {
+                short = p.owner;
+                break;
+            }
+        }
+        if (rerun and self.gathers.hasRoom()) if (short) |t| {
+            if (!self.reply_pool.canTake(.ordinary, t)) {
+                self.holdReentry(conn, req, null, t, false, .reply_capacity);
+            } else {
+                mailboxes[t].wantShare(@intCast(self.id));
+                self.holdReentry(conn, req, null, t, false, .inbox);
+            }
+            return; // its state and parts go with the defer above
+        };
+        const busy = !self.gathers.hasRoom() or (!rerun and conn.forwards_in_flight >= Connection.MAX_FORWARDS_IN_FLIGHT) or short != null;
         if (busy) {
             if (self.shard_metrics) |sm| sm.recordCrossShardOverloaded(.gather);
             return error.GatherBusy;
@@ -3134,6 +3426,7 @@ pub const Shard = struct {
         // A forwarded request is answered where it came from, and counts
         // against that shard's client, not the proxy running it.
         self.gathers.get(ticket).?.reply_to = conn.proxy_for;
+        self.gathers.get(ticket).?.since_ms = self.firstRead(conn, req.header.request_id, nowMs());
         self.gathers.get(ticket).?.op_code = req.header.op_code;
         if (conn.proxy_for == null) conn.forwards_in_flight += 1;
         // This shard's own part was read while it is halted.
@@ -3231,8 +3524,14 @@ pub const Shard = struct {
         const was_stale = proto.answering_stale;
         proto.answering_stale = was_stale or e.stale;
         defer proto.answering_stale = was_stale;
+        const prev_since = self.merging_since_ms;
+        self.merging_since_ms = e.since_ms;
+        defer self.merging_since_ms = prev_since;
         e.context.op.merge(self, conn, e.request_id, e.context.state, bodies[0..e.answers.len]) catch
             return self.failGather(e, .internal_error, .{ .reason = .internal, .ran = .no, .message = "internal error: the parts' answers did not merge — retry" });
+        // Set by what the merge ran, outside any request's dispatch: the
+        // next request read says for itself whether it parked.
+        if (self.dispatching == null) conn.response_deferred = false;
         self.flushToClient(conn.fd);
         self.endGather(e);
     }
@@ -4314,6 +4613,9 @@ pub const Shard = struct {
             const name = if (req.namespace.len == 0) "default" else req.namespace;
             if (shard.namespace_handler.table.lookup(name) == null)
                 return shard.sendRefusal(conn, request_id, .no_namespace, NO_NAMESPACE);
+            const prev = shard.reentry;
+            shard.reentry = Reentry.of(conn, req.header.request_id, shard.merging_since_ms orelse nowMs(), self.origin, .rerun);
+            defer shard.reentry = prev;
             shard.runRequest(conn, req, self.origin);
         }
     };
@@ -4350,7 +4652,7 @@ pub const Shard = struct {
         };
         const index = at orelse self.edge.knownIndex(name);
         const asked = index != null or self.askingAbout(name);
-        w.* = .{ .active = true, .seq = self.edge.takeSeq(), .reply_to = conn.replyTo(), .origin = origin, .request_id = req.header.request_id, .bytes = bytes, .name = owned, .index = index, .local = at != null, .deadline_ms = now + edge_mod.WAIT_MS };
+        w.* = .{ .active = true, .seq = self.edge.takeSeq(), .since_ms = self.firstRead(conn, req.header.request_id, now), .reply_to = conn.replyTo(), .origin = origin, .request_id = req.header.request_id, .bytes = bytes, .name = owned, .index = index, .local = at != null, .deadline_ms = now + edge_mod.WAIT_MS };
         self.edge.count += 1;
         // One of the connection's requests waiting elsewhere, as a gather's.
         conn.forwards_in_flight += 1;
@@ -4452,6 +4754,7 @@ pub const Shard = struct {
         w.bytes = &.{};
         const reply_to = w.reply_to;
         const origin = w.origin;
+        const since = w.since_ms;
         self.endEdgeWait(w);
         defer self.allocator.free(bytes);
         // Run as the client's own request, now that its namespace resolves.
@@ -4463,6 +4766,9 @@ pub const Shard = struct {
         const conn = self.getConnection(s.fd) orelse return;
         if (conn.id != s.conn_id) return;
         const req = proto.Request.parse(bytes) catch unreachable; // serialized here
+        const prev = self.reentry;
+        self.reentry = Reentry.of(conn, req.header.request_id, since, origin, .rerun);
+        defer self.reentry = prev;
         self.runRequest(conn, req, origin);
         // Run from the tick, not from reading the client: nothing else
         // sends what it answered.
@@ -7604,7 +7910,7 @@ pub const Shard = struct {
             // A readable event can still arrive after a pause (same poll batch,
             // or an interest change not yet submitted); what it would read
             // could not drain, and would look like one oversized request.
-            if (conn.reads_paused or conn.closing or conn.waiting != null) return;
+            if (conn.reads_paused or conn.closing or conn.waiting != null or conn.reentries_held > 0) return;
 
             // Read no more than the read buffer has room for: bytes read and
             // not kept would be requests silently lost.
@@ -7680,7 +7986,7 @@ pub const Shard = struct {
     fn processRequests(self: *Shard, fd: i32, conn: *Connection) void {
         self.runRequests(fd, conn);
         // Read again once the request it waited on has gone or been refused.
-        if (conn.reads_held and conn.waiting == null and !conn.reads_paused and !conn.closing) {
+        if (conn.reads_held and conn.waiting == null and conn.reentries_held == 0 and !conn.reads_paused and !conn.closing) {
             self.reactor.modifyInterests(fd, .{ .readable = true, .writable = conn.hasPendingWrites() }) catch |err| {
                 log.err("shard {d}: could not read connection fd={d} again: {s}; closing it", .{ self.id, fd, @errorName(err) });
                 return self.markClosing(fd);
@@ -7697,6 +8003,8 @@ pub const Shard = struct {
 
         while (conn.read_buf.readable() >= header_size) {
             if (conn.closing) return;
+            // Behind a request of its held for room: nothing later runs first.
+            if (conn.reentries_held > 0) return self.holdReads(fd, conn);
             if (shouldPause(conn)) return self.pauseReads(fd, conn);
             // We need contiguous bytes for parsing. Copy readable data out.
             const available = conn.read_buf.readable();
@@ -7810,9 +8118,12 @@ pub const Shard = struct {
 
     fn resumeReads(self: *Shard, fd: i32, conn: *Connection) void {
         conn.reads_paused = false;
-        conn.reads_held = false;
+        // Paused when a request of its was held for room: still not read
+        // until that goes (`processRequests` reads it again).
+        const held = conn.reentries_held > 0;
+        conn.reads_held = held;
         self.paused_count -= 1;
-        self.reactor.modifyInterests(fd, .{ .readable = true, .writable = conn.hasPendingWrites() }) catch self.noteArmFailure("interest", fd);
+        self.reactor.modifyInterests(fd, .{ .readable = !held, .writable = conn.hasPendingWrites() }) catch self.noteArmFailure("interest", fd);
         // What it had already sent runs at the end of the tick, not inside
         // whoever resumed it; its socket may hold more that announces
         // nothing, so it is queued even with nothing buffered.
@@ -8084,13 +8395,14 @@ pub const Shard = struct {
     fn settleConnections(self: *Shard) void {
         self.liftStalledPauses();
         if (self.pending_cancels.items.len > 0) self.sendPendingCancels();
+        self.resumeReentries();
         self.resumeWaiting();
         std.mem.swap(std.ArrayListUnmanaged(i32), &self.resume_fds, &self.resume_running);
         var ran = false;
         for (self.resume_running.items) |fd| {
             const conn = self.getConnection(fd) orelse continue;
             conn.resume_queued = false;
-            if (conn.closing or conn.reads_paused or conn.waiting != null) continue;
+            if (conn.closing or conn.reads_paused or conn.waiting != null or conn.reentries_held > 0) continue;
             ran = true;
             self.processRequests(fd, conn);
             // Bytes left in the socket while it waited or was paused get no
@@ -12362,6 +12674,390 @@ test "Shard: a client's writes to one namespace are refused overloaded past its 
     two.settle();
 }
 
+/// Shard `to`'s share of its inbox for sender `from`, filled with
+/// requests it hasn't drained.
+fn spendShare(to: *Shard, from: u8) void {
+    while (to.mailbox.hasShare(from)) _ = to.mailbox.sendOnShare(.{ .tag = .forward_request, .src_shard = from });
+}
+
+/// Shard 0 alone, until `s` has an answer from it on its reply ring.
+fn shard0Answers(two: *TwoShards, s: *Shard) void {
+    const a = &two.shards[0];
+    for (0..32) |_| {
+        _ = a.drainInbox();
+        _ = a.applyCommitted();
+        a.namespace_handler.settle(a);
+        if (s.mailbox.replies.pending() > 0) return;
+    }
+}
+
+test "Shard: a write into a new namespace, whose share on its key's shard is spent when shard 0 answers, waits for room and applies, unrefused" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, nextNamespaceId(a), 0, &kbuf);
+    b.runRequest(c.conn, try ParkTest.request(.kv_put, 7, "fresh", k, "v", ""), .client);
+    shard0Answers(&two, b);
+    // Spent before shard 1 hears: the write runs again, and waits.
+    spendShare(a, 1);
+    _ = b.drainInbox();
+    try expectNoAnswer(c, b);
+    try std.testing.expectEqual(@as(u32, 1), b.reentries.count);
+    try std.testing.expectEqual(@as(u16, 1), c.conn.reentries_held);
+    // Room once shard 0 drains: it goes.
+    while (a.drainInbox() > 0) {}
+    b.settleConnections();
+    try std.testing.expectEqual(@as(u32, 0), b.reentries.count);
+    two.settle();
+    var out: [512]u8 = undefined;
+    const resp = try nextAnswer(c, b, &out);
+    try std.testing.expectEqual(@as(u64, 7), resp.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    var body: [64]u8 = undefined;
+    b.runRequest(c.conn, edgeGet(&body, 8, "fresh", k), .client);
+    two.settle();
+    const got = try nextAnswer(c, b, &out);
+    var diag: schema.Diagnostic = .{};
+    try std.testing.expectEqualStrings("v", (try table_run.op("kv.get").response.decodeAll(got.data, &diag)).value);
+    try std.testing.expectEqual(@as(usize, 0), b.reply_pool.taken());
+    try std.testing.expectEqual(@as(u16, 0), c.conn.forwards_in_flight);
+}
+
+test "Shard: a request read while one of its connection's waits for room runs after it, through a resume of the connection" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, nextNamespaceId(a), 0, &kbuf);
+    b.runRequest(c.conn, try ParkTest.request(.kv_put, 7, "fresh", k, "v", ""), .client);
+    shard0Answers(&two, b);
+    spendShare(a, 1);
+    _ = b.drainInbox();
+    try std.testing.expectEqual(@as(u16, 1), c.conn.reentries_held);
+    // A read of the key, sent now: buffered, not run, while the write waits.
+    var body: [64]u8 = undefined;
+    const get = try Shard.serializeRequest(std.testing.allocator, edgeGet(&body, 8, "fresh", k));
+    defer std.testing.allocator.free(get);
+    _ = feedClient(c.pair[1], b, c.conn.fd, get);
+    b.queueResume(c.conn.fd, c.conn);
+    b.settleConnections();
+    try expectNoAnswer(c, b);
+    // The write goes, then the read, which finds it.
+    while (a.drainInbox() > 0) {}
+    for (0..4) |_| {
+        b.settleConnections();
+        two.settle();
+    }
+    var out: [1024]u8 = undefined;
+    var answers: [2]proto.Response = undefined;
+    try ParkTest.responses(b, c.conn, c.pair[1], &out, &answers);
+    try std.testing.expectEqual(@as(u64, 7), answers[0].header.request_id);
+    try std.testing.expectEqual(@as(u64, 8), answers[1].header.request_id);
+    var diag: schema.Diagnostic = .{};
+    try std.testing.expectEqualStrings("v", (try table_run.op("kv.get").response.decodeAll(answers[1].data, &diag)).value);
+}
+
+test "Shard: 64 pipelined writes into a new namespace, their share spent when shard 0 answers, all apply" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, nextNamespaceId(a), 0, &kbuf);
+    for (0..Connection.MAX_FORWARDS_IN_FLIGHT) |i| b.runRequest(c.conn, try ParkTest.request(.kv_put, 100 + i, "fresh", k, "v", ""), .client);
+    shard0Answers(&two, b);
+    spendShare(a, 1);
+    _ = b.drainInbox();
+    try std.testing.expect(b.reentries.count > 0);
+    for (0..64) |_| {
+        while (a.drainInbox() > 0) {}
+        b.settleConnections();
+        two.settle();
+        if (b.reentries.count == 0) break;
+    }
+    var out: [64 * 64]u8 = undefined;
+    var answers: [Connection.MAX_FORWARDS_IN_FLIGHT]proto.Response = undefined;
+    try ParkTest.responses(b, c.conn, c.pair[1], &out, &answers);
+    for (answers) |r| try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
+}
+
+test "Shard: a read held while shard 0 says whether its namespace is published, whose share is spent when it answers, waits for room and is answered, unrefused" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const ca = try TestClient.open(a);
+    defer _ = std.c.close(ca.pair[1]);
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, nextNamespaceId(a), 0, &kbuf);
+    // Created on shard 0, not yet published: shard 1 asks shard 0.
+    a.runRequest(ca.conn, try ParkTest.request(.namespace_create, 1, "", "xs", "", ""), .client);
+    _ = a.applyCommitted();
+    var body: [64]u8 = undefined;
+    b.runRequest(c.conn, edgeGet(&body, 8, "xs", k), .client);
+    shard0Answers(&two, b);
+    spendShare(a, 1);
+    _ = b.drainInbox();
+    try expectNoAnswer(c, b);
+    try std.testing.expectEqual(@as(u32, 1), b.reentries.count);
+    while (a.drainInbox() > 0) {}
+    b.settleConnections();
+    two.settle();
+    var out: [512]u8 = undefined;
+    const got = try nextAnswer(c, b, &out);
+    try std.testing.expectEqual(@as(u64, 8), got.header.request_id);
+    try std.testing.expect(got.header.status != @backingInt(proto.StatusCode.overloaded));
+}
+
+test "Shard: a read shard 0 held at its edge, whose share on its key's shard is spent when its namespace publishes, waits for room and is answered, unrefused" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(a, nextNamespaceId(a), 1, &kbuf);
+    a.runRequest(c.conn, try ParkTest.request(.namespace_create, 1, "", "xs", "", ""), .client);
+    _ = a.applyCommitted();
+    var body: [64]u8 = undefined;
+    a.runRequest(c.conn, edgeGet(&body, 8, "xs", k), .client);
+    try std.testing.expectEqual(@as(u32, 1), a.edge.count);
+    // Published with shard 1's share of shard 0's room spent.
+    spendShare(b, 0);
+    a.namespace_handler.settle(a);
+    _ = try a.tick(0);
+    try std.testing.expectEqual(@as(u32, 1), a.reentries.count);
+    while (b.drainInbox() > 0) {}
+    a.settleConnections();
+    two.settle();
+    var out: [1024]u8 = undefined;
+    var answers: [2]proto.Response = undefined;
+    try ParkTest.responses(a, c.conn, c.pair[1], &out, &answers);
+    try std.testing.expectEqual(@as(u64, 8), answers[1].header.request_id);
+    try std.testing.expect(answers[1].header.status != @backingInt(proto.StatusCode.overloaded));
+}
+
+test "Shard: a run-id request sent on to the shard found holding its run, its share there spent, waits for room and goes there, finding no second time" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    const sig = [_]u8{ 2, 0 } ++ "go".*;
+    const req = try ParkTest.request(.workflow_signal, 9, proto.DEFAULT_NAMESPACE, "myrun", &sig, "");
+    const auth = run_mod.authorize(.anonymous, .client, req).ok;
+    const st = try std.testing.allocator.create(Shard.RunFind);
+    st.* = .{ .bytes = try Shard.serializeRequest(std.testing.allocator, req), .auth = auth, .start_home = null };
+    defer Shard.RunFind.free(st, std.testing.allocator);
+    const Holds = table_run.op("system.holds_run").response;
+    var yes: [Holds.max_size]u8 = undefined;
+    var no: [Holds.max_size]u8 = undefined;
+    const bodies = [_][]const u8{ try Holds.encodeInto(&yes, .{ .holds = true }), try Holds.encodeInto(&no, .{ .holds = false }) };
+    // Shard 0 holds it; its share there spent.
+    spendShare(a, 1);
+    try Shard.RunFind.merge(b, c.conn, 9, st, &bodies);
+    try std.testing.expectEqual(@as(u32, 1), b.reentries.count);
+    try expectNoAnswer(c, b);
+    const gathers = b.gathers.inUse();
+    while (a.drainInbox() > 0) {}
+    b.settleConnections();
+    // Sent on to shard 0, not found again.
+    try std.testing.expectEqual(gathers, b.gathers.inUse());
+    try std.testing.expectEqual(@as(u32, 0), b.reentries.count);
+    two.settle();
+    var out: [512]u8 = undefined;
+    const got = try nextAnswer(c, b, &out);
+    try std.testing.expectEqual(@as(u64, 9), got.header.request_id);
+    try std.testing.expect(got.header.status != @backingInt(proto.StatusCode.overloaded));
+}
+
+test "Shard: a read across shards started from shard 0's answer, its share spent, waits for its parts' room instead of being refused busy" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const ca = try TestClient.open(a);
+    defer _ = std.c.close(ca.pair[1]);
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var k0buf: [16]u8 = undefined;
+    var k1buf: [16]u8 = undefined;
+    const id = nextNamespaceId(a);
+    const k0 = try keyOn(b, id, 0, &k0buf);
+    const k1 = try keyOn(b, id, 1, &k1buf);
+    a.runRequest(ca.conn, try ParkTest.request(.namespace_create, 1, "", "xs", "", ""), .client);
+    _ = a.applyCommitted();
+    var body: [128]u8 = undefined;
+    b.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_mget, 8), .namespace = "xs", .key = "", .value = try mget_mod.pieceBody(&body, &.{ k0, k1 }) }, .client);
+    shard0Answers(&two, b);
+    spendShare(a, 1);
+    _ = b.drainInbox();
+    try expectNoAnswer(c, b);
+    try std.testing.expectEqual(@as(u32, 1), b.reentries.count);
+    while (a.drainInbox() > 0) {}
+    b.settleConnections();
+    two.settle();
+    var out: [512]u8 = undefined;
+    const got = try nextAnswer(c, b, &out);
+    try std.testing.expectEqual(@as(u64, 8), got.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), got.header.status);
+}
+
+test "Shard: a connection that closes while its request waits for room leaves nothing held or counted" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, nextNamespaceId(a), 0, &kbuf);
+    b.runRequest(c.conn, try ParkTest.request(.kv_put, 7, "fresh", k, "v", ""), .client);
+    shard0Answers(&two, b);
+    spendShare(a, 1);
+    _ = b.drainInbox();
+    try std.testing.expectEqual(@as(u32, 1), b.reentries.count);
+    try std.testing.expect(b.queued[0][0] > 0);
+    _ = std.c.close(c.pair[1]);
+    b.closeConnection(c.conn.fd);
+    try std.testing.expectEqual(@as(u32, 0), b.reentries.count);
+    try std.testing.expectEqual(@as(u32, 0), b.queued[0][0]);
+}
+
+test "Shard: a request running again with every hold slot taken is refused as that, not as a full inbox" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, nextNamespaceId(a), 0, &kbuf);
+    b.runRequest(c.conn, try ParkTest.request(.kv_put, 7, "fresh", k, "v", ""), .client);
+    shard0Answers(&two, b);
+    spendShare(a, 1);
+    // Every slot held by connections long gone.
+    while (b.reentries.free()) |e| b.reentries.hold(e, .{ .active = true, .seq = b.reentries.takeSeq(), .fd = -1 });
+    _ = b.drainInbox();
+    var out: [512]u8 = undefined;
+    const resp = try nextAnswer(c, b, &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), resp.header.status);
+    try std.testing.expect(std.mem.indexOf(u8, (try resp.refused()).message, "too many requests are waiting here for room") != null);
+}
+
+test "Shard: a request held again for its connection's blocking reads, though shard 0 has room, is refused once it has waited its time" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, .default, 0, &kbuf);
+    var body: [128]u8 = undefined;
+    const req = try ParkTest.request(.queue_dequeue, 7, proto.DEFAULT_NAMESPACE, k, try table_run.op("queue.dequeue").request.encodeInto(&body, .{ .consumer = "c1", .count = 1, .lease_ms = null, .block_ms = 30_000, .ack = false }), "");
+    const auth = switch (run_mod.authorize(c.conn.principal, .client, req)) {
+        .ok => |x| x,
+        .refused => return error.Refused,
+    };
+    // Its connection's blocking reads at their cap: held for that, and held
+    // again each time it runs, though shard 0 has room.
+    c.conn.blocking_in_flight = Connection.MAX_BLOCKING_IN_FLIGHT;
+    defer c.conn.blocking_in_flight = 0;
+    b.reentry = Shard.Reentry.of(c.conn, 7, Shard.nowMs() -| Shard.ASK_WAIT_MS, .client, .rerun);
+    b.forwardToShard(0, c.conn, req, auth);
+    b.reentry = null;
+    try std.testing.expectEqual(@as(u32, 1), b.reentries.count);
+    try expectNoAnswer(c, b);
+    b.resumeReentries();
+    try std.testing.expectEqual(@as(u32, 0), b.reentries.count);
+    var out: [512]u8 = undefined;
+    const resp = try nextAnswer(c, b, &out);
+    try std.testing.expectEqual(@as(u64, 7), resp.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), resp.header.status);
+    try std.testing.expectEqual(@as(u16, 0), c.conn.forwards_in_flight);
+}
+
+test "Shard: a paused connection whose request is held for room is still not read when its pause lifts, until that request goes" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, nextNamespaceId(a), 0, &kbuf);
+    b.runRequest(c.conn, try ParkTest.request(.kv_put, 7, "fresh", k, "v", ""), .client);
+    shard0Answers(&two, b);
+    spendShare(a, 1);
+    b.pauseReads(c.conn.fd, c.conn);
+    _ = b.drainInbox();
+    try std.testing.expectEqual(@as(u32, 1), b.reentries.count);
+    // Its answers flushed as it drained lift the pause; else its stall does.
+    if (c.conn.reads_paused) b.resumeReads(c.conn.fd, c.conn);
+    try std.testing.expect(!c.conn.reads_paused and c.conn.reads_held);
+    while (a.drainInbox() > 0) {}
+    b.settleConnections();
+    two.settle();
+    var out: [512]u8 = undefined;
+    const resp = try nextAnswer(c, b, &out);
+    try std.testing.expectEqual(@as(u64, 7), resp.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expect(!c.conn.reads_held);
+}
+
+test "Shard: a client request refused before it goes to another shard says whether its share there was spent or that shard's ring was full" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var sm = ShardMetrics{ .shard_id = 1 };
+    b.shard_metrics = &sm;
+    defer b.shard_metrics = null;
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, .default, 0, &kbuf);
+    // Its share spent: share_spent.
+    spendShare(a, 1);
+    b.forwardToShard(0, c.conn, try ParkTest.request(.kv_put, 1, proto.DEFAULT_NAMESPACE, k, "v", ""), run_mod.authorize(.anonymous, .client, try ParkTest.request(.kv_put, 1, proto.DEFAULT_NAMESPACE, k, "v", "")).ok);
+    try std.testing.expectEqual(@as(u64, 1), sm.forward_refused[@backingInt(ShardMetrics.ForwardRefused.share_spent)].load(.monotonic));
+    while (a.drainInbox() > 0) {}
+    // Its share free, the ring full of what is sent on none: ring_full.
+    while (a.mailbox.inbox.send(.{ .tag = .worker_report })) {}
+    b.forwardToShard(0, c.conn, try ParkTest.request(.kv_put, 2, proto.DEFAULT_NAMESPACE, k, "v", ""), run_mod.authorize(.anonymous, .client, try ParkTest.request(.kv_put, 2, proto.DEFAULT_NAMESPACE, k, "v", "")).ok);
+    try std.testing.expectEqual(@as(u64, 1), sm.forward_refused[@backingInt(ShardMetrics.ForwardRefused.ring_full)].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), sm.forward_refused[@backingInt(ShardMetrics.ForwardRefused.share_spent)].load(.monotonic));
+    while (a.drainInbox() > 0) {}
+}
+
 test "Shard: a write on shard 1 to a namespace nobody created is answered once, and shard 1 logs only the write" {
     var two: TwoShards = undefined;
     try two.init();
@@ -15349,7 +16045,7 @@ fn feedClient(client_fd: std.posix.fd_t, shard: *Shard, conn_fd: i32, data: []co
         }
         shard.readFromClient(conn_fd);
         const conn = shard.getConnection(conn_fd) orelse break;
-        if (conn.closing or conn.reads_paused or conn.waiting != null) break;
+        if (conn.closing or conn.reads_paused or conn.waiting != null or conn.reentries_held > 0) break;
         if (sent == data.len and unreadBytes(conn_fd) == 0) break;
     }
     return sent;
@@ -22638,6 +23334,82 @@ test "actions: a report counts toward its worker's stats on the worker's own sha
     _ = feedClient(t.cb.pair[1], &t.two.shards[1], t.cb.conn.fd, done);
     t.two.settle();
     try std.testing.expectEqual(@as(u64, 1), here.worker_handler.find(.default, t.worker).?.tasks_completed);
+}
+
+test "actions: an await whose next owner's ask meets a spent share parks, and gets the task a run there brings, never an internal error" {
+    var t: TwoShardActions = undefined;
+    try t.init();
+    defer t.deinit();
+    const here = &t.two.shards[0];
+    const there = &t.two.shards[1];
+    // Two actions, both the other shard's: the second is asked once the
+    // first says none.
+    var other_buf: [16]u8 = undefined;
+    const other = for (0..256) |i| {
+        const n = try std.fmt.bufPrint(&other_buf, "other-{d}", .{i});
+        if (there.router.route(node_router.routeNsKey(.default, n)) == .local) break n;
+    } else return error.NoName;
+    _ = try applyActionEntry(there, .action_register, testRegister(other), 2, 1);
+    var b: [256]u8 = undefined;
+    const frame = try testRequest(.action_await, 1, t.worker, try ActionsHandler.for_tests.awaitBody(&b, &.{ other, t.name }, 30_000, null));
+    defer std.testing.allocator.free(frame);
+    _ = feedClient(t.ca.pair[1], here, t.ca.conn.fd, frame);
+    _ = there.drainInbox();
+    // The none comes back with this shard's share there spent.
+    spendShare(there, 0);
+    _ = here.drainInbox();
+    try expectNoAnswer(t.ca, here);
+    while (there.drainInbox() > 0) {}
+    try t.invoke(2, "\x00late");
+    t.two.settle();
+    const resp = try nextAnswer(t.ca, here, &t.out);
+    try std.testing.expectEqual(@as(u64, 1), resp.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expectEqualStrings("late", (try ActionsHandler.for_tests.task(resp.data)).?.input);
+}
+
+test "actions: awaits woken by what a request run again applies, the second asking another shard on a spent share, park: the re-run's hold is its own" {
+    var t: TwoShardActions = undefined;
+    try t.init();
+    defer t.deinit();
+    const here = &t.two.shards[0];
+    const there = &t.two.shards[1];
+    // An action on shard 0 too: awaits on shard 1 ask there for it.
+    var other_buf: [16]u8 = undefined;
+    const other = for (0..256) |i| {
+        const n = try std.fmt.bufPrint(&other_buf, "other-{d}", .{i});
+        if (here.router.route(node_router.routeNsKey(.default, n)) == .local) break n;
+    } else return error.NoName;
+    _ = try applyActionEntry(here, .action_register, testRegister(other), 2, 1);
+    var wbufs: [2][16]u8 = undefined;
+    var found: usize = 0;
+    var workers: [2][]const u8 = undefined;
+    for (0..256) |i| {
+        if (found == 2) break;
+        const w = try std.fmt.bufPrint(&wbufs[found], "aw-{d}", .{i});
+        if (there.router.route(node_router.routeNsKey(.default, w)) != .local) continue;
+        workers[found] = w;
+        found += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), found);
+    var b: [256]u8 = undefined;
+    for (workers, 1..) |w, id| {
+        const frame = try testRequest(.action_await, id, w, try ActionsHandler.for_tests.awaitBody(&b, &.{ t.name, other }, 30_000, null));
+        defer std.testing.allocator.free(frame);
+        _ = feedClient(t.cb.pair[1], there, t.cb.conn.fd, frame);
+    }
+    t.two.settle();
+    try std.testing.expectEqual(@as(u16, 2), there.waiter_pool.countByKind(.action_await));
+    spendShare(here, 1);
+    // The invoke runs again from an answer; what it applies wakes both.
+    const frame = try testRequest(.action_invoke, 50, t.name, "\x00job");
+    defer std.testing.allocator.free(frame);
+    const req = try proto.Request.parse(frame);
+    there.reentry = Shard.Reentry.of(t.cb.conn, 50, Shard.nowMs(), .client, .rerun);
+    there.runRequest(t.cb.conn, req, .client);
+    there.reentry = null;
+    try std.testing.expectEqual(@as(u32, 0), there.reentries.count);
+    try std.testing.expectEqual(@as(u16, 1), there.waiter_pool.countByKind(.action_await));
 }
 
 test "actions: an await asking another shard whose wait ran out meanwhile answers no task, and isn't asked again" {
