@@ -33,6 +33,7 @@ const router = @import("../node/router.zig");
 const proto = @import("../protocol/proto.zig");
 const stream_mod = @import("../projection/stream.zig");
 const MAX_QUALIFIED_KEY = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
+const stream_names = @import("names.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -397,6 +398,7 @@ fn configApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     const cmd = commandOf(e) orelse return error.Halt;
     if (cmd.namespace_id == .invalid or cmd.key.len == 0) return error.Halt;
     const c = StreamConfig.decode(cmd.value) orelse return error.Halt;
+    if (stream_names.reservedStreamName(cmd.key)) return out.refuse(.unauthorized, .reserved_key, stream_names.RESERVED);
     // Only an alter drops a bound; its handler sends nothing else.
     if (c.op == .create and (c.retention_age_s == StreamConfig.CLEAR or c.retention_count == StreamConfig.CLEAR)) return out.refuse(.bad_request, .malformed, CLEAR_ON_CREATE);
     const sk: StreamKey = cmd.namespace_id.bytes() ++ hashOf(cmd.key);
@@ -444,6 +446,11 @@ fn appendApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     const cmd = commandOf(e).?;
     const sk: StreamKey = cmd.namespace_id.bytes() ++ hashOf(cmd.key);
     const found: ?Meta.Value = if (try view.get(Metas, &sk)) |f| f.v else null;
+    // A name the server keeps is refused here too, for an append no handler
+    // checked (a channel's), and by the name it would land in: one whose
+    // hash a reserved stream's record holds.
+    if (stream_names.reservedStreamName(cmd.key)) return out.refuse(.unauthorized, .reserved_key, stream_names.RESERVED);
+    if (found) |f| if (f.exists and stream_names.reservedStreamName(f.name)) return out.refuse(.unauthorized, .reserved_key, stream_names.RESERVED);
     var m = if (found) |f| (if (f.exists) f else newMeta(cmd.key, e.header.timestamp_ns, f)) else newMeta(cmd.key, e.header.timestamp_ns, null);
     const av = stream_mod.decodeAppendValue(cmd.value);
     const n = @max(1, stream_mod.batchRecordCount(av.payload));
@@ -1034,6 +1041,40 @@ test "streams machine: ids still rise across a delete and a recreate with the cl
     try testing.expect(first.greaterThan(old_last));
     const next = try t.append("s", 101, 1, 4);
     try testing.expect(next.greaterThan(first));
+}
+
+test "streams machine: an append or create naming a stream the server keeps is refused at apply, and makes nothing" {
+    var t = TestStreams.init();
+    defer t.deinit();
+    var vb: [1024]u8 = undefined;
+    const appended = try t.run(.stream_append, 0, "_flo:history", stream_mod.appendValueOf(&vb, 1, 4), std.time.ns_per_ms);
+    try testing.expectEqual(@import("../protocol/reason.zig").Reason.reserved_key, appended.refused().?.refusal.reason);
+    try testing.expect((try t.config(create(1, 0, 0), "_flo:history", 1)).refused() != null);
+    try testing.expectEqual(@as(u64, 0), t.store.family(Metas.ID).count);
+    try testing.expectEqual(@as(u64, 0), t.store.family(Records.ID).count);
+    // A name only like it is a stream.
+    _ = try t.append("_flo", 1, 1, 4);
+}
+
+test "streams machine: an append whose name hashes as a reserved stream's is refused by the name it would land in" {
+    var t = TestStreams.init();
+    defer t.deinit();
+    // A reserved stream's meta, as no handler or apply would make one, and
+    // an append whose key hashes as its own.
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var keys = KeySet.init(arena.allocator());
+        try keys.addIn(Metas.ID, .default, &hashOf("x"));
+        var view = View.init(&t.store, arena.allocator(), &keys);
+        var mk: [12]u8 = undefined;
+        try view.put(Metas, storeKey(&mk, .default, &hashOf("x")), .{ .v = newMeta("_flo:history", 1, null) });
+        try view.commit();
+    }
+    var vb: [1024]u8 = undefined;
+    const appended = try t.run(.stream_append, 0, "x", stream_mod.appendValueOf(&vb, 1, 4), std.time.ns_per_ms);
+    try testing.expectEqual(@import("../protocol/reason.zig").Reason.reserved_key, appended.refused().?.refusal.reason);
+    try testing.expectEqual(@as(u64, 0), t.store.family(Records.ID).count);
 }
 
 test "streams machine: an alter's clear drops a bound, and a create carrying one is refused" {

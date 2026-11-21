@@ -29055,6 +29055,51 @@ test "Shard: a group read in a namespace never created is refused no_namespace, 
     try std.testing.expect(shard.namespace_handler.idOf("nope") == null);
 }
 
+test "Shard: every group op naming a reserved stream is refused unauthorized, not run, and logs nothing" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [512]u8 = undefined;
+    const group_consumer = "\x01\x00" ++ "g" ++ "\x01\x00" ++ "c";
+    const so = @import("../protocol/stream_ops.zig");
+    var bodies: [6][256]u8 = undefined;
+    const table_ops = [_]struct { op: proto.OpCode, body: []const u8 }{
+        .{ .op = .stream_group_list, .body = try so.op("stream.group.list").request.encodeInto(&bodies[0], .{}) },
+        .{ .op = .stream_group_members, .body = try so.op("stream.group.members").request.encodeInto(&bodies[1], .{ .group = "g" }) },
+        .{ .op = .stream_group_steal, .body = try so.op("stream.group.steal").request.encodeInto(&bodies[2], .{ .group = "g", .consumer = "c", .min_idle_ms = 1, .lease_ms = null, .records = .{ .bytes = "", .count = 0 } }) },
+        .{ .op = .stream_group_dlq_list, .body = try so.op("stream.group.dlq_list").request.encodeInto(&bodies[3], .{ .group = "g", .limit = 20, .after = null }) },
+        .{ .op = .stream_group_dlq_requeue, .body = try so.op("stream.group.dlq_requeue").request.encodeInto(&bodies[4], .{ .group = "g", .records = null, .all = true, .limit = 1 }) },
+        .{ .op = .stream_group_dlq_delete, .body = try so.op("stream.group.dlq_delete").request.encodeInto(&bodies[5], .{ .group = "g", .records = null, .all = true, .limit = 1, .dry_run = false }) },
+    };
+    const last = shard.raft_node.log.lastIndex();
+    var id: u64 = 0;
+    for ([_]proto.OpCode{ .stream_group_create, .stream_group_delete, .stream_group_read, .stream_group_ack, .stream_group_nack, .stream_group_touch, .stream_group_info, .stream_group_pending }) |op| {
+        id += 1;
+        shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(op, id), .namespace = "default", .key = "_flo:history", .value = group_consumer }, .client);
+        try expectReserved(try nextAnswer(c, &shard, &out));
+    }
+    for (table_ops) |t| {
+        id += 1;
+        shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(t.op, id), .namespace = "default", .key = "_flo:history", .value = t.body }, .client);
+        try expectReserved(try nextAnswer(c, &shard, &out));
+    }
+    try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
+    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.stream_group_read));
+}
+
+fn expectReserved(r: proto.Response) !void {
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unauthorized), r.header.status);
+    const refused = try r.refused();
+    try std.testing.expectEqual(proto.Ran.no, refused.ran);
+    try std.testing.expectEqual(proto.Reason.reserved_key, refused.reason);
+}
+
 test "Shard: a follower's reads of a namespace it doesn't know share one ask of the leader, wait for its table, and run once it gets there" {
     var f: EdgeFollower = undefined;
     try f.init();

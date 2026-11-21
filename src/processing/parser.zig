@@ -1974,6 +1974,29 @@ test "parser: a stream or queue name holding a NUL, or too long, is refused at s
     }
 }
 
+test "parser: a job reading or writing a stream the server keeps is refused at submit; a queue or a look-alike isn't" {
+    const allocator = std.testing.allocator;
+    const reserved = @import("../stream/names.zig").RESERVED_WHY;
+    for ([_][]const u8{
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"_flo:history"}}],"sinks":[{"stream":{"name":"out"}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"stream":{"name":"_flo:history"}}]}
+    }) |json_def| {
+        var def = try parseJobDefinitionWithNamespace(allocator, json_def, "acme", null);
+        defer def.deinit(allocator);
+        try std.testing.expectEqualStrings(reserved, def.namespaceRefusal().?);
+    }
+    for ([_][]const u8{
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"queue":{"name":"_flo:q"}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"_flo"}}],"sinks":[{"stream":{"name":"x_flo:y"}}]}
+    }) |json_def| {
+        var def = try parseJobDefinitionWithNamespace(allocator, json_def, "acme", null);
+        defer def.deinit(allocator);
+        try std.testing.expect(def.namespaceRefusal() == null);
+    }
+}
+
 /// The diagnostic a job definition is refused with.
 fn expectRefused(content: []const u8, expected: ParseError, message: []const u8) !void {
     var diag: Diagnostic = .{};
