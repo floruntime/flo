@@ -121,6 +121,22 @@ comptime {
     for (CHARGED ++ EXEMPT) |id| if (!seen.isSet(id)) @compileError(std.fmt.comptimePrint("family {d} is classified by the memory pool but no machine declares it", .{id}));
 }
 
+/// The channel families the pool is charged for. A sink's admission leaves
+/// them out (`dataUseOf`): two shards over share mostly from what they send
+/// each other would otherwise hold each other's sinks for good.
+pub const CHANNEL = [_]u16{ 54, 55, 56, 59 };
+
+/// The charged families but the channels'.
+pub const data: store_mod.FamilySet = blk: {
+    var set = charged;
+    for (CHANNEL) |id| set.unset(id);
+    break :blk set;
+};
+
+comptime {
+    for (CHANNEL) |id| if (!listed(&CHARGED, id)) @compileError(std.fmt.comptimePrint("channel family {d} isn't charged", .{id}));
+}
+
 /// One family's charged bytes.
 fn familyUse(store: *const Store, id: u16) u64 {
     const f = store.family(id);
@@ -132,6 +148,15 @@ fn familyUse(store: *const Store, id: u16) u64 {
 pub fn useOf(store: *const Store) u64 {
     var total: u64 = 0;
     var it = charged.iterator(.{});
+    while (it.next()) |id| total += familyUse(store, @intCast(id));
+    return total;
+}
+
+/// The shard's pool use but its channels': what a sink's message is admitted
+/// against.
+pub fn dataUseOf(store: *const Store) u64 {
+    var total: u64 = 0;
+    var it = data.iterator(.{});
     while (it.next()) |id| total += familyUse(store, @intCast(id));
     return total;
 }
@@ -149,6 +174,18 @@ pub fn recount(store: *Store) u64 {
 }
 
 const testing = std.testing;
+
+test "pool: a sink is admitted against use but the channels'" {
+    for (CHANNEL) |id| try testing.expect(charged.isSet(id) and !data.isSet(id));
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    const kv = try store.allocRecord("k");
+    store.link(10, kv, try testing.allocator.dupe(u8, "v"));
+    const out = try store.allocRecord("o");
+    store.link(55, out, try testing.allocator.dupe(u8, "outbox"));
+    try testing.expectEqual(familyUse(&store, 10), dataUseOf(&store));
+    try testing.expectEqual(familyUse(&store, 10) + familyUse(&store, 55), useOf(&store));
+}
 
 test "pool: channel outboxes and parked messages are charged; inboxes are not" {
     // Full outboxes must show in the pool; an inbox is one record per sender.

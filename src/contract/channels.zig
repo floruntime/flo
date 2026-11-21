@@ -180,8 +180,66 @@ pub const TARGET_LEN = ce.TARGET_LEN;
 pub const Target = [ce.TARGET_LEN]u8;
 
 /// What a receiving leader has proposed and not yet applied of sink
-/// messages that may park: to one target, and to all.
-pub const InFlight = struct { target: u64 = 0, total: u64 = 0 };
+/// messages that may park, to one target and to all; of every sink message,
+/// parking or not (`sink`); of those from the sender at hand (`sink_own`);
+/// and how many groups send to it (`senders`).
+pub const InFlight = struct { target: u64 = 0, total: u64 = 0, sink: u64 = 0, sink_own: u64 = 0, senders: u16 = 1 };
+
+/// Whether a receiving leader takes a message in now, and if not, why:
+/// a full target, its shard over its share, or as many sink bytes in
+/// flight as it takes at once, which an apply releases.
+pub const Admit = enum { take, target_full, over_share, sinks_in_flight };
+
+/// Most bytes of sink messages a shard's leader has proposed and not yet
+/// applied while holding them to its share. Sinks are admitted against use
+/// plus what is in flight, client writes at apply against use alone: without
+/// a bound, the sinks in flight plus the client writes ahead of them could
+/// take use to about twice the share. The bound is split evenly over the
+/// senders, at least `SINK_IN_FLIGHT_MIN_SENDER` each, so a sender waits
+/// only on its own messages' applies, whose answers resume it at once, never
+/// on another sender's stream. With it, a share is passed by at most the
+/// larger of this and the senders' minimums, plus one message per sender.
+pub const SINK_IN_FLIGHT_MAX: u64 = 1 << 20;
+pub const SINK_IN_FLIGHT_MIN_SENDER: u64 = 64 << 10;
+pub var test_sink_in_flight_max: ?u64 = null;
+
+/// What one of `senders` groups may have in flight of sink messages.
+pub fn sinkInFlightCap(senders: u16) u64 {
+    if (test_sink_in_flight_max) |m| return @max(m / @max(senders, 1), 1);
+    return @max(SINK_IN_FLIGHT_MAX / @max(senders, 1), SINK_IN_FLIGHT_MIN_SENDER);
+}
+
+/// A shard's memory use, as a sink is admitted against it, and its share.
+pub const Budget = struct { use: u64, share: u64 };
+
+/// VOPR's stand-in for a shard's budget: its stores hold no client data and
+/// bind no share. Never set in a server.
+pub var test_budget: ?*const fn (read: ReadView) ?Budget = null;
+
+/// The budget a sink's message is held to: its leader's bound share, and the
+/// use but the channels' (`pool.dataUseOf`). Null while no share is bound.
+/// Once one is, it stays in force: a budget that falls to 0 logs no 0 share,
+/// so the last share holds rather than enforcement turning off.
+pub fn budgetOf(read: ReadView) ?Budget {
+    if (test_budget) |f| return f(read);
+    const bind = @import("../settings/machine.zig").boundShare(read) orelse return null;
+    return .{ .use = @import("../budget/pool.zig").dataUseOf(read.store), .share = bind.share_bytes };
+}
+
+/// Whether a sink's message of `bytes` fits its shard's share now, with
+/// what is in flight: every sender's sinks against the share, its own
+/// sender's against that sender's cap. One alone from a sender is taken
+/// past its cap, so a large one isn't held for good.
+pub fn sinkRoom(read: ReadView, bytes: u64, in: InFlight) Admit {
+    const b = budgetOf(read) orelse return .take;
+    if (b.use +| in.sink +| bytes > b.share) return .over_share;
+    if (in.sink_own > 0 and in.sink_own + bytes > sinkInFlightCap(in.senders)) return .sinks_in_flight;
+    return .take;
+}
+
+/// VOPR's planted bug `sink_gate_after_no_target`: a sink's message with no
+/// target to park under isn't held to its share. Never set in a server.
+pub var mutant_sink_gate_after_no_target = false;
 
 /// The target entry `e` writes as parking keys it, or null for none: its
 /// machine's tag (the machine's first entry type, which no other machine
@@ -815,8 +873,9 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
             return .{ .header = h, .payload = payload };
         }
 
-        /// Whether this group's leader takes message `m` in now. Only a
-        /// sink's message to a target may park. Past the shard's parked
+        /// Whether this group's leader takes message `m` in now. A sink's
+        /// message is held while its shard is over its share (`sinkRoom`),
+        /// target or not. Only a sink's message to a target may park. Past the shard's parked
         /// cap none is taken; past its target's, none for that target.
         /// The driver proposes a batch's messages before the first not
         /// taken, and that one and those after wait at their sender
@@ -829,12 +888,23 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
         /// one message: the one admitted below it. A new leader proposes
         /// only once its predecessor's inbounds have applied, so none is
         /// in flight uncounted.
-        pub fn admits(read: ReadView, m: ce.Message.Value, in_flight: InFlight) bool {
-            const target = sinkTarget(m) orelse return true;
-            if (shardParked(read).bytes + in_flight.total >= (test_parked_shard_max orelse PARKED_SHARD_MAX)) return false;
+        pub fn admits(read: ReadView, m: ce.Message.Value, in_flight: InFlight) Admit {
+            const sink = m.flags & entry_mod.Flags.SINK != 0;
+            // Every sink's message, with a target or not, is held to its
+            // shard's share; nothing else a channel carries is.
+            if (sink and !mutant_sink_gate_after_no_target) {
+                const room = sinkRoom(read, m.payload.len, in_flight);
+                if (room != .take) return room;
+            }
+            const target = sinkTarget(m) orelse return .take;
+            if (mutant_sink_gate_after_no_target) {
+                const room = sinkRoom(read, m.payload.len, in_flight);
+                if (room != .take) return room;
+            }
+            if (shardParked(read).bytes + in_flight.total >= (test_parked_shard_max orelse PARKED_SHARD_MAX)) return .target_full;
             const parked = targetParked(read, target);
-            if (parked.count == 0 and in_flight.target == 0) return true;
-            return parked.bytes + in_flight.target < (test_parked_target_max orelse PARKED_TARGET_MAX);
+            if (parked.count == 0 and in_flight.target == 0) return .take;
+            return if (parked.bytes + in_flight.target < (test_parked_target_max orelse PARKED_TARGET_MAX)) .take else .target_full;
         }
 
         /// The target a sink's message `m` may park under, or null for one
@@ -1236,6 +1306,49 @@ test "channels: an inbound whose message's flags are the other lane's, or naming
     no_lane[2] = 7;
     try testing.expectError(error.Halt, a.run(&Probed.machine, .channel_inbound, no_lane));
     try testing.expectEqual(before, replicaState(&a));
+}
+
+fn sixtyOfAHundred(_: ReadView) ?Budget {
+    return .{ .use = 60, .share = 100 };
+}
+
+test "channels: a sink's message is held to its shard's share and its sender's sinks in flight; nothing else a channel carries is" {
+    var store = store_mod.Store.init(testing.allocator);
+    defer store.deinit();
+    const read: ReadView = .{ .store = &store };
+    // No share bound: nothing is held.
+    try testing.expectEqual(Admit.take, sinkRoom(read, 1 << 30, .{}));
+
+    test_budget = sixtyOfAHundred;
+    defer test_budget = null;
+    // Two senders, 15 each.
+    test_sink_in_flight_max = 30;
+    defer test_sink_in_flight_max = null;
+    try testing.expectEqual(@as(u64, 15), sinkInFlightCap(2));
+    try testing.expectEqual(Admit.take, sinkRoom(read, 40, .{ .senders = 2 }));
+    try testing.expectEqual(Admit.over_share, sinkRoom(read, 41, .{ .senders = 2 }));
+    // Every sender's sinks count against the share.
+    try testing.expectEqual(Admit.over_share, sinkRoom(read, 30, .{ .sink = 11, .senders = 2 }));
+    // Past its own cap, with room in the share: held until its own apply
+    // releases what is in flight. One alone isn't, and another sender's
+    // sinks in flight don't hold it.
+    try testing.expectEqual(Admit.sinks_in_flight, sinkRoom(read, 10, .{ .sink = 10, .sink_own = 10, .senders = 2 }));
+    try testing.expectEqual(Admit.take, sinkRoom(read, 5, .{ .sink = 10, .sink_own = 10, .senders = 2 }));
+    try testing.expectEqual(Admit.take, sinkRoom(read, 25, .{ .sink = 10, .sink_own = 0, .senders = 2 }));
+    test_sink_in_flight_max = null;
+    // A server's floor per sender.
+    try testing.expectEqual(SINK_IN_FLIGHT_MIN_SENDER, sinkInFlightCap(256));
+    try testing.expectEqual(SINK_IN_FLIGHT_MAX / 4, sinkInFlightCap(4));
+
+    // A sink's message is held whether or not it has a target; one that
+    // isn't a sink's, a run's history among them, never is.
+    const big: [64]u8 = @splat('x');
+    const sink: ce.Message.Value = .{ .slot = 1, .entry_type = @backingInt(EntryType.kv_put), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = 0, .origin_ns = 0, .payload = &big };
+    try testing.expect(Probed.sinkTarget(sink) == null);
+    try testing.expectEqual(Admit.over_share, Probed.admits(read, sink, .{}));
+    var other = sink;
+    other.flags = 0;
+    try testing.expectEqual(Admit.take, Probed.admits(read, other, .{}));
 }
 
 test "channels: a send is written to the outbox with its entry, in seq order per receiver" {
@@ -1656,11 +1769,11 @@ test "channels: past a target's parked cap, only that target's messages wait at 
     try deliver(&a, &b, 1, 2);
     try testing.expect(targetParked(b.read(), probeTarget(1)).bytes >= 16);
     const full = a.outRecord(1, 2).?;
-    try testing.expect(!Probed.admits(b.read(), .{ .slot = full.slot, .entry_type = full.entry_type, .layout_epoch = 0, .flags = full.flags, .origin_kind = full.origin_kind, .origin_ns = full.origin_ns, .payload = full.payload }, .{}));
+    try testing.expectEqual(Admit.target_full, Probed.admits(b.read(), .{ .slot = full.slot, .entry_type = full.entry_type, .layout_epoch = 0, .flags = full.flags, .origin_kind = full.origin_kind, .origin_ns = full.origin_ns, .payload = full.payload }, .{}));
     // Another target on the same channel is taken.
     try a.probeTo(3, "message-thr-0003");
     const other = a.outRecord(1, 3).?;
-    try testing.expect(Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = other.flags, .origin_kind = other.origin_kind, .origin_ns = other.origin_ns, .payload = other.payload }, .{}));
+    try testing.expectEqual(Admit.take, Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = other.flags, .origin_kind = other.origin_kind, .origin_ns = other.origin_ns, .payload = other.payload }, .{}));
 }
 
 test "channels: past the shard's parked cap, a sink's message to any target waits at its sender, even one with nothing parked" {
@@ -1677,9 +1790,9 @@ test "channels: past the shard's parked cap, a sink's message to any target wait
     try a.probeTo(3, "message-thr-0003");
     const other = a.outRecord(1, 3).?;
     try testing.expectEqual(@as(u64, 0), targetParked(b.read(), probeTarget(3)).count);
-    try testing.expect(!Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = other.flags, .origin_kind = other.origin_kind, .origin_ns = other.origin_ns, .payload = other.payload }, .{}));
+    try testing.expectEqual(Admit.target_full, Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = other.flags, .origin_kind = other.origin_kind, .origin_ns = other.origin_ns, .payload = other.payload }, .{}));
     // Not a sink's: it never parks, so it is taken.
-    try testing.expect(Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = 0, .origin_kind = other.origin_kind, .origin_ns = other.origin_ns, .payload = other.payload }, .{}));
+    try testing.expectEqual(Admit.take, Probed.admits(b.read(), .{ .slot = other.slot, .entry_type = other.entry_type, .layout_epoch = 0, .flags = 0, .origin_kind = other.origin_kind, .origin_ns = other.origin_ns, .payload = other.payload }, .{}));
 }
 
 test "channels: only a sink's message parks behind; another for the same target, on the main lane, goes to it" {
