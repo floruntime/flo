@@ -203,9 +203,9 @@ const Sim = struct {
     }
 };
 
-/// Probe `n` of group `g`'s name: a history probe's leads "hist".
+/// Probe `n` of group `g`'s name: a history probe's ends 'H'.
 fn bodyOf(buf: *[16]u8, g: u16, n: u64, history: bool) []const u8 {
-    return (if (history) std.fmt.bufPrint(buf, "hist{d:0>3}{d:0>9}", .{ g, n }) else std.fmt.bufPrint(buf, "g{d:0>3}-{d:0>11}", .{ g, n })) catch unreachable;
+    return (if (history) std.fmt.bufPrint(buf, "h{d:0>3}{d:0>11}H", .{ g, n }) else std.fmt.bufPrint(buf, "g{d:0>3}-{d:0>11}", .{ g, n })) catch unreachable;
 }
 
 /// Whether a workload's probe `n` is a history probe: every fourth, when
@@ -499,9 +499,9 @@ test "channel driver: a history message isn't held behind a sink's message its t
     // behind it on the main lane; a history message to slot 3 goes.
     try sim.probeBody(b, 1, "capped-0000-0002");
     try sim.probeBody(b, 3, "behind-0000-0003");
-    try sim.probeBody(b, 3, "hist-00000000004");
+    try sim.probeBody(b, 3, "hist-0000000000H");
     for (0..1000) |_| try sim.step();
-    try testing.expect(hasGot(b, "hist-00000000004"));
+    try testing.expect(hasGot(b, "hist-0000000000H"));
     try testing.expect(!hasGot(b, "behind-0000-0003"));
     try testing.expectEqual(@as(u64, 2), channels.inOf(.{ .store = &b.store }, 1, .main).?.applied);
     try testing.expectEqual(@as(u64, 1), channels.inOf(.{ .store = &b.store }, 1, .history).?.applied);

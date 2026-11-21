@@ -619,10 +619,24 @@ pub const GroupChannel = struct {
         var slot = if (r.uintLessThan(u8, 4) == 0) r.uintLessThan(u16, 4096) else POOL[r.uintLessThan(usize, POOL.len)];
         // Every fifth is a run's history's, on the history lane: to a slot
         // of its own group's, chosen without a draw, so the workload's
-        // draws are as before.
+        // draws are as before. Some of those its receiver refuses, or that
+        // send more than an apply may, so a refusal on that lane takes its
+        // seq too.
         if (c.probes_proposed % 5 == 4) {
             const n: u16 = @intCast(c.groups.sims.len);
-            body[0..4].* = "hist".*;
+            const kinds = [_][]const u8{ "hist-", "refuse", "flood-", "hist-" };
+            const kind = kinds[(c.probes_proposed / 5) % kinds.len];
+            var name: [16]u8 = @splat('0');
+            @memcpy(name[0..kind.len], kind);
+            _ = std.fmt.bufPrint(name[kind.len..15], "{d:0>2}", .{c.g}) catch return;
+            var tail = c.probes_proposed;
+            var i: usize = 14;
+            while (i >= kind.len + 2 and tail > 0) : (i -= 1) {
+                name[i] = '0' + @as(u8, @intCast(tail % 10));
+                tail /= 10;
+            }
+            name[15] = 'H';
+            body[0..16].* = name;
             slot = slot - slot % n + c.g;
             if (slot >= 4096) slot -= n;
         }

@@ -237,6 +237,9 @@ pub const Counts = struct {
     pressured: u64 = 0,
     trims_proposed: u64 = 0,
     acks_refused: u64 = 0,
+    /// Batches dropped for a message that doesn't fit its lane: a sending
+    /// build's bug.
+    batches_dropped: u64 = 0,
     /// Ticks that read every peer's records; the rest found nothing changed.
     scans: u64 = 0,
 };
@@ -704,6 +707,13 @@ pub const Driver = struct {
             self.counts.gaps += 1;
             return self.answer(from, lane, applied, dur, accepted + 1, .ok, read, io);
         }
+        // A message that doesn't fit its lane is the sending build's bug:
+        // the frame is dropped here, before it can halt this group at apply,
+        // which refuses it too.
+        if (!laneFits(lane, from, self.group, b)) {
+            self.counts.batches_dropped += 1;
+            return;
+        }
         // Propose from the first seq not yet accepted.
         if (!self.buffers()) return self.answer(from, lane, applied, dur, 0, .busy, read, io);
         var w: schema.Writer = .{ .buf = self.msgs };
@@ -718,8 +728,8 @@ pub const Driver = struct {
             // after it: the batch's prefix goes. It is stamped with this
             // node's caps before it is logged, so every replica applies it
             // under the same ones, and counted as it is logged.
-            // Only the main lane's may park (`writeSends`): a sink's on the
-            // history lane halts its inbound at apply, as its sender's bug.
+            // Only the main lane's may park: a sink's on the history lane
+            // was dropped above (`laneFits`).
             const target = if (lane != .main) null else if (self.sink_target) |f| f(m) else null;
             if (self.admits) |admits| if (!admits(read, m, self.inFlight(target))) {
                 target_full = true;
@@ -754,6 +764,19 @@ pub const Driver = struct {
         p.accepted = accepted + n;
         self.counts.inbound_proposed += 1;
         self.answer(from, lane, applied, dur, 0, .ok, read, io);
+    }
+
+    /// Whether every message of `b` rides `lane` as `writeSends` would send
+    /// it: its flags pick that lane, and a history message is its own
+    /// group's and no sink's.
+    fn laneFits(lane: Lane, from: u16, me: u16, b: Batch.Value) bool {
+        if (lane == .history and from != me) return false;
+        var it = b.messages.iterator();
+        while (it.next() catch return false) |m| {
+            if (Lane.of(m.flags) != lane) return false;
+            if (lane == .history and m.flags & entry_mod.Flags.SINK != 0) return false;
+        }
+        return true;
     }
 
     fn onAnswer(self: *Driver, from: u16, a: Answer.Value, now_ms: u64, read: ReadView) void {
@@ -856,4 +879,87 @@ test "channel driver: what a leader proposed and hasn't applied is released when
     d.reset(7);
     try std.testing.expectEqual(channels.InFlight{}, d.inFlight(t2));
     try std.testing.expectEqual(@as(usize, 0), d.target_bytes.count());
+}
+
+/// A driver's io that takes every frame and proposal, and counts them.
+const Taking = struct {
+    frames: *u32,
+    proposals: *u32,
+    pub fn sendFrame(io: Taking, _: u16, _: []const u8) bool {
+        io.frames.* += 1;
+        return true;
+    }
+    pub fn propose(io: Taking, _: anytype, _: []const u8) bool {
+        io.proposals.* += 1;
+        return true;
+    }
+};
+
+/// `store`, with group `from`'s `lane` applied through `applied` as its
+/// receiver's record says.
+fn appliedIn(store: *store_mod.Store, from: u16, lane: Lane, applied: u64) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var keys = view_mod.KeySet.init(arena.allocator());
+    const b = channels.chanBytes(from, lane);
+    try keys.add(channels.InFam.ID, "", &b);
+    var view = view_mod.View.init(store, arena.allocator(), &keys);
+    var kb: [channels.CHAN_KEY]u8 = undefined;
+    try view.put(channels.InFam, channels.chanKey(&kb, from, lane), .{ .v = .{ .applied = applied, .floor_index = 0, .floor_seq = applied, .points = .{ .bytes = "", .count = 0 } } });
+    try view.commit();
+}
+
+fn batchOf(buf: []u8, lane: Lane, first: u64, msgs: []const u8, n: u32) []const u8 {
+    return encodeFrame(buf, .batch, Batch.Value{ .lane = @backingInt(lane), .gen_term = 1, .gen_counter = 0, .first_seq = first, .messages = .{ .bytes = msgs, .count = n } }).?;
+}
+
+test "channel driver: what the history lane applied releases nothing the main lane has in flight" {
+    var d = try Driver.init(std.testing.allocator, 0, 2);
+    defer d.deinit();
+    var store = store_mod.Store.init(std.testing.allocator);
+    defer store.deinit();
+    const t: channels.Target = @splat(1);
+    try std.testing.expect(d.track(0, 1, t, 100));
+    // Group 0's own history lane has applied seq 5; its main lane, nothing.
+    try appliedIn(&store, 0, .history, 5);
+    var frames: u32 = 0;
+    var proposals: u32 = 0;
+    const io = Taking{ .frames = &frames, .proposals = &proposals };
+    var fb: [64]u8 = undefined;
+    d.onFrame(0, batchOf(&fb, .history, 6, "", 0), 1, .{ .store = &store }, 0, false, io);
+    d.tick(1, .{ .store = &store }, 0, io);
+    try std.testing.expectEqual(channels.InFlight{ .target = 100, .total = 100 }, d.inFlight(t));
+    // The main lane's applied releases it.
+    try appliedIn(&store, 0, .main, 1);
+    d.tick(2, .{ .store = &store }, 0, io);
+    try std.testing.expectEqual(channels.InFlight{}, d.inFlight(t));
+}
+
+test "channel driver: a history batch taken leaves a full target named, and one that doesn't fit its lane is dropped" {
+    var d = try Driver.init(std.testing.allocator, 0, 2);
+    defer d.deinit();
+    var store = store_mod.Store.init(std.testing.allocator);
+    defer store.deinit();
+    var frames: u32 = 0;
+    var proposals: u32 = 0;
+    const io = Taking{ .frames = &frames, .proposals = &proposals };
+    // A target over its cap refused group 0's main-lane batch.
+    d.peers[0].refused_parked = 7;
+    var mb: [256]u8 = undefined;
+    var fb: [512]u8 = undefined;
+    for ([_]u16{ entry_mod.Flags.HISTORY, entry_mod.Flags.HISTORY | entry_mod.Flags.SINK, entry_mod.Flags.SINK }, [_]u32{ 1, 1, 1 }, [_]u64{ 0, 1, 2 }, [_]u64{ 1, 2, 2 }) |flags, proposed, dropped, first| {
+        var w: schema.Writer = .{ .buf = &mb };
+        try ce.Message.encode(&w, .{ .slot = 0, .entry_type = 0, .layout_epoch = 0, .flags = flags, .origin_kind = 1, .origin_ns = 1, .payload = "x" });
+        d.onFrame(0, batchOf(&fb, .history, first, w.written(), 1), 1, .{ .store = &store }, 0, false, io);
+        try std.testing.expectEqual(proposed, proposals);
+        try std.testing.expectEqual(dropped, d.counts.batches_dropped);
+    }
+    // Taken on the history lane, the main lane's full target is still named.
+    try std.testing.expectEqual(@as(?u64, 7), d.peers[0].refused_parked);
+    // From another group, history is dropped whatever it carries.
+    var w: schema.Writer = .{ .buf = &mb };
+    try ce.Message.encode(&w, .{ .slot = 1, .entry_type = 0, .layout_epoch = 0, .flags = entry_mod.Flags.HISTORY, .origin_kind = 1, .origin_ns = 1, .payload = "x" });
+    d.onFrame(1, batchOf(&fb, .history, 1, w.written(), 1), 1, .{ .store = &store }, 0, false, io);
+    try std.testing.expectEqual(@as(u64, 3), d.counts.batches_dropped);
+    try std.testing.expectEqual(@as(u32, 1), proposals);
 }

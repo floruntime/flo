@@ -150,6 +150,8 @@ pub const ShardSlot = struct {
     /// inbound).
     halt_from: Atomic(u16) = .init(0),
     halt_seq: Atomic(u64) = .init(0),
+    /// The lane `halt_seq` counts in (`channels.Lane`): its seqs are its own.
+    halt_lane: Atomic(u8) = .init(0),
     /// How long, in ms, the committed read has been blocked, computed at publish
     /// (0 when not blocked): a plain duration, so a reader needn't subtract a raw
     /// monotonic reading. The reason buffer holds what blocked it.
@@ -314,7 +316,7 @@ pub const NodeHealth = struct {
                 try std.json.Stringify.encodeJsonString(why, .{}, w);
             };
             if (state == .halted) try w.print(",\"halt_index\":{d},\"halt_term\":{d},\"halt_crc\":{d}", .{ s.halt_index.load(.monotonic), s.halt_term.load(.monotonic), s.halt_crc.load(.monotonic) });
-            if (state == .halted and s.halt_seq.load(.monotonic) != 0) try w.print(",\"halt_message\":{{\"from\":{d},\"seq\":{d}}}", .{ s.halt_from.load(.monotonic), s.halt_seq.load(.monotonic) });
+            if (state == .halted and s.halt_seq.load(.monotonic) != 0) try w.print(",\"halt_message\":{{\"from\":{d},\"seq\":{d},\"lane\":\"{s}\"}}", .{ s.halt_from.load(.monotonic), s.halt_seq.load(.monotonic), laneName(s.halt_lane.load(.monotonic)) });
             if (state == .read_blocked) try w.print(",\"read_blocked_for_ms\":{d}", .{s.read_blocked_for_ms.load(.monotonic)});
             // Shown once any flush has failed, so a healthy shard stays quiet.
             const persist_failures = s.persist_failures.load(.monotonic);
@@ -691,4 +693,9 @@ test "health: /status shows a shard's snapshot bars: the last, the bytes since, 
     try testing.expectEqual(@as(i64, 1200), bars.get("last").?.integer);
     try testing.expectEqual(@as(i64, 4096), bars.get("bytes").?.integer);
     try testing.expectEqual(@as(i64, 64 * 1024 * 1024), bars.get("threshold").?.integer);
+}
+
+fn laneName(byte: u8) []const u8 {
+    const lane = @import("../contract/channels.zig").Lane.from(byte) orelse return "unknown";
+    return @tagName(lane);
 }

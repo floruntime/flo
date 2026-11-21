@@ -5998,6 +5998,7 @@ pub const Shard = struct {
             slot.halt_crc.store(h.crc, .monotonic);
             slot.halt_from.store(if (h.message) |m| m.from else 0, .monotonic);
             slot.halt_seq.store(if (h.message) |m| m.seq else 0, .monotonic);
+            slot.halt_lane.store(if (h.message) |m| @backingInt(m.lane) else 0, .monotonic);
         }
         const raft = self.raft_node;
         // In `healthState`'s own order, strongest first, so a block that then
@@ -8830,12 +8831,14 @@ pub const Shard = struct {
         // operator's explicit choice when the halt is at a known message.
         const inbound = etype == @backingInt(entry_mod.EntryType.channel_inbound);
         var from: u16 = 0;
+        var lane: u8 = 0;
         var first_seq: u64 = 0;
         var last_seq: u64 = 0;
         if (inbound) {
             var diag: schema.Diagnostic = .{};
             if (@import("../protocol/channel_entries.zig").Inbound.decodeAll(e.payload, &diag)) |p| {
                 from = p.from;
+                lane = p.lane;
                 first_seq = p.first_seq;
                 var it = p.messages.iterator();
                 var n: u64 = 0;
@@ -8873,6 +8876,7 @@ pub const Shard = struct {
                 .first_seq = first_seq,
                 .last_seq = last_seq,
                 .halt_seq = halt_seq,
+                .lane = lane,
             };
             var buf: [cluster_wire.RepairSkipAnswer.maxSize(raft_node_mod.MAX_PEERS + 1)]u8 = undefined;
             return shard.sendOkResponse(conn, rid, answer.encode(&buf));

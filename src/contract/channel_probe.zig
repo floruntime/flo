@@ -8,9 +8,10 @@
 //! One starting "relay" is sent on again by its receiver, to the same slot;
 //! one starting "flood" is sent on more times than an apply may send.
 //!
-//! One starting "hist" is a run's history's instead (`Flags.HISTORY`): it
-//! rides the history lane, may go only to its sender's own group, and is
-//! never parked; its slot's full mark refuses it like any other.
+//! One whose 16-byte name ends 'H' is a run's history's instead
+//! (`Flags.HISTORY`), whatever it starts with: it rides the history lane,
+//! may go only to its sender's own group, and is never parked; its slot's
+//! full mark refuses it like any other.
 //!
 //! A probe is a sink's write (`Flags.SINK`), and its target is its slot,
 //! which can be full: one starting "fill" makes its slot full at its
@@ -145,7 +146,7 @@ fn flagsOf(body: []const u8) u16 {
 }
 
 pub fn isHistory(body: []const u8) bool {
-    return std.mem.startsWith(u8, body, "hist");
+    return body.len >= NAME_LEN and body[NAME_LEN - 1] == 'H';
 }
 
 pub const machine: machine_mod.Machine = .{

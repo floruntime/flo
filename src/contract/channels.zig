@@ -621,6 +621,8 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
             // doesn't decode is a Flo bug.
             const p = ce.Inbound.decodeAll(e.payload, &diag) catch return error.Halt;
             const lane = Lane.from(p.lane) orelse return error.Halt;
+            // History only ever comes from this group itself (`writeSends`).
+            if (lane == .history and p.from != place.group) return error.Halt;
             var ik: [CHAN_KEY]u8 = undefined;
             const in_key = chanKey(&ik, p.from, lane);
             const before: ?In.Value = if (try view.get(InFam, in_key)) |v| v.v else null;
@@ -637,16 +639,18 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 // A repair skipped it: answered, never applied, and its seq
                 // is taken, so a resend is a duplicate.
                 if (skip) |*sk| if (sk.skips(seq)) {
-                    try skipMessage(view, e, m, p.from, seq, ordinal, sk);
+                    try skipMessage(view, e, m, p.from, lane, seq, ordinal, sk);
                     applied = seq;
                     continue;
                 };
-                store.applying = .{ .from = p.from, .seq = seq };
+                store.applying = .{ .from = p.from, .seq = seq, .lane = lane };
                 // Only a leader's own frames make these: a flag no message
-                // may carry, or one on the other lane's, is a Flo bug in the
-                // sender.
+                // may carry, one on the other lane's, or a sink's on the
+                // history lane (where nothing parks: parked keys carry no
+                // lane) is a Flo bug in the sender.
                 if (m.flags & ~view_mod.MESSAGE_FLAGS != 0) return error.Halt;
                 if (Lane.of(m.flags) != lane) return error.Halt;
+                if (lane == .history and m.flags & entry_mod.Flags.SINK != 0) return error.Halt;
                 const t = std.enums.fromInt(EntryType, m.entry_type) orelse return error.Halt;
                 const owner = machine_mod.ownerOf(targets, t);
                 if (owner == null) return error.Halt;
@@ -709,17 +713,19 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
         /// (`Machine.skipped`): a request's sender is told, an answer to this
         /// shard's own call settles it. Its sends leave under the inbound's
         /// index, as an applied message's do.
-        fn skipMessage(view: *View, e: *const Entry, m: ce.Message.Value, from: u16, seq: u64, ordinal: u8, sk: *const store_mod.InboundSkip) ApplyError!void {
+        fn skipMessage(view: *View, e: *const Entry, m: ce.Message.Value, from: u16, lane: Lane, seq: u64, ordinal: u8, sk: *const store_mod.InboundSkip) ApplyError!void {
             const store = view.store;
             const as = asEntry(e, m);
             var r = Result.start(&as);
             var buf: [@import("../protocol/action_entries.zig").MAX_SKIP_WHY]u8 = undefined;
             // A message skipped with the rest of its inbound says which one
             // halted the group, so its caller can tell it wasn't the cause.
+            // A history message's seq is its lane's, so the lane is named.
+            const on: []const u8 = if (lane == .history) ", history lane" else "";
             const why = (if (sk.whole and sk.halt_seq != 0 and sk.halt_seq != seq)
-                std.fmt.bufPrint(&buf, "skipped by repair (entry {d}, halted at message {d}; message {d} from shard {d})", .{ sk.index, sk.halt_seq, seq, from })
+                std.fmt.bufPrint(&buf, "skipped by repair (entry {d}, halted at message {d}; message {d} from shard {d}{s})", .{ sk.index, sk.halt_seq, seq, from, on })
             else
-                std.fmt.bufPrint(&buf, "skipped by repair (entry {d}, message {d} from shard {d})", .{ sk.index, seq, from })) catch "skipped by repair";
+                std.fmt.bufPrint(&buf, "skipped by repair (entry {d}, message {d} from shard {d}{s})", .{ sk.index, seq, from, on })) catch "skipped by repair";
             r.refuse(.conflict, .skipped_by_repair, why);
             const t = std.enums.fromInt(EntryType, m.entry_type);
             const owner = if (t) |x| machine_mod.ownerOf(targets, x) else null;
@@ -1100,9 +1106,9 @@ test "channels: a history message rides its own lane, with its own seqs, outbox,
     var a = Group.init(0, 2);
     defer a.deinit();
     try a.probeTo(2, "message-one-0001");
-    try a.probeTo(2, "hist-one-0000001");
+    try a.probeTo(2, "hist-one-000000H");
     try a.probeTo(2, "message-two-0002");
-    try a.probeTo(2, "hist-two-0000002");
+    try a.probeTo(2, "hist-two-000000H");
     try testing.expectEqual(@as(u64, 3), metaOf(a.read(), 0, .main).next_seq);
     try testing.expectEqual(@as(u64, 3), metaOf(a.read(), 0, .history).next_seq);
     try testing.expectEqual(entry_mod.Flags.HISTORY, a.outOn(0, .history, 1).?.flags);
@@ -1117,7 +1123,7 @@ test "channels: a history message rides its own lane, with its own seqs, outbox,
     _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .history, 1, 2, &buf));
     try testing.expectEqual(@as(u64, 2), inOf(a.read(), 0, .history).?.applied);
     try testing.expect(inOf(a.read(), 0, .main) == null);
-    try testing.expectEqual(@as(u64, 2), a.got("hist-two-0000002").?.seq);
+    try testing.expectEqual(@as(u64, 2), a.got("hist-two-000000H").?.seq);
     try testing.expect(a.got("message-one-0001") == null);
     _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .main, 1, 1, &buf));
     try testing.expectEqual(@as(u64, 1), inOf(a.read(), 0, .main).?.applied);
@@ -1135,7 +1141,7 @@ test "channels: a history message to another group, or a history message that is
     var a = Group.init(0, 2);
     defer a.deinit();
     // Slot 1 is group 1's.
-    try testing.expectError(error.Halt, a.run(&probe.machine, .channel_probe, try ce.Probe.encodeInto(&a.buf, .{ .slot = 1, .body = "hist-other-00001" })));
+    try testing.expectError(error.Halt, a.run(&probe.machine, .channel_probe, try ce.Probe.encodeInto(&a.buf, .{ .slot = 1, .body = "hist-other-0000H" })));
     try testing.expectEqual(@as(u64, 0), a.store.family(OutFam.ID).count);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1145,11 +1151,53 @@ test "channels: a history message to another group, or a history message that is
     try testing.expectError(error.Halt, writeSends(&view, 1));
 }
 
+test "channels: a history inbound from another group, or carrying a sink's message, halts and commits nothing" {
+    var b = Group.init(1, 2);
+    defer b.deinit();
+    const before = replicaState(&b);
+    var mb: [256]u8 = undefined;
+    var buf: [512]u8 = undefined;
+    var pb: [64]u8 = undefined;
+    const probe_payload = try ce.Probe.encodeInto(&pb, .{ .slot = 1, .body = "hist-other-0000H" });
+    for ([_]struct { from: u16, flags: u16 }{
+        // From group 0, on group 1's history lane: history is a group's own.
+        .{ .from = 0, .flags = entry_mod.Flags.HISTORY },
+        // Its own, but a sink's too: nothing parks on the history lane.
+        .{ .from = 1, .flags = entry_mod.Flags.HISTORY | entry_mod.Flags.SINK },
+    }) |c| {
+        var w: schema.Writer = .{ .buf = &mb };
+        try ce.Message.encode(&w, .{ .slot = 1, .entry_type = @backingInt(EntryType.channel_probe), .layout_epoch = 0, .flags = c.flags, .origin_kind = @backingInt(probe.PROBE_ORIGIN.kind), .origin_ns = probe.PROBE_ORIGIN.ns.int(), .payload = probe_payload });
+        const inbound = try ce.Inbound.encodeInto(&buf, .{ .from = c.from, .lane = @backingInt(Lane.history), .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } });
+        try testing.expectError(error.Halt, b.run(&Probed.machine, .channel_inbound, inbound));
+    }
+    try testing.expectEqual(before, replicaState(&b));
+}
+
+test "channels: a repair's skip of a history inbound names its lane, and takes only that lane's seq" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    try a.probeTo(2, "hist-one-000000H");
+    try a.probeTo(2, "message-one-0001");
+    var buf: [8192]u8 = undefined;
+    a.store.inbound_skip = .all(a.index + 1);
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .history, 1, 1, &buf));
+    a.store.inbound_skip = null;
+    try testing.expectEqual(@as(u64, 1), inOf(a.read(), 0, .history).?.applied);
+    try testing.expect(inOf(a.read(), 0, .main) == null);
+    try testing.expect(a.got("hist-one-000000H") == null);
+    const skipped = a.store.messages.items[0];
+    try testing.expect(skipped.skipped);
+    try testing.expect(std.mem.endsWith(u8, skipped.result.refused().?.refusal.message, "from shard 0, history lane)"));
+    // The main lane's seq 1 is untouched by it.
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .main, 1, 1, &buf));
+    try testing.expectEqual(@as(u64, 1), a.got("message-one-0001").?.seq);
+}
+
 test "channels: an inbound whose message's flags are the other lane's, or naming a lane there isn't, halts and commits nothing" {
     var a = Group.init(0, 2);
     defer a.deinit();
     try a.probeTo(2, "message-one-0001");
-    try a.probeTo(2, "hist-one-0000001");
+    try a.probeTo(2, "hist-one-000000H");
     var buf: [8192]u8 = undefined;
     const before = replicaState(&a);
     // The main lane's message, said to be on the history lane.
