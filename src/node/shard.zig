@@ -13233,6 +13233,39 @@ test "Shard: a client's requests into five namespaces it waits for: the fifth wa
     try std.testing.expectEqual(@as(u8, 0), c.conn.ns_ask_count);
 }
 
+test "Shard: a read sent after a write into a namespace shard 0 is making waits behind it, and reads what it wrote" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, nextNamespaceId(a), 0, &kbuf);
+    var body: [64]u8 = undefined;
+    const frames = try pipeline(&.{
+        try ParkTest.request(.kv_put, 1, "fresh", k, "v", ""),
+        edgeGet(&body, 2, "fresh", k),
+    });
+    defer std.testing.allocator.free(frames);
+    _ = feedClient(c.pair[1], b, c.conn.fd, frames);
+    try std.testing.expectEqual(@as(?Connection.WaitReason, .namespace_ask), if (c.conn.waiting) |w| w.reason else null);
+    for (0..8) |_| {
+        two.settle();
+        b.settleConnections();
+    }
+    var out: [1024]u8 = undefined;
+    var answers: [2]proto.Response = undefined;
+    try ParkTest.responses(b, c.conn, c.pair[1], &out, &answers);
+    for (answers, 1..) |r, id| {
+        try std.testing.expectEqual(@as(u64, id), r.header.request_id);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
+    }
+    var diag: schema.Diagnostic = .{};
+    try std.testing.expectEqualStrings("v", (try table_run.op("kv.get").response.decodeAll(answers[1].data, &diag)).value);
+}
+
 test "Shard: pipelined reads of one namespace shard 0 is asked about all go at once; a write sent after them waits" {
     var two: TwoShards = undefined;
     try two.init();
