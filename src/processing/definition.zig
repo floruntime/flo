@@ -381,6 +381,7 @@ pub const JobDefinition = struct {
         // so a job never runs against a name its writes can't use. A group
         // key separates stream from group with a NUL.
         for (self.sources.items) |src| if (resourceRefusal(src.stream)) |why| return why;
+        for (self.sources.items) |src| if (reservedStreamName(src.stream)) return names.RESERVED_WHY;
         // A source another shard owns is read by naming it in a message
         // whose name fields are 16-bit lengths.
         for (self.sources.items) |src| {
@@ -388,7 +389,23 @@ pub const JobDefinition = struct {
             if (src.ts_field.len > std.math.maxInt(u16)) return "field name too long";
         }
         for (self.sinks.items) |snk| if (resourceRefusal(snk.target)) |why| return why;
+        for (self.sinks.items) |snk| if (snk.kind == .stream and reservedStreamName(snk.target)) return names.RESERVED_WHY;
         return null;
+    }
+
+    const names = @import("../stream/names.zig");
+
+    /// A stream name the server keeps for itself: no job reads or writes one.
+    fn reservedStreamName(name: []const u8) bool {
+        return names.reservedStreamName(name);
+    }
+
+    /// Whether the job reads or writes a stream the server keeps: refused
+    /// at submit as unauthorized, and by `namespaceRefusal` wherever else.
+    pub fn namesReservedStream(self: *const JobDefinition) bool {
+        for (self.sources.items) |src| if (reservedStreamName(src.stream)) return true;
+        for (self.sinks.items) |snk| if (snk.kind == .stream and reservedStreamName(snk.target)) return true;
+        return false;
     }
 
     fn resourceRefusal(name: []const u8) ?[]const u8 {
