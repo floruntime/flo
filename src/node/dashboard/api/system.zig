@@ -140,8 +140,8 @@ pub fn getMetricsJson(allocator: Allocator, ctx: *DashboardContext) ![]const u8 
     // The node's memory budget: while a data-holder hasn't reported
     // (provisional_ms > 0) the figure shown is the last committed record. The
     // provisional duration is computed here, at scrape, so it grows with time.
-    // The pool's use is each shard's, summed; nothing is enforced against the
-    // budget yet.
+    // The pool's use is each shard's, summed, and each shard is held to its
+    // own share once its leader has bound one.
     const mb = ctx.metrics.memory_budget.snapshot();
     var mb_obj = try obj.objectField("memory_budget");
     try mb_obj.begin();
@@ -156,6 +156,20 @@ pub fn getMetricsJson(allocator: Allocator, ctx: *DashboardContext) ![]const u8 
         try by_shard.writer.print("{d}", .{sm.pool_use_bytes.load(.monotonic)});
     }
     try by_shard.end();
+    var shares = try mb_obj.arrayField("shares");
+    try shares.begin();
+    for (0..ctx.metrics.shardCount()) |i| {
+        const sm = ctx.metrics.shardMetrics(@intCast(i)) orelse break;
+        try shares.next();
+        const use = sm.pool_use_bytes.load(.monotonic);
+        const share = sm.pool_share_bytes.load(.monotonic);
+        if (share == 0) {
+            try shares.writer.print("{{\"shard\":{d},\"enforcement\":\"off: no budget bound\"}}", .{i});
+        } else {
+            try shares.writer.print("{{\"shard\":{d},\"share_bytes\":{d},\"over_share\":{}}}", .{ i, share, use > share });
+        }
+    }
+    try shares.end();
     try mb_obj.intField("governing_node", mb.governing_node);
     try mb_obj.intField("provisional_ms", mb.provisionalMs(@import("stdx").time.monotonicMs()));
     try mb_obj.intField("provisional_node", mb.provisional_node);
@@ -244,4 +258,20 @@ test "getMetricsJson: the pool's use is each shard's, and the node's is their su
     defer allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"pool_use_bytes\":345") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"pool_use_by_shard\":[300,45]") != null);
+}
+
+test "getMetricsJson: a shard's share, over it or not, and enforcement off while unbound" {
+    const allocator = std.testing.allocator;
+    var metrics = h.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    try metrics.initShards(3);
+    metrics.shardMetrics(0).?.pool_use_bytes.store(300, .monotonic);
+    metrics.shardMetrics(0).?.pool_share_bytes.store(200, .monotonic);
+    metrics.shardMetrics(1).?.pool_use_bytes.store(45, .monotonic);
+    metrics.shardMetrics(1).?.pool_share_bytes.store(200, .monotonic);
+    var ctx = DashboardContext.init(allocator, &metrics, 3);
+
+    const result = try getMetricsJson(allocator, &ctx);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"shares\":[{\"shard\":0,\"share_bytes\":200,\"over_share\":true},{\"shard\":1,\"share_bytes\":200,\"over_share\":false},{\"shard\":2,\"enforcement\":\"off: no budget bound\"}]") != null);
 }

@@ -119,6 +119,9 @@ pub const Removal = struct {
 };
 
 pub const ShardSlot = struct {
+    /// Shard 0's last committed clean budget, in bytes (0 before one is):
+    /// every shard's leader binds its share from it. Written on shard 0's slot.
+    clean_budget_bytes: Atomic(u64) = .init(0),
     state: Atomic(u8) = .init(@backingInt(ShardState.loading)),
     role: Atomic(u8) = .init(@backingInt(Role.follower)),
     last_applied: Atomic(u64) = .init(0),
