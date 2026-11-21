@@ -2708,7 +2708,7 @@ pub const Shard = struct {
         // would give it.
         var req = req_in;
         req.ns_id = self.namespaceIdOf(req);
-        if (self.namespaceAskWait(conn, req)) |ns| return .{ .target = @intCast(self.id), .blocking = false, .reason = .namespace_ask, .ns = ns };
+        if (self.namespaceAskWait(conn, req)) |ns| return .{ .target = @intCast(self.id), .blocking = false, .reason = .namespace_ask, .ns = ns, .writes = requestWrites(req) };
         // A body that doesn't decode is refused when it runs; it waits for
         // nothing first.
         if (table.isOp(req.header.op_code) and !table_run.decodes(req)) return null;
@@ -2724,13 +2724,14 @@ pub const Shard = struct {
 
     /// The namespace `req` waits behind, or null: one an earlier request of
     /// its connection's waits for, so that this one, sent after, runs after
-    /// (routed straight once the name resolves, it would overtake), or any,
-    /// when its connection waits for `MAX_NS_ASKS` and this would wait too.
+    /// (routed straight once the name resolves, it would overtake), unless
+    /// both only read; or any, when its connection waits for
+    /// `MAX_NS_NAMESPACES` others and this would wait too.
     fn namespaceAskWait(self: *const Shard, conn: *const Connection, req: proto.Request) ?u64 {
         if (conn.ns_ask_count == 0) return null;
         const ns = Connection.nsKey(req.namespace);
-        if (conn.nsAsked(ns)) return ns;
-        if (conn.ns_ask_count == Connection.MAX_NS_ASKS and self.mayWaitForNamespace(req)) return ns;
+        if (conn.nsAskBlocks(ns, requestWrites(req))) return ns;
+        if (!conn.nsAskRoom(ns) and self.mayWaitForNamespace(req)) return ns;
         return null;
     }
 
@@ -2744,7 +2745,7 @@ pub const Shard = struct {
     /// Whether `conn` may start one more wait for a namespace for `req`:
     /// it has room, or `req` is running again and its wait is already one.
     fn nsAskRoom(self: *const Shard, conn: *Connection, req: proto.Request) bool {
-        if (conn.proxy_for != null or conn.ns_ask_count < Connection.MAX_NS_ASKS) return true;
+        if (conn.proxy_for != null or conn.nsAskRoom(Connection.nsKey(req.namespace))) return true;
         return self.reentryFor(conn, req.header.request_id) != null and conn.nsAskOf(req.header.request_id) != null;
     }
 
@@ -2761,14 +2762,14 @@ pub const Shard = struct {
             a.gen = gen;
             return;
         };
-        if (starts) conn.addNsAsk(.{ .ns = Connection.nsKey(req.namespace), .request_id = req.header.request_id, .slot = slot, .gen = gen });
+        if (starts) conn.addNsAsk(.{ .ns = Connection.nsKey(req.namespace), .request_id = req.header.request_id, .slot = slot, .gen = gen, .writes = requestWrites(req) });
     }
 
     /// A namespace_ask head can go to `holdForward` again: nothing of its
-    /// connection's waits for its namespace, there is room for one more,
-    /// and nothing of its is held for room.
-    fn namespaceAskOver(conn: *const Connection, ns: u64) bool {
-        return !conn.nsAsked(ns) and conn.ns_ask_count < Connection.MAX_NS_ASKS and conn.reentries_held == 0;
+    /// connection's it must follow waits for its namespace, there is room
+    /// for it to wait too, and nothing of its is held for room.
+    fn namespaceAskOver(conn: *const Connection, w: Connection.Waiting) bool {
+        return !conn.nsAskBlocks(w.ns, w.writes) and conn.nsAskRoom(w.ns) and conn.reentries_held == 0;
     }
 
     /// `forwardWait`; but when the answer is, or last was (`was`), the inbox
@@ -8380,7 +8381,7 @@ pub const Shard = struct {
             // through `holdForward` like any head.
             const ns_wait = w.reason == .namespace_ask;
             var why: ?Connection.WaitReason = if (ns_wait)
-                (if (namespaceAskOver(conn, w.ns)) null else .namespace_ask)
+                (if (namespaceAskOver(conn, w)) null else .namespace_ask)
             else
                 self.stillWaits(conn, .{ .target = w.target, .blocking = w.blocking }, w.reason);
             const slots = &slot_room[@backingInt(class)][w.target];
@@ -13216,7 +13217,7 @@ test "Shard: a client's requests into five namespaces it waits for: the fifth wa
     const frames = try pipeline(&reqs);
     defer std.testing.allocator.free(frames);
     _ = feedClient(c.pair[1], b, c.conn.fd, frames);
-    try std.testing.expectEqual(@as(u8, Connection.MAX_NS_ASKS), c.conn.ns_ask_count);
+    try std.testing.expectEqual(@as(u8, Connection.MAX_NS_NAMESPACES), c.conn.ns_ask_count);
     try std.testing.expectEqual(@as(?Connection.WaitReason, .namespace_ask), if (c.conn.waiting) |w| w.reason else null);
     for (0..8) |_| {
         two.settle();
@@ -13229,6 +13230,38 @@ test "Shard: a client's requests into five namespaces it waits for: the fifth wa
         try std.testing.expectEqual(@as(u64, id), r.header.request_id);
         try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), r.header.status);
     }
+    try std.testing.expectEqual(@as(u8, 0), c.conn.ns_ask_count);
+}
+
+test "Shard: pipelined reads of one namespace shard 0 is asked about all go at once; a write sent after them waits" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var bodies: [6][64]u8 = undefined;
+    var reqs: [7]proto.Request = undefined;
+    for (reqs[0..6], 0..) |*r, i| r.* = edgeGet(&bodies[i], i + 1, "n1", "k");
+    reqs[6] = try ParkTest.request(.kv_put, 7, "n1", "k", "v", "");
+    const frames = try pipeline(&reqs);
+    defer std.testing.allocator.free(frames);
+    _ = feedClient(c.pair[1], b, c.conn.fd, frames);
+    // Six reads out, more than the namespaces a connection waits for; the
+    // write behind them.
+    try std.testing.expectEqual(@as(u8, 6), c.conn.ns_ask_count);
+    try std.testing.expectEqual(@as(?Connection.WaitReason, .namespace_ask), if (c.conn.waiting) |w| w.reason else null);
+    for (0..8) |_| {
+        two.settle();
+        b.settleConnections();
+    }
+    var out: [4096]u8 = undefined;
+    var answers: [7]proto.Response = undefined;
+    try ParkTest.responses(b, c.conn, c.pair[1], &out, &answers);
+    for (answers[0..6]) |r| try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), r.header.status);
+    try std.testing.expectEqual(@as(u64, 7), answers[6].header.request_id);
     try std.testing.expectEqual(@as(u8, 0), c.conn.ns_ask_count);
 }
 
@@ -13253,7 +13286,10 @@ test "Shard: an ask for a namespace whose part can't be sent leaves nothing for 
     while (a.drainInbox() > 0) {}
 }
 
-test "Shard: a chosen-id start into a namespace shard 0 is making keeps its connection's later requests behind it through the find it starts" {
+// Only while the find has room: held for it instead, the start's entry goes
+// with the ensure, and on resume a later request's own find may go first,
+// as for a namespace that exists.
+test "Shard: a chosen-id start into a namespace shard 0 is making keeps its connection's later requests behind it through the find it starts, given room" {
     var two: TwoShards = undefined;
     try two.init();
     defer two.deinit();
@@ -28838,6 +28874,47 @@ test "Shard: a put sent after a delete shard 0 holds until it publishes their na
     try std.testing.expectEqualStrings("w", try kvValue(c, a, &two, 6, "xs", key));
 }
 
+test "Shard: a chosen-id status shard 0 holds until it publishes, run again to find its run, keeps a signal sent after it waiting" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    var key_buf: [8]u8 = undefined;
+    _ = try twoShardsWithXsKey(data_dir, &key_buf);
+    var two: TwoShards = undefined;
+    try restartedBeforePublish(&two, data_dir);
+    defer two.deinit();
+    const a = &two.shards[0];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    const frames = try pipeline(&.{
+        testReq(.workflow_status, 4, "xs", "order-123", "", ""),
+        testReq(.workflow_signal, 5, "xs", "order-123", "", ""),
+    });
+    defer std.testing.allocator.free(frames);
+    _ = feedClient(c.pair[1], a, c.conn.fd, frames);
+    try std.testing.expectEqual(@as(u32, 1), a.edge.count);
+    try std.testing.expectEqual(@as(?Connection.WaitReason, .namespace_ask), if (c.conn.waiting) |w| w.reason else null);
+    // Published: the status runs again and asks each shard for its run; the
+    // signal still waits behind it.
+    a.namespace_handler.settle(a);
+    a.sweepEdge(Shard.nowMs());
+    try std.testing.expectEqual(@as(u32, 0), a.edge.count);
+    try std.testing.expectEqual(@as(usize, 1), a.gathers.inUse());
+    try std.testing.expectEqual(@as(u8, 1), c.conn.ns_ask_count);
+    a.settleConnections();
+    try std.testing.expect(c.conn.waiting != null);
+    for (0..8) |_| {
+        two.settle();
+        a.settleConnections();
+    }
+    var out: [2048]u8 = undefined;
+    var answers: [2]proto.Response = undefined;
+    try ParkTest.responses(a, c.conn, c.pair[1], &out, &answers);
+    for (answers, 4..) |r, id| try std.testing.expectEqual(@as(u64, id), r.header.request_id);
+    try std.testing.expectEqual(@as(u8, 0), c.conn.ns_ask_count);
+}
+
 test "Shard: a delete in a namespace never created is refused as having none on a node of several shards, whichever shard it reaches" {
     var two: TwoShards = undefined;
     try two.init();
@@ -29032,8 +29109,8 @@ test "Shard: a follower holds at most a shard's share of reads at the edge; past
     defer f.deinit();
     const shard = &f.t.shard;
     // Spread over connections, so none reaches its own caps first: each
-    // waits for at most `MAX_NS_ASKS` namespaces.
-    const PER = Connection.MAX_NS_ASKS;
+    // waits for at most `MAX_NS_NAMESPACES` namespaces.
+    const PER = Connection.MAX_NS_NAMESPACES;
     var others: [edge_mod.WAITS / PER - 1]TestClient = undefined;
     for (&others) |*o| o.* = try TestClient.open(shard);
     defer for (others) |o| {

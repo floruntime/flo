@@ -357,8 +357,9 @@ pub const Connection = struct {
     /// this connection's is read or run, so nothing overtakes it.
     reentries_held: u16 = 0,
     /// Its requests waiting for their namespace (`NsAsk`): later requests
-    /// naming one wait behind it, unread (`WaitReason.namespace_ask`).
-    ns_asks: [MAX_NS_ASKS]NsAsk = undefined,
+    /// naming one wait behind it, unread (`WaitReason.namespace_ask`). One
+    /// each; every one is in flight, so there are never more than that cap.
+    ns_asks: [MAX_FORWARDS_IN_FLIGHT]NsAsk = undefined,
     ns_ask_count: u8 = 0,
     /// The head waited `Shard.ASK_WAIT_MS`: it, and every request buffered
     /// behind it then (these bytes' worth) that would wait, is answered
@@ -373,8 +374,10 @@ pub const Connection = struct {
         target: u16,
         blocking: bool,
         reason: WaitReason,
-        /// For `namespace_ask`: the namespace it names (`nsKey`).
+        /// For `namespace_ask`: the namespace it names (`nsKey`), and
+        /// whether it writes.
         ns: u64 = 0,
+        writes: bool = false,
     };
 
     pub const WaitReason = enum(u3) {
@@ -387,19 +390,20 @@ pub const Connection = struct {
         /// This shard's share of the target's inbox is unread.
         inbox,
         /// An earlier request of this connection's waits for the namespace
-        /// this one names, or `MAX_NS_ASKS` of them wait for theirs: it runs
-        /// after, not before. Its target is not known until then.
+        /// this one names, and one of the two writes; or its requests wait
+        /// for `MAX_NS_NAMESPACES` others: it runs after, not before. Its
+        /// target is not known until then.
         namespace_ask,
     };
 
     /// The most namespaces one connection's requests wait for at once.
-    pub const MAX_NS_ASKS = 4;
+    pub const MAX_NS_NAMESPACES = 4;
 
     /// A request of this connection's waiting for its namespace: in an ask
     /// to shard 0 or the edge's hold. `slot` and `gen` name that wait (a
     /// gather entry or an edge wait, by address and generation), so two for
     /// one namespace are two entries and neither ends the other.
-    pub const NsAsk = struct { ns: u64, request_id: u64, slot: usize, gen: u64 };
+    pub const NsAsk = struct { ns: u64, request_id: u64, slot: usize, gen: u64, writes: bool };
 
     /// Two names alike here are one namespace to `nsAsks`: a collision only
     /// orders requests that needn't be.
@@ -412,13 +416,36 @@ pub const Connection = struct {
         return false;
     }
 
+    /// Whether a request naming `ns` runs after one waiting for it: a write
+    /// after anything, a read after a write. Reads after reads keep no order.
+    pub fn nsAskBlocks(self: *const Connection, ns: u64, writes: bool) bool {
+        for (self.ns_asks[0..self.ns_ask_count]) |a| if (a.ns == ns and (writes or a.writes)) return true;
+        return false;
+    }
+
+    /// How many namespaces its requests wait for.
+    pub fn nsNamespaces(self: *const Connection) usize {
+        var n: usize = 0;
+        for (self.ns_asks[0..self.ns_ask_count], 0..) |a, i| {
+            for (self.ns_asks[0..i]) |b| {
+                if (b.ns == a.ns) break;
+            } else n += 1;
+        }
+        return n;
+    }
+
+    /// Room for one more request waiting for `ns`.
+    pub fn nsAskRoom(self: *const Connection, ns: u64) bool {
+        return self.ns_ask_count < self.ns_asks.len and (self.nsAsked(ns) or self.nsNamespaces() < MAX_NS_NAMESPACES);
+    }
+
     pub fn nsAskOf(self: *Connection, request_id: u64) ?*NsAsk {
         for (self.ns_asks[0..self.ns_ask_count]) |*a| if (a.request_id == request_id) return a;
         return null;
     }
 
     pub fn addNsAsk(self: *Connection, a: NsAsk) void {
-        std.debug.assert(self.ns_ask_count < MAX_NS_ASKS);
+        std.debug.assert(self.ns_ask_count < self.ns_asks.len);
         self.ns_asks[self.ns_ask_count] = a;
         self.ns_ask_count += 1;
     }
