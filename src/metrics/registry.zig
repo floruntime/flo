@@ -698,7 +698,7 @@ pub const ShardMetrics = struct {
     cross_shard_overloaded: [3]Atomic(u64) = @splat(Atomic(u64).init(0)),
     /// Client requests refused before they were sent to another shard, by
     /// which bound stopped them (`ForwardRefused`).
-    forward_refused: [3]Atomic(u64) = @splat(Atomic(u64).init(0)),
+    forward_refused: [4]Atomic(u64) = @splat(Atomic(u64).init(0)),
     /// Reads a follower found no stream or series for, by op and by how
     /// they were answered (`ReadMiss`).
     read_misses: [2][2]Atomic(u64) = @splat(@splat(Atomic(u64).init(0))),
@@ -846,7 +846,7 @@ pub const ShardMetrics = struct {
 
     /// Labels for `connections_paused`: the shard's wait reasons, in order,
     /// then paused for unsent answers.
-    pub const PAUSE_REASONS = [_][]const u8{ "in_flight", "blocking_reads", "reply_capacity", "inbox", "unsent_answers" };
+    pub const PAUSE_REASONS = [_][]const u8{ "in_flight", "blocking_reads", "reply_capacity", "inbox", "namespace_ask", "unsent_answers" };
 
     pub const CrossShardClass = enum(u2) { client_forward, engine, gather };
     pub const ReadMissOp = enum(u1) { stream_read, ts_read };
@@ -924,8 +924,9 @@ pub const ShardMetrics = struct {
 
     /// Why a client request wasn't sent to another shard: its reply slots
     /// there were taken, this shard's share of that shard's inbox was
-    /// unread, or that inbox's ring was full.
-    pub const ForwardRefused = enum(u2) { target_busy, share_spent, ring_full };
+    /// unread, that inbox's ring was full, or its connection's blocking
+    /// reads were at their cap.
+    pub const ForwardRefused = enum(u2) { target_busy, share_spent, ring_full, blocking_reads };
 
     pub fn recordForwardRefused(self: *ShardMetrics, why: ForwardRefused) void {
         _ = self.forward_refused[@backingInt(why)].fetchAdd(1, .monotonic);
@@ -1017,7 +1018,7 @@ pub const ShardMetrics = struct {
         inbox_pending: u64,
         cross_shard_in_flight: u64,
         cross_shard_overloaded: [3]u64,
-        forward_refused: [3]u64,
+        forward_refused: [4]u64,
         read_misses: [2][2]u64,
         handbacks: [2][2]u64,
         replies_dropped: u64,
@@ -1085,7 +1086,7 @@ pub const ShardMetrics = struct {
             .inbox_pending = if (self.live_pending) |lp| lp.read(lp.ctx) else self.inbox_pending.load(.monotonic),
             .cross_shard_in_flight = self.cross_shard_in_flight.load(.monotonic),
             .cross_shard_overloaded = .{ self.cross_shard_overloaded[0].load(.monotonic), self.cross_shard_overloaded[1].load(.monotonic), self.cross_shard_overloaded[2].load(.monotonic) },
-            .forward_refused = .{ self.forward_refused[0].load(.monotonic), self.forward_refused[1].load(.monotonic), self.forward_refused[2].load(.monotonic) },
+            .forward_refused = .{ self.forward_refused[0].load(.monotonic), self.forward_refused[1].load(.monotonic), self.forward_refused[2].load(.monotonic), self.forward_refused[3].load(.monotonic) },
             .read_misses = .{ .{ self.read_misses[0][0].load(.monotonic), self.read_misses[0][1].load(.monotonic) }, .{ self.read_misses[1][0].load(.monotonic), self.read_misses[1][1].load(.monotonic) } },
             .handbacks = .{ .{ self.handbacks[0][0].load(.monotonic), self.handbacks[0][1].load(.monotonic) }, .{ self.handbacks[1][0].load(.monotonic), self.handbacks[1][1].load(.monotonic) } },
             .replies_dropped = self.replies_dropped.load(.monotonic),
@@ -2090,7 +2091,7 @@ test "registry: register and export stream metrics" {
 
 test "registry: paused connections are exported by what they wait for" {
     var sm = ShardMetrics.init(3);
-    sm.setConnectionsPaused(.{ 1, 2, 3, 4, 5 });
+    sm.setConnectionsPaused(.{ 1, 2, 3, 4, 5, 6 });
     // Every shard metric, with room for more.
     var buf: [16384]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);

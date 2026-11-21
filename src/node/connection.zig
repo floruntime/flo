@@ -356,6 +356,10 @@ pub const Connection = struct {
     /// an answer (`Shard.reentries`): while any is held, nothing more of
     /// this connection's is read or run, so nothing overtakes it.
     reentries_held: u16 = 0,
+    /// Its requests waiting for their namespace (`NsAsk`): later requests
+    /// naming one wait behind it, unread (`WaitReason.namespace_ask`).
+    ns_asks: [MAX_NS_ASKS]NsAsk = undefined,
+    ns_ask_count: u8 = 0,
     /// The head waited `Shard.ASK_WAIT_MS`: it, and every request buffered
     /// behind it then (these bytes' worth) that would wait, is answered
     /// `overloaded`, unrun, rather than each waiting its turn.
@@ -369,9 +373,11 @@ pub const Connection = struct {
         target: u16,
         blocking: bool,
         reason: WaitReason,
+        /// For `namespace_ask`: the namespace it names (`nsKey`).
+        ns: u64 = 0,
     };
 
-    pub const WaitReason = enum(u2) {
+    pub const WaitReason = enum(u3) {
         /// `MAX_FORWARDS_IN_FLIGHT` of this client's requests are unanswered.
         in_flight,
         /// `MAX_BLOCKING_IN_FLIGHT` of its reads are blocked on other shards.
@@ -380,7 +386,51 @@ pub const Connection = struct {
         reply_capacity,
         /// This shard's share of the target's inbox is unread.
         inbox,
+        /// An earlier request of this connection's waits for the namespace
+        /// this one names, or `MAX_NS_ASKS` of them wait for theirs: it runs
+        /// after, not before. Its target is not known until then.
+        namespace_ask,
     };
+
+    /// The most namespaces one connection's requests wait for at once.
+    pub const MAX_NS_ASKS = 4;
+
+    /// A request of this connection's waiting for its namespace: in an ask
+    /// to shard 0 or the edge's hold. `slot` and `gen` name that wait (a
+    /// gather entry or an edge wait, by address and generation), so two for
+    /// one namespace are two entries and neither ends the other.
+    pub const NsAsk = struct { ns: u64, request_id: u64, slot: usize, gen: u64 };
+
+    /// Two names alike here are one namespace to `nsAsks`: a collision only
+    /// orders requests that needn't be.
+    pub fn nsKey(name: []const u8) u64 {
+        return std.hash.Wyhash.hash(0, if (name.len == 0) "default" else name);
+    }
+
+    pub fn nsAsked(self: *const Connection, ns: u64) bool {
+        for (self.ns_asks[0..self.ns_ask_count]) |a| if (a.ns == ns) return true;
+        return false;
+    }
+
+    pub fn nsAskOf(self: *Connection, request_id: u64) ?*NsAsk {
+        for (self.ns_asks[0..self.ns_ask_count]) |*a| if (a.request_id == request_id) return a;
+        return null;
+    }
+
+    pub fn addNsAsk(self: *Connection, a: NsAsk) void {
+        std.debug.assert(self.ns_ask_count < MAX_NS_ASKS);
+        self.ns_asks[self.ns_ask_count] = a;
+        self.ns_ask_count += 1;
+    }
+
+    /// The entry for the wait `slot`/`gen` goes, if there is one.
+    pub fn endNsAsk(self: *Connection, slot: usize, gen: u64) void {
+        for (self.ns_asks[0..self.ns_ask_count], 0..) |a, i| if (a.slot == slot and a.gen == gen) {
+            self.ns_ask_count -= 1;
+            self.ns_asks[i] = self.ns_asks[self.ns_ask_count];
+            return;
+        };
+    }
 
     /// The most of one client's requests that may be unanswered on other
     /// shards at once, and the most of those that may be blocking reads.

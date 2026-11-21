@@ -2708,6 +2708,7 @@ pub const Shard = struct {
         // would give it.
         var req = req_in;
         req.ns_id = self.namespaceIdOf(req);
+        if (self.namespaceAskWait(conn, req)) |ns| return .{ .target = @intCast(self.id), .blocking = false, .reason = .namespace_ask, .ns = ns };
         // A body that doesn't decode is refused when it runs; it waits for
         // nothing first.
         if (table.isOp(req.header.op_code) and !table_run.decodes(req)) return null;
@@ -2719,6 +2720,55 @@ pub const Shard = struct {
         // goes round, a request at a time.
         if (why == null and !conn.has_turn and self.queued[@intFromBool(to.blocking)][to.target] > 0) why = .reply_capacity;
         return .{ .target = to.target, .blocking = to.blocking, .reason = why orelse return null };
+    }
+
+    /// The namespace `req` waits behind, or null: one an earlier request of
+    /// its connection's waits for, so that this one, sent after, runs after
+    /// (routed straight once the name resolves, it would overtake), or any,
+    /// when its connection waits for `MAX_NS_ASKS` and this would wait too.
+    fn namespaceAskWait(self: *const Shard, conn: *const Connection, req: proto.Request) ?u64 {
+        if (conn.ns_ask_count == 0) return null;
+        const ns = Connection.nsKey(req.namespace);
+        if (conn.nsAsked(ns)) return ns;
+        if (conn.ns_ask_count == Connection.MAX_NS_ASKS and self.mayWaitForNamespace(req)) return ns;
+        return null;
+    }
+
+    /// Whether `req` may wait for its namespace (`ensureThenRun`,
+    /// `askShard0`, the edge's hold): this node's table doesn't have it.
+    /// More than wait in the end; never fewer.
+    fn mayWaitForNamespace(self: *const Shard, req: proto.Request) bool {
+        return self.namespace_handler.table.lookup(if (req.namespace.len == 0) "default" else req.namespace) == null;
+    }
+
+    /// Whether `conn` may start one more wait for a namespace for `req`:
+    /// it has room, or `req` is running again and its wait is already one.
+    fn nsAskRoom(self: *const Shard, conn: *Connection, req: proto.Request) bool {
+        if (conn.proxy_for != null or conn.ns_ask_count < Connection.MAX_NS_ASKS) return true;
+        return self.reentryFor(conn, req.header.request_id) != null and conn.nsAskOf(req.header.request_id) != null;
+    }
+
+    const NS_ASKS_FULL: proto.Refusal = .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: this connection's requests are waiting for too many namespaces at once; this request was not run — retry" };
+
+    /// `req` waits for its namespace in `slot`/`gen` (a gather or an edge
+    /// wait): its connection's later requests naming it wait behind it. A
+    /// request running again keeps its entry, moved to its new wait, until
+    /// its last.
+    fn noteNsAsk(self: *const Shard, conn: *Connection, req: proto.Request, slot: usize, gen: u64, starts: bool) void {
+        if (conn.proxy_for != null) return;
+        if (self.reentryFor(conn, req.header.request_id) != null) if (conn.nsAskOf(req.header.request_id)) |a| {
+            a.slot = slot;
+            a.gen = gen;
+            return;
+        };
+        if (starts) conn.addNsAsk(.{ .ns = Connection.nsKey(req.namespace), .request_id = req.header.request_id, .slot = slot, .gen = gen });
+    }
+
+    /// A namespace_ask head can go to `holdForward` again: nothing of its
+    /// connection's waits for its namespace, there is room for one more,
+    /// and nothing of its is held for room.
+    fn namespaceAskOver(conn: *const Connection, ns: u64) bool {
+        return !conn.nsAsked(ns) and conn.ns_ask_count < Connection.MAX_NS_ASKS and conn.reentries_held == 0;
     }
 
     /// `forwardWait`; but when the answer is, or last was (`was`), the inbox
@@ -2909,6 +2959,7 @@ pub const Shard = struct {
     /// already routed here runs as held, already authorized. The write is
     /// copied first and has not run.
     fn ensureThenRun(self: *Shard, conn: *Connection, req: proto.Request, origin: run_mod.Origin) void {
+        if (!self.nsAskRoom(conn, req)) return self.sendRefusal(conn, req.header.request_id, .overloaded, NS_ASKS_FULL);
         const bytes = serializeRequest(self.allocator, req) catch
             return self.sendRefusal(conn, req.header.request_id, .internal_error, .{ .reason = .internal, .ran = .no, .message = "internal error: out of memory" });
         const st = self.allocator.create(EnsureThenRun) catch {
@@ -3236,7 +3287,7 @@ pub const Shard = struct {
             // what room doesn't show (its connection's blocking reads, a
             // gather's slots) would otherwise run every tick.
             if (now -| e.since_ms >= ASK_WAIT_MS) {
-                self.refuseReentry(conn, e, inbox.* > 0 or slots.* <= 0);
+                self.refuseReentry(conn, e, if (slots.* <= 0) .target_busy else if (inbox.* <= 0) .share_spent else if (e.blocking and self.blockingOut(conn) >= Connection.MAX_BLOCKING_IN_FLIGHT) .blocking_reads else .target_busy);
                 continue;
             }
             if (slots.* <= 0 or inbox.* <= 0) {
@@ -3292,17 +3343,21 @@ pub const Shard = struct {
     }
 
     /// `e` waited too long for room: refused, not run.
-    fn refuseReentry(self: *Shard, conn: *Connection, e: *reentry_mod.Entry, slots: bool) void {
+    fn refuseReentry(self: *Shard, conn: *Connection, e: *reentry_mod.Entry, why: ShardMetrics.ForwardRefused) void {
         const target = e.target;
         const bytes = self.unholdReentry(e, conn);
         defer self.allocator.free(bytes);
         const req = proto.Request.parse(bytes) catch unreachable; // serialized here
         var msg_buf: [160]u8 = undefined;
-        const message = (if (slots) std.fmt.bufPrint(&msg_buf, NOT_KEEPING_UP, .{target}) else std.fmt.bufPrint(&msg_buf, SHARE_SPENT, .{target})) catch "overloaded: this request was not run — back off and retry";
+        const message = switch (why) {
+            .share_spent => std.fmt.bufPrint(&msg_buf, SHARE_SPENT, .{target}),
+            .blocking_reads => std.fmt.bufPrint(&msg_buf, BLOCKING_READS_OUT, .{Connection.MAX_BLOCKING_IN_FLIGHT}),
+            .target_busy, .ring_full => std.fmt.bufPrint(&msg_buf, NOT_KEEPING_UP, .{target}),
+        } catch "overloaded: this request was not run — back off and retry";
         self.sendErrorResponse(conn, req.header.request_id, .overloaded, message);
         if (self.shard_metrics) |sm| {
             sm.recordCrossShardOverloaded(.client_forward);
-            sm.recordForwardRefused(if (slots) .target_busy else .share_spent);
+            sm.recordForwardRefused(why);
         }
         self.forwards_refused += 1;
         self.flushToClient(conn.fd);
@@ -3316,6 +3371,8 @@ pub const Shard = struct {
     }
 
     const ForwardRefusal = enum { target_busy, share_spent, ring_full };
+
+    const BLOCKING_READS_OUT = "overloaded: this connection has {d} blocking reads waiting already; this request was not run — retry once one returns";
 
     const NOT_KEEPING_UP = "overloaded: shard {d} is not keeping up; this request was not run — back off and retry";
 
@@ -3430,6 +3487,8 @@ pub const Shard = struct {
         self.gathers.get(ticket).?.since_ms = self.firstRead(conn, req.header.request_id, nowMs());
         self.gathers.get(ticket).?.op_code = req.header.op_code;
         if (conn.proxy_for == null) conn.forwards_in_flight += 1;
+        const entry_slot = @intFromPtr(self.gathers.get(ticket).?);
+        self.noteNsAsk(conn, req, entry_slot, ticket.gen, op == &EnsureThenRun.gather_op or op == &EdgeAsk.op);
         // This shard's own part was read while it is halted.
         if (self.halted != null) for (parts) |p| {
             if (p.owner == self.id) self.gathers.get(ticket).?.stale = true;
@@ -3442,7 +3501,7 @@ pub const Shard = struct {
         if (done) |e| return self.completeGather(e); // every part was this shard's
 
         const now = nowMs();
-        const since = conn.head_since_ms orelse now;
+        const since = self.firstRead(conn, req.header.request_id, now);
         const seq: u64 = (@as(u64, conn.id) << 32) | @as(u32, @bitCast(conn.fd));
         for (parts, 0..) |p, i| {
             if (p.owner == self.id) continue;
@@ -3457,6 +3516,7 @@ pub const Shard = struct {
                 // into an ended gather and are dropped there; their slots
                 // come back as they do.
                 if (conn.proxy_for == null) conn.forwards_in_flight -|= 1;
+                conn.endNsAsk(entry_slot, ticket.gen);
                 self.gathers.finish(self.allocator, self.gathers.get(ticket).?);
                 if (self.shard_metrics) |sm| sm.recordCrossShardOverloaded(.gather);
                 return error.GatherBusy;
@@ -3599,7 +3659,10 @@ pub const Shard = struct {
     /// The gather is done: its client has one fewer request in flight, and
     /// any part still out is dropped when it comes.
     fn endGather(self: *Shard, e: *Gathers.Entry) void {
-        if (self.gatherClient(e)) |conn| conn.forwards_in_flight -|= 1;
+        if (self.gatherClient(e)) |conn| {
+            conn.forwards_in_flight -|= 1;
+            conn.endNsAsk(@intFromPtr(e), e.gen);
+        }
         self.gathers.finish(self.allocator, e);
     }
 
@@ -4623,6 +4686,7 @@ pub const Shard = struct {
 
     fn askShard0(self: *Shard, conn: *Connection, req: proto.Request, name: []const u8, origin: run_mod.Origin) void {
         const id = req.header.request_id;
+        if (!self.nsAskRoom(conn, req)) return self.sendRefusal(conn, id, .overloaded, NS_ASKS_FULL);
         const state = self.allocator.create(EdgeAsk) catch return self.sendRefusal(conn, id, .internal_error, proto.notRun("internal error: out of memory"));
         const bytes = serializeRequest(self.allocator, req) catch {
             self.allocator.destroy(state);
@@ -4644,6 +4708,7 @@ pub const Shard = struct {
     /// Hold a read until this node's table is published through `index`, or,
     /// with none, until the leader says how far its own is.
     fn holdAtEdgeFor(self: *Shard, conn: *Connection, req: proto.Request, name: []const u8, origin: run_mod.Origin, now: u64, at: ?u64) void {
+        if (!self.nsAskRoom(conn, req)) return self.sendRefusal(conn, req.header.request_id, .overloaded, NS_ASKS_FULL);
         if (conn.forwards_in_flight >= Connection.MAX_FORWARDS_IN_FLIGHT) return self.sendRefusal(conn, req.header.request_id, .overloaded, .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many requests on this connection are waiting; this request was not run — back off and retry" });
         const w = self.edge.free() orelse return self.sendRefusal(conn, req.header.request_id, .overloaded, EDGE_FULL);
         const bytes = serializeRequest(self.allocator, req) catch return self.sendRefusal(conn, req.header.request_id, .internal_error, proto.notRun("internal error: out of memory"));
@@ -4657,9 +4722,8 @@ pub const Shard = struct {
         self.edge.count += 1;
         // One of the connection's requests waiting elsewhere, as a gather's.
         conn.forwards_in_flight += 1;
-        // Held, the read lets the connection's later requests run first, as a
-        // blocking read does: a write sent after it may apply before it runs,
-        // and it then sees that write.
+        // Its connection's later requests to this namespace wait behind it.
+        self.noteNsAsk(conn, req, @intFromPtr(w), w.seq, true);
         conn.response_deferred = true;
         if (!asked) self.askLeader(owned);
     }
@@ -4756,6 +4820,12 @@ pub const Shard = struct {
         const reply_to = w.reply_to;
         const origin = w.origin;
         const since = w.since_ms;
+        const seq = w.seq;
+        // Its connection's later requests to the namespace still wait while
+        // it runs again: whatever wait that starts takes its entry over.
+        if (self.edgeClient(w)) |c| if (c.nsAskOf(w.request_id)) |a| if (a.slot == @intFromPtr(w) and a.gen == seq) {
+            a.slot = RERUN_SLOT;
+        };
         self.endEdgeWait(w);
         defer self.allocator.free(bytes);
         // Run as the client's own request, now that its namespace resolves.
@@ -4771,16 +4841,32 @@ pub const Shard = struct {
         self.reentry = Reentry.of(conn, req.header.request_id, since, origin, .rerun);
         defer self.reentry = prev;
         self.runRequest(conn, req, origin);
+        conn.endNsAsk(RERUN_SLOT, seq);
         // Run from the tick, not from reading the client: nothing else
         // sends what it answered.
         self.flushToClient(conn.fd);
+    }
+
+    /// An entry's slot while its request runs again from the edge: no wait's.
+    const RERUN_SLOT: usize = 1;
+
+    fn edgeClient(self: *Shard, w: *const edge_mod.Wait) ?*Connection {
+        const sock = switch (w.reply_to) {
+            .socket => |sock| sock,
+            .remote => return null,
+        };
+        const conn = self.getConnection(sock.fd) orelse return null;
+        return if (conn.id == sock.conn_id) conn else null;
     }
 
     /// A held read is over: its connection has one fewer request waiting.
     fn endEdgeWait(self: *Shard, w: *edge_mod.Wait) void {
         switch (w.reply_to) {
             .socket => |sock| if (self.getConnection(sock.fd)) |conn| {
-                if (conn.id == sock.conn_id) conn.forwards_in_flight -|= 1;
+                if (conn.id == sock.conn_id) {
+                    conn.forwards_in_flight -|= 1;
+                    conn.endNsAsk(@intFromPtr(w), w.seq);
+                }
             },
             .remote => {},
         }
@@ -8229,12 +8315,13 @@ pub const Shard = struct {
         var msg_buf: [160]u8 = undefined;
         const message = switch (w.reason) {
             .in_flight => std.fmt.bufPrint(&msg_buf, "overloaded: {d} requests on this connection are still waiting on other shards (the oldest on shard {d}); this request was not run — back off and retry", .{ Connection.MAX_FORWARDS_IN_FLIGHT, blamed }),
-            .blocking_reads => std.fmt.bufPrint(&msg_buf, "overloaded: this connection has {d} blocking reads waiting already; this request was not run — retry once one returns", .{Connection.MAX_BLOCKING_IN_FLIGHT}),
+            .blocking_reads => std.fmt.bufPrint(&msg_buf, BLOCKING_READS_OUT, .{Connection.MAX_BLOCKING_IN_FLIGHT}),
             .reply_capacity => if (w.blocking)
                 std.fmt.bufPrint(&msg_buf, "overloaded: shard {d} has no room for more blocking reads from shard {d}; this read was not run — retry", .{ w.target, self.id })
             else
                 std.fmt.bufPrint(&msg_buf, NOT_KEEPING_UP, .{w.target}),
             .inbox => std.fmt.bufPrint(&msg_buf, NOT_KEEPING_UP, .{w.target}),
+            .namespace_ask => std.fmt.bufPrint(&msg_buf, "overloaded: this connection's earlier requests are still waiting for their namespaces; this request was not run — retry", .{}),
         } catch "overloaded: this request was not run — back off and retry";
         self.sendErrorResponse(conn, req.header.request_id, .overloaded, message);
         if (self.shard_metrics) |sm| sm.recordCrossShardOverloaded(.client_forward);
@@ -8251,6 +8338,7 @@ pub const Shard = struct {
             .blocking_reads => std.fmt.comptimePrint("its connection had {d} blocking reads out", .{Connection.MAX_BLOCKING_IN_FLIGHT}),
             .reply_capacity => if (w.blocking) "that shard held its share of this shard's blocking reads" else "that shard held its share of this shard's requests",
             .inbox => "that shard had not drained this shard's share of its inbox",
+            .namespace_ask => "its connection's earlier requests were still waiting for their namespaces",
         };
         log.warn("shard {d}: refused a client request after {d} ms waiting on shard {d}: {s} ({d} refused so far; {d} ordinary and {d} blocking in flight to shard {d})", .{ self.id, waited, blamed, why, self.forwards_refused, self.reply_pool.heldBy(.ordinary, blamed), self.reply_pool.heldBy(.blocking, blamed), blamed });
     }
@@ -8287,7 +8375,14 @@ pub const Shard = struct {
             };
             if (conn.closing) continue;
             const class: reply_pool_mod.Class = if (w.blocking) .blocking else .ordinary;
-            var why = self.stillWaits(conn, .{ .target = w.target, .blocking = w.blocking }, w.reason);
+            // A namespace_ask head has no target yet: it waits only for its
+            // connection's earlier requests, then for its target's room
+            // through `holdForward` like any head.
+            const ns_wait = w.reason == .namespace_ask;
+            var why: ?Connection.WaitReason = if (ns_wait)
+                (if (namespaceAskOver(conn, w.ns)) null else .namespace_ask)
+            else
+                self.stillWaits(conn, .{ .target = w.target, .blocking = w.blocking }, w.reason);
             const slots = &slot_room[@backingInt(class)][w.target];
             const inbox = &inbox_room[w.target];
             // A blocking read here waits on nothing shared.
@@ -8325,7 +8420,7 @@ pub const Shard = struct {
                     slots.* -= 1;
                     inbox.* -= 1;
                 }
-                conn.has_turn = true;
+                conn.has_turn = !ns_wait;
             } else {
                 conn.give_up_bytes = conn.read_buf.readable();
                 conn.give_up_blame = null;
@@ -12777,7 +12872,16 @@ test "Shard: 64 pipelined writes into a new namespace, their share spent when sh
     defer _ = std.c.close(c.pair[1]);
     var kbuf: [16]u8 = undefined;
     const k = try keyOn(b, nextNamespaceId(a), 0, &kbuf);
-    for (0..Connection.MAX_FORWARDS_IN_FLIGHT) |i| b.runRequest(c.conn, try ParkTest.request(.kv_put, 100 + i, "fresh", k, "v", ""), .client);
+    // Sent as a client pipelines them: the first asks shard 0 for the
+    // namespace and the rest wait, unread, behind it.
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(std.testing.allocator);
+    for (0..Connection.MAX_FORWARDS_IN_FLIGHT) |i| {
+        const frame = try Shard.serializeRequest(std.testing.allocator, try ParkTest.request(.kv_put, 100 + i, "fresh", k, "v", ""));
+        defer std.testing.allocator.free(frame);
+        try frames.appendSlice(std.testing.allocator, frame);
+    }
+    _ = feedClient(c.pair[1], b, c.conn.fd, frames.items);
     shard0Answers(&two, b);
     spendShare(a, 1);
     _ = b.drainInbox();
@@ -12988,6 +13092,9 @@ test "Shard: a request held again for its connection's blocking reads, though sh
     // again each time it runs, though shard 0 has room.
     c.conn.blocking_in_flight = Connection.MAX_BLOCKING_IN_FLIGHT;
     defer c.conn.blocking_in_flight = 0;
+    var sm = ShardMetrics{ .shard_id = 1 };
+    b.shard_metrics = &sm;
+    defer b.shard_metrics = null;
     b.reentry = Shard.Reentry.of(c.conn, 7, Shard.nowMs() -| Shard.ASK_WAIT_MS, .client, .rerun);
     b.forwardToShard(0, c.conn, req, auth);
     b.reentry = null;
@@ -12999,6 +13106,8 @@ test "Shard: a request held again for its connection's blocking reads, though sh
     const resp = try nextAnswer(c, b, &out);
     try std.testing.expectEqual(@as(u64, 7), resp.header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), resp.header.status);
+    try std.testing.expect(std.mem.indexOf(u8, (try resp.refused()).message, "blocking reads waiting already") != null);
+    try std.testing.expectEqual(@as(u64, 1), sm.forward_refused[@backingInt(ShardMetrics.ForwardRefused.blocking_reads)].load(.monotonic));
     try std.testing.expectEqual(@as(u16, 0), c.conn.forwards_in_flight);
 }
 
@@ -13029,6 +13138,179 @@ test "Shard: a paused connection whose request is held for room is still not rea
     try std.testing.expectEqual(@as(u64, 7), resp.header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     try std.testing.expect(!c.conn.reads_held);
+}
+
+/// `reqs`, serialized one after another as a client pipelines them.
+fn pipeline(reqs: []const proto.Request) ![]u8 {
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer frames.deinit(std.testing.allocator);
+    for (reqs) |r| {
+        const frame = try Shard.serializeRequest(std.testing.allocator, r);
+        defer std.testing.allocator.free(frame);
+        try frames.appendSlice(std.testing.allocator, frame);
+    }
+    return frames.toOwnedSlice(std.testing.allocator);
+}
+
+fn kvValue(c: TestClient, sh: *Shard, two: *TwoShards, id: u64, ns: []const u8, key: []const u8) ![]const u8 {
+    var body: [64]u8 = undefined;
+    sh.runRequest(c.conn, edgeGet(&body, id, ns, key), .client);
+    two.settle();
+    const S = struct {
+        var out: [512]u8 = undefined;
+    };
+    const got = try nextAnswer(c, sh, &S.out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), got.header.status);
+    var diag: schema.Diagnostic = .{};
+    return (try table_run.op("kv.get").response.decodeAll(got.data, &diag)).value;
+}
+
+test "Shard: a write sent after one whose namespace shard 0 is making, read once shard 0 has published it, applies after it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, nextNamespaceId(a), 0, &kbuf);
+    const first = try pipeline(&.{try ParkTest.request(.kv_put, 1, "fresh", k, "one", "")});
+    defer std.testing.allocator.free(first);
+    _ = feedClient(c.pair[1], b, c.conn.fd, first);
+    // Published, and answered onto shard 1's ring, not yet read there.
+    shard0Answers(&two, b);
+    try std.testing.expect(two.namespaces.lookup("fresh") != null);
+    const second = try pipeline(&.{try ParkTest.request(.kv_put, 2, "fresh", k, "two", "")});
+    defer std.testing.allocator.free(second);
+    _ = feedClient(c.pair[1], b, c.conn.fd, second);
+    try std.testing.expectEqual(@as(?Connection.WaitReason, .namespace_ask), if (c.conn.waiting) |w| w.reason else null);
+    for (0..8) |_| {
+        two.settle();
+        b.settleConnections();
+    }
+    var out: [512]u8 = undefined;
+    var answers: [2]proto.Response = undefined;
+    try ParkTest.responses(b, c.conn, c.pair[1], &out, &answers);
+    for (answers, 1..) |r, id| {
+        try std.testing.expectEqual(@as(u64, id), r.header.request_id);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
+    }
+    try std.testing.expectEqualStrings("two", try kvValue(c, b, &two, 3, "fresh", k));
+    try std.testing.expectEqual(@as(u8, 0), c.conn.ns_ask_count);
+}
+
+test "Shard: a client's requests into five namespaces it waits for: the fifth waits unread until one of the four is answered, and all are answered in order" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var bodies: [5][64]u8 = undefined;
+    var reqs: [5]proto.Request = undefined;
+    const names = [_][]const u8{ "n1", "n2", "n3", "n4", "n5" };
+    for (&reqs, names, 0..) |*r, n, i| r.* = edgeGet(&bodies[i], i + 1, n, "k");
+    const frames = try pipeline(&reqs);
+    defer std.testing.allocator.free(frames);
+    _ = feedClient(c.pair[1], b, c.conn.fd, frames);
+    try std.testing.expectEqual(@as(u8, Connection.MAX_NS_ASKS), c.conn.ns_ask_count);
+    try std.testing.expectEqual(@as(?Connection.WaitReason, .namespace_ask), if (c.conn.waiting) |w| w.reason else null);
+    for (0..8) |_| {
+        two.settle();
+        b.settleConnections();
+    }
+    var out: [2048]u8 = undefined;
+    var answers: [5]proto.Response = undefined;
+    try ParkTest.responses(b, c.conn, c.pair[1], &out, &answers);
+    for (answers, 1..) |r, id| {
+        try std.testing.expectEqual(@as(u64, id), r.header.request_id);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), r.header.status);
+    }
+    try std.testing.expectEqual(@as(u8, 0), c.conn.ns_ask_count);
+}
+
+test "Shard: an ask for a namespace whose part can't be sent leaves nothing for its connection's later requests to wait behind" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, nextNamespaceId(a), 0, &kbuf);
+    // Shard 1's share free, shard 0's ring full of what is sent on none.
+    while (a.mailbox.inbox.send(.{ .tag = .worker_report })) {}
+    b.runRequest(c.conn, try ParkTest.request(.kv_put, 1, "fresh", k, "v", ""), .client);
+    var out: [512]u8 = undefined;
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), (try nextAnswer(c, b, &out)).header.status);
+    try std.testing.expectEqual(@as(u8, 0), c.conn.ns_ask_count);
+    while (a.drainInbox() > 0) {}
+}
+
+test "Shard: a chosen-id start into a namespace shard 0 is making keeps its connection's later requests behind it through the find it starts" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    // [ver_len:u16][ver][has_idem:u8][key_len:u16][key][has_rid:u8][rid_len:u16][rid][input]
+    const start = "\x03\x001.0" ++ "\x01\x02\x00ik" ++ "\x01\x09\x00order-123" ++ "{}";
+    const frames = try pipeline(&.{
+        try ParkTest.request(.workflow_start, 1, "fresh", "wf", start, ""),
+        try ParkTest.request(.kv_put, 2, "fresh", "k", "v", ""),
+    });
+    defer std.testing.allocator.free(frames);
+    _ = feedClient(c.pair[1], b, c.conn.fd, frames);
+    try std.testing.expectEqual(@as(?Connection.WaitReason, .namespace_ask), if (c.conn.waiting) |w| w.reason else null);
+    shard0Answers(&two, b);
+    // The start runs again, now finding which shard holds its run: the put
+    // still waits behind it.
+    _ = b.drainInbox();
+    try std.testing.expectEqual(@as(usize, 1), b.gathers.inUse());
+    try std.testing.expectEqual(@as(u8, 1), c.conn.ns_ask_count);
+    b.settleConnections();
+    try std.testing.expect(c.conn.waiting != null);
+    for (0..8) |_| {
+        two.settle();
+        b.settleConnections();
+    }
+    var out: [2048]u8 = undefined;
+    var answers: [2]proto.Response = undefined;
+    try ParkTest.responses(b, c.conn, c.pair[1], &out, &answers);
+    for (answers, 1..) |r, id| try std.testing.expectEqual(@as(u64, id), r.header.request_id);
+    try std.testing.expectEqual(@as(u8, 0), c.conn.ns_ask_count);
+}
+
+test "Shard: a read across shards a request running again starts gives its parts the deadline of when its client sent it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const b = &two.shards[1];
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    c.conn.head_since_ms = null;
+    const now = Shard.nowMs();
+    var body: [64]u8 = undefined;
+    const req = edgeGet(&body, 7, "unknown", "k");
+    b.reentry = Shard.Reentry.of(c.conn, 7, now -| reply_pool_mod.DEADLINE_MS, .client, .rerun);
+    b.askShard0(c.conn, req, "unknown", .client);
+    b.reentry = null;
+    var due: ?u64 = null;
+    for (b.reply_pool.slots) |slot| if (slot.active and slot.request_id == 7) {
+        due = slot.answer_due_ms;
+    };
+    // Counted from when it was sent, it is due as soon as a part may be.
+    try std.testing.expect(due.? < now + reply_pool_mod.DEADLINE_MS);
+    two.settle();
 }
 
 test "Shard: a client request refused before it goes to another shard says whether its share there was spent or that shard's ring was full" {
@@ -28522,6 +28804,40 @@ test "Shard: after a restart, a delete through shard 0 before it publishes its n
     try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), (try nextAnswer(c, a, &out)).header.status);
 }
 
+test "Shard: a put sent after a delete shard 0 holds until it publishes their namespace applies after the delete" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    var key_buf: [8]u8 = undefined;
+    const key = try twoShardsWithXsKey(data_dir, &key_buf);
+    var two: TwoShards = undefined;
+    try restartedBeforePublish(&two, data_dir);
+    defer two.deinit();
+    const a = &two.shards[0];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    const frames = try pipeline(&.{
+        testReq(.kv_delete, 4, "xs", key, "", ""),
+        testReq(.kv_put, 5, "xs", key, "w", ""),
+    });
+    defer std.testing.allocator.free(frames);
+    _ = feedClient(c.pair[1], a, c.conn.fd, frames);
+    drainBoth(&two);
+    try expectNoAnswer(c, a);
+    _ = try a.tick(0);
+    for (0..8) |_| {
+        two.settle();
+        a.settleConnections();
+    }
+    var out: [1024]u8 = undefined;
+    var answers: [2]proto.Response = undefined;
+    try ParkTest.responses(a, c.conn, c.pair[1], &out, &answers);
+    try std.testing.expectEqual(@as(u64, 4), answers[0].header.request_id);
+    try std.testing.expectEqual(@as(u64, 5), answers[1].header.request_id);
+    try std.testing.expectEqualStrings("w", try kvValue(c, a, &two, 6, "xs", key));
+}
+
 test "Shard: a delete in a namespace never created is refused as having none on a node of several shards, whichever shard it reaches" {
     var two: TwoShards = undefined;
     try two.init();
@@ -28715,19 +29031,26 @@ test "Shard: a follower holds at most a shard's share of reads at the edge; past
     try f.init();
     defer f.deinit();
     const shard = &f.t.shard;
-    // Spread over two connections, so neither reaches its own cap first.
-    const other = try TestClient.open(shard);
-    defer _ = std.c.close(other.pair[1]);
+    // Spread over connections, so none reaches its own caps first: each
+    // waits for at most `MAX_NS_ASKS` namespaces.
+    const PER = Connection.MAX_NS_ASKS;
+    var others: [edge_mod.WAITS / PER - 1]TestClient = undefined;
+    for (&others) |*o| o.* = try TestClient.open(shard);
+    defer for (others) |o| {
+        _ = std.c.close(o.pair[1]);
+    };
     var body: [64]u8 = undefined;
     var name: [16]u8 = undefined;
     for (0..edge_mod.WAITS) |i| {
-        const c = if (i % 2 == 0) f.c else other;
+        const c = if (i / PER == 0) f.c else others[i / PER - 1];
         shard.runRequest(c.conn, edgeGet(&body, i + 1, try std.fmt.bufPrint(&name, "held-{d}", .{i}), "k"), .client);
     }
     try std.testing.expectEqual(@as(u32, edge_mod.WAITS), shard.edge.count);
-    shard.runRequest(f.c.conn, edgeGet(&body, 999, "one-more", "k"), .client);
+    const c = try TestClient.open(shard);
+    defer _ = std.c.close(c.pair[1]);
+    shard.runRequest(c.conn, edgeGet(&body, 999, "one-more", "k"), .client);
     var out: [512]u8 = undefined;
-    const over = try nextAnswer(f.c, shard, &out);
+    const over = try nextAnswer(c, shard, &out);
     try std.testing.expectEqual(@as(u64, 999), over.header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), over.header.status);
     try std.testing.expectEqual(proto.Ran.no, (try over.refused()).ran);
