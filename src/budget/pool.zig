@@ -21,8 +21,18 @@ const Store = store_mod.Store;
 /// `Record` (treap node and value slice) and the allocator's bookkeeping for
 /// its three allocations (record, key, value). A fixed figure, the same on
 /// every build, because a replicated decision reads it: change it as you
-/// would a data format. Calibrated on Linux (glibc malloc).
-pub const RESIDENT_RECORD: u64 = 112;
+/// would a data format.
+///
+/// Derived, not fitted: each of the three allocations costs at most one
+/// glibc minimum chunk (32 B) beyond its bytes, plus the `Record` itself.
+/// Measured on Linux across keys of 5-40 B and values of 0-4097 B it is
+/// 88-142 B. It models glibc's heap chunks only: a value past the mmap
+/// threshold (128 KiB) is page-rounded, up to about 4 KiB more, under 3% of
+/// such a value, and the pool doesn't count that.
+pub const RESIDENT_RECORD: u64 = ALLOCATIONS * GLIBC_MIN_CHUNK + @sizeOf(store_mod.Record);
+
+const ALLOCATIONS = 3;
+const GLIBC_MIN_CHUNK = 32;
 
 comptime {
     // The figure counts the store's encoding of a record's lengths as part of
@@ -60,6 +70,11 @@ pub const CHARGED = [_]u16{
     // ts: series, point, field
     60, 61,
     62,
+    // channels: out_ns, out, out_meta, parked. Never refused, but counted, so
+    // full outboxes hold back client writes.
+    54,
+    55, 56,
+    59,
 };
 
 /// The families the pool is not charged for: the node's own state, and
@@ -69,17 +84,15 @@ pub const EXEMPT = [_]u16{
     25, 26,
     27, 28,
     29,
-    // settings: policy, node, budget
+    // settings: policy, node, budget, bind
     50,
     51, 52,
-    // channels: out_ns, out, out_meta, in, parked (own cap)
-    54, 55,
-    56, 57,
-    59,
+    68,
+    // channels: in (one record per sender group)
+    57,
     // workflow: idem, per_def, out, sig
-    64,
-    65, 66,
-    67,
+    64, 65,
+    66, 67,
 };
 
 fn listed(comptime set: []const u16, comptime id: u16) bool {
@@ -142,7 +155,8 @@ test "pool: a record's resident figure covers the store's layout of it" {
     // moves real memory per record: calibrate again (on Linux) and change the
     // figure as a format change, or confirm it still holds.
     try testing.expectEqual(@as(usize, 64), @sizeOf(store_mod.Record));
-    try testing.expect(RESIDENT_RECORD > @sizeOf(store_mod.Record));
+    // The literal replicas agree on; it moves only with the derivation above.
+    try testing.expectEqual(@as(u64, 160), RESIDENT_RECORD);
 
     // Three allocations per record: the record, its key and its value.
     var counting = CountingAllocator{ .child = testing.allocator };
