@@ -45,3 +45,5 @@ workflow-runs-take-newest.json	runs_take_newest	--workflows	-	workflow_run_rule	
 workflow-runs-wake-any-type.json	runs_wake_any_type	--workflows	-	workflow_run_rule	a run.s status is not the ledger.s
 workflow-runs-take-picked.json	runs_take_ignores_picked	--workflows	-	workflow_run_rule	its takes name a signal its run doesn.t hold
 workflow-runs-signal-after-end.json	runs_signal_after_end	--workflows	-	workflow_run_rule	applied a signal the ledger refuses: its run has ended
+pool-load-bypasses-link.json	pool_load_bypasses_link	-	-	pool_use_recount	isn.t what its charged records hold
+pool-counts-exempt-family.json	pool_counts_exempt_family	--workflows	-	pool_use_recount	isn.t what its charged records hold

@@ -163,6 +163,7 @@ const source_page_mod = @import("../processing/source_page.zig");
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
 const memory_budget = @import("memory_budget.zig");
+const pool = @import("../budget/pool.zig");
 const host_memory = @import("host_memory.zig");
 const settings_machine = @import("../settings/machine.zig");
 const contract_view = @import("../contract/view.zig");
@@ -5860,6 +5861,7 @@ pub const Shard = struct {
             sm.snapshot_skipped_leader_not_ready.store(self.snapshot_skips_leader_not_ready, .monotonic);
             sm.ts_points.store(self.ts_handler.ts.pointCount(), .monotonic);
             sm.ts_point_bytes.store(self.ts_handler.ts.pointBytes(), .monotonic);
+            sm.pool_use_bytes.store(pool.useOf(&self.defaultPartition().store), .monotonic);
             for (&sm.ts_late, self.defaultPartition().store.ts_late_points) |*m, n| m.store(n, .monotonic);
             // Summed over senders: the log names each sender.
             for (&sm.channel_sender_bugs, 0..) |*total, reason| {
@@ -6654,7 +6656,6 @@ pub const Shard = struct {
         };
         if (self.metrics_registry) |mr| mr.memory_budget.set(
             self.budget.budget_bytes,
-            self.budget.pool_use_bytes,
             self.budget.governing_node orelse 0,
             self.budget.provisional_since_ms orelse 0,
             self.budget.provisional_node orelse 0,

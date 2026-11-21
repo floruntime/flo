@@ -46,3 +46,51 @@ test "e2e/memory_budget: a single node shows a non-zero budget" {
     try testing.expectEqual(@as(i64, 7), governing); // this node (id 7) is the sole data-holder and governs
     try testing.expectEqual(@as(i64, 0), provisional); // its own row applied, so not provisional
 }
+
+/// The node's pool use as the dashboard shows it, and shard 0's.
+fn poolUse(http: anytype) !struct { node: i64, shard0: i64 } {
+    var resp = try http.get("/api/v1/metrics");
+    defer resp.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+    const mb = parsed.value.object.get("memory_budget").?;
+    const by_shard = mb.object.get("pool_use_by_shard").?.array.items;
+    return .{ .node = mb.object.get("pool_use_bytes").?.integer, .shard0 = by_shard[0].integer };
+}
+
+test "e2e/memory_budget: the pool's use rises with what a client writes and falls when it deletes it" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true },
+    });
+    defer ctx.deinit();
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+
+    const keys = 50;
+    const value: []const u8 = &@as([2000]u8, @splat('v'));
+    var key_buf: [32]u8 = undefined;
+    const before = (try poolUse(http)).node;
+    for (0..keys) |i| try ctx.exec(&.{ "kv", "set", try std.fmt.bufPrint(&key_buf, "pool-{d}", .{i}), value });
+
+    // Published each tick: poll until the writes show.
+    var during: i64 = 0;
+    for (0..100) |_| {
+        during = (try poolUse(http)).node;
+        if (during >= before + keys * value.len) break;
+        stdx.time.sleep(50 * std.time.ns_per_ms);
+    }
+    try testing.expect(during >= before + keys * value.len);
+
+    for (0..keys) |i| try ctx.exec(&.{ "kv", "delete", try std.fmt.bufPrint(&key_buf, "pool-{d}", .{i}) });
+    // A delete frees the value: what's left is the tombstones, far less.
+    var after: i64 = during;
+    for (0..100) |_| {
+        after = (try poolUse(http)).node;
+        if (after < before + keys * value.len / 4) break;
+        stdx.time.sleep(50 * std.time.ns_per_ms);
+    }
+    try testing.expect(after < before + keys * value.len / 4);
+    // The node's figure is its shards', summed.
+    const now = try poolUse(http);
+    try testing.expect(now.node >= now.shard0);
+}
