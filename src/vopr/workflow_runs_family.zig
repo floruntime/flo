@@ -785,8 +785,8 @@ pub const WorkflowRuns = struct {
     fn nextSeqs(store: *store_mod.Store) [GROUPS]u64 {
         var out: [GROUPS]u64 = undefined;
         for (&out, 0..) |*seq, g| {
-            var kb: [channels.GROUP_KEY]u8 = undefined;
-            const got = (view_mod.ReadView{ .store = store }).get(channels.MetaFam, channels.groupKey(&kb, @intCast(g))) catch null;
+            var kb: [channels.CHAN_KEY]u8 = undefined;
+            const got = (view_mod.ReadView{ .store = store }).get(channels.MetaFam, channels.chanKey(&kb, @intCast(g), .main)) catch null;
             seq.* = if (got) |m| m.v.next_seq else 1;
         }
         return out;
@@ -802,7 +802,7 @@ pub const WorkflowRuns = struct {
         // by its type.
         for (before, after, 0..) |from, to, g| for (from..to) |seq| {
             var kb: [channels.OUT_KEY]u8 = undefined;
-            const item = ((view_mod.ReadView{ .store = store }).get(channels.OutFam, channels.outKey(&kb, @intCast(g), seq)) catch null) orelse
+            const item = ((view_mod.ReadView{ .store = store }).get(channels.OutFam, channels.outKey(&kb, @intCast(g), .main, seq)) catch null) orelse
                 return "an entry's message is missing from the outbox";
             if (n >= got.len) return "an entry sent a parent more than the ledger's messages";
             got[n] = item.v;

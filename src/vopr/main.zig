@@ -420,7 +420,7 @@ fn runGroups(allocator: std.mem.Allocator, args: Args, scenario: Scenario) !bool
             sim.printViolations(&vw) catch {};
             sim.printNodeStates(&vw) catch {};
         };
-        for (groups.oracle.violations.items) |v| vw.print("channel {d}->{d} seq {d}: {s}\n", .{ v.from, v.to, v.seq, v.detail }) catch {};
+        for (groups.oracle.violations.items) |v| vw.print("channel {d}->{d} seq {d}: {s} ({s} lane)\n", .{ v.from, v.to, v.seq, v.detail, @tagName(v.lane) }) catch {};
         std.debug.print("{s}", .{vw.buffered()});
         var mb: [64]u8 = undefined;
         const mutant = if (args.family_mutant == .none) "" else std.fmt.bufPrint(&mb, " --family-mutant={t}", .{args.family_mutant}) catch "";

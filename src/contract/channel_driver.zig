@@ -120,6 +120,8 @@ pub fn bytesText(buf: []u8, n: u64) []const u8 {
 }
 
 pub const Batch = Record(&.{
+    // The lane it is on (`channels.Lane`): its seqs count in that lane's.
+    .{ .name = "lane", .T = Int(u8) },
     .{ .name = "gen_term", .T = Int(u64) },
     .{ .name = "gen_counter", .T = Int(u32) },
     .{ .name = "first_seq", .T = Int(u64) },
@@ -127,6 +129,7 @@ pub const Batch = Record(&.{
 });
 
 pub const Answer = Record(&.{
+    .{ .name = "lane", .T = Int(u8) },
     .{ .name = "gen_term", .T = Int(u64) },
     .{ .name = "gen_counter", .T = Int(u32) },
     .{ .name = "applied", .T = Int(u64) },
@@ -170,7 +173,12 @@ pub const SinkRefusals = std.EnumArray(@import("../protocol/reason.zig").Reason,
 
 const InFlightMessage = struct { seq: u64, target: channels.Target, bytes: u64 };
 
-const Peer = struct {
+const Lane = channels.Lane;
+const LANES = channels.LANES;
+
+/// One lane of a channel with one peer, each way: its own seqs, acks,
+/// trims and resends.
+const LaneState = struct {
     // Sending to it.
     gen_counter: u32 = 0,
     /// The highest seq sent in this generation; never below `acked`.
@@ -183,6 +191,16 @@ const Peer = struct {
     trim_through: u64 = 0,
     trim_at_ms: ?u64 = null,
     last_trim_ms: u64 = 0,
+    // Receiving from it.
+    /// The highest seq proposed or applied from it; null until rebuilt.
+    accepted: ?u64 = null,
+    recv_gen: struct { term: u64 = 0, counter: u32 = 0 } = .{},
+    told_applied: u64 = 0,
+    told_durable: u64 = 0,
+};
+
+const Peer = struct {
+    lanes: [LANES]LaneState = @splat(.{}),
     /// The pressure its last answer carried, and when: kept until
     /// `PRESSURE_EXPIRY_MS` after that, probed for every
     /// `PRESSURE_PROBE_MS` meanwhile.
@@ -192,21 +210,20 @@ const Peer = struct {
     probe_ms: u64 = 0,
     /// When it last answered this leader.
     answered_ms: u64 = 0,
-    // Receiving from it.
-    /// The highest seq proposed or applied from it; null until rebuilt.
-    accepted: ?u64 = null,
     /// Its sink messages proposed and not yet applied that may park, in
-    /// seq order: what `Driver.target_bytes` counts.
+    /// seq order: what `Driver.target_bytes` counts. Only the main lane's:
+    /// no history message parks.
     in_flight: std.ArrayListUnmanaged(InFlightMessage) = .empty,
-    recv_gen: struct { term: u64 = 0, counter: u32 = 0 } = .{},
     /// This shard's parked bytes when a target over its cap last refused
     /// its batch, or null: while they are no fewer, every answer to it,
     /// probes' too, says a target is full. Read from the replicated parked
     /// totals, so a refusal is named until an unpark frees room, never by
     /// a clock.
     refused_parked: ?u64 = null,
-    told_applied: u64 = 0,
-    told_durable: u64 = 0,
+
+    fn lane(p: *Peer, l: Lane) *LaneState {
+        return &p.lanes[@backingInt(l)];
+    }
 };
 
 pub const Counts = struct {
@@ -453,7 +470,9 @@ pub const Driver = struct {
 
     /// Takes back what `track` counted for `from` past `seq`: a batch
     /// whose inbound wasn't proposed.
-    fn untrackAfter(self: *Driver, from: u16, seq: u64) void {
+    fn untrackAfter(self: *Driver, from: u16, lane: Lane, seq: u64) void {
+        // Only the main lane's messages park, so only its are tracked.
+        if (lane != .main) return;
         const p = &self.peers[from];
         while (p.in_flight.items.len > 0 and p.in_flight.items[p.in_flight.items.len - 1].seq > seq) self.forget(p.in_flight.pop().?);
     }
@@ -471,9 +490,17 @@ pub const Driver = struct {
         var quiet = true;
         for (0..self.count) |b_| {
             const b: u16 = @intCast(b_);
-            self.tickSend(b, now_ms, read, durable, io);
-            self.tickAnswer(b, read, durable, io);
-            if (!self.settled(b, read, durable)) quiet = false;
+            // Pressure is a peer's, not a lane's: ask again while it holds.
+            const p = &self.peers[b];
+            if (pressureLive(p, now_ms) and now_ms -| p.probe_ms >= PRESSURE_PROBE_MS) {
+                if (self.sendEmpty(b, .main, p, io)) p.probe_ms = now_ms;
+            }
+            if (pressureLive(p, now_ms)) quiet = false;
+            for (Lane.all) |lane| {
+                self.tickSend(b, lane, now_ms, read, durable, io);
+                self.tickAnswer(b, lane, read, durable, io);
+                if (!self.settled(b, lane, read, durable)) quiet = false;
+            }
         }
         self.quiet = quiet;
         self.seen = seen;
@@ -483,19 +510,18 @@ pub const Driver = struct {
     /// acked durably and trimmed, and every one received is told durably.
     /// Durable progress is only waited on when something isn't, so a
     /// settled channel needn't watch the durable index.
-    fn settled(self: *const Driver, b: u16, read: ReadView, durable: u64) bool {
-        const p = &self.peers[b];
-        if (pressureLive(p, self.now_ms)) return false;
-        const meta = channels.metaOf(read, b);
+    fn settled(self: *const Driver, b: u16, lane: Lane, read: ReadView, durable: u64) bool {
+        const p = &self.peers[b].lanes[@backingInt(lane)];
+        const meta = channels.metaOf(read, b, lane);
         const last = meta.next_seq - 1;
         if (meta.acked != last or p.trim_at_ms != null or p.durable_ack > meta.acked or p.applied_ack > meta.acked) return false;
-        const in = channels.inOf(read, b) orelse return true;
+        const in = channels.inOf(read, b, lane) orelse return true;
         return self.durableAck(b, in, durable) == in.applied and p.told_applied >= in.applied and p.told_durable >= in.applied;
     }
 
-    fn tickSend(self: *Driver, b: u16, now_ms: u64, read: ReadView, durable: u64, io: anytype) void {
-        const p = &self.peers[b];
-        const meta = channels.metaOf(read, b);
+    fn tickSend(self: *Driver, b: u16, lane: Lane, now_ms: u64, read: ReadView, durable: u64, io: anytype) void {
+        const p = self.peers[b].lane(lane);
+        const meta = channels.metaOf(read, b, lane);
         const last = meta.next_seq - 1;
         // Trims: one in flight; a lost one is proposed again.
         if (p.trim_at_ms) |at| {
@@ -504,17 +530,13 @@ pub const Driver = struct {
         if (p.trim_at_ms == null and p.durable_ack > meta.acked and now_ms - p.last_trim_ms >= TRIM_EVERY_MS) {
             const through = @min(p.durable_ack, meta.acked + ce.MAX_TRIM_SPAN);
             var tb: [32]u8 = undefined;
-            const bytes = ce.Trim.encodeInto(&tb, .{ .to = b, .first = meta.acked + 1, .through = through }) catch unreachable;
+            const bytes = ce.Trim.encodeInto(&tb, .{ .to = b, .lane = @backingInt(lane), .first = meta.acked + 1, .through = through }) catch unreachable;
             if (io.propose(.channel_trim, bytes)) {
                 p.trim_through = through;
                 p.trim_at_ms = now_ms;
                 p.last_trim_ms = now_ms;
                 self.counts.trims_proposed += 1;
             }
-        }
-        // Pressure is kept only while answers carry it: ask again.
-        if (pressureLive(p, now_ms) and now_ms -| p.probe_ms >= PRESSURE_PROBE_MS) {
-            if (self.sendEmpty(b, p, io)) p.probe_ms = now_ms;
         }
         if (last == 0 and p.applied_ack == 0) return;
         const floor = @max(meta.acked, p.applied_ack);
@@ -532,7 +554,7 @@ pub const Driver = struct {
             // Own-group sends don't wait for durability: their inbound entry
             // follows them in the same log.
             const ready = if (b == self.group or self.mutant == .past_durable) std.math.maxInt(u64) else durable;
-            if (self.sendBatch(b, p.sent_through + 1, last, floor, ready, read, io)) |sent| {
+            if (self.sendBatch(b, lane, p.sent_through + 1, last, floor, ready, read, io)) |sent| {
                 if (p.sent_through == floor) p.progress_ms = now_ms;
                 p.sent_through = sent;
                 p.last_sent_ms = now_ms;
@@ -542,15 +564,15 @@ pub const Driver = struct {
         // Idle, with a durable ack outstanding (a lost one would pin the
         // outbox): probe at the resend cadence.
         if (meta.acked < p.applied_ack and now_ms - p.last_sent_ms >= p.backoff_ms) {
-            _ = self.sendEmpty(b, p, io);
+            _ = self.sendEmpty(b, lane, &self.peers[b], io);
             p.last_sent_ms = now_ms;
         }
     }
 
     /// Sends `from..` up to `last`, within the window and the batch bound,
     /// as far as messages are durable. Returns the last seq sent, or null.
-    fn sendBatch(self: *Driver, b: u16, from: u64, last: u64, floor: u64, ready: u64, read: ReadView, io: anytype) ?u64 {
-        const p = &self.peers[b];
+    fn sendBatch(self: *Driver, b: u16, lane: Lane, from: u64, last: u64, floor: u64, ready: u64, read: ReadView, io: anytype) ?u64 {
+        const p = self.peers[b].lane(lane);
         if (!self.buffers()) return null;
         var list: schema.Writer = .{ .buf = self.msgs };
         var n: u32 = 0;
@@ -558,7 +580,7 @@ pub const Driver = struct {
         var seq = from;
         while (seq <= last and n < ce.MAX_BATCH and seq - floor <= WINDOW) : (seq += 1) {
             var k: [channels.OUT_KEY]u8 = undefined;
-            const o = (read.get(channels.OutFam, channels.outKey(&k, b, seq)) catch null) orelse break;
+            const o = (read.get(channels.OutFam, channels.outKey(&k, b, lane, seq)) catch null) orelse break;
             if (o.v.sent_at > ready) break;
             if (n > 0 and bytes + o.v.payload.len > MAX_BATCH_BYTES) break;
             ce.Message.encode(&list, .{ .slot = o.v.slot, .entry_type = o.v.entry_type, .layout_epoch = o.v.layout_epoch, .flags = o.v.flags, .origin_kind = o.v.origin_kind, .origin_ns = o.v.origin_ns, .payload = o.v.payload }) catch break;
@@ -567,6 +589,7 @@ pub const Driver = struct {
         }
         if (n == 0) return null;
         const f = encodeFrame(self.buf, .batch, Batch.Value{
+            .lane = @backingInt(lane),
             .gen_term = self.term,
             .gen_counter = p.gen_counter,
             .first_seq = from,
@@ -578,19 +601,20 @@ pub const Driver = struct {
         return from + n - 1;
     }
 
-    fn sendEmpty(self: *Driver, b: u16, p: *Peer, io: anytype) bool {
+    fn sendEmpty(self: *Driver, b: u16, lane: Lane, peer: *Peer, io: anytype) bool {
+        const p = peer.lane(lane);
         var buf: [64]u8 = undefined;
-        const f = encodeFrame(&buf, .batch, Batch.Value{ .gen_term = self.term, .gen_counter = p.gen_counter, .first_seq = p.sent_through + 1, .messages = .{ .bytes = &.{}, .count = 0 } }) orelse return false;
+        const f = encodeFrame(&buf, .batch, Batch.Value{ .lane = @backingInt(lane), .gen_term = self.term, .gen_counter = p.gen_counter, .first_seq = p.sent_through + 1, .messages = .{ .bytes = &.{}, .count = 0 } }) orelse return false;
         return io.sendFrame(b, f);
     }
 
-    fn tickAnswer(self: *Driver, a: u16, read: ReadView, durable: u64, io: anytype) void {
-        const p = &self.peers[a];
-        const in = channels.inOf(read, a) orelse return;
-        self.releaseApplied(a, in.applied);
+    fn tickAnswer(self: *Driver, a: u16, lane: Lane, read: ReadView, durable: u64, io: anytype) void {
+        const p = self.peers[a].lane(lane);
+        const in = channels.inOf(read, a, lane) orelse return;
+        if (lane == .main) self.releaseApplied(a, in.applied);
         const dur = self.durableAck(a, in, durable);
         if (in.applied <= p.told_applied and dur <= p.told_durable) return;
-        self.answer(a, p, in.applied, dur, 0, .ok, read, io);
+        self.answer(a, lane, in.applied, dur, 0, .ok, read, io);
     }
 
     /// What writes to this group are queued behind, written to `w`, and
@@ -618,13 +642,16 @@ pub const Driver = struct {
         return if (a == self.group) in.applied else channels.appliedAsOf(in, durable);
     }
 
-    fn answer(self: *Driver, a: u16, p: *Peer, applied: u64, dur: u64, gap: u64, status: Status, read: ReadView, io: anytype) void {
+    fn answer(self: *Driver, a: u16, lane: Lane, applied: u64, dur: u64, gap: u64, status: Status, read: ReadView, io: anytype) void {
+        const peer = &self.peers[a];
+        const p = peer.lane(lane);
         var pb: [Pressure.max_size]u8 = undefined;
         var pw: schema.Writer = .{ .buf = &pb };
-        const n = self.pressure(status, p, read, &pw);
+        const n = self.pressure(status, peer, read, &pw);
         if (n > 0) self.counts.pressured += 1;
         var buf: [128]u8 = undefined;
         const f = encodeFrame(&buf, .answer, Answer.Value{
+            .lane = @backingInt(lane),
             .gen_term = p.recv_gen.term,
             .gen_counter = p.recv_gen.counter,
             .applied = applied,
@@ -654,27 +681,31 @@ pub const Driver = struct {
     }
 
     fn onBatch(self: *Driver, from: u16, b: Batch.Value, read: ReadView, durable: u64, halted: bool, io: anytype) void {
-        const p = &self.peers[from];
-        const in = channels.inOf(read, from);
+        // A lane this build doesn't have: a frame from another build, or
+        // none at all.
+        const lane = Lane.from(b.lane) orelse return;
+        const peer = &self.peers[from];
+        const p = peer.lane(lane);
+        const in = channels.inOf(read, from, lane);
         const applied = if (in) |x| x.applied else 0;
         const dur = if (in) |x| self.durableAck(from, x, durable) else 0;
         if (p.accepted == null or p.accepted.? < applied) p.accepted = applied;
-        self.releaseApplied(from, applied);
+        if (lane == .main) self.releaseApplied(from, applied);
         p.recv_gen = .{ .term = b.gen_term, .counter = b.gen_counter };
-        if (halted) return self.answer(from, p, applied, dur, 0, .halted, read, io);
-        if (b.messages.count == 0) return self.answer(from, p, applied, dur, 0, .ok, read, io);
+        if (halted) return self.answer(from, lane, applied, dur, 0, .halted, read, io);
+        if (b.messages.count == 0) return self.answer(from, lane, applied, dur, 0, .ok, read, io);
         const accepted = p.accepted.?;
         const last = b.first_seq + b.messages.count - 1;
         if (last <= accepted) {
-            if (self.mutant == .ack_last_seq) return self.answer(from, p, last, last, 0, .ok, read, io);
-            return self.answer(from, p, applied, dur, 0, .ok, read, io);
+            if (self.mutant == .ack_last_seq) return self.answer(from, lane, last, last, 0, .ok, read, io);
+            return self.answer(from, lane, applied, dur, 0, .ok, read, io);
         }
         if (b.first_seq > accepted + 1) {
             self.counts.gaps += 1;
-            return self.answer(from, p, applied, dur, accepted + 1, .ok, read, io);
+            return self.answer(from, lane, applied, dur, accepted + 1, .ok, read, io);
         }
         // Propose from the first seq not yet accepted.
-        if (!self.buffers()) return self.answer(from, p, applied, dur, 0, .busy, read, io);
+        if (!self.buffers()) return self.answer(from, lane, applied, dur, 0, .busy, read, io);
         var w: schema.Writer = .{ .buf = self.msgs };
         var it = b.messages.iterator();
         var seq = b.first_seq;
@@ -687,7 +718,9 @@ pub const Driver = struct {
             // after it: the batch's prefix goes. It is stamped with this
             // node's caps before it is logged, so every replica applies it
             // under the same ones, and counted as it is logged.
-            const target = if (self.sink_target) |f| f(m) else null;
+            // Only the main lane's may park (`writeSends`): a sink's on the
+            // history lane halts its inbound at apply, as its sender's bug.
+            const target = if (lane != .main) null else if (self.sink_target) |f| f(m) else null;
             if (self.admits) |admits| if (!admits(read, m, self.inFlight(target))) {
                 target_full = true;
                 break;
@@ -698,34 +731,36 @@ pub const Driver = struct {
             };
             if (target) |t| if (!self.track(from, seq, t, logged.payload.len)) break;
             ce.Message.encode(&w, logged) catch {
-                self.untrackAfter(from, accepted);
+                self.untrackAfter(from, lane, accepted);
                 return;
             };
             n += 1;
         }
         if (n == 0) {
             self.counts.busy += 1;
-            if (target_full) p.refused_parked = channels.shardParked(read).bytes;
-            return self.answer(from, p, applied, dur, 0, .busy, read, io);
+            if (target_full) peer.refused_parked = channels.shardParked(read).bytes;
+            return self.answer(from, lane, applied, dur, 0, .busy, read, io);
         }
-        p.refused_parked = null;
-        const entry = ce.Inbound.encodeInto(self.buf, .{ .from = from, .first_seq = accepted + 1, .messages = .{ .bytes = w.written(), .count = n } }) catch {
-            self.untrackAfter(from, accepted);
+        if (lane == .main) peer.refused_parked = null;
+        const entry = ce.Inbound.encodeInto(self.buf, .{ .from = from, .lane = @backingInt(lane), .first_seq = accepted + 1, .messages = .{ .bytes = w.written(), .count = n } }) catch {
+            self.untrackAfter(from, lane, accepted);
             return;
         };
         if (!io.propose(.channel_inbound, entry)) {
-            self.untrackAfter(from, accepted);
+            self.untrackAfter(from, lane, accepted);
             self.counts.busy += 1;
-            return self.answer(from, p, applied, dur, 0, .busy, read, io);
+            return self.answer(from, lane, applied, dur, 0, .busy, read, io);
         }
         p.accepted = accepted + n;
         self.counts.inbound_proposed += 1;
-        self.answer(from, p, applied, dur, 0, .ok, read, io);
+        self.answer(from, lane, applied, dur, 0, .ok, read, io);
     }
 
     fn onAnswer(self: *Driver, from: u16, a: Answer.Value, now_ms: u64, read: ReadView) void {
-        const p = &self.peers[from];
-        const meta = channels.metaOf(read, from);
+        const lane = Lane.from(a.lane) orelse return;
+        const peer = &self.peers[from];
+        const p = peer.lane(lane);
+        const meta = channels.metaOf(read, from, lane);
         // Acks are bounded by what this group's state says was sent, never
         // by what this leader sent: a new leader resends from `acked` while
         // the receiver is already ahead.
@@ -749,18 +784,18 @@ pub const Driver = struct {
         if (std.enums.fromInt(Status, a.status)) |st| {
             if (st != .ok) p.backoff_ms = @min(p.backoff_ms * 2, RESEND_MAX_MS);
         }
-        p.answered_ms = now_ms;
+        peer.answered_ms = now_ms;
         // The pressure it reports now, if any, replaces what it reported.
         var it = a.pressure.iterator();
         var n: u8 = 0;
         while (it.next() catch null) |st| {
             if (n == MAX_PRESSURE) break;
             if (std.enums.fromInt(Cause, st.cause) == null) continue;
-            p.pressure[n] = st;
+            peer.pressure[n] = st;
             n += 1;
         }
-        p.pressure_len = n;
-        if (n > 0) p.pressure_ms = now_ms;
+        peer.pressure_len = n;
+        if (n > 0) peer.pressure_ms = now_ms;
     }
 };
 

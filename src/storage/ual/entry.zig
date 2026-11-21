@@ -232,6 +232,9 @@ pub const Flags = struct {
     /// the trigger's stream as the workflow's own, whether or not its
     /// namespace table has the name yet.
     pub const OWN_NAMESPACE: u16 = 1 << 6;
+    /// A run's history, sent as a channel message to its own group: it
+    /// rides the channels' history lane, never behind a sink's message.
+    pub const HISTORY: u16 = 1 << 7;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -4874,19 +4874,19 @@ fn deliverToSelf(shard: *Shard) bool {
     const ce = @import("../protocol/channel_entries.zig");
     const part = shard.defaultPartition();
     const read: contract_view.ReadView = .{ .store = &part.store };
-    const next = channels.metaOf(read, 0).next_seq;
-    const first = (if (channels.inOf(read, 0)) |i| i.applied else 0) + 1;
+    const next = channels.metaOf(read, 0, .main).next_seq;
+    const first = (if (channels.inOf(read, 0, .main)) |i| i.applied else 0) + 1;
     if (first >= next) return false;
     var mb: [128 * 1024]u8 = undefined;
     var w: wire_schema.Writer = .{ .buf = &mb };
     var seq = first;
     while (seq < next) : (seq += 1) {
         var kb: [channels.OUT_KEY]u8 = undefined;
-        const o = (read.get(channels.OutFam, channels.outKey(&kb, 0, seq)) catch unreachable).?.v;
+        const o = (read.get(channels.OutFam, channels.outKey(&kb, 0, .main, seq)) catch unreachable).?.v;
         ce.Message.encode(&w, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = 0, .flags = o.flags, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload }) catch unreachable;
     }
     var ib: [130 * 1024]u8 = undefined;
-    const inbound = ce.Inbound.encodeInto(&ib, .{ .from = 0, .first_seq = first, .messages = .{ .bytes = w.written(), .count = @intCast(next - first) } }) catch unreachable;
+    const inbound = ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = 0, .first_seq = first, .messages = .{ .bytes = w.written(), .count = @intCast(next - first) } }) catch unreachable;
     test_inbound_index += 1;
     var h = std.mem.zeroes(@import("../storage/ual/entry.zig").Header);
     h.entry_type = @backingInt(@import("../storage/ual/entry.zig").EntryType.channel_inbound);
