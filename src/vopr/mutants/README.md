@@ -41,6 +41,7 @@ means the check stopped catching its bug.
 | `consumer-groups.json` | `stream_forget_ignores_groups` | `group_rule` | `a stream's tombstone is gone while the ledger holds it` |
 | `consumer-groups.json` | `stream_clean_crosses_floor` | `group_rule` | `a stream holds other appends above its floor than the ledger's` |
 | `consumer-groups.json` | `stream_recreate_restarts_ids` | `group_rule` | `a stream's last id is not the ledger's` |
+| `consumer-groups-config.json` | `stream_alter_drops_retained` | `group_rule` | `a stream's retention index entry doesn't match its policy` |
 | `processing.json` | `job_stop_keeps_running` | `processing_rule` | `a job's status is not the ledger's` |
 | `processing.json` | `job_remove_keeps_job` | `processing_rule` | `a job the ledger doesn't hold is stored` |
 | `processing.json` | `job_limit_unchecked` | `processing_rule` | `a job the ledger doesn't hold is stored` |
@@ -121,6 +122,7 @@ are checked against the ledger, record by record.
 | A deleted stream's tombstone is forgotten only once no group counts it and none of its appends are left | `stream_forget_ignores_groups` |
 | A clean removes only appends at or below the floor; every append above it is the ledger's | `stream_clean_crosses_floor` |
 | A stream made again over a tombstone takes ids past the old stream's last, so its last id is the ledger's | `stream_recreate_restarts_ids` |
+| A stream's settings are what its create or alters set, and the retention index names it exactly while it has a policy; an alter changes only its meta and that one entry, and is never refused for memory | `stream_alter_drops_retained` |
 | A report applies only to the delivery it names; the same hand-back resent counts as applied, any other is answered by what became of the record | machine tests "a nack after an abandon of the same delivery, or the reverse, is answered released, not applied", "a report to a group that isn't there is refused not_found" |
 | Every ready, leased and dead record has its key, and no ready or dead key is left over | checked by the family from the store itself, after every applied group entry |
 

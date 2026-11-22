@@ -187,6 +187,9 @@ pub const Mutant = enum {
     /// A delete's tombstone keeps no last id or floor, so a stream made
     /// again takes ids from the start.
     stream_recreate_restarts_ids,
+    /// An alter adding retention leaves its stream out of the retention
+    /// index, so the retention duty never visits it.
+    stream_alter_drops_retained,
 
     /// Whether the bug is in a node's transaction limit: a run with none
     /// never reaches it.
@@ -201,7 +204,7 @@ pub const Mutant = enum {
             .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_condition_local, .kv_if_absent_holds, .kv_batch_conditions_ignored, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .kv_stops_batch_short, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc, .ns_stale_accepted, .ns_live_unraised => false,
             .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
             .queue_settle_ignores_token, .queue_release_removes, .queue_expire_ignores_deadline, .queue_deliver_wrong_order, .queue_deliver_short, .queue_expire_first_only, .queue_report_changes_unnamed, .queue_node_clock, .queue_cap_unchecked, .queue_cap_tightened, .queue_settle_keeps_bytes, .queue_requeue_keeps_failures, .queue_drop_keeps_bytes => false,
-            .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .stream_trim_leaves_floor, .group_delete_keeps_count, .group_extend_clock_ahead, .group_steal_ignores_idle, .group_requeue_keeps_failures, .group_drop_keeps_bytes, .stream_append_reuses_id, .stream_forget_ignores_groups, .stream_clean_crosses_floor, .stream_recreate_restarts_ids => false,
+            .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .stream_trim_leaves_floor, .group_delete_keeps_count, .group_extend_clock_ahead, .group_steal_ignores_idle, .group_requeue_keeps_failures, .group_drop_keeps_bytes, .stream_append_reuses_id, .stream_forget_ignores_groups, .stream_clean_crosses_floor, .stream_recreate_restarts_ids, .stream_alter_drops_retained => false,
             .job_stop_keeps_running, .job_remove_keeps_job, .job_limit_unchecked => false,
         };
     }
@@ -228,7 +231,7 @@ pub const Mutant = enum {
     /// group entries never reaches it.
     pub fn inGroups(m: Mutant) bool {
         return switch (m) {
-            .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .stream_trim_leaves_floor, .group_delete_keeps_count, .group_extend_clock_ahead, .group_steal_ignores_idle, .group_requeue_keeps_failures, .group_drop_keeps_bytes, .stream_append_reuses_id, .stream_forget_ignores_groups, .stream_clean_crosses_floor, .stream_recreate_restarts_ids => true,
+            .group_deliver_cursor_first, .group_abandon_counts_failure, .group_expire_ignores_deadline, .group_settle_keeps_bytes, .stream_trim_leaves_floor, .group_delete_keeps_count, .group_extend_clock_ahead, .group_steal_ignores_idle, .group_requeue_keeps_failures, .group_drop_keeps_bytes, .stream_append_reuses_id, .stream_forget_ignores_groups, .stream_clean_crosses_floor, .stream_recreate_restarts_ids, .stream_alter_drops_retained => true,
             else => false,
         };
     }

@@ -52,6 +52,9 @@ const SPOIL: u8 = 15;
 pub fn make(g: *ConsumerGroups, store: *store_mod.Store, l: Leader, r: std.Random, buf: []u8, max_len: usize) ?Made {
     g.bind(store);
     const out = buf[0..@min(buf.len, max_len)];
+    // Drawn only when the scenario has configs, so a pin from before them
+    // replays as it did.
+    if (g.config_percent > 0 and r.uintLessThan(u8, 100) < g.config_percent) return config(out, r) catch null;
     var roll = r.uintLessThan(u8, 100);
     const kind: Kind = for (WEIGHTS, 0..) |w, i| {
         if (roll < w) break @fromBackingInt(@intCast(i));
@@ -130,6 +133,24 @@ fn trim(g: *ConsumerGroups, out: []u8, r: std.Random, s: usize) !?Made {
     const key = (stream_proj.TrimBound{ .id = ids[@min(at, n - 1)] }).encode(&kb);
     const hash = gf.streamHash(STREAMS[s]);
     return .{ .entry_type = .stream_trim, .payload = gf.streamEntry(out, key, &hash) orelse return null };
+}
+
+/// Retention bounds a config sets: none, a few, or (an alter's) cleared.
+const RET_AGES = [_]u64{ 0, 30, 3600, sm.StreamConfig.CLEAR };
+const RET_COUNTS = [_]u64{ 0, 2, 5, sm.StreamConfig.CLEAR };
+
+/// A create or an alter of one of the streams. Most alter, as a user
+/// adding retention does; a create asks settings of its own, which a
+/// stream with others refuses.
+fn config(out: []u8, r: std.Random) !?Made {
+    const s = r.uintLessThan(usize, STREAMS.len);
+    const makes = r.uintLessThan(u8, 4) == 0;
+    // A create can't clear a bound.
+    const n: usize = if (makes) RET_AGES.len - 1 else RET_AGES.len;
+    const c: sm.StreamConfig = .{ .op = if (makes) .create else .alter, .partition_count = if (makes) 1 else 0, .retention_age_s = RET_AGES[r.uintLessThan(usize, n)], .retention_count = RET_COUNTS[r.uintLessThan(usize, n)] };
+    var v: [sm.StreamConfig.SIZE]u8 = undefined;
+    c.encode(&v);
+    return .{ .entry_type = .stream_config, .payload = gf.streamEntry(out, STREAMS[s], &v) orelse return null };
 }
 
 /// Half of them forced, as `--force` sends it: one unforced of a stream
