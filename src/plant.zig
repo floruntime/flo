@@ -35,8 +35,11 @@ pub const Plant = enum {
     defs_enable_moves_anchor,
     /// A cancelled run's end leaves its workflow's count of runs not ended.
     runs_cancel_keeps_active,
-    /// A completion keeps 257 history events, one past the bound.
-    runs_hist_keeps_257,
+    /// A run's history flush sends its pending events but doesn't move
+    /// past them, so its next chunk sends them again.
+    runs_hist_flushed_kept,
+    /// An ended run keeps its step outputs.
+    runs_end_keeps_outputs,
     /// An ended run takes a first step.
     runs_ended_takes_step,
     /// A schedule start's slot replaces the fired slot, even an earlier one.

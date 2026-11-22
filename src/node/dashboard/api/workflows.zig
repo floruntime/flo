@@ -444,7 +444,7 @@ fn decodeRunCursor(buf: *[MAX_RUN_CURSOR]u8, hex: []const u8) error{BadCursor}![
 /// A `workflow_status` answer: [run_id:u16][workflow:u16][version:u16]
 /// [status:u8][current_step:u16][input:u32][created_at:i64]
 /// [has:u8][started_at:i64]? [has:u8][completed_at:i64]?
-/// [has:u8][wait_signal:u16]? [has:u8][output:u32]?
+/// [has:u8][wait_signal:u16]? [has:u8]([output:u32][truncated:u8])?
 const RunState = struct {
     run_id: []const u8,
     workflow: []const u8,
@@ -457,6 +457,8 @@ const RunState = struct {
     completed_at: ?i64,
     wait_signal: ?[]const u8,
     output: ?[]const u8,
+    /// An ended run's output is a preview: its history holds the whole.
+    output_truncated: bool = false,
 
     fn parse(answer: []const u8) ?RunState {
         var r = WireReader.init(answer);
@@ -473,6 +475,7 @@ const RunState = struct {
         run.completed_at = if ((r.readU8() orelse return null) != 0) r.readI64() orelse return null else null;
         run.wait_signal = if ((r.readU8() orelse return null) != 0) r.readLengthPrefixed(u16) orelse return null else null;
         run.output = if ((r.readU8() orelse return null) != 0) r.readLengthPrefixed(u32) orelse return null else null;
+        run.output_truncated = if (run.output != null) (r.readU8() orelse return null) != 0 else false;
         return run;
     }
 };
@@ -504,6 +507,13 @@ const HistoryEvents = struct {
     fn hasMore(self: *HistoryEvents) error{Truncated}!bool {
         return (self.reader.readU8() orelse return error.Truncated) != 0;
     }
+
+    /// The next page's cursor, read after `hasMore` said there is one.
+    fn cursor(self: *HistoryEvents) error{Truncated}!u64 {
+        const c = self.reader.readLengthPrefixed(u16) orelse return error.Truncated;
+        if (c.len != 8) return error.Truncated;
+        return std.mem.readInt(u64, c[0..8], .little);
+    }
 };
 
 /// What a run's whole history says of it: how it was started, how many
@@ -534,6 +544,17 @@ const HistorySummary = struct {
             if (std.mem.eql(u8, e.event_type, "workflow_failed") or std.mem.eql(u8, e.event_type, "step_failed"))
                 summary.error_message = e.detail;
         }
+        return summary;
+    }
+
+    /// The same from a run's first event and its last, each its own page of
+    /// one (oldest first, newest first): a history of any length costs two
+    /// small reads. Its count is known only when it has one event.
+    fn ofEnds(first: []const u8, last: []const u8) error{Truncated}!HistorySummary {
+        var summary = try of(first);
+        var newest = HistoryEvents.init(last);
+        const e = (try newest.next()) orelse return summary;
+        if (std.mem.eql(u8, e.event_type, "workflow_failed") or std.mem.eql(u8, e.event_type, "step_failed")) summary.error_message = e.detail;
         return summary;
     }
 };
@@ -682,15 +703,19 @@ fn getRunStatus(allocator: Allocator, run_id: []const u8, query_string: ?[]const
     if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
     const run = RunState.parse(got.data) orelse return try h.jsonError(allocator, "workflow run status: malformed answer");
 
-    var hist = ask(&reader, client_mod.workflow.history, .{ ns, run_id, std.math.maxInt(u32) }) catch |err|
+    // Its first event and its last, one page each: never its whole history.
+    var hist = ask(&reader, client_mod.workflow.historyPage, .{ ns, run_id, 1, null, false }) catch |err|
         return try loopback.readFailed(allocator, "workflow run history", err);
     defer hist.deinit();
+    var newest = ask(&reader, client_mod.workflow.historyPage, .{ ns, run_id, 1, null, true }) catch |err|
+        return try loopback.readFailed(allocator, "workflow run history", err);
+    defer newest.deinit();
     // Not found: removed since its status was read; the history fields stay null.
-    if (hist.isError() and !hist.isNotFound()) return try h.jsonError(allocator, hist.errorMessage());
-    const summary: HistorySummary = if (hist.isError())
+    for ([_]*const client_mod.Response{ &hist, &newest }) |r| if (r.isError() and !r.isNotFound()) return try h.jsonError(allocator, r.errorMessage());
+    const summary: HistorySummary = if (hist.isError() or newest.isError())
         .{}
     else
-        HistorySummary.of(hist.data) catch return try h.jsonError(allocator, "workflow run history: malformed answer");
+        HistorySummary.ofEnds(hist.data, newest.data) catch return try h.jsonError(allocator, "workflow run history: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -710,6 +735,7 @@ fn getRunStatus(allocator: Allocator, run_id: []const u8, query_string: ?[]const
     try optionalString(&obj, "error_message", summary.error_message);
     try jsonOrString(allocator, &obj, writer, "input", if (run.input.len > 0) run.input else null);
     try jsonOrString(allocator, &obj, writer, "output", run.output);
+    try obj.boolField("output_truncated", run.output_truncated);
     try obj.nullField("step_results");
     try optionalString(&obj, "triggered_by", summary.triggered_by);
     try obj.nullField("search_attributes");
@@ -719,20 +745,20 @@ fn getRunStatus(allocator: Allocator, run_id: []const u8, query_string: ?[]const
     return try json_aw.toOwnedSlice();
 }
 
+/// How many events a run's history page shows unless asked, and at most.
+const HISTORY_DEFAULT: u64 = 500;
+const HISTORY_MOST: u64 = 5000;
+
 /// GET /workflow/runs/:id/history?namespace=&limit= (and /workflows/:id/history)
 /// — a run's events, oldest first. The dashboard asks each shard, as any
 /// client does.
 fn getRunHistory(allocator: Allocator, run_id: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
-    const limit: u32 = @intCast(@min(h.parseQueryParam(u64, query_string, "limit") orelse std.math.maxInt(u32), std.math.maxInt(u32)));
+    // Up to `limit` events, the server's pages read in turn.
+    const limit: u64 = @min(h.parseQueryParam(u64, query_string, "limit") orelse HISTORY_DEFAULT, HISTORY_MOST);
 
     var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "workflow run history", err);
     defer reader.deinit();
-    var got = ask(&reader, client_mod.workflow.history, .{ ns, run_id, limit }) catch |err|
-        return try loopback.readFailed(allocator, "workflow run history", err);
-    defer got.deinit();
-    if (got.isNotFound()) return error.NotFound;
-    if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -740,15 +766,28 @@ fn getRunHistory(allocator: Allocator, run_id: []const u8, query_string: ?[]cons
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
-    var events = HistoryEvents.init(got.data);
-    while (events.next() catch return try h.jsonError(allocator, "workflow run history: malformed answer")) |e| {
-        try arr.next();
-        var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-        try obj.begin();
-        try obj.stringField("event_type", e.event_type);
-        try obj.stringField("step_name", e.detail);
-        try obj.intField("timestamp", e.timestamp);
-        try obj.end();
+    var shown: u64 = 0;
+    var cursor: ?u64 = null;
+    while (shown < limit) {
+        var got = ask(&reader, client_mod.workflow.historyPage, .{ ns, run_id, @as(u32, @intCast(limit - shown)), cursor, false }) catch |err|
+            return try loopback.readFailed(allocator, "workflow run history", err);
+        defer got.deinit();
+        if (got.isNotFound()) return error.NotFound;
+        if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
+        var events = HistoryEvents.init(got.data);
+        while (events.next() catch return try h.jsonError(allocator, "workflow run history: malformed answer")) |e| {
+            try arr.next();
+            var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+            try obj.begin();
+            try obj.stringField("event_type", e.event_type);
+            try obj.stringField("step_name", e.detail);
+            try obj.intField("timestamp", e.timestamp);
+            try obj.end();
+            shown += 1;
+        }
+        const more = events.hasMore() catch return try h.jsonError(allocator, "workflow run history: malformed answer");
+        if (!more) break;
+        cursor = events.cursor() catch return try h.jsonError(allocator, "workflow run history: malformed answer");
     }
     try arr.end();
     return try json_aw.toOwnedSlice();
@@ -943,4 +982,32 @@ test "a run's input is its JSON when it parses, else a string" {
     try jsonOrString(allocator, &obj, &aw.writer, "c", null);
     try obj.end();
     try std.testing.expectEqualStrings("{\"a\":{\"x\":1},\"b\":\"not json\\\",\\\"evil\\\":\\\"1\",\"c\":null}", aw.written());
+}
+
+test "HistorySummary: from a run's first and last events alone, how it started and the error it failed with, its count unknown" {
+    var fb: [128]u8 = undefined;
+    var lb: [128]u8 = undefined;
+    var answers: [2][]const u8 = undefined;
+    for ([_][2][]const u8{ .{ "schedule_started", "" }, .{ "step_failed", "boom" } }, [_][]u8{ &fb, &lb }, 0..) |e, buf, i| {
+        var w: std.Io.Writer = .fixed(buf);
+        try w.writeInt(u32, 1, .little);
+        try w.writeInt(u16, @intCast(e[0].len), .little);
+        try w.writeAll(e[0]);
+        try w.writeInt(u16, @intCast(e[1].len), .little);
+        try w.writeAll(e[1]);
+        try w.writeInt(i64, 0, .little);
+        // More after each: a cursor.
+        try w.writeByte(1);
+        try w.writeInt(u16, 8, .little);
+        try w.writeInt(u64, 7, .little);
+        answers[i] = w.buffered();
+    }
+    var first = HistoryEvents.init(answers[0]);
+    _ = try first.next();
+    try std.testing.expect(try first.hasMore());
+    try std.testing.expectEqual(@as(u64, 7), try first.cursor());
+    const summary = try HistorySummary.ofEnds(answers[0], answers[1]);
+    try std.testing.expectEqualStrings("schedule", summary.triggered_by.?);
+    try std.testing.expectEqual(@as(?i64, null), summary.event_count);
+    try std.testing.expectEqualStrings("boom", summary.error_message.?);
 }

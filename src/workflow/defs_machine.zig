@@ -95,6 +95,9 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     const prev = try view.get(DefFam, cmd.key);
     switch (typeOf(e)) {
         .workflow_create => {
+            // Its runs' history names it as their owner: a longer name is
+            // refused, as its handler refuses it, never stored.
+            if (cmd.key.len - KEY_PREFIX > @import("../protocol/history_entries.zig").MAX_OWNER) return out.refuse(.bad_request, .unclassified, "a workflow name is longer than its runs' history may name");
             out.putBytes(cmd.key[KEY_PREFIX..]);
             // Its proposer parsed it; one that won't parse here breaks the
             // log, and halts on every replica alike.
@@ -164,9 +167,9 @@ const Fixture = struct {
     }
 
     fn apply(f: *Fixture, t: EntryType, name: []const u8, value: []const u8, stamp_ms: u64) !Result {
-        var kb: [64]u8 = undefined;
+        var kb: [600]u8 = undefined;
         const k = view_mod.idKey(&kb, .default, name) catch unreachable;
-        var pbuf: [1024]u8 = undefined;
+        var pbuf: [2048]u8 = undefined;
         f.index += 1;
         const e = entry_mod.buildCommandEntry(t, entry_mod.Flags.NONE, 1, f.index, stamp_ms * std.time.ns_per_ms, .default, k, value, &pbuf).?;
         var out = Result.start(&e);
@@ -175,7 +178,7 @@ const Fixture = struct {
     }
 
     fn def(f: *Fixture, name: []const u8) ?Def.Value {
-        var kb: [64]u8 = undefined;
+        var kb: [600]u8 = undefined;
         return get(.{ .store = &f.store }, view_mod.idKey(&kb, .default, name) catch unreachable);
     }
 };
@@ -233,4 +236,15 @@ test "workflow definitions machine: a definition that won't parse, or a malforme
     try testing.expectError(error.Halt, f.apply(.workflow_enabled, "wf", &.{2}, 2000));
     try testing.expectError(error.Halt, f.apply(.workflow_enabled, "wf", "", 2000));
     try testing.expectEqualStrings("1.0.0", f.def("wf").?.version);
+}
+
+test "workflow definitions machine: a workflow named longer than its runs' history may name is refused, writing nothing" {
+    var f = Fixture.init();
+    defer f.deinit();
+    var name: [@import("../protocol/history_entries.zig").MAX_OWNER + 1]u8 = undefined;
+    @memset(&name, 'n');
+    try testing.expect((try f.apply(.workflow_create, name[0 .. name.len - 1], yamlOf("1.0.0"), 1)).refused() == null);
+    try testing.expect(f.def(name[0 .. name.len - 1]) != null);
+    try testing.expect((try f.apply(.workflow_create, &name, yamlOf("1.0.0"), 1)).refused() != null);
+    try testing.expect(f.def(&name) == null);
 }

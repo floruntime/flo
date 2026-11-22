@@ -1563,23 +1563,39 @@ pub const StreamHandler = struct {
         pending: bool,
     };
 
+    /// Which of a run's events a history read wants: seqs from `from`
+    /// (inclusive) to `to` (exclusive), oldest first or newest first.
+    pub const HistoryWindow = struct {
+        from: u64 = 0,
+        to: u64 = std.math.maxInt(u64),
+        newest_first: bool = false,
+
+        /// Whether a row covering `first..last` may hold a wanted event: an
+        /// index's range is its rows', so one wholly outside is never read.
+        pub fn wants(w: HistoryWindow, first: u64, last: u64) bool {
+            return last >= w.from and first < w.to;
+        }
+    };
+
     /// `run`'s history in `family`, of incarnation `created_ns`, ended at
-    /// `completed_ms` or live (null): its rows walked oldest first, each
-    /// index row's own rows in its place, as far as `limit` pieces and the
-    /// payloads in hand go. Copies into `a`.
-    pub fn readHistory(self: *StreamHandler, a: Allocator, family: history_entries.Family, ns: router.NamespaceId, owner: []const u8, run: []const u8, created_ns: u64, completed_ms: ?u64, limit: usize) error{OutOfMemory}!HistoryRead {
+    /// `completed_ms` or live (null): its rows walked in `window`'s order,
+    /// each index row's own rows in its place, as far as `limit` pieces and
+    /// the payloads in hand go. A row wholly outside the window, an index's
+    /// included, is passed without reading it. Copies into `a`.
+    pub fn readHistory(self: *StreamHandler, a: Allocator, family: history_entries.Family, ns: router.NamespaceId, owner: []const u8, run: []const u8, created_ns: u64, completed_ms: ?u64, window: HistoryWindow, limit: usize) error{OutOfMemory}!HistoryRead {
         self.beginRead();
         var rows = try history_machine.rowsOf(self.readView(), a, family, ns, owner, run, created_ns, completed_ms);
-        // Oldest first: an index's rows are walked in its place.
+        // A stack popped in the order walked: an index's rows are walked in
+        // its place.
         var stack: std.ArrayListUnmanaged(history_entries.Locator.Value) = .empty;
         var top: std.ArrayListUnmanaged(history_entries.Locator.Value) = .empty;
         while (rows.next()) |l| try top.append(a, l);
-        var i = top.items.len;
-        while (i > 0) : (i -= 1) try stack.append(a, top.items[i - 1]);
+        try pushWalked(a, &stack, top.items, window.newest_first);
         var pieces: std.ArrayListUnmanaged(HistoryPiece) = .empty;
         var pending = false;
         while (pieces.items.len < limit) {
             const l = stack.pop() orelse break;
+            if (!window.wants(l.first_seq, l.last_seq)) continue;
             const kind = std.enums.fromInt(history_entries.Kind, l.kind) orelse continue;
             if (kind == .lost) {
                 try pieces.append(a, .{ .first_seq = l.first_seq, .last_seq = l.last_seq, .records = "", .lost = true });
@@ -1620,13 +1636,35 @@ pub const StreamHandler = struct {
                     var listed: std.ArrayListUnmanaged(history_entries.Locator.Value) = .empty;
                     var it = x.locators.iterator();
                     while (it.next() catch null) |inner| try listed.append(a, inner);
-                    var j = listed.items.len;
-                    while (j > 0) : (j -= 1) try stack.append(a, listed.items[j - 1]);
+                    try pushWalked(a, &stack, listed.items, window.newest_first);
                 },
                 .lost => unreachable,
             }
         }
         return .{ .pieces = pieces.items, .pending = pending };
+    }
+
+    /// `rows` onto `stack` in seq order, so it pops them in the order a read
+    /// walks: oldest first, or newest first. Rows sort by where they landed,
+    /// which isn't their seqs' order: a fold lands after chunks that were
+    /// on the lane ahead of it, and lists rows as they sorted. A run's rows
+    /// cover seqs that don't overlap, so their first seqs order them: its
+    /// producer sends each chunk from where the last ended (its
+    /// `hist_flushed`), a lost row covers its skipped chunk's, and a fold
+    /// covers the rows it lists, which it deletes.
+    fn pushWalked(a: Allocator, stack: *std.ArrayListUnmanaged(history_entries.Locator.Value), rows: []const history_entries.Locator.Value, newest_first: bool) error{OutOfMemory}!void {
+        const sorted = try a.dupe(history_entries.Locator.Value, rows);
+        std.mem.sort(history_entries.Locator.Value, sorted, {}, struct {
+            fn lt(_: void, x: history_entries.Locator.Value, y: history_entries.Locator.Value) bool {
+                return x.first_seq < y.first_seq;
+            }
+        }.lt);
+        if (newest_first) {
+            try stack.appendSlice(a, sorted);
+            return;
+        }
+        var j = sorted.len;
+        while (j > 0) : (j -= 1) try stack.append(a, sorted[j - 1]);
     }
 
     fn sameRun(v: anytype, ns: router.NamespaceId, family: history_entries.Family, owner: []const u8, run: []const u8, created_ns: u64) bool {

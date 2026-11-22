@@ -51,6 +51,8 @@ const ae = @import("../protocol/action_entries.zig");
 const router = @import("../node/router.zig");
 const rm = @import("../workflow/runs_machine.zig");
 const calls_mod = @import("../actions/calls_machine.zig");
+const hm = @import("../stream/history_machine.zig");
+const ce = @import("../protocol/channel_entries.zig");
 const defs_family = @import("workflow_defs_family.zig");
 
 const Allocator = std.mem.Allocator;
@@ -190,11 +192,16 @@ pub const WorkflowRuns = struct {
         sig_next: u64 = 0,
         /// Its rev after a signal woke it, while no step has moved it since.
         woken_rev: ?u64 = null,
-        /// What each of its last `HIST_KEEP` events is, by seq: a step's,
-        /// or a signal's.
-        hist: [rm.HIST_KEEP]HistL = undefined,
+        /// What each of its last `HIST_RING` events is, by seq: a step's,
+        /// or a signal's. More than a run's pending chunk ever holds.
+        hist: [HIST_RING]HistL = undefined,
     };
     const SigL = struct { type: usize, payload: usize, seq: u64, at_ms: i64 };
+    const HIST_RING = 256;
+    comptime {
+        // The smallest event a run's pending chunk holds is a step's.
+        std.debug.assert(rm.HIST_CHUNK / (8 + 4 + STEP_EVENT.len + 4 + 8) < HIST_RING);
+    }
     const HistL = struct { kind: enum(u8) { step, received, matched }, type: u8 = 0, at_ms: i64 = 0 };
 
     /// What happened, by class: each is reached by some seed of a swarm,
@@ -261,8 +268,8 @@ pub const WorkflowRuns = struct {
         calls: [NAMES.len][CALLEES.len]?CallL = @splat(@splat(null)),
     };
 
-    pub const FAMILIES = [_]u16{ rm.RunFam.ID, rm.HistFam.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID, calls_mod.Calls.ID, rm.SigFam.ID };
-    pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "workflow.hist", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents", "step.calls", "workflow.sig" };
+    pub const FAMILIES = [_]u16{ rm.RunFam.ID, hm.Workflows.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID, calls_mod.Calls.ID, rm.SigFam.ID };
+    pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "history.wf", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents", "step.calls", "workflow.sig" };
 
     pub const Kind = enum { start, step, complete, child_start, child_refuse, reply, done, retry, clear, signal };
 
@@ -388,6 +395,8 @@ pub const WorkflowRuns = struct {
         run.output = output;
         run.wait = .{};
         run.progress = "";
+        // Its step outputs go: its history holds them.
+        run.outs = @splat(null);
         // Its signals go with it.
         if (run.held_n > 0) want.classes.insert(.ended_holding);
         run.held_n = 0;
@@ -520,7 +529,7 @@ pub const WorkflowRuns = struct {
                             }
                         }
                         for (0..st.events.count) |_| {
-                            run.hist[run.hist_next % rm.HIST_KEEP] = .{ .kind = .step };
+                            run.hist[run.hist_next % HIST_RING] = .{ .kind = .step };
                             run.hist_next += 1;
                         }
                         var outs = st.outputs.iterator();
@@ -584,7 +593,7 @@ pub const WorkflowRuns = struct {
                             }
                             if (ev != TRIGGER) return refuse(.start, "its workflow is disabled");
                         }
-                        l.runs[r] = .{ .wf = w, .status = s.status, .stepped = false, .idem = k, .created_ms = stamp_ms, .hist_next = 1, .started = ev };
+                        l.runs[r] = .{ .wf = w, .status = s.status, .stepped = false, .idem = k, .created_ms = stamp_ms, .completed_ms = if (s.status.isTerminal()) stamp_ms else 0, .hist_next = 1, .started = ev };
                         if (k) |ki| l.idem[w][ki] = r;
                         var per = l.per_def[w] orelse PerDefL{ .active = 0, .fired_ms = 0 };
                         if (!s.status.isTerminal()) per.active += 1;
@@ -621,11 +630,11 @@ pub const WorkflowRuns = struct {
                         run.held[run.held_n] = .{ .type = ty, .payload = pl, .seq = run.sig_next, .at_ms = stamp_ms };
                         run.held_n += 1;
                         run.sig_next += 1;
-                        run.hist[run.hist_next % rm.HIST_KEEP] = .{ .kind = .received, .type = @intCast(ty), .at_ms = stamp_ms };
+                        run.hist[run.hist_next % HIST_RING] = .{ .kind = .received, .type = @intCast(ty), .at_ms = stamp_ms };
                         run.hist_next += 1;
                         // Its type is the one the run waits on: it wakes.
                         if (run.wait.wait == .signal and std.mem.eql(u8, run.wait.on, SIG_TYPES[ty])) {
-                            run.hist[run.hist_next % rm.HIST_KEEP] = .{ .kind = .matched, .type = @intCast(ty), .at_ms = stamp_ms };
+                            run.hist[run.hist_next % HIST_RING] = .{ .kind = .matched, .type = @intCast(ty), .at_ms = stamp_ms };
                             run.hist_next += 1;
                             run.wait = .{};
                             run.status = .running;
@@ -775,6 +784,7 @@ pub const WorkflowRuns = struct {
         var out: persistence.Result = .{};
         out.reset(e);
         try machine_mod.applyEntry(&rm.machine, store, &self.scratch, e, &out);
+        try deliverHistory(store, &self.scratch, e);
         var effect: Effect = .{ .kind = kind, .refused = out.refused() != null, .classes = want.classes };
         if (effect.refused) {
             for (FAMILIES, before[0..FAMILIES.len]) |fam, b| if (b != store.families[fam].commits) return error.RefusalChangedState;
@@ -790,6 +800,46 @@ pub const WorkflowRuns = struct {
 
     /// The groups a message's slot can be in, under the store's place.
     const GROUPS = 2;
+
+    const HistoryLane = channels.Channels(&.{hm.machine});
+
+    /// Inbounds delivered after one entry are indexed under it, apart.
+    const HISTORY_STRIDE = 1 << 16;
+
+    /// The history `e` sent delivered at once, one inbound each, and what
+    /// the folds send in turn, as a shard's driver delivers its own: every
+    /// replica's rows alike, and checked.
+    fn deliverHistory(store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, e: *const entry_mod.Entry) persistence.ApplyError!void {
+        const rv: view_mod.ReadView = .{ .store = store };
+        // Not in `scratch`: each apply resets it.
+        const a = store.allocator;
+        var k: u64 = 0;
+        while (true) : (k += 1) {
+            if (k + 1 >= HISTORY_STRIDE) return error.Halt;
+            const next = channels.metaOf(rv, 0, .history).next_seq;
+            const applied = if (channels.inOf(rv, 0, .history)) |i| i.applied else 0;
+            if (applied + 1 >= next) return;
+            const seq = applied + 1;
+            var kb: [channels.OUT_KEY]u8 = undefined;
+            const o = ((rv.get(channels.OutFam, channels.outKey(&kb, 0, .history, seq)) catch return error.Halt) orelse return error.Halt).v;
+            const mb = try a.alloc(u8, o.payload.len + 64);
+            defer a.free(mb);
+            var w: schema.Writer = .{ .buf = mb };
+            ce.Message.encode(&w, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = 0, .flags = o.flags, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload }) catch return error.Halt;
+            const ib = try a.alloc(u8, w.written().len + 64);
+            defer a.free(ib);
+            const inbound = ce.Inbound.encodeInto(ib, .{ .from = 0, .lane = @backingInt(channels.Lane.history), .first_seq = seq, .messages = .{ .bytes = w.written(), .count = 1 } }) catch return error.Halt;
+            var h = std.mem.zeroes(entry_mod.Header);
+            h.entry_type = @backingInt(entry_mod.EntryType.channel_inbound);
+            h.index = e.header.index * HISTORY_STRIDE + k + 1;
+            h.timestamp_ns = e.header.timestamp_ns;
+            h.payload_len = @intCast(inbound.len);
+            const ie: entry_mod.Entry = .{ .header = h, .payload = inbound };
+            var res = persistence.Result.start(&ie);
+            try machine_mod.applyEntry(&HistoryLane.machine, store, scratch, &ie, &res);
+            if (res.refused() != null) return error.Halt;
+        }
+    }
 
     /// Each group's next outbox seq: the outbox is never drained here, so
     /// an entry's messages are found by these, not by a walk.
@@ -874,6 +924,7 @@ pub const WorkflowRuns = struct {
         const l = &self.ledger;
 
         if (try self.callsRule(store, a)) |why| return why;
+        if (try hm.ruleOf(hm.Workflows, rv, a)) |why| return why;
         if (!sweep) return if (touched) |t| self.runRule(store, a, t, true) else null;
         // On the store alone: counts, idempotency keys naming their run, and
         // a run's wait agreeing with its status.
@@ -991,8 +1042,18 @@ pub const WorkflowRuns = struct {
         if (g.wait != w.wait or g.wait_kind != w.kind or g.wait_slot != w.slot or !std.mem.eql(u8, g.wait_on, w.on) or
             g.wait_due_ms != w.due_ms or !std.mem.eql(u8, g.wait_timeout_to, w.timeout_to)) return "a run's wait is not its last step's";
         if (!std.mem.eql(u8, g.progress, run.progress)) return "a run's counters are not its last step's";
-        const kept = @min(run.hist_next, rm.HIST_KEEP);
-        if (g.hist_next != run.hist_next or g.hist_dropped != run.hist_next - kept) return "a run's history counts are not the ledger's";
+        if (g.hist_next != run.hist_next) return "a run's history counts are not the ledger's";
+        if (g.hist_flushed > g.hist_next or g.hist_pending.len > rm.HIST_CHUNK) return "a run's pending history is past its bounds";
+        if (run.status.isTerminal() and (g.hist_flushed != g.hist_next or g.hist_pending.len != 0)) return "an ended run holds history it hasn't sent";
+        if (g.created_ns / std.time.ns_per_ms != @as(u64, @intCast(run.created_ms))) return "a run's incarnation is not its start's";
+        // Ended, its history is one row, found from its summary alone: what
+        // a delete's drop is built from.
+        if (run.status.isTerminal()) {
+            const at: u64 = @intCast(@max(g.completed_at_ms, 0));
+            if (hm.endedRow(rv, a, .workflow, NS, g.workflow, name, g.created_ns, at) == null) return "an ended run's history row is not where its summary says";
+            var live = try hm.rowsOf(rv, a, .workflow, NS, g.workflow, name, g.created_ns, null);
+            if (live.next() != null) return "an ended run keeps live history rows";
+        }
         // Its workflow's record, whatever the sweep finds of the rest.
         const wname = NAMES[run.wf];
         const per = rm.perDefOf(rv, view_mod.idKey(try a.alloc(u8, 4 + wname.len), NS, wname) catch unreachable);
@@ -1021,26 +1082,29 @@ pub const WorkflowRuns = struct {
         }
         if (si != run.held_n) return "a run's held signals are not the ledger's";
         if (!walk) return null;
-        var hist = rv.range(rm.HistFam, prefix);
-        var seq = run.hist_next - kept;
-        while (hist.next() catch return "a history event could not be read") |item| : (seq += 1) {
-            if (seq >= run.hist_next) return "a run holds more history than its last 256 events";
-            if (std.mem.readInt(u64, item.key[item.key.len - 8 ..][0..8], .big) != seq) return "a run's history is not its last seqs";
-            const h = item.value.v;
+        // Its pending events: those since what it sent, each its own.
+        var hd: schema.Diagnostic = .{};
+        var hr: schema.Reader = .{ .bytes = g.hist_pending, .diag = &hd };
+        var seq = g.hist_flushed;
+        if (run.hist_next - seq > HIST_RING) return "a run holds more pending history than a chunk";
+        while (hr.pos < g.hist_pending.len) : (seq += 1) {
+            const h = rm.HistRec.decode(&hr, "event") catch return "a run's pending history doesn't decode";
+            if (seq >= run.hist_next) return "a run holds more history than it made";
+            if (h.seq != seq) return "a run's pending history is not its next seqs";
             if (seq == 0) {
                 if (!std.mem.eql(u8, h.event, EVENTS[run.started]) or !std.mem.eql(u8, h.detail, INPUT) or h.at_ms != run.created_ms) return "a run's first event is not its start's";
             } else if (run.ended_at == seq) {
                 if (!std.mem.eql(u8, h.event, CANCEL_EVENT) or h.at_ms != run.completed_ms) return "a run's last event is not its cancel's";
-            } else switch (run.hist[seq % rm.HIST_KEEP].kind) {
+            } else switch (run.hist[seq % HIST_RING].kind) {
                 .step => if (!std.mem.eql(u8, h.event, STEP_EVENT) or h.at_ms != 0 or h.detail.len != 0) return "a run's history is not its steps'",
                 .received, .matched => |k| {
-                    const hl = run.hist[seq % rm.HIST_KEEP];
+                    const hl = run.hist[seq % HIST_RING];
                     const event = if (k == .received) "signal_received" else "signal_matched";
                     if (!std.mem.eql(u8, h.event, event) or !std.mem.eql(u8, h.detail, SIG_TYPES[hl.type]) or h.at_ms != hl.at_ms) return "a run's history is not its signals'";
                 },
             }
         }
-        if (seq != run.hist_next) return "a run's history is missing events";
+        if (seq != run.hist_next) return "a run's pending history is missing events";
         var outs = rv.range(rm.OutFam, prefix);
         var got_outs: [STEPS.len]?usize = @splat(null);
         while (outs.next() catch return "a step output could not be read") |item| {
@@ -1324,7 +1388,6 @@ fn stepValue(r: std.Random, buf: []u8, c: usize, run: WorkflowRuns.RunL, spare: 
         .ends = 0,
         .has_output = false,
         .output = "",
-        .tags = "",
         .call = "",
     };
     var next = true;
@@ -1410,7 +1473,6 @@ fn completeValue(r: std.Random, buf: []u8, status: RunStatus, wf: []const u8) ?[
         .output = if (r.boolean()) OUTPUTS[r.uintLessThan(usize, OUTPUTS.len)] else null,
         .event = CANCEL_EVENT,
         .detail = "",
-        .tags = "",
         .workflow = wf,
     };
     return c.encode(buf);

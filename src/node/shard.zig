@@ -87,6 +87,8 @@ const contract_machine = @import("../contract/machine.zig");
 const contract_machines = @import("../contract/machines.zig");
 const channel_driver = @import("../contract/channel_driver.zig");
 const channels_mod = @import("../contract/channels.zig");
+const channel_entries = @import("../protocol/channel_entries.zig");
+const history_entries = @import("../protocol/history_entries.zig");
 const contract_store = @import("../contract/store.zig");
 const kv_machine = @import("../kv/machine.zig");
 const repair = @import("repair.zig");
@@ -1067,6 +1069,7 @@ pub const Shard = struct {
         errdefer allocator.destroy(workflow_handler);
         workflow_handler.* = WorkflowHandler.init(allocator);
         workflow_handler.store = &partition.store;
+        workflow_handler.history = stream_handler;
         workflow_handler.namespaces = namespace_handler;
 
         // Create Processing handler
@@ -5726,7 +5729,7 @@ pub const Shard = struct {
         // later with records past it; nothing more is read from the log.
         if (self.stream_disk) |d| d.stopped = true;
         self.damage_for_waiters = damage;
-        self.waiter_pool.expireKinds(&.{ .stream_disk_read, .stream_read }, answerDamaged, @ptrCast(self));
+        self.waiter_pool.expireKinds(&.{ .stream_disk_read, .stream_read, .workflow_history }, answerDamaged, @ptrCast(self));
         if (self.raft_network == null) {
             self.offline = damage;
             self.offline_published.store(true, .release);
@@ -6168,6 +6171,7 @@ pub const Shard = struct {
         const d = self.stream_disk orelse return;
         if (!d.drain()) return;
         self.waiter_pool.notifyAny(.stream_disk_read, resolveStreamWaiter, @ptrCast(self));
+        self.waiter_pool.notifyAny(.workflow_history, resolveHistoryWaiter, @ptrCast(self));
         // A blocking read parked for new appends may have met one too.
         self.waiter_pool.notifyAny(.stream_read, resolveStreamWaiter, @ptrCast(self));
     }
@@ -7200,7 +7204,27 @@ pub const Shard = struct {
                 self.waiter_pool.notify(.stream_read, cmd.key, resolveStreamWaiter, @ptrCast(self));
                 group_handler.appended(self, stream_mod.streamKey(cmd.namespace_id, cmd.key));
             },
+            .channel_inbound => self.wakeHistoryReads(entry),
             else => {},
+        }
+    }
+
+    /// The history reads held for runs whose chunks or folds an inbound on
+    /// the history lane just landed.
+    fn wakeHistoryReads(self: *Shard, entry: *const entry_mod.Entry) void {
+        if (self.waiter_pool.countByKind(.workflow_history) == 0) return;
+        var diag: schema.Diagnostic = .{};
+        const inbound = channel_entries.Inbound.decodeAll(entry.payload, &diag) catch return;
+        if (inbound.lane != @backingInt(channels_mod.Lane.history)) return;
+        var it = inbound.messages.iterator();
+        while (it.next() catch return) |m| {
+            var hd: schema.Diagnostic = .{};
+            var r: schema.Reader = .{ .bytes = m.payload, .diag = &hd };
+            const h = history_entries.Header.decode(&r, "header") catch continue;
+            if (h.family != @backingInt(history_entries.Family.workflow)) continue;
+            var kb: [4 + history_entries.MAX_RUN]u8 = undefined;
+            const key = contract_view.idKey(&kb, .of(h.ns), h.run) catch continue;
+            self.waiter_pool.notify(.workflow_history, key, resolveHistoryWaiter, @ptrCast(self));
         }
     }
 
@@ -7497,6 +7521,9 @@ pub const Shard = struct {
             }
             self.dropForward(f);
         }
+        // A held history read isn't answered short as at its deadline: its
+        // chunks may still land, so it is told to ask again.
+        self.waiter_pool.expireKinds(&.{.workflow_history}, answerShuttingDown, @ptrCast(self));
         self.waiter_pool.expireAll(handleWaiterTimeout, @ptrCast(self));
         self.refuseUnrunRequests();
         self.takeAnswersUntilAllStopped();
@@ -9248,7 +9275,22 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
         .stream_disk_read => shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(DISK_READ_LATE)),
         // No task in time: `{task: none}`, the optional's absent byte.
         .action_await => shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, &.{0}),
+        // Its chunks not all landed in time: what did, the rest said missing.
+        .workflow_history => _ = shard.workflow_handler.resolveHistoryWaiter(shard, waiter, true),
     }
+}
+
+/// A held read answered as its shard shuts down: retryable, nothing run.
+fn answerShuttingDown(waiter: *const Waiter, ctx: *anyopaque) void {
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
+    shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(Shard.SHUTTING_DOWN_NOT_RUN));
+}
+
+/// A held history read asked again: its run's chunks landed, or came back
+/// from disk.
+fn resolveHistoryWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
+    return shard.workflow_handler.resolveHistoryWaiter(shard, waiter, false);
 }
 
 /// What a stream read refused for its disk reads is told, by why.
@@ -20047,7 +20089,7 @@ test "Shard: a run's history read that meets a blocked disk read stops, answered
     }
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const landed = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, 10);
+    const landed = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, .{}, 10);
     try std.testing.expectEqual(@as(usize, 1), landed.pieces.len);
     // Pushed out of the ring and the warm store, onto disk only.
     for (0..80) |_| {
@@ -20059,13 +20101,13 @@ test "Shard: a run's history read that meets a blocked disk read stops, answered
     // tried again, and says nothing of it as lost.
     s.durable_log.?.test_open_error = error.SystemResources;
     // Asked for, its read fails; asked again, it is held back.
-    var held = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, 10);
+    var held = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, .{}, 10);
     var tries: usize = 0;
     while (s.stream_handler.held != .blocked and tries < 2_000) : (tries += 1) {
         try std.testing.expect(held.pending);
         _ = s.stream_disk.?.drain();
         @import("stdx").time.sleep(std.time.ns_per_ms);
-        held = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, 10);
+        held = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, .{}, 10);
     }
     try std.testing.expect(s.stream_handler.held == .blocked);
     try std.testing.expect(held.pending);
@@ -22321,7 +22363,6 @@ test "Shard: a leader that built its workflow caches while halted keeps what app
         .ends = 0,
         .has_output = false,
         .output = "",
-        .tags = "",
         .call = "",
     };
     var sb: [512]u8 = undefined;
@@ -31754,14 +31795,14 @@ test "Shard: a run's history, sent to its own shard as it goes and folded, reads
         pumpChannels(&two);
         // Live, halfway: what landed so far, in order.
         if (i + 1 == 10) {
-            const live = try a.stream_handler.readHistory(arena.allocator(), .action, .default, owner, "r1", 5, null, 100);
+            const live = try a.stream_handler.readHistory(arena.allocator(), .action, .default, owner, "r1", 5, null, .{}, 100);
             try std.testing.expect(!live.pending);
             try std.testing.expectEqual(@as(usize, 10), live.pieces.len);
             for (live.pieces, 1..) |piece, n| try std.testing.expectEqual(@as(u64, n), piece.first_seq);
         }
     }
     for (0..4) |_| pumpChannels(&two);
-    const read = try a.stream_handler.readHistory(arena.allocator(), .action, .default, owner, "r1", 5, 4242, 100);
+    const read = try a.stream_handler.readHistory(arena.allocator(), .action, .default, owner, "r1", 5, 4242, .{}, 100);
     try std.testing.expect(!read.pending);
     try std.testing.expectEqual(@as(usize, CHUNKS), read.pieces.len);
     for (read.pieces, 1..) |piece, n| {
@@ -31771,7 +31812,7 @@ test "Shard: a run's history, sent to its own shard as it goes and folded, reads
         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want, "chunk-{d:0>2}", .{n}), piece.records);
     }
     // A limit stops the walk where it says.
-    const some = try a.stream_handler.readHistory(arena.allocator(), .action, .default, owner, "r1", 5, 4242, 3);
+    const some = try a.stream_handler.readHistory(arena.allocator(), .action, .default, owner, "r1", 5, 4242, .{}, 3);
     try std.testing.expectEqual(@as(usize, 3), some.pieces.len);
     try std.testing.expectEqual(@as(u64, 3), some.pieces[2].last_seq);
     // The ended run is one row.
@@ -31821,10 +31862,10 @@ test "Shard: a run's history, sent to its own shard as it goes and folded, reads
         stolen.last_seq = 20;
         try view2.put(hm.Actions, borrowed, .{ .v = stolen });
         try view2.commit();
-        const other = try a.stream_handler.readHistory(al, .action, .default, owner, "r4", 8, null, 10);
+        const other = try a.stream_handler.readHistory(al, .action, .default, owner, "r4", 8, null, .{}, 10);
         try std.testing.expectEqual(@as(usize, 1), other.pieces.len);
         try std.testing.expect(other.pieces[0].lost);
-        const lost = try a.stream_handler.readHistory(al, .action, .default, owner, "r3", 7, null, 10);
+        const lost = try a.stream_handler.readHistory(al, .action, .default, owner, "r3", 7, null, .{}, 10);
         try std.testing.expect(!lost.pending);
         try std.testing.expectEqual(@as(usize, 2), lost.pieces.len);
         for (lost.pieces) |piece| try std.testing.expect(piece.lost);
@@ -32429,7 +32470,6 @@ fn proposeCallOf(s: *Shard, kind: action_entries.CallKind, target: []const u8, w
         .ends = 0,
         .has_output = false,
         .output = "",
-        .tags = "",
         .call = call,
     };
     const step_buf = try a.alloc(u8, persistence_mod.MAX_PERSIST_PAYLOAD);
@@ -33808,4 +33848,102 @@ test "Shard: a guarded node's vouch comes back with its guard at boot, exactly; 
     try @import("stdx").fs.writeAll(f, buf[0 .. full.len - 5]);
     @import("stdx").fs.closeFile(f);
     try std.testing.expectError(error.Truncated, Shard.init(std.testing.allocator, 0, 2, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 2, .join, .{}, .{}));
+}
+
+test "Shard: a workflow run's history read waits while its chunks are on the history lane, and is answered once they land" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [16 * 1024]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+
+    const def =
+        \\{"kind":"Workflow","name":"gate","version":"1.0.0",
+        \\"start":{"wait_for_signal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    shard.runRequest(conn, try ParkTest.request(.workflow_create, 1, "a", "gate", def, ""), .client);
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    const named = [_]u8{ 0, 0, 0, 1, 2, 0, 'r', '1' };
+    shard.runRequest(conn, try ParkTest.request(.workflow_start, 2, "a", "gate", &named, ""), .client);
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    // Signals it doesn't wait on, each event about a kilobyte: a chunk is
+    // sent, and stays on the lane until the channel ticks.
+    var sig: [2 + 1000]u8 = undefined;
+    std.mem.writeInt(u16, sig[0..2], 1000, .little);
+    @memset(sig[2..], 'x');
+    for (0..4) |i| {
+        shard.runRequest(conn, try ParkTest.request(.workflow_signal, 3 + i, "a", "r1", &sig, ""), .client);
+        try ParkTest.ack(&shard);
+        try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    }
+    const ns = shard.namespaceId("a");
+    var kb: [64]u8 = undefined;
+    const rec = @import("../workflow/runs_machine.zig").runOf(.{ .store = &shard.defaultPartition().store }, contract_view.idKey(&kb, ns, "r1") catch unreachable).?;
+    try std.testing.expect(rec.hist_flushed > 0);
+
+    // Held, not answered short.
+    const limit = [_]u8{ 100, 0, 0, 0 };
+    shard.runRequest(conn, try ParkTest.request(.workflow_history, 9, "a", "r1", &limit, ""), .client);
+    try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.workflow_history));
+    // Its chunk lands: answered, whole.
+    try ParkTest.deliverOwn(&shard);
+    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.workflow_history));
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 9), one[0].header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, one[0].data[0..4], .little));
+    // Asked again, it answers at once.
+    shard.runRequest(conn, try ParkTest.request(.workflow_history, 10, "a", "r1", &limit, ""), .client);
+    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.workflow_history));
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, one[0].data[0..4], .little));
+}
+
+test "Shard: a workflow named longer than its runs' history may name is refused at create and at start, before anything is proposed" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [4096]u8 = undefined;
+    var two: [2]proto.Response = undefined;
+    const max = @import("../protocol/history_entries.zig").MAX_OWNER;
+    var name: [max + 1]u8 = undefined;
+    @memset(&name, 'n');
+    var db: [max + 256]u8 = undefined;
+    const def = try std.fmt.bufPrint(&db, "{{\"kind\":\"Workflow\",\"name\":\"{s}\",\"version\":\"1.0.0\",\"start\":{{\"wait_for_signal\":{{\"type\":\"go\"}},\"transitions\":{{\"success\":\"flo.Completed\"}}}}}}", .{&name});
+    const before = shard.raft_node.log.lastIndex();
+    shard.runRequest(conn, try ParkTest.request(.workflow_create, 1, proto.DEFAULT_NAMESPACE, &name, def, ""), .client);
+    const start = [_]u8{ 0, 0, 0, 0 };
+    shard.runRequest(conn, try ParkTest.request(.workflow_start, 2, proto.DEFAULT_NAMESPACE, &name, &start, ""), .client);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &two);
+    for (two) |r| {
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.header.status);
+        try std.testing.expect(std.mem.startsWith(u8, (try r.refused()).message, "a workflow name is at most 256 bytes"));
+    }
+    try std.testing.expectEqual(before, shard.raft_node.log.lastIndex());
 }

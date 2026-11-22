@@ -62,6 +62,10 @@ const router = @import("../node/router.zig");
 const ae = @import("../protocol/action_entries.zig");
 const calls_mod = @import("../actions/calls_machine.zig");
 const wire_schema = @import("../protocol/schema.zig");
+const StreamHandler = @import("../stream/handler.zig").StreamHandler;
+const ops = @import("../protocol/ops.zig");
+const history_machine = @import("../stream/history_machine.zig");
+const waiter_pool_mod = @import("../node/waiter_pool.zig");
 const runs_machine = @import("runs_machine.zig");
 const progress_mod = @import("progress.zig");
 const children_mod = runs_machine;
@@ -185,6 +189,9 @@ pub const WorkflowHandler = struct {
     /// The shard's contract state, where the definitions machine keeps each
     /// workflow (`defs_machine.zig`), keyed `writeKey`: namespace id ‖ name.
     store: ?*Store = null,
+    /// The shard's stream handler, which reads a run's history from the
+    /// rows the stream machine keeps and the log they point into.
+    history: ?*StreamHandler = null,
     /// A store of its own, for a handler built without a shard (tests).
     own_store: Store,
     /// What a definition applied here directly (`replayEntry`) stages in.
@@ -244,7 +251,11 @@ pub const WorkflowHandler = struct {
     /// by circuit breakers to skip failing executors.
     plan_health: std.StringHashMap(plan_types.ExecutorHealth),
 
-    const MAX_WORKFLOW_NAME_LEN: usize = 256;
+    /// The longest workflow name: its runs' history names it as its owner.
+    pub const MAX_WORKFLOW_NAME_LEN: usize = 256;
+    comptime {
+        std.debug.assert(MAX_WORKFLOW_NAME_LEN == @import("../protocol/history_entries.zig").MAX_OWNER);
+    }
     /// The longest key a create or start entry carries.
     pub const MAX_START_KEY: usize = 600;
     /// The longest run id a start may choose: its key is the namespace's id
@@ -509,9 +520,13 @@ pub const WorkflowHandler = struct {
     }
 
     pub fn init(allocator: Allocator) WorkflowHandler {
+        var own = Store.init(allocator);
+        // Built without a shard, it is a group of one: a run's history goes
+        // to its own outbox.
+        own.place = .{ .group = 0, .count = 1 };
         return .{
             .allocator = allocator,
-            .own_store = Store.init(allocator),
+            .own_store = own,
             .def_scratch = .init(allocator),
             .runs = std.StringHashMap(RunRecord).init(allocator),
             .stream_triggers = std.StringHashMap(StreamTriggerState).init(allocator),
@@ -821,6 +836,13 @@ pub const WorkflowHandler = struct {
         };
         defer def.deinit(self.allocator);
 
+        // Its runs' history names it: no longer than that may.
+        if (def.name.len > MAX_WORKFLOW_NAME_LEN) {
+            var mb: [96]u8 = undefined;
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, std.fmt.bufPrint(&mb, "a workflow name is at most {d} bytes, not {d}", .{ MAX_WORKFLOW_NAME_LEN, def.name.len }) catch "workflow name too long");
+            return null;
+        }
+
         // A trigger reads from its stream without passing a client's
         // request check, so the namespace it names is checked here.
         if (def.trigger) |t| if (t.namespace) |ns| if (ns.len > 0) if (@import("../namespace/handler.zig").nameRefusal(ns)) |why| {
@@ -883,6 +905,11 @@ pub const WorkflowHandler = struct {
 
         if (workflow_name.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow name is required");
+            return null;
+        }
+        if (workflow_name.len > MAX_WORKFLOW_NAME_LEN) {
+            var mb: [96]u8 = undefined;
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, std.fmt.bufPrint(&mb, "a workflow name is at most {d} bytes, not {d}", .{ MAX_WORKFLOW_NAME_LEN, workflow_name.len }) catch "workflow name too long");
             return null;
         }
 
@@ -1042,7 +1069,13 @@ pub const WorkflowHandler = struct {
         }
         self.allocator.free(run_ns_key);
 
-        // The applier creates the run from the entry.
+        // The applier creates the run from the entry. It makes history at
+        // once: refused while this shard's history lane has no room for it.
+        if (shard.historyWait(req.ns_id)) |w| {
+            var wb: [256]u8 = undefined;
+            shard.sendRefusal(conn, req.header.request_id, .overloaded, .{ .reason = .unclassified, .ran = .no, .message = Shard.sendWaitText(w, &wb) });
+            return null;
+        }
         const proposed = self.proposeStart(shard, req.ns_id, run_id_str, workflow_name, version, input, idempotency_key, "workflow_started", null) catch |err| {
             shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "run not persisted"));
             return null;
@@ -1246,6 +1279,12 @@ pub const WorkflowHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run_id is required");
             return null;
         }
+        // A signal is said in its run's history.
+        if (shard.historyWait(req.ns_id)) |w| {
+            var wb: [256]u8 = undefined;
+            shard.sendRefusal(conn, req.header.request_id, .overloaded, .{ .reason = .unclassified, .ran = .no, .message = Shard.sendWaitText(w, &wb) });
+            return null;
+        }
         const run_ns_key = self.nsKey(req.ns_id, run_id) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
             return null;
@@ -1324,7 +1363,7 @@ pub const WorkflowHandler = struct {
             return null;
         }
         const reason = if (req.value.len > 0) req.value else "cancelled by user";
-        const c: runs_machine.Complete = .{ .status = .cancelled, .output = null, .event = terminalEventType(.cancelled), .detail = reason, .tags = "", .workflow = run.workflow };
+        const c: runs_machine.Complete = .{ .status = .cancelled, .output = null, .event = terminalEventType(.cancelled), .detail = reason, .workflow = run.workflow };
         var vbuf: [MAX_CANCEL_REASON + MAX_WORKFLOW_NAME_LEN + 64]u8 = undefined;
         const value = c.encode(&vbuf) orelse {
             shard.sendRefusal(conn, req.header.request_id, .internal_error, proto.notRun("internal error: a cancel that doesn't encode"));
@@ -1390,6 +1429,9 @@ pub const WorkflowHandler = struct {
         // [status:u8][current_step_len:u16][current_step][input_len:u32][input]
         // [created_at:i64][has_started:u8][started_at?:i64][has_completed:u8][completed_at?:i64]
         // [has_wait_signal:u8][wait_signal_len:u16][wait_signal]?
+        // [has_output:u8]([output_len:u32][output][output_truncated:u8])?
+        // An ended run's input is empty, and its output its first
+        // `OUTPUT_PREVIEW` bytes: its history holds both whole.
         const current_step = run.current_step_name_owned orelse "start";
         // Sized to the run. Each field is bounded where the run was made: the
         // start entry (key < 600 bytes, value <= 65000) and the completion
@@ -1398,7 +1440,7 @@ pub const WorkflowHandler = struct {
             1 + 2 + current_step.len + 4 + run.input_owned.len + 8 +
             1 + (if (run.started_at_ms != null) @as(usize, 8) else 0) + 1 + (if (run.completed_at_ms != null) @as(usize, 8) else 0) +
             1 + (if (run.wait_signal_type_owned) |sig| 2 + sig.len else 0) +
-            1 + (if (run.output_owned) |o| 4 + o.len else 0);
+            1 + (if (run.output_owned) |o| 4 + o.len + 1 else 0);
         const wire_buf = self.allocator.alloc(u8, size) catch {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "out of memory");
             return;
@@ -1434,6 +1476,7 @@ pub const WorkflowHandler = struct {
             w.writeByte(1) catch unreachable;
             w.writeInt(u32, @intCast(output.len), .little) catch unreachable;
             w.writeAll(output) catch unreachable;
+            w.writeByte(@intFromBool(run.output_truncated)) catch unreachable;
         } else {
             w.writeByte(0) catch unreachable;
         }
@@ -1455,6 +1498,9 @@ pub const WorkflowHandler = struct {
         completed_at_ms: ?i64,
         wait_signal_type_owned: ?[]const u8,
         output_owned: ?[]const u8,
+        /// An ended run's output is its first `OUTPUT_PREVIEW` bytes: more
+        /// were cut, and its history holds the whole.
+        output_truncated: bool = false,
         search_tags_owned: ?[]const u8,
     };
 
@@ -1473,97 +1519,290 @@ pub const WorkflowHandler = struct {
             .completed_at_ms = if (rec.completed_at_ms != 0) rec.completed_at_ms else null,
             .wait_signal_type_owned = if (!status.isTerminal() and rec.wait == .signal) rec.wait_on else null,
             .output_owned = if (rec.has_output != 0) rec.output else null,
+            .output_truncated = rec.output_truncated,
             .search_tags_owned = if (rec.search_tags.len > 0) rec.search_tags else null,
         };
     }
 
-    /// Run `run_key`'s history as applied (`workflow.hist`), oldest first;
-    /// the events point into the store, so they hold until the next apply.
-    fn appliedHistory(self: *WorkflowHandler, run_key: []const u8, out: *std.ArrayListUnmanaged(HistoryEvent)) !void {
-        const prefix = try runs_machine.runRange(self.allocator, keyNamespace(run_key), keyName(run_key));
-        defer self.allocator.free(prefix);
-        var it = self.defsRead().range(runs_machine.HistFam, prefix);
-        while (try it.next()) |item| try out.append(self.allocator, .{ .event_type_owned = item.value.v.event, .detail_owned = item.value.v.detail, .timestamp_ms = item.value.v.at_ms });
+    /// One event of a run's history and the seqs it covers: its own, or a
+    /// gap's (`HISTORY_LOST`, `HISTORY_MISSING`), within what was asked.
+    pub const SeqEvent = struct {
+        seq: u64,
+        event: HistoryEvent,
+        last: u64,
+
+        fn one(seq: u64, event: HistoryEvent) SeqEvent {
+            return .{ .seq = seq, .event = event, .last = seq };
+        }
+
+        /// A gap's event over `first..last`, cut to `window`, or null for
+        /// none of it in the window.
+        fn gap(a: Allocator, window: StreamHandler.HistoryWindow, event_type: []const u8, comptime fmt: []const u8, first: u64, last: u64) error{OutOfMemory}!?SeqEvent {
+            if (!window.wants(first, last)) return null;
+            const lo = @max(first, window.from);
+            const hi = @min(last, window.to - 1);
+            return .{ .seq = lo, .last = hi, .event = .{ .event_type_owned = event_type, .detail_owned = try std.fmt.allocPrint(a, fmt, .{ lo, hi }), .timestamp_ms = 0 } };
+        }
+    };
+
+    /// A page of a run's history: its events in the order asked, and, when
+    /// more follow, the cursor that asks for them.
+    pub const HistoryPage = struct { events: []const SeqEvent, more: ?u64 };
+
+    pub const HistoryAnswer = union(enum) {
+        page: HistoryPage,
+        /// Not all of it here yet: a chunk in flight to its rows, or one
+        /// being read back from disk. Held, then asked again.
+        wait,
+        /// At its deadline, a chunk still being read back from disk:
+        /// answered retryable, never as a short page that looks whole.
+        disk_late,
+    };
+
+    /// How long a history read is held for its chunks to land, or come back
+    /// from disk, before it is answered with what landed.
+    pub const HISTORY_HOLD_MS: u32 = 5_000;
+
+    /// The most events one history page holds, whatever its limit asks.
+    pub const MAX_HISTORY_PAGE: u32 = 1000;
+    /// The most bytes one page's events take on the wire: the answer's
+    /// bound, less its count and trailer. One event, from one entry, always
+    /// fits.
+    pub const HISTORY_PAGE_BYTES: usize = ops.MAX_RESPONSE_BODY - 4 - (1 + 2 + 8);
+    comptime {
+        std.debug.assert(HISTORY_PAGE_BYTES >= persistence_mod.MAX_PERSIST_PAYLOAD + 2 + 2 + 8);
+    }
+
+    fn wireSize(e: SeqEvent) usize {
+        return 2 + e.event.event_type_owned.len + 2 + e.event.detail_owned.len + 8;
+    }
+
+    /// Event type of a gap in a run's history: events a repair skipped, or
+    /// the log no longer holds (`lost`), or not landed by the read's
+    /// deadline (`missing`).
+    pub const HISTORY_LOST = "history_lost";
+    pub const HISTORY_MISSING = "history_missing";
+
+    /// Run `run_key`'s history as applied, `rec` its run: the events landed
+    /// in its rows and those its run holds pending, merged by seq, at most
+    /// `limit`, from `window`. A read whose chunks haven't all landed waits,
+    /// unless it is `final` (its deadline): then the rest is said missing.
+    /// Points into `a`.
+    pub fn readRunHistory(self: *WorkflowHandler, a: Allocator, run_key: []const u8, rec: runs_machine.Run.Value, window: StreamHandler.HistoryWindow, asked: u32, final: bool) error{OutOfMemory}!HistoryAnswer {
+        const limit = std.math.clamp(asked, 1, MAX_HISTORY_PAGE);
+        const stream = self.history orelse return .{ .page = .{ .events = &.{}, .more = null } };
+        const ns = keyNamespace(run_key);
+        const run_id = keyName(run_key);
+        const ended: ?u64 = if (appliedStatus(rec).isTerminal()) @intCast(@max(rec.completed_at_ms, 0)) else null;
+        const landed = try stream.readHistory(a, .workflow, ns, rec.workflow, run_id, rec.created_ns, ended, window, @as(usize, limit) + 1);
+        if (landed.pending and !final) return .wait;
+        if (landed.pending) return .disk_late;
+        // Every seq below `hist_flushed` was sent: those past what landed are
+        // still on their way.
+        const through = history_machine.landedThrough(self.defsRead(), a, .workflow, ns, rec.workflow, run_id, rec.created_ns, ended);
+        const landed_next: u64 = if (through) |t| t + 1 else 0;
+        const in_flight = landed_next < rec.hist_flushed;
+
+        var landed_events: std.ArrayListUnmanaged(SeqEvent) = .empty;
+        for (landed.pieces) |piece| {
+            if (piece.lost) {
+                if (try SeqEvent.gap(a, window, HISTORY_LOST, "events {d}-{d} were lost", piece.first_seq, piece.last_seq)) |g| try landed_events.append(a, g);
+                continue;
+            }
+            const mark = landed_events.items.len;
+            try decodeRecords(a, piece.records, window, &landed_events);
+            if (window.newest_first) std.mem.reverse(SeqEvent, landed_events.items[mark..]);
+        }
+        var missing: std.ArrayListUnmanaged(SeqEvent) = .empty;
+        if (in_flight) if (try SeqEvent.gap(a, window, HISTORY_MISSING, "events {d}-{d} had not landed in time", landed_next, rec.hist_flushed - 1)) |g| try missing.append(a, g);
+        var pending: std.ArrayListUnmanaged(SeqEvent) = .empty;
+        try decodeRecords(a, rec.hist_pending, window, &pending);
+
+        // Oldest first: landed, then missing, then pending; newest first,
+        // the reverse.
+        var all: std.ArrayListUnmanaged(SeqEvent) = .empty;
+        if (window.newest_first) {
+            std.mem.reverse(SeqEvent, pending.items);
+            try all.appendSlice(a, pending.items);
+            try all.appendSlice(a, missing.items);
+            try all.appendSlice(a, landed_events.items);
+        } else {
+            try all.appendSlice(a, landed_events.items);
+            try all.appendSlice(a, missing.items);
+            try all.appendSlice(a, pending.items);
+        }
+        // At most `limit` events, and no more than a page's bytes.
+        var n: usize = 0;
+        var bytes: usize = 0;
+        while (n < @min(all.items.len, limit)) : (n += 1) {
+            bytes += wireSize(all.items[n]);
+            if (bytes > HISTORY_PAGE_BYTES) break;
+        }
+        const more = all.items.len > n or landed.pieces.len > limit;
+        const page = all.items[0..n];
+        // Held only when what isn't landed yet is in this page: one the
+        // events in hand fill, or wholly before or after the gap, is
+        // answered now.
+        if (!final and missing.items.len > 0) for (page) |e| {
+            if (std.mem.eql(u8, e.event.event_type_owned, HISTORY_MISSING) and e.seq == missing.items[0].seq) return .wait;
+        };
+        // The next page starts past every seq this one covered, a gap's too.
+        const next: ?u64 = if (!more or page.len == 0) null else if (window.newest_first) page[page.len - 1].seq else page[page.len - 1].last + 1;
+        return .{ .page = .{ .events = page, .more = next } };
+    }
+
+    /// The events `records` (a chunk's, or a run's pending) holds within
+    /// `window`, oldest first, onto `out`.
+    fn decodeRecords(a: Allocator, records: []const u8, window: StreamHandler.HistoryWindow, out: *std.ArrayListUnmanaged(SeqEvent)) error{OutOfMemory}!void {
+        var diag: wire_schema.Diagnostic = .{};
+        var r: wire_schema.Reader = .{ .bytes = records, .diag = &diag };
+        while (r.pos < records.len) {
+            // What the runs machine encoded: one that doesn't decode ends
+            // what is read of it.
+            const rec = runs_machine.HistRec.decode(&r, "event") catch return;
+            if (rec.seq < window.from or rec.seq >= window.to) continue;
+            try out.append(a, SeqEvent.one(rec.seq, .{ .event_type_owned = rec.event, .detail_owned = rec.detail, .timestamp_ms = rec.at_ms }));
+        }
     }
 
     // ── HISTORY ─────────────────────────────────────────────────────────
 
+    /// A history request: `[limit:u32]`, then optionally
+    /// `[cursor_len:u16][cursor][newest_first:u8]`, the cursor a page's
+    /// answer gave (empty for the start).
+    pub const HistoryRequest = struct {
+        limit: u32 = 100,
+        cursor: ?u64 = null,
+        newest_first: bool = false,
+
+        pub fn parse(value: []const u8) ?HistoryRequest {
+            var q: HistoryRequest = .{};
+            if (value.len == 0) return q;
+            if (value.len < 4) return null;
+            q.limit = std.mem.readInt(u32, value[0..4], .little);
+            if (value.len == 4) return q;
+            if (value.len < 6) return null;
+            const clen = std.mem.readInt(u16, value[4..6], .little);
+            if (clen != 0 and clen != 8) return null;
+            if (value.len != 6 + clen + 1) return null;
+            if (clen == 8) q.cursor = std.mem.readInt(u64, value[6..14], .little);
+            q.newest_first = switch (value[6 + clen]) {
+                0 => false,
+                1 => true,
+                else => return null,
+            };
+            return q;
+        }
+
+        /// What a held read keeps of `q` beside its limit and its cursor (the
+        /// waiter's `min_version`): whether it reads newest first, and has a
+        /// cursor at all.
+        fn waiterFlags(q: HistoryRequest) u32 {
+            return @as(u32, @intFromBool(q.newest_first)) | @as(u32, @intFromBool(q.cursor != null)) << 1;
+        }
+
+        fn fromWaiter(w: *const waiter_pool_mod.Waiter) HistoryRequest {
+            const flags = w.stream.partition orelse 0;
+            return .{ .limit = w.stream.limit, .cursor = if (flags & 2 != 0) w.min_version else null, .newest_first = flags & 1 != 0 };
+        }
+
+        fn window(q: HistoryRequest) StreamHandler.HistoryWindow {
+            if (q.newest_first) return .{ .to = q.cursor orelse std.math.maxInt(u64), .newest_first = true };
+            return .{ .from = q.cursor orelse 0 };
+        }
+    };
+
     fn handleHistory(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
         const run_id = req.key;
-
-        if (run_id.len == 0) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run_id is required");
-            return;
-        }
-
-        const run_ns_key = self.nsKey(req.ns_id, run_id) orelse {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
+        if (run_id.len == 0) return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run_id is required");
+        const q = HistoryRequest.parse(req.value) orelse return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "malformed history request");
+        // The namespace is the request's, as every op's: its run is read in
+        // that namespace only.
+        const run_ns_key = self.nsKey(req.ns_id, run_id) orelse return shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
         defer self.allocator.free(run_ns_key);
-
-        const shown_run = self.shownRun(run_ns_key, keyName(run_ns_key)) orelse {
-            shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
-            return;
-        };
-
-        // Parse limit from value
-        var limit: u32 = 100;
-        if (req.value.len >= 4) {
-            limit = std.mem.readInt(u32, req.value[0..4], .little);
+        switch (self.answerHistory(shard, run_ns_key, q, false)) {
+            .ok => |bytes| {
+                defer self.allocator.free(bytes);
+                shard.sendOkResponse(conn, req.header.request_id, bytes);
+            },
+            .refused => |r| shard.sendErrorResponse(conn, req.header.request_id, r.status, r.message),
+            .wait => {
+                const registered = shard.waiter_pool.register(.{
+                    .kind = .workflow_history,
+                    .reply_to = conn.replyTo(),
+                    .request_id = req.header.request_id,
+                    .key = run_ns_key,
+                    .min_version = q.cursor orelse 0,
+                    .stream = .{ .limit = q.limit, .partition = q.waiterFlags() },
+                    .timeout_ms = HISTORY_HOLD_MS,
+                });
+                if (!registered) return shard.refuseWaitersFull(conn, req.header.request_id);
+                conn.response_deferred = true;
+            },
         }
+    }
 
-        // Serialize to binary wire format:
-        // [count:u32]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
-        // [has_more:u8][cursor_len:u16]
-        // Event types are literals; details are a signal type (u16 on the
-        // wire), a cancel reason (MAX_CANCEL_REASON), step or terminal names
-        // from a definition under 64 KiB, or, once complete, the completion
-        // record's, itself under 64 KiB. So each length fits u16. The run's,
-        // as applied: every node answers alike.
-        _ = shown_run;
-        var applied_events: std.ArrayListUnmanaged(HistoryEvent) = .empty;
-        defer applied_events.deinit(self.allocator);
-        self.appliedHistory(run_ns_key, &applied_events) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
+    const Answered = union(enum) {
+        ok: []u8,
+        refused: struct { status: proto.StatusCode, message: []const u8 },
+        wait,
+    };
+
+    /// History request `q` for run `run_ns_key`, answered as the wire has
+    /// it, or held: `final` at its deadline, so never held again.
+    fn answerHistory(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8, q: HistoryRequest, final: bool) Answered {
+        _ = shard;
+        const rec = runs_machine.runOf(self.defsRead(), run_ns_key) orelse return .{ .refused = .{ .status = .not_found, .message = "" } };
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const answer = self.readRunHistory(arena.allocator(), run_ns_key, rec, q.window(), q.limit, final) catch return .{ .refused = .{ .status = .internal_error, .message = "allocation failed" } };
+        const page = switch (answer) {
+            .page => |p| p,
+            .wait => return .wait,
+            .disk_late => return .{ .refused = .{ .status = .unavailable, .message = shard_mod.DISK_READ_LATE } },
         };
-        const events = applied_events.items;
-        const count: u32 = @intCast(@min(events.len, limit));
+        return .{ .ok = encodeHistoryPage(self.allocator, page) catch return .{ .refused = .{ .status = .internal_error, .message = "allocation failed" } } };
+    }
 
-        var total: usize = 4; // count
-        for (events[0..count]) |evt| {
-            total += 2 + evt.event_type_owned.len; // type_len:u16 + type
-            total += 2 + evt.detail_owned.len; // detail_len:u16 + detail
-            total += 8; // timestamp:i64
+    /// A page on the wire:
+    /// `[count:u32]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*`
+    /// `[has_more:u8][cursor_len:u16][cursor]`, the cursor the next page's
+    /// seq (u64) when there is one. Event types are literals and details
+    /// come from an entry under 64 KiB, so each length fits u16.
+    fn encodeHistoryPage(a: Allocator, page: HistoryPage) error{OutOfMemory}![]u8 {
+        var total: usize = 4 + 1 + 2 + (if (page.more != null) @as(usize, 8) else 0);
+        for (page.events) |e| total += 2 + e.event.event_type_owned.len + 2 + e.event.detail_owned.len + 8;
+        const buf = try a.alloc(u8, total);
+        var w: std.Io.Writer = .fixed(buf);
+        w.writeInt(u32, @intCast(page.events.len), .little) catch unreachable;
+        for (page.events) |e| {
+            w.writeInt(u16, @intCast(e.event.event_type_owned.len), .little) catch unreachable;
+            w.writeAll(e.event.event_type_owned) catch unreachable;
+            w.writeInt(u16, @intCast(e.event.detail_owned.len), .little) catch unreachable;
+            w.writeAll(e.event.detail_owned) catch unreachable;
+            w.writeInt(i64, e.event.timestamp_ms, .little) catch unreachable;
         }
-        total += 1 + 2; // trailer
+        w.writeByte(@intFromBool(page.more != null)) catch unreachable;
+        if (page.more) |c| {
+            w.writeInt(u16, 8, .little) catch unreachable;
+            w.writeInt(u64, c, .little) catch unreachable;
+        } else w.writeInt(u16, 0, .little) catch unreachable;
+        return buf;
+    }
 
-        const buf = self.allocator.alloc(u8, total) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-        defer self.allocator.free(buf);
-
-        std.mem.writeInt(u32, buf[0..4], count, .little);
-        var pos: usize = 4;
-        for (events[0..count]) |evt| {
-            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(evt.event_type_owned.len), .little);
-            pos += 2;
-            @memcpy(buf[pos..][0..evt.event_type_owned.len], evt.event_type_owned);
-            pos += evt.event_type_owned.len;
-            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(evt.detail_owned.len), .little);
-            pos += 2;
-            @memcpy(buf[pos..][0..evt.detail_owned.len], evt.detail_owned);
-            pos += evt.detail_owned.len;
-            std.mem.writeInt(i64, buf[pos..][0..8], evt.timestamp_ms, .little);
-            pos += 8;
+    /// A held history read, asked again: its chunks landed, or came back
+    /// from disk, or (`final`) its deadline came. True once answered.
+    pub fn resolveHistoryWaiter(self: *WorkflowHandler, shard: *Shard, waiter: *const waiter_pool_mod.Waiter, final: bool) bool {
+        const q = HistoryRequest.fromWaiter(waiter);
+        switch (self.answerHistory(shard, waiter.key(), q, final)) {
+            .ok => |bytes| {
+                defer self.allocator.free(bytes);
+                shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, bytes);
+            },
+            .refused => |r| shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, r.status, proto.notRun(r.message)),
+            .wait => return false,
         }
-        buf[pos] = 0; // has_more
-        pos += 1;
-        std.mem.writeInt(u16, buf[pos..][0..2], 0, .little); // cursor_len
-
-        shard.sendOkResponse(conn, req.header.request_id, buf);
+        return true;
     }
 
     // ── LIST RUNS ───────────────────────────────────────────────────────
@@ -2223,6 +2462,12 @@ pub const WorkflowHandler = struct {
     fn callStep(self: *WorkflowHandler, shard: *Shard, run: *RunRecord, kind: ae.CallKind, target: []const u8, version: []const u8, input: []const u8, step_label: []const u8, ns: NamespaceId, can_wait: bool, now_ms: i64) ?[]const u8 {
         const slot = router.nsKeySlot(ns, target);
         if (input.len > ae.MAX_INPUT or version.len > ae.MAX_VERSION) return definition.StepOutcome.execution_failure;
+        // A child's runs' history names its workflow: one named longer is
+        // none that could exist.
+        if (kind == .workflow and target.len > MAX_WORKFLOW_NAME_LEN) {
+            self.addHistoryEvent(run, "step_call_too_large", "a workflow name is longer than a run's history may name", now_ms);
+            return definition.StepOutcome.execution_failure;
+        }
         // Its start goes to the callee's shard: held, as for a full log,
         // while that outbox, this shard's, or the namespace's share of
         // either has no room, so one tenant's calls can't fill them.
@@ -3109,7 +3354,7 @@ pub const WorkflowHandler = struct {
         }
         const run = &kv.value;
         const index = self.proposeStep(shard, run) catch |err| {
-            if (err == error.Unchanged or err == error.HeldForParent) return;
+            if (err == error.Unchanged or err == error.HeldForParent or err == error.HeldForHistory) return;
             if (!shard.quietHalted(err)) log.warn("shard {d}: workflow run {f}: step not logged: {s}; taken again later", .{ shard.id, shown(run_key), @errorName(err) });
             return;
         };
@@ -3130,6 +3375,9 @@ pub const WorkflowHandler = struct {
         // while that outbox has no room. Each child is held for its own
         // parent, so one full parent holds no other run's end.
         if (run.ending != null and parentWait(shard, ns, run.run_id_owned)) return error.HeldForParent;
+        // Its events go on this shard's history lane: held, and decided
+        // again, while that is past its cap and the namespace its share.
+        if (shard.historyWait(ns) != null) return error.HeldForHistory;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -3212,16 +3460,8 @@ pub const WorkflowHandler = struct {
                 return error.Unchanged;
         }
         var output: ?[]const u8 = null;
-        var tags: []const u8 = "";
         if (run.ending) |status| {
             if (status == .completed) output = self.workflowOutput(run, ns);
-            if (self.nsKey(ns, run.workflow_name_owned)) |def_key| {
-                defer self.allocator.free(def_key);
-                if (self.buildSearchTags(def_key, run)) |t| {
-                    defer self.allocator.free(t);
-                    tags = try a.dupe(u8, t);
-                }
-            }
         }
         defer if (output) |o| self.allocator.free(o);
 
@@ -3243,7 +3483,6 @@ pub const WorkflowHandler = struct {
             .ends = if (run.ending) |status| @backingInt(status) else 0,
             .has_output = output != null,
             .output = output orelse "",
-            .tags = tags,
             .call = if (wait == .call) run.call_payload orelse "" else "",
             .takes = .{ .bytes = takes.written(), .count = @intCast(run.takes.items.len) },
         };
@@ -3280,7 +3519,6 @@ pub const WorkflowHandler = struct {
             .ends = @backingInt(RunStatus.failed),
             .has_output = false,
             .output = "",
-            .tags = "",
             .call = "",
         };
         const bytes = try runs_machine.Step.encodeInto(try a.alloc(u8, limit), value);
@@ -3357,58 +3595,6 @@ pub const WorkflowHandler = struct {
             run.run_id_owned,
         ) catch |err| {
             log.warn("Workflow output mapping resolution failed: {}", .{err});
-            return null;
-        };
-    }
-
-    /// Build pre-computed search attribute JSON from definition + run data.
-    /// Returns an owned JSON string like `{"customer_id":"C-789","order_amount":149.99}`
-    /// or null if the definition has no search attributes.
-    fn buildSearchTags(self: *WorkflowHandler, def_ns_key: []const u8, run: *RunRecord) ?[]const u8 {
-        const def_rec = self.defOf(def_ns_key) orelse return null;
-        var def = self.parseStored(def_rec.yaml, def_ns_key) catch return null;
-        defer def.deinit(self.allocator);
-        if (def.search_attributes.len == 0) return null;
-
-        var resolver = jsonpath.PathResolver.init(
-            self.allocator,
-            run.input_owned,
-            if (run.step_outputs) |*so| so else null,
-            run.run_id_owned,
-        );
-
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        const w: *std.Io.Writer = &aw.writer;
-        w.writeByte('{') catch {
-            aw.deinit();
-            return null;
-        };
-
-        var first = true;
-        for (def.search_attributes) |attr| {
-            const resolved = resolver.resolve(attr.from) catch null;
-            defer if (resolved) |r| self.allocator.free(r);
-
-            if (!first) w.writeByte(',') catch continue;
-            w.writeByte('"') catch continue;
-            writeJsonEscaped(w, attr.name) catch continue;
-            w.writeAll("\":") catch continue;
-
-            if (resolved) |val| {
-                // val is already JSON-formatted (strings quoted, numbers raw)
-                w.writeAll(val) catch continue;
-            } else {
-                w.writeAll("null") catch continue;
-            }
-            first = false;
-        }
-
-        w.writeByte('}') catch {
-            aw.deinit();
-            return null;
-        };
-        return aw.toOwnedSlice() catch {
-            aw.deinit();
             return null;
         };
     }
@@ -4152,6 +4338,8 @@ pub const WorkflowHandler = struct {
         event_type: []const u8,
     ) ?u64 {
         const proposed = self.proposeStart(shard, ns, run_id, wf_name, version, input, idempotency_key, event_type, null) catch |err| {
+            // Held for room: asked again on a later tick.
+            if (err == error.Overloaded) return null;
             if (!shard.quietHalted(err)) log.err("workflow {s}: run {s} not started: {s}", .{ wf_name, run_id, @errorName(err) });
             return null;
         };
@@ -4176,6 +4364,9 @@ pub const WorkflowHandler = struct {
         trigger: ?runs_machine.TriggerAt,
     ) !persistence_mod.ProposeResult {
         _ = self;
+        // A run makes history from its start: held while this shard's
+        // history lane is past its cap, and the namespace past its share.
+        if (shard.historyWait(ns) != null) return error.Overloaded;
         var ns_key_buf: [MAX_START_KEY]u8 = undefined;
         if (KEY_PREFIX + run_id.len > ns_key_buf.len) return error.KeyTooLarge;
         const ns_key = writeKey(&ns_key_buf, ns, run_id);
@@ -4456,8 +4647,34 @@ pub const WorkflowHandler = struct {
         self.commitRun(shard, run_key);
     }
 
+    /// For tests: `run`'s history, all of it, as a read with no deadline
+    /// left answers it, onto its copy, counted as logged.
+    fn loadHistory(self: *WorkflowHandler, run: *RunRecord, run_key: []const u8, rec: runs_machine.Run.Value) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        var cursor: ?u64 = null;
+        while (true) {
+            const q: HistoryRequest = .{ .limit = MAX_HISTORY_PAGE, .cursor = cursor };
+            const got = try self.readRunHistory(arena.allocator(), run_key, rec, q.window(), q.limit, true);
+            const page = switch (got) {
+                .page => |p| p,
+                else => return error.Unavailable,
+            };
+            for (page.events) |e| {
+                const event_type = try self.allocator.dupe(u8, e.event.event_type_owned);
+                errdefer self.allocator.free(event_type);
+                const detail = try self.allocator.dupe(u8, e.event.detail_owned);
+                errdefer self.allocator.free(detail);
+                try run.history.append(self.allocator, .{ .event_type_owned = event_type, .detail_owned = detail, .timestamp_ms = e.event.timestamp_ms });
+            }
+            cursor = page.more orelse break;
+        }
+        run.hist_logged = run.history.items.len;
+    }
+
     /// For tests: run `run_key` as a decision would take it, built from
-    /// what is applied. Read only; good until the handler's deinit.
+    /// what is applied, with its history. Read only; good until the
+    /// handler's deinit.
     pub fn inspect(self: *WorkflowHandler, run_key: []const u8) ?*const RunRecord {
         const rec = runs_machine.runOf(self.defsRead(), run_key) orelse return null;
         var one = std.StringHashMap(RunRecord).init(self.allocator);
@@ -4465,6 +4682,12 @@ pub const WorkflowHandler = struct {
         self.copyRunInto(&one, run_key, rec) catch return null;
         var it = one.iterator();
         const kv = it.next().?;
+        // Its history as a read answers it, what landed and what is pending.
+        self.loadHistory(kv.value_ptr, run_key, rec) catch {
+            self.allocator.free(kv.key_ptr.*);
+            self.freeRunRecord(kv.value_ptr);
+            return null;
+        };
         const copy = self.allocator.create(RunRecord) catch {
             self.allocator.free(kv.key_ptr.*);
             self.freeRunRecord(kv.value_ptr);
@@ -4508,15 +4731,8 @@ pub const WorkflowHandler = struct {
         defer scratch.deinit();
         const read = self.defsRead();
         const prefix = try runs_machine.runRange(scratch.allocator(), keyNamespace(run_key), keyName(run_key));
-        var hit = read.range(runs_machine.HistFam, prefix);
-        while (try hit.next()) |item| {
-            const ev = item.value.v;
-            const event_type = try a.dupe(u8, ev.event);
-            errdefer a.free(event_type);
-            const detail = try a.dupe(u8, ev.detail);
-            errdefer a.free(detail);
-            try run.history.append(a, .{ .event_type_owned = event_type, .detail_owned = detail, .timestamp_ms = ev.at_ms });
-        }
+        // Its history isn't copied: no decision reads a past event, and a
+        // step logs only the events its decision added (`hist_logged` on).
         var oit = read.range(runs_machine.OutFam, prefix);
         while (try oit.next()) |item| {
             if (run.step_outputs == null) run.step_outputs = StepOutputMap.init();
@@ -4906,8 +5122,43 @@ fn applyTestActionEntry(shard: *Shard, comptime etype: @import("../storage/ual/e
 fn settleTest(shard: *Shard) void {
     while (true) {
         _ = shard.applyCommitted();
-        if (!deliverToSelf(shard)) return;
+        const history = deliverHistoryToSelf(shard);
+        if (!deliverToSelf(shard) and !history) return;
     }
+}
+
+/// The history lane's messages to this shard itself, proposed as one
+/// inbound, as its driver would: logged, so a history row's locator finds
+/// it. True when there were any.
+fn deliverHistoryToSelf(shard: *Shard) bool {
+    const channels = @import("../contract/channels.zig");
+    const ce = @import("../protocol/channel_entries.zig");
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    const next = channels.metaOf(read, 0, .history).next_seq;
+    const first = (if (channels.inOf(read, 0, .history)) |i| i.applied else 0) + 1;
+    if (first >= next) return false;
+    var mb: [256 * 1024]u8 = undefined;
+    var w: wire_schema.Writer = .{ .buf = &mb };
+    var seq = first;
+    // A few at a time, and a big one alone: this harness's log ring holds
+    // 256 KiB.
+    while (seq < next and seq < first + 8 and (seq == first or w.written().len < 64 * 1024)) : (seq += 1) {
+        var kb: [channels.OUT_KEY]u8 = undefined;
+        const o = (read.get(channels.OutFam, channels.outKey(&kb, 0, .history, seq)) catch unreachable).?.v;
+        ce.Message.encode(&w, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = 0, .flags = o.flags, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload }) catch break;
+    }
+    if (seq == first) unreachable;
+    const ib = std.testing.allocator.alloc(u8, w.written().len + 64) catch unreachable;
+    defer std.testing.allocator.free(ib);
+    const inbound = ce.Inbound.encodeInto(ib, .{ .from = 0, .lane = @backingInt(channels.Lane.history), .first_seq = first, .messages = .{ .bytes = w.written(), .count = @intCast(seq - first) } }) catch unreachable;
+    _ = shard.raft_node.propose(.channel_inbound, @import("../storage/ual/entry.zig").Flags.NONE, inbound) catch unreachable;
+    _ = shard.applyCommitted();
+    // Delivered: trimmed from the outbox, as the driver's ack trims it.
+    var tb: [ce.Trim.max_size]u8 = undefined;
+    const trim = ce.Trim.encodeInto(&tb, .{ .to = 0, .lane = @backingInt(channels.Lane.history), .first = first, .through = seq - 1 }) catch unreachable;
+    _ = shard.raft_node.propose(.channel_trim, @import("../storage/ual/entry.zig").Flags.NONE, trim) catch unreachable;
+    _ = shard.applyCommitted();
+    return true;
 }
 
 var test_inbound_index: u64 = 1 << 40;
@@ -4981,10 +5232,31 @@ fn timeOutTestAction(shard: *Shard, run_id: []const u8) void {
     settleTest(shard);
 }
 
+/// For a handler built without a shard: run `run_key`'s history, the chunks
+/// its own outbox holds for it then its pending events, oldest first. The
+/// events point into the store and `events`' allocator's arena-less copies
+/// are not made: good until the next apply.
+fn appliedHistoryForTest(handler: *WorkflowHandler, run_key: []const u8, events: *std.ArrayListUnmanaged(WorkflowHandler.HistoryEvent)) !void {
+    const channels = @import("../contract/channels.zig");
+    const a = handler.def_scratch.allocator();
+    const read = handler.defsRead();
+    var pb: [channels.CHAN_KEY]u8 = undefined;
+    var got: std.ArrayListUnmanaged(WorkflowHandler.SeqEvent) = .empty;
+    var it = read.range(channels.OutFam, channels.outPrefix(&pb, 0, .history));
+    while (try it.next()) |item| {
+        var diag: wire_schema.Diagnostic = .{};
+        const c = try @import("../protocol/history_entries.zig").Chunk.decodeAll(try a.dupe(u8, item.value.v.payload), &diag);
+        if (!std.mem.eql(u8, c.run, keyName(run_key))) continue;
+        try WorkflowHandler.decodeRecords(a, c.records, .{}, &got);
+    }
+    const rec = runs_machine.runOf(read, run_key).?;
+    try WorkflowHandler.decodeRecords(a, rec.hist_pending, .{}, &got);
+    for (got.items) |e| try events.append(testing.allocator, e.event);
+}
+
 /// Create a minimal test shard with an actions handler for unit tests.
 /// Only `actions_handler` is usable — all other fields are undefined.
 fn createTestShard(actions: *ActionsHandler) !Shard {
-    const waiter_pool_mod = @import("../node/waiter_pool.zig");
     const RaftNode = @import("../raft/node.zig").RaftNode;
     var shard: Shard = undefined;
     shard.id = 0;
@@ -5053,12 +5325,18 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     // One group of one: a step's call sends to this shard itself, held to
     // its outbox caps like any send.
     partition.store.place = .{ .group = 0, .count = 1 };
+    // A run's history is read through its stream handler.
+    const streams = try std.testing.allocator.create(StreamHandler);
+    streams.* = StreamHandler.init(std.testing.allocator, partition);
+    shard.stream_handler = streams;
     shard.channel = try @import("../contract/channel_driver.zig").Driver.init(std.testing.allocator, 0, 1);
     shard.outbox_caps = .{};
     return shard;
 }
 
 fn destroyTestShard(shard: *Shard) void {
+    shard.stream_handler.deinit();
+    std.testing.allocator.destroy(shard.stream_handler);
     shard.channel.deinit();
     shard.waiter_pool.deinit(std.testing.allocator);
     shard.raft_node.deinit();
@@ -5110,6 +5388,7 @@ test "a producer's start leaves its run to step; its first step is logged, and t
     registerTestAction(&shard, "step-a");
     registerTestAction(&shard, "step-b");
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
 
@@ -5166,6 +5445,7 @@ test "a child pinned to a version starts that version, and one pinned to a versi
         var shard = try createTestShard(&actions);
         defer destroyTestShard(&shard);
         handler.store = &shard.defaultPartition().store;
+        handler.history = shard.stream_handler;
         shard.workflow_handler = &handler;
         registerTestAction(&shard, "step-a");
         var jb: [512]u8 = undefined;
@@ -5207,6 +5487,7 @@ test "a child whose run id another run already holds is refused, not proposed fo
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "par-wf"), "par-wf", test_parent_json);
@@ -5244,6 +5525,7 @@ test "a pending child's start is proposed once while it may apply, and a second 
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "par-wf"), "par-wf", test_parent_json);
@@ -5281,6 +5563,7 @@ test "a parent's child is called, started by the child's shard, and its end told
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "par-wf"), "par-wf", test_parent_json);
@@ -5328,6 +5611,7 @@ test "step executor: linear workflow completes via action invocation" {
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     registerTestAction(&shard, "step-b");
@@ -5381,6 +5665,7 @@ test "step executor: wait_for_signal parks run" {
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "init");
 
@@ -5418,6 +5703,7 @@ test "step executor: signal resumes waiting workflow" {
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "init");
 
@@ -5464,6 +5750,7 @@ test "step executor: missing definition does not crash" {
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
 
     // No definition registered
@@ -5496,6 +5783,7 @@ test "a leader drops the calls whose workflow run has ended, and keeps a waiting
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     actions.missing_action_wait_ms = 3_600_000;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -5531,6 +5819,7 @@ test "step executor: a step whose action's outbox is at its cap waits for room, 
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -5567,6 +5856,7 @@ test "step executor: a full sink target on its action's shard holds no step; the
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -5605,6 +5895,7 @@ test "step executor: a step whose action isn't registered doesn't give up while 
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "run-r"), "run-r", "test-wf");
@@ -5639,6 +5930,7 @@ test "step executor: a call asked for again waits while its action's outbox has 
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "run-q"), "run-q", "test-wf");
@@ -5671,6 +5963,7 @@ test "step executor: missing action yields target_not_found" {
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
 
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -5699,6 +5992,7 @@ test "step executor: a plan's executor waits when the only other's breaker is op
         var shard = try createTestShard(&actions);
         defer destroyTestShard(&shard);
         handler.store = &shard.defaultPartition().store;
+        handler.history = shard.stream_handler;
         shard.workflow_handler = &handler;
 
         createTestDef(&handler, testKey(.default, "plan-wf"), "plan-wf", test_plan_exhaust_workflow_json);
@@ -5732,6 +6026,7 @@ test "workflow duty: looks only at runs parked on an action or a child" {
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -5757,6 +6052,7 @@ test "workflow duty: a timer fires when due, and one the run moved past is dropp
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
 
@@ -5788,6 +6084,7 @@ test "workflow duty: a run with two timers due fires once" {
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "two-waits"), "two-waits", test_two_waits_json);
     createTestRun(&handler, testKey(.default, "r"), "r", "two-waits");
@@ -5817,6 +6114,7 @@ test "workflow duty: a wait with a timeout arms its timer, which holds until due
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "two-waits"), "two-waits", test_two_waits_json);
     createTestRun(&handler, testKey(.default, "r"), "r", "two-waits");
@@ -5840,6 +6138,7 @@ test "workflow duty: an entry from before doesn't fire a run's later timer" {
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     const later = @import("stdx").time.milliTimestamp() + 3_600_000;
@@ -5868,6 +6167,7 @@ test "workflow duty: a signal already there ends a wait, and leaves no deadline 
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "two-waits"), "two-waits", test_two_waits_json);
     createTestRun(&handler, testKey(.default, "r"), "r", "two-waits");
@@ -5893,6 +6193,7 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
 
     var out: Result = .{};
@@ -5932,7 +6233,7 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     // Two unfinished here: it holds, though another namespace's run makes three.
     try testing.expectEqual(@as(usize, 0), runsOf(&handler, &shard));
 
-    const c: runs_machine.Complete = .{ .status = .cancelled, .output = null, .event = "workflow_cancelled", .detail = "stop", .tags = "", .workflow = "wf" };
+    const c: runs_machine.Complete = .{ .status = .cancelled, .output = null, .event = "workflow_cancelled", .detail = "stop", .workflow = "wf" };
     var record_buf: [128]u8 = undefined;
     const record = c.encode(&record_buf).?;
     // Applied twice (a second cancel): one run finished.
@@ -5972,6 +6273,7 @@ test "workflow first steps: a burst bigger than a pass is logged across passes, 
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
 
     // An entry carries its namespace's id: "a" is created first.
@@ -6138,6 +6440,7 @@ test "workflow schedule: a slot starts one run however many leaders propose it, 
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
 
     // Created ten intervals ago; slot 0 fired then, nothing since.
@@ -6197,6 +6500,7 @@ test "workflow cancel: while one is in flight nothing moves the run, and once it
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "two-waits"), "two-waits", test_two_waits_json);
     createTestRun(&handler, testKey(.default, "r"), "r", "two-waits");
@@ -6249,6 +6553,7 @@ test "workflow cancel: in flight, a finished action and a first step both wait f
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -6311,6 +6616,7 @@ test "step executor: failing action follows failure transition" {
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     registerTestAction(&shard, "step-b"); // step-b will fail
@@ -6353,6 +6659,7 @@ test "step executor: an action completed naming no outcome takes the success tra
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     registerTestAction(&shard, "step-b");
@@ -6383,6 +6690,7 @@ test "step executor: retry on failure" {
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "flaky"); // always fails
 
@@ -6441,6 +6749,7 @@ test "step executor: a plan whose executors all fail fails the step after one pa
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "stripe");
     registerTestAction(&shard, "paypal");
@@ -6484,6 +6793,7 @@ test "step executor: an action run that timed out takes the step's failure trans
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "flaky");
 
@@ -6519,6 +6829,7 @@ test "step executor: poll re-arms on pending and times out after max_attempts" {
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "poller");
 
@@ -6578,6 +6889,7 @@ test "step executor: checkPendingActions handles completed async action" {
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
 
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -6727,8 +7039,8 @@ test "workflow replay: a run starts and completes at its entries' stamps, not th
         var out: Result = .{};
         try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, stamp_ns, .default, testKey(.default, "r1"), &start, &pbuf).?, &out);
         try testing.expectEqual(stamp_ms, shownOf(&handler, testKey(.default, "r1")).?.created_at_ms);
-        // completed, no output, no steps, no history, no tags, workflow "wf"
-        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, .default, testKey(.default, "r1"), &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 'w', 'f' }, &pbuf).?, &out);
+        // completed, no output, no event, workflow "wf"
+        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, .default, testKey(.default, "r1"), &[_]u8{ 3, 0, 0, 0, 0, 0, 2, 0, 'w', 'f' }, &pbuf).?, &out);
         const run = shownOf(&handler, testKey(.default, "r1")).?;
         try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
         try testing.expectEqual(@as(?i64, stamp_ms + 9), run.completed_at_ms);
@@ -6745,12 +7057,12 @@ test "workflow replay: a complete entry cut short leaves the run as it was, and 
     var start_out: Result = .{};
     try handler.replayStart(testKey(.default, "r1"), &start, 1, &start_out);
 
-    // completed, output "ok", last event "e"/"d", tags "t", workflow "wf"
-    const whole = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++ [_]u8{ 1, 0, 'e', 1, 0, 'd' } ++ [_]u8{ 1, 0, 't' } ++ [_]u8{ 2, 0, 'w', 'f' };
+    // completed, output "ok", last event "e"/"d", workflow "wf"
+    const whole = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++ [_]u8{ 1, 0, 'e', 1, 0, 'd' } ++ [_]u8{ 2, 0, 'w', 'f' };
 
     var events: std.ArrayListUnmanaged(WorkflowHandler.HistoryEvent) = .empty;
     defer events.deinit(allocator);
-    try handler.appliedHistory(testKey(.default, "r1"), &events);
+    try appliedHistoryForTest(&handler, testKey(.default, "r1"), &events);
     try testing.expectEqual(@as(usize, 1), events.items.len);
     // Every cut is skipped whole.
     for (1..whole.len) |n| {
@@ -6759,7 +7071,7 @@ test "workflow replay: a complete entry cut short leaves the run as it was, and 
         try testing.expectEqual(WorkflowHandler.RunStatus.running, run.status);
         try testing.expect(run.output_owned == null);
         events.clearRetainingCapacity();
-        try handler.appliedHistory(testKey(.default, "r1"), &events);
+        try appliedHistoryForTest(&handler, testKey(.default, "r1"), &events);
         try testing.expectEqualStrings("started", events.items[0].event_type_owned);
     }
 
@@ -6767,10 +7079,11 @@ test "workflow replay: a complete entry cut short leaves the run as it was, and 
     const run = shownOf(&handler, testKey(.default, "r1")).?;
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
     try testing.expectEqualStrings("ok", run.output_owned.?);
-    try testing.expectEqualStrings("t", run.search_tags_owned.?);
+    // An ended run keeps no search tags: a search covers live runs.
+    try testing.expect(run.search_tags_owned == null);
     // Its last event follows the history it had.
     events.clearRetainingCapacity();
-    try handler.appliedHistory(testKey(.default, "r1"), &events);
+    try appliedHistoryForTest(&handler, testKey(.default, "r1"), &events);
     try testing.expectEqual(@as(usize, 2), events.items.len);
     try testing.expectEqualStrings("e", events.items[1].event_type_owned);
 }
@@ -6780,8 +7093,8 @@ test "workflow replay: a cancel logged after a completion is refused and changes
     // next leader took while that completion hadn't applied there.
     const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0, 0 };
     const wf = [_]u8{ 2, 0, 'w', 'f' };
-    const completed = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ wf;
-    const cancelled = [_]u8{5} ++ [_]u8{0} ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ wf;
+    const completed = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ wf;
+    const cancelled = [_]u8{5} ++ [_]u8{0} ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ wf;
 
     // Two replicas apply the same log.
     for (0..2) |_| {
@@ -6841,6 +7154,7 @@ test "cancelling a run that already finished is refused and keeps its result" {
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     var conn = try Connection.init(allocator, -1, 0, 0);
     defer conn.deinit();
@@ -6868,6 +7182,7 @@ test "an engine-reached end with a detail past the cancel-reason cap is trimmed,
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "big"), "big", "test-wf");
@@ -6889,6 +7204,7 @@ test "a wait that times out with no target ends the run through the log, and onl
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
 
@@ -6918,6 +7234,7 @@ test "a client signal with a reserved type is refused and doesn't move a run par
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "init");
     createTestDef(&handler, testKey(.default, "wait-wf"), "wait-wf", test_wait_workflow_json);
@@ -6969,6 +7286,7 @@ test "a step's call at the most an entry holds is logged with it, and one a byte
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -7013,6 +7331,7 @@ test "a step's logged counters that won't decode end the run failed, saying why,
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "r"), "r", "test-wf");
@@ -7036,7 +7355,6 @@ test "a step's logged counters that won't decode end the run failed, saying why,
         .ends = 0,
         .has_output = false,
         .output = "",
-        .tags = "",
         .call = "",
     };
     var sb: [512]u8 = undefined;
@@ -7063,6 +7381,7 @@ test "a signal that wakes a run is the log's: a leader with none of the old one'
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "two-waits"), "two-waits", test_two_waits_json);
     createTestRun(&handler, testKey(.default, "r"), "r", "two-waits");
@@ -7095,6 +7414,7 @@ test "a signal that commits between a wait's decision and its step is taken: the
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     var conn = try Connection.init(allocator, -1, 0, 0);
     defer conn.deinit();
@@ -7122,6 +7442,7 @@ test "a signal sent before its wait is taken by that wait alone: a second wait o
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     const key = testKey(.default, "r");
     createTestDef(&handler, testKey(.default, "two-approvals"), "two-approvals", test_two_approvals_json);
@@ -7155,6 +7476,7 @@ test "runs parked on actions never registered cost no step per tick, and don't h
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     // They wait an hour for their action to be registered.
     actions.missing_action_wait_ms = 3_600_000;
@@ -7208,6 +7530,7 @@ test "a run whose call a repair settled refused, while parked, is looked at and 
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -7243,6 +7566,7 @@ test "parked runs held by a step in flight don't keep one whose call settled fro
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     actions.missing_action_wait_ms = 3_600_000;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -7280,6 +7604,7 @@ test "a signal to a finished run is refused and leaves its history alone" {
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     var conn = try Connection.init(allocator, -1, 0, 0);
     defer conn.deinit();
@@ -7306,7 +7631,6 @@ test "workflow handler: a trigger cursor restored inside an append resumes with 
     var partition = try Partition.init(allocator, 0, 1 << 20, 0);
     defer partition.deinit();
     partition.wireProjections();
-    const StreamHandler = @import("../stream/handler.zig").StreamHandler;
     var streams = StreamHandler.init(allocator, &partition);
     defer streams.deinit();
 
@@ -7350,6 +7674,7 @@ test "workflow handler: a client's start with a key with a leading '_' is refuse
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     var conn = try Connection.init(allocator, -1, 0, 0);
     defer conn.deinit();
@@ -7414,6 +7739,7 @@ test "workflow handler: a trigger's start of an event in a stream made again, or
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "wf"), "wf", "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1\",\"trigger\":{\"stream\":\"events\"},\"start\":{\"wait_for_signal\":{\"type\":\"never\"},\"transitions\":{\"success\":\"flo.Completed\"}}}");
     const t = handler.stream_triggers.getPtr(testKey(.default, "wf")).?;
@@ -7440,6 +7766,7 @@ test "a step whose mapped input would nest past 128 levels fails its run" {
     registerTestAction(&shard, "step-a");
     // Its completions apply through the log, as on a shard.
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "map-wf"), "map-wf",
         \\{"kind":"Workflow","name":"map-wf","version":"1.0.0",
@@ -7522,14 +7849,13 @@ fn createTestRunAt(handler: *WorkflowHandler, run_id: []const u8, wf_name: []con
                 .ends = 0,
                 .has_output = false,
                 .output = "",
-                .tags = "",
                 .call = "",
             };
             var sb: [512]u8 = undefined;
             try handler.applyDirect(.workflow_step, 0, ns_key, try runs_machine.Step.encodeInto(&sb, step), started_at, &out);
         },
         else => {
-            const c: runs_machine.Complete = .{ .status = status, .output = null, .event = "ended", .detail = "", .tags = "", .workflow = wf_name };
+            const c: runs_machine.Complete = .{ .status = status, .output = null, .event = "ended", .detail = "", .workflow = wf_name };
             var cb: [256]u8 = undefined;
             try handler.replayComplete(ns_key, c.encode(&cb).?, started_at, &out);
         },
@@ -7903,6 +8229,7 @@ test "step executor: a call its action's shard holds over its memory share waits
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
@@ -7921,7 +8248,7 @@ test "step executor: a call its action's shard holds over its memory share waits
     // Held, not failed, and not taken for a missing action.
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
     var held: usize = 0;
-    for (run.history.items) |evt| {
+    for (handler.inspect(testKey(.default, "run-m")).?.history.items) |evt| {
         try testing.expect(!std.mem.eql(u8, evt.event_type_owned, "action_not_registered"));
         if (std.mem.eql(u8, evt.event_type_owned, "call_held_over_budget")) held += 1;
     }
@@ -7935,12 +8262,13 @@ test "step executor: a call its action's shard holds over its memory share waits
     try testing.expectEqual(calls_mod.State.started, WorkflowHandler.callOf(&shard, again, again.pending_action_run_id_owned.?).?.state);
     // The ask again added nothing to history.
     held = 0;
-    for (again.history.items) |evt| {
+    handler.commitRun(&shard, testKey(.default, "run-m"));
+    settleTest(&shard);
+    for (handler.inspect(testKey(.default, "run-m")).?.history.items) |evt| {
         try testing.expect(!std.mem.eql(u8, evt.event_type_owned, "action_call_retry"));
         if (std.mem.eql(u8, evt.event_type_owned, "call_held_over_budget")) held += 1;
     }
     try testing.expectEqual(@as(usize, 1), held);
-    handler.commitRun(&shard, testKey(.default, "run-m"));
 }
 
 test "step executor: a call that can't wait, held over its action's shard's memory share, fails at once saying why" {
@@ -7953,6 +8281,7 @@ test "step executor: a call that can't wait, held over its action's shard's memo
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     registerTestAction(&shard, "stripe");
     registerTestAction(&shard, "paypal");
@@ -7984,6 +8313,7 @@ test "step executor: a call first unregistered, then over its action's shard's s
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
     shard.workflow_handler = &handler;
     createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
     createTestRun(&handler, testKey(.default, "run-u"), "run-u", "test-wf");
@@ -8030,4 +8360,282 @@ test "step executor: a call first unregistered, then over its action's shard's s
     S.again(&handler, &shard, key);
     try testing.expectEqual(calls_mod.State.no_action, WorkflowHandler.callOf(&shard, handler.inspect(key).?, handler.inspect(key).?.pending_action_run_id_owned.?).?.state);
     try testing.expectEqual([2]usize{ 1, 1 }, S.notes(handler.inspect(key).?));
+}
+
+/// `n` signals to run `key`, each with a type `size` bytes long, applied as
+/// a shard applies them: their events fill its chunks fast.
+fn signalTestRun(handler: *WorkflowHandler, key: []const u8, n: usize, size: usize) void {
+    var tb: [1024]u8 = undefined;
+    var vb: [1100]u8 = undefined;
+    var pb: [1300]u8 = undefined;
+    for (0..n) |i| {
+        @memset(tb[0..size], 'a' + @as(u8, @intCast(i % 26)));
+        const value = runs_machine.Signal.encodeInto(&vb, .{ .type = tb[0..size], .payload = "" }) catch unreachable;
+        var out: Result = .{};
+        handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_signal, 0, 1, 100 + i, (1 + i) * std.time.ns_per_ms, .default, key, value, &pb).?, &out) catch unreachable;
+    }
+}
+
+/// Every seq a history read gives run `key`, page by page of `limit`.
+fn pagedSeqs(handler: *WorkflowHandler, key: []const u8, limit: u32, newest_first: bool, out: []u64) ![]u64 {
+    var n: usize = 0;
+    var cursor: ?u64 = null;
+    var pages: usize = 0;
+    while (true) : (pages += 1) {
+        try testing.expect(pages < 1000);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const q: WorkflowHandler.HistoryRequest = .{ .limit = limit, .cursor = cursor, .newest_first = newest_first };
+        const rec = runs_machine.runOf(handler.defsRead(), key).?;
+        const page = (try handler.readRunHistory(arena.allocator(), key, rec, q.window(), limit, false)).page;
+        try testing.expect(page.events.len <= limit);
+        for (page.events) |e| {
+            out[n] = e.seq;
+            n += 1;
+        }
+        cursor = page.more orelse return out[0..n];
+    }
+}
+
+test "workflow history: a run's events read back whole and in order, past its chunks' folds, paged by cursor either way" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    // Braces in its workflow's name route nothing: its slot is its own.
+    const key = testKey(.default, "run-h");
+    createTestRun(&handler, key, "run-h", "x{y}z");
+    // About three events a chunk: past 16 chunks, so its rows fold.
+    signalTestRun(&handler, key, 60, 1000);
+    settleTest(&shard);
+    const rec = runs_machine.runOf(handler.defsRead(), key).?;
+    try testing.expectEqual(@as(u64, 60), rec.hist_next);
+    try testing.expect(rec.hist_flushed >= 48);
+
+    var seqs: [80]u64 = undefined;
+    const all = try pagedSeqs(&handler, key, 1000, false, &seqs);
+    try testing.expectEqual(@as(usize, 60), all.len);
+    for (all, 0..) |s, i| try testing.expectEqual(@as(u64, i), s);
+    // Paged, each once, oldest first or newest first.
+    for ([_]u32{ 1, 7, 59, 60 }) |limit| {
+        const up = try pagedSeqs(&handler, key, limit, false, &seqs);
+        try testing.expectEqual(@as(usize, 60), up.len);
+        for (up, 0..) |s, i| try testing.expectEqual(@as(u64, i), s);
+        const down = try pagedSeqs(&handler, key, limit, true, &seqs);
+        try testing.expectEqual(@as(usize, 60), down.len);
+        for (down, 0..) |s, i| try testing.expectEqual(@as(u64, 59 - i), s);
+    }
+    // Each event as its signal applied it.
+    const run = handler.inspect(key).?;
+    try testing.expectEqual(@as(usize, 60), run.history.items.len);
+    try testing.expectEqualStrings("signal_received", run.history.items[59].event_type_owned);
+    try testing.expectEqual(@as(usize, 1000), run.history.items[59].detail_owned.len);
+}
+
+test "workflow history: a read whose chunks haven't landed waits, and at its deadline says which are missing" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    const key = testKey(.default, "run-w");
+    createTestRun(&handler, key, "run-w", "test-wf");
+    // Sent, not delivered: its chunks are on the lane.
+    signalTestRun(&handler, key, 8, 1000);
+    const rec = runs_machine.runOf(handler.defsRead(), key).?;
+    try testing.expect(rec.hist_flushed > 0);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect(try handler.readRunHistory(a, key, rec, .{}, 100, false) == .wait);
+    // A page wholly past the gap, the newest pending event, isn't held.
+    try testing.expect(rec.hist_next > rec.hist_flushed);
+    const newest = (try handler.readRunHistory(a, key, rec, .{ .newest_first = true }, 1, false)).page;
+    try testing.expectEqual(rec.hist_next - 1, newest.events[0].seq);
+    // At its deadline: what landed (none), the rest said missing, then
+    // what is pending.
+    const late = (try handler.readRunHistory(a, key, rec, .{}, 100, true)).page;
+    try testing.expectEqualStrings(WorkflowHandler.HISTORY_MISSING, late.events[0].event.event_type_owned);
+    try testing.expectEqual(rec.hist_next - rec.hist_flushed + 1, late.events.len);
+    try testing.expectEqual(rec.hist_flushed, late.events[1].seq);
+    // Paged at its deadline one at a time, the gap is one page, and the
+    // next starts past it.
+    var cursor: ?u64 = null;
+    var pages: usize = 0;
+    while (true) : (pages += 1) {
+        try testing.expect(pages <= late.events.len);
+        const q: WorkflowHandler.HistoryRequest = .{ .limit = 1, .cursor = cursor };
+        const p = (try handler.readRunHistory(a, key, rec, q.window(), 1, true)).page;
+        if (pages == 0) try testing.expectEqualStrings(WorkflowHandler.HISTORY_MISSING, p.events[0].event.event_type_owned);
+        cursor = p.more orelse break;
+    }
+    try testing.expectEqual(late.events.len - 1, pages);
+    // Landed: whole, with no wait.
+    settleTest(&shard);
+    const landed = (try handler.readRunHistory(a, key, rec, .{}, 100, false)).page;
+    try testing.expectEqual(@as(usize, 8), landed.events.len);
+    for (landed.events, 0..) |e, i| try testing.expectEqual(@as(u64, i), e.seq);
+}
+
+test "workflow history: a request is a limit, then a cursor and an order; anything else is refused" {
+    const Q = WorkflowHandler.HistoryRequest;
+    try testing.expectEqual(@as(u32, 100), Q.parse("").?.limit);
+    const only = Q.parse(&[_]u8{ 5, 0, 0, 0 }).?;
+    try testing.expectEqual(@as(u32, 5), only.limit);
+    try testing.expect(only.cursor == null and !only.newest_first);
+    const full = Q.parse(&([_]u8{ 5, 0, 0, 0, 8, 0 } ++ [_]u8{ 9, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{1})).?;
+    try testing.expectEqual(@as(?u64, 9), full.cursor);
+    try testing.expect(full.newest_first);
+    const no_cursor = Q.parse(&[_]u8{ 5, 0, 0, 0, 0, 0, 1 }).?;
+    try testing.expect(no_cursor.cursor == null and no_cursor.newest_first);
+    for ([_][]const u8{ &.{ 5, 0, 0 }, &.{ 5, 0, 0, 0, 0 }, &.{ 5, 0, 0, 0, 4, 0, 1, 2, 3, 4, 0 }, &.{ 5, 0, 0, 0, 0, 0, 2 }, &.{ 5, 0, 0, 0, 0, 0, 1, 0 } }) |bad| try testing.expect(Q.parse(bad) == null);
+}
+
+test "workflow history: past its history lane's cap, a shard holds new runs and steps until the lane drains" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    registerTestAction(&shard, "step-a");
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    shard.outbox_caps.other.channel = 64;
+    const key = testKey(.default, "run-q");
+    createTestRun(&handler, key, "run-q", "test-wf");
+    // Its chunks on the lane, past its cap: a start, and a step, wait.
+    signalTestRun(&handler, key, 4, 1000);
+    try testing.expect(shard.historyWait(.default) != null);
+    try testing.expectError(error.Overloaded, handler.proposeStart(&shard, .default, "run-r", "test-wf", "latest", "{}", null, "workflow_started", null));
+    try testing.expect(handler.proposeRun(&shard, .default, "run-r", "test-wf", "latest", "{}", null, "schedule_started") == null);
+    const run = handler.takeRun(&shard, key).?;
+    try testing.expectError(error.HeldForHistory, handler.proposeStep(&shard, run));
+    handler.commitRun(&shard, key);
+    try testing.expect(handler.steppingAt(&shard, key) == null);
+    // Drained: both go.
+    settleTest(&shard);
+    try testing.expect(shard.historyWait(.default) == null);
+    try testing.expect(handler.proposeRun(&shard, .default, "run-r", "test-wf", "latest", "{}", null, "schedule_started") != null);
+}
+
+/// A step of run `key` (of `wf`) at `rev`, one event with `detail`, applied
+/// as a shard applies it.
+fn stepTestRun(handler: *WorkflowHandler, key: []const u8, wf: []const u8, rev: u64, detail: []const u8) void {
+    const Step = runs_machine.Step;
+    const eb = testing.allocator.alloc(u8, detail.len + 64) catch unreachable;
+    defer testing.allocator.free(eb);
+    var ew: wire_schema.Writer = .{ .buf = eb };
+    runs_machine.Event.encode(&ew, .{ .event = "big", .detail = detail, .at_ms = 0 }) catch unreachable;
+    const value: Step.Value = .{
+        .rev = rev,
+        .step = "s",
+        .events = .{ .bytes = ew.written(), .count = 1 },
+        .outputs = .{ .bytes = "", .count = 0 },
+        .wait = .none,
+        .wait_kind = .action,
+        .wait_slot = 0,
+        .wait_on = "",
+        .wait_due_ms = 0,
+        .wait_timeout_to = "",
+        .progress = "",
+        .settles = "",
+        .caller_slot = calls_mod.callerSlot(.default, wf),
+        .workflow = wf,
+        .ends = 0,
+        .has_output = false,
+        .output = "",
+        .call = "",
+        .takes = .{ .bytes = "", .count = 0 },
+    };
+    const vb = testing.allocator.alloc(u8, detail.len + 1024) catch unreachable;
+    defer testing.allocator.free(vb);
+    const pb = testing.allocator.alloc(u8, persistence_mod.MAX_PERSIST_PAYLOAD) catch unreachable;
+    defer testing.allocator.free(pb);
+    var out: Result = .{};
+    handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_step, 0, 1, 500 + rev, (1 + rev) * std.time.ns_per_ms, .default, key, Step.encodeInto(vb, value) catch unreachable, pb).?, &out) catch unreachable;
+}
+
+test "workflow history: a page holds at most its event bound and its byte bound, and paging reads past both" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    const key = testKey(.default, "run-b");
+    createTestRun(&handler, key, "run-b", "test-wf");
+    // Five events of 60 KiB: more than one answer's bytes.
+    const detail = try allocator.alloc(u8, 60 * 1024);
+    defer allocator.free(detail);
+    @memset(detail, 'd');
+    for (0..5) |i| stepTestRun(&handler, key, "test-wf", i, detail);
+    settleTest(&shard);
+    const rec = runs_machine.runOf(handler.defsRead(), key).?;
+    try testing.expectEqual(@as(u64, 5), rec.hist_next);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // However many asked for, a page's bytes fit its answer.
+    const first = (try handler.readRunHistory(a, key, rec, .{}, std.math.maxInt(u32), false)).page;
+    var bytes: usize = 0;
+    for (first.events) |e| bytes += WorkflowHandler.wireSize(e);
+    try testing.expect(bytes <= WorkflowHandler.HISTORY_PAGE_BYTES);
+    try testing.expect(first.events.len < 5 and first.events.len > 0);
+    try testing.expect(first.more != null);
+    const encoded = try WorkflowHandler.encodeHistoryPage(allocator, first);
+    defer allocator.free(encoded);
+    try testing.expect(encoded.len <= ops.MAX_RESPONSE_BODY);
+    // Paged, every event once.
+    var seqs: [16]u64 = undefined;
+    const all = try pagedSeqs(&handler, key, std.math.maxInt(u32), false, &seqs);
+    try testing.expectEqual(@as(usize, 5), all.len);
+    // A limit of none still reads one.
+    try testing.expectEqual(@as(usize, 1), (try handler.readRunHistory(a, key, rec, .{}, 0, false)).page.events.len);
+}
+
+test "a step calling a child workflow named longer than a run's history may name fails, saying so, and starts nothing" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    var name: [WorkflowHandler.MAX_WORKFLOW_NAME_LEN + 1]u8 = undefined;
+    @memset(&name, 'k');
+    var db: [1024]u8 = undefined;
+    const def = try std.fmt.bufPrint(&db, "{{\"kind\":\"Workflow\",\"name\":\"par\",\"version\":\"1.0.0\",\"start\":{{\"run\":\"@workflow/{s}\",\"transitions\":{{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}}}}", .{&name});
+    createTestDef(&handler, testKey(.default, "par"), "par", def);
+    createTestRun(&handler, testKey(.default, "p1"), "p1", "par");
+    handler.advanceWorkflow(&shard, testKey(.default, "p1"));
+    settleTest(&shard);
+    const run = handler.inspect(testKey(.default, "p1")).?;
+    try testing.expect(run.pending_action_run_id_owned == null);
+    var said = false;
+    for (run.history.items) |evt| {
+        if (std.mem.eql(u8, evt.event_type_owned, "step_call_too_large") and std.mem.eql(u8, evt.detail_owned, "a workflow name is longer than a run's history may name")) said = true;
+    }
+    try testing.expect(said);
 }
