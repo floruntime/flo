@@ -71,13 +71,13 @@ fn watch(m: *const machine_mod.Machine, store: *Store, e: *const Entry, out: *co
     if (t == .channel_inbound or t == .channel_unpark) for (store.messages.items) |*msg| {
         if (msg.result.refused()) |r| if (r.refusal.reason == .memory_budget) return fail(e, "a channel's message was refused for memory");
     };
-    const class = gate.classOf(t);
+    const refusable = gate.refusable(e);
     const memory = if (out.refused()) |r| r.refusal.reason == .memory_budget else false;
     if (memory) refused += 1;
-    if (class == .refusable and e.header.flags & entry_mod.Flags.SINK == 0) judged += 1;
+    if (refusable) judged += 1;
     if (t == .group_deliver) return judgeDeliver(store, e, memory, before, share);
-    if (memory and (class != .refusable or e.header.flags & entry_mod.Flags.SINK != 0)) return fail(e, "an entry never refused for memory was refused for it");
-    if (class != .refusable or e.header.flags & entry_mod.Flags.SINK != 0) return;
+    if (memory and !refusable) return fail(e, "an entry never refused for memory was refused for it");
+    if (!refusable) return;
     if (out.refused() != null and !memory) return;
     const delta: i64 = if (memory) wouldAdd(m, store, e, before) orelse return else @as(i64, @intCast(pool.useOf(store))) - @as(i64, @intCast(before));
     if (memory and gate.fits(before, delta, share)) return fail(e, "a write within its shard's share was refused for memory");

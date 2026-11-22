@@ -198,3 +198,69 @@ test "e2e/memory_budget: past its share a shard refuses a write, takes a delete,
     defer resp.deinit();
     try testing.expect(std.mem.indexOf(u8, resp.body, "flo_shard_memory_refusals_total{shard_id=\"0\"} 1\n") != null);
 }
+
+test "e2e/memory_budget: past its share a shard takes a stream alter that adds retention, and its use falls, while a stream create is refused" {
+    const env: []const [2][]const u8 = &.{.{ src.node.test_faults.SHARE_ENV, "262144" }};
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true, .faults = true },
+        .env = env,
+    });
+    defer ctx.deinit();
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    for (0..100) |_| {
+        var resp = try http.get("/api/v1/metrics");
+        defer resp.deinit();
+        if (std.mem.indexOf(u8, resp.body, "\"share_bytes\":262144") != null) break;
+        stdx.time.sleep(50 * std.time.ns_per_ms);
+    } else return error.ShareNeverBound;
+
+    // A stream with appends and no retention, then the shard filled.
+    for (0..40) |_| try ctx.exec(&.{ "stream", "append", "keep", "a-record-the-user-no-longer-needs" });
+    const value: []const u8 = &@as([2000]u8, @splat('v'));
+    var key_buf: [32]u8 = undefined;
+    var refused = false;
+    for (0..400) |i| {
+        var r = try ctx.execResult(&.{ "kv", "set", try std.fmt.bufPrint(&key_buf, "fill-{d}", .{i}), value });
+        defer r.deinit();
+        if (pastShare(r)) {
+            refused = true;
+            break;
+        }
+    }
+    try testing.expect(refused);
+    // Then small writes, till not even one fits: a stream's create adds more.
+    refused = false;
+    for (0..400) |i| {
+        var r = try ctx.execResult(&.{ "kv", "set", try std.fmt.bufPrint(&key_buf, "tight-{d}", .{i}), "small" });
+        defer r.deinit();
+        if (pastShare(r)) {
+            refused = true;
+            break;
+        }
+    }
+    try testing.expect(refused);
+
+    // A new stream would grow the shard: refused.
+    {
+        var r = try ctx.execResult(&.{ "stream", "create", "more", "--retention-count", "2" });
+        defer r.deinit();
+        try testing.expect(pastShare(r));
+    }
+    // Retention on the stream it holds is how the user frees memory: taken.
+    const at_share = (try poolUse(http)).node;
+    {
+        var r = try ctx.execResult(&.{ "stream", "alter", "keep", "--retention-count", "2", "--output", "json" });
+        defer r.deinit();
+        try testing.expect(!pastShare(r));
+        try testing.expect(r.contains("\"status\":\"altered\""));
+    }
+    // The retention duty removes all but two appends: the use falls.
+    var after = at_share;
+    for (0..200) |_| {
+        after = (try poolUse(http)).node;
+        if (after < at_share) break;
+        stdx.time.sleep(50 * std.time.ns_per_ms);
+    }
+    try testing.expect(after < at_share);
+}
