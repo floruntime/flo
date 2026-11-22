@@ -33904,3 +33904,37 @@ test "Shard: a workflow run's history read waits while its chunks are on the his
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, one[0].data[0..4], .little));
 }
+
+test "Shard: a workflow named longer than its runs' history may name is refused at create and at start, before anything is proposed" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [4096]u8 = undefined;
+    var two: [2]proto.Response = undefined;
+    const max = @import("../protocol/history_entries.zig").MAX_OWNER;
+    var name: [max + 1]u8 = undefined;
+    @memset(&name, 'n');
+    var db: [max + 256]u8 = undefined;
+    const def = try std.fmt.bufPrint(&db, "{{\"kind\":\"Workflow\",\"name\":\"{s}\",\"version\":\"1.0.0\",\"start\":{{\"wait_for_signal\":{{\"type\":\"go\"}},\"transitions\":{{\"success\":\"flo.Completed\"}}}}}}", .{&name});
+    const before = shard.raft_node.log.lastIndex();
+    shard.runRequest(conn, try ParkTest.request(.workflow_create, 1, proto.DEFAULT_NAMESPACE, &name, def, ""), .client);
+    const start = [_]u8{ 0, 0, 0, 0 };
+    shard.runRequest(conn, try ParkTest.request(.workflow_start, 2, proto.DEFAULT_NAMESPACE, &name, &start, ""), .client);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &two);
+    for (two) |r| {
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.header.status);
+        try std.testing.expect(std.mem.startsWith(u8, (try r.refused()).message, "a workflow name is at most 256 bytes"));
+    }
+    try std.testing.expectEqual(before, shard.raft_node.log.lastIndex());
+}

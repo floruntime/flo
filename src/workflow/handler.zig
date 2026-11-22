@@ -250,7 +250,8 @@ pub const WorkflowHandler = struct {
     /// by circuit breakers to skip failing executors.
     plan_health: std.StringHashMap(plan_types.ExecutorHealth),
 
-    const MAX_WORKFLOW_NAME_LEN: usize = 256;
+    /// The longest workflow name: its runs' history names it as its owner.
+    pub const MAX_WORKFLOW_NAME_LEN: usize = @import("../protocol/history_entries.zig").MAX_OWNER;
     /// The longest key a create or start entry carries.
     pub const MAX_START_KEY: usize = 600;
     /// The longest run id a start may choose: its key is the namespace's id
@@ -831,6 +832,13 @@ pub const WorkflowHandler = struct {
         };
         defer def.deinit(self.allocator);
 
+        // Its runs' history names it: no longer than that may.
+        if (def.name.len > MAX_WORKFLOW_NAME_LEN) {
+            var mb: [96]u8 = undefined;
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, std.fmt.bufPrint(&mb, "a workflow name is at most {d} bytes, not {d}", .{ MAX_WORKFLOW_NAME_LEN, def.name.len }) catch "workflow name too long");
+            return null;
+        }
+
         // A trigger reads from its stream without passing a client's
         // request check, so the namespace it names is checked here.
         if (def.trigger) |t| if (t.namespace) |ns| if (ns.len > 0) if (@import("../namespace/handler.zig").nameRefusal(ns)) |why| {
@@ -893,6 +901,11 @@ pub const WorkflowHandler = struct {
 
         if (workflow_name.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow name is required");
+            return null;
+        }
+        if (workflow_name.len > MAX_WORKFLOW_NAME_LEN) {
+            var mb: [96]u8 = undefined;
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, std.fmt.bufPrint(&mb, "a workflow name is at most {d} bytes, not {d}", .{ MAX_WORKFLOW_NAME_LEN, workflow_name.len }) catch "workflow name too long");
             return null;
         }
 

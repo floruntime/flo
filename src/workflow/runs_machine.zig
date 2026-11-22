@@ -494,6 +494,8 @@ fn carriesServerKeys(event: []const u8) bool {
     return std.mem.eql(u8, event, "schedule_started") or std.mem.eql(u8, event, "trigger_started");
 }
 
+pub const NAME_TOO_LONG = "a workflow name is longer than its runs' history may name";
+
 pub const SERVER_KEY_REFUSED = "reserved idempotency key: a leading '_' is the server's";
 
 /// A `workflow_complete` value:
@@ -694,6 +696,9 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
     const stamp_ms: i64 = @intCast(stamp_ns / std.time.ns_per_ms);
     const s = Start.parse(cmd.value) orelse return error.Halt;
     const arena = view.arena;
+    // Its history names its workflow as its owner: one longer can't be
+    // created, and its start is refused rather than its end halting.
+    if (s.workflow.len > he.MAX_OWNER) return out.refuse(.bad_request, .unclassified, NAME_TOO_LONG);
     // Only a trigger's start says where it read, and every one does.
     if ((s.trigger != null) != std.mem.eql(u8, s.event, "trigger_started")) return error.Halt;
     // A server's key on a start the server didn't make: refused.
@@ -1977,4 +1982,24 @@ test "workflow runs machine: a run takes 64 signals and refuses the next; an end
     try testing.expectEqualStrings("run already finished", ended.refused().?.refusal.message);
     const missing = try f.command(.workflow_signal, view_mod.idKey(&kb, .default, "nope") catch unreachable, value, 4);
     try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, missing.refused().?.status);
+}
+
+test "workflow runs machine: a workflow named as long as a history owner may runs and ends with its history sent; one longer is refused at its start" {
+    var f = Fixture.init();
+    defer f.deinit();
+    var longest: [he.MAX_OWNER + 1]u8 = undefined;
+    @memset(&longest, 'w');
+    const at_most = longest[0..he.MAX_OWNER];
+    // This group owns the long name's slot, where its runs' history goes.
+    f.store.place.?.group = channels.ownerOf(.{ .group = 0, .count = 2 }, calls_mod.callerSlot(.default, at_most));
+    _ = try f.start("r1", at_most, "workflow_started", "", 1);
+    var vb: [1024]u8 = undefined;
+    try testing.expect((try f.complete("r1", completeValue(&vb, .cancelled, at_most), 5)).refused() == null);
+    const sent = try f.chunks();
+    try testing.expect(sent[sent.len - 1].final);
+    try testing.expectEqualStrings(at_most, sent[sent.len - 1].owner);
+    // One byte longer: refused, nothing made.
+    const r = try f.start("r2", &longest, "workflow_started", "", 1);
+    try testing.expectEqualStrings(NAME_TOO_LONG, r.refused().?.refusal.message);
+    try testing.expect(f.get("r2") == null);
 }
