@@ -20029,6 +20029,48 @@ test "Shard: a stream read whose disk read is blocked is refused at once, not he
     try std.testing.expect(again == .pending and c.shard.stream_handler.held == .blocked);
 }
 
+test "Shard: a run's history read that meets a blocked disk read stops, answered retryable, never as lost" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 0, 0, 0);
+    defer c.deinit();
+    const he = @import("../protocol/history_entries.zig");
+    const s = &c.shard;
+    var buf: [he.Chunk.max_size]u8 = undefined;
+    const p = try he.Chunk.encodeInto(&buf, .{ .ns = ns_table.DEFAULT.int(), .family = @backingInt(he.Family.action), .owner = "act", .run = "r1", .created_ns = 3, .first_seq = 1, .last_seq = 2, .final = true, .completed_ms = 77, .records = "events" });
+    try sendFromApplyFlagged(s, @intCast(node_router.nsKeySlot(.default, "act")), .history_chunk, entry_mod.Flags.HISTORY, p);
+    // Its frames to itself come through its own inbox.
+    for (0..8) |_| {
+        s.tickChannels();
+        _ = s.drainInbox();
+        _ = s.applyCommitted();
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const landed = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, 10);
+    try std.testing.expectEqual(@as(usize, 1), landed.pieces.len);
+    // Pushed out of the ring and the warm store, onto disk only.
+    for (0..80) |_| {
+        _ = try persistence_mod.proposeEntry(s, .stream_append, entry_mod.Flags.NONE, "", "f", c.value);
+        try std.testing.expect(s.applyCommitted());
+    }
+    try s.flushSegmentToDisk();
+    // The disk can't be read now: the read stops before the chunk, to be
+    // tried again, and says nothing of it as lost.
+    s.durable_log.?.test_open_error = error.SystemResources;
+    // Asked for, its read fails; asked again, it is held back.
+    var held = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, 10);
+    var tries: usize = 0;
+    while (s.stream_handler.held != .blocked and tries < 2_000) : (tries += 1) {
+        try std.testing.expect(held.pending);
+        _ = s.stream_disk.?.drain();
+        @import("stdx").time.sleep(std.time.ns_per_ms);
+        held = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, 10);
+    }
+    try std.testing.expect(s.stream_handler.held == .blocked);
+    try std.testing.expect(held.pending);
+    try std.testing.expectEqual(@as(usize, 0), held.pieces.len);
+}
+
 test "Shard: an internal op from a client is answered as an unknown one, and nothing is proposed" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);

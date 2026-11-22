@@ -1603,7 +1603,7 @@ pub const StreamHandler = struct {
                     // Another run's chunk where this row points is a lost one,
                     // never read as this run's.
                     const decoded = history_entries.Chunk.decodeAll(msg, &diag) catch null;
-                    if (decoded == null or !sameRun(decoded.?, owner, run, created_ns)) {
+                    if (decoded == null or !sameRun(decoded.?, ns, family, owner, run, created_ns)) {
                         try pieces.append(a, .{ .first_seq = l.first_seq, .last_seq = l.last_seq, .records = "", .lost = true });
                         continue;
                     }
@@ -1612,7 +1612,7 @@ pub const StreamHandler = struct {
                 },
                 .index => {
                     const decoded = history_entries.Index.decodeAll(msg, &diag) catch null;
-                    if (decoded == null or !sameRun(decoded.?, owner, run, created_ns)) {
+                    if (decoded == null or !sameRun(decoded.?, ns, family, owner, run, created_ns)) {
                         try pieces.append(a, .{ .first_seq = l.first_seq, .last_seq = l.last_seq, .records = "", .lost = true });
                         continue;
                     }
@@ -1629,8 +1629,8 @@ pub const StreamHandler = struct {
         return .{ .pieces = pieces.items, .pending = pending };
     }
 
-    fn sameRun(v: anytype, owner: []const u8, run: []const u8, created_ns: u64) bool {
-        return v.created_ns == created_ns and std.mem.eql(u8, v.owner, owner) and std.mem.eql(u8, v.run, run);
+    fn sameRun(v: anytype, ns: router.NamespaceId, family: history_entries.Family, owner: []const u8, run: []const u8, created_ns: u64) bool {
+        return v.ns == ns.int() and v.family == @backingInt(family) and v.created_ns == created_ns and std.mem.eql(u8, v.owner, owner) and std.mem.eql(u8, v.run, run);
     }
 
     /// Message `part` (its place in the inbound, plus one) of an inbound's
