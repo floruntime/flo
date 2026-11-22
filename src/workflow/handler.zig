@@ -2463,9 +2463,13 @@ pub const WorkflowHandler = struct {
         const slot = router.nsKeySlot(ns, target);
         if (input.len > ae.MAX_INPUT or version.len > ae.MAX_VERSION) return definition.StepOutcome.execution_failure;
         // A child's runs' history names its workflow: one named longer is
-        // none that could exist.
+        // none that could exist. An action's name is bounded too.
         if (kind == .workflow and target.len > MAX_WORKFLOW_NAME_LEN) {
             self.addHistoryEvent(run, "step_call_too_large", "a workflow name is longer than a run's history may name", now_ms);
+            return definition.StepOutcome.execution_failure;
+        }
+        if (kind == .action and target.len > ae.MAX_ACTION_NAME) {
+            self.addHistoryEvent(run, "step_call_too_large", "an action name is longer than an action may have", now_ms);
             return definition.StepOutcome.execution_failure;
         }
         // Its start goes to the callee's shard: held, as for a full log,
@@ -8638,4 +8642,41 @@ test "a step calling a child workflow named longer than a run's history may name
         if (std.mem.eql(u8, evt.event_type_owned, "step_call_too_large") and std.mem.eql(u8, evt.detail_owned, "a workflow name is longer than a run's history may name")) said = true;
     }
     try testing.expect(said);
+}
+
+test "a step calling an action named longer than an action may be fails, saying so, and one at the bound makes its call" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    var name: [ae.MAX_ACTION_NAME + 1]u8 = undefined;
+    @memset(&name, 'a');
+    var db: [1024]u8 = undefined;
+    inline for (.{ "at", "over" }, 0..) |wf, i| {
+        const target: []const u8 = if (i == 0) name[0..ae.MAX_ACTION_NAME] else &name;
+        const def = try std.fmt.bufPrint(&db, "{{\"kind\":\"Workflow\",\"name\":\"{s}\",\"version\":\"1.0.0\",\"start\":{{\"run\":\"@actions/{s}\",\"transitions\":{{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}}}}", .{ wf, target });
+        createTestDef(&handler, testKey(.default, wf), wf, def);
+        const key = testKey(.default, wf);
+        createTestRun(&handler, key, wf, wf);
+        handler.advanceWorkflow(&shard, key);
+        settleTest(&shard);
+        const run = handler.inspect(key).?;
+        var said = false;
+        for (run.history.items) |evt| {
+            if (std.mem.eql(u8, evt.event_type_owned, "step_call_too_large") and std.mem.eql(u8, evt.detail_owned, "an action name is longer than an action may have")) said = true;
+        }
+        if (target.len <= ae.MAX_ACTION_NAME) {
+            try testing.expect(!said);
+            try testing.expect(run.pending_action_run_id_owned != null);
+        } else {
+            try testing.expect(said);
+            try testing.expect(run.pending_action_run_id_owned == null);
+        }
+    }
 }

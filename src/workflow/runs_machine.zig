@@ -2035,3 +2035,28 @@ test "workflow runs machine: a child's start for a workflow named longer than a 
     try testing.expectEqual(ae.Answer.refused, told.?.answer);
     try testing.expectEqualStrings("kid1", told.?.run);
 }
+
+test "workflow runs machine: a step's call of an action named longer than an action may be is recorded refused, saying so, and starts nothing" {
+    var f = Fixture.init();
+    defer f.deinit();
+    var name: [ae.MAX_ACTION_NAME + 1]u8 = undefined;
+    @memset(&name, 'a');
+    var cb: [ae.Call.max_size]u8 = undefined;
+    const slot = calls_mod.callerSlot(.default, "wf");
+    for ([_][]const u8{ name[0..ae.MAX_ACTION_NAME], &name }, [_][]const u8{ "r1", "r2" }, [_][]const u8{ "a1", "a2" }) |target, run, callee| {
+        _ = try f.start(run, "wf", "workflow_started", "", 1);
+        const call = try ae.Call.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .kind = .action, .caller_run = run, .caller_workflow = "wf", .step = "s", .target = target, .version = "", .run = callee, .input = "{}", .can_wait = false });
+        const sent = f.store.families[channels.OutFam.ID].count;
+        try testing.expect((try f.step(run, .{ .rev = 0, .wait = .call, .wait_on = callee, .call = call })).refused() == null);
+        const c = calls_mod.callOf(.{ .store = &f.store }, .default, slot, callee).?;
+        if (target.len <= ae.MAX_ACTION_NAME) {
+            // At the most an action's name may be: its start sent.
+            try testing.expectEqual(calls_mod.State.sent, c.state);
+            try testing.expectEqual(sent + 1, f.store.families[channels.OutFam.ID].count);
+        } else {
+            try testing.expectEqual(calls_mod.State.refused, c.state);
+            try testing.expectEqualStrings(calls_mod.TARGET_TOO_LONG, c.outcome);
+            try testing.expectEqual(sent, f.store.families[channels.OutFam.ID].count);
+        }
+    }
+}

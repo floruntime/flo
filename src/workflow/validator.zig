@@ -421,15 +421,26 @@ fn isValidActionOrPlanReference(target: []const u8) bool {
     // @plan/<name>
     // @workflow/<name> or @workflow/<name>:<version>
     if (mem.startsWith(u8, target, "@actions/")) {
-        return target.len > "@actions/".len;
+        return nameFits(target["@actions/".len..], MAX_ACTION_NAME);
     }
     if (mem.startsWith(u8, target, "@plan/")) {
         return target.len > "@plan/".len;
     }
     if (mem.startsWith(u8, target, "@workflow/")) {
-        return target.len > "@workflow/".len;
+        const rest = target["@workflow/".len..];
+        return nameFits(rest[0 .. mem.indexOfScalar(u8, rest, ':') orelse rest.len], MAX_WORKFLOW_NAME);
     }
     return false;
+}
+
+/// The longest action and workflow names a call may name: an action's, and
+/// the most a run's history names its workflow by.
+const MAX_ACTION_NAME = @import("../protocol/action_entries.zig").MAX_ACTION_NAME;
+const MAX_WORKFLOW_NAME = @import("../protocol/history_entries.zig").MAX_OWNER;
+
+/// Whether `name` is one a call may name: some, and no longer than `max`.
+fn nameFits(name: []const u8, max: usize) bool {
+    return name.len > 0 and name.len <= max;
 }
 
 fn validateReachability(result: *ValidationResult, def: *const WorkflowDefinition) !void {
@@ -793,7 +804,7 @@ fn isValidActionReference(target: []const u8) bool {
     if (mem.indexOfScalar(u8, target, 0) != null) return false; // as above
     // Plan executors can only reference actions, not other plans
     if (mem.startsWith(u8, target, "@actions/")) {
-        return target.len > "@actions/".len;
+        return nameFits(target["@actions/".len..], MAX_ACTION_NAME);
     }
     return false;
 }
@@ -1068,6 +1079,17 @@ test "isValidActionOrPlanReference" {
     try testing.expect(!isValidActionOrPlanReference("@plan/")); // Empty name
     try testing.expect(!isValidActionOrPlanReference("validate")); // No prefix
     try testing.expect(!isValidActionOrPlanReference("")); // Empty
+    // At most an action's name, or a workflow's that a history may name.
+    const action_name: [MAX_ACTION_NAME]u8 = @splat('a');
+    const long = "@actions/".* ++ action_name;
+    try testing.expect(isValidActionOrPlanReference(&long));
+    try testing.expect(!isValidActionOrPlanReference(&(long ++ "a".*)));
+    try testing.expect(isValidActionReference(&long));
+    try testing.expect(!isValidActionReference(&(long ++ "a".*)));
+    const workflow_name: [MAX_WORKFLOW_NAME]u8 = @splat('w');
+    const child = "@workflow/".* ++ workflow_name;
+    try testing.expect(isValidActionOrPlanReference(&(child ++ ":1.0.0".*)));
+    try testing.expect(!isValidActionOrPlanReference(&(child ++ "w".*)));
 }
 
 test "validateWorkflow: undefined plan reference" {
