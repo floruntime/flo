@@ -95,6 +95,8 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
 
         // Stream — no projection (UAL direct reads)
         .stream_append, .stream_trim, .stream_delete, .stream_config, .stream_clean, .stream_forget => .none,
+        // A run's history: the stream machine's history families.
+        .history_chunk, .history_index, .history_drop => .none,
 
         // Raft control — consensus layer
         .raft_config, .raft_noop, .repair_skip => .none,

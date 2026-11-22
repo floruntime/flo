@@ -413,15 +413,22 @@ pub fn metaOf(read: ReadView, to: u16, lane: Lane) Meta.Value {
 }
 
 /// What an outbox's bytes are held to the caps as: a sink's, which a full
-/// target can hold back, apart from the rest, so the rest never waits on
-/// them.
+/// target can hold back, and a run's history, each apart from the rest, so
+/// the rest never waits on them.
 pub const Class = enum {
-    /// The main and history lanes.
+    /// The main lane.
     other,
     sink,
+    /// The history lane: held to a cap of its own, past which it holds
+    /// only the namespaces whose history fills it (`Shard.historyWait`).
+    history,
 
     pub fn of(lane: Lane) Class {
-        return if (lane == .sink) .sink else .other;
+        return switch (lane) {
+            .main => .other,
+            .sink => .sink,
+            .history => .history,
+        };
     }
 };
 
@@ -680,7 +687,7 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 if (owner == null) return error.Halt;
                 const as = asEntry(e, m);
                 const mark = view.mark();
-                view.message = .{ .from = p.from, .seq = seq, .ordinal = ordinal };
+                view.message = .{ .from = p.from, .seq = seq, .ordinal = ordinal, .slot = m.slot };
                 defer view.message = null;
                 var r = Result.start(&as);
                 var bug: ?store_mod.SenderBug = null;
@@ -754,7 +761,7 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
             const t = std.enums.fromInt(EntryType, m.entry_type);
             const owner = if (t) |x| machine_mod.ownerOf(targets, x) else null;
             if (owner) |o| if (o.skipped) |answer| {
-                view.message = .{ .from = from, .seq = seq, .ordinal = ordinal };
+                view.message = .{ .from = from, .seq = seq, .ordinal = ordinal, .slot = m.slot };
                 defer view.message = null;
                 try answer(view, &as, why);
                 try writeSends(view, e.header.index);

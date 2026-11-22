@@ -81,6 +81,11 @@ pub const EntryType = enum(u8) {
     /// The retention duty's: drop a deleted stream's tombstone once it holds
     /// no appends and no group counts it.
     stream_forget = 0x15,
+    /// A run's history, sent to its own group on the history lane and kept
+    /// by the stream machine (`protocol/history_entries.zig`).
+    history_chunk = 0x16,
+    history_index = 0x17,
+    history_drop = 0x18,
 
     // ── Queue ──
     queue_enqueue = 0x20,
@@ -195,6 +200,8 @@ pub const EntryType = enum(u8) {
             .step_call_retry, .step_call_clear, .call_reply, .call_done, .action_abandon_send, .action_abandon => false,
             .child_start, .child_refuse => false,
             .stream_append, .stream_trim, .stream_delete, .stream_config, .stream_clean, .stream_forget => true,
+            // A run's history's payloads are schemas (`protocol/history_entries.zig`).
+            .history_chunk, .history_index, .history_drop => false,
             .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge, .queue_requeue, .queue_drop => false,
             .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean, .group_steal, .group_requeue, .group_drop => false,
             .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,

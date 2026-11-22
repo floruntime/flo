@@ -237,7 +237,14 @@ pub const Place = struct { group: u16, count: u16 };
 /// place in the inbound entry that carried it. Every message in one inbound
 /// entry applies at that entry's index, so a record located by index takes
 /// `(index, ordinal)` to stay unique.
-pub const Message = struct { from: u16, seq: u64, ordinal: u8 };
+pub const Message = struct {
+    from: u16,
+    seq: u64,
+    ordinal: u8,
+    /// The slot it was sent to, which this group owns; 0 for a message
+    /// applied from parking, whose slot isn't kept.
+    slot: u16 = 0,
+};
 
 pub const Mark = struct { ops: usize, sends: usize, late: [8]u64 };
 

@@ -1,0 +1,837 @@
+//! A run's history on the contract: where each run's events are in the
+//! log, a fixed number of rows per run however long it ran. The events
+//! themselves stay in the log, in the `history_chunk` messages its applies
+//! sent its own group on the history lane (`channels.Lane.history`); a row
+//! here locates one by its inbound's index and the message's place in it,
+//! which is unique (`channels.zig`).
+//!
+//! Two families, one per producer, so each takes its producer's budget
+//! class: `history.wf` (a workflow's runs) and `history.act` (an action's).
+//! Each keys a run's rows by its incarnation: its owner (the workflow or
+//! action, by name hash), its run id and the stamp it was made at, so a
+//! run id chosen again never meets an earlier run's rows.
+//!
+//! - `L` rows, one per landed chunk while the run is live, oldest first,
+//!   each a locator. At 16, one `history_index` folds them into one row
+//!   that lists them: sent to this group itself, so its seq comes after
+//!   the chunks already on the lane, and serialized by a marker (`P`), so
+//!   only one fold is in flight per run.
+//! - `F`, kept from the run's last chunk (`final`) until its rows have
+//!   folded to one: when it ended, and how often a fold was lost.
+//! - `E`, one per ended run, keyed by its owner and when it ended so
+//!   retention walks a workflow's or action's ended runs oldest first: its
+//!   one remaining row's locator.
+//!
+//! A chunk or fold a repair skipped is recorded, not dropped: a skipped
+//! chunk lands as a `lost` row for its events, so reads say they're gone;
+//! a skipped fold leaves its rows as they were. A run whose fold is lost
+//! three times ends pointing at its live rows as they are (`mode` live):
+//! correct, but not one row.
+
+const std = @import("std");
+const entry_mod = @import("../storage/ual/entry.zig");
+const persistence = @import("../storage/persistence.zig");
+const schema = @import("../protocol/schema.zig");
+const he = @import("../protocol/history_entries.zig");
+const view_mod = @import("../contract/view.zig");
+const machine_mod = @import("../contract/machine.zig");
+const delivery = @import("../contract/delivery.zig");
+const router = @import("../node/router.zig");
+
+const Entry = entry_mod.Entry;
+const EntryType = entry_mod.EntryType;
+const View = view_mod.View;
+const ReadView = view_mod.ReadView;
+const KeySet = view_mod.KeySet;
+const Result = persistence.Result;
+const ApplyError = persistence.ApplyError;
+const Int = schema.Int;
+const NamespaceId = router.NamespaceId;
+
+/// One row's value, whichever kind its key's tag says: a live row's
+/// locator; a marker's nothing but its owner; a final row's end and lost
+/// folds; an ended run's end and remaining row.
+pub const Row = schema.Record(&.{
+    // The owner's name as stored: a reader filters on it, as two owners'
+    // names can hash alike.
+    .{ .name = "owner", .T = schema.Bytes(he.MAX_OWNER) },
+    .{ .name = "ual_index", .T = Int(u64) },
+    .{ .name = "part", .T = Int(u8) },
+    .{ .name = "first_seq", .T = Int(u64) },
+    .{ .name = "last_seq", .T = Int(u64) },
+    .{ .name = "byte_len", .T = Int(u32) },
+    .{ .name = "kind", .T = Int(u8) },
+    .{ .name = "completed_ms", .T = Int(u64) },
+    .{ .name = "retries", .T = Int(u8) },
+    .{ .name = "mode", .T = Int(u8) },
+});
+
+/// How an ended run's row points at its history.
+pub const Mode = enum(u8) {
+    /// At its one remaining row, whose locator `E` carries.
+    one = 0,
+    /// At its live rows, left as they were: its folds were lost.
+    live = 1,
+};
+
+pub const Workflows = view_mod.Family(70, "history.wf", .id, delivery.Stored(Row));
+pub const Actions = view_mod.Family(71, "history.act", .id, delivery.Stored(Row));
+
+/// How many times a run's last fold may be lost before it ends with its
+/// live rows as they are.
+pub const MAX_FOLD_RETRIES = 3;
+
+// ─── Keys ────────────────────────────────────────────────────────────────
+
+pub const Tag = enum(u8) { live = 'L', marker = 'P', final = 'F', ended = 'E' };
+
+/// A run's incarnation as its keys name it, after the tag: its owner's
+/// name hash, its run id (length first, so no run's key is another's
+/// prefix) and the stamp it was made at.
+fn incarnationLen(run: []const u8) usize {
+    return 8 + 2 + run.len + 8;
+}
+
+fn writeIncarnation(buf: []u8, owner: []const u8, run: []const u8, created_ns: u64) []u8 {
+    buf[0..8].* = ownerHash(owner);
+    std.mem.writeInt(u16, buf[8..10], @intCast(run.len), .big);
+    @memcpy(buf[10..][0..run.len], run);
+    std.mem.writeInt(u64, buf[10 + run.len ..][0..8], created_ns, .big);
+    return buf[0..incarnationLen(run)];
+}
+
+pub fn ownerHash(owner: []const u8) [8]u8 {
+    var h: [8]u8 = undefined;
+    std.mem.writeInt(u64, &h, std.hash.Wyhash.hash(0x4157, owner), .big);
+    return h;
+}
+
+/// The key after a namespace for a run's `tag` row (not an ended one's),
+/// in `a`: the tag, then the incarnation.
+fn runKey(a: std.mem.Allocator, tag: Tag, owner: []const u8, run: []const u8, created_ns: u64) error{OutOfMemory}![]u8 {
+    const buf = try a.alloc(u8, 1 + incarnationLen(run));
+    buf[0] = @backingInt(tag);
+    _ = writeIncarnation(buf[1..], owner, run, created_ns);
+    return buf;
+}
+
+/// A live row's key after a namespace: the run's, then where the row's
+/// payload is, so a run's rows sort in landing order.
+fn liveKey(a: std.mem.Allocator, owner: []const u8, run: []const u8, created_ns: u64, ual_index: u64, part: u8) error{OutOfMemory}![]u8 {
+    const base = try runKey(a, .live, owner, run, created_ns);
+    const buf = try a.alloc(u8, base.len + 9);
+    @memcpy(buf[0..base.len], base);
+    std.mem.writeInt(u64, buf[base.len..][0..8], ual_index, .big);
+    buf[base.len + 8] = part;
+    return buf;
+}
+
+/// An ended run's key after a namespace: its owner's hash, when it ended,
+/// then the run's id and stamp, so an owner's ended runs sort oldest first.
+fn endedKey(a: std.mem.Allocator, owner: []const u8, run: []const u8, created_ns: u64, completed_ms: u64) error{OutOfMemory}![]u8 {
+    const buf = try a.alloc(u8, 1 + 8 + 8 + 2 + run.len + 8);
+    buf[0] = @backingInt(Tag.ended);
+    buf[1..9].* = ownerHash(owner);
+    std.mem.writeInt(u64, buf[9..17], completed_ms, .big);
+    std.mem.writeInt(u16, buf[17..19], @intCast(run.len), .big);
+    @memcpy(buf[19..][0..run.len], run);
+    std.mem.writeInt(u64, buf[19 + run.len ..][0..8], created_ns, .big);
+    return buf;
+}
+
+/// A live row's whole key, for a test that plants one.
+pub fn liveRowKey(a: std.mem.Allocator, ns: NamespaceId, owner: []const u8, run: []const u8, created_ns: u64, ual_index: u64, part: u8) error{OutOfMemory}![]u8 {
+    if (!@import("builtin").is_test) @compileError("liveRowKey is for tests");
+    return inNs(a, ns, try liveKey(a, owner, run, created_ns, ual_index, part));
+}
+
+fn inNs(a: std.mem.Allocator, ns: NamespaceId, k: []const u8) error{OutOfMemory}![]u8 {
+    const buf = try a.alloc(u8, 4 + k.len);
+    return view_mod.idKey(buf, ns, k) catch unreachable;
+}
+
+// ─── Entries ─────────────────────────────────────────────────────────────
+
+fn typeOf(e: *const Entry) EntryType {
+    return @fromBackingInt(@intCast(e.header.entry_type));
+}
+
+/// Any history entry's header: the fields every one leads with.
+pub const Head = struct {
+    ns: NamespaceId,
+    family: he.Family,
+    owner: []const u8,
+    run: []const u8,
+    created_ns: u64,
+    first_seq: u64,
+    last_seq: u64,
+    final: bool,
+    completed_ms: u64,
+};
+
+fn headOf(v: anytype) ?Head {
+    const family = std.enums.fromInt(he.Family, v.family) orelse return null;
+    if (v.ns == 0 or v.owner.len == 0 or v.run.len == 0) return null;
+    return .{ .ns = .of(v.ns), .family = family, .owner = v.owner, .run = v.run, .created_ns = v.created_ns, .first_seq = v.first_seq, .last_seq = v.last_seq, .final = v.final, .completed_ms = v.completed_ms };
+}
+
+/// An entry's header, or null for one that doesn't decode or names no run.
+pub fn headOfEntry(e: *const Entry) ?Head {
+    var diag: schema.Diagnostic = .{};
+    return switch (typeOf(e)) {
+        .history_chunk => headOf(he.Chunk.decodeAll(e.payload, &diag) catch return null),
+        .history_index => headOf(he.Index.decodeAll(e.payload, &diag) catch return null),
+        .history_drop => headOf(he.Drop.decodeAll(e.payload, &diag) catch return null),
+        else => null,
+    };
+}
+
+fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
+    const h = headOfEntry(e) orelse return;
+    const a = out.allocator;
+    const fam: u16 = familyId(h.family);
+    out.addRangeIn(fam, h.ns, try runKey(a, .live, h.owner, h.run, h.created_ns)) catch |err| switch (err) {
+        error.NoNamespace => return,
+        else => |o| return o,
+    };
+    try out.addIn(fam, h.ns, try runKey(a, .marker, h.owner, h.run, h.created_ns));
+    try out.addIn(fam, h.ns, try runKey(a, .final, h.owner, h.run, h.created_ns));
+    // The ended row a run moves to is keyed by when it ended, which a fold
+    // landing after its last chunk reads from the final row, not its own
+    // header: the owner's ended rows, all of them, as a range.
+    var eb: [9]u8 = undefined;
+    eb[0] = @backingInt(Tag.ended);
+    eb[1..9].* = ownerHash(h.owner);
+    out.addRangeIn(fam, h.ns, &eb) catch unreachable;
+}
+
+fn familyId(f: he.Family) u16 {
+    return switch (f) {
+        .workflow => Workflows.ID,
+        .action => Actions.ID,
+    };
+}
+
+/// Why a history message can't apply, or null: one its sender built wrong.
+pub fn malformed(e: *const Entry) ?[]const u8 {
+    _ = headOfEntry(e) orelse return "bad request: a history entry that names no run";
+    if (typeOf(e) == .history_index) {
+        var diag: schema.Diagnostic = .{};
+        const v = he.Index.decodeAll(e.payload, &diag) catch unreachable;
+        if (v.locators.count == 0) return "bad request: a history index that lists no rows";
+    }
+    return null;
+}
+
+fn commandNamespace(e: *const Entry) ?u32 {
+    const h = headOfEntry(e) orelse return null;
+    return h.ns.int();
+}
+
+// ─── Apply ───────────────────────────────────────────────────────────────
+
+fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
+    // Only a run's own apply sends these, on the history lane: one in a
+    // client's entry, or as another kind of message, is a Flo bug.
+    const msg = view.message orelse return error.Halt;
+    if (e.header.flags & entry_mod.Flags.HISTORY == 0) return error.Halt;
+    const h = headOfEntry(e) orelse return out.refuse(.bad_request, .malformed, "bad request: a history entry that names no run");
+    return switch (h.family) {
+        .workflow => applyIn(Workflows, view, e, msg, h),
+        .action => applyIn(Actions, view, e, msg, h),
+    };
+}
+
+fn applyIn(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Message, h: Head) ApplyError!void {
+    var diag: schema.Diagnostic = .{};
+    switch (typeOf(e)) {
+        .history_chunk => {
+            const v = he.Chunk.decodeAll(e.payload, &diag) catch return error.Halt;
+            try land(F, view, e, msg, h, .chunk, @intCast(v.records.len));
+        },
+        .history_index => {
+            const v = he.Index.decodeAll(e.payload, &diag) catch return error.Halt;
+            try fold(F, view, e, msg, h, v.locators);
+        },
+        .history_drop => try drop(F, view, h),
+        else => return error.Halt,
+    }
+}
+
+fn row(owner: []const u8) Row.Value {
+    return .{ .owner = owner, .ual_index = 0, .part = 0, .first_seq = 0, .last_seq = 0, .byte_len = 0, .kind = 0, .completed_ms = 0, .retries = 0, .mode = 0 };
+}
+
+/// A chunk's row, or a lost one for its events: the run's next live row,
+/// then the fold or end it may make due.
+fn land(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Message, h: Head, kind: he.Kind, byte_len: u32) ApplyError!void {
+    const a = view.arena;
+    var r = row(h.owner);
+    r.ual_index = e.header.index;
+    r.part = msg.ordinal + 1;
+    r.first_seq = h.first_seq;
+    r.last_seq = h.last_seq;
+    r.byte_len = byte_len;
+    r.kind = @backingInt(kind);
+    try view.put(F, try inNs(a, h.ns, try liveKey(a, h.owner, h.run, h.created_ns, r.ual_index, r.part)), .{ .v = r });
+    if (h.final) {
+        var f = row(h.owner);
+        f.completed_ms = h.completed_ms;
+        try view.put(F, try inNs(a, h.ns, try runKey(a, .final, h.owner, h.run, h.created_ns)), .{ .v = f });
+    }
+    try settle(F, view, msg, h);
+}
+
+/// A fold landed: the rows it lists become the one row it is, if its run
+/// still waits on it. One for a run dropped since, or whose marker a lost
+/// fold cleared, changes nothing: its message is left unread in the log.
+fn fold(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Message, h: Head, locators: he.Locators.Value) ApplyError!void {
+    const a = view.arena;
+    const marker = try inNs(a, h.ns, try runKey(a, .marker, h.owner, h.run, h.created_ns));
+    if (try view.get(F, marker) == null) return;
+    try view.delete(F, marker);
+    var first: u64 = std.math.maxInt(u64);
+    var last: u64 = 0;
+    var it = locators.iterator();
+    while (it.next() catch return error.Halt) |l| {
+        const k = try inNs(a, h.ns, try liveKey(a, h.owner, h.run, h.created_ns, l.ual_index, l.part));
+        // Each row it lists is one the marker kept from folding twice.
+        if (try view.get(F, k) == null) return error.Halt;
+        try view.delete(F, k);
+        if (l.kind != @backingInt(he.Kind.lost) or l.last_seq != 0) {
+            first = @min(first, l.first_seq);
+            last = @max(last, l.last_seq);
+        }
+    }
+    var r = row(h.owner);
+    r.ual_index = e.header.index;
+    r.part = msg.ordinal + 1;
+    r.first_seq = if (first == std.math.maxInt(u64)) 0 else first;
+    r.last_seq = last;
+    r.byte_len = @intCast(e.payload.len);
+    r.kind = @backingInt(he.Kind.index);
+    try view.put(F, try inNs(a, h.ns, try liveKey(a, h.owner, h.run, h.created_ns, r.ual_index, r.part)), .{ .v = r });
+    try settle(F, view, msg, h);
+}
+
+/// What a run's rows need next, with no fold in flight: an ended run's
+/// move to one row, by as many folds as it takes, or a live run's fold of
+/// its oldest 16.
+fn settle(comptime F: type, view: *View, msg: view_mod.Message, h: Head) ApplyError!void {
+    const a = view.arena;
+    if (try view.get(F, try inNs(a, h.ns, try runKey(a, .marker, h.owner, h.run, h.created_ns))) != null) return;
+    const final_key = try inNs(a, h.ns, try runKey(a, .final, h.owner, h.run, h.created_ns));
+    const final = try view.get(F, final_key);
+    var rows: [he.INDEX_FANOUT]Row.Value = undefined;
+    var n: usize = 0;
+    var more = false;
+    var it = try view.range(F, try inNs(a, h.ns, try runKey(a, .live, h.owner, h.run, h.created_ns)));
+    while (try it.next()) |item| {
+        if (n == rows.len) {
+            more = true;
+            break;
+        }
+        rows[n] = item.value.v;
+        n += 1;
+    }
+    if (final) |f| {
+        if (n == 0) return error.Halt;
+        if (n == 1 and !more) return end(F, view, h, f.v.completed_ms, rows[0]);
+        return sendFold(F, view, msg, h, f.v.completed_ms, rows[0..n]);
+    }
+    if (n == rows.len) try sendFold(F, view, msg, h, h.completed_ms, rows[0..n]);
+}
+
+/// Folds `rows` into one: a `history_index` this group sends itself, on
+/// the history lane to the slot its chunks came to, and the marker that
+/// holds any other fold of the run until it lands.
+fn sendFold(comptime F: type, view: *View, msg: view_mod.Message, h: Head, completed_ms: u64, rows: []const Row.Value) ApplyError!void {
+    const a = view.arena;
+    var lb: [he.Locators.max_size]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &lb };
+    for (rows) |r| he.Locator.encode(&w, .{ .ual_index = r.ual_index, .part = r.part, .first_seq = r.first_seq, .last_seq = r.last_seq, .byte_len = r.byte_len, .kind = r.kind }) catch return error.Halt;
+    const buf = try a.alloc(u8, he.Index.max_size);
+    const payload = he.Index.encodeInto(buf, .{ .ns = h.ns.int(), .family = @backingInt(h.family), .owner = h.owner, .run = h.run, .created_ns = h.created_ns, .first_seq = 0, .last_seq = 0, .final = false, .completed_ms = completed_ms, .locators = .{ .bytes = w.written(), .count = @intCast(rows.len) } }) catch return error.Halt;
+    try view.sendFlagged(.user(h.ns), msg.slot, @backingInt(EntryType.history_index), entry_mod.Flags.HISTORY, payload);
+    try view.put(F, try inNs(a, h.ns, try runKey(a, .marker, h.owner, h.run, h.created_ns)), .{ .v = row(h.owner) });
+}
+
+/// An ended run's move to its one ended row, pointing at `last`, its one
+/// remaining row: the live and final rows go.
+fn end(comptime F: type, view: *View, h: Head, completed_ms: u64, last: Row.Value) ApplyError!void {
+    const a = view.arena;
+    var r = last;
+    r.owner = h.owner;
+    r.completed_ms = completed_ms;
+    r.mode = @backingInt(Mode.one);
+    try view.put(F, try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, completed_ms)), .{ .v = r });
+    try view.delete(F, try inNs(a, h.ns, try liveKey(a, h.owner, h.run, h.created_ns, last.ual_index, last.part)));
+    try view.delete(F, try inNs(a, h.ns, try runKey(a, .final, h.owner, h.run, h.created_ns)));
+}
+
+/// Every row of a run's incarnation, gone. Its bytes stay in the log.
+fn drop(comptime F: type, view: *View, h: Head) ApplyError!void {
+    const a = view.arena;
+    var doomed: std.ArrayListUnmanaged([]const u8) = .empty;
+    var it = try view.range(F, try inNs(a, h.ns, try runKey(a, .live, h.owner, h.run, h.created_ns)));
+    while (try it.next()) |item| try doomed.append(a, item.key);
+    for (doomed.items) |k| try view.delete(F, k);
+    try view.delete(F, try inNs(a, h.ns, try runKey(a, .marker, h.owner, h.run, h.created_ns)));
+    try view.delete(F, try inNs(a, h.ns, try runKey(a, .final, h.owner, h.run, h.created_ns)));
+    try view.delete(F, try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, h.completed_ms)));
+}
+
+// ─── A repair's skips ────────────────────────────────────────────────────
+
+/// A history message a repair skipped: a chunk lands as a lost row for its
+/// events, so a read says they're gone; a fold leaves its rows as they
+/// were, and is sent again if its run has ended, up to its retries, after
+/// which the run ends at its live rows; a drop changes nothing, and may be
+/// sent again.
+fn skipped(view: *View, e: *const Entry, _: []const u8) ApplyError!void {
+    const msg = view.message orelse return;
+    const h = headOfEntry(e) orelse return;
+    return switch (h.family) {
+        .workflow => skippedIn(Workflows, view, e, msg, h),
+        .action => skippedIn(Actions, view, e, msg, h),
+    };
+}
+
+fn skippedIn(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Message, h: Head) ApplyError!void {
+    const a = view.arena;
+    switch (typeOf(e)) {
+        .history_chunk => try land(F, view, e, msg, h, .lost, 0),
+        .history_index => {
+            const marker = try inNs(a, h.ns, try runKey(a, .marker, h.owner, h.run, h.created_ns));
+            if (try view.get(F, marker) == null) return;
+            try view.delete(F, marker);
+            const final_key = try inNs(a, h.ns, try runKey(a, .final, h.owner, h.run, h.created_ns));
+            const final = (try view.get(F, final_key)) orelse return;
+            var f = final.v;
+            f.retries += 1;
+            if (f.retries < MAX_FOLD_RETRIES) {
+                try view.put(F, final_key, .{ .v = f });
+                return settle(F, view, msg, h);
+            }
+            // Past its retries: the run ends at its live rows as they are.
+            var r = row(h.owner);
+            r.completed_ms = f.completed_ms;
+            r.mode = @backingInt(Mode.live);
+            try view.put(F, try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, f.completed_ms)), .{ .v = r });
+            try view.delete(F, final_key);
+        },
+        else => {},
+    }
+}
+
+pub const machine: machine_mod.Machine = .{
+    .name = "history",
+    .entry_types = &.{ .history_chunk, .history_index, .history_drop },
+    .families = &.{ machine_mod.info(Workflows), machine_mod.info(Actions) },
+    .keys = keys,
+    .apply = apply,
+    .malformed = malformed,
+    .namespace = commandNamespace,
+    .skipped = skipped,
+};
+
+// ─── Reads ───────────────────────────────────────────────────────────────
+
+/// A run's history rows, oldest first, as a read walks them: its ended
+/// row's one locator, or its live rows (an ended run whose folds were
+/// lost, or a run not ended yet). Index rows list rows of their own,
+/// which the reader resolves from the log.
+pub const Rows = struct {
+    family: he.Family,
+    one: ?he.Locator.Value = null,
+    owner: []const u8,
+    it: ?view_mod.ReadRange(Workflows) = null,
+    it_act: ?view_mod.ReadRange(Actions) = null,
+
+    pub fn next(self: *Rows) ?he.Locator.Value {
+        if (self.one) |l| {
+            self.one = null;
+            return l;
+        }
+        while (true) {
+            const v = self.nextRow() orelse return null;
+            if (!std.mem.eql(u8, v.owner, self.owner)) continue;
+            return locatorOf(v);
+        }
+    }
+
+    fn nextRow(self: *Rows) ?Row.Value {
+        if (self.it) |*i| {
+            const item = (i.next() catch null) orelse return null;
+            return item.value.v;
+        }
+        if (self.it_act) |*i| {
+            const item = (i.next() catch null) orelse return null;
+            return item.value.v;
+        }
+        return null;
+    }
+};
+
+fn locatorOf(v: Row.Value) he.Locator.Value {
+    return .{ .ual_index = v.ual_index, .part = v.part, .first_seq = v.first_seq, .last_seq = v.last_seq, .byte_len = v.byte_len, .kind = v.kind };
+}
+
+/// `run`'s rows of incarnation `created_ns`, with `completed_ms` its end if
+/// it has ended (its summary keeps that), or null for a live run.
+pub fn rowsOf(read: ReadView, a: std.mem.Allocator, family: he.Family, ns: NamespaceId, owner: []const u8, run: []const u8, created_ns: u64, completed_ms: ?u64) error{OutOfMemory}!Rows {
+    var rows: Rows = .{ .family = family, .owner = owner };
+    if (completed_ms) |at| {
+        const k = try inNs(a, ns, try endedKey(a, owner, run, created_ns, at));
+        const got = switch (family) {
+            .workflow => read.get(Workflows, k) catch null,
+            .action => read.get(Actions, k) catch null,
+        };
+        if (got) |g| if (std.mem.eql(u8, g.v.owner, owner) and g.v.mode == @backingInt(Mode.one)) {
+            rows.one = locatorOf(g.v);
+            return rows;
+        };
+    }
+    const prefix = try inNs(a, ns, try runKey(a, .live, owner, run, created_ns));
+    switch (family) {
+        .workflow => rows.it = read.range(Workflows, prefix),
+        .action => rows.it_act = read.range(Actions, prefix),
+    }
+    return rows;
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+const store_mod = @import("../contract/store.zig");
+const channels = @import("../contract/channels.zig");
+const ce = @import("../protocol/channel_entries.zig");
+
+const Ch = channels.Channels(&.{machine});
+
+/// One group of one, its history lane to itself: chunks sent as a run's
+/// apply sends them, and every message on the lane delivered back, one
+/// inbound each, as its driver would.
+const H = struct {
+    store: store_mod.Store,
+    scratch: std.heap.ArenaAllocator,
+    index: u64 = 0,
+    /// The inbound seqs to skip, as a repair names them.
+    skip: []const u64 = &.{},
+    fn init() H {
+        var t: H = .{ .store = store_mod.Store.init(testing.allocator), .scratch = std.heap.ArenaAllocator.init(testing.allocator) };
+        t.store.place = .{ .group = 0, .count = 1 };
+        t.store.strict_keys = true;
+        return t;
+    }
+
+    fn deinit(t: *H) void {
+        t.store.deinit();
+        t.scratch.deinit();
+    }
+
+    fn read(t: *H) ReadView {
+        return .{ .store = &t.store };
+    }
+
+    const Run = struct { family: he.Family = .action, ns: NamespaceId = .default, owner: []const u8 = "act", run: []const u8 = "r1", created_ns: u64 = 1 };
+
+    /// Sends chunk `first..last` of `r`, as its apply would, `final` with
+    /// its end at `completed_ms`.
+    fn chunk(t: *H, r: Run, first: u64, last: u64, final: bool, completed_ms: u64) !void {
+        var buf: [he.Chunk.max_size]u8 = undefined;
+        const p = try he.Chunk.encodeInto(&buf, .{ .ns = r.ns.int(), .family = @backingInt(r.family), .owner = r.owner, .run = r.run, .created_ns = r.created_ns, .first_seq = first, .last_seq = last, .final = final, .completed_ms = completed_ms, .records = "events" });
+        try t.sendOwn(r, .history_chunk, p);
+    }
+
+    fn dropOf(t: *H, r: Run, completed_ms: u64) !void {
+        var buf: [he.Drop.max_size]u8 = undefined;
+        const p = try he.Drop.encodeInto(&buf, .{ .ns = r.ns.int(), .family = @backingInt(r.family), .owner = r.owner, .run = r.run, .created_ns = r.created_ns, .first_seq = 0, .last_seq = 0, .final = false, .completed_ms = completed_ms });
+        try t.sendOwn(r, .history_drop, p);
+    }
+
+    fn sendOwn(t: *H, r: Run, etype: EntryType, payload: []const u8) !void {
+        t.index += 1;
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var ks = KeySet.init(arena.allocator());
+        var view = View.init(&t.store, arena.allocator(), &ks);
+        try view.sendFlagged(.user(r.ns), @intCast(router.nsKeySlot(r.ns, r.owner)), @backingInt(etype), entry_mod.Flags.HISTORY, payload);
+        try channels.writeSends(&view, t.index);
+        try view.commit();
+    }
+
+    /// Every message on the history lane delivered, one inbound each, until
+    /// none is left: what the folds send comes round too.
+    fn pump(t: *H) !void {
+        while (true) {
+            const next = channels.metaOf(t.read(), 0, .history).next_seq;
+            const applied = if (channels.inOf(t.read(), 0, .history)) |i| i.applied else 0;
+            if (applied + 1 >= next) return;
+            const seq = applied + 1;
+            var kb: [channels.OUT_KEY]u8 = undefined;
+            const o = (try t.read().get(channels.OutFam, channels.outKey(&kb, 0, .history, seq))).?.v;
+            var mb: [he.Chunk.max_size + 64]u8 = undefined;
+            var w: schema.Writer = .{ .buf = &mb };
+            try ce.Message.encode(&w, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = 0, .flags = o.flags, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload });
+            var ib: [he.Chunk.max_size + 128]u8 = undefined;
+            const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = @backingInt(channels.Lane.history), .first_seq = seq, .messages = .{ .bytes = w.written(), .count = 1 } });
+            t.index += 1;
+            var h = std.mem.zeroes(entry_mod.Header);
+            h.entry_type = @backingInt(EntryType.channel_inbound);
+            h.index = t.index;
+            h.payload_len = @intCast(inbound.len);
+            const e: Entry = .{ .header = h, .payload = inbound };
+            if (std.mem.indexOfScalar(u64, t.skip, seq) != null) t.store.inbound_skip = .all(t.index);
+            defer t.store.inbound_skip = null;
+            var res = Result.start(&e);
+            try machine_mod.applyEntry(&Ch.machine, &t.store, &t.scratch, &e, &res);
+        }
+    }
+
+    fn countTag(t: *H, r: Run, tag: Tag) usize {
+        return switch (r.family) {
+            .workflow => t.countTagIn(Workflows, r, tag),
+            .action => t.countTagIn(Actions, r, tag),
+        };
+    }
+
+    fn countTagIn(t: *H, comptime F: type, r: Run, tag: Tag) usize {
+        var buf: [1 + 4 + 1 + 8 + 2 + he.MAX_RUN + 8]u8 = undefined;
+        const k = runKey(testing.allocator, tag, r.owner, r.run, r.created_ns) catch unreachable;
+        defer testing.allocator.free(k);
+        const p = view_mod.idKey(&buf, r.ns, k) catch unreachable;
+        var it = t.read().range(F, p);
+        var n: usize = 0;
+        while (it.next() catch null) |_| n += 1;
+        return n;
+    }
+
+    fn ended(t: *H, r: Run, completed_ms: u64) ?Row.Value {
+        const k = endedKey(testing.allocator, r.owner, r.run, r.created_ns, completed_ms) catch unreachable;
+        defer testing.allocator.free(k);
+        var buf: [4 + 1 + 8 + 8 + 2 + he.MAX_RUN + 8]u8 = undefined;
+        const key = view_mod.idKey(&buf, r.ns, k) catch unreachable;
+        const got = switch (r.family) {
+            .workflow => t.read().get(Workflows, key) catch null,
+            .action => t.read().get(Actions, key) catch null,
+        };
+        return if (got) |g| g.v else null;
+    }
+
+    /// The live rows of `r`, oldest first.
+    fn live(t: *H, r: Run, out: []Row.Value) []Row.Value {
+        var buf: [1 + 4 + 1 + 8 + 2 + he.MAX_RUN + 8]u8 = undefined;
+        const k = runKey(testing.allocator, .live, r.owner, r.run, r.created_ns) catch unreachable;
+        defer testing.allocator.free(k);
+        const p = view_mod.idKey(&buf, r.ns, k) catch unreachable;
+        var n: usize = 0;
+        switch (r.family) {
+            inline else => |f| {
+                var it = t.read().range(if (f == .workflow) Workflows else Actions, p);
+                while (it.next() catch null) |item| : (n += 1) out[n] = item.value.v;
+            },
+        }
+        return out[0..n];
+    }
+
+    fn checksum(t: *H) u64 {
+        var h = std.hash.Wyhash.init(0);
+        for ([_]u16{ Workflows.ID, Actions.ID }) |id| h.update(std.mem.asBytes(&store_mod.checksum(&t.store, id)));
+        return h.final();
+    }
+};
+
+test "history: a live run's chunks land as rows in order, and at 16 one fold makes them one, so its rows stay few" {
+    for ([_][]const u8{ "act", "a}b", "{x", "x{y}z" }) |owner| {
+        var t = H.init();
+        defer t.deinit();
+        const r: H.Run = .{ .owner = owner };
+        for (0..15) |i| try t.chunk(r, 2 * i + 1, 2 * i + 2, false, 0);
+        try t.pump();
+        try testing.expectEqual(@as(usize, 15), t.countTag(r, .live));
+        try testing.expectEqual(@as(usize, 0), t.countTag(r, .marker));
+        // The 16th: a fold of the 16, sent and landed; one row covers them.
+        try t.chunk(r, 31, 32, false, 0);
+        try t.pump();
+        var rows: [32]Row.Value = undefined;
+        const got = t.live(r, &rows);
+        try testing.expectEqual(@as(usize, 1), got.len);
+        try testing.expectEqual(@as(u8, @backingInt(he.Kind.index)), got[0].kind);
+        try testing.expectEqual(@as(u64, 1), got[0].first_seq);
+        try testing.expectEqual(@as(u64, 32), got[0].last_seq);
+        try testing.expectEqual(@as(usize, 0), t.countTag(r, .marker));
+        // On: 15 more, and the fold of those 15 and the index.
+        for (0..15) |i| try t.chunk(r, 33 + i, 33 + i, false, 0);
+        try t.pump();
+        const again = t.live(r, &rows);
+        try testing.expectEqual(@as(usize, 1), again.len);
+        try testing.expectEqual(@as(u64, 47), again[0].last_seq);
+    }
+}
+
+test "history: chunks landing while a fold is on its way add rows, and only one fold is in flight per run" {
+    var t = H.init();
+    defer t.deinit();
+    const r: H.Run = .{};
+    for (0..16) |i| try t.chunk(r, i + 1, i + 1, false, 0);
+    // Five more sent before the fold the 16th makes: the lane delivers
+    // them first.
+    for (0..5) |i| try t.chunk(r, 17 + i, 17 + i, false, 0);
+    try t.pump();
+    var rows: [32]Row.Value = undefined;
+    const got = t.live(r, &rows);
+    try testing.expectEqual(@as(usize, 6), got.len);
+    try testing.expectEqual(@as(u8, @backingInt(he.Kind.index)), got[got.len - 1].kind);
+    try testing.expectEqual(@as(usize, 0), t.countTag(r, .marker));
+}
+
+test "history: an ended run moves to one ended row: at once from one row, by a fold from several, and by as many folds as it takes" {
+    for ([_]usize{ 1, 2, 16, 37 }) |chunks| for ([_]he.Family{ .action, .workflow }) |family| {
+        var t = H.init();
+        defer t.deinit();
+        const r: H.Run = .{ .family = family };
+        for (0..chunks) |i| try t.chunk(r, i + 1, i + 1, i + 1 == chunks, 900);
+        try t.pump();
+        try testing.expectEqual(@as(usize, 0), t.countTag(r, .live));
+        try testing.expectEqual(@as(usize, 0), t.countTag(r, .final));
+        try testing.expectEqual(@as(usize, 0), t.countTag(r, .marker));
+        const e = t.ended(r, 900).?;
+        try testing.expectEqual(@as(u8, @backingInt(Mode.one)), e.mode);
+        try testing.expectEqual(@as(u8, @backingInt(if (chunks == 1) he.Kind.chunk else he.Kind.index)), e.kind);
+        try testing.expectEqual(@as(u64, 1), e.first_seq);
+        try testing.expectEqual(@as(u64, chunks), e.last_seq);
+    };
+}
+
+test "history: a skipped chunk lands as lost for its events; a skipped fold is sent again, and past its retries the run ends at its live rows" {
+    {
+        var t = H.init();
+        defer t.deinit();
+        const r: H.Run = .{};
+        try t.chunk(r, 1, 4, false, 0);
+        try t.chunk(r, 5, 9, false, 0);
+        t.skip = &.{2};
+        try t.pump();
+        var rows: [4]Row.Value = undefined;
+        const got = t.live(r, &rows);
+        try testing.expectEqual(@as(usize, 2), got.len);
+        try testing.expectEqual(@as(u8, @backingInt(he.Kind.lost)), got[1].kind);
+        try testing.expectEqual(@as(u64, 5), got[1].first_seq);
+        try testing.expectEqual(@as(u64, 9), got[1].last_seq);
+    }
+    for ([_]usize{ 1, 2, 3 }) |losses| {
+        var t = H.init();
+        defer t.deinit();
+        const r: H.Run = .{};
+        try t.chunk(r, 1, 1, false, 0);
+        try t.chunk(r, 2, 2, true, 700);
+        // Seq 3 is the first fold, 4 its resend, 5 the next.
+        const skips = [_]u64{ 3, 4, 5 };
+        t.skip = skips[0..losses];
+        try t.pump();
+        const e = t.ended(r, 700).?;
+        try testing.expectEqual(@as(usize, 0), t.countTag(r, .final));
+        try testing.expectEqual(@as(usize, 0), t.countTag(r, .marker));
+        if (losses < MAX_FOLD_RETRIES) {
+            try testing.expectEqual(@as(u8, @backingInt(Mode.one)), e.mode);
+            try testing.expectEqual(@as(usize, 0), t.countTag(r, .live));
+        } else {
+            try testing.expectEqual(@as(u8, @backingInt(Mode.live)), e.mode);
+            try testing.expectEqual(@as(usize, 2), t.countTag(r, .live));
+        }
+    }
+}
+
+test "history: a drop takes every row of its run's incarnation and no other's" {
+    var t = H.init();
+    defer t.deinit();
+    const a: H.Run = .{};
+    const again: H.Run = .{ .created_ns = 2 };
+    const other: H.Run = .{ .owner = "other" };
+    for ([_]H.Run{ a, again, other }) |r| {
+        for (0..3) |i| try t.chunk(r, i + 1, i + 1, false, 0);
+    }
+    try t.chunk(a, 4, 4, true, 50);
+    try t.pump();
+    try testing.expect(t.ended(a, 50) != null);
+    try t.dropOf(a, 50);
+    try t.pump();
+    try testing.expect(t.ended(a, 50) == null);
+    try testing.expectEqual(@as(usize, 0), t.countTag(a, .live));
+    try testing.expectEqual(@as(usize, 3), t.countTag(again, .live));
+    try testing.expectEqual(@as(usize, 3), t.countTag(other, .live));
+    // A live run's drop too.
+    try t.dropOf(again, 0);
+    try t.pump();
+    try testing.expectEqual(@as(usize, 0), t.countTag(again, .live));
+    try testing.expectEqual(@as(usize, 3), t.countTag(other, .live));
+}
+
+test "history: a run's reads see only its own incarnation's rows, and an ended run's one row" {
+    var t = H.init();
+    defer t.deinit();
+    const first: H.Run = .{};
+    const again: H.Run = .{ .created_ns = 2 };
+    try t.chunk(first, 1, 1, true, 10);
+    try t.chunk(again, 1, 3, false, 0);
+    try t.pump();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ended_rows = try rowsOf(t.read(), arena.allocator(), .action, .default, "act", "r1", 1, 10);
+    try testing.expectEqual(@as(u64, 1), ended_rows.next().?.last_seq);
+    try testing.expect(ended_rows.next() == null);
+    var live_rows = try rowsOf(t.read(), arena.allocator(), .action, .default, "act", "r1", 2, null);
+    try testing.expectEqual(@as(u64, 3), live_rows.next().?.last_seq);
+    try testing.expect(live_rows.next() == null);
+}
+
+test "history: every replica of the same messages and skips holds the same rows" {
+    var a = H.init();
+    defer a.deinit();
+    var b = H.init();
+    defer b.deinit();
+    for ([_]*H{ &a, &b }) |t| {
+        t.skip = &.{ 7, 19 };
+        const r: H.Run = .{};
+        for (0..30) |i| try t.chunk(r, i + 1, i + 1, i == 29, 77);
+        try t.pump();
+    }
+    try testing.expectEqual(a.checksum(), b.checksum());
+}
+
+test "history: an entry of a run's history outside a message halts its apply" {
+    var t = H.init();
+    defer t.deinit();
+    var buf: [he.Chunk.max_size]u8 = undefined;
+    const p = try he.Chunk.encodeInto(&buf, .{ .ns = 1, .family = 1, .owner = "act", .run = "r1", .created_ns = 1, .first_seq = 1, .last_seq = 1, .final = false, .completed_ms = 0, .records = "x" });
+    var h = std.mem.zeroes(entry_mod.Header);
+    h.entry_type = @backingInt(EntryType.history_chunk);
+    h.index = 1;
+    h.flags = entry_mod.Flags.HISTORY;
+    h.payload_len = @intCast(p.len);
+    const e: Entry = .{ .header = h, .payload = p };
+    var res = Result.start(&e);
+    try testing.expectError(error.Halt, machine_mod.applyEntry(&machine, &t.store, &t.scratch, &e, &res));
+}
+
+test "history: every row's slot follows from the owner it stores, as its chunks were routed, braces and all" {
+    const slot_check = @import("../contract/slot_check.zig");
+    const Derive = struct {
+        fn slot(_: void, _: *store_mod.Store, key: []const u8, value: []const u8) ?u32 {
+            const v = (delivery.Stored(Row).decode(value) catch return null).v;
+            return router.nsKeySlot(slot_check.nsOf(key), v.owner);
+        }
+    };
+    for ([_][]const u8{ "a}b", "{x", "x{y}z", "{t}rest" }) |owner| {
+        var t = H.init();
+        defer t.deinit();
+        const r: H.Run = .{ .owner = owner };
+        for (0..20) |i| try t.chunk(r, i + 1, i + 1, false, 0);
+        const ended: H.Run = .{ .owner = owner, .run = "r2" };
+        for (0..3) |i| try t.chunk(ended, i + 1, i + 1, i == 2, 9);
+        try t.pump();
+        const n = try slot_check.expectFamily(&t.store, Actions.ID, router.nsKeySlot(.default, owner), {}, Derive.slot);
+        try testing.expect(n > 0);
+    }
+}
