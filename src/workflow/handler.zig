@@ -2223,7 +2223,7 @@ pub const WorkflowHandler = struct {
         // Its start goes to the callee's shard: held, as for a full log,
         // while that outbox, this shard's, or the namespace's share of
         // either has no room, so one tenant's calls can't fill them.
-        if (shard.sendWait(shard.router.slotToShard(slot), ns) != null) return self.holdStepForRoom(run, step_label, now_ms);
+        if (shard.sendWait(shard.router.slotToShard(slot), .main, ns) != null) return self.holdStepForRoom(run, step_label, now_ms);
         var run_id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
         const run_id = shard.run_id_gen.next(if (kind == .action) .action else .workflow, slot, shard.raft_node.current_term, &run_id_buf);
         const buf = self.allocator.alloc(u8, ae.Call.max_size) catch return definition.StepOutcome.execution_failure;
@@ -2340,7 +2340,7 @@ pub const WorkflowHandler = struct {
         run.call_retry_at_ms = now_ms +| 1_000;
         const ns = keyNamespace(run.ns_key);
         // Its start is sent again: not while its outbox has no room.
-        if (shard.sendWait(shard.router.slotToShard(router.nsKeySlot(ns, c.target)), ns) != null) return;
+        if (shard.sendWait(shard.router.slotToShard(router.nsKeySlot(ns, c.target)), .main, ns) != null) return;
         var buf: [ae.CallRetry.max_size]u8 = undefined;
         const payload = ae.CallRetry.encodeInto(&buf, .{ .ns = ns.int(), .slot = calls_mod.callerSlot(ns, run.workflow_name_owned), .run = action_rid }) catch return;
         run.call_retry_index = (proposeCharged(shard, ns, .step_call_retry, payload) catch return).index;
@@ -2361,7 +2361,7 @@ pub const WorkflowHandler = struct {
     fn parentWait(shard: *Shard, ns: NamespaceId, run_id: []const u8) bool {
         const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
         const p = children_mod.parentOf(read, ns, run_id) orelse return false;
-        return shard.sendWait(shard.router.slotToShard(p.parent_slot), ns) != null;
+        return shard.sendWait(shard.router.slotToShard(p.parent_slot), .main, ns) != null;
     }
 
     /// Parent records one pass looks at, at most.
@@ -2435,7 +2435,7 @@ pub const WorkflowHandler = struct {
         const taken = self.appliedRun(run_key) != null;
         if (!held or taken) {
             // A refusal is told to the parent: not past its outbox's room.
-            if (shard.sendWait(shard.router.slotToShard(p.parent_slot), ns) != null) return error.Overloaded;
+            if (shard.sendWait(shard.router.slotToShard(p.parent_slot), .main, ns) != null) return error.Overloaded;
             var buf: [ae.ChildRefuse.max_size]u8 = undefined;
             const payload = try ae.ChildRefuse.encodeInto(&buf, .{ .ns = ns.int(), .run = run_id, .answer = if (taken) .conflict else .no_action });
             return shard.raft_node.propose(.child_refuse, entry_mod.Flags.NONE, payload);
@@ -5506,7 +5506,7 @@ test "step executor: a step whose action's outbox is at its cap waits for room, 
     try testing.expect(handler.inspect(testKey(.default, "run-1")).?.pending_action_run_id_owned != null);
     // One byte a channel: the second's step waits on its timer, its step
     // logged with no call.
-    shard.outbox_caps = .{ .shard = 1 << 30, .channel = 1 };
+    shard.outbox_caps = .{ .other = .{ .shard = 1 << 30, .channel = 1 } };
     const before = shard.raft_node.log.lastIndex();
     handler.advanceWorkflow(&shard, testKey(.default, "run-2"));
     try testing.expectEqual(before + 1, shard.raft_node.log.lastIndex());
@@ -5520,6 +5520,44 @@ test "step executor: a step whose action's outbox is at its cap waits for room, 
     handler.advanceWorkflow(&shard, testKey(.default, "run-2"));
     settleTest(&shard);
     try testing.expect(handler.inspect(testKey(.default, "run-2")).?.pending_action_run_id_owned != null);
+}
+
+test "step executor: a full sink target on its action's shard holds no step; the step's own lane's pressure does" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    shard.workflow_handler = &handler;
+    registerTestAction(&shard, "step-a");
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    createTestRun(&handler, testKey(.default, "run-1"), "run-1", "test-wf");
+    createTestRun(&handler, testKey(.default, "run-2"), "run-2", "test-wf");
+    const now = @import("stdx").time.monotonicMs();
+    const Lane = @import("../contract/channels.zig").Lane;
+    // The action's shard (this one) has a sink target full, as its answers
+    // on the sink lane say: a step's call starts on the main lane, so it
+    // calls.
+    const sink = &shard.channel.peers[0].lanes[@backingInt(Lane.sink)];
+    sink.pressure[0] = .{ .shard = 0, .cause = @backingInt(@import("../contract/channel_driver.zig").Cause.target_full) };
+    sink.pressure_len = 1;
+    sink.pressure_ms = now;
+    handler.advanceWorkflow(&shard, testKey(.default, "run-1"));
+    settleTest(&shard);
+    try testing.expect(handler.inspect(testKey(.default, "run-1")).?.pending_action_run_id_owned != null);
+    // The same said on the main lane holds the next step.
+    const main = &shard.channel.peers[0].lanes[@backingInt(Lane.main)];
+    main.pressure = sink.pressure;
+    main.pressure_len = 1;
+    main.pressure_ms = now;
+    handler.advanceWorkflow(&shard, testKey(.default, "run-2"));
+    settleTest(&shard);
+    const held = handler.inspect(testKey(.default, "run-2")).?;
+    try testing.expect(held.waiting_for_room);
+    try testing.expect(held.pending_action_run_id_owned == null);
 }
 
 test "step executor: a step whose action isn't registered doesn't give up while it asks again" {
@@ -5575,7 +5613,7 @@ test "step executor: a call asked for again waits while its action's outbox has 
     const rid = run.pending_action_run_id_owned.?;
     try testing.expectEqual(calls_mod.State.no_action, WorkflowHandler.callOf(&shard, run, rid).?.state);
     // No room: nothing is proposed.
-    shard.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    shard.outbox_caps = .{ .other = .{ .shard = 0, .channel = 1 << 30 } };
     const before = shard.raft_node.log.lastIndex();
     handler.retryCall(&shard, run, rid, WorkflowHandler.callOf(&shard, run, rid).?, @import("stdx").time.milliTimestamp());
     try testing.expectEqual(before, shard.raft_node.log.lastIndex());

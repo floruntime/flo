@@ -1588,30 +1588,30 @@ pub const ProcessingHandler = struct {
         // stops adding to one at its cap, and each pipeline's batch passes
         // it by at most its own size. It goes on below the cap: no
         // hysteresis, since one batch is the most it overshoots by.
-        const caps = shard.outbox_caps;
+        const caps = shard.outbox_caps.sink;
         // The driver's clock moves only while it ticks; pressure is read
         // against the time now, so it expires though nothing is sent.
         const now_ms = @import("stdx").time.monotonicMs();
-        const total = shard.outboxBytes();
+        const total = shard.outboxBytes(.sink);
         if (total >= caps.shard) return .{ .outbox = .{ .to = null, .bytes = total, .cap = caps.shard } };
         // One namespace's sinks may send to every shard, so its share of
         // the shard's cap is over all its outboxes together.
         for (pipe.sinks) |snk| {
-            const held = shard.nsOutboxBytes(self.namespaceIdOf(snk.namespace));
+            const held = shard.nsOutboxBytes(.sink, self.namespaceIdOf(snk.namespace));
             if (raft_node_mod.shareHeld(held, total, caps.shard)) return .{ .share = .{ .to = null, .namespace = snk.namespace, .bytes = held, .cap = caps.shard } };
         }
         var to: u16 = 0;
         const shards: u16 = @max(self.peer_shard_count, 1);
         while (to < shards) : (to += 1) {
             if (!self.sendsTo(pipe, to)) continue;
-            const meta = channels_mod.metaOf(read, to, .main);
-            if (shard.channel.pressureOf(to, now_ms)) |stall|
+            const meta = channels_mod.metaOf(read, to, .sink);
+            if (shard.channel.pressureOf(to, .sink, now_ms)) |stall|
                 return .{ .pressure = .{ .shard = to, .stall = stall, .target = self.waitingSink(read, pipe, to, meta.acked + 1) } };
-            const bytes = channels_mod.bytesTo(read, to);
-            if (bytes >= caps.channel) return .{ .outbox = .{ .to = to, .bytes = bytes, .cap = caps.channel, .cause = shard.channel.causeOf(to, now_ms) } };
+            const bytes = channels_mod.bytesTo(read, to, .sink);
+            if (bytes >= caps.channel) return .{ .outbox = .{ .to = to, .bytes = bytes, .cap = caps.channel, .cause = shard.channel.causeOf(to, .sink, now_ms) } };
             for (pipe.sinks) |snk| {
                 if (self.sinkShard(snk)) |s_to| if (s_to != to) continue;
-                const held = channels_mod.nsBytesTo(read, to, self.namespaceIdOf(snk.namespace));
+                const held = channels_mod.nsBytesTo(read, to, .sink, self.namespaceIdOf(snk.namespace));
                 if (raft_node_mod.shareHeld(held, bytes, caps.channel)) return .{ .share = .{ .to = to, .namespace = snk.namespace, .bytes = held, .cap = caps.channel } };
             }
         }
@@ -1642,7 +1642,7 @@ pub const ProcessingHandler = struct {
     /// another job's, whose full target this one can't name.
     fn waitingSink(self: *const ProcessingHandler, read: view_mod.ReadView, pipe: *const PipelineState, to: u16, seq: u64) []const u8 {
         var kb: [channels_mod.OUT_KEY]u8 = undefined;
-        const out = (read.get(channels_mod.OutFam, channels_mod.outKey(&kb, to, .main, seq)) catch null) orelse return "";
+        const out = (read.get(channels_mod.OutFam, channels_mod.outKey(&kb, to, .sink, seq)) catch null) orelse return "";
         for (pipe.sinks) |snk| {
             const name = if (snk.kind == .ts) snk.measurement else snk.target;
             if (snk.kind == .kv) continue;

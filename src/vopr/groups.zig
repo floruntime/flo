@@ -262,8 +262,8 @@ pub const ChannelOracle = struct {
     /// A message with a target reached it at the receiver's `index`: once,
     /// and after every earlier message from its sender to the same target.
     pub fn delivered(self: *ChannelOracle, from: GroupId, to: GroupId, seq: u64, index: u64) !void {
-        // Only the main lane's messages have targets.
-        const c = self.chan(from, to, .main);
+        // Only the sink lane's messages have targets.
+        const c = self.chan(from, to, .sink);
         if (c.delivered.get(seq)) |was| {
             if (was == index) {
                 self.replays += 1;
@@ -377,7 +377,7 @@ pub const ChannelOracle = struct {
         };
         // Taken in and parked, but never reached its target.
         for (&self.channels, 0..) |*row, from| for (row, 0..) |*lanes, to| {
-            const c = &lanes[@backingInt(Lane.main)];
+            const c = &lanes[@backingInt(Lane.sink)];
             if (to < halted.len and halted[to]) continue;
             for (c.sent.items[0..c.appliedThrough()], 1..) |s, seq| {
                 if (s.target == null or c.delivered.contains(seq)) continue;
@@ -426,7 +426,7 @@ const channel_machines = [_]machine_mod.Machine{ probe.machine, Probed.machine }
 fn probeTarget(payload: []const u8) ?u16 {
     var diag: @import("../protocol/schema.zig").Diagnostic = .{};
     const p = ce.Probe.decodeAll(payload, &diag) catch return null;
-    if (std.mem.startsWith(u8, p.body, "fill") or std.mem.startsWith(u8, p.body, "drai") or probe.isHistory(p.body)) return null;
+    if (std.mem.startsWith(u8, p.body, "fill") or std.mem.startsWith(u8, p.body, "drai") or probe.isHistory(p.body) or probe.isMain(p.body)) return null;
     return p.slot;
 }
 
@@ -639,6 +639,10 @@ pub const GroupChannel = struct {
             body[0..16].* = name;
             slot = slot - slot % n + c.g;
             if (slot >= 4096) slot -= n;
+        } else if (c.probes_proposed % 5 == 2) {
+            // And every fifth another's, on the main lane: to any slot,
+            // never parked, held by no full target.
+            body[15] = 'M';
         }
         var buf: [body.len + 64]u8 = undefined;
         const payload = ce.Probe.encodeInto(&buf, .{ .slot = slot, .body = body[0 .. 16 + extra] }) catch return;

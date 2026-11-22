@@ -1212,7 +1212,7 @@ pub const ActionsHandler = struct {
         }
         // Sent to the run's shard: not past the outbox caps, where its
         // lease, ending, gives it back instead.
-        if (shard.sendWait(ownerOf(shard, ns, t.action), ns) != null) return shard.dropHandBack(.action, "the outbox to its run's shard is full; its lease ends it");
+        if (shard.sendWait(ownerOf(shard, ns, t.action), .main, ns) != null) return shard.dropHandBack(.action, "the outbox to its run's shard is full; its lease ends it");
         var out: [ae.Abandon.max_size]u8 = undefined;
         const bytes = ae.Abandon.encodeInto(&out, .{ .ns = ns.int(), .action = t.action, .run = t.run, .holder = holder, .deliveries = t.deliveries, .token = .{ .term = t.term, .index = t.index } }) catch return shard.dropHandBack(.action, "it is larger than a hand-back holds");
         _ = shard.raft_node.propose(.action_abandon_send, Flags.NONE, bytes) catch |err| return shard.dropHandBack(.action, @errorName(err));
@@ -1393,7 +1393,7 @@ pub const ActionsHandler = struct {
     fn endWait(shard: *Shard, ns: NamespaceId, run: Run) ?table_run.Refused {
         if (run.source != .workflow) return null;
         const workflow = run.caller_workflow orelse return null;
-        const w = shard.sendWait(shard.router.slotToShard(calls_machine.callerSlot(ns, workflow)), ns) orelse return null;
+        const w = shard.sendWait(shard.router.slotToShard(calls_machine.callerSlot(ns, workflow)), .main, ns) orelse return null;
         return .{ .status = .overloaded, .refusal = .{ .reason = .unclassified, .ran = .no, .message = Shard.sendWaitText(w, &shard.actions_handler.refusal_buf) } };
     }
 

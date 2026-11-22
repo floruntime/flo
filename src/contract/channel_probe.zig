@@ -11,7 +11,9 @@
 //! One whose 16-byte name ends 'H' is a run's history's instead
 //! (`Flags.HISTORY`), whatever it starts with: it rides the history lane,
 //! may go only to its sender's own group, and is never parked; its slot's
-//! full mark refuses it like any other.
+//! full mark refuses it like any other. One whose name ends 'M' carries no
+//! flag: it rides the main lane, and has its slot for a target like a
+//! sink's, but isn't a sink's, so it never parks.
 //!
 //! A probe is a sink's write (`Flags.SINK`), and its target is its slot,
 //! which can be full: one starting "fill" makes its slot full at its
@@ -142,7 +144,13 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
 
 /// The flags a probe with `body` is sent with: a history's, or a sink's.
 fn flagsOf(body: []const u8) u16 {
-    return if (isHistory(body)) entry_mod.Flags.HISTORY else entry_mod.Flags.SINK;
+    if (isHistory(body)) return entry_mod.Flags.HISTORY;
+    if (isMain(body)) return 0;
+    return entry_mod.Flags.SINK;
+}
+
+pub fn isMain(body: []const u8) bool {
+    return body.len >= NAME_LEN and body[NAME_LEN - 1] == 'M';
 }
 
 pub fn isHistory(body: []const u8) bool {

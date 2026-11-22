@@ -307,7 +307,7 @@ test "channel driver: an ack above what was sent is refused, and a frame's sende
     try sim.probeFrom(g, 1);
     var buf: [64]u8 = undefined;
     buf[0] = @backingInt(driver_mod.Kind.answer);
-    const body = try driver_mod.Answer.encodeInto(buf[1..], .{ .lane = 0, .gen_term = 1, .gen_counter = 0, .applied = 5, .durable = 5, .gap = 0, .status = 0, .pressure = .{ .bytes = "", .count = 0 } });
+    const body = try driver_mod.Answer.encodeInto(buf[1..], .{ .lane = 2, .gen_term = 1, .gen_counter = 0, .applied = 5, .durable = 5, .gap = 0, .status = 0, .pressure = .{ .bytes = "", .count = 0 } });
     g.driver.onFrame(1, buf[0 .. 1 + body.len], 1, .{ .store = &g.store }, 0, false, Sim.Io{ .sim = &sim, .me = 0 });
     try testing.expectEqual(@as(u64, 1), g.driver.counts.acks_refused);
     // From a group past the node's count: ignored outright.
@@ -330,25 +330,25 @@ test "channel driver: a gap rewinds once per generation; one from an older batch
         for (0..5) |_| try sim.probeFrom(g, 1);
         // Seqs 1..5 go out in generation 0.
         g.driver.tick(1, .{ .store = &g.store }, 100, Sim.Io{ .sim = &sim, .me = 0 });
-        try testing.expectEqual(@as(u64, 5), g.driver.peers[1].lanes[0].sent_through);
+        try testing.expectEqual(@as(u64, 5), g.driver.peers[1].lanes[2].sent_through);
         var buf: [64]u8 = undefined;
         // The receiver lost 3..5: it says gap at 3, to generation 0.
-        const gap = answerFrame(&buf, .{ .lane = 0, .gen_term = 1, .gen_counter = 0, .applied = 2, .durable = 2, .gap = 3, .status = 0, .pressure = .{ .bytes = "", .count = 0 } });
+        const gap = answerFrame(&buf, .{ .lane = 2, .gen_term = 1, .gen_counter = 0, .applied = 2, .durable = 2, .gap = 3, .status = 0, .pressure = .{ .bytes = "", .count = 0 } });
         g.driver.onFrame(1, gap, 2, .{ .store = &g.store }, 100, false, Sim.Io{ .sim = &sim, .me = 0 });
-        try testing.expectEqual(@as(u64, 2), g.driver.peers[1].lanes[0].sent_through);
-        try testing.expectEqual(@as(u32, 1), g.driver.peers[1].lanes[0].gen_counter);
+        try testing.expectEqual(@as(u64, 2), g.driver.peers[1].lanes[2].sent_through);
+        try testing.expectEqual(@as(u32, 1), g.driver.peers[1].lanes[2].gen_counter);
         // Generation 1 resends 3..5.
         g.driver.tick(3, .{ .store = &g.store }, 100, Sim.Io{ .sim = &sim, .me = 0 });
-        try testing.expectEqual(@as(u64, 5), g.driver.peers[1].lanes[0].sent_through);
+        try testing.expectEqual(@as(u64, 5), g.driver.peers[1].lanes[2].sent_through);
         // A duplicate of the first gap, late: it answers an older batch.
         g.driver.onFrame(1, gap, 4, .{ .store = &g.store }, 100, false, Sim.Io{ .sim = &sim, .me = 0 });
         switch (mutant) {
             .none => {
-                try testing.expectEqual(@as(u64, 5), g.driver.peers[1].lanes[0].sent_through);
-                try testing.expectEqual(@as(u32, 1), g.driver.peers[1].lanes[0].gen_counter);
+                try testing.expectEqual(@as(u64, 5), g.driver.peers[1].lanes[2].sent_through);
+                try testing.expectEqual(@as(u32, 1), g.driver.peers[1].lanes[2].gen_counter);
             },
             // Without the filter it rewinds again: the guard is what stops it.
-            else => try testing.expectEqual(@as(u64, 2), g.driver.peers[1].lanes[0].sent_through),
+            else => try testing.expectEqual(@as(u64, 2), g.driver.peers[1].lanes[2].sent_through),
         }
     }
 }
@@ -364,17 +364,17 @@ test "channel driver: a gap from an earlier term's generation of the same counte
         // A new term: its first generation is counter 0 again, and sends 1..5.
         g.driver.reset(2);
         g.driver.tick(2, .{ .store = &g.store }, 100, Sim.Io{ .sim = &sim, .me = 0 });
-        try testing.expectEqual(@as(u64, 5), g.driver.peers[1].lanes[0].sent_through);
+        try testing.expectEqual(@as(u64, 5), g.driver.peers[1].lanes[2].sent_through);
         // A late gap answering term 1's batch, with the same counter.
         var buf: [64]u8 = undefined;
-        const gap = answerFrame(&buf, .{ .lane = 0, .gen_term = 1, .gen_counter = 0, .applied = 2, .durable = 2, .gap = 3, .status = 0, .pressure = .{ .bytes = "", .count = 0 } });
+        const gap = answerFrame(&buf, .{ .lane = 2, .gen_term = 1, .gen_counter = 0, .applied = 2, .durable = 2, .gap = 3, .status = 0, .pressure = .{ .bytes = "", .count = 0 } });
         g.driver.onFrame(1, gap, 3, .{ .store = &g.store }, 100, false, Sim.Io{ .sim = &sim, .me = 0 });
         switch (mutant) {
             .none => {
-                try testing.expectEqual(@as(u64, 5), g.driver.peers[1].lanes[0].sent_through);
-                try testing.expectEqual(@as(u32, 0), g.driver.peers[1].lanes[0].gen_counter);
+                try testing.expectEqual(@as(u64, 5), g.driver.peers[1].lanes[2].sent_through);
+                try testing.expectEqual(@as(u32, 0), g.driver.peers[1].lanes[2].gen_counter);
             },
-            else => try testing.expectEqual(@as(u64, 2), g.driver.peers[1].lanes[0].sent_through),
+            else => try testing.expectEqual(@as(u64, 2), g.driver.peers[1].lanes[2].sent_through),
         }
     }
 }
@@ -387,15 +387,15 @@ test "channel driver: an applied ack past what was sent is refused even when its
         g.driver.mutant = mutant;
         for (0..2) |_| try sim.probeFrom(g, 1);
         var buf: [64]u8 = undefined;
-        const ack = answerFrame(&buf, .{ .lane = 0, .gen_term = 1, .gen_counter = 0, .applied = 5, .durable = 1, .gap = 0, .status = 0, .pressure = .{ .bytes = "", .count = 0 } });
+        const ack = answerFrame(&buf, .{ .lane = 2, .gen_term = 1, .gen_counter = 0, .applied = 5, .durable = 1, .gap = 0, .status = 0, .pressure = .{ .bytes = "", .count = 0 } });
         g.driver.onFrame(1, ack, 1, .{ .store = &g.store }, 100, false, Sim.Io{ .sim = &sim, .me = 0 });
         switch (mutant) {
             .none => {
                 try testing.expectEqual(@as(u64, 1), g.driver.counts.acks_refused);
-                try testing.expectEqual(@as(u64, 0), g.driver.peers[1].lanes[0].applied_ack);
-                try testing.expectEqual(@as(u64, 0), g.driver.peers[1].lanes[0].durable_ack);
+                try testing.expectEqual(@as(u64, 0), g.driver.peers[1].lanes[2].applied_ack);
+                try testing.expectEqual(@as(u64, 0), g.driver.peers[1].lanes[2].durable_ack);
             },
-            else => try testing.expectEqual(@as(u64, 5), g.driver.peers[1].lanes[0].applied_ack),
+            else => try testing.expectEqual(@as(u64, 5), g.driver.peers[1].lanes[2].applied_ack),
         }
     }
 }
@@ -413,16 +413,16 @@ test "channel driver: an ack past what this group's state says was sent is refus
         for (0..2) |_| try sim.probeFrom(g, 1);
         var buf: [64]u8 = undefined;
         // Two were sent; a receiver claiming 5 applied and durable is wrong.
-        const ack = answerFrame(&buf, .{ .lane = 0, .gen_term = 1, .gen_counter = 0, .applied = 5, .durable = 5, .gap = 0, .status = 0, .pressure = .{ .bytes = "", .count = 0 } });
+        const ack = answerFrame(&buf, .{ .lane = 2, .gen_term = 1, .gen_counter = 0, .applied = 5, .durable = 5, .gap = 0, .status = 0, .pressure = .{ .bytes = "", .count = 0 } });
         g.driver.onFrame(1, ack, 1, .{ .store = &g.store }, 100, false, Sim.Io{ .sim = &sim, .me = 0 });
         switch (mutant) {
             .none => {
                 try testing.expectEqual(@as(u64, 1), g.driver.counts.acks_refused);
-                try testing.expectEqual(@as(u64, 0), g.driver.peers[1].lanes[0].durable_ack);
-                try testing.expectEqual(@as(u64, 0), g.driver.peers[1].lanes[0].applied_ack);
+                try testing.expectEqual(@as(u64, 0), g.driver.peers[1].lanes[2].durable_ack);
+                try testing.expectEqual(@as(u64, 0), g.driver.peers[1].lanes[2].applied_ack);
             },
             // Without the bound it would trim past what was sent.
-            else => try testing.expectEqual(@as(u64, 5), g.driver.peers[1].lanes[0].durable_ack),
+            else => try testing.expectEqual(@as(u64, 5), g.driver.peers[1].lanes[2].durable_ack),
         }
     }
 }
@@ -454,11 +454,21 @@ test "channel driver: past a target's parked cap its messages wait at their send
     try testing.expect(hasGot(b, "before-0000-0002"));
     try testing.expect(!hasGot(b, "behind-0000-0004"));
     try testing.expect(b.driver.counts.busy > 0);
-    // Its answers say why: a full target on b.
-    const said = a.driver.pressureOf(1, sim.now).?;
+    // Its answers say why: a full target on b. That holds only a's sink
+    // sends: its other lanes' sends to b are held by nothing.
+    const said = a.driver.pressureOf(1, .sink, sim.now).?;
     try testing.expectEqual(@as(u16, 1), said.shard);
     try testing.expectEqual(@as(u8, @backingInt(driver_mod.Cause.target_full)), said.cause);
-    try testing.expectEqual(@as(u64, 2), channels.inOf(.{ .store = &b.store }, 0, .main).?.applied);
+    try testing.expect(a.driver.pressureOf(1, .main, sim.now) == null);
+    try testing.expect(a.driver.pressureOf(1, .history, sim.now) == null);
+    try testing.expectEqual(@as(?driver_mod.Cause, null), a.driver.causeOf(1, .main, sim.now));
+    try sim.probeBody(a, 3, "unheld-00000001M");
+    for (0..200) |_| try sim.step();
+    try testing.expect(hasGot(b, "unheld-00000001M"));
+    // b's answers to it, on the main lane, name no full target either.
+    try testing.expect(a.driver.pressureOf(1, .main, sim.now) == null);
+    try testing.expect(a.driver.pressureOf(1, .sink, sim.now) != null);
+    try testing.expectEqual(@as(u64, 2), channels.inOf(.{ .store = &b.store }, 0, .sink).?.applied);
     // b drains slot 1 by its own channel; the unpark empties it, and the
     // rest go, in order.
     try sim.probeBody(b, 1, "drain-slot1-0002");
@@ -473,13 +483,13 @@ test "channel driver: past a target's parked cap its messages wait at their send
     // The sender's backoff grew while it was busy: up to 5 s.
     for (0..12_000) |_| try sim.step();
     try testing.expect(hasGot(b, "parked-0000-0001") and hasGot(b, "capped-0000-0003") and hasGot(b, "behind-0000-0004"));
-    try testing.expectEqual(@as(u64, 4), channels.inOf(.{ .store = &b.store }, 0, .main).?.applied);
+    try testing.expectEqual(@as(u64, 4), channels.inOf(.{ .store = &b.store }, 0, .sink).?.applied);
     // Taken: what holds a pipeline sending to b is gone, once no answer
     // carries it.
-    try testing.expect(a.driver.pressureOf(1, sim.now) == null);
+    try testing.expect(a.driver.pressureOf(1, .sink, sim.now) == null);
 }
 
-test "channel driver: a history message isn't held behind a sink's message its target is full for, on the same channel" {
+test "channel driver: a history or main message isn't held behind a sink's message its target is full for, on the same channel" {
     channels.test_parked_target_max = 1;
     defer channels.test_parked_target_max = null;
     var sim = try Sim.init(testing.allocator, 2, 37, .{});
@@ -495,15 +505,18 @@ test "channel driver: a history message isn't held behind a sink's message its t
     try sim.probeBody(b, 1, "parked-0000-0001");
     for (0..40) |_| try sim.step();
     try testing.expectEqual(@as(u64, 1), channels.targetParked(.{ .store = &b.store }, channelsTarget(1)).count);
-    // Over its cap: b's next message to slot 1 waits, and the one to slot 3
-    // behind it on the main lane; a history message to slot 3 goes.
+    // Over its cap: b's next message to slot 1 waits, and the sink's one to
+    // slot 3 behind it; a history message and a main one to slot 3 go.
     try sim.probeBody(b, 1, "capped-0000-0002");
     try sim.probeBody(b, 3, "behind-0000-0003");
     try sim.probeBody(b, 3, "hist-0000000000H");
+    try sim.probeBody(b, 3, "main-0000000000M");
     for (0..1000) |_| try sim.step();
     try testing.expect(hasGot(b, "hist-0000000000H"));
+    try testing.expect(hasGot(b, "main-0000000000M"));
     try testing.expect(!hasGot(b, "behind-0000-0003"));
-    try testing.expectEqual(@as(u64, 2), channels.inOf(.{ .store = &b.store }, 1, .main).?.applied);
+    try testing.expectEqual(@as(u64, 1), channels.inOf(.{ .store = &b.store }, 1, .main).?.applied);
+    try testing.expectEqual(@as(u64, 2), channels.inOf(.{ .store = &b.store }, 1, .sink).?.applied);
     try testing.expectEqual(@as(u64, 1), channels.inOf(.{ .store = &b.store }, 1, .history).?.applied);
     // And trimmed: nothing of it is left in b's outbox.
     try testing.expectEqual(@as(u64, 1), channels.metaOf(.{ .store = &b.store }, 1, .history).acked);
@@ -519,7 +532,7 @@ test "channel driver: a history message isn't held behind a sink's message its t
 /// An empty batch from `from`, as a probe is.
 fn emptyBatch(buf: []u8, term: u64) []const u8 {
     buf[0] = @backingInt(driver_mod.Kind.batch);
-    const body = driver_mod.Batch.encodeInto(buf[1..], .{ .lane = 0, .gen_term = term, .gen_counter = 0, .first_seq = 1, .messages = .{ .bytes = "", .count = 0 } }) catch unreachable;
+    const body = driver_mod.Batch.encodeInto(buf[1..], .{ .lane = 2, .gen_term = term, .gen_counter = 0, .first_seq = 1, .messages = .{ .bytes = "", .count = 0 } }) catch unreachable;
     return buf[0 .. 1 + body.len];
 }
 
@@ -549,27 +562,27 @@ test "channel driver: a sender keeps the pressure an answer carried, probes whil
     b.driver.own_cause = .cannot_flush;
     try sim.probeBody(a, 1, "pressure-0000-01");
     for (0..20) |_| try sim.step();
-    const said = a.driver.pressureOf(1, sim.now).?;
+    const said = a.driver.pressureOf(1, .sink, sim.now).?;
     try testing.expectEqual(@as(u16, 1), said.shard);
     try testing.expectEqual(@as(u8, @backingInt(driver_mod.Cause.cannot_flush)), said.cause);
     // Idle, it is kept fresh by probes, which b answers with it.
     for (0..1500) |_| try sim.step();
-    try testing.expect(a.driver.pressureOf(1, sim.now) != null);
-    try testing.expect(a.driver.peers[1].probe_ms > 0);
+    try testing.expect(a.driver.pressureOf(1, .sink, sim.now) != null);
+    try testing.expect(a.driver.peers[1].lanes[@backingInt(channels.Lane.sink)].probe_ms > 0);
     // Answers that carry none clear it.
     b.driver.own_cause = null;
     for (0..1500) |_| try sim.step();
-    try testing.expect(a.driver.pressureOf(1, sim.now) == null);
+    try testing.expect(a.driver.pressureOf(1, .sink, sim.now) == null);
     // An idle channel asks nothing, so learns none; the next message does,
     // and it lasts a second past the last answer that carried it.
     b.driver.own_cause = .cannot_flush;
     for (0..1500) |_| try sim.step();
-    try testing.expect(a.driver.pressureOf(1, sim.now) == null);
+    try testing.expect(a.driver.pressureOf(1, .sink, sim.now) == null);
     try sim.probeBody(a, 1, "pressure-0000-02");
     for (0..20) |_| try sim.step();
-    const at = a.driver.peers[1].pressure_ms;
-    try testing.expect(a.driver.pressureOf(1, at + driver_mod.PRESSURE_EXPIRY_MS - 1) != null);
-    try testing.expect(a.driver.pressureOf(1, at + driver_mod.PRESSURE_EXPIRY_MS) == null);
+    const at = a.driver.peers[1].lanes[@backingInt(channels.Lane.sink)].pressure_ms;
+    try testing.expect(a.driver.pressureOf(1, .sink, at + driver_mod.PRESSURE_EXPIRY_MS - 1) != null);
+    try testing.expect(a.driver.pressureOf(1, .sink, at + driver_mod.PRESSURE_EXPIRY_MS) == null);
 }
 
 test "channel driver: what a receiver proposed to a target and hasn't applied counts against its cap, so one batch can't pass it" {
@@ -591,7 +604,7 @@ test "channel driver: what a receiver proposed to a target and hasn't applied co
     try sim.step();
     var ok: [channels.OUT_KEY]u8 = undefined;
     const read_a: @import("view.zig").ReadView = .{ .store = &a.store };
-    const one = (try read_a.get(channels.OutFam, channels.outKey(&ok, 1, .main, 1))).?.v.payload.len;
+    const one = (try read_a.get(channels.OutFam, channels.outKey(&ok, 1, .sink, 1))).?.v.payload.len;
     // Room for two whole ones and part of a third: the third is the one
     // admitted below the cap.
     channels.test_parked_target_max = 2 * one + 1;

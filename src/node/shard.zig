@@ -1584,38 +1584,44 @@ pub const Shard = struct {
         log.err("shard {d}: a channel message from shard {d} was refused as that shard's bug ({s}): {s}; this is a bug in this build, not in the data", .{ self.id, m.from, @tagName(bug), why });
     }
 
-    /// What namespace `ns`'s messages hold of this shard's outboxes, over
-    /// every peer.
-    pub fn nsOutboxBytes(self: *Shard, ns: node_router.NamespaceId) u64 {
+    /// What namespace `ns`'s messages hold of this shard's outboxes on
+    /// `class`'s lanes, over every peer.
+    pub fn nsOutboxBytes(self: *Shard, class: channels_mod.Class, ns: node_router.NamespaceId) u64 {
         const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
         var n: u64 = 0;
-        for (0..self.channel.count) |to| n += channels_mod.nsBytesTo(read, @intCast(to), ns);
+        for (0..self.channel.count) |to| n += channels_mod.nsBytesTo(read, @intCast(to), class, ns);
         return n;
     }
 
-    /// Why a write for namespace `ns` that sends to shard `to` waits at this
-    /// leader's edge: pressure from `to`, its outbox's cap or the shard's,
-    /// or `ns`'s share of either. Writes are never refused at apply for an
-    /// outbox's sake, so each edge that sends checks this first, as a
-    /// pipeline does.
+    /// Why a write for namespace `ns` that sends to shard `to` on a lane
+    /// waits at this leader's edge: pressure from `to` on that lane, the
+    /// cap of its outbox or of all the shard's, or `ns`'s share of either,
+    /// each over the lane's class of outbox bytes alone (`channels.Class`).
+    /// Writes are never refused at apply for an outbox's sake, so each edge
+    /// that sends checks this first, as a pipeline does.
     pub const SendWait = union(enum) {
         pressure: channel_driver.Stall.Value,
         outbox: struct { to: ?u16, bytes: u64, cap: u64, cause: ?channel_driver.Cause = null },
         share: struct { to: ?u16, bytes: u64, cap: u64 },
     };
 
-    pub fn sendWait(self: *Shard, to: u16, ns: node_router.NamespaceId) ?SendWait {
+    /// `lane` is the lane the write's messages ride. Only that lane's
+    /// pressure holds it, and only its class's bytes (`channels.Class`):
+    /// a full sink target, and the sink bytes it holds back, hold no main
+    /// or history write, and a sink's write waits on the sink lane's alone.
+    pub fn sendWait(self: *Shard, to: u16, lane: channels_mod.Lane, ns: node_router.NamespaceId) ?SendWait {
         const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
-        const caps = self.outbox_caps;
+        const class = channels_mod.Class.of(lane);
+        const caps = self.outbox_caps.forClass(class);
         const now_ms = @import("stdx").time.monotonicMs();
-        const total = self.outboxBytes();
+        const total = self.outboxBytes(class);
         if (total >= caps.shard) return .{ .outbox = .{ .to = null, .bytes = total, .cap = caps.shard } };
-        const ns_total = self.nsOutboxBytes(ns);
+        const ns_total = self.nsOutboxBytes(class, ns);
         if (raft_node_mod.shareHeld(ns_total, total, caps.shard)) return .{ .share = .{ .to = null, .bytes = ns_total, .cap = caps.shard } };
-        if (self.channel.pressureOf(to, now_ms)) |stall| return .{ .pressure = stall };
-        const bytes = channels_mod.bytesTo(read, to);
-        if (bytes >= caps.channel) return .{ .outbox = .{ .to = to, .bytes = bytes, .cap = caps.channel, .cause = self.channel.causeOf(to, now_ms) } };
-        const held = channels_mod.nsBytesTo(read, to, ns);
+        if (self.channel.pressureOf(to, lane, now_ms)) |stall| return .{ .pressure = stall };
+        const bytes = channels_mod.bytesTo(read, to, class);
+        if (bytes >= caps.channel) return .{ .outbox = .{ .to = to, .bytes = bytes, .cap = caps.channel, .cause = self.channel.causeOf(to, lane, now_ms) } };
+        const held = channels_mod.nsBytesTo(read, to, class, ns);
         if (raft_node_mod.shareHeld(held, bytes, caps.channel)) return .{ .share = .{ .to = to, .bytes = held, .cap = caps.channel } };
         return null;
     }
@@ -1642,12 +1648,12 @@ pub const Shard = struct {
         };
     }
 
-    /// Payload bytes this shard's channel outboxes hold, over every
-    /// channel: what `outbox_caps.shard` bounds.
-    pub fn outboxBytes(self: *Shard) u64 {
+    /// Payload bytes this shard's channel outboxes hold on `class`'s
+    /// lanes, over every channel: what that class's shard cap bounds.
+    pub fn outboxBytes(self: *Shard, class: channels_mod.Class) u64 {
         const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
         var n: u64 = 0;
-        for (0..self.channel.count) |to| n += channels_mod.bytesTo(read, @intCast(to));
+        for (0..self.channel.count) |to| n += channels_mod.bytesTo(read, @intCast(to), class);
         return n;
     }
 
@@ -5962,7 +5968,7 @@ pub const Shard = struct {
                 for (self.channel.sender_bugs) |by_reason| n += by_reason[reason];
                 total.store(n, .monotonic);
             }
-            sm.channel_outbox_bytes.store(self.outboxBytes(), .monotonic);
+            sm.channel_outbox_bytes.store(self.outboxBytes(.other) + self.outboxBytes(.sink), .monotonic);
             for (std.enums.values(proto.Reason)) |k| {
                 var n: u64 = 0;
                 for (self.channel.sink_refusals) |by_reason| n += by_reason.get(k);
@@ -14368,7 +14374,7 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
     _ = try a.stream_handler.appendPayloadToStream(source, "default", "r0");
     two.settle();
     // One byte a channel: the first batch fills it.
-    a.outbox_caps = .{ .shard = 1 << 30, .channel = 1 };
+    a.outbox_caps = .{ .sink = .{ .shard = 1 << 30, .channel = 1 } };
     const c = try TestClient.open(a);
     defer _ = std.c.close(c.pair[1]);
     var yb: [128]u8 = undefined;
@@ -14377,7 +14383,7 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
     two.settle();
     try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
     const read: contract_view.ReadView = .{ .store = &a.defaultPartition().store };
-    const held = channels_mod.metaOf(read, 1, .main).bytes;
+    const held = channels_mod.metaOf(read, 1, .sink).bytes;
     try std.testing.expect(held > 0);
     _ = try a.stream_handler.appendPayloadToStream(source, "default", try std.fmt.bufPrint(&rb, "r{d}", .{1}));
     two.settle();
@@ -14385,6 +14391,11 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
     try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
     try std.testing.expectEqual(@as(?u16, 1), pipe.wait.outbox.to);
     try std.testing.expectEqual(held, pipe.wait.outbox.bytes);
+    // The sink's bytes are counted against the sink's caps alone: a main or
+    // history write to shard 1 isn't held by them, a sink's is.
+    try std.testing.expect(a.sendWait(1, .main, .default) == null);
+    try std.testing.expect(a.sendWait(1, .history, .default) == null);
+    try std.testing.expect(a.sendWait(1, .sink, .default).? == .outbox);
     {
         // A replica of shard 0, as a restart or a new leader holds it: the
         // same log, applied, holds the same outbox bytes.
@@ -14400,30 +14411,30 @@ test "Shard: a pipeline waits while its outbox to a sink's shard, or all its out
             var out = persistence_mod.Result.start(&e);
             try std.testing.expect(r.applyEntry(&e, &out));
         }
-        try std.testing.expectEqual(held, channels_mod.metaOf(.{ .store = &r.defaultPartition().store }, 1, .main).bytes);
-        try std.testing.expectEqual(held, r.outboxBytes());
+        try std.testing.expectEqual(held, channels_mod.metaOf(.{ .store = &r.defaultPartition().store }, 1, .sink).bytes);
+        try std.testing.expectEqual(held, r.outboxBytes(.sink));
     }
     const job = a.processing_handler.firstJob().?;
     var lb: [512]u8 = undefined;
     try std.testing.expectEqualStrings("waiting: the outbox to shard 1 is full (46 B of 1 B)", a.processing_handler.liveNote(&job, &lb).?);
     // Delivered, acked and trimmed: room again, and the next record goes.
     pumpChannels(&two);
-    try std.testing.expectEqual(@as(u64, 0), channels_mod.metaOf(read, 1, .main).bytes);
+    try std.testing.expectEqual(@as(u64, 0), channels_mod.metaOf(read, 1, .sink).bytes);
     tickNow(a, pipe);
     two.settle();
     try std.testing.expect(pipe.wait == .none);
     try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
     // The shard's cap, over all its outboxes, holds it the same way.
-    a.outbox_caps = .{ .shard = 1, .channel = 1 << 30 };
+    a.outbox_caps = .{ .sink = .{ .shard = 1, .channel = 1 << 30 } };
     _ = try a.stream_handler.appendPayloadToStream(source, "default", try std.fmt.bufPrint(&rb, "r{d}", .{2}));
     two.settle();
     tickNow(a, pipe);
     try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
     try std.testing.expectEqual(@as(?u16, null), pipe.wait.outbox.to);
     // Trims are spaced 100 ms apart; this one is due now.
-    a.channel.peers[1].lanes[0].last_trim_ms = 0;
+    a.channel.peers[1].lanes[@backingInt(channels_mod.Lane.sink)].last_trim_ms = 0;
     pumpChannels(&two);
-    try std.testing.expectEqual(@as(u64, 0), a.outboxBytes());
+    try std.testing.expectEqual(@as(u64, 0), a.outboxBytes(.sink));
     tickNow(a, pipe);
     two.settle();
     try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
@@ -14451,10 +14462,10 @@ test "Shard: a pipeline whose namespace holds three quarters of a channel's outb
     tickNow(a, pipe);
     two.settle();
     const read: contract_view.ReadView = .{ .store = &a.defaultPartition().store };
-    const held = channels_mod.nsBytesOf(read, 1, .main, .default);
-    try std.testing.expectEqual(channels_mod.metaOf(read, 1, .main).bytes, held);
+    const held = channels_mod.nsBytesOf(read, 1, .sink, .default);
+    try std.testing.expectEqual(channels_mod.metaOf(read, 1, .sink).bytes, held);
     // A cap the outbox is under, but whose three quarters the namespace holds.
-    a.outbox_caps = .{ .shard = 1 << 30, .channel = held + held / 4 + 1 };
+    a.outbox_caps = .{ .sink = .{ .shard = 1 << 30, .channel = held + held / 4 + 1 } };
     _ = try a.stream_handler.appendPayloadToStream(source, "default", "r1");
     two.settle();
     tickNow(a, pipe);
@@ -14462,9 +14473,9 @@ test "Shard: a pipeline whose namespace holds three quarters of a channel's outb
     try std.testing.expectEqual(@as(?u16, 1), pipe.wait.share.to);
     try std.testing.expectEqual(held, pipe.wait.share.bytes);
     // Taken and trimmed: its share is free, and it reads on.
-    a.channel.peers[1].lanes[0].last_trim_ms = 0;
+    a.channel.peers[1].lanes[2].last_trim_ms = 0;
     pumpChannels(&two);
-    try std.testing.expectEqual(@as(u64, 0), channels_mod.nsBytesOf(read, 1, .main, .default));
+    try std.testing.expectEqual(@as(u64, 0), channels_mod.nsBytesOf(read, 1, .sink, .default));
     tickNow(a, pipe);
     two.settle();
     try std.testing.expect(pipe.wait == .none);
@@ -14497,7 +14508,7 @@ test "Shard: a namespace holding three quarters of all this shard's outboxes wai
     tickNow(a, pipelineOf(a, "default"));
     two.settle();
     const read: contract_view.ReadView = .{ .store = &a.defaultPartition().store };
-    const held = channels_mod.nsBytesOf(read, 1, .main, .default);
+    const held = channels_mod.nsBytesOf(read, 1, .sink, .default);
     try std.testing.expect(held > 0);
     // A second job, in its own namespace, reading the same stream.
     var ybuf: [256]u8 = undefined;
@@ -14516,7 +14527,7 @@ test "Shard: a namespace holding three quarters of all this shard's outboxes wai
     two.settle();
     // Each channel has room, and so do the outboxes together; but the
     // default namespace holds three quarters of the shard's cap.
-    a.outbox_caps = .{ .shard = held + held / 4 + 1, .channel = 1 << 30 };
+    a.outbox_caps = .{ .sink = .{ .shard = held + held / 4 + 1, .channel = 1 << 30 } };
     _ = try a.stream_handler.appendPayloadToStream(source, "default", "r1");
     two.settle();
     tickNow(a, pipelineOf(a, "default"));
@@ -14549,7 +14560,7 @@ test "Shard: pressure that arrived as a send-only shard's outbox emptied still e
     const pipe = try sinkJob(&two, c, source, try std.fmt.bufPrint(&yb, "  - name: out\n    queue: {{ name: {s} }}", .{q.name}));
     tickNow(a, pipe);
     two.settle();
-    a.channel.peers[1].lanes[0].last_trim_ms = 0;
+    a.channel.peers[1].lanes[@backingInt(channels_mod.Lane.sink)].last_trim_ms = 0;
     pumpChannels(&two);
     // Everything sent is taken and trimmed: nothing left for a's channels.
     const fams = &a.defaultPartition().store.families;
@@ -14558,13 +14569,17 @@ test "Shard: pressure that arrived as a send-only shard's outbox emptied still e
     // Time is set, not waited for: each phase stamps the pressure as of
     // the clock it is read against.
     if (Shard.nowMs() <= 2 * channel_driver.PRESSURE_EXPIRY_MS) return error.SkipZigTest;
-    const p = &a.channel.peers[1];
+    const p = &a.channel.peers[1].lanes[@backingInt(channels_mod.Lane.sink)];
     p.pressure[0] = .{ .shard = 1, .cause = @backingInt(channel_driver.Cause.halted) };
     p.pressure_len = 1;
     p.probe_ms = 0;
     _ = try a.stream_handler.appendPayloadToStream(source, "default", "r1");
     two.settle();
     p.pressure_ms = Shard.nowMs();
+    // It holds a's sink sends to shard 1, and no other lane's.
+    try std.testing.expect(a.sendWait(1, .sink, .default) != null);
+    try std.testing.expect(a.sendWait(1, .main, .default) == null);
+    try std.testing.expect(a.sendWait(1, .history, .default) == null);
     tickNow(a, pipe);
     try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
     try std.testing.expect(pipe.wait == .pressure);
@@ -22943,7 +22958,7 @@ test "queues: a dequeue waiting on a queue is answered when a sink's enqueue par
     var w: schema.Writer = .{ .buf = &mb };
     try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, "q"))), .entry_type = @backingInt(entry_mod.EntryType.queue_enqueue), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = try oneSlotEnqueue(&eb, "q", "parked") });
     var ib: [1024]u8 = undefined;
-    _ = try s.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } }));
+    _ = try s.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = @backingInt(channels_mod.Lane.sink), .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } }));
     try std.testing.expect(s.applyCommitted());
     const st = &s.defaultPartition().store;
     try std.testing.expectEqual(@as(u64, 1), channels_mod.shardParked(.{ .store = st }).count);
@@ -27007,7 +27022,7 @@ test "Shard: a second skip of an inbound's halt, committed with the first, skips
             try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, key[ns_table.DEFAULT.bytes().len..]))), .entry_type = @backingInt(entry_mod.EntryType.kv_put), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = put });
         }
         var ib: [2048]u8 = undefined;
-        h = (try shard.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 1, .lane = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 3 } }))).index;
+        h = (try shard.raft_node.propose(.channel_inbound, entry_mod.Flags.NONE, try ce.Inbound.encodeInto(&ib, .{ .from = 1, .lane = @backingInt(channels_mod.Lane.sink), .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 3 } }))).index;
         try std.testing.expect(!shard.applyCommitted());
         try std.testing.expectEqual(@as(u64, 1), shard.halted.?.message.?.seq);
         const kv_before = shard.kv_handler.kv.countLive();
@@ -27021,7 +27036,7 @@ test "Shard: a second skip of an inbound's halt, committed with the first, skips
         // The first took it past; the second skipped nothing.
         try std.testing.expectEqual(@as(usize, 1), shard.skips.named.items.len);
         try std.testing.expectEqual(kv_before + 2, shard.kv_handler.kv.countLive());
-        try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1, .main).?.applied);
+        try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1, .sink).?.applied);
         live = SkipState.of(&shard, h);
         try shard.flushSegmentToDisk();
     }
@@ -27031,7 +27046,7 @@ test "Shard: a second skip of an inbound's halt, committed with the first, skips
     try std.testing.expect(shard.halted == null and shard.offline == null);
     try std.testing.expectEqual(@as(usize, 1), shard.skips.named.items.len);
     try std.testing.expectEqual(live, SkipState.of(&shard, h));
-    try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1, .main).?.applied);
+    try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(.{ .store = &shard.defaultPartition().store }, 1, .sink).?.applied);
 }
 
 test "Shard: a second skip of an inbound's halt doesn't take it past the next message that halts it" {
@@ -31473,12 +31488,12 @@ test "Shard: a sink's enqueue naming a namespace id none could have is refused a
         try ce.Message.encode(&w, .{ .slot = q.slot, .entry_type = @backingInt(entry_mod.EntryType.queue_enqueue), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = enq });
     }
     var ib: [2048]u8 = undefined;
-    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
+    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = @backingInt(channels_mod.Lane.sink), .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
     const e = entry_mod.buildEntry(.channel_inbound, 0, b.raft_node.current_term, b.raft_node.last_applied + 1, 1, inbound);
     var out = persistence_mod.Result.start(&e);
     try std.testing.expect(b.applyEntry(&e, &out));
     const read: contract_view.ReadView = .{ .store = &b.defaultPartition().store };
-    try std.testing.expectEqual(@as(u64, 2), channels_mod.inOf(read, 0, .main).?.applied);
+    try std.testing.expectEqual(@as(u64, 2), channels_mod.inOf(read, 0, .sink).?.applied);
     try std.testing.expectEqual(@as(u64, 2), b.channel.sender_bugs[0][@backingInt(contract_store.SenderBug.bad_payload)]);
     try std.testing.expectEqual(@as(u64, 0), channels_mod.shardParked(read).count);
 }
@@ -31508,7 +31523,7 @@ test "Shard: a sink's write its target refuses for good is counted by the shard 
         try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, key))), .entry_type = @backingInt(entry_mod.EntryType.kv_put), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = put });
     }
     var ib: [2048]u8 = undefined;
-    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
+    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = @backingInt(channels_mod.Lane.sink), .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 2 } });
     const e = entry_mod.buildEntry(.channel_inbound, 0, b.raft_node.current_term, b.raft_node.last_applied + 1, 1, inbound);
     var out = persistence_mod.Result.start(&e);
     try std.testing.expect(b.applyEntry(&e, &out));
@@ -31543,7 +31558,7 @@ test "Shard: a stream append a channel carries to a new stream makes its stream.
     const append = entry_mod.buildCommandEntry(.stream_append, 0, 1, 1, 0, .default, name, "\x00\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00x\x00\x00", &cb).?.payload;
     try ce.Message.encode(&w, .{ .slot = @intCast(node_router.slot(node_router.routeNsKey(.default, name))), .entry_type = @backingInt(entry_mod.EntryType.stream_append), .layout_epoch = 0, .flags = entry_mod.Flags.SINK, .origin_kind = TEST_USER, .origin_ns = TEST_DEFAULT_NS, .payload = append });
     var ib: [1024]u8 = undefined;
-    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = 0, .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } });
+    const inbound = try ce.Inbound.encodeInto(&ib, .{ .from = 0, .lane = @backingInt(channels_mod.Lane.sink), .first_seq = 1, .messages = .{ .bytes = w.written(), .count = 1 } });
     const e = entry_mod.buildEntry(.channel_inbound, 0, b.raft_node.current_term, b.raft_node.last_applied + 1, 1, inbound);
     var out = persistence_mod.Result.start(&e);
     try std.testing.expect(b.applyEntry(&e, &out));
@@ -31678,7 +31693,9 @@ test "Shard: a sink's enqueues to a full queue on another shard park, a KV write
     pumpChannels(&two);
 
     const read: contract_view.ReadView = .{ .store = &b.defaultPartition().store };
-    try std.testing.expectEqual(@as(u64, 4), channels_mod.inOf(read, 0, .main).?.applied);
+    // The sink's three on the sink lane, the KV write on the main lane.
+    try std.testing.expectEqual(@as(u64, 3), channels_mod.inOf(read, 0, .sink).?.applied);
+    try std.testing.expectEqual(@as(u64, 1), channels_mod.inOf(read, 0, .main).?.applied);
     try std.testing.expectEqualStrings("v", b.kv_handler.kv.getIn(.default, key).?.value);
     try std.testing.expectEqual(@as(u64, 2), channels_mod.shardParked(read).count);
     var bodies: [8][]const u8 = undefined;
@@ -31696,7 +31713,8 @@ test "Shard: a sink's enqueues to a full queue on another shard park, a KV write
     try std.testing.expectEqual(@as(u64, 1), sm.channel_parked_targets.load(.monotonic));
     // The sender's outbox is trimmed: parked, the messages are the
     // receiver's to keep.
-    try std.testing.expectEqual(@as(u64, 4), channels_mod.metaOf(.{ .store = &a.defaultPartition().store }, 1, .main).acked);
+    try std.testing.expectEqual(@as(u64, 3), channels_mod.metaOf(.{ .store = &a.defaultPartition().store }, 1, .sink).acked);
+    try std.testing.expectEqual(@as(u64, 1), channels_mod.metaOf(.{ .store = &a.defaultPartition().store }, 1, .main).acked);
 
     // Room for one: the next parked message, and only it.
     try purgeQueue(b, q.name);
@@ -32617,7 +32635,7 @@ test "Shard: a worker's complete of a run a step called is refused while the cal
     two.settle();
     const task = (try ActionsHandler.for_tests.task((try nextAnswer(c, b, &out)).data)).?;
     // No room on b's outboxes: its end can't be sent, so it isn't made.
-    b.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    b.outbox_caps = .{ .other = .{ .shard = 0, .channel = 1 << 30 } };
     var done: [512]u8 = undefined;
     const body = try ActionsHandler.for_tests.completeBody(&done, task, "w", "", "{}");
     b.runRequest(c.conn, try ParkTest.request(.action_complete, 32, proto.DEFAULT_NAMESPACE, task.run, body, ""), .client);
@@ -32656,7 +32674,7 @@ test "actions: an expire that would end a run a step called waits while the call
     _ = actions.expireDue(&t.shard);
     actions.duty_since_ns = 0;
     // No room: only the client's run's lease is ended.
-    t.shard.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    t.shard.outbox_caps = .{ .other = .{ .shard = 0, .channel = 1 << 30 } };
     try std.testing.expectEqual(@as(u64, 1), actions.expireDue(&t.shard));
     try ParkTest.ack(&t.shard);
     try std.testing.expectEqual(action_machine.Status.timed_out, ActionsHandler.for_tests.run(&t.shard, .default, "r2").?.status);
@@ -32763,7 +32781,7 @@ test "Shard: a worker's fail that ends a run a step called is refused while the 
     b.runRequest(c.conn, try ParkTest.request(.action_await, 31, proto.DEFAULT_NAMESPACE, "w", try ActionsHandler.for_tests.awaitBody(&aw, &.{n.action}, 0, null), ""), .client);
     two.settle();
     const task = (try ActionsHandler.for_tests.task((try nextAnswer(c, b, &out)).data)).?;
-    b.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    b.outbox_caps = .{ .other = .{ .shard = 0, .channel = 1 << 30 } };
     var fb: [512]u8 = undefined;
     // A fail with no retry ends the run: refused.
     b.runRequest(c.conn, try ParkTest.request(.action_fail, 32, proto.DEFAULT_NAMESPACE, task.run, try ActionsHandler.for_tests.failBody(&fb, task, "w", false, "boom"), ""), .client);
@@ -32790,7 +32808,7 @@ test "Shard: a task handed back to another shard's run past the outbox caps is d
     var wb: [16]u8 = undefined;
     const n = try callNames(&two, 1, 0, &ab, &wb);
     const task: action_ops_mod.Task.Value = .{ .run = "r-x", .namespace = "default", .deliveries = 1, .term = 1, .index = 5, .action = n.action, .created_at_ms = 0, .attempt = 1, .lease_ms = 5000, .caller_run = null, .caller_workflow = null, .input = "" };
-    a.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    a.outbox_caps = .{ .other = .{ .shard = 0, .channel = 1 << 30 } };
     const before = a.raft_node.log.lastIndex();
     a.actions_handler.handBack(a, .default, "", task);
     try std.testing.expectEqual(before, a.raft_node.log.lastIndex());
@@ -32819,7 +32837,7 @@ test "actions: a called run's lease isn't ended on any attempt while its end has
     const actions = t.shard.actions_handler;
     _ = actions.expireDue(&t.shard);
     actions.duty_since_ns = 0;
-    t.shard.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    t.shard.outbox_caps = .{ .other = .{ .shard = 0, .channel = 1 << 30 } };
     try std.testing.expectEqual(@as(u64, 0), actions.expireDue(&t.shard));
     try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(&t.shard, .default, "r1").?.status);
     try std.testing.expectEqual(@as(u64, 1), metrics.workflow.action_expires_held.load(.monotonic));
@@ -32875,7 +32893,7 @@ test "actions: more held leases than one expire pass looks at don't keep an ordi
     _ = actions.expireDue(&t.shard);
     actions.duty_since_ns = 0;
     // No room for any called run's end.
-    t.shard.outbox_caps = .{ .shard = 0, .channel = 1 << 30 };
+    t.shard.outbox_caps = .{ .other = .{ .shard = 0, .channel = 1 << 30 } };
     var passes: usize = 0;
     while (passes < 4 and ActionsHandler.for_tests.run(&t.shard, .default, "plain").?.status == .leased) : (passes += 1) {
         _ = actions.expireDue(&t.shard);
@@ -33034,7 +33052,7 @@ test "Shard: a child's end waits while its own parent's outbox is full, and anot
         two.shards[1].channel.peers[1].lanes[0].last_trim_ms = 0;
         _ = b.applyCommitted();
     }
-    b.outbox_caps = .{ .shard = 1 << 30, .channel = 1 };
+    b.outbox_caps = .{ .other = .{ .shard = 1 << 30, .channel = 1 } };
     const rd: contract_view.ReadView = .{ .store = &b.defaultPartition().store };
     try std.testing.expect(channels_mod.metaOf(rd, 0, .main).bytes > 0);
     try std.testing.expectEqual(@as(u64, 0), channels_mod.metaOf(rd, 1, .main).bytes);
