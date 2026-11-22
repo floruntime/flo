@@ -96,6 +96,16 @@ pub const HIST_CHUNK: usize = 4 << 10;
 pub const OUTPUT_PREVIEW: usize = 1024;
 pub const OUTPUT_EVENT = "workflow_output";
 
+comptime {
+    // A chunk holds at most a full pending chunk, or one event alone: an
+    // event that wouldn't fit beside the pending ones is sent after them,
+    // by itself. One event's type and detail come from one entry, its
+    // output's too, so the largest is an entry's payload and the record's
+    // seq, lengths and stamp.
+    const largest_event = MAX_PERSIST_PAYLOAD + 8 + 4 + 4 + 8;
+    std.debug.assert(he.MAX_CHUNK_RECORDS >= @max(HIST_CHUNK, largest_event));
+}
+
 pub const Run = Record(&.{
     .{ .name = "workflow", .T = Bytes(MAX_PERSIST_PAYLOAD) },
     .{ .name = "version", .T = Bytes(MAX_PERSIST_PAYLOAD) },
@@ -1259,7 +1269,7 @@ const Fixture = struct {
     }
 
     fn command(f: *Fixture, t: EntryType, key: []const u8, value: []const u8, stamp_ms: u64) !Result {
-        var pbuf: [4096]u8 = undefined;
+        var pbuf: [MAX_PERSIST_PAYLOAD]u8 = undefined;
         f.index += 1;
         const e = entry_mod.buildCommandEntry(t, entry_mod.Flags.NONE, 1, f.index, stamp_ms * std.time.ns_per_ms, .default, key, value, &pbuf).?;
         return run(if (t == .workflow_create or t == .workflow_enabled) &defs_machine.machine else &machine, f, &e);
@@ -1519,6 +1529,31 @@ test "workflow runs machine: a step, a signal or a completion for a run not ther
     try testing.expect((try f.command(.workflow_signal, view_mod.idKey(&kb, .default, "gone") catch unreachable, sig, 5)).refused() != null);
     try testing.expectEqual(sent, (try f.chunks()).len);
     try testing.expect(f.get("gone") == null);
+}
+
+test "workflow runs machine: a run's largest output, an entry's whole payload, goes to its history in one chunk" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    // Some events pending, then the largest completion an entry holds.
+    try testing.expect((try f.step("r1", .{ .rev = 0, .events = 40 })).refused() == null);
+    const room = MAX_PERSIST_PAYLOAD - entry_mod.COMMAND_PREFIX_SIZE - 4 - 2;
+    const fixed = (Complete{ .status = .completed, .output = "", .event = "workflow_completed", .detail = "", .workflow = "wf" }).size();
+    const ob = try testing.allocator.alloc(u8, room - fixed);
+    defer testing.allocator.free(ob);
+    @memset(ob, 'o');
+    const vb = try testing.allocator.alloc(u8, room);
+    defer testing.allocator.free(vb);
+    const value = (Complete{ .status = .completed, .output = ob, .event = "workflow_completed", .detail = "", .workflow = "wf" }).encode(vb).?;
+    try testing.expect((try f.complete("r1", value, 9)).refused() == null);
+    const run = f.get("r1").?;
+    try testing.expect(run.output_truncated);
+    var whole = false;
+    for (try f.chunks()) |c| {
+        try testing.expect(c.records.len <= he.MAX_CHUNK_RECORDS);
+        whole = whole or std.mem.indexOf(u8, c.records, ob) != null;
+    }
+    try testing.expect(whole);
 }
 
 test "workflow runs machine: an ended run keeps a summary: a preview of its output, its whole output sent, no input, tags or step outputs" {

@@ -1648,7 +1648,10 @@ pub const StreamHandler = struct {
     /// walks: oldest first, or newest first. Rows sort by where they landed,
     /// which isn't their seqs' order: a fold lands after chunks that were
     /// on the lane ahead of it, and lists rows as they sorted. A run's rows
-    /// cover seqs that don't overlap, so their first seqs order them.
+    /// cover seqs that don't overlap, so their first seqs order them: its
+    /// producer sends each chunk from where the last ended (its
+    /// `hist_flushed`), a lost row covers its skipped chunk's, and a fold
+    /// covers the rows it lists, which it deletes.
     fn pushWalked(a: Allocator, stack: *std.ArrayListUnmanaged(history_entries.Locator.Value), rows: []const history_entries.Locator.Value, newest_first: bool) error{OutOfMemory}!void {
         const sorted = try a.dupe(history_entries.Locator.Value, rows);
         std.mem.sort(history_entries.Locator.Value, sorted, {}, struct {
