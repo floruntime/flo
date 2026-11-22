@@ -529,6 +529,50 @@ test "channel driver: a history or main message isn't held behind a sink's messa
     try testing.expect(sim.settled());
 }
 
+var over_share = false;
+
+fn shareOfAHundred(_: view_mod.ReadView) ?channels.Budget {
+    return .{ .use = if (over_share) 200 else 0, .share = 100 };
+}
+
+test "channel driver: while its shard is over its share a sink's messages wait at their sender, say why, and go once use falls" {
+    channels.test_budget = shareOfAHundred;
+    defer channels.test_budget = null;
+    over_share = true;
+    defer over_share = false;
+    var sim = try Sim.init(testing.allocator, 2, 37, .{});
+    defer sim.deinit();
+    for (sim.groups) |*g| {
+        g.driver.admits = Probed.admits;
+        g.driver.sink_target = Probed.sinkTarget;
+    }
+    const a = &sim.groups[0];
+    const b = &sim.groups[1];
+    try sim.probeBody(a, 1, "held-00000000001");
+    for (0..1000) |_| try sim.step();
+    try testing.expect(!hasGot(b, "held-00000000001"));
+    try testing.expect(b.driver.counts.over_share > 0);
+    try testing.expectEqual(@as(u64, 0), b.driver.sink_bytes);
+    const said = a.driver.pressureOf(1, .sink, sim.now).?;
+    try testing.expectEqual(@as(u16, 1), said.shard);
+    try testing.expectEqual(@as(u8, @backingInt(driver_mod.Cause.over_share)), said.cause);
+    // It holds only a's sink sends: a main message from a to b goes
+    // meanwhile, and b's answers on the main lane name nothing.
+    try sim.probeBody(a, 1, "unheld-00000001M");
+    for (0..200) |_| try sim.step();
+    try testing.expect(hasGot(b, "unheld-00000001M"));
+    try testing.expect(!hasGot(b, "held-00000000001"));
+    try testing.expect(a.driver.pressureOf(1, .main, sim.now) == null);
+    try testing.expect(a.driver.pressureOf(1, .history, sim.now) == null);
+    try testing.expect(a.driver.pressureOf(1, .sink, sim.now) != null);
+    // Use falls: the sender's next resend is taken, and applied releases it.
+    over_share = false;
+    for (0..12_000) |_| try sim.step();
+    try testing.expect(hasGot(b, "held-00000000001"));
+    try testing.expectEqual(@as(u64, 0), b.driver.sink_bytes);
+    try testing.expect(a.driver.pressureOf(1, .sink, sim.now) == null);
+}
+
 /// An empty batch from `from`, as a probe is.
 fn emptyBatch(buf: []u8, term: u64) []const u8 {
     buf[0] = @backingInt(driver_mod.Kind.batch);
@@ -613,7 +657,7 @@ test "channel driver: what a receiver proposed to a target and hasn't applied co
     try testing.expectEqual(@as(u64, 3), channels.targetParked(.{ .store = &b.store }, channelsTarget(1)).count);
     try testing.expect(!hasGot(b, "inflight-0000-04"));
     // Applied, none is still counted in flight.
-    try testing.expectEqual(@as(u64, 0), b.driver.inFlight(channelsTarget(1)).target);
+    try testing.expectEqual(@as(u64, 0), b.driver.inFlight(0, channelsTarget(1)).target);
     try testing.expectEqual(@as(u64, 0), b.driver.in_flight_bytes);
 }
 

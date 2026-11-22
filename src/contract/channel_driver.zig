@@ -21,6 +21,7 @@
 //!   never a field of the frame: one group can't answer for another.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const schema = @import("../protocol/schema.zig");
 const ce = @import("../protocol/channel_entries.zig");
 const channels = @import("channels.zig");
@@ -98,6 +99,9 @@ pub const Cause = enum(u8) {
     cannot_flush = 3,
     /// A target on the named shard is past what it parks.
     target_full = 4,
+    /// The named shard is over its memory share: a sink's writes wait
+    /// until its use falls.
+    over_share = 5,
 };
 
 /// One shard writes are queued behind, and why.
@@ -126,6 +130,7 @@ pub fn causeWords(cause: Cause) []const u8 {
         .no_leader => std.fmt.comptimePrint("hasn't answered for {d} s", .{NO_LEADER_MS / std.time.ms_per_s}),
         .cannot_flush => "cannot flush to disk",
         .target_full => "has a full target",
+        .over_share => "is over its memory share",
     };
 }
 
@@ -192,7 +197,8 @@ fn encodeFrame(buf: []u8, comptime kind: Kind, v: anytype) ?[]const u8 {
 
 pub const SinkRefusals = std.EnumArray(@import("../protocol/reason.zig").Reason, u64);
 
-const InFlightMessage = struct { seq: u64, target: channels.Target, bytes: u64 };
+/// A sink's message in flight; `target` is null for one that never parks.
+const InFlightMessage = struct { seq: u64, target: ?channels.Target, bytes: u64 };
 
 const Lane = channels.Lane;
 const LANES = channels.LANES;
@@ -232,9 +238,10 @@ const Peer = struct {
     lanes: [LANES]LaneState = @splat(.{}),
     /// When it last answered this leader.
     answered_ms: u64 = 0,
-    /// Its sink messages proposed and not yet applied that may park, in
-    /// seq order: what `Driver.target_bytes` counts. Only the sink lane's:
-    /// no other message parks.
+    /// Its sink messages proposed and not yet applied, in seq order: what
+    /// `Driver.sink_bytes` counts, and, of those that may park,
+    /// `Driver.target_bytes`. Only the sink lane's: no other message is a
+    /// sink's.
     in_flight: std.ArrayListUnmanaged(InFlightMessage) = .empty,
     /// This shard's parked bytes when a target over its cap last refused
     /// its batch, or null: while they are no fewer, every answer to it,
@@ -242,6 +249,12 @@ const Peer = struct {
     /// totals, so a refusal is named until an unpark frees room, never by
     /// a clock.
     refused_parked: ?u64 = null,
+    /// This shard's use when its share last held its batch, or null: while
+    /// use is no lower, every answer to it says the shard is over share.
+    refused_use: ?u64 = null,
+    /// Its sink messages' bytes in `in_flight`: what its own cap holds
+    /// (`channels.sinkInFlightCap`).
+    sink_bytes: u64 = 0,
 
     fn lane(p: *Peer, l: Lane) *LaneState {
         return &p.lanes[@backingInt(l)];
@@ -255,6 +268,8 @@ pub const Counts = struct {
     gaps: u64 = 0,
     inbound_proposed: u64 = 0,
     busy: u64 = 0,
+    /// Batches whose sink messages its shard's share held back.
+    over_share: u64 = 0,
     /// Answers that said what writes through this group are queued behind.
     pressured: u64 = 0,
     trims_proposed: u64 = 0,
@@ -295,6 +310,14 @@ pub const Mutant = enum {
     /// Never release what was proposed once it applies: its target's
     /// in-flight bytes only grow, until it refuses everything.
     leak_in_flight,
+    /// Never release a sink's message with no target from the sink bytes in
+    /// flight.
+    sink_untargeted_leaked,
+    /// Keep the sink bytes in flight across a new term.
+    sink_in_flight_kept_on_reset,
+    /// Hold a sink's message to its share only when it has a target
+    /// (`channels.mutant_sink_gate_after_no_target`).
+    sink_gate_after_no_target,
 };
 
 pub const Driver = struct {
@@ -306,7 +329,7 @@ pub const Driver = struct {
     peers: []Peer,
     /// Whether this group takes a message in now, given what it has
     /// taken and not yet applied (`Channels.admits`); null takes every one.
-    admits: ?*const fn (read: ReadView, m: ce.Message.Value, in_flight: channels.InFlight) bool = null,
+    admits: ?*const fn (read: ReadView, m: ce.Message.Value, in_flight: channels.InFlight) channels.Admit = null,
     /// The target a sink's message may park under (`Channels.sinkTarget`),
     /// so what this leader proposed to it and hasn't applied counts
     /// against its cap; null when nothing parks.
@@ -317,6 +340,10 @@ pub const Driver = struct {
     /// never read by apply.
     target_bytes: std.AutoHashMapUnmanaged(channels.Target, u64) = .empty,
     in_flight_bytes: u64 = 0,
+    /// Every sink's message bytes this leader proposed and its log hasn't
+    /// applied, parking or not: what a sink is admitted against beside the
+    /// shard's use (`channels.sinkRoom`).
+    sink_bytes: u64 = 0,
     counts: Counts = .{},
     /// Rewrites a message before this leader logs it, or null to log it as
     /// it came: a sink's enqueue takes this node's queue caps, as its own
@@ -445,15 +472,16 @@ pub const Driver = struct {
         }
         self.target_bytes.clearRetainingCapacity();
         self.in_flight_bytes = 0;
+        if (self.mutant != .sink_in_flight_kept_on_reset) self.sink_bytes = 0;
         self.started_ms = 0;
         self.quiet = false;
     }
 
     /// What a sink's messages to `target` this leader proposed and hasn't
-    /// applied take, and all of them.
-    pub fn inFlight(self: *const Driver, target: ?channels.Target) channels.InFlight {
+    /// applied take, and all of them, and of those `from` sent.
+    pub fn inFlight(self: *const Driver, from: u16, target: ?channels.Target) channels.InFlight {
         const t = if (target) |x| self.target_bytes.get(x) orelse 0 else 0;
-        return .{ .target = t, .total = self.in_flight_bytes };
+        return .{ .target = t, .total = self.in_flight_bytes, .sink = self.sink_bytes, .sink_own = self.peers[from].sink_bytes, .senders = self.count };
     }
 
     /// `from`'s messages through `applied` have applied: no longer in flight.
@@ -463,44 +491,70 @@ pub const Driver = struct {
         var gone: usize = 0;
         for (p.in_flight.items) |m| {
             if (m.seq > applied) break;
-            self.forget(m);
+            self.forget(from, m);
             gone += 1;
         }
         if (gone == 0) return;
         const rest = p.in_flight.items.len - gone;
         std.mem.copyForwards(InFlightMessage, p.in_flight.items[0..rest], p.in_flight.items[gone..]);
         p.in_flight.shrinkRetainingCapacity(rest);
+        self.assertSinkBytes();
     }
 
-    fn forget(self: *Driver, m: InFlightMessage) void {
+    fn forget(self: *Driver, from: u16, m: InFlightMessage) void {
+        if (!(self.mutant == .sink_untargeted_leaked and m.target == null)) {
+            self.sink_bytes -= m.bytes;
+            self.peers[from].sink_bytes -= m.bytes;
+        }
+        const t = m.target orelse return;
         self.in_flight_bytes -= m.bytes;
-        const e = self.target_bytes.getPtr(m.target).?;
+        const e = self.target_bytes.getPtr(t).?;
         e.* -= m.bytes;
-        if (e.* == 0) _ = self.target_bytes.remove(m.target);
+        if (e.* == 0) _ = self.target_bytes.remove(t);
     }
 
-    /// Counts `m` in flight to `target`; false out of memory, when it
-    /// must not be proposed.
-    fn track(self: *Driver, from: u16, seq: u64, target: channels.Target, bytes: u64) bool {
+    /// `sink_bytes` is what every peer's list holds, and each peer's what
+    /// its own does: none counted twice or missed. A walk of every message
+    /// in flight, so debug builds only.
+    fn assertSinkBytes(self: *const Driver) void {
+        if (builtin.mode != .debug or self.mutant != .none) return;
+        var sum: u64 = 0;
+        for (self.peers) |*p| {
+            var own: u64 = 0;
+            for (p.in_flight.items) |m| own += m.bytes;
+            std.debug.assert(own == p.sink_bytes);
+            sum += own;
+        }
+        std.debug.assert(sum == self.sink_bytes);
+    }
+
+    /// Counts a sink's message in flight, to `target` if it may park;
+    /// false out of memory, when it must not be proposed.
+    fn track(self: *Driver, from: u16, seq: u64, target: ?channels.Target, bytes: u64) bool {
         const p = &self.peers[from];
         p.in_flight.append(self.allocator, .{ .seq = seq, .target = target, .bytes = bytes }) catch return false;
-        const e = self.target_bytes.getOrPut(self.allocator, target) catch {
-            _ = p.in_flight.pop();
-            return false;
-        };
-        if (!e.found_existing) e.value_ptr.* = 0;
-        e.value_ptr.* += bytes;
-        self.in_flight_bytes += bytes;
+        if (target) |t| {
+            const e = self.target_bytes.getOrPut(self.allocator, t) catch {
+                _ = p.in_flight.pop();
+                return false;
+            };
+            if (!e.found_existing) e.value_ptr.* = 0;
+            e.value_ptr.* += bytes;
+            self.in_flight_bytes += bytes;
+        }
+        self.sink_bytes += bytes;
+        p.sink_bytes += bytes;
         return true;
     }
 
     /// Takes back what `track` counted for `from` past `seq`: a batch
     /// whose inbound wasn't proposed.
     fn untrackAfter(self: *Driver, from: u16, lane: Lane, seq: u64) void {
-        // Only the sink lane's messages park, so only its are tracked.
+        // Only the sink lane carries sinks, so only its are tracked.
         if (lane != .sink) return;
         const p = &self.peers[from];
-        while (p.in_flight.items.len > 0 and p.in_flight.items[p.in_flight.items.len - 1].seq > seq) self.forget(p.in_flight.pop().?);
+        while (p.in_flight.items.len > 0 and p.in_flight.items[p.in_flight.items.len - 1].seq > seq) self.forget(from, p.in_flight.pop().?);
+        self.assertSinkBytes();
     }
 
     /// The periodic work: deliver, resend, probe, trim, and tell senders
@@ -646,14 +700,19 @@ pub const Driver = struct {
     /// What writes to this group on `lane` are queued behind, written to
     /// `w`, and how many: its own state, on every lane, and on the sink
     /// lane a full target while nothing has unparked since one refused
-    /// `to`'s batch. None of it reaches an apply: it only tells senders'
+    /// `to`'s batch, or its share while its use is no lower than when that
+    /// held one. None of it reaches an apply: it only tells senders'
     /// leaders to wait.
     fn pressure(self: *const Driver, status: Status, lane: Lane, to: *const Peer, read: ReadView, w: *schema.Writer) u32 {
         var n: u32 = 0;
         const own: ?Cause = if (status == .halted) .halted else self.own_cause;
         if (own) |c| n += @intFromBool(addStall(w, self.group, c));
-        if (lane == .sink) if (to.refused_parked) |at| if (channels.shardParked(read).bytes >= at) {
+        if (lane != .sink) return n;
+        if (to.refused_parked) |at| if (channels.shardParked(read).bytes >= at) {
             n += @intFromBool(addStall(w, self.group, .target_full));
+        };
+        if (to.refused_use) |at| if (channels.budgetOf(read)) |b| if (b.use >= at) {
+            n += @intFromBool(addStall(w, self.group, .over_share));
         };
         return n;
     }
@@ -744,26 +803,29 @@ pub const Driver = struct {
         var it = b.messages.iterator();
         var seq = b.first_seq;
         var n: u32 = 0;
-        var target_full = false;
+        var held: channels.Admit = .take;
         while (it.next() catch null) |m| : (seq += 1) {
             if (seq <= accepted) continue;
             // A message whose target is over its parked cap, counting what
-            // is on its way there, waits at its sender, and so do those
-            // after it: the batch's prefix goes. It is stamped with this
-            // node's caps before it is logged, so every replica applies it
-            // under the same ones, and counted as it is logged.
-            // Only the sink lane's may park: a sink's on another lane was
-            // dropped above (`laneFits`).
-            const target = if (lane != .sink) null else if (self.sink_target) |f| f(m) else null;
-            if (self.admits) |admits| if (!admits(read, m, self.inFlight(target))) {
-                target_full = true;
-                break;
-            };
+            // is on its way there, or that its shard's share or its
+            // sender's sinks in flight hold, waits at its sender, and so do
+            // those after it: the batch's prefix goes. It is stamped with
+            // this node's caps before it is logged, so every replica applies
+            // it under the same ones, and judged and counted as it is logged.
+            // Only the sink lane's are judged: no other lane carries a
+            // sink's message (`laneFits`), and none of theirs parks.
             var logged = m;
             if (self.stamp) |f| if (f(self.stamp_ctx, m, self.stamp_buf)) |payload| {
                 logged.payload = payload;
             };
-            if (target) |t| if (!self.track(from, seq, t, logged.payload.len)) break;
+            const target = if (lane != .sink) null else if (self.sink_target) |f| f(m) else null;
+            if (lane == .sink) {
+                if (self.admits) |admits| {
+                    held = admits(read, logged, self.inFlight(from, target));
+                    if (held != .take) break;
+                }
+                if (!self.track(from, seq, target, logged.payload.len)) break;
+            }
             ce.Message.encode(&w, logged) catch {
                 self.untrackAfter(from, lane, accepted);
                 return;
@@ -772,10 +834,17 @@ pub const Driver = struct {
         }
         if (n == 0) {
             self.counts.busy += 1;
-            if (target_full) peer.refused_parked = channels.shardParked(read).bytes;
+            // The cause this hold names, and no other: a stale one would
+            // mask it.
+            peer.refused_parked = if (held == .target_full) channels.shardParked(read).bytes else null;
+            peer.refused_use = if (held == .over_share) if (channels.budgetOf(read)) |bg| bg.use else null else null;
+            if (held == .over_share) self.counts.over_share += 1;
             return self.answer(from, lane, applied, dur, 0, .busy, read, io);
         }
-        if (lane == .sink) peer.refused_parked = null;
+        if (lane == .sink) {
+            peer.refused_parked = null;
+            peer.refused_use = null;
+        }
         const entry = ce.Inbound.encodeInto(self.buf, .{ .from = from, .lane = @backingInt(lane), .first_seq = accepted + 1, .messages = .{ .bytes = w.written(), .count = n } }) catch {
             self.untrackAfter(from, lane, accepted);
             return;
@@ -895,14 +964,18 @@ test "channel driver: what a leader proposed and hasn't applied is released when
     try std.testing.expect(d.track(0, 1, t1, 100));
     try std.testing.expect(d.track(0, 2, t2, 50));
     try std.testing.expect(d.track(2, 1, t1, 10));
-    try std.testing.expectEqual(channels.InFlight{ .target = 110, .total = 160 }, d.inFlight(t1));
+    // A sink's message with no target counts only among the sinks.
+    try std.testing.expect(d.track(2, 2, null, 7));
+    try std.testing.expectEqual(channels.InFlight{ .target = 110, .total = 160, .sink = 167, .sink_own = 150, .senders = 3 }, d.inFlight(0, t1));
     // Sender 0's first applied.
     d.releaseApplied(0, 1);
-    try std.testing.expectEqual(channels.InFlight{ .target = 10, .total = 60 }, d.inFlight(t1));
-    try std.testing.expectEqual(channels.InFlight{ .target = 50, .total = 60 }, d.inFlight(t2));
+    try std.testing.expectEqual(channels.InFlight{ .target = 10, .total = 60, .sink = 67, .sink_own = 50, .senders = 3 }, d.inFlight(0, t1));
+    try std.testing.expectEqual(channels.InFlight{ .target = 50, .total = 60, .sink = 67, .sink_own = 50, .senders = 3 }, d.inFlight(0, t2));
+    d.releaseApplied(2, 2);
+    try std.testing.expectEqual(channels.InFlight{ .target = 50, .total = 50, .sink = 50, .sink_own = 50, .senders = 3 }, d.inFlight(0, t2));
     // A new term: none of it is this leader's any more.
     d.reset(7);
-    try std.testing.expectEqual(channels.InFlight{}, d.inFlight(t2));
+    try std.testing.expectEqual(channels.InFlight{ .senders = 3 }, d.inFlight(0, t2));
     try std.testing.expectEqual(@as(usize, 0), d.target_bytes.count());
 }
 
@@ -916,6 +989,19 @@ const Taking = struct {
     }
     pub fn propose(io: Taking, _: anytype, _: []const u8) bool {
         io.proposals.* += 1;
+        return true;
+    }
+};
+
+const TestIo = struct {
+    proposed: u32 = 0,
+
+    pub fn sendFrame(_: *TestIo, _: u16, _: []const u8) bool {
+        return true;
+    }
+
+    pub fn propose(io: *TestIo, _: entry_mod.EntryType, _: []const u8) bool {
+        io.proposed += 1;
         return true;
     }
 };
@@ -956,11 +1042,11 @@ test "channel driver: what another lane applied releases nothing the sink lane h
     d.onFrame(0, batchOf(&fb, .history, 6, "", 0), 1, .{ .store = &store }, 0, false, io);
     d.onFrame(0, batchOf(&fb, .main, 6, "", 0), 1, .{ .store = &store }, 0, false, io);
     d.tick(1, .{ .store = &store }, 0, io);
-    try std.testing.expectEqual(channels.InFlight{ .target = 100, .total = 100 }, d.inFlight(t));
+    try std.testing.expectEqual(channels.InFlight{ .target = 100, .total = 100, .sink = 100, .sink_own = 100, .senders = 2 }, d.inFlight(0, t));
     // The sink lane's applied releases it.
     try appliedIn(&store, 0, .sink, 1);
     d.tick(2, .{ .store = &store }, 0, io);
-    try std.testing.expectEqual(channels.InFlight{}, d.inFlight(t));
+    try std.testing.expectEqual(channels.InFlight{ .senders = 2 }, d.inFlight(0, t));
 }
 
 test "channel driver: a history batch taken leaves a full target named, and one that doesn't fit its lane is dropped" {
@@ -990,4 +1076,125 @@ test "channel driver: a history batch taken leaves a full target named, and one 
     d.onFrame(1, batchOf(&fb, .history, 1, w.written(), 1), 1, .{ .store = &store }, 0, false, io);
     try std.testing.expectEqual(@as(u64, 3), d.counts.batches_dropped);
     try std.testing.expectEqual(@as(u32, 1), proposals);
+}
+
+/// A batch of one message of `len` bytes from seq `first` on `flags`'
+/// lane, of an entry no target parks.
+fn oneMessageBatch(buf: []u8, msgs: []u8, term: u64, first: u64, len: usize, flags: u16) []const u8 {
+    const payload: [256]u8 = @splat('p');
+    var w: schema.Writer = .{ .buf = msgs };
+    ce.Message.encode(&w, .{ .slot = 1, .entry_type = @backingInt(entry_mod.EntryType.kv_put), .layout_epoch = 0, .flags = flags, .origin_kind = 0, .origin_ns = 0, .payload = payload[0..len] }) catch unreachable;
+    return encodeFrame(buf, .batch, Batch.Value{ .lane = @backingInt(Lane.of(flags)), .gen_term = term, .gen_counter = 0, .first_seq = first, .messages = .{ .bytes = w.written(), .count = 1 } }).?;
+}
+
+var test_over_share = false;
+
+fn testBudget(_: ReadView) ?channels.Budget {
+    return .{ .use = if (test_over_share) 1 << 20 else 0, .share = 1 << 19 };
+}
+
+const TestChannels = channels.Channels(&.{@import("channel_probe.zig").machine});
+
+test "channel driver: every sink's message counts in flight, with a target or not, and a sender waits only on its own" {
+    channels.test_budget = testBudget;
+    defer channels.test_budget = null;
+    // Three groups: each sender's cap is 20 bytes.
+    channels.test_sink_in_flight_max = 60;
+    defer channels.test_sink_in_flight_max = null;
+    var store = store_mod.Store.init(std.testing.allocator);
+    defer store.deinit();
+    const read: ReadView = .{ .store = &store };
+    var d = try Driver.init(std.testing.allocator, 0, 3);
+    defer d.deinit();
+    d.reset(1);
+    d.admits = TestChannels.admits;
+    d.sink_target = TestChannels.sinkTarget;
+    var io: TestIo = .{};
+    var fb: [512]u8 = undefined;
+    var mb: [512]u8 = undefined;
+    const SINK = entry_mod.Flags.SINK;
+
+    // Group 2's sink, with no target to park under, is counted in flight,
+    // under its sender only.
+    d.onFrame(2, oneMessageBatch(&fb, &mb, 1, 1, 20, SINK), 0, read, 0, false, &io);
+    try std.testing.expectEqual(@as(u32, 1), io.proposed);
+    try std.testing.expectEqual(@as(u64, 20), d.sink_bytes);
+    try std.testing.expectEqual(@as(u64, 20), d.peers[2].sink_bytes);
+    try std.testing.expectEqual(@as(u64, 0), d.in_flight_bytes);
+    // A message that isn't a sink's counts nothing.
+    d.onFrame(1, oneMessageBatch(&fb, &mb, 1, 1, 30, 0), 0, read, 0, false, &io);
+    try std.testing.expectEqual(@as(u32, 2), io.proposed);
+    try std.testing.expectEqual(@as(u64, 20), d.sink_bytes);
+    // Group 2's next waits on its own: busy, naming no cause.
+    d.onFrame(2, oneMessageBatch(&fb, &mb, 1, 2, 10, SINK), 0, read, 0, false, &io);
+    try std.testing.expectEqual(@as(u32, 2), io.proposed);
+    try std.testing.expect(d.peers[2].refused_use == null and d.peers[2].refused_parked == null);
+    // Group 1's sink, the first on its sink lane, isn't held by group 2's
+    // in flight, however large.
+    d.onFrame(1, oneMessageBatch(&fb, &mb, 1, 1, 200, SINK), 0, read, 0, false, &io);
+    try std.testing.expectEqual(@as(u32, 3), io.proposed);
+    try std.testing.expectEqual(@as(u64, 220), d.sink_bytes);
+    // Group 2's own apply releases it, and its resend is taken.
+    d.releaseApplied(2, 1);
+    d.onFrame(2, oneMessageBatch(&fb, &mb, 1, 2, 10, SINK), 0, read, 0, false, &io);
+    try std.testing.expectEqual(@as(u32, 4), io.proposed);
+    try std.testing.expectEqual(@as(u64, 210), d.sink_bytes);
+}
+
+test "channel driver: a hold names its own cause and clears the other's" {
+    channels.test_budget = testBudget;
+    defer channels.test_budget = null;
+    test_over_share = true;
+    defer test_over_share = false;
+    var store = store_mod.Store.init(std.testing.allocator);
+    defer store.deinit();
+    const read: ReadView = .{ .store = &store };
+    var d = try Driver.init(std.testing.allocator, 0, 2);
+    defer d.deinit();
+    d.reset(1);
+    d.admits = TestChannels.admits;
+    d.sink_target = TestChannels.sinkTarget;
+    var io: TestIo = .{};
+    var fb: [512]u8 = undefined;
+    var mb: [512]u8 = undefined;
+    // An earlier full target's hold, still recorded.
+    d.peers[1].refused_parked = 0;
+    d.onFrame(1, oneMessageBatch(&fb, &mb, 1, 1, 10, entry_mod.Flags.SINK), 0, read, 0, false, &io);
+    try std.testing.expectEqual(@as(u32, 0), io.proposed);
+    try std.testing.expect(d.peers[1].refused_parked == null);
+    try std.testing.expectEqual(@as(?u64, 1 << 20), d.peers[1].refused_use);
+    try std.testing.expectEqual(@as(u64, 1), d.counts.over_share);
+}
+
+test "channel driver: a run's history and a main message are taken while their shard is over its share" {
+    channels.test_budget = testBudget;
+    defer channels.test_budget = null;
+    test_over_share = true;
+    defer test_over_share = false;
+    var store = store_mod.Store.init(std.testing.allocator);
+    defer store.deinit();
+    const read: ReadView = .{ .store = &store };
+    var d = try Driver.init(std.testing.allocator, 0, 2);
+    defer d.deinit();
+    d.reset(1);
+    d.admits = TestChannels.admits;
+    d.sink_target = TestChannels.sinkTarget;
+    var io: TestIo = .{};
+    var fb: [512]u8 = undefined;
+    var mb: [512]u8 = undefined;
+    // A sink's message from group 1 is held...
+    d.onFrame(1, oneMessageBatch(&fb, &mb, 1, 1, 10, entry_mod.Flags.SINK), 0, read, 0, false, &io);
+    try std.testing.expectEqual(@as(u32, 0), io.proposed);
+    // ...and this group's own history goes, counting nothing in flight.
+    d.onFrame(0, oneMessageBatch(&fb, &mb, 1, 1, 10, entry_mod.Flags.HISTORY), 0, read, 0, false, &io);
+    try std.testing.expectEqual(@as(u32, 1), io.proposed);
+    // ...and so does group 1's main message, on the same channel, and its
+    // answer names no share.
+    d.onFrame(1, oneMessageBatch(&fb, &mb, 1, 1, 10, 0), 0, read, 0, false, &io);
+    try std.testing.expectEqual(@as(u32, 2), io.proposed);
+    try std.testing.expectEqual(@as(u64, 0), d.sink_bytes);
+    var pw_buf: [Pressure.max_size]u8 = undefined;
+    var pw: schema.Writer = .{ .buf = &pw_buf };
+    try std.testing.expectEqual(@as(u32, 0), d.pressure(.ok, .main, &d.peers[1], read, &pw));
+    try std.testing.expectEqual(@as(u32, 1), d.pressure(.ok, .sink, &d.peers[1], read, &pw));
 }

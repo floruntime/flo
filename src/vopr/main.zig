@@ -82,6 +82,9 @@ const Args = struct {
     channel_mutant: vopr.groups.ChannelMutant = .none,
     /// With --groups: group disks that stop flushing now and then.
     flush_stalls: bool = false,
+    /// With --groups: each group held to a memory share its fills pass and
+    /// its drains bring it back under, so the sink gate holds and releases.
+    memory_share: bool = false,
     max_delivered: u64 = 0,
     skip: [8]u64 = undefined,
     skip_len: usize = 0,
@@ -153,6 +156,8 @@ fn parseArgs(argv: []const []const u8) !Args {
             if (args.groups == 0 or args.groups > vopr.groups.MAX_GROUPS) return error.Usage;
         } else if (std.mem.eql(u8, arg, "--flush-stalls")) {
             args.flush_stalls = true;
+        } else if (std.mem.eql(u8, arg, "--memory-share")) {
+            args.memory_share = true;
         } else if (std.mem.startsWith(u8, arg, "--channel-mutant=")) {
             args.channel_mutant = std.meta.stringToEnum(vopr.groups.ChannelMutant, arg["--channel-mutant=".len..]) orelse return error.Usage;
         } else if (std.mem.eql(u8, arg, "--txn-limits")) {
@@ -405,11 +410,16 @@ fn runGroups(allocator: std.mem.Allocator, args: Args, scenario: Scenario) !bool
     vopr.groups.channels.mutant_no_park_behind = args.channel_mutant == .no_park_behind;
     vopr.groups.channels.test_parked_target_max = vopr.groups.GroupChannel.PARKED_TARGET_CAP;
     if (args.flush_stalls) groups.stall_permille = 2;
+    vopr.groups.channels.mutant_sink_gate_after_no_target = args.channel_mutant == .sink_gate_after_no_target;
+    if (args.memory_share) {
+        vopr.groups.channels.test_budget = vopr.groups.GroupChannel.probeBudget;
+        vopr.groups.channels.test_sink_in_flight_max = vopr.groups.GroupChannel.SINK_IN_FLIGHT_CAP;
+    }
     const s = try groups.run();
     defer allocator.free(s.groups);
     std.debug.print(
-        "[vopr] seed={d} {s}: groups={d} crashes={d} probes={d} frames_sent={d} frames_delivered={d} frames_refused={d} flush_stalls={d} frames_lost_in_crash={d} channel_applies={d} channel_violations={d} held_by_halts={d} left_in_mailbox={d} unparks={d} busy={d} pressured={d}\n",
-        .{ scenario.seed, if (s.ok) "OK" else "FAILED", s.groups.len, s.crashes, s.probes_proposed, s.frames_sent, s.frames_delivered, s.frames_refused, s.flush_stalls, s.frames_lost_in_crash, s.channel_applies, s.channel_violations, s.held_by_halts, s.left_in_mailbox, s.unparks, s.busy, s.pressured },
+        "[vopr] seed={d} {s}: groups={d} crashes={d} probes={d} frames_sent={d} frames_delivered={d} frames_refused={d} flush_stalls={d} frames_lost_in_crash={d} channel_applies={d} channel_violations={d} held_by_halts={d} left_in_mailbox={d} unparks={d} busy={d} pressured={d} over_share={d}\n",
+        .{ scenario.seed, if (s.ok) "OK" else "FAILED", s.groups.len, s.crashes, s.probes_proposed, s.frames_sent, s.frames_delivered, s.frames_refused, s.flush_stalls, s.frames_lost_in_crash, s.channel_applies, s.channel_violations, s.held_by_halts, s.left_in_mailbox, s.unparks, s.busy, s.pressured, s.over_share },
     );
     for (s.groups, 0..) |g, i| std.debug.print("[vopr]   group {d} {s}: ticks={d} acked={d} lost={d} committed={d} state_checks={d}\n", .{ i, if (g.ok) "OK" else "FAILED", g.ticks, g.ops_acked, g.ops_lost, g.max_committed, g.state_checks });
     if (!s.ok) {
@@ -428,12 +438,13 @@ fn runGroups(allocator: std.mem.Allocator, args: Args, scenario: Scenario) !bool
         const from = if (args.scenario_in) |pin| std.fmt.bufPrint(&sb, "--scenario-in={s}", .{pin}) catch pin else std.fmt.bufPrint(&sb, "--seed={d}", .{scenario.seed}) catch "";
         var cmb: [48]u8 = undefined;
         const cmutant = if (args.channel_mutant == .none) "" else std.fmt.bufPrint(&cmb, " --channel-mutant={t}", .{args.channel_mutant}) catch "";
-        std.debug.print("[vopr] reproduce with: vopr {s} --groups={d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
+        std.debug.print("[vopr] reproduce with: vopr {s} --groups={d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
             from,
             args.groups,
             mutant,
             cmutant,
             if (args.flush_stalls) " --flush-stalls" else "",
+            if (args.memory_share) " --memory-share" else "",
             // A pinned scenario carries its own families and limits.
             if (args.scenario_in == null and args.actions) " --actions" else "",
             if (args.scenario_in == null and args.queues) " --queues" else "",
@@ -718,6 +729,7 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
     var cm_arg: [48]u8 = undefined;
     if (args.channel_mutant != .none) try argv.append(allocator, try std.fmt.bufPrint(&cm_arg, "--channel-mutant={t}", .{args.channel_mutant}));
     if (args.flush_stalls) try argv.append(allocator, "--flush-stalls");
+    if (args.memory_share) try argv.append(allocator, "--memory-share");
     if (args.verbose) try argv.append(allocator, "--verbose");
 
     var child = stdx.process.Child.init(argv.items, allocator);
