@@ -1,7 +1,8 @@
 //! The per-node memory budget, derived from the committed cluster-settings
 //! family (`settings/machine.zig`) joined with the data-holding membership.
-//! This derivation feeds `/status` and metrics only; nothing reads it to
-//! admit or refuse a write yet, so it records nothing in applied state.
+//! Each shard's leader binds its share of it, and the shard holds its pool
+//! to that share (`budget/gate.zig`, `channels.sinkRoom`). The derivation
+//! itself records nothing in applied state.
 //!
 //! budget = min over every data-holding member WITH a settings row of
 //!          pool_share × (ram_bytes − reserve). A data-holder with no row yet
@@ -10,6 +11,11 @@
 //!          small node keeps the min high, so the node over-commits.
 
 const std = @import("std");
+const pool = @import("../budget/pool.zig");
+const channels = @import("../contract/channels.zig");
+const channel_driver = @import("../contract/channel_driver.zig");
+const ce = @import("../protocol/channel_entries.zig");
+const ae = @import("../protocol/action_entries.zig");
 
 /// The fixed overhead a shard holds before client data, measured ~5 MiB after
 /// flo#461/#462 (rings resident only as written). Scales with the node's shard
@@ -26,13 +32,38 @@ pub fn ringBytesPerShard(hot_buffer_capacity: u64) u64 {
     return hot_buffer_capacity +| raft;
 }
 
-/// A node's reserve: its per-shard floor plus its configured ring sizes, over
-/// its shards, plus a margin. A node computes this from its own config and
-/// reports it in its settings row; the cluster takes it as given. The margin
-/// covers the ~10 MiB a node carries once at low shard counts, so the linear
-/// `floor × shards` holds there too.
+/// What one workflow's call of an action adds to the action's shard beyond
+/// the bytes the call carries: its run and ready records (their keys, the
+/// run's own fields, `RESIDENT_RECORD` each). Pinned by an actions test with
+/// every field at its largest.
+pub const CALL_RECORDS_BYTES: u64 = 2 * pool.RESIDENT_RECORD + 1024;
+/// What its answer to the caller takes: the outbox row, and, on a first send
+/// to that caller's group or for that namespace, the channel's meta row and
+/// its per-namespace byte count (each value under 64 bytes).
+pub const CALL_REPLY_BYTES: u64 = 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + channels.CHAN_KEY + channels.OUT_NS_KEY + 3 * 64 + ae.Reply.max_size;
+
+/// How far one channel inbound can take its shard past its share. A
+/// workflow's call that arrives inside an inbound is held to the share
+/// against the use committed before the inbound, its own rows alone, so
+/// every call of one inbound may land though together they pass it; the
+/// next inbound's calls are then refused. An inbound carries at most
+/// `MAX_BATCH` messages and `MAX_BATCH_BYTES` of payload, its first
+/// message whatever its size (a call's is far smaller).
+///
+/// It holds while an action's invoke is the only charged write an inbound
+/// grows past the share. Anything else a channel carries that grows a
+/// charged family (a history row an invoke sends, say) adds to it.
+pub const INBOUND_OVERSHOOT_BYTES: u64 = channel_driver.MAX_BATCH_BYTES + ce.MAX_BATCH * (CALL_RECORDS_BYTES + CALL_REPLY_BYTES);
+
+/// A node's reserve: per shard, its floor, its configured ring sizes and the
+/// one inbound it may take past its share; plus a margin. Held back before
+/// the pool's share of RAM is taken, so a shard's overshoot fits whatever
+/// share an admin sets, up to all of it. A node computes this from its own
+/// config and reports it in its settings row; the cluster takes it as given.
+/// The margin covers the ~10 MiB a node carries once at low shard counts, so
+/// the linear `floor × shards` holds there too.
 pub fn reserve(shard_count: u32, ring_bytes_per_shard: u64, margin: u64) u64 {
-    return @as(u64, shard_count) * (PER_SHARD_FLOOR_BYTES +| ring_bytes_per_shard) +| margin;
+    return @as(u64, shard_count) * (PER_SHARD_FLOOR_BYTES +| ring_bytes_per_shard +| INBOUND_OVERSHOOT_BYTES) +| margin;
 }
 
 /// One data-holding member, for the derivation. `mem` is null when the node
@@ -95,8 +126,8 @@ pub const DEFAULT_SHARE_PERMILLE: u16 = 700;
 pub const DEFAULT_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A node's running view of its budget, held on shard 0 and refreshed at each
-/// settings-or-membership apply. It feeds `/status` and metrics only and
-/// records nothing itself. Through a provisional spell (a data-holder with no
+/// settings-or-membership apply. It feeds `/status`, metrics and the shares
+/// shard leaders bind, and records nothing itself. Through a provisional spell (a data-holder with no
 /// row yet) it shows the last committed record, not an in-memory derive, so a
 /// missing small joiner never inflates it and every replica shows the same
 /// value across a restart.
@@ -213,7 +244,12 @@ test "derive: reserve ≥ ram contributes 0" {
 test "reserve: floor + rings over shards + margin" {
     // 4 shards, 80 MiB rings each, 256 MiB margin.
     const r = reserve(4, ringBytesPerShard(64 * 1024 * 1024), 256 * 1024 * 1024);
-    try testing.expectEqual(@as(u64, 4) * (PER_SHARD_FLOOR_BYTES + 80 * 1024 * 1024) + 256 * 1024 * 1024, r);
+    try testing.expectEqual(@as(u64, 4) * (PER_SHARD_FLOOR_BYTES + 80 * 1024 * 1024 + INBOUND_OVERSHOOT_BYTES) + 256 * 1024 * 1024, r);
+}
+
+test "reserve: one inbound's overshoot is its payload bound and its calls' rows, within 256 KiB over the payload" {
+    try testing.expect(INBOUND_OVERSHOOT_BYTES > channel_driver.MAX_BATCH_BYTES);
+    try testing.expect(INBOUND_OVERSHOOT_BYTES < channel_driver.MAX_BATCH_BYTES + 256 * 1024);
 }
 
 test "ringBytesPerShard: log + raft clamp(hot/4, 2, 16 MiB)" {

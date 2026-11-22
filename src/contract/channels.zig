@@ -138,7 +138,7 @@ pub const families = [_]machine_mod.FamilyInfo{ machine_mod.info(OutFam), machin
 /// Per-namespace outbox keys live under a namespace of their own, so a trim
 /// can declare the range of one peer's.
 pub const OUT_NS = "~outns";
-const OUT_NS_KEY = 1 + OUT_NS.len + CHAN_LEN + 4;
+pub const OUT_NS_KEY = 1 + OUT_NS.len + CHAN_LEN + 4;
 
 fn outNsKey(buf: *[OUT_NS_KEY]u8, to: u16, lane: Lane, ns: ns_table.Id) []const u8 {
     var raw: [CHAN_LEN + 4]u8 = undefined;
@@ -2161,4 +2161,48 @@ test "channels: nothing an inbound carries is refused for memory, past its shard
     const got = try deliverAll(&Kv.machine, &st, &scratch, &.{.{ .entry_type = .kv_put, .kind = .user, .ns = ns, .payload = put }});
     try testing.expect(got[0].result.refused() == null);
     try testing.expectEqual(@as(usize, 1), st.family(@import("../kv/machine.zig").Values.ID).count);
+}
+
+test "channels: a workflow's call of an action, in an inbound, takes no more for its answer than the reserve's call bound" {
+    const actions = @import("../actions/machine.zig");
+    const ae = @import("../protocol/action_entries.zig");
+    const pool = @import("../budget/pool.zig");
+    const memory_budget = @import("../node/memory_budget.zig");
+    const A = Channels(&.{actions.machine});
+    var st = store_mod.Store.init(testing.allocator);
+    defer st.deinit();
+    st.place = .{ .group = 0, .count = 1 };
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    const ns: ns_table.Id = .of(7);
+    var rb: [256]u8 = undefined;
+    const reg = try ae.Register.encodeInto(&rb, .{ .ns = ns.int(), .name = "act", .owner = "", .lease_ms = ae.MIN_LEASE_MS, .max_attempts = 3 });
+    var h = std.mem.zeroes(entry_mod.Header);
+    h.entry_type = @backingInt(EntryType.action_register);
+    h.index = 1;
+    h.payload_len = @intCast(reg.len);
+    const re: Entry = .{ .header = h, .payload = reg };
+    var out = Result.start(&re);
+    try machine_mod.applyEntry(&A.machine, &st, &scratch, &re, &out);
+    try testing.expect(out.refused() == null);
+
+    // Its answer is the channel's first send: outbox, meta and per-namespace rows all new.
+    const channel = struct {
+        fn use(s: *store_mod.Store) u64 {
+            var n: u64 = 0;
+            for (pool.CHANNEL) |id| {
+                const f = s.family(id);
+                n += f.encoded_bytes + f.count * (pool.RESIDENT_RECORD - store_mod.RECORD_OVERHEAD);
+            }
+            return n;
+        }
+    };
+    const before = channel.use(&st);
+    var pb: [ae.Invoke.max_size]u8 = undefined;
+    const call = try ae.Invoke.encodeInto(&pb, .{ .ns = ns.int(), .action = "act", .run = "r1", .input = "{}", .labels = null, .source = .workflow, .caller_run = "wr1", .caller_workflow = "wf" });
+    const got = try deliverAll(&A.machine, &st, &scratch, &.{.{ .entry_type = .action_invoke, .kind = .user, .ns = ns, .payload = call }});
+    try testing.expect(got[0].result.refused() == null);
+    const added = channel.use(&st) - before;
+    try testing.expect(added > 0);
+    try testing.expect(added <= memory_budget.CALL_REPLY_BYTES);
 }
