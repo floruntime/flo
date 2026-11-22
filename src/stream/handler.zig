@@ -42,6 +42,9 @@ const Connection = connection_mod.Connection;
 const table_run = @import("../node/table_run.zig");
 const stream_ops = @import("../protocol/stream_ops.zig");
 const schema = @import("../protocol/schema.zig");
+const ce = @import("../protocol/channel_entries.zig");
+const history_entries = @import("../protocol/history_entries.zig");
+const history_machine = @import("history_machine.zig");
 const group_handler = @import("group_handler.zig");
 const group_machine = @import("group_machine.zig");
 const stream_machine = @import("machine.zig");
@@ -1525,6 +1528,120 @@ pub const StreamHandler = struct {
             }
         }
         if (self.tiered_metrics) |tm| tm.recordMiss();
+        return null;
+    }
+
+    /// The raw payload of log entry `index`, hot, warm or read back from
+    /// disk; null when it isn't in hand, `held` then saying whether a disk
+    /// read for it is coming or can't be made now.
+    fn entryPayload(self: *StreamHandler, index: u64) ?[]const u8 {
+        if (self.partition.ual.read(index)) |e| return e.payload;
+        if (self.partition.readPayloadWarm(index)) |raw| return raw;
+        if (self.disk) |d| {
+            if (d.get(index)) |raw| return raw;
+            switch (d.want(index, self.disk_window)) {
+                .pending => self.held = .pending,
+                .blocked => if (self.held == .no) {
+                    self.held = .blocked;
+                },
+                .absent => {},
+            }
+        }
+        return null;
+    }
+
+    /// One of a run's history pieces, oldest first: a chunk's records, or
+    /// events known lost (a chunk a repair skipped, or one the log no
+    /// longer holds).
+    pub const HistoryPiece = struct { first_seq: u64, last_seq: u64, records: []const u8, lost: bool };
+
+    pub const HistoryRead = struct {
+        pieces: []const HistoryPiece,
+        /// A piece isn't in hand now (being read back from disk, or the
+        /// disk read held back for now): the read stopped before it, and is
+        /// answered retryable, never as lost.
+        pending: bool,
+    };
+
+    /// `run`'s history in `family`, of incarnation `created_ns`, ended at
+    /// `completed_ms` or live (null): its rows walked oldest first, each
+    /// index row's own rows in its place, as far as `limit` pieces and the
+    /// payloads in hand go. Copies into `a`.
+    pub fn readHistory(self: *StreamHandler, a: Allocator, family: history_entries.Family, ns: router.NamespaceId, owner: []const u8, run: []const u8, created_ns: u64, completed_ms: ?u64, limit: usize) error{OutOfMemory}!HistoryRead {
+        self.beginRead();
+        var rows = try history_machine.rowsOf(self.readView(), a, family, ns, owner, run, created_ns, completed_ms);
+        // Oldest first: an index's rows are walked in its place.
+        var stack: std.ArrayListUnmanaged(history_entries.Locator.Value) = .empty;
+        var top: std.ArrayListUnmanaged(history_entries.Locator.Value) = .empty;
+        while (rows.next()) |l| try top.append(a, l);
+        var i = top.items.len;
+        while (i > 0) : (i -= 1) try stack.append(a, top.items[i - 1]);
+        var pieces: std.ArrayListUnmanaged(HistoryPiece) = .empty;
+        var pending = false;
+        while (pieces.items.len < limit) {
+            const l = stack.pop() orelse break;
+            const kind = std.enums.fromInt(history_entries.Kind, l.kind) orelse continue;
+            if (kind == .lost) {
+                try pieces.append(a, .{ .first_seq = l.first_seq, .last_seq = l.last_seq, .records = "", .lost = true });
+                continue;
+            }
+            const raw = self.entryPayload(l.ual_index) orelse {
+                if (self.held != .no) {
+                    pending = true;
+                    break;
+                }
+                try pieces.append(a, .{ .first_seq = l.first_seq, .last_seq = l.last_seq, .records = "", .lost = true });
+                continue;
+            };
+            const msg = messageAt(raw, l.part) orelse {
+                try pieces.append(a, .{ .first_seq = l.first_seq, .last_seq = l.last_seq, .records = "", .lost = true });
+                continue;
+            };
+            var diag: schema.Diagnostic = .{};
+            switch (kind) {
+                .chunk => {
+                    // Another run's chunk where this row points is a lost one,
+                    // never read as this run's.
+                    const decoded = history_entries.Chunk.decodeAll(msg, &diag) catch null;
+                    if (decoded == null or !sameRun(decoded.?, ns, family, owner, run, created_ns)) {
+                        try pieces.append(a, .{ .first_seq = l.first_seq, .last_seq = l.last_seq, .records = "", .lost = true });
+                        continue;
+                    }
+                    const c = decoded.?;
+                    try pieces.append(a, .{ .first_seq = c.first_seq, .last_seq = c.last_seq, .records = try a.dupe(u8, c.records), .lost = false });
+                },
+                .index => {
+                    const decoded = history_entries.Index.decodeAll(msg, &diag) catch null;
+                    if (decoded == null or !sameRun(decoded.?, ns, family, owner, run, created_ns)) {
+                        try pieces.append(a, .{ .first_seq = l.first_seq, .last_seq = l.last_seq, .records = "", .lost = true });
+                        continue;
+                    }
+                    const x = decoded.?;
+                    var listed: std.ArrayListUnmanaged(history_entries.Locator.Value) = .empty;
+                    var it = x.locators.iterator();
+                    while (it.next() catch null) |inner| try listed.append(a, inner);
+                    var j = listed.items.len;
+                    while (j > 0) : (j -= 1) try stack.append(a, listed.items[j - 1]);
+                },
+                .lost => unreachable,
+            }
+        }
+        return .{ .pieces = pieces.items, .pending = pending };
+    }
+
+    fn sameRun(v: anytype, ns: router.NamespaceId, family: history_entries.Family, owner: []const u8, run: []const u8, created_ns: u64) bool {
+        return v.ns == ns.int() and v.family == @backingInt(family) and v.created_ns == created_ns and std.mem.eql(u8, v.owner, owner) and std.mem.eql(u8, v.run, run);
+    }
+
+    /// Message `part` (its place in the inbound, plus one) of an inbound's
+    /// payload, or null when there is none.
+    fn messageAt(payload: []const u8, part: u8) ?[]const u8 {
+        if (part == 0) return null;
+        var diag: schema.Diagnostic = .{};
+        const inbound = ce.Inbound.decodeAll(payload, &diag) catch return null;
+        var it = inbound.messages.iterator();
+        var i: usize = 0;
+        while (it.next() catch return null) |m| : (i += 1) if (i + 1 == part) return m.payload;
         return null;
     }
 

@@ -75,6 +75,8 @@ pub const CHARGED = [_]u16{
     54,
     55, 56,
     59,
+    // history.act: an action run's history rows, charged where its runs are
+    71,
 };
 
 /// The families the pool is not charged for: the node's own state, and
@@ -93,6 +95,8 @@ pub const EXEMPT = [_]u16{
     // workflow: idem, per_def, out, sig
     64, 65,
     66, 67,
+    // history.wf: a workflow run's history rows, exempt as workflow state is
+    70,
 };
 
 fn listed(comptime set: []const u16, comptime id: u16) bool {

@@ -22,6 +22,7 @@ const group_entries = @import("group_entries.zig");
 const settings_entries = @import("settings_entries.zig");
 const channel_entries = @import("channel_entries.zig");
 const processing_entries = @import("processing_entries.zig");
+const history_entries = @import("history_entries.zig");
 const golden = @import("golden.zig");
 const proto = @import("proto.zig");
 const EntryType = @import("../storage/ual/entry.zig").EntryType;
@@ -29,7 +30,7 @@ const EntryType = @import("../storage/ual/entry.zig").EntryType;
 pub const op_table = system_ops.table ++ namespace_ops.table ++ kv_ops.table ++ stream_ops.table ++ queue_ops.table ++ ts_ops.table ++ action_ops.table ++ worker_ops.table ++ processing_ops.table;
 /// The groups the table's ops form under their families.
 pub const op_groups = kv_ops.groups;
-pub const entry_table = kv_entries.table ++ namespace_entries.table ++ action_entries.table ++ queue_entries.table ++ group_entries.table ++ settings_entries.table ++ channel_entries.table ++ processing_entries.table;
+pub const entry_table = kv_entries.table ++ namespace_entries.table ++ action_entries.table ++ queue_entries.table ++ group_entries.table ++ settings_entries.table ++ channel_entries.table ++ processing_entries.table ++ history_entries.table;
 
 comptime {
     ops.check(&op_table);

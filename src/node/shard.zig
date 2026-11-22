@@ -1603,13 +1603,39 @@ pub const Shard = struct {
         pressure: channel_driver.Stall.Value,
         outbox: struct { to: ?u16, bytes: u64, cap: u64, cause: ?channel_driver.Cause = null },
         share: struct { to: ?u16, bytes: u64, cap: u64 },
+        /// This namespace's runs' history, queued to this shard itself, is
+        /// past its share of the history lane's cap.
+        history: struct { bytes: u64, cap: u64 },
     };
+
+    /// Why a write for namespace `ns` that makes history waits at this
+    /// leader's edge, or null: its history lane (to this shard itself) past
+    /// its cap, and `ns`'s share of it used. Only past the cap does the lane
+    /// hold anything, and then only the namespaces holding a share of it,
+    /// so one tenant's history holds only its own runs; at twice the cap,
+    /// every namespace with history queued waits. A history send itself is
+    /// never refused: what it may overshoot is bounded by the writes these
+    /// hold, and by its rows counting toward the memory pool.
+    pub fn historyWait(self: *Shard, ns: node_router.NamespaceId) ?SendWait {
+        const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
+        const bound = settings_machine.boundShare(read);
+        const cap = self.outbox_caps.historyCap(if (bound) |b| b.share_bytes else null);
+        const total = channels_mod.metaOf(read, self.id, .history).bytes;
+        // Under its cap, the lane holds nothing.
+        if (total < cap) return null;
+        const held = channels_mod.nsBytesOf(read, self.id, .history, ns);
+        if (held > 0 and total >= 2 * cap) return .{ .history = .{ .bytes = held, .cap = cap } };
+        if (raft_node_mod.shareHeld(held, total, cap)) return .{ .history = .{ .bytes = held, .cap = cap } };
+        return null;
+    }
 
     /// `lane` is the lane the write's messages ride. Only that lane's
     /// pressure holds it, and only its class's bytes (`channels.Class`):
     /// a full sink target, and the sink bytes it holds back, hold no main
     /// or history write, and a sink's write waits on the sink lane's alone.
     pub fn sendWait(self: *Shard, to: u16, lane: channels_mod.Lane, ns: node_router.NamespaceId) ?SendWait {
+        // History goes only to this shard itself, and is held as its own.
+        if (lane == .history) return self.historyWait(ns);
         const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
         const class = channels_mod.Class.of(lane);
         const caps = self.outbox_caps.forClass(class);
@@ -1641,6 +1667,7 @@ pub const Shard = struct {
                 std.fmt.bufPrint(buf, "overloaded: writes to shard {d} are queued ({s} of {s}) because it {s}" ++ tail, .{ to, channel_driver.bytesText(&hb, o.bytes), channel_driver.bytesText(&cb, o.cap), channel_driver.causeWords(c) }) catch "overloaded" ++ tail
             else
                 std.fmt.bufPrint(buf, "overloaded: writes to shard {d} are queued ({s} of {s})" ++ tail, .{ to, channel_driver.bytesText(&hb, o.bytes), channel_driver.bytesText(&cb, o.cap) }) catch "overloaded" ++ tail) else std.fmt.bufPrint(buf, "overloaded: this shard's writes to other shards are queued ({s} of {s})" ++ tail, .{ channel_driver.bytesText(&hb, o.bytes), channel_driver.bytesText(&cb, o.cap) }) catch "overloaded" ++ tail,
+            .history => |hw| std.fmt.bufPrint(buf, "overloaded: this namespace's runs' history is queued past its share ({s} of {s})" ++ tail, .{ channel_driver.bytesText(&hb, hw.bytes), channel_driver.bytesText(&cb, hw.cap) }) catch "overloaded" ++ tail,
             .share => |sh| if (sh.to) |to|
                 std.fmt.bufPrint(buf, "overloaded: this namespace's share of the writes queued to shard {d} is used ({s} of {s})" ++ tail, .{ to, channel_driver.bytesText(&hb, sh.bytes), channel_driver.bytesText(&cb, sh.cap) }) catch "overloaded" ++ tail
             else
@@ -5968,7 +5995,7 @@ pub const Shard = struct {
                 for (self.channel.sender_bugs) |by_reason| n += by_reason[reason];
                 total.store(n, .monotonic);
             }
-            sm.channel_outbox_bytes.store(self.outboxBytes(.other) + self.outboxBytes(.sink), .monotonic);
+            sm.channel_outbox_bytes.store(self.outboxBytes(.other) + self.outboxBytes(.sink) + self.outboxBytes(.history), .monotonic);
             for (std.enums.values(proto.Reason)) |k| {
                 var n: u64 = 0;
                 for (self.channel.sink_refusals) |by_reason| n += by_reason.get(k);
@@ -20002,6 +20029,48 @@ test "Shard: a stream read whose disk read is blocked is refused at once, not he
     try std.testing.expect(again == .pending and c.shard.stream_handler.held == .blocked);
 }
 
+test "Shard: a run's history read that meets a blocked disk read stops, answered retryable, never as lost" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 0, 0, 0);
+    defer c.deinit();
+    const he = @import("../protocol/history_entries.zig");
+    const s = &c.shard;
+    var buf: [he.Chunk.max_size]u8 = undefined;
+    const p = try he.Chunk.encodeInto(&buf, .{ .ns = ns_table.DEFAULT.int(), .family = @backingInt(he.Family.action), .owner = "act", .run = "r1", .created_ns = 3, .first_seq = 1, .last_seq = 2, .final = true, .completed_ms = 77, .records = "events" });
+    try sendFromApplyFlagged(s, @intCast(node_router.nsKeySlot(.default, "act")), .history_chunk, entry_mod.Flags.HISTORY, p);
+    // Its frames to itself come through its own inbox.
+    for (0..8) |_| {
+        s.tickChannels();
+        _ = s.drainInbox();
+        _ = s.applyCommitted();
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const landed = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, 10);
+    try std.testing.expectEqual(@as(usize, 1), landed.pieces.len);
+    // Pushed out of the ring and the warm store, onto disk only.
+    for (0..80) |_| {
+        _ = try persistence_mod.proposeEntry(s, .stream_append, entry_mod.Flags.NONE, "", "f", c.value);
+        try std.testing.expect(s.applyCommitted());
+    }
+    try s.flushSegmentToDisk();
+    // The disk can't be read now: the read stops before the chunk, to be
+    // tried again, and says nothing of it as lost.
+    s.durable_log.?.test_open_error = error.SystemResources;
+    // Asked for, its read fails; asked again, it is held back.
+    var held = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, 10);
+    var tries: usize = 0;
+    while (s.stream_handler.held != .blocked and tries < 2_000) : (tries += 1) {
+        try std.testing.expect(held.pending);
+        _ = s.stream_disk.?.drain();
+        @import("stdx").time.sleep(std.time.ns_per_ms);
+        held = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, 10);
+    }
+    try std.testing.expect(s.stream_handler.held == .blocked);
+    try std.testing.expect(held.pending);
+    try std.testing.expectEqual(@as(usize, 0), held.pieces.len);
+}
+
 test "Shard: an internal op from a client is answered as an unknown one, and nothing is proposed" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
@@ -29190,6 +29259,52 @@ test "Shard: a group read in a namespace never created is refused no_namespace, 
     try std.testing.expect(shard.namespace_handler.idOf("nope") == null);
 }
 
+test "Shard: history queued under its lane's cap holds nothing; past it, only the namespaces holding a share of it, and at twice the cap every one with any; other writes not at all" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    shard.outbox_caps = .{ .other = .{ .shard = 1 << 30, .channel = 400 } };
+    const big: node_router.NamespaceId = .of(17);
+    const small: node_router.NamespaceId = .of(18);
+    const none: node_router.NamespaceId = .of(19);
+    const Sends = struct {
+        fn history(s: *Shard, ns: node_router.NamespaceId, bytes: usize) !void {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            var ks = contract_view.KeySet.init(arena.allocator());
+            var view = contract_view.View.init(&s.defaultPartition().store, arena.allocator(), &ks);
+            const payload = try arena.allocator().alloc(u8, bytes);
+            @memset(payload, 'h');
+            try view.sendFlagged(.user(ns), 0, @backingInt(entry_mod.EntryType.history_chunk), entry_mod.Flags.HISTORY, payload);
+            try channels_mod.writeSends(&view, s.raft_node.last_applied);
+            try view.commit();
+        }
+    };
+    // Under the cap, nothing waits: not even a namespace holding nearly all
+    // of it.
+    try Sends.history(&shard, big, 350);
+    try std.testing.expect(shard.historyWait(big) == null);
+    // At the cap, the namespace holding most of it waits; one holding
+    // little, and one holding none, don't; nor any main-lane write.
+    try Sends.history(&shard, small, 50);
+    try std.testing.expect(shard.historyWait(big).? == .history);
+    try std.testing.expect(shard.sendWait(0, .history, big).? == .history);
+    try std.testing.expect(shard.historyWait(small) == null);
+    try std.testing.expect(shard.historyWait(none) == null);
+    try std.testing.expect(shard.sendWait(0, .main, big) == null);
+    // At twice the cap, every namespace with history queued waits, and one
+    // with none still doesn't.
+    try Sends.history(&shard, big, 400);
+    try std.testing.expect(shard.historyWait(small).? == .history);
+    try std.testing.expect(shard.historyWait(none) == null);
+    var tb: [256]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, Shard.sendWaitText(shard.historyWait(small).?, &tb), "history is queued past its share (50 B of 400 B)") != null);
+}
+
 test "Shard: every group op naming a reserved stream is refused unauthorized, not run, and logs nothing" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
@@ -31609,6 +31724,112 @@ fn sendFromApplyFlagged(a: *Shard, slot: u16, etype: entry_mod.EntryType, flags:
     try view.sendFlagged(.user(.default), slot, @backingInt(etype), flags, payload);
     try channels_mod.writeSends(&view, a.raft_node.last_applied);
     try view.commit();
+}
+
+test "Shard: a run's history, sent to its own shard as it goes and folded, reads back oldest first, live and after it ends" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const a = &two.shards[0];
+    const he = @import("../protocol/history_entries.zig");
+    // An action shard 0 owns.
+    var nb: [16]u8 = undefined;
+    var ni: usize = 0;
+    const owner = while (true) : (ni += 1) {
+        const n = try std.fmt.bufPrint(&nb, "act{d}", .{ni});
+        if (a.router.hashToShard(node_router.routeNsKey(.default, n)) == 0) break n;
+    };
+    const slot: u16 = @intCast(node_router.nsKeySlot(.default, owner));
+    const CHUNKS = 20;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (0..CHUNKS) |i| {
+        var rb: [16]u8 = undefined;
+        var buf: [he.Chunk.max_size]u8 = undefined;
+        const p = try he.Chunk.encodeInto(&buf, .{ .ns = ns_table.DEFAULT.int(), .family = @backingInt(he.Family.action), .owner = owner, .run = "r1", .created_ns = 5, .first_seq = i + 1, .last_seq = i + 1, .final = i + 1 == CHUNKS, .completed_ms = 4242, .records = try std.fmt.bufPrint(&rb, "chunk-{d:0>2}", .{i + 1}) });
+        try sendFromApplyFlagged(a, slot, .history_chunk, entry_mod.Flags.HISTORY, p);
+        pumpChannels(&two);
+        // Live, halfway: what landed so far, in order.
+        if (i + 1 == 10) {
+            const live = try a.stream_handler.readHistory(arena.allocator(), .action, .default, owner, "r1", 5, null, 100);
+            try std.testing.expect(!live.pending);
+            try std.testing.expectEqual(@as(usize, 10), live.pieces.len);
+            for (live.pieces, 1..) |piece, n| try std.testing.expectEqual(@as(u64, n), piece.first_seq);
+        }
+    }
+    for (0..4) |_| pumpChannels(&two);
+    const read = try a.stream_handler.readHistory(arena.allocator(), .action, .default, owner, "r1", 5, 4242, 100);
+    try std.testing.expect(!read.pending);
+    try std.testing.expectEqual(@as(usize, CHUNKS), read.pieces.len);
+    for (read.pieces, 1..) |piece, n| {
+        var want: [16]u8 = undefined;
+        try std.testing.expect(!piece.lost);
+        try std.testing.expectEqual(@as(u64, n), piece.first_seq);
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want, "chunk-{d:0>2}", .{n}), piece.records);
+    }
+    // A limit stops the walk where it says.
+    const some = try a.stream_handler.readHistory(arena.allocator(), .action, .default, owner, "r1", 5, 4242, 3);
+    try std.testing.expectEqual(@as(usize, 3), some.pieces.len);
+    try std.testing.expectEqual(@as(u64, 3), some.pieces[2].last_seq);
+    // The ended run is one row.
+    const hm = @import("../stream/history_machine.zig");
+    try std.testing.expectEqual(@as(u64, 1), a.defaultPartition().store.family(hm.Actions.ID).count);
+    // A row whose entry the log no longer holds, and one naming a message
+    // its inbound doesn't carry, read as lost for their events: never
+    // passed over.
+    {
+        const st = &a.defaultPartition().store;
+        const al = arena.allocator();
+        const gone = try hm.liveRowKey(al, .default, owner, "r3", 7, 1 << 40, 1);
+        const no_message = try hm.liveRowKey(al, .default, owner, "r3", 7, read.pieces.len + 2, 60);
+        var ks = contract_view.KeySet.init(al);
+        try ks.add(hm.Actions.ID, "", gone);
+        try ks.add(hm.Actions.ID, "", no_message);
+        var view = contract_view.View.init(st, al, &ks);
+        view.strict = false;
+        var row = std.mem.zeroes(hm.Row.Value);
+        row.owner = owner;
+        row.kind = @backingInt(he.Kind.chunk);
+        row.ual_index = 1 << 40;
+        row.part = 1;
+        row.first_seq = 1;
+        row.last_seq = 4;
+        try view.put(hm.Actions, gone, .{ .v = row });
+        row.ual_index = a.raft_node.last_applied;
+        row.part = 60;
+        row.first_seq = 5;
+        row.last_seq = 6;
+        try view.put(hm.Actions, no_message, .{ .v = row });
+        try view.commit();
+        // And one pointing at another run's index: never read as this run's.
+        var ended = try hm.rowsOf(.{ .store = st }, al, .action, .default, owner, "r1", 5, 4242);
+        const theirs = ended.next().?;
+        const borrowed = try hm.liveRowKey(al, .default, owner, "r4", 8, theirs.ual_index, theirs.part);
+        var ks2 = contract_view.KeySet.init(al);
+        try ks2.add(hm.Actions.ID, "", borrowed);
+        var view2 = contract_view.View.init(st, al, &ks2);
+        view2.strict = false;
+        var stolen = std.mem.zeroes(hm.Row.Value);
+        stolen.owner = owner;
+        stolen.kind = theirs.kind;
+        stolen.ual_index = theirs.ual_index;
+        stolen.part = theirs.part;
+        stolen.first_seq = 1;
+        stolen.last_seq = 20;
+        try view2.put(hm.Actions, borrowed, .{ .v = stolen });
+        try view2.commit();
+        const other = try a.stream_handler.readHistory(al, .action, .default, owner, "r4", 8, null, 10);
+        try std.testing.expectEqual(@as(usize, 1), other.pieces.len);
+        try std.testing.expect(other.pieces[0].lost);
+        const lost = try a.stream_handler.readHistory(al, .action, .default, owner, "r3", 7, null, 10);
+        try std.testing.expect(!lost.pending);
+        try std.testing.expectEqual(@as(usize, 2), lost.pieces.len);
+        for (lost.pieces) |piece| try std.testing.expect(piece.lost);
+        const firsts = [_]u64{ lost.pieces[0].first_seq, lost.pieces[1].first_seq };
+        try std.testing.expect(std.mem.indexOfScalar(u64, &firsts, 1) != null and std.mem.indexOfScalar(u64, &firsts, 5) != null);
+    }
 }
 
 /// A queue name shard `owner` of two owns, in the default namespace, and

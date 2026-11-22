@@ -63,11 +63,22 @@ pub const OutboxCaps = struct {
         };
     }
 
+    /// A class's caps. History is held to `historyCap` instead, past which
+    /// only the namespaces filling it wait; its shard and channel caps are
+    /// the rest's, so a reading of them alone holds no less.
     pub fn forClass(self: OutboxCaps, class: channels.Class) Caps {
         return switch (class) {
-            .other => self.other,
+            .other, .history => self.other,
             .sink => self.sink,
         };
+    }
+
+    /// The most a shard's history lane holds before the namespaces whose
+    /// history fills it wait: the rest's channel cap, or a quarter of the
+    /// shard's memory share once one is bound, whichever is less.
+    pub fn historyCap(self: OutboxCaps, share: ?u64) u64 {
+        const cap = self.other.channel;
+        return if (share) |s| @min(cap, s / 4) else cap;
     }
 };
 /// Most payload bytes in one batch.
@@ -920,6 +931,13 @@ test "channel driver: outbox caps are an eighth of the node's memory over its sh
     try std.testing.expectEqual(OutboxCaps{ .other = .{ .shard = 256 << 20, .channel = 64 << 20 }, .sink = .{ .shard = 128 << 20, .channel = 32 << 20 } }, OutboxCaps.of(16 << 30, 8));
     try std.testing.expectEqual(OutboxCaps{ .other = .{ .shard = 1 << 30, .channel = 128 << 20 }, .sink = .{ .shard = 512 << 20, .channel = 64 << 20 } }, OutboxCaps.of(256 << 30, 4));
     try std.testing.expectEqual(OutboxCaps{ .other = .{ .shard = 32 << 20, .channel = 8 << 20 }, .sink = .{ .shard = 16 << 20, .channel = 4 << 20 } }, OutboxCaps.of(1 << 30, 4));
+}
+
+test "channel driver: the history lane's cap is the rest's channel cap, or a quarter of a bound share if less" {
+    const caps = OutboxCaps.of(16 << 30, 8);
+    try std.testing.expectEqual(caps.other.channel, caps.historyCap(null));
+    try std.testing.expectEqual(caps.other.channel, caps.historyCap(1 << 30));
+    try std.testing.expectEqual(@as(u64, 8 << 20), caps.historyCap(32 << 20));
 }
 
 test "channel driver: byte counts read in the largest unit that keeps them whole" {

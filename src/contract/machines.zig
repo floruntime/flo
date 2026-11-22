@@ -12,6 +12,7 @@ const targets = [_]machine.Machine{
     @import("../queue/machine.zig").machine,
     @import("../stream/group_machine.zig").machine,
     @import("../stream/machine.zig").machine,
+    @import("../stream/history_machine.zig").machine,
     @import("../settings/machine.zig").machine,
     @import("../ts/machine.zig").machine,
 };
