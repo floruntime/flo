@@ -162,6 +162,30 @@ pub fn history(
     return client.sendRequest(.workflow_history, namespace, run_id, value);
 }
 
+/// One page of a run's history, from `cursor` (a page's answer gave it;
+/// null for the start), oldest first or newest first.
+/// Wire format in value:
+///   [limit:u32][cursor_len:u16][cursor][newest_first:u8]
+pub fn historyPage(
+    client: *Client,
+    namespace: []const u8,
+    run_id: []const u8,
+    limit: u32,
+    cursor: ?u64,
+    newest_first: bool,
+) !Response {
+    var value_buf: [4 + 2 + 8 + 1]u8 = undefined;
+    var fbs: std.Io.Writer = .fixed(&value_buf);
+    const writer = &fbs;
+    try writer.writeInt(u32, limit, .little);
+    if (cursor) |c| {
+        try writer.writeInt(u16, 8, .little);
+        try writer.writeInt(u64, c, .little);
+    } else try writer.writeInt(u16, 0, .little);
+    try writer.writeByte(@intFromBool(newest_first));
+    return client.sendRequest(.workflow_history, namespace, run_id, fbs.buffered());
+}
+
 /// List workflow runs
 /// Wire format in value:
 ///   [limit:u32][status_filter_len:u16][status_filter]?[cursor_len:u16][cursor]?[search_len:u16][search]?

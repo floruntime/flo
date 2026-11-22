@@ -93,7 +93,7 @@ pub const HIST_CHUNK: usize = 4 << 10;
 
 /// How much of an ended run's output its record keeps; the whole is in its
 /// history, as `OUTPUT_EVENT`'s detail, when it is longer.
-pub const OUTPUT_PREVIEW: usize = 1024;
+pub const OUTPUT_PREVIEW: usize = 256;
 pub const OUTPUT_EVENT = "workflow_output";
 
 comptime {

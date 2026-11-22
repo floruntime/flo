@@ -7521,6 +7521,9 @@ pub const Shard = struct {
             }
             self.dropForward(f);
         }
+        // A held history read isn't answered short as at its deadline: its
+        // chunks may still land, so it is told to ask again.
+        self.waiter_pool.expireKinds(&.{.workflow_history}, answerShuttingDown, @ptrCast(self));
         self.waiter_pool.expireAll(handleWaiterTimeout, @ptrCast(self));
         self.refuseUnrunRequests();
         self.takeAnswersUntilAllStopped();
@@ -9275,6 +9278,12 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
         // Its chunks not all landed in time: what did, the rest said missing.
         .workflow_history => _ = shard.workflow_handler.resolveHistoryWaiter(shard, waiter, true),
     }
+}
+
+/// A held read answered as its shard shuts down: retryable, nothing run.
+fn answerShuttingDown(waiter: *const Waiter, ctx: *anyopaque) void {
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
+    shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(Shard.SHUTTING_DOWN_NOT_RUN));
 }
 
 /// A held history read asked again: its run's chunks landed, or came back
