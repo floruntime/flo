@@ -3121,6 +3121,11 @@ pub const Simulator = struct {
         return true;
     }
 
+    /// Node `id`'s log entry at `index`, its payload copied into `buf`.
+    pub fn entryAt(self: *const Simulator, id: NodeId, index: u64, buf: []u8) ?entry_mod.Entry {
+        return self.nodes[id - 1].raft.log.getEntryCopy(index, buf);
+    }
+
     /// The last index node `id`'s log holds: right after a restart, what
     /// its crash kept.
     pub fn keptIndex(self: *const Simulator, id: NodeId) u64 {

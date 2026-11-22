@@ -411,15 +411,20 @@ jobs:
         # for its repair; a halted sender still delivers what it sent.
         run: ./zig-out/bin/vopr --iterations=10 --seed=1 --jobs=4 --groups=4 --halts --seed-timeout=120 --out-dir=/tmp/vopr-groups-halts
         timeout-minutes: 10
+      - name: Swarm of groups held to a memory share
+        # Fills put a group over its share and drains bring it back: its
+        # sinks wait at their senders, and every one is applied in the end.
+        run: ./zig-out/bin/vopr --iterations=10 --seed=1 --jobs=4 --groups=4 --memory-share --seed-timeout=120 --out-dir=/tmp/vopr-groups-share
+        timeout-minutes: 10
       - name: Channel mutants are caught
         # Each planted bug in the channel driver fails at least one seed, and
         # fails it as the channel oracle names that bug: a panic, a usage
         # error or a timeout catches nothing.
         run: |
           check() {
-            m=$1; says=$2
+            m=$1; says=$2; flags=$3
             rm -rf /tmp/vopr-cm-$m
-            ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --groups=4 --channel-mutant=$m --seed-timeout=120 --out-dir=/tmp/vopr-cm-$m > /tmp/vopr-cm-$m.out 2>&1 || true
+            ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --groups=4 $flags --channel-mutant=$m --seed-timeout=120 --out-dir=/tmp/vopr-cm-$m > /tmp/vopr-cm-$m.out 2>&1 || true
             n=$(grep -lE "channel [0-9]+->[0-9]+ seq [0-9]+: $says" /tmp/vopr-cm-$m/*.log 2>/dev/null | wc -l)
             if [ "$n" -eq 0 ]; then
               tail -20 /tmp/vopr-cm-$m.out; echo "::error::channel mutant $m: no seed failed with 'channel ... seq ...: $says'"; exit 1
@@ -430,7 +435,10 @@ jobs:
           check trim_on_applied "a message its sender holds was never applied"
           check ack_last_seq "a message its sender holds was never applied"
           check no_park_behind "a message reached its target after a later one to it"
-          check leak_in_flight "a message its sender holds was never applied"
+          check leak_in_flight "a leader's sink bytes in flight are not its log's unapplied sinks"
+          check sink_untargeted_leaked "a leader's sink bytes in flight are not its log's unapplied sinks" --memory-share
+          check sink_in_flight_kept_on_reset "a leader's sink bytes in flight are not its log's unapplied sinks" --memory-share
+          check sink_gate_after_no_target "a sink's message was admitted past its shard's share" --memory-share
         timeout-minutes: 20
       - name: Swarm with lost disks
         # Crashes that lose a disk or its hard state, up to two nodes at once:

@@ -408,6 +408,8 @@ pub const Summary = struct {
     /// above 0, the caps were reached.
     busy: u64,
     pressured: u64,
+    /// Batches a group's share held back: above 0, the sink gate held.
+    over_share: u64,
     frames_refused: u64,
     flush_stalls: u64,
     held_by_halts: u64,
@@ -442,6 +444,8 @@ pub const GroupChannel = struct {
     driver: driver_mod.Driver,
     probes_proposed: u64 = 0,
     unparks: u64 = 0,
+    /// Where a log entry is read back for the sink checks.
+    entry_buf: []u8 = &.{},
     /// The unpark this group's leader last proposed: one at a time.
     unpark_index: u64 = 0,
     unpark_term: u64 = 0,
@@ -460,10 +464,12 @@ pub const GroupChannel = struct {
         c.store.strict_keys = true;
         c.driver.admits = Probed.admits;
         c.driver.sink_target = Probed.sinkTarget;
+        c.entry_buf = try allocator.alloc(u8, ce.Inbound.max_size);
         return c;
     }
 
     fn deinit(c: *GroupChannel) void {
+        c.driver.allocator.free(c.entry_buf);
         c.store.deinit();
         c.scratch.deinit();
         c.driver.deinit();
@@ -551,9 +557,74 @@ pub const GroupChannel = struct {
         }
 
         pub fn propose(io: Io, etype: entry_mod.EntryType, payload: []const u8) bool {
+            if (etype == .channel_inbound) io.c.checkSinkAdmission(payload);
             return io.c.groups.sims[io.c.g].proposeOn(NODE, etype, payload);
         }
     };
+
+    /// The sink messages' bytes in this group's log past what it applied,
+    /// read from the log itself: what its leader's driver must count in
+    /// flight, once a tick has released what applied.
+    /// Of those, the ones `from` sent, when it isn't null.
+    fn sinkBytesUnapplied(c: *GroupChannel, from: ?u16) u64 {
+        const sim = &c.groups.sims[c.g];
+        var total: u64 = 0;
+        var idx = sim.appliedIndex(NODE) + 1;
+        while (idx <= sim.lastIndex(NODE)) : (idx += 1) {
+            const e = sim.entryAt(NODE, idx, c.entry_buf) orelse continue;
+            if (e.header.entry_type != @backingInt(entry_mod.EntryType.channel_inbound)) continue;
+            total += sinkBytesOf(e.payload, from);
+        }
+        return total;
+    }
+
+    fn sinkBytesOf(inbound: []const u8, from: ?u16) u64 {
+        var diag: @import("../protocol/schema.zig").Diagnostic = .{};
+        const p = ce.Inbound.decodeAll(inbound, &diag) catch return 0;
+        if (from) |f| if (p.from != f) return 0;
+        var total: u64 = 0;
+        var it = p.messages.iterator();
+        while (it.next() catch null) |m| if (m.flags & entry_mod.Flags.SINK != 0) {
+            total += m.payload.len;
+        };
+        return total;
+    }
+
+    /// Every sink message an inbound about to be proposed carries fits its
+    /// shard's share and its sender's cap, judged here from the log and the
+    /// scenario's budget, not by the driver or `channels.sinkRoom`: what is
+    /// in flight is the log's unapplied sinks and those ahead of it in the
+    /// inbound. The driver counts no less, so a message it admits passes.
+    fn checkSinkAdmission(c: *GroupChannel, inbound: []const u8) void {
+        if (channels_mod.test_budget == null) return;
+        var diag: @import("../protocol/schema.zig").Diagnostic = .{};
+        const p = ce.Inbound.decodeAll(inbound, &diag) catch return;
+        const budget = probeBudget(c.read()).?;
+        const cap = @max(SINK_IN_FLIGHT_CAP / c.groups.chans.len, 1);
+        var all = c.sinkBytesUnapplied(null);
+        var own = c.sinkBytesUnapplied(p.from);
+        var it = p.messages.iterator();
+        var seq = p.first_seq;
+        while (it.next() catch null) |m| : (seq += 1) {
+            if (m.flags & entry_mod.Flags.SINK == 0) continue;
+            const bytes = m.payload.len;
+            if (budget.use + all + bytes > budget.share or (own > 0 and own + bytes > cap)) {
+                c.groups.oracle.failOn(@intCast(p.from), c.g, .sink, seq, "a sink's message was admitted past its shard's share");
+                return;
+            }
+            all += bytes;
+            own += bytes;
+        }
+    }
+
+    /// After a tick, the driver counts in flight exactly the sink bytes its
+    /// log holds past what it applied.
+    fn checkSinkBytes(c: *GroupChannel) void {
+        const sim = &c.groups.sims[c.g];
+        if (!sim.leadsReady(NODE) or sim.isHalted(NODE) or c.driver.term != sim.termOf(NODE)) return;
+        const want = c.sinkBytesUnapplied(null);
+        if (c.driver.sink_bytes != want) c.groups.oracle.fail(c.g, c.g, sim.appliedIndex(NODE), "a leader's sink bytes in flight are not its log's unapplied sinks");
+    }
 
     /// Where this group's duties run, its driver started over on a new
     /// term.
@@ -583,6 +654,20 @@ pub const GroupChannel = struct {
 
     /// What a target may park before more to it is refused.
     pub const PARKED_TARGET_CAP = 8 << 10;
+
+    /// With `--memory-share`, the budget the sink gate holds each group to:
+    /// a unit of use per full pool slot, against a share with room for two,
+    /// so fills put a group over its share and drains bring it back. Its
+    /// sinks in flight are bounded well below a unit, split over senders.
+    pub const SHARE_UNIT: u64 = 64 << 10;
+    pub const SHARE: u64 = 2 * SHARE_UNIT + SHARE_UNIT / 2;
+    pub const SINK_IN_FLIGHT_CAP: u64 = 4 << 10;
+
+    pub fn probeBudget(read_: view_mod.ReadView) ?channels_mod.Budget {
+        var full: u64 = 0;
+        for (POOL) |slot| full += @intFromBool(probe.slotFull(read_, slot));
+        return .{ .use = full * SHARE_UNIT, .share = SHARE };
+    }
 
     /// Slots most probes go to, so a target is written again while it is
     /// full, and parks.
@@ -809,7 +894,10 @@ pub const Groups = struct {
             if (!up) continue;
             if (self.on_frame) |handle| try handle(self, f) else self.chans[f.to].take(f);
         }
-        if (up) for (self.chans) |*c| c.tick();
+        if (up) for (self.chans) |*c| {
+            c.tick();
+            c.checkSinkBytes();
+        };
     }
 
     /// Each outbox's recorded bytes are the payload bytes of the records
@@ -926,6 +1014,11 @@ pub const Groups = struct {
                 var n: u64 = 0;
                 for (self.chans) |*c| n += c.driver.counts.pressured;
                 break :pressured n;
+            },
+            .over_share = over_share: {
+                var n: u64 = 0;
+                for (self.chans) |*c| n += c.driver.counts.over_share;
+                break :over_share n;
             },
             .unparks = unparks: {
                 var n: u64 = 0;
