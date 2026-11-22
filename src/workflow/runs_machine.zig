@@ -1136,6 +1136,9 @@ fn applyParent(view: *View, e: *const Entry, n: Named) ApplyError!void {
     switch (typeOf(e).?) {
         .child_start => {
             const p = ae.ChildStart.decodeAll(e.payload, &diag) catch return error.Halt;
+            // A workflow its runs' history can't name: refused to its
+            // parent here, before any start is made of it.
+            if (p.workflow.len > he.MAX_OWNER) return reply(view, n.ns, n.run, p.parent_slot, .refused, NAME_TOO_LONG);
             if (found) |f| {
                 // Sent again for the same call: the first stands. Another
                 // caller's start naming the same run (an id repeated across
@@ -2002,4 +2005,33 @@ test "workflow runs machine: a workflow named as long as a history owner may run
     const r = try f.start("r2", &longest, "workflow_started", "", 1);
     try testing.expectEqualStrings(NAME_TOO_LONG, r.refused().?.refusal.message);
     try testing.expect(f.get("r2") == null);
+}
+
+test "workflow runs machine: a child's start for a workflow named longer than a run's history may name is refused to its parent, recording nothing" {
+    var f = Fixture.init();
+    defer f.deinit();
+    var name: [he.MAX_OWNER + 1]u8 = undefined;
+    @memset(&name, 'k');
+    var cb: [ae.ChildStart.max_size]u8 = undefined;
+    for ([_][]const u8{ &name, name[0..he.MAX_OWNER] }, [_][]const u8{ "kid1", "kid2" }) |wf, kid| {
+        const cs = try ae.ChildStart.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .parent_slot = 7, .parent_run = "par", .parent_workflow = "pwf", .workflow = wf, .version = "", .run = kid, .input = "{}" });
+        f.index += 1;
+        const ce = entry_mod.buildEntry(.child_start, entry_mod.Flags.NONE, 1, f.index, 0, cs);
+        const before = f.store.families[channels.OutFam.ID].count;
+        try testing.expect((try Fixture.run(&machine, &f, &ce)).refused() == null);
+        const long = wf.len > he.MAX_OWNER;
+        // Too long: no record, and its parent told refused. At the most a
+        // history names: recorded, to be started.
+        try testing.expectEqual(!long, parentOf(.{ .store = &f.store }, .default, kid) != null);
+        try testing.expectEqual(before + @intFromBool(long), f.store.families[channels.OutFam.ID].count);
+    }
+    var it = (ReadView{ .store = &f.store }).range(channels.OutFam, "");
+    var told: ?ae.Reply.Value = null;
+    while (try it.next()) |item| {
+        if (item.value.v.entry_type != @backingInt(EntryType.call_reply)) continue;
+        var diag: schema.Diagnostic = .{};
+        told = try ae.Reply.decodeAll(item.value.v.payload, &diag);
+    }
+    try testing.expectEqual(ae.Answer.refused, told.?.answer);
+    try testing.expectEqualStrings("kid1", told.?.run);
 }

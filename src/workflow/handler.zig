@@ -252,7 +252,10 @@ pub const WorkflowHandler = struct {
     plan_health: std.StringHashMap(plan_types.ExecutorHealth),
 
     /// The longest workflow name: its runs' history names it as its owner.
-    pub const MAX_WORKFLOW_NAME_LEN: usize = @import("../protocol/history_entries.zig").MAX_OWNER;
+    pub const MAX_WORKFLOW_NAME_LEN: usize = 256;
+    comptime {
+        std.debug.assert(MAX_WORKFLOW_NAME_LEN == @import("../protocol/history_entries.zig").MAX_OWNER);
+    }
     /// The longest key a create or start entry carries.
     pub const MAX_START_KEY: usize = 600;
     /// The longest run id a start may choose: its key is the namespace's id
@@ -2459,6 +2462,12 @@ pub const WorkflowHandler = struct {
     fn callStep(self: *WorkflowHandler, shard: *Shard, run: *RunRecord, kind: ae.CallKind, target: []const u8, version: []const u8, input: []const u8, step_label: []const u8, ns: NamespaceId, can_wait: bool, now_ms: i64) ?[]const u8 {
         const slot = router.nsKeySlot(ns, target);
         if (input.len > ae.MAX_INPUT or version.len > ae.MAX_VERSION) return definition.StepOutcome.execution_failure;
+        // A child's runs' history names its workflow: one named longer is
+        // none that could exist.
+        if (kind == .workflow and target.len > MAX_WORKFLOW_NAME_LEN) {
+            self.addHistoryEvent(run, "step_call_too_large", "a workflow name is longer than a run's history may name", now_ms);
+            return definition.StepOutcome.execution_failure;
+        }
         // Its start goes to the callee's shard: held, as for a full log,
         // while that outbox, this shard's, or the namespace's share of
         // either has no room, so one tenant's calls can't fill them.
@@ -8601,4 +8610,32 @@ test "workflow history: a page holds at most its event bound and its byte bound,
     try testing.expectEqual(@as(usize, 5), all.len);
     // A limit of none still reads one.
     try testing.expectEqual(@as(usize, 1), (try handler.readRunHistory(a, key, rec, .{}, 0, false)).page.events.len);
+}
+
+test "a step calling a child workflow named longer than a run's history may name fails, saying so, and starts nothing" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    var name: [WorkflowHandler.MAX_WORKFLOW_NAME_LEN + 1]u8 = undefined;
+    @memset(&name, 'k');
+    var db: [1024]u8 = undefined;
+    const def = try std.fmt.bufPrint(&db, "{{\"kind\":\"Workflow\",\"name\":\"par\",\"version\":\"1.0.0\",\"start\":{{\"run\":\"@workflow/{s}\",\"transitions\":{{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}}}}", .{&name});
+    createTestDef(&handler, testKey(.default, "par"), "par", def);
+    createTestRun(&handler, testKey(.default, "p1"), "p1", "par");
+    handler.advanceWorkflow(&shard, testKey(.default, "p1"));
+    settleTest(&shard);
+    const run = handler.inspect(testKey(.default, "p1")).?;
+    try testing.expect(run.pending_action_run_id_owned == null);
+    var said = false;
+    for (run.history.items) |evt| {
+        if (std.mem.eql(u8, evt.event_type_owned, "step_call_too_large") and std.mem.eql(u8, evt.detail_owned, "a workflow name is longer than a run's history may name")) said = true;
+    }
+    try testing.expect(said);
 }
