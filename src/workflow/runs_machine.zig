@@ -3,7 +3,11 @@
 //!
 //! - `workflow.run`, keyed (namespace id, run id): what started it, how it
 //!   stands, and, once it ended, how and with what output.
-//! - `workflow.hist`, its history: the last `HIST_KEEP` events, by seq.
+//! - its history: none here. Each apply that adds events puts them in the
+//!   run's pending chunk (`hist_pending`), sent on the history lane to the
+//!   run's own slot as one `history_chunk` once full, and once the run
+//!   ends; the stream machine keeps where each chunk is in the log
+//!   (`stream/history_machine.zig`).
 //! - `workflow.out`, each step's outcome and output, by step name.
 //! - `workflow.idem`: the run each (workflow, idempotency key) started, so
 //!   a later start with that key is answered with it.
@@ -33,6 +37,7 @@
 const std = @import("std");
 const schema = @import("../protocol/schema.zig");
 const ae = @import("../protocol/action_entries.zig");
+const he = @import("../protocol/history_entries.zig");
 const limits = @import("../protocol/limits.zig");
 const view_mod = @import("../contract/view.zig");
 const machine_mod = @import("../contract/machine.zig");
@@ -82,8 +87,14 @@ pub const RunStatus = enum(u8) {
     }
 };
 
-/// The events a run's history keeps; each one past it drops the oldest.
-pub const HIST_KEEP: u64 = 256;
+/// The most event bytes a run holds before sending them: a chunk. An event
+/// over half of it goes at once, with those before it.
+pub const HIST_CHUNK: usize = 4 << 10;
+
+/// How much of an ended run's output its record keeps; the whole is in its
+/// history, as `OUTPUT_EVENT`'s detail, when it is longer.
+pub const OUTPUT_PREVIEW: usize = 1024;
+pub const OUTPUT_EVENT = "workflow_output";
 
 pub const Run = Record(&.{
     .{ .name = "workflow", .T = Bytes(MAX_PERSIST_PAYLOAD) },
@@ -96,12 +107,21 @@ pub const Run = Record(&.{
     // 0 until it ends.
     .{ .name = "completed_at_ms", .T = Int(i64) },
     .{ .name = "has_output", .T = Int(u8) },
+    // Once it ended, only its first `OUTPUT_PREVIEW` bytes, and whether
+    // there were more: the whole is its history's `OUTPUT_EVENT`.
     .{ .name = "output", .T = Bytes(MAX_PERSIST_PAYLOAD) },
+    .{ .name = "output_truncated", .T = schema.Bool },
+    // Empty once it ended, as its input is: a search covers live runs.
     .{ .name = "search_tags", .T = Bytes(MAX_PERSIST_PAYLOAD) },
-    // The seq the next history event takes, and how many were dropped to
-    // keep `HIST_KEEP`.
+    // Its history: the seq the next event takes, the first not yet sent,
+    // and those since, encoded (`HistRec`), sent once a chunk is full or
+    // the run ends.
     .{ .name = "hist_next", .T = Int(u64) },
-    .{ .name = "hist_dropped", .T = Int(u64) },
+    .{ .name = "hist_flushed", .T = Int(u64) },
+    .{ .name = "hist_pending", .T = Bytes(HIST_CHUNK) },
+    // The stamp of the entry that started it: its history's incarnation,
+    // so a run id used again never reads an earlier run's.
+    .{ .name = "created_ns", .T = Int(u64) },
     // The step it is at ("" for its start), and how many steps it has
     // taken: a `workflow_step` applies only at this `rev`, then adds one.
     .{ .name = "step", .T = Bytes(MAX_PERSIST_PAYLOAD) },
@@ -205,11 +225,10 @@ pub const Step = Record(&.{
     // The run's workflow, which counts its runs (`workflow.per_def`).
     .{ .name = "workflow", .T = Bytes(MAX_PERSIST_PAYLOAD) },
     // When the step ends the run: how (a terminal `RunStatus`; 0 for a step
-    // that doesn't), its output and its search tags.
+    // that doesn't) and its output.
     .{ .name = "ends", .T = Int(u8) },
     .{ .name = "has_output", .T = schema.Bool },
     .{ .name = "output", .T = Bytes(MAX_PERSIST_PAYLOAD) },
-    .{ .name = "tags", .T = Bytes(MAX_PERSIST_PAYLOAD) },
     // The call the step makes (an `ae.Call`; empty for none): recorded in
     // `step.calls` and its start sent in this apply, its callee the run's
     // new wait.
@@ -219,7 +238,9 @@ pub const Step = Record(&.{
     .{ .name = "takes", .T = schema.BoundedList(Take, MAX_SIGNALS, MAX_PERSIST_PAYLOAD) },
 });
 
-pub const Hist = Record(&.{
+/// One event of a run's history, as its chunk carries it.
+pub const HistRec = Record(&.{
+    .{ .name = "seq", .T = Int(u64) },
     .{ .name = "event", .T = Bytes(MAX_PERSIST_PAYLOAD) },
     .{ .name = "detail", .T = Bytes(MAX_PERSIST_PAYLOAD) },
     .{ .name = "at_ms", .T = Int(i64) },
@@ -270,7 +291,6 @@ pub const Parent = Record(&.{
 
 pub const Parents = view_mod.Family(26, "workflow.parents", .id, Stored(Parent));
 pub const RunFam = view_mod.Family(28, "workflow.run", .id, Stored(Run));
-pub const HistFam = view_mod.Family(29, "workflow.hist", .id, Stored(Hist));
 pub const IdemFam = view_mod.Family(64, "workflow.idem", .id, Stored(Idem));
 pub const PerDefFam = view_mod.Family(65, "workflow.per_def", .id, Stored(PerDef));
 pub const OutFam = view_mod.Family(66, "workflow.out", .id, Stored(Out));
@@ -470,16 +490,13 @@ pub const SERVER_KEY_REFUSED = "reserved idempotency key: a leading '_' is the s
 ///   [status:u8]
 ///   [has_output:u8]([output_len:u32][output])?
 ///   [event_len:u16][event][detail_len:u16][detail]
-///   [tags_len:u16][search_tags]
 ///   [wf_len:u16][workflow]
-/// The event is the run's last, stamped with the entry's time; the history
-/// before it is the run's own (`workflow.hist`).
+/// The event is the run's last, stamped with the entry's time.
 pub const Complete = struct {
     status: RunStatus,
     output: ?[]const u8,
     event: []const u8,
     detail: []const u8,
-    tags: []const u8,
     workflow: []const u8,
 
     pub fn parse(value: []const u8) ?Complete {
@@ -491,10 +508,9 @@ pub const Complete = struct {
         const output: ?[]const u8 = if (has_output == 1) c.take(c.int(u32) orelse return null) orelse return null else null;
         const event = c.take(c.int(u16) orelse return null) orelse return null;
         const detail = c.take(c.int(u16) orelse return null) orelse return null;
-        const tags = c.take(c.int(u16) orelse return null) orelse return null;
         const workflow = c.take(c.int(u16) orelse return null) orelse return null;
         if (c.off != value.len) return null;
-        return .{ .status = status, .output = output, .event = event, .detail = detail, .tags = tags, .workflow = workflow };
+        return .{ .status = status, .output = output, .event = event, .detail = detail, .workflow = workflow };
     }
 
     /// Its encoding into `buf`, or null when it doesn't fit.
@@ -506,7 +522,7 @@ pub const Complete = struct {
             w.writeInt(u32, std.math.cast(u32, o.len) orelse return null, .little) catch return null;
             w.writeAll(o) catch return null;
         } else w.writeByte(0) catch return null;
-        for ([_][]const u8{ c.event, c.detail, c.tags, c.workflow }) |part| {
+        for ([_][]const u8{ c.event, c.detail, c.workflow }) |part| {
             w.writeInt(u16, std.math.cast(u16, part.len) orelse return null, .little) catch return null;
             w.writeAll(part) catch return null;
         }
@@ -514,7 +530,7 @@ pub const Complete = struct {
     }
 
     pub fn size(c: Complete) usize {
-        return 2 + (if (c.output) |o| 4 + o.len else 0) + 8 + c.event.len + c.detail.len + c.tags.len + c.workflow.len;
+        return 2 + (if (c.output) |o| 4 + o.len else 0) + 6 + c.event.len + c.detail.len + c.workflow.len;
     }
 };
 
@@ -597,14 +613,12 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             const s = Start.parse(cmd.value) orelse return;
             try out.addIn(defs_machine.DefFam.ID, n.ns, s.workflow);
             try out.addIn(PerDefFam.ID, n.ns, s.workflow);
-            try out.addIn(HistFam.ID, n.ns, (try histKey(arena, n.ns, n.run, 0))[KEY_PREFIX..]);
             if (s.idem) |k| try out.addIn(IdemFam.ID, n.ns, (try idemKey(arena, n.ns, s.workflow, k))[KEY_PREFIX..]);
         },
         .workflow_step => {
             const cmd = command(e).?;
             try out.addIn(RunFam.ID, n.ns, n.run);
             const range = (try runRange(arena, n.ns, n.run))[KEY_PREFIX..];
-            out.addRangeIn(HistFam.ID, n.ns, range) catch return error.OutOfMemory;
             out.addRangeIn(OutFam.ID, n.ns, range) catch return error.OutOfMemory;
             // A wait on a signal: whether the run holds one of its type.
             out.addRangeIn(SigFam.ID, n.ns, range) catch return error.OutOfMemory;
@@ -620,7 +634,6 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         .workflow_signal => {
             try out.addIn(RunFam.ID, n.ns, n.run);
             const range = (try runRange(arena, n.ns, n.run))[KEY_PREFIX..];
-            out.addRangeIn(HistFam.ID, n.ns, range) catch return error.OutOfMemory;
             out.addRangeIn(SigFam.ID, n.ns, range) catch return error.OutOfMemory;
         },
         .workflow_complete => {
@@ -628,7 +641,6 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             try out.addIn(RunFam.ID, n.ns, n.run);
             const range = (try runRange(arena, n.ns, n.run))[KEY_PREFIX..];
             // Not the invalid namespace, checked above.
-            out.addRangeIn(HistFam.ID, n.ns, range) catch return error.OutOfMemory;
             out.addRangeIn(OutFam.ID, n.ns, range) catch return error.OutOfMemory;
             // An ended run's signals go with it.
             out.addRangeIn(SigFam.ID, n.ns, range) catch return error.OutOfMemory;
@@ -656,7 +668,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     const stamp_ms: i64 = @intCast(e.header.timestamp_ns / std.time.ns_per_ms);
     switch (typeOf(e).?) {
         .child_start, .child_refuse => return applyParent(view, e, n),
-        .workflow_start => return applyStart(view, n, command(e).?, stamp_ms, out),
+        .workflow_start => return applyStart(view, n, command(e).?, e.header.timestamp_ns, out),
         .workflow_step => return applyStep(view, n, command(e).?, stamp_ms, out),
         .workflow_signal => return applySignal(view, n, command(e).?, stamp_ms, out),
         .workflow_complete => return applyComplete(view, n, command(e).?, stamp_ms, out),
@@ -668,7 +680,8 @@ fn statusOf(r: Run.Value) RunStatus {
     return std.enums.fromInt(RunStatus, r.status) orelse .failed;
 }
 
-fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64, out: *Result) ApplyError!void {
+fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u64, out: *Result) ApplyError!void {
+    const stamp_ms: i64 = @intCast(stamp_ns / std.time.ns_per_ms);
     const s = Start.parse(cmd.value) orelse return error.Halt;
     const arena = view.arena;
     // Only a trigger's start says where it read, and every one does.
@@ -731,9 +744,12 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i6
         .completed_at_ms = 0,
         .has_output = 0,
         .output = "",
+        .output_truncated = false,
         .search_tags = if (def) |d| try searchTags(arena, d.yaml, s.input, n.run) else "",
         .hist_next = 0,
-        .hist_dropped = 0,
+        .hist_flushed = 0,
+        .hist_pending = "",
+        .created_ns = stamp_ns,
         .sig_next = 0,
         .sig_held = 0,
         .step = "",
@@ -746,8 +762,13 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i6
         .wait_timeout_to = "",
         .progress = "",
     };
-    // The run's first history event, as the start path recorded it.
+    // The run's first history event, as the start path recorded it. A run
+    // that starts ended sends it as its last.
     if (s.event.len > 0) try appendHist(view, n, &run, s.event, s.input, stamp_ms);
+    if (s.status.isTerminal()) {
+        run.completed_at_ms = stamp_ms;
+        try summarize(view, n, &run, null, false, stamp_ms);
+    }
     try view.put(RunFam, cmd.key, .{ .v = run });
     if (comptime plant.active != .runs_idem_unwritten) if (idem_key) |k| try view.put(IdemFam, k, .{ .v = .{ .run = n.run } });
 
@@ -882,17 +903,68 @@ fn oldestHeld(view: *View, n: Named, signal_type: []const u8, taken: []const []c
     return newest;
 }
 
-/// One event onto `run`'s history at its next seq; past `HIST_KEEP` the
-/// oldest goes, counted.
+/// One event onto `run`'s history at its next seq, in its pending chunk:
+/// sent first when it wouldn't fit there, and with it when it is over
+/// half a chunk.
 fn appendHist(view: *View, n: Named, run: *Run.Value, event: []const u8, detail: []const u8, at_ms: i64) ApplyError!void {
-    const arena = view.arena;
-    try view.put(HistFam, try histKey(arena, n.ns, n.run, run.hist_next), .{ .v = .{ .event = event, .detail = detail, .at_ms = at_ms } });
-    const keep: u64 = if (comptime plant.active == .runs_hist_keeps_257) HIST_KEEP + 1 else HIST_KEEP;
-    if (run.hist_next >= keep) {
-        try view.delete(HistFam, try histKey(arena, n.ns, n.run, run.hist_next - keep));
-        run.hist_dropped += 1;
-    }
+    const a = view.arena;
+    const rec: HistRec.Value = .{ .seq = run.hist_next, .event = event, .detail = detail, .at_ms = at_ms };
+    const buf = try a.alloc(u8, HistRec.encodedSize(rec) catch return error.Halt);
+    var w: schema.Writer = .{ .buf = buf };
+    HistRec.encode(&w, rec) catch return error.Halt;
+    const bytes = w.written();
+    if (run.hist_pending.len + bytes.len > HIST_CHUNK and run.hist_pending.len > 0) try flushHist(view, n, run, null);
+    const joined = try a.alloc(u8, run.hist_pending.len + bytes.len);
+    @memcpy(joined[0..run.hist_pending.len], run.hist_pending);
+    @memcpy(joined[run.hist_pending.len..], bytes);
+    run.hist_pending = joined;
     run.hist_next += 1;
+    if (bytes.len > HIST_CHUNK / 2) try flushHist(view, n, run, null);
+}
+
+/// An ended run's record made its summary: its output's preview, the whole
+/// in its history when longer; no input, tags or step outputs, all of
+/// which its history holds or a search of live runs needed; and its last
+/// chunk sent. A run that starts ended has no step outputs to drop.
+fn summarize(view: *View, n: Named, run: *Run.Value, output: ?[]const u8, has_steps: bool, stamp_ms: i64) ApplyError!void {
+    const out = output orelse "";
+    run.has_output = @intFromBool(output != null);
+    run.output_truncated = out.len > OUTPUT_PREVIEW;
+    if (run.output_truncated) try appendHist(view, n, run, OUTPUT_EVENT, out, stamp_ms);
+    run.output = out[0..@min(out.len, OUTPUT_PREVIEW)];
+    run.input = "";
+    run.search_tags = "";
+    if (has_steps and comptime plant.active != .runs_end_keeps_outputs) try view.deleteRange(OutFam, try runRange(view.arena, n.ns, n.run), null);
+    try flushHist(view, n, run, stamp_ms);
+}
+
+/// `run`'s pending events sent as one chunk on the history lane, to its
+/// workflow's slot, which is the run's own; with `ended_ms` the last, the
+/// run having ended then. A last chunk goes even with no events, so the
+/// run's rows move to its one ended row.
+fn flushHist(view: *View, n: Named, run: *Run.Value, ended_ms: ?i64) ApplyError!void {
+    const final = ended_ms != null;
+    if (run.hist_pending.len == 0 and !final) return;
+    const a = view.arena;
+    // A run's events are its own seqs: none pending is an empty range at
+    // the next one.
+    const last = if (run.hist_next > run.hist_flushed) run.hist_next - 1 else run.hist_flushed;
+    const buf = try a.alloc(u8, he.Chunk.max_size);
+    const payload = he.Chunk.encodeInto(buf, .{
+        .ns = n.ns.int(),
+        .family = @backingInt(he.Family.workflow),
+        .owner = run.workflow,
+        .run = n.run,
+        .created_ns = run.created_ns,
+        .first_seq = run.hist_flushed,
+        .last_seq = last,
+        .final = final,
+        .completed_ms = if (ended_ms) |ms| @intCast(@max(ms, 0)) else 0,
+        .records = run.hist_pending,
+    }) catch return error.Halt;
+    try view.sendFlagged(.user(n.ns), calls_mod.callerSlot(n.ns, run.workflow), @backingInt(EntryType.history_chunk), entry_mod.Flags.HISTORY, payload);
+    if (comptime plant.active != .runs_hist_flushed_kept) run.hist_flushed = run.hist_next;
+    run.hist_pending = "";
 }
 
 /// A step its leader took from the run at `rev`: applied only while the
@@ -970,14 +1042,15 @@ fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64
     run.wait_timeout_to = st.wait_timeout_to;
     run.progress = st.progress;
     run.status = @backingInt(if (st.wait == .none) RunStatus.running else RunStatus.waiting);
-    if (ends) |status| return endRun(view, n, cmd.key, &run, status, if (st.has_output) st.output else null, st.tags, stamp_ms);
+    if (ends) |status| return endRun(view, n, cmd.key, &run, status, if (st.has_output) st.output else null, stamp_ms);
     try view.put(RunFam, cmd.key, .{ .v = run });
 }
 
 fn applyComplete(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64, out: *Result) ApplyError!void {
     const c = Complete.parse(cmd.value) orelse return error.Halt;
-    // Runs are never removed: a completion names one that started.
-    var run = ((try view.get(RunFam, cmd.key)) orelse return error.Halt).v;
+    // A run deleted since its completion was proposed: refused, as a step
+    // or a signal to it is.
+    var run = ((try view.get(RunFam, cmd.key)) orelse return out.refuse(.not_found, .not_found, "run not found")).v;
     if (!std.mem.eql(u8, run.workflow, c.workflow)) return error.Halt;
     // The first completion in the log ends the run; a cancel and a
     // completion in flight together leave it as the first left it. A second
@@ -988,18 +1061,15 @@ fn applyComplete(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms:
     }
 
     try appendHist(view, n, &run, c.event, c.detail, stamp_ms);
-    return endRun(view, n, cmd.key, &run, c.status, c.output, c.tags, stamp_ms);
+    return endRun(view, n, cmd.key, &run, c.status, c.output, stamp_ms);
 }
 
 /// `run` ended `status` at `stamp_ms`: no longer counted among its
 /// workflow's, and a child's parent hears how, its record gone.
-fn endRun(view: *View, n: Named, run_key: []const u8, run: *Run.Value, status: RunStatus, output: ?[]const u8, tags: []const u8, stamp_ms: i64) ApplyError!void {
+fn endRun(view: *View, n: Named, run_key: []const u8, run: *Run.Value, status: RunStatus, output: ?[]const u8, stamp_ms: i64) ApplyError!void {
     const arena = view.arena;
     run.status = @backingInt(status);
     run.completed_at_ms = stamp_ms;
-    run.has_output = @intFromBool(output != null);
-    run.output = output orelse "";
-    if (tags.len > 0) run.search_tags = tags;
     run.wait = .none;
     run.wait_kind = .action;
     run.wait_slot = 0;
@@ -1007,6 +1077,7 @@ fn endRun(view: *View, n: Named, run_key: []const u8, run: *Run.Value, status: R
     run.wait_due_ms = 0;
     run.wait_timeout_to = "";
     run.progress = "";
+    try summarize(view, n, run, output, true, stamp_ms);
     // Signals no wait took: none can now.
     if (comptime plant.active != .runs_end_keeps_signals) {
         try view.deleteRange(SigFam, try runRange(arena, n.ns, n.run), null);
@@ -1144,7 +1215,6 @@ pub const machine: machine_mod.Machine = .{
         machine_mod.info(calls_mod.Calls),
         machine_mod.info(Parents),
         machine_mod.info(RunFam),
-        machine_mod.info(HistFam),
         machine_mod.info(IdemFam),
         machine_mod.info(PerDefFam),
         machine_mod.info(OutFam),
@@ -1170,8 +1240,10 @@ const Fixture = struct {
     fn init() Fixture {
         var f: Fixture = .{ .store = Store.init(testing.allocator), .scratch = .init(testing.allocator) };
         f.store.strict_keys = true;
-        // A group of two, so a parent's slot is another group's.
-        f.store.place = .{ .group = 0, .count = 2 };
+        // A group of two, so a parent's slot is another group's; this one
+        // owns workflow "wf"'s slot, where its runs' history goes.
+        const group = channels.ownerOf(.{ .group = 0, .count = 2 }, calls_mod.callerSlot(.default, "wf"));
+        f.store.place = .{ .group = group, .count = 2 };
         return f;
     }
 
@@ -1233,7 +1305,6 @@ const Fixture = struct {
             .ends = if (spec.ends) |e| @backingInt(e) else 0,
             .has_output = spec.ends != null,
             .output = if (spec.ends != null) "out" else "",
-            .tags = "",
             .call = spec.call,
             .takes = .{ .bytes = tw.written(), .count = @intCast(spec.takes.len) },
         };
@@ -1270,13 +1341,27 @@ const Fixture = struct {
         return perDefOf(.{ .store = &f.store }, view_mod.idKey(&kb, .default, wf) catch unreachable);
     }
 
-    /// The seqs of `run_id`'s history, oldest first.
-    fn histSeqs(f: *Fixture, run_id: []const u8, out: []u64) ![]u64 {
-        const prefix = try runRange(testing.allocator, .default, run_id);
-        defer testing.allocator.free(prefix);
-        var it = (ReadView{ .store = &f.store }).range(HistFam, prefix);
+    /// The history chunks this group has sent itself, oldest first, as
+    /// they are in its outbox (into `f.scratch`).
+    fn chunks(f: *Fixture) ![]he.Chunk.Value {
+        const a = f.scratch.allocator();
+        var pb: [channels.CHAN_KEY]u8 = undefined;
+        const prefix = channels.outPrefix(&pb, f.store.place.?.group, .history);
+        var it = (ReadView{ .store = &f.store }).range(channels.OutFam, prefix);
+        var got: std.ArrayListUnmanaged(he.Chunk.Value) = .empty;
+        while (try it.next()) |item| {
+            var diag: schema.Diagnostic = .{};
+            try got.append(a, try he.Chunk.decodeAll(try a.dupe(u8, item.value.v.payload), &diag));
+        }
+        return got.items;
+    }
+
+    /// The seqs `records` (a chunk's, or a run's pending) holds, in order.
+    fn seqsOf(records: []const u8, out: []u64) ![]u64 {
+        var diag: schema.Diagnostic = .{};
+        var r: schema.Reader = .{ .bytes = records, .diag = &diag };
         var n: usize = 0;
-        while (try it.next()) |item| : (n += 1) out[n] = std.mem.readInt(u64, item.key[item.key.len - 8 ..][0..8], .big);
+        while (r.pos < records.len) : (n += 1) out[n] = (try HistRec.decode(&r, "rec")).seq;
         return out[0..n];
     }
 };
@@ -1304,7 +1389,7 @@ fn startValue(buf: []u8, wf: []const u8, event: []const u8, idem: []const u8) []
 
 /// A cancel's completion of a run of `wf`.
 fn completeValue(buf: []u8, status: RunStatus, wf: []const u8) []const u8 {
-    const c: Complete = .{ .status = status, .output = null, .event = "workflow_cancelled", .detail = "stop", .tags = "", .workflow = wf };
+    const c: Complete = .{ .status = status, .output = null, .event = "workflow_cancelled", .detail = "stop", .workflow = wf };
     return c.encode(buf).?;
 }
 
@@ -1320,8 +1405,11 @@ test "workflow runs machine: a start creates its run, first event, idempotency k
     try testing.expectEqual(@as(u64, 0), run.rev);
     try testing.expectEqual(@as(u64, 1), run.hist_next);
     try testing.expectEqual(@as(u32, 1), f.active("wf").?.active);
+    // Its first event is pending, under its incarnation's stamp.
     var seqs: [4]u64 = undefined;
-    try testing.expectEqualSlices(u64, &.{0}, try f.histSeqs("r1", &seqs));
+    try testing.expectEqualSlices(u64, &.{0}, try Fixture.seqsOf(run.hist_pending, &seqs));
+    try testing.expectEqual(@as(u64, 1000 * std.time.ns_per_ms), run.created_ns);
+    try testing.expectEqual(@as(usize, 0), (try f.chunks()).len);
 
     // The key started r1: a second start with it is answered with r1.
     r = try f.start("r2", "wf", "workflow_started", "k", 1001);
@@ -1360,7 +1448,7 @@ test "workflow runs machine: a step applies only at its run's rev, and never aft
     try testing.expect((try f.step("r1", .{ .rev = 2 })).refused() != null);
 }
 
-test "workflow runs machine: a run's history keeps its last 256 events, counting the dropped; a cancel ends it and a second cancel changes nothing" {
+test "workflow runs machine: a run's history is sent in chunks, each event once and in order, the last with its end; a cancel ends it and a second cancel changes nothing" {
     var f = Fixture.init();
     defer f.deinit();
     _ = try f.start("r1", "wf", "workflow_started", "", 1);
@@ -1369,12 +1457,25 @@ test "workflow runs machine: a run's history keeps its last 256 events, counting
     for (0..5) |i| try testing.expect((try f.step("r1", .{ .rev = i, .events = 60 })).refused() == null);
     var run = f.get("r1").?;
     try testing.expectEqual(@as(u64, 301), run.hist_next);
-    try testing.expectEqual(@as(u64, 301 - HIST_KEEP), run.hist_dropped);
-    var seqs: [301]u64 = undefined;
-    const kept = try f.histSeqs("r1", &seqs);
-    try testing.expectEqual(@as(usize, HIST_KEEP), kept.len);
-    try testing.expectEqual(@as(u64, 301 - HIST_KEEP), kept[0]);
-    try testing.expectEqual(@as(u64, 300), kept[kept.len - 1]);
+    try testing.expect(run.hist_pending.len <= HIST_CHUNK);
+    // What was sent and what is pending: every seq, once, in order.
+    var seqs: [400]u64 = undefined;
+    var n: usize = 0;
+    for (try f.chunks()) |c| {
+        try testing.expectEqualStrings("r1", c.run);
+        try testing.expectEqualStrings("wf", c.owner);
+        try testing.expect(!c.final);
+        try testing.expect(c.records.len <= HIST_CHUNK);
+        const got = try Fixture.seqsOf(c.records, seqs[n..]);
+        try testing.expectEqual(c.first_seq, got[0]);
+        try testing.expectEqual(c.last_seq, got[got.len - 1]);
+        n += got.len;
+    }
+    try testing.expect(n > 0);
+    try testing.expectEqual(@as(u64, n), run.hist_flushed);
+    n += (try Fixture.seqsOf(run.hist_pending, seqs[n..])).len;
+    for (seqs[0..n], 0..) |seq, i| try testing.expectEqual(@as(u64, i), seq);
+    try testing.expectEqual(@as(usize, 301), n);
 
     var vb: [512]u8 = undefined;
     try testing.expect((try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 50)).refused() == null);
@@ -1382,6 +1483,14 @@ test "workflow runs machine: a run's history keeps its last 256 events, counting
     try testing.expectEqual(@as(u8, @backingInt(RunStatus.cancelled)), run.status);
     try testing.expectEqual(@as(i64, 50), run.completed_at_ms);
     try testing.expectEqual(@as(u64, 302), run.hist_next);
+    // Its end sent what was pending as its last chunk.
+    try testing.expectEqual(@as(u64, 302), run.hist_flushed);
+    try testing.expectEqualStrings("", run.hist_pending);
+    const sent = try f.chunks();
+    const last = sent[sent.len - 1];
+    try testing.expect(last.final);
+    try testing.expectEqual(@as(u64, 50), last.completed_ms);
+    try testing.expectEqual(@as(u64, 301), last.last_seq);
     try testing.expectEqual(@as(u32, 1), f.active("wf").?.active);
     // A second cancel: OK, and nothing changes. Another end: refused.
     const commits = f.store.families[RunFam.ID].commits;
@@ -1389,9 +1498,53 @@ test "workflow runs machine: a run's history keeps its last 256 events, counting
     try testing.expectEqual(commits, f.store.families[RunFam.ID].commits);
     const other = try f.complete("r1", completeValue(&vb, .failed, "wf"), 70);
     try testing.expectEqualStrings("run already finished", other.refused().?.refusal.message);
-    // One naming another workflow, or a run never started, is a broken log.
+    // One naming another workflow is a broken log; one for a run not
+    // there (deleted since it was proposed) is refused, changing nothing.
     try testing.expectError(error.Halt, f.complete("r2", completeValue(&vb, .cancelled, "other"), 80));
-    try testing.expectError(error.Halt, f.complete("nope", completeValue(&vb, .cancelled, "wf"), 80));
+    const gone = try f.complete("nope", completeValue(&vb, .cancelled, "wf"), 80);
+    try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, gone.refused().?.status);
+    try testing.expect(f.get("nope") == null);
+}
+
+test "workflow runs machine: a step, a signal or a completion for a run not there is refused, sending nothing" {
+    var f = Fixture.init();
+    defer f.deinit();
+    var vb: [512]u8 = undefined;
+    const sent = (try f.chunks()).len;
+    try testing.expect((try f.step("gone", .{ .rev = 0 })).refused() != null);
+    try testing.expect((try f.complete("gone", completeValue(&vb, .completed, "wf"), 5)).refused() != null);
+    var kb: [64]u8 = undefined;
+    var sb: [64]u8 = undefined;
+    const sig = try Signal.encodeInto(&sb, .{ .type = "go", .payload = "" });
+    try testing.expect((try f.command(.workflow_signal, view_mod.idKey(&kb, .default, "gone") catch unreachable, sig, 5)).refused() != null);
+    try testing.expectEqual(sent, (try f.chunks()).len);
+    try testing.expect(f.get("gone") == null);
+}
+
+test "workflow runs machine: an ended run keeps a summary: a preview of its output, its whole output sent, no input, tags or step outputs" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    try testing.expect((try f.step("r1", .{ .rev = 0, .output_step = "s1" })).refused() == null);
+    var ob: [3000]u8 = undefined;
+    @memset(&ob, 'o');
+    var vb: [4096]u8 = undefined;
+    const value = (Complete{ .status = .completed, .output = &ob, .event = "workflow_completed", .detail = "", .workflow = "wf" }).encode(&vb).?;
+    try testing.expect((try f.complete("r1", value, 9)).refused() == null);
+    const run = f.get("r1").?;
+    try testing.expectEqual(@as(usize, OUTPUT_PREVIEW), run.output.len);
+    try testing.expect(run.output_truncated);
+    try testing.expectEqualStrings("", run.input);
+    try testing.expectEqualStrings("", run.search_tags);
+    var none = (ReadView{ .store = &f.store }).range(OutFam, try runRange(f.scratch.allocator(), .default, "r1"));
+    try testing.expect((try none.next()) == null);
+    // The whole output was sent: over half a chunk, at once, then the
+    // last chunk.
+    const sent = try f.chunks();
+    try testing.expect(sent[sent.len - 1].final);
+    var whole = false;
+    for (sent) |c| whole = whole or (std.mem.indexOf(u8, c.records, OUTPUT_EVENT) != null and std.mem.indexOf(u8, c.records, &ob) != null);
+    try testing.expect(whole);
 }
 
 test "workflow runs machine: a step's call is recorded and its start sent with it; a step taking its end applies only once it settled" {

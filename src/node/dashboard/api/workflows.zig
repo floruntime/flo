@@ -444,7 +444,7 @@ fn decodeRunCursor(buf: *[MAX_RUN_CURSOR]u8, hex: []const u8) error{BadCursor}![
 /// A `workflow_status` answer: [run_id:u16][workflow:u16][version:u16]
 /// [status:u8][current_step:u16][input:u32][created_at:i64]
 /// [has:u8][started_at:i64]? [has:u8][completed_at:i64]?
-/// [has:u8][wait_signal:u16]? [has:u8][output:u32]?
+/// [has:u8][wait_signal:u16]? [has:u8]([output:u32][truncated:u8])?
 const RunState = struct {
     run_id: []const u8,
     workflow: []const u8,
@@ -457,6 +457,8 @@ const RunState = struct {
     completed_at: ?i64,
     wait_signal: ?[]const u8,
     output: ?[]const u8,
+    /// An ended run's output is a preview: its history holds the whole.
+    output_truncated: bool = false,
 
     fn parse(answer: []const u8) ?RunState {
         var r = WireReader.init(answer);
@@ -473,6 +475,7 @@ const RunState = struct {
         run.completed_at = if ((r.readU8() orelse return null) != 0) r.readI64() orelse return null else null;
         run.wait_signal = if ((r.readU8() orelse return null) != 0) r.readLengthPrefixed(u16) orelse return null else null;
         run.output = if ((r.readU8() orelse return null) != 0) r.readLengthPrefixed(u32) orelse return null else null;
+        run.output_truncated = if (run.output != null) (r.readU8() orelse return null) != 0 else false;
         return run;
     }
 };
@@ -710,6 +713,7 @@ fn getRunStatus(allocator: Allocator, run_id: []const u8, query_string: ?[]const
     try optionalString(&obj, "error_message", summary.error_message);
     try jsonOrString(allocator, &obj, writer, "input", if (run.input.len > 0) run.input else null);
     try jsonOrString(allocator, &obj, writer, "output", run.output);
+    try obj.boolField("output_truncated", run.output_truncated);
     try obj.nullField("step_results");
     try optionalString(&obj, "triggered_by", summary.triggered_by);
     try obj.nullField("search_attributes");

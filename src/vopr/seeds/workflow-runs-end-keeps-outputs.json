@@ -37,6 +37,8 @@
   "group_percent": 0,
   "processing_percent": 0,
   "workflow_percent": 51,
+  "kv_reap_percent": 0,
+  "memory_share": 0,
   "namespace_creates": false,
   "apply_lag_permille": 0,
   "apply_lag_max_ms": 0,

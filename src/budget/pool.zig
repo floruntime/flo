@@ -82,19 +82,18 @@ pub const CHARGED = [_]u16{
 /// The families the pool is not charged for: the node's own state, and
 /// workflow state, which is charged with the move of its caps to apply.
 pub const EXEMPT = [_]u16{
-    // step.calls; workflow parents, def, run, hist
+    // step.calls; workflow parents, def, run
     25, 26,
     27, 28,
-    29,
     // settings: policy, node, budget, bind
-    50,
-    51, 52,
-    68,
+    50, 51,
+    52, 68,
     // channels: in (one record per sender group)
     57,
     // workflow: idem, per_def, out, sig
-    64, 65,
-    66, 67,
+    64,
+    65, 66,
+    67,
     // history.wf: a workflow run's history rows, exempt as workflow state is
     70,
 };

@@ -104,6 +104,13 @@ pub const WaiterKind = enum(u8) {
     /// A stream read whose payloads are being read back from disk: made
     /// again once they are, and refused retryable if they aren't in time.
     stream_disk_read,
+
+    /// A workflow run's history read whose chunks haven't all landed, or
+    /// are being read back from disk: asked again as they land, and at its
+    /// deadline answered with what did. `stream.limit` is its limit,
+    /// `stream.partition` its order and whether it has a cursor, and
+    /// `min_version` the cursor.
+    workflow_history,
 };
 
 /// The window a parked stream read covers: records of one stream strictly

@@ -504,6 +504,53 @@ pub fn rowsOf(read: ReadView, a: std.mem.Allocator, family: he.Family, ns: Names
     return rows;
 }
 
+/// `run`'s ended row of incarnation `created_ns`, ended at `completed_ms`,
+/// if it has one and it is `run`'s owner's.
+pub fn endedRow(read: ReadView, a: std.mem.Allocator, family: he.Family, ns: NamespaceId, owner: []const u8, run: []const u8, created_ns: u64, completed_ms: u64) ?Row.Value {
+    const k = inNs(a, ns, endedKey(a, owner, run, created_ns, completed_ms) catch return null) catch return null;
+    const got = switch (family) {
+        .workflow => read.get(Workflows, k) catch null,
+        .action => read.get(Actions, k) catch null,
+    };
+    const g = got orelse return null;
+    return if (std.mem.eql(u8, g.v.owner, owner)) g.v else null;
+}
+
+/// Why `F`'s rows break what a run's history keeps, or null: a run with
+/// its ended row has no live, marker or final row besides. A chunk landing
+/// after a run ended would make it live again.
+pub fn ruleOf(comptime F: type, read: ReadView, a: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
+    var it = read.range(F, "");
+    while (it.next() catch return "a history row could not be read") |item| {
+        const k = item.key;
+        // `ns ‖ E ‖ owner hash ‖ completed_ms ‖ run len ‖ run ‖ created_ns`
+        if (k.len < 4 + 1 + 8 + 8 + 2 or k[4] != @backingInt(Tag.ended)) continue;
+        const run_len = std.mem.readInt(u16, k[21..23], .big);
+        if (k.len != 23 + run_len + 8) return "an ended history row's key is not one";
+        // The run's own rows: its tag, then its incarnation.
+        for ([_]Tag{ .live, .marker, .final }) |tag| {
+            const prefix = try a.alloc(u8, 4 + 1 + 8 + 2 + run_len + 8);
+            @memcpy(prefix[0..4], k[0..4]);
+            prefix[4] = @backingInt(tag);
+            @memcpy(prefix[5..13], k[5..13]);
+            @memcpy(prefix[13..], k[21..]);
+            var rows = read.range(F, prefix);
+            if ((rows.next() catch return "a history row could not be read") != null) return "a run with its ended row has live, marker or final rows besides";
+        }
+    }
+    return null;
+}
+
+/// The last seq `run`'s rows hold, landed or known lost, of incarnation
+/// `created_ns` (`completed_ms` as for `rowsOf`); null for none landed. A
+/// fold's row covers its rows' seqs, so this reads rows only, never the log.
+pub fn landedThrough(read: ReadView, a: std.mem.Allocator, family: he.Family, ns: NamespaceId, owner: []const u8, run: []const u8, created_ns: u64, completed_ms: ?u64) ?u64 {
+    var rows = rowsOf(read, a, family, ns, owner, run, created_ns, completed_ms) catch return null;
+    var last: ?u64 = null;
+    while (rows.next()) |l| last = @max(last orelse 0, l.last_seq);
+    return last;
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -918,4 +965,23 @@ test "history: every row's slot follows from the owner it stores, as its chunks 
         const n = try slot_check.expectFamily(&t.store, Actions.ID, router.nsKeySlot(.default, owner), {}, Derive.slot);
         try testing.expect(n > 0);
     }
+}
+
+test "history machine: a run with its ended row and a chunk landed after it breaks the rule VOPR checks" {
+    var t = H.init();
+    defer t.deinit();
+    const r: H.Run = .{};
+    try t.chunk(r, 0, 1, false, 0);
+    try t.chunk(r, 2, 3, true, 50);
+    try t.pump();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect(t.ended(r, 50) != null);
+    try testing.expect(try ruleOf(Actions, t.read(), arena.allocator()) == null);
+    try testing.expect(endedRow(t.read(), arena.allocator(), .action, r.ns, r.owner, r.run, r.created_ns, 50) != null);
+    try testing.expect(endedRow(t.read(), arena.allocator(), .action, r.ns, r.owner, r.run, r.created_ns, 51) == null);
+    // A chunk after its end makes the run live again.
+    try t.chunk(r, 4, 4, false, 0);
+    try t.pump();
+    try testing.expectEqualStrings("a run with its ended row has live, marker or final rows besides", (try ruleOf(Actions, t.read(), arena.allocator())).?);
 }

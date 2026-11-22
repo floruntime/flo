@@ -418,7 +418,9 @@ fn verifyWorkflows(ctx: *stdx.testing.TestContext, restarted: bool) !void {
         defer testing.allocator.free(status);
         var want: [96]u8 = undefined;
         try testing.expectEqualStrings("Workflow: same (latest)", line(status, "Workflow:") orelse return error.NoLine);
-        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "Input:    {s}", .{try runInput(&buf, ns, 1)}), line(status, "Input:") orelse return error.NoLine);
+        // An ended run's status keeps no input; its history's start does.
+        const shown_input = if (i == 0) "" else try runInput(&buf, ns, 1);
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "Input:    {s}", .{shown_input}), line(status, "Input:") orelse return error.NoLine);
         // A run waiting for a signal isn't restored as waiting across a
         // restart, so namespace 1's is checked only before one.
         if (i == 0 or !restarted) {
