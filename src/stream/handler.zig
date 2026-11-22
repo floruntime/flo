@@ -1557,7 +1557,9 @@ pub const StreamHandler = struct {
 
     pub const HistoryRead = struct {
         pieces: []const HistoryPiece,
-        /// A piece is being read back from disk: the read stopped before it.
+        /// A piece isn't in hand now (being read back from disk, or the
+        /// disk read held back for now): the read stopped before it, and is
+        /// answered retryable, never as lost.
         pending: bool,
     };
 
@@ -1584,7 +1586,7 @@ pub const StreamHandler = struct {
                 continue;
             }
             const raw = self.entryPayload(l.ual_index) orelse {
-                if (self.held == .pending) {
+                if (self.held != .no) {
                     pending = true;
                     break;
                 }
@@ -1598,17 +1600,23 @@ pub const StreamHandler = struct {
             var diag: schema.Diagnostic = .{};
             switch (kind) {
                 .chunk => {
-                    const c = history_entries.Chunk.decodeAll(msg, &diag) catch {
+                    // Another run's chunk where this row points is a lost one,
+                    // never read as this run's.
+                    const decoded = history_entries.Chunk.decodeAll(msg, &diag) catch null;
+                    if (decoded == null or !sameRun(decoded.?, owner, run, created_ns)) {
                         try pieces.append(a, .{ .first_seq = l.first_seq, .last_seq = l.last_seq, .records = "", .lost = true });
                         continue;
-                    };
+                    }
+                    const c = decoded.?;
                     try pieces.append(a, .{ .first_seq = c.first_seq, .last_seq = c.last_seq, .records = try a.dupe(u8, c.records), .lost = false });
                 },
                 .index => {
-                    const x = history_entries.Index.decodeAll(msg, &diag) catch {
+                    const decoded = history_entries.Index.decodeAll(msg, &diag) catch null;
+                    if (decoded == null or !sameRun(decoded.?, owner, run, created_ns)) {
                         try pieces.append(a, .{ .first_seq = l.first_seq, .last_seq = l.last_seq, .records = "", .lost = true });
                         continue;
-                    };
+                    }
+                    const x = decoded.?;
                     var listed: std.ArrayListUnmanaged(history_entries.Locator.Value) = .empty;
                     var it = x.locators.iterator();
                     while (it.next() catch null) |inner| try listed.append(a, inner);
@@ -1619,6 +1627,10 @@ pub const StreamHandler = struct {
             }
         }
         return .{ .pieces = pieces.items, .pending = pending };
+    }
+
+    fn sameRun(v: anytype, owner: []const u8, run: []const u8, created_ns: u64) bool {
+        return v.created_ns == created_ns and std.mem.eql(u8, v.owner, owner) and std.mem.eql(u8, v.run, run);
     }
 
     /// Message `part` (its place in the inbound, plus one) of an inbound's

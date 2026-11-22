@@ -1621,6 +1621,8 @@ pub const Shard = struct {
         const bound = settings_machine.boundShare(read);
         const cap = self.outbox_caps.historyCap(if (bound) |b| b.share_bytes else null);
         const total = channels_mod.metaOf(read, self.id, .history).bytes;
+        // Under its cap, the lane holds nothing.
+        if (total < cap) return null;
         const held = channels_mod.nsBytesOf(read, self.id, .history, ns);
         if (held > 0 and total >= 2 * cap) return .{ .history = .{ .bytes = held, .cap = cap } };
         if (raft_node_mod.shareHeld(held, total, cap)) return .{ .history = .{ .bytes = held, .cap = cap } };
@@ -29215,7 +29217,7 @@ test "Shard: a group read in a namespace never created is refused no_namespace, 
     try std.testing.expect(shard.namespace_handler.idOf("nope") == null);
 }
 
-test "Shard: history queued past its lane's cap holds only the namespaces holding a share of it, and at twice the cap every one with any; other writes not at all" {
+test "Shard: history queued under its lane's cap holds nothing; past it, only the namespaces holding a share of it, and at twice the cap every one with any; other writes not at all" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
@@ -29240,12 +29242,12 @@ test "Shard: history queued past its lane's cap holds only the namespaces holdin
             try view.commit();
         }
     };
-    // Under the cap, nothing waits.
-    try Sends.history(&shard, big, 250);
+    // Under the cap, nothing waits: not even a namespace holding nearly all
+    // of it.
+    try Sends.history(&shard, big, 350);
     try std.testing.expect(shard.historyWait(big) == null);
-    // Past three quarters, the namespace holding most of it waits; one
-    // holding little, and one holding none, don't; nor any main-lane write.
-    try Sends.history(&shard, big, 100);
+    // At the cap, the namespace holding most of it waits; one holding
+    // little, and one holding none, don't; nor any main-lane write.
     try Sends.history(&shard, small, 50);
     try std.testing.expect(shard.historyWait(big).? == .history);
     try std.testing.expect(shard.sendWait(0, .history, big).? == .history);
@@ -31759,6 +31761,26 @@ test "Shard: a run's history, sent to its own shard as it goes and folded, reads
         row.last_seq = 6;
         try view.put(hm.Actions, no_message, .{ .v = row });
         try view.commit();
+        // And one pointing at another run's index: never read as this run's.
+        var ended = try hm.rowsOf(.{ .store = st }, al, .action, .default, owner, "r1", 5, 4242);
+        const theirs = ended.next().?;
+        const borrowed = try hm.liveRowKey(al, .default, owner, "r4", 8, theirs.ual_index, theirs.part);
+        var ks2 = contract_view.KeySet.init(al);
+        try ks2.add(hm.Actions.ID, "", borrowed);
+        var view2 = contract_view.View.init(st, al, &ks2);
+        view2.strict = false;
+        var stolen = std.mem.zeroes(hm.Row.Value);
+        stolen.owner = owner;
+        stolen.kind = theirs.kind;
+        stolen.ual_index = theirs.ual_index;
+        stolen.part = theirs.part;
+        stolen.first_seq = 1;
+        stolen.last_seq = 20;
+        try view2.put(hm.Actions, borrowed, .{ .v = stolen });
+        try view2.commit();
+        const other = try a.stream_handler.readHistory(al, .action, .default, owner, "r4", 8, null, 10);
+        try std.testing.expectEqual(@as(usize, 1), other.pieces.len);
+        try std.testing.expect(other.pieces[0].lost);
         const lost = try a.stream_handler.readHistory(al, .action, .default, owner, "r3", 7, null, 10);
         try std.testing.expect(!lost.pending);
         try std.testing.expectEqual(@as(usize, 2), lost.pieces.len);

@@ -236,6 +236,10 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     const msg = view.message orelse return error.Halt;
     if (e.header.flags & entry_mod.Flags.HISTORY == 0) return error.Halt;
     const h = headOfEntry(e) orelse return out.refuse(.bad_request, .malformed, "bad request: a history entry that names no run");
+    // A run's history goes to its owner's slot, and a fold back to the slot
+    // its chunk came to: one that came to another is misrouted or forged,
+    // and would key rows a move of that slot couldn't find.
+    if (router.nsKeySlot(h.ns, h.owner) != msg.slot) return error.Halt;
     return switch (h.family) {
         .workflow => applyIn(Workflows, view, e, msg, h),
         .action => applyIn(Actions, view, e, msg, h),
@@ -564,7 +568,13 @@ const H = struct {
     /// Every message on the history lane delivered, one inbound each, until
     /// none is left: what the folds send comes round too.
     fn pump(t: *H) !void {
-        while (true) {
+        return t.pumpAtMost(std.math.maxInt(usize));
+    }
+
+    /// `pump`, delivering at most `n` messages.
+    fn pumpAtMost(t: *H, n: usize) !void {
+        var left = n;
+        while (left > 0) : (left -= 1) {
             const next = channels.metaOf(t.read(), 0, .history).next_seq;
             const applied = if (channels.inOf(t.read(), 0, .history)) |i| i.applied else 0;
             if (applied + 1 >= next) return;
@@ -587,6 +597,19 @@ const H = struct {
             var res = Result.start(&e);
             try machine_mod.applyEntry(&Ch.machine, &t.store, &t.scratch, &e, &res);
         }
+    }
+
+    /// How many messages of `etype` this group has sent itself.
+    fn sent(t: *H, etype: EntryType) usize {
+        var n: usize = 0;
+        const next = channels.metaOf(t.read(), 0, .history).next_seq;
+        var seq: u64 = channels.metaOf(t.read(), 0, .history).acked + 1;
+        while (seq < next) : (seq += 1) {
+            var kb: [channels.OUT_KEY]u8 = undefined;
+            const o = (t.read().get(channels.OutFam, channels.outKey(&kb, 0, .history, seq)) catch null) orelse continue;
+            if (o.v.entry_type == @backingInt(etype)) n += 1;
+        }
+        return n;
     }
 
     fn countTag(t: *H, r: Run, tag: Tag) usize {
@@ -684,6 +707,49 @@ test "history: chunks landing while a fold is on its way add rows, and only one 
     try testing.expectEqual(@as(usize, 6), got.len);
     try testing.expectEqual(@as(u8, @backingInt(he.Kind.index)), got[got.len - 1].kind);
     try testing.expectEqual(@as(usize, 0), t.countTag(r, .marker));
+    // One fold in all: the five that landed while it was on its way sent
+    // none of their own.
+    try testing.expectEqual(@as(usize, 1), t.sent(.history_index));
+}
+
+test "history: a drop that lands before a fold already on its way leaves nothing, and the fold changes nothing" {
+    var t = H.init();
+    defer t.deinit();
+    const r: H.Run = .{};
+    for (0..16) |i| try t.chunk(r, i + 1, i + 1, false, 0);
+    // The 16th lands and sends its fold, behind the drop on the lane.
+    try t.pumpAtMost(15);
+    try t.dropOf(r, 0);
+    try t.pump();
+    try testing.expectEqual(@as(usize, 1), t.sent(.history_index));
+    try testing.expectEqual(@as(usize, 0), t.countTag(r, .live));
+    try testing.expectEqual(@as(usize, 0), t.countTag(r, .marker));
+    try testing.expectEqual(@as(usize, 0), t.countTag(r, .final));
+}
+
+test "history: a fold listing a row its run doesn't hold halts, as the marker keeps that from happening" {
+    var t = H.init();
+    defer t.deinit();
+    const r: H.Run = .{};
+    for (0..16) |i| try t.chunk(r, i + 1, i + 1, false, 0);
+    // All 16 land; the fold they send waits on the lane.
+    try t.pumpAtMost(16);
+    try testing.expectEqual(@as(usize, 1), t.countTag(r, .marker));
+    // One of the rows it lists gone, as no apply removes it.
+    var rows: [16]Row.Value = undefined;
+    const got = t.live(r, &rows);
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const k = try liveRowKey(arena.allocator(), r.ns, r.owner, r.run, r.created_ns, got[3].ual_index, got[3].part);
+        var ks = KeySet.init(arena.allocator());
+        try ks.add(Actions.ID, "", k);
+        var view = View.init(&t.store, arena.allocator(), &ks);
+        view.strict = false;
+        try view.delete(Actions, k);
+        try view.commit();
+    }
+    try testing.expectError(error.Halt, t.pump());
 }
 
 test "history: an ended run moves to one ended row: at once from one row, by a fold from several, and by as many folds as it takes" {
@@ -798,6 +864,24 @@ test "history: every replica of the same messages and skips holds the same rows"
         try t.pump();
     }
     try testing.expectEqual(a.checksum(), b.checksum());
+}
+
+test "history: a run's history message to a slot that isn't its owner's halts its apply" {
+    var t = H.init();
+    defer t.deinit();
+    var buf: [he.Chunk.max_size]u8 = undefined;
+    const p = try he.Chunk.encodeInto(&buf, .{ .ns = 1, .family = 1, .owner = "act", .run = "r1", .created_ns = 1, .first_seq = 1, .last_seq = 1, .final = false, .completed_ms = 0, .records = "x" });
+    t.index += 1;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ks = KeySet.init(arena.allocator());
+    var view = View.init(&t.store, arena.allocator(), &ks);
+    const wrong: u16 = @intCast((router.nsKeySlot(.default, "act") + 1) % router.SLOTS);
+    try view.sendFlagged(.user(.default), wrong, @backingInt(EntryType.history_chunk), entry_mod.Flags.HISTORY, p);
+    try channels.writeSends(&view, t.index);
+    try view.commit();
+    try testing.expectError(error.Halt, t.pump());
+    try testing.expectEqual(@as(u64, 0), t.store.family(Actions.ID).count);
 }
 
 test "history: an entry of a run's history outside a message halts its apply" {

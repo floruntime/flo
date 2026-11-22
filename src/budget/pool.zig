@@ -74,7 +74,8 @@ pub const CHARGED = [_]u16{
     // full outboxes hold back client writes.
     54,
     55, 56,
-    59, // history.act: an action run's history rows, charged where its runs are
+    59,
+    // history.act: an action run's history rows, charged where its runs are
     71,
 };
 
