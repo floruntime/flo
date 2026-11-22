@@ -937,7 +937,7 @@ fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64
         const k = (try calls_mod.callKeyAlloc(view.arena, n.ns, st.caller_slot, st.settles)) orelse return error.Halt;
         if (try view.get(calls_mod.Calls, k)) |call| {
             switch (call.v.state) {
-                .done, .refused, .no_action => {},
+                .done, .refused, .no_action, .over_budget => {},
                 .sent, .started => if (comptime plant.active != .runs_settle_before_call_ends) return out.refuse(.conflict, .unclassified, "conflict: the run's call hasn't ended"),
             }
             if (comptime plant.active != .runs_settled_call_kept) try view.delete(calls_mod.Calls, k);
@@ -1444,6 +1444,30 @@ test "workflow runs machine: a call settled refused stays refused when its run's
     try testing.expectEqual(calls_mod.State.refused, c.state);
     try testing.expectEqualStrings("repaired", c.outcome);
     try testing.expectEqualStrings("", c.result);
+}
+
+test "workflow runs machine: a repair skip leaves a call held over its callee's memory share as it is" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    var cb: [ae.Call.max_size]u8 = undefined;
+    const call = try ae.Call.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .kind = .action, .caller_run = "r1", .caller_workflow = "wf", .step = "s", .target = "act", .version = "", .run = "a1", .input = "{}", .can_wait = true });
+    _ = try f.step("r1", .{ .rev = 0, .wait = .call, .wait_on = "a1", .call = call });
+    const slot = calls_mod.callerSlot(.default, "wf");
+    var rb: [ae.Reply.max_size]u8 = undefined;
+    const held = try ae.Reply.encodeInto(&rb, .{ .ns = NamespaceId.default.int(), .slot = slot, .run = "a1", .answer = .over_budget, .why = "would pass its share" });
+    _ = try f.answer(.call_reply, held);
+    try testing.expectEqual(calls_mod.State.over_budget, calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1").?.state);
+    // A skip of a later answer to it: the hold stands, to be retried.
+    f.index += 1;
+    const e = entry_mod.buildEntry(.call_reply, entry_mod.Flags.NONE, 1, f.index, 0, held);
+    _ = f.scratch.reset(.retain_capacity);
+    var ks = view_mod.KeySet.init(f.scratch.allocator());
+    try machine.keys(&e, &ks);
+    var view = view_mod.View.init(&f.store, f.scratch.allocator(), &ks);
+    try machine.skipped.?(&view, &e, "repaired");
+    try view.commit();
+    try testing.expectEqual(calls_mod.State.over_budget, calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1").?.state);
 }
 
 test "workflow runs machine: a step whose counters are past their bound is refused, writing nothing" {

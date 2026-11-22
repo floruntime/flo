@@ -110,7 +110,8 @@ pub const Cause = enum(u8) {
     cannot_flush = 3,
     /// A target on the named shard is past what it parks.
     target_full = 4,
-    /// The named shard is over its memory share: a sink's writes wait
+    /// The named shard's use, with the sinks in flight to it and the
+    /// write's own bytes, would pass its memory share: a sink's writes wait
     /// until its use falls.
     over_share = 5,
 };
@@ -141,7 +142,7 @@ pub fn causeWords(cause: Cause) []const u8 {
         .no_leader => std.fmt.comptimePrint("hasn't answered for {d} s", .{NO_LEADER_MS / std.time.ms_per_s}),
         .cannot_flush => "cannot flush to disk",
         .target_full => "has a full target",
-        .over_share => "is over its memory share",
+        .over_share => "would pass its memory share",
     };
 }
 

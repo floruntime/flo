@@ -32,6 +32,7 @@ pub const Summary = simulator.Summary;
 pub const Invariant = simulator.Invariant;
 
 pub const groups = @import("groups.zig");
+pub const memory_gate = @import("memory_gate.zig");
 pub const Groups = groups.Groups;
 
 test {

@@ -1069,3 +1069,45 @@ test "kv machine: put and delete churn of unique keys over more than an hour, re
     try testing.expect(kv.store.family(machine.Values.ID).count <= 61 * 1000);
     try testing.expectEqual(@as(u64, 0), kv.state().countsOf(.default).history_bytes);
 }
+
+test "kv machine: past its shard's share a write is refused and changes nothing; one that frees or shrinks is taken" {
+    const settings = @import("../settings/machine.zig");
+    const pool = @import("../budget/pool.zig");
+    const store_mod = @import("../contract/store.zig");
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    var buf: [1024]u8 = undefined;
+    const big: [200]u8 = @splat('x');
+    var r = try kv.apply(&putEntry(&buf, dk("a"), &big, 1, STAMP, 0));
+    try testing.expect(r.refused() == null);
+    // A share the next put of that size can't fit in.
+    const use = pool.useOf(&kv.store);
+    try settings.bindForTest(&kv.store, use + 100);
+    var before: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer before.deinit();
+    try store_mod.encode(&kv.store, 10, &before.writer);
+    r = try kv.apply(&putEntry(&buf, dk("b"), &big, 2, STAMP, 0));
+    const refused = r.refused().?;
+    try testing.expectEqual(proto.StatusCode.limit, refused.status);
+    try testing.expectEqual(proto.Reason.memory_budget, refused.refusal.reason);
+    try testing.expectEqual(@as(u16, 0), r.len);
+    try testing.expectEqual(use, pool.useOf(&kv.store));
+    try testing.expectEqual(@as(u64, 1), kv.store.memory_refusals);
+    var after: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer after.deinit();
+    try store_mod.encode(&kv.store, 10, &after.writer);
+    try testing.expectEqualStrings(before.written(), after.written());
+    // A smaller value for the key it holds frees bytes: taken, over share or not.
+    try settings.bindForTest(&kv.store, 1);
+    r = try kv.apply(&putEntry(&buf, dk("a"), "z", 3, STAMP, 0));
+    try testing.expect(r.refused() == null);
+    try testing.expect(pool.useOf(&kv.store) < use);
+    // So is a delete.
+    r = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = dk("a"), .cas_version = null }, 4, STAMP));
+    try testing.expect(r.refused() == null);
+    // And with no share bound, nothing is refused.
+    var free = TestKv.init(testing.allocator);
+    defer free.deinit();
+    r = try free.apply(&putEntry(&buf, dk("c"), &big, 1, STAMP, 0));
+    try testing.expect(r.refused() == null);
+}

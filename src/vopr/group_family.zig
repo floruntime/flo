@@ -24,6 +24,7 @@
 //! groups) is read from the store itself.
 
 const std = @import("std");
+const gate = @import("../budget/gate.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence = @import("../storage/persistence.zig");
 const store_mod = @import("../contract/store.zig");
@@ -448,7 +449,9 @@ pub const ConsumerGroups = struct {
                 if (out.refused()) |refused| {
                     if (!std.mem.eql(u64, &before, &commits(store))) return error.RefusalChangedState;
                     effect.refused = true;
-                    if (want != .refused) {
+                    if (want != .refused and kind == .create and refused.refusal.reason == .memory_budget) {
+                        // Past its share: the memory checker's to judge.
+                    } else if (want != .refused) {
                         effect.broke = "the group machine refused an entry the ledger applies";
                     } else if (want.refused != refused.status) {
                         effect.broke = "the group machine refused an entry with another status than the ledger's";
@@ -562,7 +565,7 @@ pub const ConsumerGroups = struct {
         try machine_mod.applyEntry(&sm.machine, store, &self.scratch, e, &out);
         if (out.refused()) |rf| {
             if (!std.mem.eql(u64, &before, &commits(store))) return error.RefusalChangedState;
-            if (!refuse) effect.broke = "the streams machine refused a stream entry the ledger applies" else if (rf.status != .conflict) effect.broke = "the streams machine refused a delete with another status than the ledger's";
+            if (rf.refusal.reason == .memory_budget) {} else if (!refuse) effect.broke = "the streams machine refused a stream entry the ledger applies" else if (rf.status != .conflict) effect.broke = "the streams machine refused a delete with another status than the ledger's";
             return true;
         }
         if (refuse) effect.broke = "the streams machine deleted a stream holding records, unforced";
@@ -964,6 +967,10 @@ pub const ConsumerGroups = struct {
         // record of an append already counted.
         var fresh: usize = 0;
         var capped = false;
+        // At its shard's share a deliver takes no fresh record, and a group
+        // it would make is refused.
+        const at_share = gate.atShare(store) != null;
+        if (at_share and made) return .{ .refused = .limit };
         {
             const from = if (floor.greaterThan(cursor)) floor else cursor;
             const ids = try a.alloc(StreamID, p.count - chosen.items.len);
@@ -973,7 +980,8 @@ pub const ConsumerGroups = struct {
             const shard = shardHeld(store);
             const each = heldOf(0);
             const through: StreamID = .{ .timestamp_ms = p.through_ms, .sequence = p.through_seq };
-            for (ids[0..got]) |rec| {
+            if (at_share and got > 0) capped = true;
+            for (ids[0..if (at_share) 0 else got]) |rec| {
                 if (rec.greaterThan(through)) break;
                 if (held + fresh + 1 > p.max_held or held_bytes + each * (fresh + 1) > p.max_held_bytes or shard + each * (fresh + 1) > p.shard_held_bytes) {
                     capped = true;
@@ -987,7 +995,7 @@ pub const ConsumerGroups = struct {
                 fresh += 1;
             }
         }
-        if (chosen.items.len == 0 and capped) return .{ .refused = .overloaded };
+        if (chosen.items.len == 0 and capped) return .{ .refused = if (at_share) .limit else .overloaded };
         // Each one's deliveries after this one: a fresh record's first.
         const deliveries = try a.alloc(u32, chosen.items.len);
         for (chosen.items, deliveries) |rec, *d| {

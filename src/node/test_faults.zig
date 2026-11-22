@@ -53,6 +53,16 @@ pub const HALT_KEY = "flo-test-fault-halt";
 /// every entry, as a fixed build would.
 pub const OFF_ENV = "FLO_TEST_FAULTS_OFF";
 
+/// Set in a server's environment to a byte count, every shard binds that
+/// share of the memory budget, not its own: a share small enough to pass.
+pub const SHARE_ENV = "FLO_TEST_MEMORY_SHARE";
+
+/// The share `SHARE_ENV` names, if it names one.
+pub fn share() ?u64 {
+    const v = std.c.getenv(SHARE_ENV) orelse return null;
+    return std.fmt.parseInt(u64, std.mem.span(v), 10) catch null;
+}
+
 /// The fault a kv set of `entry` asks for, if any.
 pub fn of(entry: *const entry_mod.Entry) ?Fault {
     if (entry.header.entry_type != @backingInt(entry_mod.EntryType.kv_put)) return null;

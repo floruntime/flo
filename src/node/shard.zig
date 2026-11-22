@@ -5988,6 +5988,7 @@ pub const Shard = struct {
             sm.pool_use_bytes.store(pool.useOf(&self.defaultPartition().store), .monotonic);
             const bound = settings_machine.boundShare(.{ .store = &self.defaultPartition().store });
             sm.pool_share_bytes.store(if (bound) |b| b.share_bytes else 0, .monotonic);
+            sm.memory_refusals.store(self.defaultPartition().store.memory_refusals, .monotonic);
             for (&sm.ts_late, self.defaultPartition().store.ts_late_points) |*m, n| m.store(n, .monotonic);
             // Summed over senders: the log names each sender.
             for (&sm.channel_sender_bugs, 0..) |*total, reason| {
@@ -6943,7 +6944,7 @@ pub const Shard = struct {
         const budget = self.node_health[0].clean_budget_bytes.load(.acquire);
         if (budget == 0) return;
         const shards = self.router.shard_count;
-        const share = budget / shards;
+        const share = if (comptime build_options.test_faults) (@import("test_faults.zig").share() orelse budget / shards) else budget / shards;
         if (share == 0) {
             if (!self.bind_zero_warned) log.warn("shard {d}: a memory budget of {d} bytes over {d} shards leaves no share; no share is bound", .{ self.id, budget, shards });
             self.bind_zero_warned = true;

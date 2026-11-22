@@ -473,6 +473,14 @@ jobs:
         # family's own ledger. It fails if any kind of entry never applied.
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --consumer-groups --seed-timeout=120 --out-dir=/tmp/vopr-consumer-groups
         timeout-minutes: 10
+      - name: Swarm held to a memory share
+        # Every replica's stores bound to a small share, so client writes are
+        # refused past it; each verdict is judged from the store, apart from
+        # the gate, and a group's deliver at its share takes nothing fresh.
+        run: |
+          ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --memory-gate --seed-timeout=120 --out-dir=/tmp/vopr-memory-gate
+          ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --memory-gate --consumer-groups --seed-timeout=120 --out-dir=/tmp/vopr-memory-gate-groups
+        timeout-minutes: 15
       - name: Swarm with namespace creates and lagging applies
         # Nodes fall behind on applying and win elections that way; no
         # namespace create may lose its id to another.

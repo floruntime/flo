@@ -42,6 +42,7 @@ const ae = @import("../protocol/action_entries.zig");
 const action_ops = @import("../protocol/action_ops.zig");
 const limits = @import("../protocol/limits.zig");
 const view_mod = @import("../contract/view.zig");
+const gate = @import("../budget/gate.zig");
 const machine_mod = @import("../contract/machine.zig");
 const delivery = @import("../contract/delivery.zig");
 const calls = @import("calls_machine.zig");
@@ -271,6 +272,10 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 if (call) return reply(view, p, if (eqlOpt(old.v.caller_run, p.caller_run) and eqlOpt(old.v.caller_workflow, p.caller_workflow)) .started else .conflict);
                 return out.refuse(.conflict, .unclassified, RUN_EXISTS);
             }
+            // A call's start is held to the shard's share here, not at the
+            // top-level gate, which never sees a channel's messages: past
+            // it, the call is told so and asks again later.
+            const mark = view.mark();
             try view.put(Runs, rk, .{ .v = .{
                 .action = p.action,
                 .status = .ready,
@@ -299,6 +304,13 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             } });
             var b: KeyBuf = undefined;
             try view.put(Ready, try idKey(view, .of(p.ns), readyKey(&b, p.action, {}, stamp, p.run)), .{});
+            if (call) if (gate.overSince(view, mark)) |o| {
+                try view.rollback(mark);
+                var wb: [128]u8 = undefined;
+                const shard: u16 = if (view.store.place) |pl| pl.group else 0;
+                const why = std.fmt.bufPrint(&wb, "shard {d} memory: {d} + {d} would pass its share {d}", .{ shard, o.use, o.delta, o.share }) catch "shard memory: past its share";
+                return replyWhy(view, p, .over_budget, why);
+            };
             if (call) try reply(view, p, .started);
             out.putBytes(p.run);
         },
@@ -1158,3 +1170,25 @@ test "actions machine: every record's slot follows from what it stores, the acti
 }
 
 const store_mod_t = @import("../contract/store.zig").Store;
+
+test "actions machine: past its shard's share a settle still lands, its large result with it; a new run is refused" {
+    const settings = @import("../settings/machine.zig");
+    const pool = @import("../budget/pool.zig");
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 3);
+    try invoke(&t, "r1", 10 * ms);
+    try testing.expect((try deliver(&t, "r1", 10 * ms, 20 * ms)).refused() == null);
+    // A share already full: nothing more fits.
+    try settings.bindForTest(&t.store, pool.useOf(&t.store));
+    const r2 = try t.apply(.action_invoke, ae.Invoke.Value{ .ns = DEFAULT, .action = "send", .run = "r2", .input = "in", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null }, 21 * ms);
+    try testing.expectEqual(Reason.memory_budget, r2.refused().?.refusal.reason);
+    // The run admitted is let finish, or its lease would expire and run it again.
+    const big: [32 * 1024]u8 = @splat('r');
+    var settle = settleOf(&t, "r1");
+    settle.result = &big;
+    const use = pool.useOf(&t.store);
+    try testing.expect((try t.apply(.action_settle, settle, 30 * ms)).refused() == null);
+    try testing.expectEqual(Status.completed, t.run(.default, "r1").?.status);
+    try testing.expect(pool.useOf(&t.store) > use);
+}

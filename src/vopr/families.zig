@@ -359,6 +359,8 @@ pub const Kv = struct {
         merged,
         /// A JSON patch that deleted a field.
         field_deleted,
+        /// Refused past its shard's share, which the memory checker judges.
+        memory_refused,
         /// A reap that dropped one of the keys it names.
         reaped,
     };
@@ -379,7 +381,7 @@ pub const Kv = struct {
         pub fn count(self: *Counts, o: Effect) void {
             switch (o) {
                 .other => {},
-                .refused => self.refusals += 1,
+                .refused, .memory_refused => self.refusals += 1,
                 .staged_refused => {
                     self.refusals += 1;
                     self.staged_refusals += 1;
@@ -528,6 +530,12 @@ pub const Kv = struct {
         } else {
             try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, e, &out);
         }
+        // Past its share a write is refused whatever it asks: the memory
+        // checker judges that verdict (`memory_gate.zig`).
+        if (out.refused()) |rf| if (rf.refusal.reason == .memory_budget) {
+            if (!std.mem.eql(u64, &before, &self.commits())) return error.RefusalChangedState;
+            return .memory_refused;
+        };
         if (holds) |h| if (h != (out.refused() == null)) return error.ConditionDecidedWrong;
         const refusal = out.refused() orelse
             return if (conditionalPut(e) != null) .condition_held else patchEffect(e);
@@ -848,7 +856,8 @@ pub const Actions = struct {
         try machine_mod.applyEntry(&action_machine.machine, &self.store, &self.scratch, &applied, &out);
         if (out.refused() != null) {
             if (!std.mem.eql(u64, &before, &self.commits())) return error.RefusalChangedState;
-            return .{ .kind = kind, .refused = true, .broke = refusedWrongly(e, stamp, touched.items, def_before) };
+            const memory = out.refused().?.refusal.reason == .memory_budget;
+            return .{ .kind = kind, .refused = true, .broke = if (memory) null else refusedWrongly(e, stamp, touched.items, def_before) };
         }
         var effect: Effect = .{ .kind = kind, .refused = false };
         effect.broke = self.check(e, stamp, touched.items, &effect.cross_term);

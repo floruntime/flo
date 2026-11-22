@@ -27,6 +27,8 @@ const replay = @import("../node/replay.zig");
 const silent_loss = @import("../node/silent_loss.zig");
 const plant = @import("../plant.zig");
 const pool_mod = @import("../budget/pool.zig");
+const memory_gate = @import("memory_gate.zig");
+const settings_machine = @import("../settings/machine.zig");
 const store_mod = @import("../contract/store.zig");
 const scenario_mod = @import("scenario.zig");
 const workload_mod = @import("workload.zig");
@@ -128,6 +130,10 @@ pub const Invariant = enum {
     /// charged records hold, or two replicas whose families hold the same
     /// show different use after the same history.
     pool_use_recount,
+    /// The memory gate refused a write within its shard's share, took one
+    /// past it, refused for memory what is never refused, or a group's
+    /// deliver at its share took a fresh record (`memory_gate.zig`).
+    memory_gate,
     /// A leader proposed a KV batch above its own transaction limit.
     txn_gate,
     /// More messages than a run has any reason to send: replication is going
@@ -1228,6 +1234,10 @@ pub const Simulator = struct {
         }
         // Hooks attach after (empty) replay, mirroring production wiring.
         for (self.nodes) |*node| self.attachDisk(node);
+        if (scenario.memory_share > 0) {
+            memory_gate.enable(allocator);
+            for (self.nodes) |*node| bindShare(node, scenario.memory_share);
+        }
         self.setWallClocks();
         return self;
     }
@@ -1521,6 +1531,7 @@ pub const Simulator = struct {
         node.wf_runs.reset();
         node.groups.reset();
         node.ns.reset();
+        if (self.scenario.memory_share > 0) bindShare(node, self.scenario.memory_share);
         if (self.extension) |x| x.reset(x.ctx, node.id);
         node.apply_paused_until = 0;
         node.families_index = 0;
@@ -2265,6 +2276,7 @@ pub const Simulator = struct {
     fn checkBatchAnswer(self: *Simulator, node: *SimNode, e: *const entry_mod.Entry, idx: u64, first: bool, effect: families.Kv.Effect) void {
         if (e.header.entry_type != @backingInt(entry_mod.EntryType.kv_batch)) return;
         const answer = Workload.batchAnswer(e.payload) orelse return;
+        if (effect == .memory_refused) return;
         const refused = effect == .batch_condition_refused;
         // `Kv.apply` judges the reason and op of what the machine refuses, so
         // `.staged_refused` on a batch that must refuse is a mutant refusing early.
@@ -2294,6 +2306,9 @@ pub const Simulator = struct {
                 .detail = "a leader proposed a batch above its own transaction limit",
             });
         }
+        // Past its share: refused whatever it holds, which the memory
+        // checker judges.
+        if (effect == .memory_refused) return;
         if (effect == .staged_refused or effect == .refused or effect == .batch_condition_refused) {
             if (first) c.machine_refused += 1;
             // The planted refusal diverges a replica, which is the checksums'
@@ -2744,6 +2759,7 @@ pub const Simulator = struct {
         if (sampled) if (node.actions.danglingRequest()) |why| self.checker.fail(.{ .invariant = .action_rule, .node = node.id, .index = idx, .tick = self.now, .detail = why });
         if (comptime plant.active == .pool_load_bypasses_link) loadBypassingLink(&node.kv.store, idx);
         if (sampled) if (poolRecountBroke(node)) |why| self.checker.fail(.{ .invariant = .pool_use_recount, .node = node.id, .index = idx, .tick = self.now, .detail = why });
+        if (memory_gate.take()) |b| self.checker.fail(.{ .invariant = .memory_gate, .node = node.id, .index = b.index, .tick = self.now, .detail = b.why });
         self.checker.onState(node.id, idx, node.history, node.counter.checksum(mutant), if (sampled) sumsOf(node) else null, poolUseOf(node), !live, self.now);
     }
 
@@ -3147,6 +3163,12 @@ pub const Simulator = struct {
     /// share the queues', runs the workflow definitions').
     fn poolStores(node: *SimNode) [6]*store_mod.Store {
         return .{ &node.kv.store, &node.actions.store, &node.queues.store, &node.jobs.store, &node.wf_defs.store, node.ns.handler.store };
+    }
+
+    /// Every pool store of `node` held to `share`, as an applied bind holds
+    /// a shard's, from before its first entry.
+    fn bindShare(node: *SimNode, share: u64) void {
+        for (poolStores(node)) |st| settings_machine.bindForTest(st, share) catch @panic("sim OOM");
     }
 
     /// The node's memory-pool use, from its stores' counters.
