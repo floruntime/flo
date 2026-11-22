@@ -1192,3 +1192,21 @@ test "actions machine: past its shard's share a settle still lands, its large re
     try testing.expectEqual(Status.completed, t.run(.default, "r1").?.status);
     try testing.expect(pool.useOf(&t.store) > use);
 }
+
+test "actions machine: a run adds no more than its invoke's bytes and the call bound, every field at its largest" {
+    const pool = @import("../budget/pool.zig");
+    const memory_budget = @import("../node/memory_budget.zig");
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    const name: [ae.MAX_ACTION_NAME]u8 = @splat('a');
+    try testing.expect((try t.apply(.action_register, ae.Register.Value{ .ns = DEFAULT, .name = &name, .owner = "", .lease_ms = LEASE_MS, .max_attempts = 3 }, 1)).refused() == null);
+    const run: [ae.MAX_RUN_ID]u8 = @splat('r');
+    const input: [ae.MAX_INPUT]u8 = @splat('i');
+    const labels: [ae.MAX_LABELS]u8 = @splat('l');
+    const caller: [limits.MAX_QUALIFIED_KEY]u8 = @splat('c');
+    const inv: ae.Invoke.Value = .{ .ns = DEFAULT, .action = &name, .run = &run, .input = &input, .labels = &labels, .source = .direct, .caller_run = &caller, .caller_workflow = &caller };
+    const before = pool.useOf(&t.store);
+    try testing.expect((try t.apply(.action_invoke, inv, 10 * ms)).refused() == null);
+    const added = pool.useOf(&t.store) - before;
+    try testing.expect(added <= try ae.Invoke.encodedSize(inv) + memory_budget.CALL_RECORDS_BYTES);
+}
