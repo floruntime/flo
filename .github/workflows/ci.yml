@@ -477,9 +477,12 @@ jobs:
         # Every replica's stores bound to a small share, so client writes are
         # refused past it; each verdict is judged from the store, apart from
         # the gate, and a group's deliver at its share takes nothing fresh.
+        # A swarm exits 1 when a seed fails, 3 when every seed passed but too
+        # few reached what its mode tests.
         run: |
           ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --memory-gate --seed-timeout=120 --out-dir=/tmp/vopr-memory-gate
           ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --memory-gate --consumer-groups --seed-timeout=120 --out-dir=/tmp/vopr-memory-gate-groups
+          ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --memory-gate --actions --seed-timeout=120 --out-dir=/tmp/vopr-memory-gate-actions
         timeout-minutes: 15
       - name: Swarm with namespace creates and lagging applies
         # Nodes fall behind on applying and win elections that way; no

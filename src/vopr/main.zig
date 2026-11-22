@@ -248,7 +248,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     else
         Scenario.fromSeed(seed);
     if (args.volatile_mode) scenario.hard_state = .volatile_state;
-    if (args.memory_gate) scenario.memory_share = MEMORY_GATE_SHARE;
+    if (args.memory_gate) scenario.memory_share = if (args.actions) MEMORY_GATE_ACTIONS_SHARE else MEMORY_GATE_SHARE;
     if (args.groups > 0) {
         // These faults need more than the one node every group lives on.
         const needs_nodes: ?[]const u8 = if (args.wipes) "--wipes" else if (args.membership) "--membership" else if (args.byzantine) "--byzantine" else if (args.catching_up) "--catching-up" else null;
@@ -404,6 +404,11 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
 /// The share `--memory-gate` binds on each store: small enough that the
 /// workloads pass it and their deletes bring it back under.
 const MEMORY_GATE_SHARE: u64 = 24 << 10;
+/// The actions mode's: an action's run holds its input, so at the small
+/// share most invokes are refused and too few leases outlive a leader. At
+/// this one the gate still refuses about 40% of what it judges, and as many
+/// seeds expire a lease across a term as without it.
+const MEMORY_GATE_ACTIONS_SHARE: u64 = 64 << 10;
 
 /// `scenario` as group 0 of `args.groups` groups on one node.
 fn runGroups(allocator: std.mem.Allocator, args: Args, scenario: Scenario) !bool {
@@ -800,7 +805,11 @@ const HANG_SILENCE_MS: u64 = 60_000;
 
 const Failure = struct { seed: u64, class: []const u8, last_tick: ?u64, outcome: Outcome };
 
-fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
+/// How a swarm ended. A coverage miss isn't a seed's failure: every seed
+/// passed, but the batch didn't reach a path it is meant to test.
+const SwarmEnd = enum { ok, failed, uncovered };
+
+fn runSwarm(allocator: std.mem.Allocator, args: Args) !SwarmEnd {
     const base = args.seed orelse @as(u64, @bitCast(@as(i64, @truncate(stdx.time.nanoTimestamp()))));
     const iterations = args.iterations.?;
 
@@ -959,6 +968,8 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
     // A batch whose leases never outlive a leader tested none of the
     // takeover paths: it fails, though every seed passed.
     var covered = true;
+    // A passing seed whose counts couldn't be read is the harness broken.
+    var counted = true;
     if (args.actions) {
         std.debug.print("[vopr] actions, applied/refused (refused share):", .{});
         for (ACTION_KINDS, action_totals.applied, action_totals.refused) |k, a, rf| {
@@ -967,13 +978,13 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
         std.debug.print("\n[vopr] across a term change: {d} settles in {d} seeds, {d} expires in {d} seeds\n", .{ action_totals.cross_term_settles, settle_seeds, action_totals.cross_term_expires, expire_seeds });
         if (unread_counts > 0) {
             std.debug.print("[vopr] FAILED: {d} passing seeds printed no action counts\n", .{unread_counts});
-            covered = false;
+            counted = false;
         }
         // A few seeds, not one: a workload change that loses the path in
         // most seeds should fail here, not pass on a lucky one.
         const want = @min(MIN_TAKEOVER_SEEDS, ok_count);
         if (settle_seeds < want or expire_seeds < want) {
-            std.debug.print("[vopr] FAILED: fewer than {d} seeds settled and expired leases from an earlier term\n", .{want});
+            std.debug.print("[vopr] UNCOVERED: fewer than {d} seeds settled and expired leases from an earlier term\n", .{want});
             covered = false;
         }
     }
@@ -985,11 +996,11 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
         std.debug.print("; messages applied/refused {d}/{d}\n[vopr] across a term change: {d} settles in {d} seeds, {d} expires in {d} seeds\n", .{ queue_totals.items_applied, queue_totals.items_refused, queue_totals.cross_term_settles, settle_seeds, queue_totals.cross_term_expires, expire_seeds });
         if (unread_counts > 0) {
             std.debug.print("[vopr] FAILED: {d} passing seeds printed no queue counts\n", .{unread_counts});
-            covered = false;
+            counted = false;
         }
         const want = @min(MIN_TAKEOVER_SEEDS, ok_count);
         if (settle_seeds < want or expire_seeds < want) {
-            std.debug.print("[vopr] FAILED: fewer than {d} seeds settled and expired queue leases from an earlier term\n", .{want});
+            std.debug.print("[vopr] UNCOVERED: fewer than {d} seeds settled and expired queue leases from an earlier term\n", .{want});
             covered = false;
         }
     }
@@ -1000,10 +1011,10 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
         std.debug.print("; records applied/refused {d}/{d}\n", .{ group_totals.items_applied, group_totals.items_refused });
         if (unread_counts > 0) {
             std.debug.print("[vopr] FAILED: {d} passing seeds printed no group counts\n", .{unread_counts});
-            covered = false;
+            counted = false;
         }
         for (GROUP_KINDS, group_totals.applied) |k, a| if (a == 0 and ok_count > 0) {
-            std.debug.print("[vopr] FAILED: no seed applied a group {t}\n", .{k});
+            std.debug.print("[vopr] UNCOVERED: no seed applied a group {t}\n", .{k});
             covered = false;
         };
         // An entry that applied but did nothing tested nothing either.
@@ -1011,12 +1022,12 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
         for (GROUP_MARKS, group_totals.marks) |m, n| std.debug.print(" {t}={d}", .{ m, n });
         std.debug.print("\n[vopr] across a term change: settles in {d} seeds, expires in {d} seeds\n", .{ settle_seeds, expire_seeds });
         for (GROUP_MARKS, group_totals.marks) |m, n| if (n == 0 and ok_count > 0) {
-            std.debug.print("[vopr] FAILED: no seed had a group {t}\n", .{m});
+            std.debug.print("[vopr] UNCOVERED: no seed had a group {t}\n", .{m});
             covered = false;
         };
         const want = @min(MIN_TAKEOVER_SEEDS, ok_count);
         if (settle_seeds < want or expire_seeds < want) {
-            std.debug.print("[vopr] FAILED: fewer than {d} seeds settled and expired group leases from an earlier term\n", .{want});
+            std.debug.print("[vopr] UNCOVERED: fewer than {d} seeds settled and expired group leases from an earlier term\n", .{want});
             covered = false;
         }
     }
@@ -1029,10 +1040,10 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
         std.debug.print("\n", .{});
         if (unread_counts > 0) {
             std.debug.print("[vopr] FAILED: {d} passing seeds printed no workflow run counts\n", .{unread_counts});
-            covered = false;
+            counted = false;
         }
         for (WORKFLOW_RUN_CLASSES, wf_run_totals.classes) |k, n| if (n == 0 and ok_count > 0) {
-            std.debug.print("[vopr] FAILED: no seed reached {t}\n", .{k});
+            std.debug.print("[vopr] UNCOVERED: no seed reached {t}\n", .{k});
             covered = false;
         };
     }
@@ -1042,15 +1053,16 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
         std.debug.print("[vopr] seeds reaching: a leader's refusal {d}; large batches applied {d}, past a replica's own limit {d}, replayed {d}, at a later leader below them {d}\n", .{ txn_seeds.refused, txn_seeds.large, txn_seeds.past_own, txn_seeds.replayed, txn_seeds.across_leaders });
         if (unread_counts > 0) {
             std.debug.print("[vopr] FAILED: {d} passing seeds printed no transaction counts\n", .{unread_counts});
-            covered = false;
+            counted = false;
         }
         const want = @min(MIN_TXN_SEEDS, ok_count);
         if (txn_seeds.refused < want or txn_seeds.large < want or txn_seeds.past_own < want or txn_seeds.replayed < want or txn_seeds.across_leaders < @min(MIN_TXN_ACROSS_LEADERS_SEEDS, ok_count)) {
-            std.debug.print("[vopr] FAILED: too few seeds had a leader refuse a batch, or applied large ones past a replica's limit, on replay ({d} of each) or at a later leader below them ({d})\n", .{ want, @min(MIN_TXN_ACROSS_LEADERS_SEEDS, ok_count) });
+            std.debug.print("[vopr] UNCOVERED: too few seeds had a leader refuse a batch, or applied large ones past a replica's limit, on replay ({d} of each) or at a later leader below them ({d})\n", .{ want, @min(MIN_TXN_ACROSS_LEADERS_SEEDS, ok_count) });
             covered = false;
         }
     }
-    return failures.items.len == 0 and covered;
+    if (failures.items.len > 0 or !counted) return .failed;
+    return if (covered) .ok else .uncovered;
 }
 
 // std's default gpa is SafeAllocator in ReleaseSafe, which flo's own main
@@ -1117,12 +1129,18 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
-    const ok = if (args.iterations != null)
+    // 1: a seed failed. 3: every seed passed, but too few reached a path
+    // the mode exists to test. 2 is for a bad command line.
+    const end: SwarmEnd = if (args.iterations != null)
         try runSwarm(init.gpa, args)
     else blk: {
         const seed = args.seed orelse
             @as(u64, @bitCast(@as(i64, @truncate(stdx.time.nanoTimestamp()))));
-        break :blk try runOne(init.gpa, args, seed);
+        break :blk if (try runOne(init.gpa, args, seed)) .ok else .failed;
     };
-    if (!ok) std.process.exit(1);
+    switch (end) {
+        .ok => {},
+        .failed => std.process.exit(1),
+        .uncovered => std.process.exit(3),
+    }
 }
