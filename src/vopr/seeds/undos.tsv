@@ -47,3 +47,7 @@ workflow-runs-take-picked.json	runs_take_ignores_picked	--workflows	-	workflow_r
 workflow-runs-signal-after-end.json	runs_signal_after_end	--workflows	-	workflow_run_rule	applied a signal the ledger refuses: its run has ended
 pool-load-bypasses-link.json	pool_load_bypasses_link	-	-	pool_use_recount	isn.t what its charged records hold
 pool-counts-exempt-family.json	pool_counts_exempt_family	--workflows	-	pool_use_recount	isn.t what its charged records hold
+memory-admits-over-share.json	memory_admits_over_share	--memory-gate	-	memory_gate	a write past its shard.s share was taken
+memory-delta-first-write.json	memory_delta_first_write	--memory-gate	-	memory_gate	its shard.s share was (taken|refused)
+memory-refuses-system.json	memory_refuses_system	--consumer-groups	memory_share=24576	queue_rule	\[memory_gate\].*never refused for memory was refused for it
+group-deliver-uncapped.json	group_deliver_uncapped	--consumer-groups	memory_share=24576	group_rule	\[memory_gate\].*at its shard.s share took a fresh record

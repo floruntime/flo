@@ -85,6 +85,9 @@ const Args = struct {
     /// With --groups: each group held to a memory share its fills pass and
     /// its drains bring it back under, so the sink gate holds and releases.
     memory_share: bool = false,
+    /// Every replica's stores held to a small bound share, so client writes
+    /// are refused past it, and each verdict checked (`memory_gate.zig`).
+    memory_gate: bool = false,
     max_delivered: u64 = 0,
     skip: [8]u64 = undefined,
     skip_len: usize = 0,
@@ -158,6 +161,8 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.flush_stalls = true;
         } else if (std.mem.eql(u8, arg, "--memory-share")) {
             args.memory_share = true;
+        } else if (std.mem.eql(u8, arg, "--memory-gate")) {
+            args.memory_gate = true;
         } else if (std.mem.startsWith(u8, arg, "--channel-mutant=")) {
             args.channel_mutant = std.meta.stringToEnum(vopr.groups.ChannelMutant, arg["--channel-mutant=".len..]) orelse return error.Usage;
         } else if (std.mem.eql(u8, arg, "--txn-limits")) {
@@ -243,6 +248,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     else
         Scenario.fromSeed(seed);
     if (args.volatile_mode) scenario.hard_state = .volatile_state;
+    if (args.memory_gate) scenario.memory_share = MEMORY_GATE_SHARE;
     if (args.groups > 0) {
         // These faults need more than the one node every group lives on.
         const needs_nodes: ?[]const u8 = if (args.wipes) "--wipes" else if (args.membership) "--membership" else if (args.byzantine) "--byzantine" else if (args.catching_up) "--catching-up" else null;
@@ -339,6 +345,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
             s.kv.batch_conditions_held,
         },
     );
+    if (scenario.memory_share > 0) std.debug.print("[vopr] memory gate: {d} writes judged, {d} refused for memory\n", .{ vopr.memory_gate.judged, vopr.memory_gate.refused });
     if (sim.leader_not_ready_refused > 0) std.debug.print("[vopr] client writes refused for a leader still applying earlier terms: {d}\n", .{sim.leader_not_ready_refused});
     if (scenario.action_percent > 0) printActionCounts(s.actions);
     if (scenario.queue_percent > 0) printQueueCounts(s.queues);
@@ -362,13 +369,14 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         var mb: [64]u8 = undefined;
         const mutant = if (args.family_mutant == .none) "" else std.fmt.bufPrint(&mb, " --family-mutant={t}", .{args.family_mutant}) catch "";
         if (args.scenario_in) |pin| {
-            std.debug.print("[vopr] reproduce with: vopr --scenario-in={s}{s}{s}\n", .{
+            std.debug.print("[vopr] reproduce with: vopr --scenario-in={s}{s}{s}{s}\n", .{
                 pin,
                 mutant,
                 if (args.volatile_mode) " --mode=volatile" else "",
+                "",
             });
         } else {
-            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
+            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
                 s.seed,
                 mutant,
                 if (args.actions) " --actions" else "",
@@ -386,11 +394,16 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
                 if (args.catching_up) " --catching-up" else "",
                 if (args.txn_limits) " --txn-limits" else "",
                 if (args.volatile_mode) " --mode=volatile" else "",
+                if (args.memory_gate) " --memory-gate" else "",
             });
         }
     }
     return s.ok;
 }
+
+/// The share `--memory-gate` binds on each store: small enough that the
+/// workloads pass it and their deletes bring it back under.
+const MEMORY_GATE_SHARE: u64 = 24 << 10;
 
 /// `scenario` as group 0 of `args.groups` groups on one node.
 fn runGroups(allocator: std.mem.Allocator, args: Args, scenario: Scenario) !bool {
@@ -730,6 +743,7 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
     if (args.channel_mutant != .none) try argv.append(allocator, try std.fmt.bufPrint(&cm_arg, "--channel-mutant={t}", .{args.channel_mutant}));
     if (args.flush_stalls) try argv.append(allocator, "--flush-stalls");
     if (args.memory_share) try argv.append(allocator, "--memory-share");
+    if (args.memory_gate) try argv.append(allocator, "--memory-gate");
     if (args.verbose) try argv.append(allocator, "--verbose");
 
     var child = stdx.process.Child.init(argv.items, allocator);

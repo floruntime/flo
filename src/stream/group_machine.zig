@@ -293,6 +293,8 @@ pub fn live(m: Meta.Value, r: StreamView) bool {
 }
 
 const qm = @import("../queue/machine.zig");
+const gate = @import("../budget/gate.zig");
+const plant = @import("../plant.zig");
 const sm = @import("machine.zig");
 const Helds = qm.Helds;
 const HELD_KEY = qm.HELD_KEY;
@@ -687,9 +689,14 @@ fn deliverApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     var took_fresh: usize = 0;
     const each = heldBy(0);
     const shard_held = try qm.heldOf(view);
-    var capped = false;
+    // At its shard's share it takes no fresh record, each one more it holds,
+    // but still redelivers: a full share of expired leases must drain.
+    const at_share = if (comptime plant.active == .group_deliver_uncapped) null else gate.atShare(view.store);
+    if (made) if (at_share) |o| return gate.refuse(out, if (view.store.place) |pl| pl.group else null, o);
+    // Only records it would have taken are held back by it.
+    var capped = at_share != null and got > 0;
     const through: StreamID = .{ .timestamp_ms = p.through_ms, .sequence = p.through_seq };
-    for (fresh[0..got]) |record| {
+    for (fresh[0..if (at_share != null) 0 else got]) |record| {
         // Past what the leader holds the payloads of: left for the next.
         if (record.greaterThan(through)) break;
         const held = meta.ready + meta.leased + meta.dead + took_fresh;
@@ -706,6 +713,7 @@ fn deliverApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     }
     // Full, with nothing ready: refused, so the reader knows why.
     if (n == 0 and capped) {
+        if (at_share) |o| return gate.refuse(out, if (view.store.place) |pl| pl.group else null, o);
         const held = meta.ready + meta.leased + meta.dead;
         if (held + 1 > p.max_held or meta.held_bytes + each > p.max_held_bytes)
             return out.refuseFmt(.overloaded, .group_held_full, FULL, .{ p.group, p.stream, held, p.max_held, meta.held_bytes, p.max_held_bytes });
@@ -2058,4 +2066,29 @@ test "group machine: a steal answers gone for a record a trim cut, as a deliver 
     const sums = t.sums();
     try testing.expectEqual(Why.gone, stealAnswer(try stealOf(&t, &.{rec}, 1, "rescue", 1, 5_000 * ms)).why.?);
     try testing.expectEqual(sums, t.sums());
+}
+
+test "group machine: at its shard's share a deliver takes no fresh record but still redelivers, and a group it would make is refused" {
+    const settings = @import("../settings/machine.zig");
+    const pool = @import("../budget/pool.zig");
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 3);
+    const d = try deliver(&t, 1, 1 << 20, "c1", 10 * ms);
+    _ = try release(&t, d, &.{sid(100, 0)}, false, 20 * ms);
+    // The share is reached: its use is all of it.
+    try settings.bindForTest(&t.store, pool.useOf(&t.store));
+    const items = t.count(Items);
+    // The released record goes again; the two fresh ones wait.
+    const again = try deliver(&t, 3, 1 << 20, "c1", 30 * ms);
+    try testing.expectEqual(@as(u32, 1), again.n);
+    try testing.expect(again.records[0].eql(sid(100, 0)));
+    try testing.expectEqual(items, t.count(Items));
+    // With nothing ready, a deliver the share holds back is refused for it.
+    var rb: [ge.MAX_BATCH * ge.RecordId.max_size]u8 = undefined;
+    var r = try t.apply(.group_deliver, ge.Deliver.Value{ .ns = NS.int(), .stream = "s", .group = "g", .count = 1, .max_bytes = 1 << 20, .holder = "c1", .lease_ms = LEASE_MS, .create = true, .ready = readyChoice(&rb, &t, 40 * ms), .through_ms = std.math.maxInt(u64), .through_seq = std.math.maxInt(u64), .max_held = qe_caps.DEFAULT_MAX_MESSAGES, .max_held_bytes = qe_caps.DEFAULT_MAX_BYTES, .shard_held_bytes = qe_caps.DEFAULT_SHARD_HELD_BYTES }, 40 * ms);
+    try testing.expectEqual(@import("../protocol/reason.zig").Reason.memory_budget, r.refused().?.refusal.reason);
+    // And so is a group it would make.
+    r = try t.apply(.group_deliver, ge.Deliver.Value{ .ns = NS.int(), .stream = "s", .group = "g2", .count = 1, .max_bytes = 1 << 20, .holder = "c1", .lease_ms = LEASE_MS, .create = true, .ready = readyChoice(&rb, &t, 50 * ms), .through_ms = std.math.maxInt(u64), .through_seq = std.math.maxInt(u64), .max_held = qe_caps.DEFAULT_MAX_MESSAGES, .max_held_bytes = qe_caps.DEFAULT_MAX_BYTES, .shard_held_bytes = qe_caps.DEFAULT_SHARD_HELD_BYTES }, 50 * ms);
+    try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.limit, r.refused().?.status);
 }

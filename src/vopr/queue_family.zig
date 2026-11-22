@@ -245,6 +245,8 @@ pub const Queues = struct {
                 const p = qe.Enqueue.decodeAll(e.payload, &diag) catch return error.Halt;
                 const s = snaps.items[0];
                 if (over(p, s)) return .{ .kind = kind, .refused = true };
+                // Past its shard's share: the memory checker's to judge.
+                if (out.refused().?.refusal.reason == .memory_budget) return .{ .kind = kind, .refused = true };
                 return .{ .kind = kind, .refused = true, .broke = "an enqueue within its caps was refused" };
             }
             // A requeue or drop of a queue never written to.

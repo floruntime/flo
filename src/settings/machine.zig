@@ -103,6 +103,18 @@ fn bindKey(buf: *[1 + BIND_KEY.len]u8) []const u8 {
     return view_mod.key(buf, "", BIND_KEY) catch unreachable;
 }
 
+/// Binds `share` on `store` as an applied bind would: for tests and the
+/// simulator, which hold a store without its settings machine's log.
+pub fn bindForTest(store: *@import("../contract/store.zig").Store, share: u64) !void {
+    var kb: [1 + BIND_KEY.len]u8 = undefined;
+    const k = bindKey(&kb);
+    var vb: [Bind.max_size]u8 = undefined;
+    const bytes = try Bind.encodeInto(&vb, .{ .share_bytes = share, .budget_bytes = share });
+    if (store.find(BindFam.ID, k)) |node| {
+        store.replace(BindFam.ID, node, try store.allocator.dupe(u8, bytes));
+    } else store.link(BindFam.ID, try store.allocRecord(k), try store.allocator.dupe(u8, bytes));
+}
+
 /// The share bound on the store `read` reads, or null when none is.
 pub fn boundShare(read: view_mod.ReadView) ?Bind.Value {
     var kb: [1 + BIND_KEY.len]u8 = undefined;

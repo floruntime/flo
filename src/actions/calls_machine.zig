@@ -56,6 +56,9 @@ pub const State = enum(u8) {
     done = 4,
     /// Its start named another caller's run: it has no run, and won't.
     refused = 5,
+    /// Its action's shard was at its memory share when the start arrived:
+    /// no run yet, and its start is sent again once memory may have freed.
+    over_budget = 6,
 };
 
 /// A step's call of an action's run or a child workflow's, kept under the
@@ -259,7 +262,7 @@ pub fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         .step_call_retry => {
             var c = (found orelse return).v;
             // Answered since the retry was proposed, or proposed twice.
-            if (c.state != .no_action) return;
+            if (c.state != .no_action and c.state != .over_budget) return;
             c.state = .sent;
             c.attempts +|= 1;
             c.last_ns = stamp;
@@ -279,6 +282,7 @@ pub fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             c.state = switch (p.answer) {
                 .started => .started,
                 .no_action => .no_action,
+                .over_budget => .over_budget,
                 .conflict, .skipped, .refused => .refused,
                 .moved => unreachable,
             };
@@ -318,7 +322,7 @@ pub fn skipped(view: *View, e: *const Entry, why: []const u8) ApplyError!void {
     var kb: KeyBuf = undefined;
     const k = callKey(&kb, n.ns, n.slot, n.run) orelse return;
     var c = ((try view.get(Calls, k)) orelse return).v;
-    if (c.state == .done or c.state == .refused or c.state == .no_action) return;
+    if (c.state == .done or c.state == .refused or c.state == .no_action or c.state == .over_budget) return;
     c.state = .refused;
     c.outcome = why;
     c.last_ns = e.header.timestamp_ns;

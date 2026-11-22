@@ -2142,3 +2142,23 @@ test "channels: a message declaring only a deadline in another namespace is refu
     try testing.expectEqual(@as(?store_mod.SenderBug, null), reported[0].sender_bug);
     try testing.expectEqual(@as(?store_mod.SenderBug, .wrong_origin), reported[1].sender_bug);
 }
+
+test "channels: nothing an inbound carries is refused for memory, past its shard's share or not" {
+    const kv_entries = @import("../protocol/kv_entries.zig");
+    const Kv = Channels(&.{@import("../kv/machine.zig").machine});
+    var st = store_mod.Store.init(testing.allocator);
+    defer st.deinit();
+    st.place = .{ .group = 0, .count = 1 };
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    // A share no write fits in.
+    try @import("../settings/machine.zig").bindForTest(&st, 1);
+    var pb: [128]u8 = undefined;
+    const ns: ns_table.Id = .of(7);
+    var kb: [16]u8 = undefined;
+    const key = try std.fmt.bufPrint(&kb, "{s}k", .{&ns.bytes()});
+    const put = try kv_entries.Put.encodeInto(&pb, .{ .key = key, .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null });
+    const got = try deliverAll(&Kv.machine, &st, &scratch, &.{.{ .entry_type = .kv_put, .kind = .user, .ns = ns, .payload = put }});
+    try testing.expect(got[0].result.refused() == null);
+    try testing.expectEqual(@as(usize, 1), st.family(@import("../kv/machine.zig").Values.ID).count);
+}

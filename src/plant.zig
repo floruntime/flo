@@ -105,6 +105,14 @@ pub const Plant = enum {
     /// Records reach a store without its link, as a loader that skipped the
     /// store's counters would leave them.
     pool_load_bypasses_link,
+    /// The memory gate takes a write past its shard's share.
+    memory_admits_over_share,
+    /// The memory gate refuses a queue's deliver, a duty, past the share.
+    memory_refuses_system,
+    /// A write's charged bytes count each key's first write, not its last.
+    memory_delta_first_write,
+    /// A group's deliver takes fresh records past its shard's share.
+    group_deliver_uncapped,
 };
 
 pub const active: Plant = std.meta.stringToEnum(Plant, @import("build_options").vopr_plant) orelse

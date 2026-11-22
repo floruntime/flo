@@ -146,6 +146,9 @@ pub const Store = struct {
     /// Keys an entry touched without declaring them, where `strict_keys`
     /// is off; each power of two is logged.
     undeclared_keys: u64 = 0,
+    /// Writes this store's memory gate refused (`budget/gate.zig`): counted
+    /// on every replica, as each applies the same entries.
+    memory_refusals: u64 = 0,
     /// Time-series points this node applied late, past each lateness edge
     /// (`ts/machine.zig`), added as each entry commits. A count of applies,
     /// not state: no snapshot carries it, it starts again from zero with

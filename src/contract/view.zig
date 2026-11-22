@@ -8,6 +8,7 @@ const std = @import("std");
 const store_mod = @import("store.zig");
 const ApplyError = @import("../storage/persistence.zig").ApplyError;
 const log = @import("stdx").log;
+const plant = @import("../plant.zig");
 
 const Allocator = std.mem.Allocator;
 const Store = store_mod.Store;
@@ -558,6 +559,77 @@ pub const View = struct {
         for (&self.store.ts_late_points, self.ts_late_points) |*n, d| n.* += d;
     }
 
+    /// At least what committing would add to the families in `fams`, each
+    /// record counted as its key, its value and `per_record`, read off the
+    /// staged writes alone: every put counted whole, nothing freed. O(ops),
+    /// with no lookup.
+    pub fn stagedBound(self: *const View, fams: *const store_mod.FamilySet, per_record: u64) u64 {
+        return self.stagedBoundSince(.{ .ops = 0, .sends = 0, .late = @splat(0) }, fams, per_record);
+    }
+
+    /// `stagedBound`, of the writes staged since `mark` alone.
+    pub fn stagedBoundSince(self: *const View, since: Mark, fams: *const store_mod.FamilySet, per_record: u64) u64 {
+        var n: u64 = 0;
+        for (self.ops.items[since.ops..]) |op| {
+            if (op.range or !fams.isSet(op.fam)) continue;
+            const v = op.value orelse continue;
+            n += op.key.len + v.len + per_record;
+        }
+        return n;
+    }
+
+    /// What committing would add to the families in `fams` (less than 0:
+    /// what it frees), each record counted as `stagedBound` counts it: the
+    /// last write per key against the committed record, as `commit` makes
+    /// it. With `walk_ranges` false, a range delete frees nothing, so the
+    /// figure is at least the true one; with it true, the committed records
+    /// a range covers and no later write keeps are walked and freed, and the
+    /// figure is exact.
+    pub fn chargedDelta(self: *View, fams: *const store_mod.FamilySet, per_record: u64, walk_ranges: bool) i64 {
+        var d: i64 = 0;
+        for (self.ops.items, 0..) |op, i| {
+            if (op.range or !fams.isSet(op.fam)) continue;
+            if (comptime plant.active == .memory_delta_first_write) {
+                if (self.firstWrite(op.fam, op.key) != i) continue;
+            } else if (self.lastWrite(op.fam, op.key) != i) continue;
+            // A later range takes it, and frees what it covers.
+            if (self.ranges.items.len > 0 and self.rangedAfter(op.fam, op.key, i)) continue;
+            const old: i64 = if (self.store.find(op.fam, op.key)) |node| sizeOf(node.key, store_mod.Record.of(node).value, per_record) else 0;
+            const new: i64 = if (op.value) |v| sizeOf(op.key, v, per_record) else 0;
+            d += new - old;
+        }
+        if (!walk_ranges) return d;
+        for (self.ranges.items, 0..) |at, n| {
+            const op = self.ops.items[at];
+            if (!fams.isSet(op.fam)) continue;
+            var it = self.store.range(op.fam, op.key);
+            while (it.next()) |rec| {
+                if (op.below) |b| if (std.mem.order(u8, rec.key(), b) != .lt) break;
+                // An earlier range freed it already.
+                if (coveredBy(self.ops.items, self.ranges.items[0..n], op.fam, rec.key())) continue;
+                // A last write no range after it takes keeps it, as commit
+                // does, and its own delta counted it above.
+                if (self.lastWrite(op.fam, rec.key())) |w| if (!self.rangedAfter(op.fam, rec.key(), w)) continue;
+                d -= sizeOf(rec.key(), rec.value, per_record);
+            }
+        }
+        return d;
+    }
+
+    fn firstWrite(self: *const View, fam: u16, k: []const u8) ?usize {
+        for (self.ops.items, 0..) |op, i| if (!op.range and op.fam == fam and std.mem.eql(u8, op.key, k)) return i;
+        return null;
+    }
+
+    fn sizeOf(k: []const u8, v: []const u8, per_record: u64) i64 {
+        return @intCast(k.len + v.len + per_record);
+    }
+
+    fn coveredBy(ops: []const Op, ranges: []const usize, fam: u16, k: []const u8) bool {
+        for (ranges) |at| if (ops[at].covers(fam, k)) return true;
+        return false;
+    }
+
     const Step = struct {
         op: Op,
         /// The record it changes, found while reserving.
@@ -715,4 +787,69 @@ test "a key in one family is never the same key in another, whatever their hashe
     try std.testing.expect(!ctx.eql(.{ .fam = 1, .key = "\x01tk" }, .{ .fam = 2, .key = "\x01tk" }));
     try std.testing.expect(ctx.eql(.{ .fam = 1, .key = "\x01tk" }, .{ .fam = 1, .key = "\x01tk" }));
     try std.testing.expect(!ctx.eql(.{ .fam = 1, .key = "\x01tk" }, .{ .fam = 1, .key = "\x01tj" }));
+}
+
+const DeltaBytes = struct {
+    b: []const u8,
+    pub fn encode(self: DeltaBytes, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeAll(self.b);
+    }
+    pub fn decode(bytes: []const u8) error{Malformed}!DeltaBytes {
+        return .{ .b = bytes };
+    }
+};
+const DeltaFam = Family(1, "test.delta", .shard, DeltaBytes);
+const OtherFam = Family(2, "test.other", .shard, DeltaBytes);
+
+/// What the families in `fams` hold, as `chargedDelta` counts a record.
+fn chargedOf(store: *Store, fams: *const store_mod.FamilySet, per_record: u64) i64 {
+    var n: i64 = 0;
+    var it = fams.iterator(.{});
+    while (it.next()) |id| {
+        const f = store.family(@intCast(id));
+        n += @intCast(f.encoded_bytes + f.count * (per_record - store_mod.RECORD_OVERHEAD));
+    }
+    return n;
+}
+
+test "chargedDelta: an entry's writes add what their commit adds, the last write per key against what is committed, ranges walked" {
+    const R = 100;
+    var fams: store_mod.FamilySet = .empty;
+    fams.set(DeltaFam.ID);
+    var prng = std.Random.DefaultPrng.init(0x3c);
+    const rand = prng.random();
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const names = [_][]const u8{ "a", "ab", "abc", "b", "ba", "c" };
+    const values = [_][]const u8{ "", "x", "yy", "a longer value" };
+    for (0..400) |_| {
+        _ = scratch.reset(.retain_capacity);
+        var keys = KeySet.init(scratch.allocator());
+        try keys.addRange(DeltaFam.ID, "t", "");
+        try keys.addRange(OtherFam.ID, "t", "");
+        var view = View.init(&store, scratch.allocator(), &keys);
+        // Past `SCAN_LIMIT` now and then, so the last-write index is used.
+        const ops = rand.uintLessThan(usize, if (rand.boolean()) 8 else SCAN_LIMIT + 8);
+        for (0..ops) |_| {
+            var kb: [16]u8 = undefined;
+            const k = try key(&kb, "t", names[rand.uintLessThan(usize, names.len)]);
+            switch (rand.uintLessThan(u8, 10)) {
+                0...5 => try view.put(DeltaFam, k, .{ .b = values[rand.uintLessThan(usize, values.len)] }),
+                6, 7 => try view.delete(DeltaFam, k),
+                8 => try view.deleteRange(DeltaFam, k, if (rand.boolean()) null else try key(&kb, "t", "b")),
+                // An uncharged family's writes count nothing.
+                else => try view.put(OtherFam, k, .{ .b = "other" }),
+            }
+        }
+        const bound = view.chargedDelta(&fams, R, false);
+        const exact = view.chargedDelta(&fams, R, true);
+        const before = chargedOf(&store, &fams, R);
+        try view.commit();
+        const after = chargedOf(&store, &fams, R);
+        try std.testing.expectEqual(after - before, exact);
+        try std.testing.expect(bound >= exact);
+        try std.testing.expect(@as(i64, @intCast(view.stagedBound(&fams, R))) >= bound);
+    }
 }

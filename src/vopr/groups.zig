@@ -623,7 +623,11 @@ pub const GroupChannel = struct {
         const sim = &c.groups.sims[c.g];
         if (!sim.leadsReady(NODE) or sim.isHalted(NODE) or c.driver.term != sim.termOf(NODE)) return;
         const want = c.sinkBytesUnapplied(null);
-        if (c.driver.sink_bytes != want) c.groups.oracle.fail(c.g, c.g, sim.appliedIndex(NODE), "a leader's sink bytes in flight are not its log's unapplied sinks");
+        if (c.driver.sink_bytes != want) return c.groups.oracle.failOn(c.g, c.g, .sink, sim.appliedIndex(NODE), "a leader's sink bytes in flight are not its log's unapplied sinks");
+        // And per sender: what holds one sender back is its own in flight.
+        for (c.driver.peers, 0..) |*p, from| {
+            if (p.sink_bytes != c.sinkBytesUnapplied(@intCast(from))) return c.groups.oracle.failOn(@intCast(from), c.g, .sink, sim.appliedIndex(NODE), "a leader's sink bytes in flight from a sender are not its log's unapplied sinks from it");
+        }
     }
 
     /// Where this group's duties run, its driver started over on a new

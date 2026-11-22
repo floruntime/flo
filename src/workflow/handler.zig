@@ -323,6 +323,9 @@ pub const WorkflowHandler = struct {
         /// Its step's call found its action not registered: said once in
         /// its history. Leader memory, like the rest of a step's wait.
         call_unregistered_noted: bool = false,
+        /// Its step's call is held by its action's shard's memory share:
+        /// said once in its history, however long the hold.
+        call_over_budget_noted: bool = false,
         /// When this leader may next ask again for that call, and the index
         /// of the last time it did: until that applies, the step waits on
         /// it, so it can't give up as the start goes out again.
@@ -2331,11 +2334,28 @@ pub const WorkflowHandler = struct {
                 self.retryCall(shard, run, action_rid, c, now_ms);
                 return false;
             },
+            .over_budget => {
+                // A step that can't wait fails at once, saying why.
+                if (!c.can_wait) return true;
+                // Said once, however long the hold: memory frees when it
+                // frees, and each ask again adds nothing to history.
+                if (!run.call_over_budget_noted) {
+                    run.call_over_budget_noted = true;
+                    self.addHistoryEvent(run, "call_held_over_budget", c.outcome, now_ms);
+                }
+                if (run.call_retry_index > shard.raft_node.last_applied) return false;
+                const now_ns: u64 = @intCast(@max(now_ms, 0) *| std.time.ns_per_ms);
+                const wait_ms = callRetryMs(c.attempts);
+                if (now_ns < c.last_ns +| wait_ms * std.time.ns_per_ms or now_ms < run.call_retry_at_ms) return false;
+                self.retryCall(shard, run, action_rid, c, now_ms);
+                return false;
+            },
         }
     }
 
-    /// Asks again for a call whose action wasn't registered. Not proposed
-    /// (a busy log, a step-down): asked again a second later.
+    /// Asks again for a call whose action wasn't registered, or whose
+    /// action's shard was at its memory share. Not proposed (a busy log, a
+    /// step-down): asked again a second later.
     fn retryCall(self: *WorkflowHandler, shard: *Shard, run: *RunRecord, action_rid: []const u8, c: calls_mod.Call.Value, now_ms: i64) void {
         run.call_retry_at_ms = now_ms +| 1_000;
         const ns = keyNamespace(run.ns_key);
@@ -2345,6 +2365,8 @@ pub const WorkflowHandler = struct {
         const payload = ae.CallRetry.encodeInto(&buf, .{ .ns = ns.int(), .slot = calls_mod.callerSlot(ns, run.workflow_name_owned), .run = action_rid }) catch return;
         run.call_retry_index = (proposeCharged(shard, ns, .step_call_retry, payload) catch return).index;
         if (shard.metrics_registry) |m| m.workflow.recordActionCallRetry();
+        // A hold over memory was said once, when it started.
+        if (c.state == .over_budget) return;
         var nb: [ae.MAX_ACTION_NAME + 96]u8 = undefined;
         const next_s = callRetryMs(c.attempts +| 1) / 1000;
         self.addHistoryEvent(run, "action_call_retry", std.fmt.bufPrint(&nb, "waiting for action {s} to be registered, retry in {d} s", .{ c.target, next_s }) catch c.target, now_ms);
@@ -2688,6 +2710,16 @@ pub const WorkflowHandler = struct {
                 const due_ms = @max(ceilMs(next_ns), p.call_retry_at_ms);
                 return .{ .later = @min(due_ms, ceilMs(waited_out_ns)) };
             },
+            .over_budget => {
+                if (!c.can_wait) return .step;
+                const p = progress_mod.Progress.decode(rec.progress) catch return .step;
+                if (!p.call_over_budget_noted) return .step;
+                if (p.call_retry_index > shard.raft_node.last_applied) return .none;
+                const now_ns: u64 = @intCast(@max(now_ms, 0) *| std.time.ns_per_ms);
+                const next_ns = c.last_ns +| callRetryMs(c.attempts) * std.time.ns_per_ms;
+                if (now_ns >= next_ns and now_ms >= p.call_retry_at_ms) return .step;
+                return .{ .later = @max(ceilMs(next_ns), p.call_retry_at_ms) };
+            },
         }
     }
 
@@ -2747,7 +2779,8 @@ pub const WorkflowHandler = struct {
                 .cancelled => .failed,
             },
             .no_action => .no_action,
-            .refused => .refused,
+            // Settled only when its step can't wait: refused, saying why.
+            .refused, .over_budget => .refused,
             // Not settled: `callSettled` resumes only a settled one.
             .sent, .started => return,
         } else .lost;
@@ -2816,6 +2849,7 @@ pub const WorkflowHandler = struct {
         // The call's record goes with the step that takes its end.
         run.took_call_end = true;
         run.call_unregistered_noted = false;
+        run.call_over_budget_noted = false;
         run.call_retry_at_ms = 0;
         run.call_retry_index = 0;
 
@@ -4519,6 +4553,7 @@ pub const WorkflowHandler = struct {
         run.poll_attempt = p.poll_attempt;
         run.waiting_for_room = p.waiting_for_room;
         run.call_unregistered_noted = p.call_unregistered_noted;
+        run.call_over_budget_noted = p.call_over_budget_noted;
         run.call_retry_at_ms = p.call_retry_at_ms;
         run.call_retry_index = p.call_retry_index;
         run.plan_executor_idx = p.plan_executor_idx;
@@ -4543,6 +4578,7 @@ pub const WorkflowHandler = struct {
             .poll_attempt = run.poll_attempt,
             .waiting_for_room = run.waiting_for_room,
             .call_unregistered_noted = run.call_unregistered_noted,
+            .call_over_budget_noted = run.call_over_budget_noted,
             .call_retry_at_ms = run.call_retry_at_ms,
             .call_retry_index = run.call_retry_index,
             .plan_executor_idx = run.plan_executor_idx,
@@ -7855,4 +7891,143 @@ test "workflow leader caches: a schedule that couldn't be built for want of memo
         try testing.expect(handler.schedules.contains(writeKey(&key_buf, .default, "wf")));
         if (!failing.has_induced_failure) break;
     }
+}
+
+test "step executor: a call its action's shard holds over its memory share waits, says so once, and starts once memory frees" {
+    const settings = @import("../settings/machine.zig");
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    shard.workflow_handler = &handler;
+    registerTestAction(&shard, "step-a");
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    createTestRun(&handler, testKey(.default, "run-m"), "run-m", "test-wf");
+    // The shard has no room for a run.
+    try settings.bindForTest(&shard.defaultPartition().store, 1);
+    handler.advanceWorkflow(&shard, testKey(.default, "run-m"));
+    settleTest(&shard);
+    handler.checkPendingActions(&shard);
+    settleTest(&shard);
+    const run = handler.takeRun(&shard, testKey(.default, "run-m")).?;
+    const rid = run.pending_action_run_id_owned.?;
+    const c = WorkflowHandler.callOf(&shard, run, rid).?;
+    try testing.expectEqual(calls_mod.State.over_budget, c.state);
+    try testing.expect(std.mem.indexOf(u8, c.outcome, "would pass its share") != null);
+    // Held, not failed, and not taken for a missing action.
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    var held: usize = 0;
+    for (run.history.items) |evt| {
+        try testing.expect(!std.mem.eql(u8, evt.event_type_owned, "action_not_registered"));
+        if (std.mem.eql(u8, evt.event_type_owned, "call_held_over_budget")) held += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), held);
+    // Memory frees: asked again, it starts.
+    try settings.bindForTest(&shard.defaultPartition().store, 1 << 40);
+    handler.retryCall(&shard, run, rid, c, @import("stdx").time.milliTimestamp());
+    handler.commitRun(&shard, testKey(.default, "run-m"));
+    settleTest(&shard);
+    const again = handler.takeRun(&shard, testKey(.default, "run-m")).?;
+    try testing.expectEqual(calls_mod.State.started, WorkflowHandler.callOf(&shard, again, again.pending_action_run_id_owned.?).?.state);
+    // The ask again added nothing to history.
+    held = 0;
+    for (again.history.items) |evt| {
+        try testing.expect(!std.mem.eql(u8, evt.event_type_owned, "action_call_retry"));
+        if (std.mem.eql(u8, evt.event_type_owned, "call_held_over_budget")) held += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), held);
+    handler.commitRun(&shard, testKey(.default, "run-m"));
+}
+
+test "step executor: a call that can't wait, held over its action's shard's memory share, fails at once saying why" {
+    const settings = @import("../settings/machine.zig");
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    shard.workflow_handler = &handler;
+    registerTestAction(&shard, "stripe");
+    registerTestAction(&shard, "paypal");
+    // Each executor's call can't wait: the other could run.
+    createTestDef(&handler, testKey(.default, "plan-wf"), "plan-wf", test_plan_exhaust_workflow_json);
+    createTestRun(&handler, testKey(.default, "run-c"), "run-c", "plan-wf");
+    try settings.bindForTest(&shard.defaultPartition().store, 1);
+    handler.advanceWorkflow(&shard, testKey(.default, "run-c"));
+    settleTest(&shard);
+    handler.checkPendingActions(&shard);
+    settleTest(&shard);
+    const run = handler.inspect(testKey(.default, "run-c")).?;
+    var refused = false;
+    for (run.history.items) |evt| {
+        try testing.expect(!std.mem.eql(u8, evt.event_type_owned, "action_not_found"));
+        try testing.expect(!std.mem.eql(u8, evt.event_type_owned, "call_held_over_budget"));
+        if (std.mem.eql(u8, evt.event_type_owned, "action_refused") and std.mem.indexOf(u8, evt.detail_owned, "would pass its share") != null) refused = true;
+    }
+    try testing.expect(refused);
+}
+
+test "step executor: a call first unregistered, then over its action's shard's share, then unregistered again, says each hold once" {
+    const settings = @import("../settings/machine.zig");
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    shard.workflow_handler = &handler;
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    createTestRun(&handler, testKey(.default, "run-u"), "run-u", "test-wf");
+    const key = testKey(.default, "run-u");
+    const S = struct {
+        /// Each hold's note in `run`'s history, how many times.
+        fn notes(run: *const WorkflowHandler.RunRecord) [2]usize {
+            var n: [2]usize = .{ 0, 0 };
+            for (run.history.items) |evt| {
+                if (std.mem.eql(u8, evt.event_type_owned, "action_not_registered")) n[0] += 1;
+                if (std.mem.eql(u8, evt.event_type_owned, "call_held_over_budget")) n[1] += 1;
+            }
+            return n;
+        }
+        /// Asked again, as the duty would, and answered.
+        fn again(h: *WorkflowHandler, sh: *Shard, k: []const u8) void {
+            const run = h.takeRun(sh, k).?;
+            const rid = run.pending_action_run_id_owned.?;
+            h.retryCall(sh, run, rid, WorkflowHandler.callOf(sh, run, rid).?, @import("stdx").time.milliTimestamp());
+            h.commitRun(sh, k);
+            settleTest(sh);
+            h.checkPendingActions(sh);
+            settleTest(sh);
+        }
+    };
+    // Not registered: said once.
+    handler.advanceWorkflow(&shard, key);
+    settleTest(&shard);
+    handler.checkPendingActions(&shard);
+    settleTest(&shard);
+    try testing.expectEqual([2]usize{ 1, 0 }, S.notes(handler.inspect(key).?));
+    // Registered, but its shard has no room: that hold said once too.
+    registerTestAction(&shard, "step-a");
+    try settings.bindForTest(&shard.defaultPartition().store, 1);
+    S.again(&handler, &shard, key);
+    S.again(&handler, &shard, key);
+    try testing.expectEqual(calls_mod.State.over_budget, WorkflowHandler.callOf(&shard, handler.inspect(key).?, handler.inspect(key).?.pending_action_run_id_owned.?).?.state);
+    try testing.expectEqual([2]usize{ 1, 1 }, S.notes(handler.inspect(key).?));
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.inspect(key).?.status);
+    // Then room, but the action gone: unregistered again, and neither hold
+    // said twice for the one call.
+    applyTestActionEntry(&shard, .action_delete, test_action_entries.Delete.Value{ .ns = NamespaceId.default.int(), .name = "step-a" }, 1);
+    try settings.bindForTest(&shard.defaultPartition().store, 1 << 40);
+    S.again(&handler, &shard, key);
+    try testing.expectEqual(calls_mod.State.no_action, WorkflowHandler.callOf(&shard, handler.inspect(key).?, handler.inspect(key).?.pending_action_run_id_owned.?).?.state);
+    try testing.expectEqual([2]usize{ 1, 1 }, S.notes(handler.inspect(key).?));
 }

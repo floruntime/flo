@@ -123,6 +123,8 @@ pub const TestContext = struct {
         server: ServerProcess.ServerConfig = .{},
         /// Custom server startup timeout (ms)
         server_timeout_ms: u64 = ServerProcess.DEFAULT_READY_TIMEOUT_MS,
+        /// Set in the server's environment, over this process's.
+        env: []const [2][]const u8 = &.{},
     };
 
     /// Initialize with custom configuration
@@ -140,6 +142,7 @@ pub const TestContext = struct {
         var attempt: u8 = 0;
         while (true) {
             self.server = try ServerProcess.initWithConfig(allocator, config.server);
+            self.server.extra_env = config.env;
 
             self.server.startWithTimeout(config.server_timeout_ms) catch |err| {
                 self.server.deinit();

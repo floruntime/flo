@@ -793,6 +793,8 @@ pub const ShardMetrics = struct {
     /// The share of the budget this shard is bound to, or 0 while none is
     /// bound (nothing is enforced then).
     pool_share_bytes: Atomic(u64) = Atomic(u64).init(0),
+    /// Client writes refused here as past the shard's share, since start.
+    memory_refusals: Atomic(u64) = Atomic(u64).init(0),
     /// Time-series points this node applied behind their field's newest
     /// time, past each lateness edge, since it started.
     ts_late: [TS_LATE_EDGES.len]Atomic(u64) = @splat(Atomic(u64).init(0)),
@@ -1054,6 +1056,7 @@ pub const ShardMetrics = struct {
         ts_point_bytes: u64,
         pool_use_bytes: u64,
         pool_share_bytes: u64,
+        memory_refusals: u64,
         ts_late: [TS_LATE_EDGES.len]u64,
         channel_sender_bugs: [SENDER_BUGS]u64,
         channel_sink_refusals: std.EnumArray(Reason, u64),
@@ -1126,6 +1129,7 @@ pub const ShardMetrics = struct {
             .ts_point_bytes = self.ts_point_bytes.load(.monotonic),
             .pool_use_bytes = self.pool_use_bytes.load(.monotonic),
             .pool_share_bytes = self.pool_share_bytes.load(.monotonic),
+            .memory_refusals = self.memory_refusals.load(.monotonic),
             .ts_late = blk: {
                 var v: [TS_LATE_EDGES.len]u64 = undefined;
                 for (&v, &self.ts_late) |*o, *a| o.* = a.load(.monotonic);
@@ -2021,6 +2025,7 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_pool_use_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.pool_use_bytes });
     // No line while unbound: 0 would read as a share every write is over.
     if (snap.pool_share_bytes > 0) try writer.print("flo_shard_pool_share_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.pool_share_bytes });
+    try writer.print("flo_shard_memory_refusals_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.memory_refusals });
     for (TS_LATE_EDGES, snap.ts_late) |edge, n| try writer.print("flo_ts_late_points_total{{shard_id=\"{d}\",behind=\"{s}\"}} {d}\n", .{ snap.shard_id, edge, n });
     for (std.enums.values(SenderBug), snap.channel_sender_bugs) |bug, n| try writer.print("flo_shard_channel_sender_bugs_total{{shard_id=\"{d}\",reason=\"{s}\"}} {d}\n", .{ snap.shard_id, @tagName(bug), n });
     try writer.print("flo_shard_channel_outbox_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.channel_outbox_bytes });
@@ -2234,6 +2239,7 @@ test "registry: a shard's pool share has no line until one is bound" {
     defer allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "flo_shard_pool_share_bytes{shard_id=\"1\"} 4096\n") != null);
     try testing.expect(std.mem.indexOf(u8, text, "flo_shard_pool_share_bytes{shard_id=\"0\"}") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "flo_shard_memory_refusals_total{shard_id=\"1\"} 0\n") != null);
 }
 
 test "registry: a follower's read misses are counted by op and by how they were answered" {

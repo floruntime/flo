@@ -5,7 +5,8 @@ Each test spawns real `zig-out/bin/flo` servers. The full suite takes about
 change touches locally, and leave the full suite to CI.
 
 The fault files (`apply_crash`, `halt`, `repair_skip`, `salvage`,
-`snapshot_window`) instead spawn `zig-out/test/flo-faults` — a second `flo`
+`snapshot_window`, and one `memory_budget` test, for a small bound share)
+instead spawn `zig-out/test/flo-faults` — a second `flo`
 compiled with the fault drive the shipped binary never carries. `test-e2e`
 builds it automatically, so any `test-e2e` run pays one extra full `flo`
 compile the first time `flo`'s sources change; zig caches by content, so a

@@ -264,6 +264,9 @@ pub const Answer = enum(u8) {
     /// The start was refused: the child's workflow was disabled when it
     /// applied. This call has no run. The reply's `why` says so.
     refused = 6,
+    /// The action's shard is at its memory share: no run was started, and
+    /// the call may ask again once memory frees. The reply's `why` says so.
+    over_budget = 7,
 };
 
 /// The action's shard's answer to a call's start, sent back to the

@@ -10,6 +10,7 @@ const persistence = @import("../storage/persistence.zig");
 const store_mod = @import("store.zig");
 const view_mod = @import("view.zig");
 const channels = @import("channels.zig");
+const gate = @import("../budget/gate.zig");
 
 const EntryType = entry_mod.EntryType;
 const Entry = entry_mod.Entry;
@@ -177,6 +178,22 @@ pub fn families(comptime machines: []const Machine) []const FamilyInfo {
 /// unless it was refused or failed. `scratch` holds the entry's staged
 /// bytes and is reset first.
 pub fn applyEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, e: *const Entry, out: *persistence.Result) ApplyError!void {
+    const watch = gate_watch orelse return applyStaged(m, store, scratch, e, out);
+    watch.before(store);
+    try applyStaged(m, store, scratch, e, out);
+    watch.after(m, store, e, out);
+}
+
+/// Told of every entry `applyEntry` applies, before and after: the
+/// simulator's memory checker judges each verdict from the store, apart
+/// from the gate. Null in the server.
+pub const GateWatch = struct {
+    before: *const fn (store: *store_mod.Store) void,
+    after: *const fn (m: *const Machine, store: *store_mod.Store, e: *const Entry, out: *const persistence.Result) void,
+};
+pub var gate_watch: ?*const GateWatch = null;
+
+fn applyStaged(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, e: *const Entry, out: *persistence.Result) ApplyError!void {
     _ = scratch.reset(.retain_capacity);
     const arena = scratch.allocator();
     var keys = view_mod.KeySet.init(arena);
@@ -189,6 +206,12 @@ pub fn applyEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.heap
     if (view.sends.items.len > 0) {
         if (channels.tooMuchSent(view.sends.items)) |why| return out.refuse(.bad_request, .malformed, why);
         try channels.writeSends(&view, e.header.index);
+    }
+    // Past its shard's share, a client's write is refused, sends and all:
+    // the outbox it would fill is charged.
+    if (gate.judge(&view, e)) |o| {
+        store.memory_refusals += 1;
+        return gate.refuse(out, if (store.place) |p| p.group else null, o);
     }
     try view.commit();
 }
