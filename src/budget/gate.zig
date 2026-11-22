@@ -19,6 +19,7 @@ const store_mod = @import("../contract/store.zig");
 const pool = @import("pool.zig");
 const settings = @import("../settings/machine.zig");
 const plant = @import("../plant.zig");
+const stream_machine = @import("../stream/machine.zig");
 
 const EntryType = entry_mod.EntryType;
 const Entry = entry_mod.Entry;
@@ -37,7 +38,8 @@ pub const Class = enum {
 /// Every entry type's class. A new type fails the build until it is given one.
 pub fn classOf(t: EntryType) Class {
     return switch (t) {
-        .kv_put, .kv_batch, .kv_incr, .kv_json_patch, .kv_expire => .refusable,
+        .kv_put, .kv_batch, .kv_incr, .kv_json_patch => .refusable,
+        // A stream config that alters is admitted (`refusable`).
         .stream_append, .stream_config => .refusable,
         .queue_enqueue => .refusable,
         .ts_write, .ts_write_batch => .refusable,
@@ -47,6 +49,9 @@ pub fn classOf(t: EntryType) Class {
 
         .group_deliver => .own,
 
+        // A TTL set on a live key's current value, in place: no history
+        // version kept, its size unchanged. It is how a user frees memory.
+        .kv_expire => .never,
         // Deletes and trims.
         .kv_delete, .stream_trim, .stream_delete, .stream_clean, .stream_forget => .never,
         .ts_delete, .ts_retention, .queue_purge, .group_delete, .action_delete => .never,
@@ -84,6 +89,19 @@ const REFUSABLE: [256]bool = blk: {
     break :blk r;
 };
 
+/// Whether `e` may be refused for memory: its type's class is `refusable`,
+/// it isn't a sink's direct write (held before it was proposed, as its
+/// channel's are), and it isn't a stream alter. An alter only sets an
+/// existing stream's retention, one record per stream, and is how a user
+/// frees memory; a stream config that creates stays refusable.
+pub fn refusable(e: *const Entry) bool {
+    // Every write passes here: a table, not a search of the enum.
+    if (!REFUSABLE[e.header.entry_type]) return false;
+    if (e.header.flags & entry_mod.Flags.SINK != 0) return false;
+    if (e.header.entry_type == @backingInt(EntryType.stream_config)) return !stream_machine.isAlter(e);
+    return true;
+}
+
 /// What the gate weighed: the shard's use, what the entry adds, and the share.
 pub const Over = struct { use: u64, delta: i64, share: u64 };
 
@@ -91,12 +109,8 @@ pub const Over = struct { use: u64, delta: i64, share: u64 };
 /// it is refusable, at the top level, isn't a sink's direct write, and would
 /// add charged bytes past the share. Null when it may commit.
 pub fn judge(view: *view_mod.View, e: *const Entry) ?Over {
-    // Every write passes here: a table, not a search of the enum.
-    const refusable = REFUSABLE[e.header.entry_type] or (comptime plant.active == .memory_refuses_system) and e.header.entry_type == @backingInt(EntryType.queue_deliver);
-    if (!refusable) return null;
-    // A sink's direct write was held before it was proposed, as its
-    // channel's are.
-    if (e.header.flags & entry_mod.Flags.SINK != 0) return null;
+    const system = (comptime plant.active == .memory_refuses_system) and e.header.entry_type == @backingInt(EntryType.queue_deliver);
+    if (!refusable(e) and !system) return null;
     if (comptime plant.active == .memory_admits_over_share) return null;
     return over(view);
 }
@@ -164,7 +178,7 @@ test "gate: what a client writes is refusable, what frees or the node writes for
     // Every type has a class (the switch is exhaustive); these are the ones
     // whose class decides a refusal.
     for ([_]EntryType{ .kv_put, .kv_batch, .stream_append, .queue_enqueue, .ts_write, .group_create, .action_invoke, .processing_submit }) |t| try testing.expectEqual(Class.refusable, classOf(t));
-    for ([_]EntryType{ .kv_delete, .kv_reap, .stream_trim, .queue_deliver, .action_settle, .action_release, .namespace_create, .channel_inbound, .channel_unpark, .workflow_start, .settings_budget_bind }) |t| try testing.expectEqual(Class.never, classOf(t));
+    for ([_]EntryType{ .kv_delete, .kv_reap, .kv_expire, .stream_trim, .queue_deliver, .action_settle, .action_release, .namespace_create, .channel_inbound, .channel_unpark, .workflow_start, .settings_budget_bind }) |t| try testing.expectEqual(Class.never, classOf(t));
     try testing.expectEqual(Class.own, classOf(.group_deliver));
 }
 

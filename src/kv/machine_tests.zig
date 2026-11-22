@@ -1102,8 +1102,13 @@ test "kv machine: past its shard's share a write is refused and changes nothing;
     r = try kv.apply(&putEntry(&buf, dk("a"), "z", 3, STAMP, 0));
     try testing.expect(r.refused() == null);
     try testing.expect(pool.useOf(&kv.store) < use);
+    // An expire sets the TTL in place, keeping no version: it adds nothing.
+    const at_expire = pool.useOf(&kv.store);
+    r = try kv.apply(&testEntry(&buf, .kv_expire, .{ .key = dk("a"), .ttl_ms = 60_000, .cas_version = null }, 4, STAMP));
+    try testing.expect(r.refused() == null);
+    try testing.expectEqual(at_expire, pool.useOf(&kv.store));
     // So is a delete.
-    r = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = dk("a"), .cas_version = null }, 4, STAMP));
+    r = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = dk("a"), .cas_version = null }, 5, STAMP));
     try testing.expect(r.refused() == null);
     // And with no share bound, nothing is refused.
     var free = TestKv.init(testing.allocator);

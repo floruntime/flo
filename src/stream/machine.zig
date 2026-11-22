@@ -304,6 +304,14 @@ fn commandOf(e: *const Entry) ?entry_mod.CommandPayload {
     return entry_mod.CommandPayload.deserialize(e.payload);
 }
 
+/// Whether a `stream_config` entry is an alter: it sets retention on a
+/// stream that exists, and creates nothing.
+pub fn isAlter(e: *const Entry) bool {
+    const cmd = commandOf(e) orelse return false;
+    const c = StreamConfig.decode(cmd.value) orelse return false;
+    return c.op == .alter;
+}
+
 /// The stream an entry names: a trim's key is its bound and its value the
 /// name's hash; a clean's value is the hash, and a forget's the hash and
 /// the generation it forgets; every other names it by its key.
@@ -1090,4 +1098,20 @@ test "streams machine: an alter's clear drops a bound, and a create carrying one
     try testing.expect(!t.retained("s"));
     try testing.expectEqual(proto.StatusCode.bad_request, (try t.config(create(1, StreamConfig.CLEAR, 0), "t", 4)).refused().?.status);
     try testing.expect(t.meta("t") == null);
+}
+
+test "streams machine: past its shard's share an alter that adds retention is taken, a create is refused" {
+    const settings = @import("../settings/machine.zig");
+    const pool = @import("../budget/pool.zig");
+    var t = TestStreams.init();
+    defer t.deinit();
+    _ = try t.append("s", 1, 4, 64);
+    // A share already full: nothing more fits.
+    try settings.bindForTest(&t.store, pool.useOf(&t.store));
+    try testing.expectEqual(proto.Reason.memory_budget, (try t.config(create(1, 30, 0), "new", 2)).refused().?.refusal.reason);
+    try testing.expect(t.meta("new") == null);
+    // A user freeing memory: the alter is how they ask for it.
+    try testing.expect((try t.config(alter(0, 2), "s", 3)).refused() == null);
+    try testing.expect(t.retained("s"));
+    try testing.expectEqual(@as(u64, 2), t.meta("s").?.retention_count);
 }
