@@ -40,6 +40,13 @@ pub const Plant = enum {
     runs_hist_flushed_kept,
     /// An ended run keeps its step outputs.
     runs_end_keeps_outputs,
+    /// An action run's history flush sends its pending events but doesn't
+    /// move past them.
+    actions_hist_flushed_kept,
+    /// An ended action run keeps its input.
+    actions_end_keeps_input,
+    /// A settle's resend, matching the first, tells the caller again.
+    actions_resend_rewrites_result,
     /// An ended run takes a first step.
     runs_ended_takes_step,
     /// A schedule start's slot replaces the fired slot, even an earlier one.

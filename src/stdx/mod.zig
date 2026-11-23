@@ -23,6 +23,8 @@ pub const net = @import("net.zig");
 /// Sync primitives shim — `@import("stdx").Mutex` was removed in 0.16.
 pub const sync = @import("sync.zig");
 pub const process = @import("process.zig");
+/// Hashes whose values are stored: pinned, unlike `std.hash`.
+pub const hash = @import("hash.zig");
 pub const Mutex = sync.Mutex;
 
 pub const testing = @import("testing/e2e/mod.zig");

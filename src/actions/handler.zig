@@ -22,6 +22,7 @@ const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
 const run_id_mod = @import("../node/run_id.zig");
 const table_run = @import("../node/table_run.zig");
+const history_ops = @import("../node/history_ops.zig");
 const gather_mod = @import("../node/gather.zig");
 const waiter_pool_mod = @import("../node/waiter_pool.zig");
 const ReplyTo = @import("../node/reply_to.zig").ReplyTo;
@@ -268,6 +269,7 @@ pub const ActionsHandler = struct {
         dispatcher.registerWithRoute(.action_invoke, dispatchAction, preRouteByAction);
         // The run id's bits name the partition the run lives on.
         dispatcher.registerWithRoute(.action_status, table_run.handler("action.status", ActionsHandler, runStatus), run_id_mod.preRouteByRunId);
+        dispatcher.registerWithRoute(.action_history, table_run.handler("action.history", history_ops.Ops, history_ops.Ops.actionHistory), run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.action_info, table_run.handler("action.info", ActionsHandler, runInfo), preRouteByAction);
         dispatcher.registerWalk(.action_list, dispatchAction, localScanActions);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
@@ -585,6 +587,8 @@ pub const ActionsHandler = struct {
                 .worker_id = worker_id,
                 .outcome = named_outcome,
                 .held = held,
+                .output_truncated = output != null and run.result_truncated,
+                .error_truncated = error_message != null and run.error_truncated,
             },
         };
     }

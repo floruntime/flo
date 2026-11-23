@@ -202,6 +202,7 @@ pub const OpCode = enum(u16) {
     action_touch = 0x30D,
     action_deliver = 0x30E,
     action_info = 0x30F,
+    action_history = 0x310,
 
     // ── Workers (0x320 – 0x33F) ──────────────────────────────────────────────
     worker_register = 0x320,

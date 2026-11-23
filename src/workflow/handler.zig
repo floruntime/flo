@@ -20,7 +20,7 @@
 //! | workflow_signal      | run_id            | [sig_len:u16][sig_type][payload...]  |
 //! | workflow_cancel      | run_id            | reason (optional)                   |
 //! | workflow_status      | run_id            | (empty)                             |
-//! | workflow_history     | run_id            | [limit:u32]                         |
+//! | workflow_history     | run_id            | on the op table (`workflow.history`) |
 //! | workflow_list_runs   | workflow_name     | [limit:u32][status_len:u16][status][cursor_len:u16][cursor][search_len:u16][search] |
 //! | workflow_get_def     | workflow_name     | version (optional)                  |
 //! | workflow_disable     | workflow_name     | version (optional)                  |
@@ -63,6 +63,9 @@ const ae = @import("../protocol/action_entries.zig");
 const calls_mod = @import("../actions/calls_machine.zig");
 const wire_schema = @import("../protocol/schema.zig");
 const StreamHandler = @import("../stream/handler.zig").StreamHandler;
+const history_read = @import("../stream/history_read.zig");
+const history_ops = @import("../node/history_ops.zig");
+const table_run = @import("../node/table_run.zig");
 const ops = @import("../protocol/ops.zig");
 const history_machine = @import("../stream/history_machine.zig");
 const waiter_pool_mod = @import("../node/waiter_pool.zig");
@@ -661,7 +664,7 @@ pub const WorkflowHandler = struct {
         dispatcher.registerWithRoute(.workflow_status, dispatchWorkflow, run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.workflow_signal, dispatchWorkflow, run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.workflow_cancel, dispatchWorkflow, run_id_mod.preRouteByRunId);
-        dispatcher.registerWithRoute(.workflow_history, dispatchWorkflow, run_id_mod.preRouteByRunId);
+        dispatcher.registerWithRoute(.workflow_history, table_run.handler("workflow.history", history_ops.Ops, history_ops.Ops.workflowHistory), run_id_mod.preRouteByRunId);
         dispatcher.registerWalk(.workflow_list_definitions, dispatchWorkflow, localScanWorkflowDefs);
     }
 
@@ -790,7 +793,6 @@ pub const WorkflowHandler = struct {
             .workflow_signal => return self.handleSignal(shard, conn, req),
             .workflow_cancel => return self.handleCancel(shard, conn, req),
             .workflow_status => self.handleStatus(shard, conn, req),
-            .workflow_history => self.handleHistory(shard, conn, req),
             .workflow_list_runs => self.handleListRuns(shard, conn, req),
             .workflow_get_definition => self.handleGetDefinition(shard, conn, req),
             .workflow_disable => return self.handleSetEnabled(shard, conn, req, false),
@@ -1524,285 +1526,29 @@ pub const WorkflowHandler = struct {
         };
     }
 
-    /// One event of a run's history and the seqs it covers: its own, or a
-    /// gap's (`HISTORY_LOST`, `HISTORY_MISSING`), within what was asked.
-    pub const SeqEvent = struct {
-        seq: u64,
-        event: HistoryEvent,
-        last: u64,
+    pub const SeqEvent = history_read.SeqEvent;
+    pub const HistoryPage = history_read.Page;
+    pub const HistoryAnswer = history_read.Answer;
+    pub const MAX_HISTORY_PAGE = history_read.MAX_PAGE;
+    pub const HISTORY_LOST = history_read.LOST;
+    pub const HISTORY_MISSING = history_read.MISSING;
+    pub const HistoryRequest = history_read.Query;
 
-        fn one(seq: u64, event: HistoryEvent) SeqEvent {
-            return .{ .seq = seq, .event = event, .last = seq };
-        }
-
-        /// A gap's event over `first..last`, cut to `window`, or null for
-        /// none of it in the window.
-        fn gap(a: Allocator, window: StreamHandler.HistoryWindow, event_type: []const u8, comptime fmt: []const u8, first: u64, last: u64) error{OutOfMemory}!?SeqEvent {
-            if (!window.wants(first, last)) return null;
-            const lo = @max(first, window.from);
-            const hi = @min(last, window.to - 1);
-            return .{ .seq = lo, .last = hi, .event = .{ .event_type_owned = event_type, .detail_owned = try std.fmt.allocPrint(a, fmt, .{ lo, hi }), .timestamp_ms = 0 } };
-        }
-    };
-
-    /// A page of a run's history: its events in the order asked, and, when
-    /// more follow, the cursor that asks for them.
-    pub const HistoryPage = struct { events: []const SeqEvent, more: ?u64 };
-
-    pub const HistoryAnswer = union(enum) {
-        page: HistoryPage,
-        /// Not all of it here yet: a chunk in flight to its rows, or one
-        /// being read back from disk. Held, then asked again.
-        wait,
-        /// At its deadline, a chunk still being read back from disk:
-        /// answered retryable, never as a short page that looks whole.
-        disk_late,
-    };
-
-    /// How long a history read is held for its chunks to land, or come back
-    /// from disk, before it is answered with what landed.
-    pub const HISTORY_HOLD_MS: u32 = 5_000;
-
-    /// The most events one history page holds, whatever its limit asks.
-    pub const MAX_HISTORY_PAGE: u32 = 1000;
-    /// The most bytes one page's events take on the wire: the answer's
-    /// bound, less its count and trailer. One event, from one entry, always
-    /// fits.
-    pub const HISTORY_PAGE_BYTES: usize = ops.MAX_RESPONSE_BODY - 4 - (1 + 2 + 8);
-    comptime {
-        std.debug.assert(HISTORY_PAGE_BYTES >= persistence_mod.MAX_PERSIST_PAYLOAD + 2 + 2 + 8);
-    }
-
-    fn wireSize(e: SeqEvent) usize {
-        return 2 + e.event.event_type_owned.len + 2 + e.event.detail_owned.len + 8;
-    }
-
-    /// Event type of a gap in a run's history: events a repair skipped, or
-    /// the log no longer holds (`lost`), or not landed by the read's
-    /// deadline (`missing`).
-    pub const HISTORY_LOST = "history_lost";
-    pub const HISTORY_MISSING = "history_missing";
-
-    /// Run `run_key`'s history as applied, `rec` its run: the events landed
-    /// in its rows and those its run holds pending, merged by seq, at most
-    /// `limit`, from `window`. A read whose chunks haven't all landed waits,
-    /// unless it is `final` (its deadline): then the rest is said missing.
-    /// Points into `a`.
+    /// Run `run_key`'s history as applied, `rec` its run, as
+    /// `history_read.read` answers it. Points into `a`.
     pub fn readRunHistory(self: *WorkflowHandler, a: Allocator, run_key: []const u8, rec: runs_machine.Run.Value, window: StreamHandler.HistoryWindow, asked: u32, final: bool) error{OutOfMemory}!HistoryAnswer {
-        const limit = std.math.clamp(asked, 1, MAX_HISTORY_PAGE);
         const stream = self.history orelse return .{ .page = .{ .events = &.{}, .more = null } };
-        const ns = keyNamespace(run_key);
-        const run_id = keyName(run_key);
         const ended: ?u64 = if (appliedStatus(rec).isTerminal()) @intCast(@max(rec.completed_at_ms, 0)) else null;
-        const landed = try stream.readHistory(a, .workflow, ns, rec.workflow, run_id, rec.created_ns, ended, window, @as(usize, limit) + 1);
-        if (landed.pending and !final) return .wait;
-        if (landed.pending) return .disk_late;
-        // Every seq below `hist_flushed` was sent: those past what landed are
-        // still on their way.
-        const through = history_machine.landedThrough(self.defsRead(), a, .workflow, ns, rec.workflow, run_id, rec.created_ns, ended);
-        const landed_next: u64 = if (through) |t| t + 1 else 0;
-        const in_flight = landed_next < rec.hist_flushed;
-
-        var landed_events: std.ArrayListUnmanaged(SeqEvent) = .empty;
-        for (landed.pieces) |piece| {
-            if (piece.lost) {
-                if (try SeqEvent.gap(a, window, HISTORY_LOST, "events {d}-{d} were lost", piece.first_seq, piece.last_seq)) |g| try landed_events.append(a, g);
-                continue;
-            }
-            const mark = landed_events.items.len;
-            try decodeRecords(a, piece.records, window, &landed_events);
-            if (window.newest_first) std.mem.reverse(SeqEvent, landed_events.items[mark..]);
-        }
-        var missing: std.ArrayListUnmanaged(SeqEvent) = .empty;
-        if (in_flight) if (try SeqEvent.gap(a, window, HISTORY_MISSING, "events {d}-{d} had not landed in time", landed_next, rec.hist_flushed - 1)) |g| try missing.append(a, g);
-        var pending: std.ArrayListUnmanaged(SeqEvent) = .empty;
-        try decodeRecords(a, rec.hist_pending, window, &pending);
-
-        // Oldest first: landed, then missing, then pending; newest first,
-        // the reverse.
-        var all: std.ArrayListUnmanaged(SeqEvent) = .empty;
-        if (window.newest_first) {
-            std.mem.reverse(SeqEvent, pending.items);
-            try all.appendSlice(a, pending.items);
-            try all.appendSlice(a, missing.items);
-            try all.appendSlice(a, landed_events.items);
-        } else {
-            try all.appendSlice(a, landed_events.items);
-            try all.appendSlice(a, missing.items);
-            try all.appendSlice(a, pending.items);
-        }
-        // At most `limit` events, and no more than a page's bytes.
-        var n: usize = 0;
-        var bytes: usize = 0;
-        while (n < @min(all.items.len, limit)) : (n += 1) {
-            bytes += wireSize(all.items[n]);
-            if (bytes > HISTORY_PAGE_BYTES) break;
-        }
-        const more = all.items.len > n or landed.pieces.len > limit;
-        const page = all.items[0..n];
-        // Held only when what isn't landed yet is in this page: one the
-        // events in hand fill, or wholly before or after the gap, is
-        // answered now.
-        if (!final and missing.items.len > 0) for (page) |e| {
-            if (std.mem.eql(u8, e.event.event_type_owned, HISTORY_MISSING) and e.seq == missing.items[0].seq) return .wait;
-        };
-        // The next page starts past every seq this one covered, a gap's too.
-        const next: ?u64 = if (!more or page.len == 0) null else if (window.newest_first) page[page.len - 1].seq else page[page.len - 1].last + 1;
-        return .{ .page = .{ .events = page, .more = next } };
-    }
-
-    /// The events `records` (a chunk's, or a run's pending) holds within
-    /// `window`, oldest first, onto `out`.
-    fn decodeRecords(a: Allocator, records: []const u8, window: StreamHandler.HistoryWindow, out: *std.ArrayListUnmanaged(SeqEvent)) error{OutOfMemory}!void {
-        var diag: wire_schema.Diagnostic = .{};
-        var r: wire_schema.Reader = .{ .bytes = records, .diag = &diag };
-        while (r.pos < records.len) {
-            // What the runs machine encoded: one that doesn't decode ends
-            // what is read of it.
-            const rec = runs_machine.HistRec.decode(&r, "event") catch return;
-            if (rec.seq < window.from or rec.seq >= window.to) continue;
-            try out.append(a, SeqEvent.one(rec.seq, .{ .event_type_owned = rec.event, .detail_owned = rec.detail, .timestamp_ms = rec.at_ms }));
-        }
-    }
-
-    // ── HISTORY ─────────────────────────────────────────────────────────
-
-    /// A history request: `[limit:u32]`, then optionally
-    /// `[cursor_len:u16][cursor][newest_first:u8]`, the cursor a page's
-    /// answer gave (empty for the start).
-    pub const HistoryRequest = struct {
-        limit: u32 = 100,
-        cursor: ?u64 = null,
-        newest_first: bool = false,
-
-        pub fn parse(value: []const u8) ?HistoryRequest {
-            var q: HistoryRequest = .{};
-            if (value.len == 0) return q;
-            if (value.len < 4) return null;
-            q.limit = std.mem.readInt(u32, value[0..4], .little);
-            if (value.len == 4) return q;
-            if (value.len < 6) return null;
-            const clen = std.mem.readInt(u16, value[4..6], .little);
-            if (clen != 0 and clen != 8) return null;
-            if (value.len != 6 + clen + 1) return null;
-            if (clen == 8) q.cursor = std.mem.readInt(u64, value[6..14], .little);
-            q.newest_first = switch (value[6 + clen]) {
-                0 => false,
-                1 => true,
-                else => return null,
-            };
-            return q;
-        }
-
-        /// What a held read keeps of `q` beside its limit and its cursor (the
-        /// waiter's `min_version`): whether it reads newest first, and has a
-        /// cursor at all.
-        fn waiterFlags(q: HistoryRequest) u32 {
-            return @as(u32, @intFromBool(q.newest_first)) | @as(u32, @intFromBool(q.cursor != null)) << 1;
-        }
-
-        fn fromWaiter(w: *const waiter_pool_mod.Waiter) HistoryRequest {
-            const flags = w.stream.partition orelse 0;
-            return .{ .limit = w.stream.limit, .cursor = if (flags & 2 != 0) w.min_version else null, .newest_first = flags & 1 != 0 };
-        }
-
-        fn window(q: HistoryRequest) StreamHandler.HistoryWindow {
-            if (q.newest_first) return .{ .to = q.cursor orelse std.math.maxInt(u64), .newest_first = true };
-            return .{ .from = q.cursor orelse 0 };
-        }
-    };
-
-    fn handleHistory(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
-        const run_id = req.key;
-        if (run_id.len == 0) return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run_id is required");
-        const q = HistoryRequest.parse(req.value) orelse return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "malformed history request");
-        // The namespace is the request's, as every op's: its run is read in
-        // that namespace only.
-        const run_ns_key = self.nsKey(req.ns_id, run_id) orelse return shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-        defer self.allocator.free(run_ns_key);
-        switch (self.answerHistory(shard, run_ns_key, q, false)) {
-            .ok => |bytes| {
-                defer self.allocator.free(bytes);
-                shard.sendOkResponse(conn, req.header.request_id, bytes);
-            },
-            .refused => |r| shard.sendErrorResponse(conn, req.header.request_id, r.status, r.message),
-            .wait => {
-                const registered = shard.waiter_pool.register(.{
-                    .kind = .workflow_history,
-                    .reply_to = conn.replyTo(),
-                    .request_id = req.header.request_id,
-                    .key = run_ns_key,
-                    .min_version = q.cursor orelse 0,
-                    .stream = .{ .limit = q.limit, .partition = q.waiterFlags() },
-                    .timeout_ms = HISTORY_HOLD_MS,
-                });
-                if (!registered) return shard.refuseWaitersFull(conn, req.header.request_id);
-                conn.response_deferred = true;
-            },
-        }
-    }
-
-    const Answered = union(enum) {
-        ok: []u8,
-        refused: struct { status: proto.StatusCode, message: []const u8 },
-        wait,
-    };
-
-    /// History request `q` for run `run_ns_key`, answered as the wire has
-    /// it, or held: `final` at its deadline, so never held again.
-    fn answerHistory(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8, q: HistoryRequest, final: bool) Answered {
-        _ = shard;
-        const rec = runs_machine.runOf(self.defsRead(), run_ns_key) orelse return .{ .refused = .{ .status = .not_found, .message = "" } };
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const answer = self.readRunHistory(arena.allocator(), run_ns_key, rec, q.window(), q.limit, final) catch return .{ .refused = .{ .status = .internal_error, .message = "allocation failed" } };
-        const page = switch (answer) {
-            .page => |p| p,
-            .wait => return .wait,
-            .disk_late => return .{ .refused = .{ .status = .unavailable, .message = shard_mod.DISK_READ_LATE } },
-        };
-        return .{ .ok = encodeHistoryPage(self.allocator, page) catch return .{ .refused = .{ .status = .internal_error, .message = "allocation failed" } } };
-    }
-
-    /// A page on the wire:
-    /// `[count:u32]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*`
-    /// `[has_more:u8][cursor_len:u16][cursor]`, the cursor the next page's
-    /// seq (u64) when there is one. Event types are literals and details
-    /// come from an entry under 64 KiB, so each length fits u16.
-    fn encodeHistoryPage(a: Allocator, page: HistoryPage) error{OutOfMemory}![]u8 {
-        var total: usize = 4 + 1 + 2 + (if (page.more != null) @as(usize, 8) else 0);
-        for (page.events) |e| total += 2 + e.event.event_type_owned.len + 2 + e.event.detail_owned.len + 8;
-        const buf = try a.alloc(u8, total);
-        var w: std.Io.Writer = .fixed(buf);
-        w.writeInt(u32, @intCast(page.events.len), .little) catch unreachable;
-        for (page.events) |e| {
-            w.writeInt(u16, @intCast(e.event.event_type_owned.len), .little) catch unreachable;
-            w.writeAll(e.event.event_type_owned) catch unreachable;
-            w.writeInt(u16, @intCast(e.event.detail_owned.len), .little) catch unreachable;
-            w.writeAll(e.event.detail_owned) catch unreachable;
-            w.writeInt(i64, e.event.timestamp_ms, .little) catch unreachable;
-        }
-        w.writeByte(@intFromBool(page.more != null)) catch unreachable;
-        if (page.more) |c| {
-            w.writeInt(u16, 8, .little) catch unreachable;
-            w.writeInt(u64, c, .little) catch unreachable;
-        } else w.writeInt(u16, 0, .little) catch unreachable;
-        return buf;
-    }
-
-    /// A held history read, asked again: its chunks landed, or came back
-    /// from disk, or (`final`) its deadline came. True once answered.
-    pub fn resolveHistoryWaiter(self: *WorkflowHandler, shard: *Shard, waiter: *const waiter_pool_mod.Waiter, final: bool) bool {
-        const q = HistoryRequest.fromWaiter(waiter);
-        switch (self.answerHistory(shard, waiter.key(), q, final)) {
-            .ok => |bytes| {
-                defer self.allocator.free(bytes);
-                shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, bytes);
-            },
-            .refused => |r| shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, r.status, proto.notRun(r.message)),
-            .wait => return false,
-        }
-        return true;
+        return history_read.read(a, stream, self.defsRead(), .{
+            .family = .workflow,
+            .ns = keyNamespace(run_key),
+            .owner = rec.workflow,
+            .run = keyName(run_key),
+            .created_ns = rec.created_ns,
+            .ended_ms = ended,
+            .flushed = rec.hist_flushed,
+            .pending = rec.hist_pending,
+        }, window, asked, final);
     }
 
     // ── LIST RUNS ───────────────────────────────────────────────────────
@@ -4665,11 +4411,11 @@ pub const WorkflowHandler = struct {
                 else => return error.Unavailable,
             };
             for (page.events) |e| {
-                const event_type = try self.allocator.dupe(u8, e.event.event_type_owned);
+                const event_type = try self.allocator.dupe(u8, e.event_type);
                 errdefer self.allocator.free(event_type);
-                const detail = try self.allocator.dupe(u8, e.event.detail_owned);
+                const detail = try self.allocator.dupe(u8, e.detail);
                 errdefer self.allocator.free(detail);
-                try run.history.append(self.allocator, .{ .event_type_owned = event_type, .detail_owned = detail, .timestamp_ms = e.event.timestamp_ms });
+                try run.history.append(self.allocator, .{ .event_type_owned = event_type, .detail_owned = detail, .timestamp_ms = e.timestamp_ms });
             }
             cursor = page.more orelse break;
         }
@@ -5251,11 +4997,11 @@ fn appliedHistoryForTest(handler: *WorkflowHandler, run_key: []const u8, events:
         var diag: wire_schema.Diagnostic = .{};
         const c = try @import("../protocol/history_entries.zig").Chunk.decodeAll(try a.dupe(u8, item.value.v.payload), &diag);
         if (!std.mem.eql(u8, c.run, keyName(run_key))) continue;
-        try WorkflowHandler.decodeRecords(a, c.records, .{}, &got);
+        try history_read.decodeRecords(a, c.records, .{}, &got);
     }
     const rec = runs_machine.runOf(read, run_key).?;
-    try WorkflowHandler.decodeRecords(a, rec.hist_pending, .{}, &got);
-    for (got.items) |e| try events.append(testing.allocator, e.event);
+    try history_read.decodeRecords(a, rec.hist_pending, .{}, &got);
+    for (got.items) |e| try events.append(testing.allocator, .{ .event_type_owned = e.event_type, .detail_owned = e.detail, .timestamp_ms = e.timestamp_ms });
 }
 
 /// Create a minimal test shard with an actions handler for unit tests.
@@ -8470,7 +8216,7 @@ test "workflow history: a read whose chunks haven't landed waits, and at its dea
     // At its deadline: what landed (none), the rest said missing, then
     // what is pending.
     const late = (try handler.readRunHistory(a, key, rec, .{}, 100, true)).page;
-    try testing.expectEqualStrings(WorkflowHandler.HISTORY_MISSING, late.events[0].event.event_type_owned);
+    try testing.expectEqualStrings(WorkflowHandler.HISTORY_MISSING, late.events[0].event_type);
     try testing.expectEqual(rec.hist_next - rec.hist_flushed + 1, late.events.len);
     try testing.expectEqual(rec.hist_flushed, late.events[1].seq);
     // Paged at its deadline one at a time, the gap is one page, and the
@@ -8481,7 +8227,7 @@ test "workflow history: a read whose chunks haven't landed waits, and at its dea
         try testing.expect(pages <= late.events.len);
         const q: WorkflowHandler.HistoryRequest = .{ .limit = 1, .cursor = cursor };
         const p = (try handler.readRunHistory(a, key, rec, q.window(), 1, true)).page;
-        if (pages == 0) try testing.expectEqualStrings(WorkflowHandler.HISTORY_MISSING, p.events[0].event.event_type_owned);
+        if (pages == 0) try testing.expectEqualStrings(WorkflowHandler.HISTORY_MISSING, p.events[0].event_type);
         cursor = p.more orelse break;
     }
     try testing.expectEqual(late.events.len - 1, pages);
@@ -8492,18 +8238,18 @@ test "workflow history: a read whose chunks haven't landed waits, and at its dea
     for (landed.events, 0..) |e, i| try testing.expectEqual(@as(u64, i), e.seq);
 }
 
-test "workflow history: a request is a limit, then a cursor and an order; anything else is refused" {
-    const Q = WorkflowHandler.HistoryRequest;
-    try testing.expectEqual(@as(u32, 100), Q.parse("").?.limit);
-    const only = Q.parse(&[_]u8{ 5, 0, 0, 0 }).?;
-    try testing.expectEqual(@as(u32, 5), only.limit);
-    try testing.expect(only.cursor == null and !only.newest_first);
-    const full = Q.parse(&([_]u8{ 5, 0, 0, 0, 8, 0 } ++ [_]u8{ 9, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{1})).?;
+test "workflow history: a request is a limit, then a cursor and an order, as its schema has them" {
+    const R = history_read.Request;
+    var buf: [R.max_size]u8 = undefined;
+    var diag: wire_schema.Diagnostic = .{};
+    const full = try R.decodeAll(try R.encodeInto(&buf, .{ .limit = 5, .cursor = 9, .newest_first = true }), &diag);
+    try testing.expectEqual(@as(u32, 5), full.limit);
     try testing.expectEqual(@as(?u64, 9), full.cursor);
     try testing.expect(full.newest_first);
-    const no_cursor = Q.parse(&[_]u8{ 5, 0, 0, 0, 0, 0, 1 }).?;
-    try testing.expect(no_cursor.cursor == null and no_cursor.newest_first);
-    for ([_][]const u8{ &.{ 5, 0, 0 }, &.{ 5, 0, 0, 0, 0 }, &.{ 5, 0, 0, 0, 4, 0, 1, 2, 3, 4, 0 }, &.{ 5, 0, 0, 0, 0, 0, 2 }, &.{ 5, 0, 0, 0, 0, 0, 1, 0 } }) |bad| try testing.expect(Q.parse(bad) == null);
+    const plain = try R.decodeAll(try R.encodeInto(&buf, .{ .limit = 100, .cursor = null, .newest_first = false }), &diag);
+    try testing.expect(plain.cursor == null and !plain.newest_first);
+    // A presence byte that is neither absent nor present is refused.
+    try testing.expectError(error.Refused, R.decodeAll(&.{ 2, 0, 0, 0, 0 }, &diag));
 }
 
 test "workflow history: past its history lane's cap, a shard holds new runs and steps until the lane drains" {
@@ -8600,14 +8346,10 @@ test "workflow history: a page holds at most its event bound and its byte bound,
     const a = arena.allocator();
     // However many asked for, a page's bytes fit its answer.
     const first = (try handler.readRunHistory(a, key, rec, .{}, std.math.maxInt(u32), false)).page;
-    var bytes: usize = 0;
-    for (first.events) |e| bytes += WorkflowHandler.wireSize(e);
-    try testing.expect(bytes <= WorkflowHandler.HISTORY_PAGE_BYTES);
     try testing.expect(first.events.len < 5 and first.events.len > 0);
     try testing.expect(first.more != null);
-    const encoded = try WorkflowHandler.encodeHistoryPage(allocator, first);
-    defer allocator.free(encoded);
-    try testing.expect(encoded.len <= ops.MAX_RESPONSE_BODY);
+    const v = try history_read.response(a, first);
+    try testing.expect(try history_read.Response.encodedSize(v) <= ops.MAX_RESPONSE_BODY);
     // Paged, every event once.
     var seqs: [16]u64 = undefined;
     const all = try pagedSeqs(&handler, key, std.math.maxInt(u32), false, &seqs);

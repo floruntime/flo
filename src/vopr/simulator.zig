@@ -2758,6 +2758,7 @@ pub const Simulator = struct {
         });
         const sampled = idx % SAMPLE_EVERY == 0;
         if (sampled) if (node.actions.danglingRequest()) |why| self.checker.fail(.{ .invariant = .action_rule, .node = node.id, .index = idx, .tick = self.now, .detail = why });
+        if (sampled) if (node.actions.historyRows()) |why| self.checker.fail(.{ .invariant = .action_rule, .node = node.id, .index = idx, .tick = self.now, .detail = why });
         if (comptime plant.active == .pool_load_bypasses_link) loadBypassingLink(&node.kv.store, idx);
         if (sampled) if (poolRecountBroke(node)) |why| self.checker.fail(.{ .invariant = .pool_use_recount, .node = node.id, .index = idx, .tick = self.now, .detail = why });
         if (memory_gate.take()) |b| self.checker.fail(.{ .invariant = .memory_gate, .node = node.id, .index = b.index, .tick = self.now, .detail = b.why });

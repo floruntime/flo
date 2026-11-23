@@ -89,6 +89,8 @@ const channel_driver = @import("../contract/channel_driver.zig");
 const channels_mod = @import("../contract/channels.zig");
 const channel_entries = @import("../protocol/channel_entries.zig");
 const history_entries = @import("../protocol/history_entries.zig");
+const history_read = @import("../stream/history_read.zig");
+const history_ops = @import("history_ops.zig");
 const contract_store = @import("../contract/store.zig");
 const kv_machine = @import("../kv/machine.zig");
 const repair = @import("repair.zig");
@@ -719,6 +721,9 @@ pub const Shard = struct {
     /// Unified waiter pool — handles blocking GET, blocking dequeue,
     /// stream long-poll, and action_await across all subsystems.
     waiter_pool: WaiterPool,
+    /// A history read's answer, kept until the next read: the table encodes
+    /// it after the read returns.
+    history_scratch: std.heap.ArenaAllocator,
 
     /// Cooperative periodic background tasks (hot_flush, TTL sweep, etc.).
     task_scheduler: TaskScheduler,
@@ -1470,6 +1475,7 @@ pub const Shard = struct {
             .shard_metrics = null,
             .cluster_node_id = node_id,
             .waiter_pool = waiter_pool,
+            .history_scratch = std.heap.ArenaAllocator.init(allocator),
             .task_scheduler = TaskScheduler.init(),
             .hot_flush_seconds = hot_flush_seconds,
             .peer_shards = null,
@@ -2150,6 +2156,7 @@ pub const Shard = struct {
         self.gathers.deinit(self.allocator);
         self.reply_pool.deinit(self.allocator);
         self.waiter_pool.deinit(self.allocator);
+        self.history_scratch.deinit();
         self.slab.deinit();
         self.reactor.deinit();
     }
@@ -5729,7 +5736,7 @@ pub const Shard = struct {
         // later with records past it; nothing more is read from the log.
         if (self.stream_disk) |d| d.stopped = true;
         self.damage_for_waiters = damage;
-        self.waiter_pool.expireKinds(&.{ .stream_disk_read, .stream_read, .workflow_history }, answerDamaged, @ptrCast(self));
+        self.waiter_pool.expireKinds(&.{ .stream_disk_read, .stream_read, .history_read }, answerDamaged, @ptrCast(self));
         if (self.raft_network == null) {
             self.offline = damage;
             self.offline_published.store(true, .release);
@@ -6171,7 +6178,7 @@ pub const Shard = struct {
         const d = self.stream_disk orelse return;
         if (!d.drain()) return;
         self.waiter_pool.notifyAny(.stream_disk_read, resolveStreamWaiter, @ptrCast(self));
-        self.waiter_pool.notifyAny(.workflow_history, resolveHistoryWaiter, @ptrCast(self));
+        self.waiter_pool.notifyAny(.history_read, resolveHistoryWaiter, @ptrCast(self));
         // A blocking read parked for new appends may have met one too.
         self.waiter_pool.notifyAny(.stream_read, resolveStreamWaiter, @ptrCast(self));
     }
@@ -7212,7 +7219,7 @@ pub const Shard = struct {
     /// The history reads held for runs whose chunks or folds an inbound on
     /// the history lane just landed.
     fn wakeHistoryReads(self: *Shard, entry: *const entry_mod.Entry) void {
-        if (self.waiter_pool.countByKind(.workflow_history) == 0) return;
+        if (self.waiter_pool.countByKind(.history_read) == 0) return;
         var diag: schema.Diagnostic = .{};
         const inbound = channel_entries.Inbound.decodeAll(entry.payload, &diag) catch return;
         if (inbound.lane != @backingInt(channels_mod.Lane.history)) return;
@@ -7221,10 +7228,10 @@ pub const Shard = struct {
             var hd: schema.Diagnostic = .{};
             var r: schema.Reader = .{ .bytes = m.payload, .diag = &hd };
             const h = history_entries.Header.decode(&r, "header") catch continue;
-            if (h.family != @backingInt(history_entries.Family.workflow)) continue;
-            var kb: [4 + history_entries.MAX_RUN]u8 = undefined;
-            const key = contract_view.idKey(&kb, .of(h.ns), h.run) catch continue;
-            self.waiter_pool.notify(.workflow_history, key, resolveHistoryWaiter, @ptrCast(self));
+            const family = std.enums.fromInt(history_entries.Family, h.family) orelse continue;
+            var kb: [history_read.KEY_LEN]u8 = undefined;
+            const key = history_read.waiterKey(&kb, family, .of(h.ns), h.run) catch continue;
+            self.waiter_pool.notify(.history_read, key, resolveHistoryWaiter, @ptrCast(self));
         }
     }
 
@@ -7523,7 +7530,7 @@ pub const Shard = struct {
         }
         // A held history read isn't answered short as at its deadline: its
         // chunks may still land, so it is told to ask again.
-        self.waiter_pool.expireKinds(&.{.workflow_history}, answerShuttingDown, @ptrCast(self));
+        self.waiter_pool.expireKinds(&.{.history_read}, answerShuttingDown, @ptrCast(self));
         self.waiter_pool.expireAll(handleWaiterTimeout, @ptrCast(self));
         self.refuseUnrunRequests();
         self.takeAnswersUntilAllStopped();
@@ -9276,7 +9283,7 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
         // No task in time: `{task: none}`, the optional's absent byte.
         .action_await => shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, &.{0}),
         // Its chunks not all landed in time: what did, the rest said missing.
-        .workflow_history => _ = shard.workflow_handler.resolveHistoryWaiter(shard, waiter, true),
+        .history_read => _ = history_ops.resolve(shard, waiter, true),
     }
 }
 
@@ -9290,7 +9297,7 @@ fn answerShuttingDown(waiter: *const Waiter, ctx: *anyopaque) void {
 /// from disk.
 fn resolveHistoryWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
-    return shard.workflow_handler.resolveHistoryWaiter(shard, waiter, false);
+    return history_ops.resolve(shard, waiter, false);
 }
 
 /// What a stream read refused for its disk reads is told, by why.
@@ -11788,7 +11795,7 @@ fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8)
             body.block_ms = ms;
             return table_run.op("action.await").request.encodeInto(buf, body) catch unreachable;
         },
-        .action_complete, .action_fail, .action_touch, .action_deliver => return value,
+        .action_complete, .action_fail, .action_touch, .action_deliver, .action_history, .action_status, .workflow_history => return value,
         // A dequeue's count and wait from its options, encoded as the op's
         // body would be but with the wait unbounded, so one past its bound
         // reaches the server.
@@ -22774,6 +22781,60 @@ test "actions: an await takes a ready run under a new delivery; a complete namin
     try std.testing.expectEqualStrings("out", t.run(run_id).result);
     // A resend is answered as the first was.
     _ = try t.ok(.action_complete, run_id, try ActionsHandler.for_tests.completeBody(&body, task, "w1", "approved", "out"));
+}
+
+test "actions: an action run's history reads back whole, a page at a time by its cursor and newest first; its status is a preview with its flag" {
+    var t: ActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    _ = try t.ok(.action_register, "act", "");
+    _ = try t.ok(.action_invoke, "act", "\x00in");
+    var task = (try t.take("w1", "act", 0, null)).?;
+    var run_buf: [64]u8 = undefined;
+    const run_id = run_buf[0..task.run.len];
+    @memcpy(run_id, task.run);
+    task.run = run_id;
+    var action_buf: [16]u8 = undefined;
+    @memcpy(action_buf[0..3], "act");
+    task.action = action_buf[0..3];
+    const result: [300]u8 = @splat('r');
+    var body: [1024]u8 = undefined;
+    _ = try t.ok(.action_complete, run_id, try ActionsHandler.for_tests.completeBody(&body, task, "w1", "ok", &result));
+
+    var diag: schema.Diagnostic = .{};
+    const status = try table_run.op("action.status").response.decodeAll((try t.ok(.action_status, run_id, "")).data, &diag);
+    try std.testing.expectEqual(@as(usize, action_machine.PREVIEW), status.output.?.len);
+    try std.testing.expect(status.output_truncated);
+    try std.testing.expect(!status.error_truncated);
+
+    const R = history_read.Request;
+    var rb: [R.max_size]u8 = undefined;
+    // Its last chunk is still on the lane: the read is held, then answered
+    // once it lands.
+    try t.feed(.action_history, run_id, try R.encodeInto(&rb, .{ .limit = 2, .cursor = null, .newest_first = false }));
+    try std.testing.expectEqual(@as(u16, 1), t.shard.waiter_pool.countByKind(.history_read));
+    try ParkTest.deliverOwn(&t.shard);
+    try std.testing.expectEqual(@as(u16, 0), t.shard.waiter_pool.countByKind(.history_read));
+    const first = try history_read.Response.decodeAll((try nextAnswer(t.c, &t.shard, &t.out)).data, &diag);
+    try std.testing.expectEqual(@as(u32, 2), first.events.count);
+    try std.testing.expect(first.has_more);
+    const cursor = first.cursor;
+    var it = first.events.iterator();
+    try std.testing.expectEqualStrings(action_machine.EV_INVOKED, (try it.next()).?.event_type);
+    try std.testing.expectEqualStrings(action_machine.EV_DELIVERED, (try it.next()).?.event_type);
+    // The rest, from its cursor: the whole result, and its outcome.
+    const rest = try history_read.Response.decodeAll((try t.ok(.action_history, run_id, try R.encodeInto(&rb, .{ .limit = 100, .cursor = cursor, .newest_first = false }))).data, &diag);
+    try std.testing.expect(!rest.has_more);
+    it = rest.events.iterator();
+    const settled = (try it.next()).?;
+    try std.testing.expectEqualStrings(action_machine.EV_SETTLED, settled.event_type);
+    try std.testing.expectEqualSlices(u8, &result, settled.detail);
+    try std.testing.expectEqualStrings("ok", settled.extra);
+    try std.testing.expectEqualStrings(action_machine.EV_ENDED, (try it.next()).?.event_type);
+    // Newest first, one: its end.
+    const newest = try history_read.Response.decodeAll((try t.ok(.action_history, run_id, try R.encodeInto(&rb, .{ .limit = 1, .cursor = null, .newest_first = true }))).data, &diag);
+    it = newest.events.iterator();
+    try std.testing.expectEqualStrings(action_machine.EV_ENDED, (try it.next()).?.event_type);
 }
 
 test "actions: an await with block_ms 0 answers at once with no task; one that waits is answered when a run is invoked" {
@@ -33897,21 +33958,23 @@ test "Shard: a workflow run's history read waits while its chunks are on the his
     try std.testing.expect(rec.hist_flushed > 0);
 
     // Held, not answered short.
-    const limit = [_]u8{ 100, 0, 0, 0 };
-    shard.runRequest(conn, try ParkTest.request(.workflow_history, 9, "a", "r1", &limit, ""), .client);
-    try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.workflow_history));
+    var lb: [history_read.Request.max_size]u8 = undefined;
+    const limit = try history_read.Request.encodeInto(&lb, .{ .limit = 100, .cursor = null, .newest_first = false });
+    shard.runRequest(conn, try ParkTest.request(.workflow_history, 9, "a", "r1", limit, ""), .client);
+    try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.history_read));
     // Its chunk lands: answered, whole.
     try ParkTest.deliverOwn(&shard);
-    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.workflow_history));
+    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.history_read));
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 9), one[0].header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
-    try std.testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, one[0].data[0..4], .little));
+    var hd: schema.Diagnostic = .{};
+    try std.testing.expectEqual(@as(u32, 5), (try history_read.Response.decodeAll(one[0].data, &hd)).events.count);
     // Asked again, it answers at once.
-    shard.runRequest(conn, try ParkTest.request(.workflow_history, 10, "a", "r1", &limit, ""), .client);
-    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.workflow_history));
+    shard.runRequest(conn, try ParkTest.request(.workflow_history, 10, "a", "r1", limit, ""), .client);
+    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.history_read));
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-    try std.testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, one[0].data[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 5), (try history_read.Response.decodeAll(one[0].data, &hd)).events.count);
 }
 
 test "Shard: a workflow named longer than its runs' history may name is refused at create and at start, before anything is proposed" {

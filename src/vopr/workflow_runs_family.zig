@@ -52,6 +52,7 @@ const router = @import("../node/router.zig");
 const rm = @import("../workflow/runs_machine.zig");
 const calls_mod = @import("../actions/calls_machine.zig");
 const hm = @import("../stream/history_machine.zig");
+const history_lane = @import("history_lane.zig");
 const ce = @import("../protocol/channel_entries.zig");
 const defs_family = @import("workflow_defs_family.zig");
 
@@ -154,6 +155,8 @@ fn slotOwnerOf(slot: u16) ?usize {
 
 pub const WorkflowRuns = struct {
     scratch: std.heap.ArenaAllocator,
+    /// What landed of each run's history.
+    landed: history_lane.Landed = .{},
     ledger: Ledger = .{},
 
     /// What a run waits for, as its last step set it.
@@ -306,12 +309,14 @@ pub const WorkflowRuns = struct {
     }
 
     pub fn deinit(self: *WorkflowRuns) void {
+        self.landed.deinit(self.scratch.child_allocator);
         self.scratch.deinit();
     }
 
     /// Replay re-applies from the start: the ledger goes with the store.
     pub fn reset(self: *WorkflowRuns) void {
         self.ledger = .{};
+        self.landed.clear();
     }
 
     pub fn owns(entry_type: u8) bool {
@@ -784,13 +789,16 @@ pub const WorkflowRuns = struct {
         var out: persistence.Result = .{};
         out.reset(e);
         try machine_mod.applyEntry(&rm.machine, store, &self.scratch, e, &out);
-        try deliverHistory(store, &self.scratch, e);
+        // The history it sent, delivered at once, as a shard's driver
+        // delivers its own, and checked as it lands.
+        const landed = try self.landed.deliver(store, &self.scratch, e);
         var effect: Effect = .{ .kind = kind, .refused = out.refused() != null, .classes = want.classes };
         if (effect.refused) {
             for (FAMILIES, before[0..FAMILIES.len]) |fam, b| if (b != store.families[fam].commits) return error.RefusalChangedState;
             if (before[FAMILIES.len] != store.families[channels.OutFam.ID].commits) return error.RefusalChangedState;
             if (want.refused == null) effect.broke = REFUSED_APPLIES[@backingInt(kind)];
         } else if (want.refused) |why| effect.broke = why;
+        if (effect.broke == null) effect.broke = landed;
         if (effect.broke == null) effect.broke = sentRule(store, seqs, want.sends);
         // The whole store at the indices the checksums are sampled at; the
         // run the entry names, and the calls, at every one.
@@ -800,46 +808,6 @@ pub const WorkflowRuns = struct {
 
     /// The groups a message's slot can be in, under the store's place.
     const GROUPS = 2;
-
-    const HistoryLane = channels.Channels(&.{hm.machine});
-
-    /// Inbounds delivered after one entry are indexed under it, apart.
-    const HISTORY_STRIDE = 1 << 16;
-
-    /// The history `e` sent delivered at once, one inbound each, and what
-    /// the folds send in turn, as a shard's driver delivers its own: every
-    /// replica's rows alike, and checked.
-    fn deliverHistory(store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, e: *const entry_mod.Entry) persistence.ApplyError!void {
-        const rv: view_mod.ReadView = .{ .store = store };
-        // Not in `scratch`: each apply resets it.
-        const a = store.allocator;
-        var k: u64 = 0;
-        while (true) : (k += 1) {
-            if (k + 1 >= HISTORY_STRIDE) return error.Halt;
-            const next = channels.metaOf(rv, 0, .history).next_seq;
-            const applied = if (channels.inOf(rv, 0, .history)) |i| i.applied else 0;
-            if (applied + 1 >= next) return;
-            const seq = applied + 1;
-            var kb: [channels.OUT_KEY]u8 = undefined;
-            const o = ((rv.get(channels.OutFam, channels.outKey(&kb, 0, .history, seq)) catch return error.Halt) orelse return error.Halt).v;
-            const mb = try a.alloc(u8, o.payload.len + 64);
-            defer a.free(mb);
-            var w: schema.Writer = .{ .buf = mb };
-            ce.Message.encode(&w, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = 0, .flags = o.flags, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload }) catch return error.Halt;
-            const ib = try a.alloc(u8, w.written().len + 64);
-            defer a.free(ib);
-            const inbound = ce.Inbound.encodeInto(ib, .{ .from = 0, .lane = @backingInt(channels.Lane.history), .first_seq = seq, .messages = .{ .bytes = w.written(), .count = 1 } }) catch return error.Halt;
-            var h = std.mem.zeroes(entry_mod.Header);
-            h.entry_type = @backingInt(entry_mod.EntryType.channel_inbound);
-            h.index = e.header.index * HISTORY_STRIDE + k + 1;
-            h.timestamp_ns = e.header.timestamp_ns;
-            h.payload_len = @intCast(inbound.len);
-            const ie: entry_mod.Entry = .{ .header = h, .payload = inbound };
-            var res = persistence.Result.start(&ie);
-            try machine_mod.applyEntry(&HistoryLane.machine, store, scratch, &ie, &res);
-            if (res.refused() != null) return error.Halt;
-        }
-    }
 
     /// Each group's next outbox seq: the outbox is never drained here, so
     /// an entry's messages are found by these, not by a walk.

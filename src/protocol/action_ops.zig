@@ -11,6 +11,7 @@ const Bytes = schema.Bytes;
 const Optional = schema.Optional;
 const Record = schema.Record;
 const Defaulted = schema.Defaulted;
+const history = @import("../stream/history_read.zig");
 
 /// Where a run is: the values `action.status` answers with.
 pub const RunStatus = enum(u8) {
@@ -98,15 +99,28 @@ pub const table = [_]ops.Op{
             // Attempts begun so far, the current one included.
             .{ .name = "attempt", .T = Int(u32), .doc = "Attempts so far, counting from 1 once a worker has taken it" },
             // What the worker completed it with.
-            .{ .name = "output", .T = Optional(Bytes(MAX_OUTPUT)), .doc = "What a completed run returned" },
+            .{ .name = "output", .T = Optional(Bytes(MAX_OUTPUT)), .doc = "What a completed run returned: its first 256 bytes" },
             // Why its last attempt failed.
-            .{ .name = "error_message", .T = Optional(Bytes(MAX_ERROR)), .doc = "The error its last attempt failed with" },
+            .{ .name = "error_message", .T = Optional(Bytes(MAX_ERROR)), .doc = "The error its last attempt failed with: its first 256 bytes" },
             .{ .name = "worker_id", .T = Optional(Bytes(MAX_WORKER_ID)), .doc = "The worker that holds the run, or last held it" },
             .{ .name = "outcome", .T = Optional(Bytes(MAX_OUTCOME)), .doc = "The outcome a completed run's worker named, which a workflow step follows; none for success" },
             .{ .name = "held", .T = Optional(Bytes(MAX_HELD_NOTE)), .doc = "Why its lease, past due, isn't ended: its end waits for room on the calling workflow's shard" },
+            // At the end, so a decoder that stops before them still reads the rest.
+            .{ .name = "output_truncated", .T = schema.Bool, .doc = "Whether output is only the result's first 256 bytes; the whole is the run's action_settled history event" },
+            .{ .name = "error_truncated", .T = schema.Bool, .doc = "Whether error_message is only the error's first 256 bytes; the whole is in the run's history" },
         }),
         .cli = .{ .expose = .hand, .render = .record, .examples = &.{"flo action status act-1a2b3c4d5e6f00-3-1c"} },
         .doc = "A run's status, timestamps, attempts, worker, and its output or last error.",
+    },
+    .{
+        .name = "action.history",
+        .code = 0x310,
+        .class = .read,
+        .route = .run_id,
+        .request = history.Request,
+        .response = history.Response,
+        .cli = .{ .key = .{ .name = "run_id", .doc = "The run's id" }, .render = .table, .examples = &.{"flo action history act-1a2b3c4d5e6f00-3-1c"} },
+        .doc = "A page of an action run's history: its invoke, deliveries, failures and result, in order.",
     },
     .{
         .name = "action.await",

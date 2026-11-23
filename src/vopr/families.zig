@@ -32,6 +32,12 @@ const Workload = @import("workload.zig").Workload;
 const limits = @import("../protocol/limits.zig");
 const schema = @import("../protocol/schema.zig");
 const action_machine = @import("../actions/machine.zig");
+const action_ops = @import("../protocol/action_ops.zig");
+const hp = @import("../stream/history_producer.zig");
+const hm = @import("../stream/history_machine.zig");
+const channels = @import("../contract/channels.zig");
+const history_lane = @import("history_lane.zig");
+const fnv1a64 = @import("stdx").hash.fnv1a64;
 const ae = @import("../protocol/action_entries.zig");
 const ns_handler = @import("../namespace/handler.zig");
 const NamespaceId = @import("../namespace/table.zig").Id;
@@ -709,9 +715,13 @@ pub const Actions = struct {
     scratch: std.heap.ArenaAllocator,
     /// A mutant's rewritten payload.
     rewrite: []u8,
+    /// What landed of each run's history: its store is a group of one,
+    /// which sends its history to itself.
+    landed: history_lane.Landed = .{},
 
-    pub const FAMILIES = [_]u16{ action_machine.Defs.ID, action_machine.Runs.ID, action_machine.Ready.ID, action_machine.Deadlines.ID, action_machine.Requests.ID };
-    pub const NAMES = [_][]const u8{ "action.def", "action.run", "action.ready", "action.deadline", "action.request" };
+    pub const FAMILIES = [_]u16{ action_machine.Defs.ID, action_machine.Runs.ID, action_machine.Ready.ID, action_machine.Deadlines.ID, action_machine.Requests.ID, hm.Actions.ID };
+    pub const NAMES = [_][]const u8{ "action.def", "action.run", "action.ready", "action.deadline", "action.request", "history.act" };
+    const PLACE: view_mod.Place = .{ .group = 0, .count = 1 };
 
     pub const Kind = enum { register, delete, invoke, deliver, settle, release, extend, expire };
 
@@ -750,10 +760,12 @@ pub const Actions = struct {
     pub fn init(allocator: Allocator) Actions {
         var a: Actions = .{ .store = store_mod.Store.init(allocator), .scratch = std.heap.ArenaAllocator.init(allocator), .rewrite = allocator.alloc(u8, ae.Expire.max_size) catch @panic("sim OOM") };
         a.store.strict_keys = true;
+        a.store.place = PLACE;
         return a;
     }
 
     pub fn deinit(self: *Actions) void {
+        self.landed.deinit(self.store.allocator);
         self.store.allocator.free(self.rewrite);
         self.store.deinit();
         self.scratch.deinit();
@@ -761,7 +773,9 @@ pub const Actions = struct {
 
     pub fn reset(self: *Actions) void {
         self.store.clear();
+        self.landed.clear();
         std.debug.assert(self.store.strict_keys);
+        std.debug.assert(std.meta.eql(self.store.place, PLACE));
     }
 
     pub fn owns(entry_type: u8) bool {
@@ -856,15 +870,32 @@ pub const Actions = struct {
         var out: persistence.Result = .{};
         out.reset(&applied);
         const before = self.commits();
+        const all_before = self.allCommits();
         try machine_mod.applyEntry(&action_machine.machine, &self.store, &self.scratch, &applied, &out);
         if (out.refused() != null) {
-            if (!std.mem.eql(u64, &before, &self.commits())) return error.RefusalChangedState;
+            if (!std.mem.eql(u64, &before, &self.commits()) or all_before != self.allCommits()) return error.RefusalChangedState;
             const memory = out.refused().?.refusal.reason == .memory_budget;
             return .{ .kind = kind, .refused = true, .broke = if (memory) null else refusedWrongly(e, stamp, touched.items, def_before) };
         }
         var effect: Effect = .{ .kind = kind, .refused = false };
-        effect.broke = self.check(e, stamp, touched.items, &effect.cross_term);
+        // A settle's resend, or one a run already ended names, changes
+        // nothing at all: no row, and no send.
+        if (kind == .settle) if (touched.items[0].before) |pre| if (pre.completed_ns != 0 and all_before != self.allCommits()) {
+            effect.broke = "a settle naming an ended run changed the store";
+        };
+        // The history it sent, delivered at once, as a shard's driver
+        // delivers its own, and checked as it lands.
+        const landed = try self.landed.deliver(&self.store, &self.scratch, &applied);
+        if (effect.broke == null) effect.broke = landed;
+        if (effect.broke == null) effect.broke = self.check(e, stamp, touched.items, &effect.cross_term);
         return effect;
+    }
+
+    /// Every family's commits: one apply that changes nothing leaves this.
+    fn allCommits(self: *const Actions) u64 {
+        var n: u64 = 0;
+        for (self.store.families) |f| n +%= f.commits;
+        return n;
     }
 
     /// An action's definition, if it has one.
@@ -924,6 +955,8 @@ pub const Actions = struct {
         if (v.request_key) |k| c.request_key = try a.dupe(u8, k);
         c.result = try a.dupe(u8, v.result);
         c.@"error" = try a.dupe(u8, v.@"error");
+        c.outcome = try a.dupe(u8, v.outcome);
+        c.hist_pending = try a.dupe(u8, v.hist_pending);
         return c;
     }
 
@@ -960,8 +993,12 @@ pub const Actions = struct {
                 .settle => {
                     const p = ae.Settle.decodeAll(e.payload, &diag) catch unreachable;
                     if (holdsDelivery(pre, p.holder, p.deliveries, p.token)) {
-                        if (post.status != .completed or post.ended != .settled or !std.mem.eql(u8, post.result, p.result) or !std.mem.eql(u8, post.outcome, p.outcome))
+                        if (post.status != .completed or post.ended != .settled or !std.mem.eql(u8, post.outcome, p.outcome))
                             return "a settle naming the live delivery didn't complete the run with its result";
+                        // Its row keeps the result's preview and hash; the
+                        // whole is in its history.
+                        if (!std.mem.eql(u8, post.result, preview(p.result)) or post.result_truncated != (p.result.len > action_machine.PREVIEW) or post.result_hash != fnv1a64(p.result))
+                            return "a completed run's preview or hash is not its settle's result's";
                         cross_term.* = cross_term.* or pre.token.term < e.header.term;
                     } else if (changed) return "a settle that names no live delivery completed a run";
                 },
@@ -972,6 +1009,7 @@ pub const Actions = struct {
                         if (post.failures != pre.failures + failed) return "a run's failures don't count the deliveries that failed";
                         const spent = !p.abandoned and (!p.retry or pre.failures + 1 >= pre.max_attempts);
                         if (post.ended != (if (p.abandoned) action_machine.Ended.abandoned else .released)) return "a release naming the live delivery didn't end it as it said";
+                        if (!std.mem.eql(u8, post.@"error", preview(p.@"error")) or post.error_truncated != (p.@"error".len > action_machine.PREVIEW)) return "a released run's error is not its release's preview";
                         if (spent) {
                             if (post.status != .failed) return "a release that spent the run's attempts didn't fail it";
                         } else if (post.status != .ready or post.due_ns != after(stamp, p.delay_ms)) return "a released run isn't ready again after its delay";
@@ -1012,9 +1050,14 @@ pub const Actions = struct {
         return null;
     }
 
+    fn preview(whole: []const u8) []const u8 {
+        return whole[0..@min(whole.len, action_machine.PREVIEW)];
+    }
+
     /// What every run must be, whatever entry left it so.
     fn ruleOfRun(self: *Actions, ns: NamespaceId, id: []const u8, v: action_machine.Run.Value) ?[]const u8 {
         if (v.failures >= v.max_attempts and v.status != .failed and v.status != .timed_out) return "a run that spent its attempts didn't end";
+        if (historyRule(self, ns, id, v)) |why| return why;
         var b: [512]u8 = undefined;
         var kb: [512]u8 = undefined;
         switch (v.status) {
@@ -1030,6 +1073,41 @@ pub const Actions = struct {
             else => {},
         }
         return null;
+    }
+
+    /// A run's history as its row holds it: its pending events its next
+    /// seqs, and, ended, all of it sent, its row where its summary says,
+    /// and no input or labels kept.
+    fn historyRule(self: *Actions, ns: NamespaceId, id: []const u8, v: action_machine.Run.Value) ?[]const u8 {
+        if (v.hist_flushed > v.hist_next or v.hist_pending.len > hp.HIST_CHUNK) return "a run's pending history is past its bounds";
+        var diag: schema.Diagnostic = .{};
+        var r: schema.Reader = .{ .bytes = v.hist_pending, .diag = &diag };
+        var seq = v.hist_flushed;
+        while (r.pos < v.hist_pending.len) : (seq += 1) {
+            const h = hp.HistRec.decode(&r, "event") catch return "a run's pending history doesn't decode";
+            if (h.seq != seq) return "a run's pending history is not its next seqs";
+        }
+        if (seq != v.hist_next) return "a run's pending history is missing events";
+        if (v.result.len > action_machine.PREVIEW or v.@"error".len > action_machine.PREVIEW) return "a run keeps more than a preview";
+        if (v.completed_ns == 0) {
+            if (v.status != .ready and v.status != .leased) return "a run ended with no end stamp";
+            return null;
+        }
+        if (v.status == .ready or v.status == .leased) return "a live run has an end stamp";
+        if (v.hist_flushed != v.hist_next or v.hist_pending.len != 0) return "an ended run holds history it hasn't sent";
+        if (v.input.len != 0 or v.labels != null) return "an ended run keeps its input or labels";
+        var arena = std.heap.ArenaAllocator.init(self.store.allocator);
+        defer arena.deinit();
+        if (hm.endedRow(self.read(), arena.allocator(), .action, ns, v.action, id, v.created_ns, v.completed_ns / std.time.ns_per_ms) == null) return "an ended run's history row is not where its summary says";
+        return null;
+    }
+
+    /// The history families' own rule, over every row. Walks them, so the
+    /// simulator calls it when it samples.
+    pub fn historyRows(self: *Actions) ?[]const u8 {
+        var arena = std.heap.ArenaAllocator.init(self.store.allocator);
+        defer arena.deinit();
+        return hm.ruleOf(hm.Actions, self.read(), arena.allocator()) catch "the history rows could not be read";
     }
 
     /// Every request record names its run's live delivery. Walks the

@@ -46,6 +46,14 @@ const gate = @import("../budget/gate.zig");
 const machine_mod = @import("../contract/machine.zig");
 const delivery = @import("../contract/delivery.zig");
 const calls = @import("calls_machine.zig");
+const hp = @import("../stream/history_producer.zig");
+const he = @import("../protocol/history_entries.zig");
+const channels = @import("../contract/channels.zig");
+const router = @import("../node/router.zig");
+const fnv1a64 = @import("stdx").hash.fnv1a64;
+const plant = @import("../plant.zig");
+const settings = @import("../settings/machine.zig");
+const shareHeld = @import("../raft/node.zig").shareHeld;
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -101,9 +109,27 @@ pub const Run = Record(&.{
     // A completed run's named outcome, which a workflow step follows: a
     // worker's "failure" completes the run and takes the failure branch.
     .{ .name = "outcome", .T = ae.Outcome },
-    .{ .name = "result", .T = Bytes(action_ops.MAX_OUTPUT) },
-    .{ .name = "error", .T = Bytes(action_ops.MAX_ERROR) },
+    // Its first `PREVIEW` bytes, and whether there were more: the whole is
+    // in its history. A result only once completed, with the whole's hash,
+    // which a settle's resend is held to; an error once an attempt failed.
+    .{ .name = "result", .T = Bytes(PREVIEW) },
+    .{ .name = "result_truncated", .T = schema.Bool },
+    .{ .name = "result_hash", .T = Int(u64) },
+    .{ .name = "error", .T = Bytes(PREVIEW) },
+    .{ .name = "error_truncated", .T = schema.Bool },
+    // Its history: the seq the next event takes, the first not yet sent,
+    // and those since, encoded, sent once a chunk is full or the run ends.
+    .{ .name = "hist_next", .T = Int(u64) },
+    .{ .name = "hist_flushed", .T = Int(u64) },
+    .{ .name = "hist_pending", .T = Bytes(hp.HIST_CHUNK) },
+    // Hand-backs, which count no failure, and deliveries past those its
+    // history records (`RECORDED_DELIVERIES`): both said once, as it ends.
+    .{ .name = "abandons", .T = Int(u32) },
+    .{ .name = "deliveries_unrecorded", .T = Int(u32) },
 });
+
+/// How much of a run's result or error its row keeps.
+pub const PREVIEW: u32 = 256;
 
 pub const Empty = delivery.Empty;
 pub const Deadline = delivery.Deadline;
@@ -272,11 +298,20 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 if (call) return reply(view, p, if (eqlOpt(old.v.caller_run, p.caller_run) and eqlOpt(old.v.caller_workflow, p.caller_workflow)) .started else .conflict);
                 return out.refuse(.conflict, .unclassified, RUN_EXISTS);
             }
+            // A call's start comes as a message, which no edge holds: past
+            // its namespace's share of this shard's history lane, it is told
+            // so, and asks again later, so one tenant's calls don't fill the
+            // lane every tenant's invokes wait on.
+            if (call) if (historyHeld(view, .of(p.ns))) |h| {
+                var wb: [128]u8 = undefined;
+                const why = std.fmt.bufPrint(&wb, "history lane: namespace holds {d} of a {d} cap", .{ h.held, h.cap }) catch "history lane: past its share";
+                return replyWhy(view, p, .over_budget, why);
+            };
             // A call's start is held to the shard's share here, not at the
             // top-level gate, which never sees a channel's messages: past
             // it, the call is told so and asks again later.
             const mark = view.mark();
-            try view.put(Runs, rk, .{ .v = .{
+            var new: Run.Value = .{
                 .action = p.action,
                 .status = .ready,
                 .input = p.input,
@@ -300,8 +335,18 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 .completed_ns = 0,
                 .outcome = "",
                 .result = "",
+                .result_truncated = false,
+                .result_hash = 0,
                 .@"error" = "",
-            } });
+                .error_truncated = false,
+                .hist_next = 0,
+                .hist_flushed = 0,
+                .hist_pending = "",
+                .abandons = 0,
+                .deliveries_unrecorded = 0,
+            };
+            try record(view, .of(p.ns), p.run, &new, .{ .event = EV_INVOKED, .detail = p.input, .at_ms = msOf(stamp) }, .flush_on_size);
+            try view.put(Runs, rk, .{ .v = new });
             var b: KeyBuf = undefined;
             try view.put(Ready, try idKey(view, .of(p.ns), readyKey(&b, p.action, {}, stamp, p.run)), .{});
             if (call) if (gate.overSince(view, mark)) |o| {
@@ -324,6 +369,10 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             if (run.v.status != .ready or run.v.due_ns != p.due_ns or p.due_ns > stamp)
                 return out.refuse(.conflict, .unclassified, NOT_READY);
             try M.deliver(view, .of(p.ns), p.run, &run.v, p.holder, p.request_key, .{ .term = e.header.term, .index = e.header.index }, p.lease_ms, stamp);
+            if (run.v.deliveries <= recordedDeliveries(run.v.max_attempts))
+                try record(view, .of(p.ns), p.run, &run.v, .{ .event = EV_DELIVERED, .detail = p.holder, .at_ms = msOf(stamp) }, .flush_on_size)
+            else
+                run.v.deliveries_unrecorded +|= 1;
             try view.put(Runs, rk, run);
             out.putInt(u32, run.v.deliveries);
         },
@@ -334,21 +383,29 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             if (!holds(run.v, p.holder, p.deliveries, p.token)) {
                 // A resend of the settle that applied answers as it did; a
                 // second with another result is told the run has one.
+                // It is held to the first by its hash, the row keeping only a
+                // preview, and changes nothing: no write, and no send.
                 if (sameDelivery(run.v, p.holder, p.deliveries, p.token) and run.v.ended == .settled) {
-                    if (std.mem.eql(u8, run.v.outcome, p.outcome) and std.mem.eql(u8, run.v.result, p.result)) return;
+                    if (std.mem.eql(u8, run.v.outcome, p.outcome) and fnv1a64(p.result) == run.v.result_hash) {
+                        if (comptime plant.active == .actions_resend_rewrites_result) {
+                            try tellCaller(view, .of(p.ns), p.run, run.v, p.result);
+                            try view.put(Runs, rk, run);
+                        }
+                        return;
+                    }
                     return out.refuse(.conflict, .stale_report, OTHER_RESULT);
                 }
                 return stale(out, run.v, p.holder, p.deliveries, p.token);
             }
             try M.endLease(view, .of(p.ns), p.run, run.v, p.holder, p.request_key, p.expiry_ns);
-            run.v.status = .completed;
+            try record(view, .of(p.ns), p.run, &run.v, .{ .event = EV_SETTLED, .detail = p.result, .extra = p.outcome, .at_ms = msOf(stamp) }, .hold);
             run.v.ended = .settled;
             run.v.outcome = p.outcome;
-            run.v.result = p.result;
-            run.v.@"error" = "";
-            run.v.completed_ns = stamp;
+            preview(&run.v.result, &run.v.result_truncated, p.result);
+            run.v.result_hash = fnv1a64(p.result);
+            preview(&run.v.@"error", &run.v.error_truncated, "");
+            try endRun(view, .of(p.ns), p.run, &run.v, .completed, stamp, p.result);
             try view.put(Runs, rk, run);
-            try tellCaller(view, .of(p.ns), p.run, run.v);
         },
         .action_release => {
             const p = ae.Release.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -360,20 +417,25 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 return stale(out, run.v, p.holder, p.deliveries, p.token);
             }
             try M.endLease(view, .of(p.ns), p.run, run.v, p.holder, p.request_key, p.expiry_ns);
-            run.v.@"error" = p.@"error";
+            const at_ms = msOf(stamp);
             if (p.abandoned) {
                 run.v.ended = .abandoned;
+                // A hand-back counts no failure, so they may go on without
+                // end: past its attempts, one is only counted.
+                if (run.v.abandons < run.v.max_attempts)
+                    try record(view, .of(p.ns), p.run, &run.v, .{ .event = EV_ABANDONED, .detail = p.@"error", .at_ms = at_ms }, .flush_on_size);
+                run.v.abandons +|= 1;
+                preview(&run.v.@"error", &run.v.error_truncated, p.@"error");
                 try M.readyAgain(view, .of(p.ns), p.run, &run.v, after(stamp, p.delay_ms));
             } else {
                 run.v.ended = .released;
                 run.v.failures +|= 1;
-                if (!p.retry or run.v.failures >= run.v.max_attempts) {
-                    run.v.status = .failed;
-                    run.v.completed_ns = stamp;
-                } else try M.readyAgain(view, .of(p.ns), p.run, &run.v, after(stamp, p.delay_ms));
+                const ends = !p.retry or run.v.failures >= run.v.max_attempts;
+                try record(view, .of(p.ns), p.run, &run.v, .{ .event = EV_RELEASED, .detail = p.@"error", .at_ms = at_ms }, if (ends) .hold else .flush_on_size);
+                preview(&run.v.@"error", &run.v.error_truncated, p.@"error");
+                if (ends) try endRun(view, .of(p.ns), p.run, &run.v, .failed, stamp, "") else try M.readyAgain(view, .of(p.ns), p.run, &run.v, after(stamp, p.delay_ms));
             }
             try view.put(Runs, rk, run);
-            try tellCaller(view, .of(p.ns), p.run, run.v);
         },
         .action_extend => {
             const p = ae.Extend.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -425,14 +487,34 @@ fn expireOne(view: *View, item: ae.ExpireItem.Value, stamp: u64) ApplyError!bool
     try M.dropRequest(view, .of(item.ns), item.holder, item.request_key, item.run);
     run.v.ended = .expired;
     run.v.failures +|= 1;
-    run.v.@"error" = "lease expired";
-    if (run.v.failures >= run.v.max_attempts) {
-        run.v.status = .timed_out;
-        run.v.completed_ns = stamp;
-    } else try M.readyAgain(view, .of(item.ns), item.run, &run.v, stamp);
+    const ends = run.v.failures >= run.v.max_attempts;
+    try record(view, .of(item.ns), item.run, &run.v, .{ .event = EV_EXPIRED, .detail = LEASE_EXPIRED, .at_ms = msOf(stamp) }, if (ends) .hold else .flush_on_size);
+    preview(&run.v.@"error", &run.v.error_truncated, LEASE_EXPIRED);
+    if (ends) try endRun(view, .of(item.ns), item.run, &run.v, .timed_out, stamp, "") else try M.readyAgain(view, .of(item.ns), item.run, &run.v, stamp);
     try view.put(Runs, rk, run);
-    try tellCaller(view, .of(item.ns), item.run, run.v);
     return true;
+}
+
+/// The history lane's bytes a call's start in `ns` would wait on, as the
+/// edge holds a client's (`Shard.historyWait`), from replicated state alone:
+/// the lane's and the namespace's bytes, with what this apply has sent on it
+/// so far, against the replicated part of the edge's cap, a quarter of the
+/// bound share. With no share bound there is no replicated cap, and no
+/// check: the edge's cap is node configuration, which no apply may read.
+fn historyHeld(view: *View, ns: NamespaceId) ?struct { held: u64, cap: u64 } {
+    const read: view_mod.ReadView = .{ .store = view.store };
+    const cap = (settings.boundShare(read) orelse return null).share_bytes / 4;
+    const own: u16 = if (view.place) |pl| pl.group else 0;
+    var total = channels.metaOf(read, own, .history).bytes;
+    var held = channels.nsBytesOf(read, own, .history, ns);
+    for (view.sends.items) |snd| if (snd.flags & entry_mod.Flags.HISTORY != 0) {
+        total += snd.payload.len;
+        if (snd.origin.ns == ns) held += snd.payload.len;
+    };
+    if (total < cap) return null;
+    if (held > 0 and total >= 2 * cap) return .{ .held = held, .cap = cap };
+    if (shareHeld(held, total, cap)) return .{ .held = held, .cap = cap };
+    return null;
 }
 
 fn eqlOpt(a: ?[]const u8, b: ?[]const u8) bool {
@@ -452,8 +534,9 @@ fn replyWhy(view: *View, p: ae.Invoke.Value, answer: ae.Answer, why: ?[]const u8
     try view.send(.user(ns), calls.callerSlot(ns, p.caller_workflow.?), @backingInt(EntryType.call_reply), bytes);
 }
 
-/// A called run that ended tells its caller how, and what it returned.
-fn tellCaller(view: *View, ns: NamespaceId, run_id: []const u8, run: Run.Value) ApplyError!void {
+/// A called run that ended tells its caller how, and what it returned:
+/// `result`, the whole, which its row keeps only a preview of.
+fn tellCaller(view: *View, ns: NamespaceId, run_id: []const u8, run: Run.Value, result: []const u8) ApplyError!void {
     if (run.source != .workflow) return;
     const workflow = run.caller_workflow orelse return;
     const status: ae.DoneStatus = switch (run.status) {
@@ -464,11 +547,112 @@ fn tellCaller(view: *View, ns: NamespaceId, run_id: []const u8, run: Run.Value) 
     };
     const done = run.status == .completed;
     const buf = view.arena.alloc(u8, ae.Done.max_size) catch return error.OutOfMemory;
-    const bytes = ae.Done.encodeInto(buf, .{ .ns = ns.int(), .slot = calls.callerSlot(ns, workflow), .run = run_id, .status = status, .outcome = if (done) run.outcome else "", .result = if (done) run.result else "" }) catch return error.Halt;
+    const bytes = ae.Done.encodeInto(buf, .{ .ns = ns.int(), .slot = calls.callerSlot(ns, workflow), .run = run_id, .status = status, .outcome = if (done) run.outcome else "", .result = if (done) result else "" }) catch return error.Halt;
     try view.send(.user(ns), calls.callerSlot(ns, workflow), @backingInt(EntryType.call_done), bytes);
 }
 
 pub const CALL_HAS_NO_CALLER = "bad request: a call's start names no calling workflow";
+
+// ─── History ─────────────────────────────────────────────────────────────
+
+pub const EV_INVOKED = "action_invoked";
+pub const EV_DELIVERED = "action_delivered";
+pub const EV_SETTLED = "action_settled";
+pub const EV_RELEASED = "action_released";
+pub const EV_ABANDONED = "action_abandoned";
+pub const EV_EXPIRED = "action_expired";
+pub const EV_ENDED = "action_ended";
+pub const LEASE_EXPIRED = "lease expired";
+
+/// `action_ended`'s detail: the hand-backs and the deliveries its history
+/// didn't record. The longest, both at u32's largest, is `ENDED_DETAIL_MAX`.
+const ENDED_FMT = "{{\"abandons\":{d},\"deliveries_unrecorded\":{d}}}";
+const ENDED_DETAIL_MAX = std.fmt.count(ENDED_FMT, .{ std.math.maxInt(u32), std.math.maxInt(u32) });
+
+/// A run's deliveries its history records: its history is then bounded by
+/// its attempts, whatever is handed back.
+pub fn recordedDeliveries(max_attempts: u32) u64 {
+    return 2 * @as(u64, max_attempts);
+}
+
+comptime {
+    const rb = hp.recordBound;
+    const C = he.MAX_CHUNK_RECORDS;
+    std.debug.assert(ae.MAX_INPUT <= hp.MAX_DETAIL and action_ops.MAX_OUTPUT <= hp.MAX_DETAIL and action_ops.MAX_ERROR <= hp.MAX_DETAIL);
+    std.debug.assert(ae.MAX_OUTCOME <= hp.MAX_EXTRA);
+    // An event over half a chunk goes alone: an invoke's input, at most.
+    std.debug.assert(rb(EV_INVOKED.len, ae.MAX_INPUT, 0) <= C);
+    std.debug.assert(rb(EV_RELEASED.len, action_ops.MAX_ERROR, 0) <= C and rb(EV_ABANDONED.len, action_ops.MAX_ERROR, 0) <= C);
+    // The apply that ends a run sends one chunk: its pending events, that
+    // apply's and its end's.
+    const ended = rb(EV_ENDED.len, ENDED_DETAIL_MAX, 0);
+    const settled = rb(EV_SETTLED.len, action_ops.MAX_OUTPUT, ae.MAX_OUTCOME);
+    const expired = rb(EV_EXPIRED.len, LEASE_EXPIRED.len, 0);
+    std.debug.assert(hp.HIST_CHUNK + settled + ended <= C);
+    std.debug.assert(hp.HIST_CHUNK + rb(EV_RELEASED.len, action_ops.MAX_ERROR, 0) + ended <= C);
+    std.debug.assert(hp.HIST_CHUNK + expired + ended <= C);
+    // A settle sends that chunk and its call's end.
+    std.debug.assert(hp.chunkBound(hp.HIST_CHUNK + settled + ended) + ae.Done.max_size <= channels.MAX_SEND_BYTES);
+    // An expire, per item it ends: a chunk, and a call's end with no
+    // result (the run didn't complete); one that doesn't end it, at most
+    // its pending chunk. Bounded here, whatever its proposer read.
+    const item = hp.chunkBound(hp.HIST_CHUNK + expired + ended) + (ae.Done.max_size - action_ops.MAX_OUTPUT);
+    std.debug.assert(2 * ae.MAX_EXPIRE_ITEMS <= channels.MAX_SENDS);
+    std.debug.assert(ae.MAX_EXPIRE_ITEMS * item <= channels.MAX_SEND_BYTES);
+}
+
+fn msOf(stamp_ns: u64) i64 {
+    return @intCast(stamp_ns / std.time.ns_per_ms);
+}
+
+fn histOf(run: *const Run.Value) hp.Hist {
+    return .{ .next = run.hist_next, .flushed = run.hist_flushed, .pending = run.hist_pending };
+}
+
+fn setHist(run: *Run.Value, h: hp.Hist) void {
+    run.hist_next = h.next;
+    run.hist_flushed = h.flushed;
+    run.hist_pending = h.pending;
+}
+
+/// Where run `id`'s chunks go: its action's slot, which its run id
+/// carries, so its own group.
+fn ownerOf(ns: NamespaceId, id: []const u8, run: *const Run.Value) hp.Owner {
+    return .{ .family = .action, .ns = ns, .owner = run.action, .run = id, .created_ns = run.created_ns, .slot = @intCast(router.nsKeySlot(ns, run.action)) };
+}
+
+/// One event onto run `id`'s history. A run that ended records none: an
+/// entry that would is a Flo bug.
+fn record(view: *View, ns: NamespaceId, id: []const u8, run: *Run.Value, ev: hp.Event, mode: hp.Mode) ApplyError!void {
+    if (run.completed_ns != 0) return error.Halt;
+    var h = histOf(run);
+    try hp.append(view, ownerOf(ns, id, run), &h, ev, mode);
+    setHist(run, h);
+}
+
+/// `field` set to `whole`'s preview.
+fn preview(field: *[]const u8, truncated: *bool, whole: []const u8) void {
+    field.* = whole[0..@min(whole.len, PREVIEW)];
+    truncated.* = whole.len > PREVIEW;
+}
+
+/// Run `id` ended `status` at `stamp`, this apply's events held for it:
+/// the counts its history didn't record go in its last chunk, sent now;
+/// its caller is told, with the whole `result`; and its row keeps its
+/// summary, without its input or labels.
+fn endRun(view: *View, ns: NamespaceId, id: []const u8, run: *Run.Value, status: Status, stamp: u64, result: []const u8) ApplyError!void {
+    var db: [ENDED_DETAIL_MAX]u8 = undefined;
+    const detail = std.fmt.bufPrint(&db, ENDED_FMT, .{ run.abandons, run.deliveries_unrecorded }) catch unreachable;
+    try record(view, ns, id, run, .{ .event = EV_ENDED, .detail = detail, .at_ms = msOf(stamp) }, .hold);
+    run.status = status;
+    run.completed_ns = stamp;
+    try tellCaller(view, ns, id, run.*, result);
+    if (comptime plant.active != .actions_end_keeps_input) run.input = "";
+    run.labels = null;
+    var h = histOf(run);
+    try hp.flushKeeping(view, ownerOf(ns, id, run), &h, msOf(stamp), comptime plant.active == .actions_hist_flushed_kept);
+    setHist(run, h);
+}
 
 /// The run at `rk`, if it is `action`'s.
 fn inScope(view: *View, rk: []const u8, action: []const u8) ApplyError!?Stored(Run) {
@@ -543,6 +727,8 @@ pub const TestActions = struct {
     pub fn init(allocator: std.mem.Allocator) TestActions {
         var store = store_mod.Store.init(allocator);
         store.strict_keys = true;
+        // A group of one: every slot is its own, its runs' history too.
+        store.place = .{ .group = 0, .count = 1 };
         return .{ .store = store, .scratch = std.heap.ArenaAllocator.init(allocator) };
     }
 
@@ -1172,7 +1358,6 @@ test "actions machine: every record's slot follows from what it stores, the acti
 const store_mod_t = @import("../contract/store.zig").Store;
 
 test "actions machine: past its shard's share a settle still lands, its large result with it; a new run is refused" {
-    const settings = @import("../settings/machine.zig");
     const pool = @import("../budget/pool.zig");
     var t = TestActions.init(testing.allocator);
     defer t.deinit();
@@ -1193,7 +1378,7 @@ test "actions machine: past its shard's share a settle still lands, its large re
     try testing.expect(pool.useOf(&t.store) > use);
 }
 
-test "actions machine: a run adds no more than its invoke's bytes and the call bound, every field at its largest" {
+test "actions machine: a run adds no more than its invoke's bytes, its input again in its history, and the call bound, every field at its largest" {
     const pool = @import("../budget/pool.zig");
     const memory_budget = @import("../node/memory_budget.zig");
     var t = TestActions.init(testing.allocator);
@@ -1205,8 +1390,274 @@ test "actions machine: a run adds no more than its invoke's bytes and the call b
     const labels: [ae.MAX_LABELS]u8 = @splat('l');
     const caller: [limits.MAX_QUALIFIED_KEY]u8 = @splat('c');
     const inv: ae.Invoke.Value = .{ .ns = DEFAULT, .action = &name, .run = &run, .input = &input, .labels = &labels, .source = .direct, .caller_run = &caller, .caller_workflow = &caller };
-    const before = pool.useOf(&t.store);
-    try testing.expect((try t.apply(.action_invoke, inv, 10 * ms)).refused() == null);
-    const added = pool.useOf(&t.store) - before;
-    try testing.expect(added <= try ae.Invoke.encodedSize(inv) + memory_budget.CALL_RECORDS_BYTES);
+    // Largest, its input goes to its history at once; a little under half
+    // a chunk, it stays in the run's pending history.
+    for ([_]usize{ ae.MAX_INPUT, hp.HIST_CHUNK / 2 - 64 }, 0..) |len, i| {
+        var id = run;
+        id[0] = @intCast('0' + i);
+        var one = inv;
+        one.run = &id;
+        one.input = input[0..len];
+        const before = pool.useOf(&t.store);
+        try testing.expect((try t.apply(.action_invoke, one, 10 * ms)).refused() == null);
+        const added = pool.useOf(&t.store) - before;
+        try testing.expect(added <= try ae.Invoke.encodedSize(one) + len + memory_budget.CALL_RECORDS_BYTES);
+    }
+}
+
+// ─── History ─────────────────────────────────────────────────────────────
+
+/// The history chunks the group has sent itself, oldest first, as its
+/// outbox holds them (copied into `a`).
+fn histChunks(t: *TestActions, a: std.mem.Allocator) ![]he.Chunk.Value {
+    var pb: [channels.CHAN_KEY]u8 = undefined;
+    const prefix = channels.outPrefix(&pb, 0, .history);
+    var it = (view_mod.ReadView{ .store = &t.store }).range(channels.OutFam, prefix);
+    var got: std.ArrayListUnmanaged(he.Chunk.Value) = .empty;
+    while (try it.next()) |item| {
+        var diag: schema.Diagnostic = .{};
+        try got.append(a, try he.Chunk.decodeAll(try a.dupe(u8, item.value.v.payload), &diag));
+    }
+    return got.items;
+}
+
+/// The events `records` holds, in order.
+fn histEvents(a: std.mem.Allocator, records: []const u8) ![]hp.HistRec.Value {
+    var diag: schema.Diagnostic = .{};
+    var r: schema.Reader = .{ .bytes = records, .diag = &diag };
+    var got: std.ArrayListUnmanaged(hp.HistRec.Value) = .empty;
+    while (r.pos < records.len) try got.append(a, try hp.HistRec.decode(&r, "rec"));
+    return got.items;
+}
+
+/// Every event the group's chunks carry, in the order sent.
+fn sentEvents(t: *TestActions, a: std.mem.Allocator) ![]hp.HistRec.Value {
+    var all: std.ArrayListUnmanaged(hp.HistRec.Value) = .empty;
+    for (try histChunks(t, a)) |c| try all.appendSlice(a, try histEvents(a, c.records));
+    return all.items;
+}
+
+/// How many messages the group has sent, on either lane.
+fn sendCount(t: *TestActions) u64 {
+    const rv: view_mod.ReadView = .{ .store = &t.store };
+    return channels.metaOf(rv, 0, .main).next_seq + channels.metaOf(rv, 0, .history).next_seq - 2;
+}
+
+fn eventNames(events: []const hp.HistRec.Value, out: [][]const u8) [][]const u8 {
+    for (events, 0..) |e, i| out[i] = e.event;
+    return out[0..events.len];
+}
+
+test "actions machine: a run's events go in its last chunk, sent as it ends, in order and at its seqs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 3);
+    try invoke(&t, "r1", 10 * ms);
+    try testing.expect((try deliver(&t, "r1", 10 * ms, 20 * ms)).refused() == null);
+    try testing.expect((try t.apply(.action_release, releaseOf(&t, "r1", false), 30 * ms)).refused() == null);
+    try testing.expect((try deliver(&t, "r1", 35 * ms, 40 * ms)).refused() == null);
+    // Nothing is sent before the end: each event is far under a chunk.
+    try testing.expectEqual(@as(u64, 0), sendCount(&t));
+    var settle = settleOf(&t, "r1");
+    settle.outcome = "ok";
+    try testing.expect((try t.apply(.action_settle, settle, 50 * ms)).refused() == null);
+
+    const chunks = try histChunks(&t, a);
+    try testing.expectEqual(@as(usize, 1), chunks.len);
+    try testing.expect(chunks[0].final);
+    try testing.expectEqual(@as(u64, 0), chunks[0].first_seq);
+    try testing.expectEqual(@as(u64, 5), chunks[0].last_seq);
+    try testing.expectEqual(@as(u64, 50), chunks[0].completed_ms);
+    try testing.expectEqual(@backingInt(he.Family.action), chunks[0].family);
+    try testing.expectEqualStrings("send", chunks[0].owner);
+    const events = try histEvents(a, chunks[0].records);
+    var nb: [8][]const u8 = undefined;
+    const want = [_][]const u8{ EV_INVOKED, EV_DELIVERED, EV_RELEASED, EV_DELIVERED, EV_SETTLED, EV_ENDED };
+    try testing.expectEqual(want.len, eventNames(events, &nb).len);
+    for (want, events, 0..) |w, e, i| {
+        try testing.expectEqualStrings(w, e.event);
+        try testing.expectEqual(@as(u64, i), e.seq);
+    }
+    try testing.expectEqualStrings("in", events[0].detail);
+    try testing.expectEqualStrings("w1", events[1].detail);
+    try testing.expectEqualStrings("boom", events[2].detail);
+    try testing.expectEqualStrings("done", events[4].detail);
+    try testing.expectEqualStrings("ok", events[4].extra);
+    try testing.expectEqualStrings("{\"abandons\":0,\"deliveries_unrecorded\":0}", events[5].detail);
+
+    // Its row is its summary: no input, its result's preview and hash, and
+    // nothing pending.
+    const done = t.run(.default, "r1").?;
+    try testing.expectEqualStrings("", done.input);
+    try testing.expectEqualStrings("done", done.result);
+    try testing.expect(!done.result_truncated);
+    try testing.expectEqual(@import("stdx").hash.fnv1a64("done"), done.result_hash);
+    try testing.expectEqual(@as(u64, 6), done.hist_next);
+    try testing.expectEqual(@as(u64, 6), done.hist_flushed);
+    try testing.expectEqualStrings("", done.hist_pending);
+}
+
+test "actions machine: an input over half a chunk is sent at its invoke, alone" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 3);
+    const input: [hp.HIST_CHUNK / 2 + 1]u8 = @splat('i');
+    const r = try t.apply(.action_invoke, ae.Invoke.Value{ .ns = DEFAULT, .action = "send", .run = "r1", .input = &input, .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null }, 10 * ms);
+    try testing.expect(r.refused() == null);
+    const chunks = try histChunks(&t, arena.allocator());
+    try testing.expectEqual(@as(usize, 1), chunks.len);
+    try testing.expect(!chunks[0].final);
+    try testing.expectEqual(@as(u64, 0), chunks[0].last_seq);
+    const run = t.run(.default, "r1").?;
+    try testing.expectEqual(@as(u64, 1), run.hist_flushed);
+    try testing.expectEqualStrings("", run.hist_pending);
+}
+
+test "actions machine: deliveries past twice its attempts and hand-backs past its attempts are only counted, the counts said as it ends" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 1);
+    try invoke(&t, "r1", 10 * ms);
+    var due: u64 = 10 * ms;
+    var stamp: u64 = 20 * ms;
+    for (0..5) |_| {
+        try testing.expect((try deliver(&t, "r1", due, stamp)).refused() == null);
+        var rel = releaseOf(&t, "r1", true);
+        rel.delay_ms = 0;
+        try testing.expect((try t.apply(.action_release, rel, stamp + ms)).refused() == null);
+        due = stamp + ms;
+        stamp += 10 * ms;
+    }
+    try testing.expect((try deliver(&t, "r1", due, stamp)).refused() == null);
+    try testing.expect((try t.apply(.action_settle, settleOf(&t, "r1"), stamp + ms)).refused() == null);
+    const events = try sentEvents(&t, a);
+    var delivered: usize = 0;
+    var abandoned: usize = 0;
+    for (events) |e| {
+        if (std.mem.eql(u8, e.event, EV_DELIVERED)) delivered += 1;
+        if (std.mem.eql(u8, e.event, EV_ABANDONED)) abandoned += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), delivered);
+    try testing.expectEqual(@as(usize, 1), abandoned);
+    try testing.expectEqualStrings(EV_ENDED, events[events.len - 1].event);
+    try testing.expectEqualStrings("{\"abandons\":5,\"deliveries_unrecorded\":4}", events[events.len - 1].detail);
+}
+
+test "actions machine: an expire of 24 runs, each with a near-full pending chunk and a caller, applies within an apply's sends" {
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 1);
+    const input: [2000]u8 = @splat('i');
+    const holder: [1900]u8 = @splat('h');
+    var ids: [ae.MAX_EXPIRE_ITEMS][8]u8 = undefined;
+    for (&ids, 0..) |*id, i| {
+        _ = try std.fmt.bufPrint(id, "r{d:0>7}", .{i});
+        try testing.expect((try t.apply(.action_invoke, ae.Invoke.Value{ .ns = DEFAULT, .action = "send", .run = id, .input = &input, .labels = null, .source = .workflow, .caller_run = "wr", .caller_workflow = "wf" }, 10 * ms)).refused() == null);
+        try testing.expect((try t.apply(.action_deliver, ae.Deliver.Value{ .ns = DEFAULT, .action = "send", .run = id, .due_ns = 10 * ms, .holder = &holder, .request_key = null, .lease_ms = LEASE_MS }, 20 * ms)).refused() == null);
+        try testing.expect(t.run(.default, id).?.hist_pending.len > hp.HIST_CHUNK - 200);
+    }
+    try testing.expectEqual(@as(u64, 0), sendCount(&t));
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    for (&ids) |*id| {
+        var ib: [ae.ExpireItem.max_size]u8 = undefined;
+        try buf.appendSlice(testing.allocator, try ae.ExpireItem.encodeInto(&ib, .{ .ns = DEFAULT, .action = "send", .run = id, .expiry_ns = 20 * ms + LEASE, .holder = &holder, .request_key = null }));
+    }
+    const r = try t.apply(.action_expire, ae.Expire.Value{ .items = .{ .bytes = buf.items, .count = ae.MAX_EXPIRE_ITEMS } }, 20 * ms + LEASE);
+    try testing.expect(r.refused() == null);
+    try testing.expectEqual(@as(u64, 2 * ae.MAX_EXPIRE_ITEMS), sendCount(&t));
+    for (&ids) |*id| try testing.expectEqual(Status.timed_out, t.run(.default, id).?.status);
+}
+
+test "actions machine: a 64 KiB result with a 256 B outcome lands whole in its history, its row a preview" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 3);
+    try invoke(&t, "r1", 10 * ms);
+    try testing.expect((try deliver(&t, "r1", 10 * ms, 20 * ms)).refused() == null);
+    const result: [action_ops.MAX_OUTPUT]u8 = @splat('r');
+    const outcome: [ae.MAX_OUTCOME]u8 = @splat('o');
+    var settle = settleOf(&t, "r1");
+    settle.result = &result;
+    settle.outcome = &outcome;
+    try testing.expect((try t.apply(.action_settle, settle, 30 * ms)).refused() == null);
+    const events = try sentEvents(&t, arena.allocator());
+    const settled = events[events.len - 2];
+    try testing.expectEqualStrings(EV_SETTLED, settled.event);
+    try testing.expectEqualSlices(u8, &result, settled.detail);
+    try testing.expectEqualSlices(u8, &outcome, settled.extra);
+    const done = t.run(.default, "r1").?;
+    try testing.expectEqual(@as(usize, PREVIEW), done.result.len);
+    try testing.expect(done.result_truncated);
+}
+
+test "actions machine: a settle's resend is held to the first by its hash and sends nothing; another result is still refused" {
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 3);
+    try testing.expect((try t.apply(.action_invoke, ae.Invoke.Value{ .ns = DEFAULT, .action = "send", .run = "r1", .input = "in", .labels = null, .source = .workflow, .caller_run = "wr", .caller_workflow = "wf" }, 10 * ms)).refused() == null);
+    try testing.expect((try deliver(&t, "r1", 10 * ms, 20 * ms)).refused() == null);
+    const result: [300]u8 = @splat('r');
+    var settle = settleOf(&t, "r1");
+    settle.result = &result;
+    try testing.expect((try t.apply(.action_settle, settle, 30 * ms)).refused() == null);
+    const sums = t.sums();
+    const sent = sendCount(&t);
+    try testing.expect((try t.apply(.action_settle, settle, 31 * ms)).refused() == null);
+    try testing.expectEqual(sums, t.sums());
+    try testing.expectEqual(sent, sendCount(&t));
+    var other = settle;
+    var changed = result;
+    changed[299] = 'x';
+    other.result = &changed;
+    const r = try t.apply(.action_settle, other, 32 * ms);
+    try testing.expectEqualStrings(OTHER_RESULT, r.refused().?.refusal.message);
+}
+
+test "actions machine: a settle's result over its preview reaches its caller whole" {
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 3);
+    try testing.expect((try t.apply(.action_invoke, ae.Invoke.Value{ .ns = DEFAULT, .action = "send", .run = "r1", .input = "in", .labels = null, .source = .workflow, .caller_run = "wr", .caller_workflow = "wf" }, 10 * ms)).refused() == null);
+    try testing.expect((try deliver(&t, "r1", 10 * ms, 20 * ms)).refused() == null);
+    const result: [PREVIEW + 44]u8 = @splat('r');
+    var settle = settleOf(&t, "r1");
+    settle.result = &result;
+    try testing.expect((try t.apply(.action_settle, settle, 30 * ms)).refused() == null);
+    var pb: [channels.CHAN_KEY]u8 = undefined;
+    var it = (view_mod.ReadView{ .store = &t.store }).range(channels.OutFam, channels.outPrefix(&pb, 0, .main));
+    const out = (try it.next()).?.value.v;
+    try testing.expectEqual(@backingInt(EntryType.call_done), out.entry_type);
+    var diag: schema.Diagnostic = .{};
+    const done = try ae.Done.decodeAll(out.payload, &diag);
+    try testing.expectEqualSlices(u8, &result, done.result);
+}
+
+test "actions machine: a run's history is its action's, by a name with a brace and one at the longest" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const longest: [ae.MAX_ACTION_NAME]u8 = @splat('a');
+    for ([_][]const u8{ "a}b", &longest }) |name| {
+        var t = TestActions.init(testing.allocator);
+        defer t.deinit();
+        try testing.expect((try t.apply(.action_register, ae.Register.Value{ .ns = DEFAULT, .name = name, .owner = "", .lease_ms = LEASE_MS, .max_attempts = 3 }, 1)).refused() == null);
+        try testing.expect((try t.apply(.action_invoke, ae.Invoke.Value{ .ns = DEFAULT, .action = name, .run = "r1", .input = "in", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null }, 10 * ms)).refused() == null);
+        try testing.expect((try t.apply(.action_deliver, ae.Deliver.Value{ .ns = DEFAULT, .action = name, .run = "r1", .due_ns = 10 * ms, .holder = "w1", .request_key = null, .lease_ms = LEASE_MS }, 20 * ms)).refused() == null);
+        var settle = settleOf(&t, "r1");
+        settle.action = name;
+        try testing.expect((try t.apply(.action_settle, settle, 30 * ms)).refused() == null);
+        const chunks = try histChunks(&t, arena.allocator());
+        try testing.expectEqual(@as(usize, 1), chunks.len);
+        try testing.expectEqualStrings(name, chunks[0].owner);
+    }
 }

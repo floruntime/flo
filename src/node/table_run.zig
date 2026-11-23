@@ -220,6 +220,12 @@ pub fn atLeader(req: proto.Request) bool {
 /// name. A field missing here fails the build's tests, and so does a name
 /// no test has any more.
 pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []const []const u8 }{
+    .{ .op = "action.history", .field = "limit", .tests = &.{"actions: an action run's history reads back whole, a page at a time by its cursor and newest first; its status is a preview with its flag"} },
+    .{ .op = "action.history", .field = "cursor", .tests = &.{"actions: an action run's history reads back whole, a page at a time by its cursor and newest first; its status is a preview with its flag"} },
+    .{ .op = "action.history", .field = "newest_first", .tests = &.{"actions: an action run's history reads back whole, a page at a time by its cursor and newest first; its status is a preview with its flag"} },
+    .{ .op = "workflow.history", .field = "limit", .tests = &.{"Shard: a workflow run's history read waits while its chunks are on the history lane, and is answered once they land"} },
+    .{ .op = "workflow.history", .field = "cursor", .tests = &.{"Shard: a workflow run's history read waits while its chunks are on the history lane, and is answered once they land"} },
+    .{ .op = "workflow.history", .field = "newest_first", .tests = &.{"Shard: a workflow run's history read waits while its chunks are on the history lane, and is answered once they land"} },
     .{ .op = "action.await", .field = "actions", .tests = &.{"actions: an await takes a ready run under a new delivery; a complete naming it completes the run, its result and outcome kept; one naming another delivery, or another action, is refused"} },
     .{ .op = "action.await", .field = "block_ms", .tests = &.{"actions: an await with block_ms 0 answers at once with no task; one that waits is answered when a run is invoked"} },
     .{ .op = "action.await", .field = "request_key", .tests = &.{"actions: an await retried with its request key gets the task the first got, while the worker holds it; another key gets another run"} },
