@@ -175,6 +175,16 @@ pub fn namespaceOf(e: *const Entry) ?u32 {
     return n.ns.int();
 }
 
+pub const TARGET_TOO_LONG = "the call's target is longer than an action name may be";
+
+/// Why call `c`'s start can't be made, or null: an action's target longer
+/// than an action's name has no run to start. Its leader refuses those
+/// first; this keeps one that reaches the log from halting it.
+fn unstartable(c: Call.Value) ?[]const u8 {
+    if (c.kind == .action and c.target.len > ae.MAX_ACTION_NAME) return TARGET_TOO_LONG;
+    return null;
+}
+
 /// Sends the call's start to its target's slot: an action's run's invoke,
 /// or a child workflow's start, which carries where the child's end goes.
 fn sendStart(view: *View, ns: NamespaceId, slot: u16, run: []const u8, c: Call.Value) ApplyError!void {
@@ -242,6 +252,14 @@ pub fn record(view: *View, p: ae.Call.Value, stamp: u64) ApplyError!void {
         .outcome = "",
         .result = "",
     };
+    // One that can't start is recorded refused, saying why, and its step
+    // fails as for any refused call.
+    if (unstartable(c)) |why| {
+        var refused = c;
+        refused.state = .refused;
+        refused.outcome = why;
+        return view.put(Calls, k, .{ .v = refused });
+    }
     try view.put(Calls, k, .{ .v = c });
     try sendStart(view, ns, slot, p.run, c);
 }
@@ -263,9 +281,14 @@ pub fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             var c = (found orelse return).v;
             // Answered since the retry was proposed, or proposed twice.
             if (c.state != .no_action and c.state != .over_budget) return;
-            c.state = .sent;
             c.attempts +|= 1;
             c.last_ns = stamp;
+            if (unstartable(c)) |why| {
+                c.state = .refused;
+                c.outcome = why;
+                return view.put(Calls, k, .{ .v = c });
+            }
+            c.state = .sent;
             try view.put(Calls, k, .{ .v = c });
             try sendStart(view, n.ns, n.slot, n.run, c);
         },
