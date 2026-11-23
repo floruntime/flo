@@ -181,6 +181,9 @@ pub const Scenario = struct {
     /// memory gate refuses client writes past it and each verdict is
     /// checked (`memory_gate.zig`); 0 for none, as the server is unbound.
     memory_share: u64 = 0,
+    /// Of consumer-group ops, the percent that create or alter one of the
+    /// streams (`stream_config`); 0 in a pin made before there were any.
+    stream_config_percent: u8 = 0,
     /// About one workload op in sixteen creates a namespace, through shard
     /// 0's own create path. Off, the workload is what it was before
     /// creates existed.
@@ -435,6 +438,8 @@ pub const Scenario = struct {
         var prng = PRNG.init(std.hash.Wyhash.hash(0xC6, std.mem.asBytes(&seed)));
         s.queue_percent = prng.random().intRangeAtMost(u8, 5, 15);
         s.group_percent = prng.random().intRangeAtMost(u8, 40, 70);
+        // Fixed, not drawn, so the draws after it are what they were.
+        s.stream_config_percent = 4;
         // Room for a group entry's items: a deliver's ready list, a
         // report's records, an expire's leases.
         s.payload_max = @max(s.payload_max, 1024);
@@ -568,6 +573,7 @@ pub const Scenario = struct {
             \\  "workflow_percent": {d},
             \\  "kv_reap_percent": {d},
             \\  "memory_share": {d},
+            \\  "stream_config_percent": {d},
             \\  "namespace_creates": {},
             \\  "apply_lag_permille": {d},
             \\  "apply_lag_max_ms": {d},
@@ -576,7 +582,7 @@ pub const Scenario = struct {
             \\  "txn_limits": [{d}, {d}, {d}, {d}, {d}, {d}, {d}, {d}]
             \\}}
             \\
-        , .{ self.repair_halt, self.action_percent, self.queue_percent, self.group_percent, self.processing_percent, self.workflow_percent, self.kv_reap_percent, self.memory_share, self.namespace_creates, self.apply_lag_permille, self.apply_lag_max_ms, self.pending_read_permille, self.pending_read_max_ticks, self.txn_limits[0], self.txn_limits[1], self.txn_limits[2], self.txn_limits[3], self.txn_limits[4], self.txn_limits[5], self.txn_limits[6], self.txn_limits[7] });
+        , .{ self.repair_halt, self.action_percent, self.queue_percent, self.group_percent, self.processing_percent, self.workflow_percent, self.kv_reap_percent, self.memory_share, self.stream_config_percent, self.namespace_creates, self.apply_lag_permille, self.apply_lag_max_ms, self.pending_read_permille, self.pending_read_max_ticks, self.txn_limits[0], self.txn_limits[1], self.txn_limits[2], self.txn_limits[3], self.txn_limits[4], self.txn_limits[5], self.txn_limits[6], self.txn_limits[7] });
     }
 
     /// Parse a scenario back from `writeJson` output — the pin format.
@@ -636,6 +642,7 @@ pub const Scenario = struct {
             .workflow_percent = if (obj.get("workflow_percent") == null) 0 else try jsonInt(u8, obj, "workflow_percent"),
             .kv_reap_percent = if (obj.get("kv_reap_percent") == null) 0 else try jsonInt(u8, obj, "kv_reap_percent"),
             .memory_share = if (obj.get("memory_share") == null) 0 else try jsonInt(u64, obj, "memory_share"),
+            .stream_config_percent = if (obj.get("stream_config_percent") == null) 0 else try jsonInt(u8, obj, "stream_config_percent"),
             .namespace_creates = if (obj.get("namespace_creates")) |v| switch (v) {
                 .bool => |b| b,
                 else => return error.InvalidField,
@@ -877,7 +884,7 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 46), obj.count());
+    try testing.expectEqual(@as(usize, 47), obj.count());
     try testing.expectEqual(@as(usize, MAX_NODES), obj.get("txn_limits").?.array.items.len);
     try testing.expectEqual(s.repair_halt, obj.get("repair_halt").?.bool);
     try testing.expectEqual(@as(i64, s.action_percent), obj.get("action_percent").?.integer);
@@ -888,6 +895,7 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     try testing.expectEqual(@as(i64, s.kv_reap_percent), obj.get("kv_reap_percent").?.integer);
     try testing.expectEqual(s.namespace_creates, obj.get("namespace_creates").?.bool);
     try testing.expectEqual(@as(i64, @intCast(s.memory_share)), obj.get("memory_share").?.integer);
+    try testing.expectEqual(@as(i64, s.stream_config_percent), obj.get("stream_config_percent").?.integer);
     try testing.expectEqual(@as(i64, s.apply_lag_permille), obj.get("apply_lag_permille").?.integer);
     try testing.expectEqual(@as(i64, s.apply_lag_max_ms), obj.get("apply_lag_max_ms").?.integer);
     try testing.expectEqual(@as(i64, s.outsider_permille), obj.get("outsider_permille").?.integer);

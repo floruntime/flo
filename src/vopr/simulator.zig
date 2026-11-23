@@ -1217,6 +1217,7 @@ pub const Simulator = struct {
                 .groups = group_family.ConsumerGroups.init(allocator),
                 .ns = families.Namespaces.init(allocator),
             };
+            node.groups.config_percent = scenario.stream_config_percent;
             // Drawn only with drift on, so a run without it replays as before.
             if (scenario.clock_drift_ppm > 0) {
                 const d: i32 = @intCast(scenario.clock_drift_ppm);
@@ -3752,6 +3753,7 @@ fn groupsTestScenario(seed: u64) Scenario {
     scenario.action_percent = 0;
     scenario.queue_percent = 10;
     scenario.group_percent = 70;
+    scenario.stream_config_percent = 4;
     // As the slice sets it: room for a group entry's items.
     scenario.payload_max = @max(scenario.payload_max, 1024);
     return scenario;

@@ -24,6 +24,7 @@
 //! groups) is read from the store itself.
 
 const std = @import("std");
+const proto = @import("../protocol/proto.zig");
 const gate = @import("../budget/gate.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence = @import("../storage/persistence.zig");
@@ -204,7 +205,9 @@ const LGroup = struct {
 /// A stream as the ledger has it: `made` while the streams machine keeps a
 /// record of it, live or a tombstone; `below` its appends at or below the
 /// floor not yet removed.
-const LStream = struct { made: bool = false, exists: bool = false, floor: StreamID = StreamID.MIN, gen: u64 = 0, groups: u64 = 0, last: StreamID = StreamID.MIN, below: u64 = 0 };
+/// A stream as the ledger holds it. `explicit` and the retention bounds are
+/// what a create or alter set; a stream an append made has none.
+const LStream = struct { made: bool = false, exists: bool = false, floor: StreamID = StreamID.MIN, gen: u64 = 0, groups: u64 = 0, last: StreamID = StreamID.MIN, below: u64 = 0, explicit: bool = false, ret_age_s: u64 = 0, ret_count: u64 = 0 };
 
 /// An append the ledger counts: its first and last record ids.
 const LAppend = struct { first: StreamID, last: StreamID, records: u32 };
@@ -268,8 +271,11 @@ pub const ConsumerGroups = struct {
     stream: stream_proj.StreamProjection = .{},
     ledger: Ledger,
     allocator: Allocator,
+    /// Of the leader's ops, the percent that create or alter a stream
+    /// (`Scenario.stream_config_percent`).
+    config_percent: u8 = 0,
 
-    pub const Kind = enum { append, trim, stream_delete, stream_clean, stream_forget, create, delete, deliver, settle, release, extend, expire, clean, steal, requeue, drop };
+    pub const Kind = enum { append, trim, stream_delete, stream_clean, stream_forget, create, delete, deliver, settle, release, extend, expire, clean, steal, requeue, drop, config };
 
     /// What an applied entry did, beyond applying: the swarm fails if one
     /// never happens, since a rule it never met was never checked.
@@ -370,6 +376,7 @@ pub const ConsumerGroups = struct {
             .group_steal => .steal,
             .group_requeue => .requeue,
             .group_drop => .drop,
+            .stream_config => .config,
             else => .clean,
         };
     }
@@ -431,7 +438,7 @@ pub const ConsumerGroups = struct {
         const kind = kindOf(e.header.entry_type);
         var effect: Effect = .{ .kind = kind, .refused = false };
         switch (kind) {
-            .append, .trim, .stream_delete, .stream_clean, .stream_forget => {
+            .append, .trim, .stream_delete, .stream_clean, .stream_forget, .config => {
                 effect.refused = try self.applyStream(store, e, kind, r, &effect);
                 if (effect.broke == null) effect.broke = self.streamLedgerRule(store);
                 if (effect.broke == null) effect.broke = streamRule(store);
@@ -483,7 +490,7 @@ pub const ConsumerGroups = struct {
         var t: Touched = @splat(@splat(false));
         var diag: schema.Diagnostic = .{};
         switch (kind) {
-            .append, .trim, .stream_delete, .stream_clean, .stream_forget => {
+            .append, .trim, .stream_delete, .stream_clean, .stream_forget, .config => {
                 const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return error.Halt;
                 const s = streamOfCmd(kind, cmd) orelse return error.Halt;
                 t[s] = @splat(true);
@@ -544,6 +551,23 @@ pub const ConsumerGroups = struct {
         return streamIndex(cmd.key);
     }
 
+    /// A stream made, or made again over a tombstone: that keeps its
+    /// generation, last id and floor, so its ids continue past the old
+    /// stream's, and none of its settings.
+    fn makeStream(st: *LStream, effect: *Effect) void {
+        if (st.made) effect.marks.insert(.stream_remade) else st.* = .{ .groups = st.groups };
+        st.made = true;
+        st.exists = true;
+        st.explicit = false;
+        st.ret_age_s = 0;
+        st.ret_count = 0;
+    }
+
+    /// Whether a create asks for the settings a stream already has.
+    fn sameSettings(st: LStream, c: sm.StreamConfig) bool {
+        return @max(1, c.partition_count) == 1 and st.ret_age_s == c.retention_age_s and st.ret_count == c.retention_count;
+    }
+
     fn applyStream(self: *ConsumerGroups, store: *Store, e: *const Entry, kind: Kind, r: Replica, effect: *Effect) (persistence.ApplyError || error{RefusalChangedState})!bool {
         const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return error.Halt;
         const s = streamOfCmd(kind, cmd) orelse return error.Halt;
@@ -552,7 +576,17 @@ pub const ConsumerGroups = struct {
         // Whether a delete must be refused: the ledger's own appends above
         // its floor, never what the streams machine says it holds.
         const refuse = kind == .stream_delete and st.exists and e.header.flags & entry_mod.Flags.FORCE == 0 and self.ledger.appends[s].items.len > 0;
+        // A config's answer, from the ledger: an alter of no stream is not
+        // found; a create asking other settings than a stream's own is a
+        // conflict.
+        const cfg: ?sm.StreamConfig = if (kind == .config) (sm.StreamConfig.decode(cmd.value) orelse return error.Halt) else null;
+        const cfg_refusal: ?proto.StatusCode = if (cfg) |c| switch (c.op) {
+            .alter => if (st.exists) null else .not_found,
+            .create => if (st.exists and st.explicit and !sameSettings(st.*, c)) .conflict else null,
+        } else null;
         const before = commits(store);
+        const retained_before = store.family(sm.Retained.ID).count;
+        const metas_before = store.family(sm.Metas.ID).count;
         var out: persistence.Result = .{};
         out.reset(e);
         var prev = if (sm.metaAt(.{ .store = store }, sk)) |m| m else null;
@@ -565,20 +599,49 @@ pub const ConsumerGroups = struct {
         try machine_mod.applyEntry(&sm.machine, store, &self.scratch, e, &out);
         if (out.refused()) |rf| {
             if (!std.mem.eql(u64, &before, &commits(store))) return error.RefusalChangedState;
-            if (rf.refusal.reason == .memory_budget) {} else if (!refuse) effect.broke = "the streams machine refused a stream entry the ledger applies" else if (rf.status != .conflict) effect.broke = "the streams machine refused a delete with another status than the ledger's";
+            if (rf.refusal.reason == .memory_budget) {
+                // An alter only sets a stream's retention, and is how a user
+                // frees memory: never refused for it.
+                if (cfg) |c| if (c.op == .alter) {
+                    effect.broke = "a stream alter was refused for memory";
+                };
+            } else if (cfg != null) {
+                if (cfg_refusal == null) effect.broke = "the streams machine refused a stream config the ledger applies" else if (rf.status != cfg_refusal.?) effect.broke = "the streams machine refused a stream config with another status than the ledger's";
+            } else if (!refuse) effect.broke = "the streams machine refused a stream entry the ledger applies" else if (rf.status != .conflict) effect.broke = "the streams machine refused a delete with another status than the ledger's";
             return true;
         }
         if (refuse) effect.broke = "the streams machine deleted a stream holding records, unforced";
+        if (cfg_refusal != null) effect.broke = "the streams machine applied a stream config the ledger refuses";
         switch (kind) {
             .append => {
                 if (r.mutant == .stream_append_reuses_id) if (prev) |p| try restoreLast(store, sk, p);
-                if (!st.exists) {
-                    // Made, or made again over a tombstone: that keeps its
-                    // generation, last id and floor, so its ids continue
-                    // past the old stream's.
-                    if (st.made) effect.marks.insert(.stream_remade) else st.* = .{ .groups = st.groups };
-                    st.made = true;
-                    st.exists = true;
+                if (!st.exists) makeStream(st, effect);
+            },
+            .config => {
+                const c = cfg.?;
+                if (!st.exists) makeStream(st, effect);
+                switch (c.op) {
+                    .create => if (!st.explicit) {
+                        st.explicit = true;
+                        st.ret_age_s = c.retention_age_s;
+                        st.ret_count = c.retention_count;
+                    },
+                    .alter => {
+                        st.explicit = true;
+                        if (c.retention_age_s == sm.StreamConfig.CLEAR) st.ret_age_s = 0 else if (c.retention_age_s > 0) st.ret_age_s = c.retention_age_s;
+                        if (c.retention_count == sm.StreamConfig.CLEAR) st.ret_count = 0 else if (c.retention_count > 0) st.ret_count = c.retention_count;
+                        // What an alter may grow: its stream's meta, rewritten,
+                        // and at most its one retention index entry.
+                        const after = commits(store);
+                        for (FAMILIES, before[0..FAMILIES.len], after[0..FAMILIES.len]) |fam, b, a| {
+                            if (fam == sm.Metas.ID or fam == sm.Retained.ID) continue;
+                            if (a != b) effect.broke = "a stream alter changed more than its stream's meta and retention entry";
+                        }
+                        if (store.family(sm.Metas.ID).count != metas_before) effect.broke = "a stream alter added or removed a stream";
+                        const retained = store.family(sm.Retained.ID).count;
+                        if (@max(retained, retained_before) - @min(retained, retained_before) > 1) effect.broke = "a stream alter changed more than one retention index entry";
+                        if (r.mutant == .stream_alter_drops_retained) try dropRetained(store, sk);
+                    },
                 }
             },
             .trim => {
@@ -634,6 +697,13 @@ pub const ConsumerGroups = struct {
         return false;
     }
 
+    /// `stream_alter_drops_retained`: the stream's retention index entry
+    /// taken out after its alter.
+    fn dropRetained(store: *Store, sk: StreamKey) persistence.ApplyError!void {
+        const node = store.find(sm.Retained.ID, &sk) orelse return;
+        store.unlink(sm.Retained.ID, node);
+    }
+
     /// `stream_recreate_restarts_ids`: the tombstone forgets its last id and
     /// floor, so a stream made again takes ids from the start.
     fn restartIds(store: *Store, sk: StreamKey) persistence.ApplyError!void {
@@ -678,6 +748,9 @@ pub const ConsumerGroups = struct {
             if (m.exists != st.exists or m.gen != st.gen) return "a stream is live or a tombstone, or at a generation, other than the ledger's";
             if (!sm.lastOf(m).eql(st.last)) return "a stream's last id is not the ledger's";
             if (!sm.floorOf(m).eql(st.floor)) return "a stream's floor is not the last record it lost";
+            if (m.exists and (m.explicit != st.explicit or m.retention_age_s != st.ret_age_s or m.retention_count != st.ret_count)) return "a stream's settings are not the ledger's";
+            // The retention duty visits exactly the live streams with a policy.
+            if ((store.get(sm.Retained.ID, &sk) != null) != (m.exists and (st.ret_age_s > 0 or st.ret_count > 0))) return "a stream's retention index entry doesn't match its policy";
             // Raw records, past the ledger's own floor: none of the
             // machine's floor handling is the checker's.
             var it = rv.range(sm.Records, &sk);
