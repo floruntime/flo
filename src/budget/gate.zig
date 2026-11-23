@@ -68,7 +68,8 @@ pub fn classOf(t: EntryType) Class {
         // relies on the create: a refused create would orphan its id. The
         // table is capped instead.
         .namespace_create => .never,
-        // Workflow state and calls: not charged until their caps move to apply.
+        // Workflow state and calls are not charged yet, so definitions and
+        // runs have no bound at apply, by count or by memory.
         .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step, .workflow_signal => .never,
         .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done => .never,
         .processing_sink_batch => .never,

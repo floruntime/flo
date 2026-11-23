@@ -17755,6 +17755,47 @@ test "Shard: a node that stops leading forgets the expire it proposed and the ru
     try std.testing.expectEqual(@as(u32, 0), actions.reserved.count());
 }
 
+test "Shard: an action list pages by name, each page read from after the last name sent" {
+    var t: FollowerTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const s = &t.shard;
+    const names = [_][]const u8{ "ap-a", "ap-b", "ap-c", "ap-d", "ap-e", "other" };
+    for (names, 1..) |n, i| _ = try applyActionEntry(s, .action_register, testRegister(n), i, 1);
+    const op = @backingInt(proto.OpCode.action_list);
+    try std.testing.expect(s.dispatcher.walk_paged[op]);
+    const scan = s.dispatcher.walk_fn[op].?;
+    const ns: dispatcher_mod.WalkNamespace = .{ .name = "default", .id = .default };
+
+    var cursor_buf: [64]u8 = undefined;
+    var cursor: ?[]const u8 = null;
+    var got: std.ArrayListUnmanaged(u8) = .empty;
+    defer got.deinit(std.testing.allocator);
+    var pages: usize = 0;
+    while (pages < 10) {
+        pages += 1;
+        const page = scan(@ptrCast(s), ns, "ap-", cursor, 2);
+        try std.testing.expect(page.items.len <= 2);
+        for (page.items) |n| try got.appendSlice(std.testing.allocator, n[3..]);
+        const next = page.next_cursor orelse break;
+        // The cursor is the page's last name.
+        try std.testing.expectEqualStrings(page.items[page.items.len - 1], next);
+        @memcpy(cursor_buf[0..next.len], next);
+        cursor = cursor_buf[0..next.len];
+    }
+    try std.testing.expectEqual(@as(usize, 3), pages);
+    try std.testing.expectEqualStrings("abcde", got.items);
+
+    // A name deleted between pages moves no other out of the walk.
+    const first = scan(@ptrCast(s), ns, "ap-", null, 2);
+    try std.testing.expectEqualStrings("ap-b", first.next_cursor.?);
+    _ = try applyActionEntry(s, .action_delete, action_entries.Delete.Value{ .ns = ns_table.DEFAULT.int(), .name = "ap-a" }, names.len + 1, 1);
+    const second = scan(@ptrCast(s), ns, "ap-", "ap-b", 2);
+    try std.testing.expectEqual(@as(usize, 2), second.items.len);
+    try std.testing.expectEqualStrings("ap-c", second.items[0]);
+    try std.testing.expectEqualStrings("ap-d", second.items[1]);
+}
+
 test "Shard: a node that doesn't lead ends no lease, however far past its deadline" {
     var t: FollowerTest = undefined;
     try t.init();
