@@ -336,7 +336,9 @@ jobs:
           fi
           echo "running $mode"
           scripts/vopr-seed-undos.sh "$mode"
-        timeout-minutes: 25
+        # Cold, its 50 release builds alone take 16.5-17.5 min on a runner,
+        # and more as plants are added.
+        timeout-minutes: 45
   vopr-workflows:
     # Its own job, beside the others: workflow runs and definitions entries
     # made from the leader's own state, each checked against the families'

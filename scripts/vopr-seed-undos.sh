@@ -41,11 +41,13 @@ build() {
 
 # Build with each plant named, $JOBS at once: each is a whole release build
 # of its own (the plant is a build option), so one after another they come
-# to most of the check's time. A failed build is reported again by `build`.
+# to most of the check's time. Each build's time is printed, so a check
+# nearing its CI timeout shows where the time went. A failed build is
+# reported again by `build`.
 build_all() {
   local plant running=0
   for plant in "$@"; do
-    build "$plant" > /dev/null 2>&1 &
+    ( started=$SECONDS; build "$plant" > /dev/null 2>&1; echo "built $plant ($((SECONDS - started)) s)" ) &
     running=$((running + 1))
     # In batches: macOS's bash has no `wait -n`.
     if [ "$running" -ge "$JOBS" ]; then wait; running=0; fi
