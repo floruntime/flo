@@ -28,13 +28,16 @@ const DEAD = "x";
 /// And workers that hold a run longer than its lease, extending it, so
 /// its old deadline keys go stale behind it.
 const SLOW = "s";
-/// Past a preview: a quarter of workers' names and errors are this long, so
-/// their history events are cut. Chosen by the entry's id, not drawn, so
-/// the scenario a seed makes is unchanged.
+/// Past a preview: one in sixteen workers' names and errors are this
+/// long, so their history events are cut. Chosen by the entry's id, not
+/// drawn, though their size still changes what a memory share refuses.
+/// Rare, so a memory-gated swarm isn't held at its share by them: at one
+/// in four, a run kept near full was refused and retried four times as
+/// long.
 const PAD: [action_machine.PREVIEW + 44]u8 = @splat('-');
 
 fn long(tag: []const u8) bool {
-    return (std.fmt.parseInt(u64, tag, 16) catch 1) % 4 == 0;
+    return (std.fmt.parseInt(u64, tag, 16) catch 1) % 16 == 0;
 }
 /// What the expire duty waits after a term begins, as the handler does.
 const MAX_GRACE_MS: u64 = 30_000;
