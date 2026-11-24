@@ -446,7 +446,7 @@ fn skippedIn(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Messa
             try view.delete(F, final_key);
         },
         .history_drop => {
-            if (h.first_seq + 1 < MAX_DROP_RETRIES) return sendDrop(view, msg, h, h.first_seq + 1);
+            if (h.first_seq < MAX_DROP_RETRIES - 1) return sendDrop(view, msg, h, h.first_seq + 1);
             // Past its retries: its rows stay, marked, until a later drop.
             var o = row(h.owner);
             o.completed_ms = h.completed_ms;
@@ -941,6 +941,21 @@ test "history: a skipped drop is sent again, and past its retries its run is mar
             try testing.expectEqual(@as(usize, 0), t.countTag(r, .orphan));
         }
     }
+}
+
+test "history: a skipped drop whose count is past any it could reach marks its run orphaned, not wraps" {
+    var t = H.init();
+    defer t.deinit();
+    const r: H.Run = .{};
+    try t.chunk(r, 1, 1, true, 50);
+    try t.pump();
+    var buf: [he.Drop.max_size]u8 = undefined;
+    const p = try he.Drop.encodeInto(&buf, .{ .ns = r.ns.int(), .family = @backingInt(r.family), .owner = r.owner, .run = r.run, .created_ns = r.created_ns, .first_seq = std.math.maxInt(u64), .last_seq = 0, .final = false, .completed_ms = 50 });
+    // Seq 2 is that drop.
+    t.skip = &.{2};
+    try t.sendOwn(r, .history_drop, p);
+    try t.pump();
+    try testing.expectEqual(@as(usize, 1), t.countTag(r, .orphan));
 }
 
 test "history: a run's reads see only its own incarnation's rows, and an ended run's one row" {

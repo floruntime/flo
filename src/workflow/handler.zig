@@ -4307,7 +4307,7 @@ pub const WorkflowHandler = struct {
         const etype = std.enums.fromInt(entry_mod.EntryType, entry.header.entry_type) orelse return error.Halt;
         const m: *const contract_machine.Machine = switch (etype) {
             .workflow_create, .workflow_enabled => &defs_machine.machine,
-            .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done => &runs_machine.machine,
+            .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .workflow_run_delete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done => &runs_machine.machine,
             else => return error.Halt,
         };
         try contract_machine.applyEntry(m, self.defsRead().store, &self.def_scratch, entry, out);
@@ -6750,6 +6750,13 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     try testing.expectEqual(@as(?u32, 1), activeOf(&handler, testKey(TEST_NS_A, "wf")));
     // Room now: it fires once.
     try testing.expectEqual(@as(usize, 1), runsOf(&handler, &shard));
+    // The ended run deleted through the same seam: gone.
+    const r1 = handler.appliedRun(testKey(TEST_NS_A, "r1")).?;
+    const d: runs_machine.Delete = .{ .workflow = r1.workflow, .idem = r1.idempotency_key, .created_ns = r1.created_ns };
+    var del_buf: [128]u8 = undefined;
+    try handler.applyDirect(.workflow_run_delete, 0, testKey(TEST_NS_A, "r1"), d.encode(&del_buf).?, 8, &out);
+    try testing.expect(out.refused() == null);
+    try testing.expect(handler.appliedRun(testKey(TEST_NS_A, "r1")) == null);
 }
 
 /// The runs of workflow `def_key` not ended, as applied; null before any started.
