@@ -102,6 +102,8 @@ pub const Reason = enum(u16) {
     /// it never runs, on any node. The message names the repair's entry
     /// and the message's seq.
     skipped_by_repair = 38,
+    /// A delete of a run that hasn't ended: cancel it, then delete it.
+    run_live = 39,
 };
 
 /// Whether a refused request took effect.

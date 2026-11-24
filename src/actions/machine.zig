@@ -241,6 +241,10 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
                 if (item.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, item.holder, k));
             }
         },
+        .action_run_delete => {
+            const p = ae.RunDelete.decodeAll(e.payload, &diag) catch return;
+            try out.addIn(Runs.ID, .of(p.ns), p.run);
+        },
         // A hand-back reads and writes nothing here.
         .action_abandon => {},
         else => {},
@@ -460,6 +464,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         // from its own record once it applies (`ActionsHandler.afterApply`).
         // It changes nothing here.
         .action_abandon => {},
+        .action_run_delete => return applyRunDelete(view, e, out),
         .action_abandon_send => {
             // Only an await's shard makes these, from a task it holds.
             const p = ae.Abandon.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -682,6 +687,24 @@ fn inScope(view: *View, rk: []const u8, action: []const u8) ApplyError!?Stored(R
 }
 
 pub const OTHER_RESULT = "stale report: the run was completed with another result";
+pub const RUN_LIVE = "bad request: the run hasn't ended; cancel it first";
+
+/// An ended run deleted: its row goes, and its history is dropped on the
+/// history lane, after its last chunk. Its id is then free for a new run.
+/// No caller asks for it again: a call asks only while no run exists,
+/// and call run ids are never chosen twice. Answers `not_found` for a run
+/// that isn't there, a delete resent included, or another incarnation.
+fn applyRunDelete(view: *View, e: *const Entry, out: *Result) ApplyError!void {
+    var diag: schema.Diagnostic = .{};
+    const p = ae.RunDelete.decodeAll(e.payload, &diag) catch return error.Halt;
+    const ns: NamespaceId = .of(p.ns);
+    const rk = try idKey(view, ns, p.run);
+    const run = (try inScope(view, rk, p.action)) orelse return out.refuse(.not_found, .not_found, NO_RUN);
+    if (run.v.created_ns != p.created_ns) return out.refuse(.not_found, .not_found, NO_RUN);
+    if (run.v.completed_ns == 0) return out.refuse(.bad_request, .run_live, RUN_LIVE);
+    try view.delete(Runs, rk);
+    try hp.sendDrop(view, ownerOf(ns, p.run, &run.v), msOf(run.v.completed_ns));
+}
 
 const holds = delivery.holds;
 const sameDelivery = delivery.sameDelivery;
@@ -692,7 +715,7 @@ const idKey = M.inNs;
 
 pub const machine: machine_mod.Machine = .{
     .name = "actions",
-    .entry_types = &.{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_abandon_send, .action_abandon },
+    .entry_types = &.{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_run_delete, .action_abandon_send, .action_abandon },
     .families = &([_]machine_mod.FamilyInfo{ machine_mod.info(Defs), machine_mod.info(Runs) } ++ M.FAMILIES),
     .keys = keys,
     .apply = apply,
@@ -1436,10 +1459,64 @@ fn histChunks(t: *TestActions, a: std.mem.Allocator) ![]he.Chunk.Value {
     var it = (view_mod.ReadView{ .store = &t.store }).range(channels.OutFam, prefix);
     var got: std.ArrayListUnmanaged(he.Chunk.Value) = .empty;
     while (try it.next()) |item| {
+        if (item.value.v.entry_type != @backingInt(EntryType.history_chunk)) continue;
         var diag: schema.Diagnostic = .{};
         try got.append(a, try he.Chunk.decodeAll(try a.dupe(u8, item.value.v.payload), &diag));
     }
     return got.items;
+}
+
+fn histDrops(t: *TestActions, a: std.mem.Allocator) ![]he.Drop.Value {
+    var pb: [channels.CHAN_KEY]u8 = undefined;
+    const prefix = channels.outPrefix(&pb, 0, .history);
+    var it = (view_mod.ReadView{ .store = &t.store }).range(channels.OutFam, prefix);
+    var got: std.ArrayListUnmanaged(he.Drop.Value) = .empty;
+    while (try it.next()) |item| {
+        if (item.value.v.entry_type != @backingInt(EntryType.history_drop)) continue;
+        var diag: schema.Diagnostic = .{};
+        try got.append(a, try he.Drop.decodeAll(try a.dupe(u8, item.value.v.payload), &diag));
+    }
+    return got.items;
+}
+
+test "actions machine: a delete of an ended run removes it and drops its history; a live run, another incarnation or a resend is refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 3);
+    try invoke(&t, "r1", 10 * ms);
+    const created = t.run(.default, "r1").?.created_ns;
+    const del: ae.RunDelete.Value = .{ .ns = DEFAULT, .action = "send", .run = "r1", .created_ns = created };
+    // Live: refused, and nothing changes.
+    const live = try t.apply(.action_run_delete, del, 15 * ms);
+    try testing.expectEqual(Reason.run_live, live.refused().?.refusal.reason);
+    try testing.expect(t.run(.default, "r1") != null);
+    _ = try deliver(&t, "r1", 10 * ms, 20 * ms);
+    try testing.expect((try t.apply(.action_settle, settleOf(&t, "r1"), 30 * ms)).refused() == null);
+    // Another incarnation, or another action's: not found.
+    var other = del;
+    other.created_ns += 1;
+    try testing.expect((try t.apply(.action_run_delete, other, 35 * ms)).refused().?.refusal.reason == .not_found);
+    other = del;
+    other.action = "else";
+    try testing.expect((try t.apply(.action_run_delete, other, 35 * ms)).refused().?.refusal.reason == .not_found);
+    try testing.expectEqual(@as(usize, 0), (try histDrops(&t, a)).len);
+
+    try testing.expect((try t.apply(.action_run_delete, del, 40 * ms)).refused() == null);
+    try testing.expect(t.run(.default, "r1") == null);
+    try testing.expectEqual(@as(usize, 0), t.count(Runs));
+    const d = (try histDrops(&t, a))[0];
+    try testing.expectEqualStrings("send", d.owner);
+    try testing.expectEqualStrings("r1", d.run);
+    try testing.expectEqual(created, d.created_ns);
+    try testing.expectEqual(@as(u64, 30), d.completed_ms);
+    // Resent: not found, nothing more sent. The id then names a new run.
+    try testing.expect((try t.apply(.action_run_delete, del, 45 * ms)).refused().?.refusal.reason == .not_found);
+    try testing.expectEqual(@as(usize, 1), (try histDrops(&t, a)).len);
+    try invoke(&t, "r1", 50 * ms);
+    try testing.expectEqual(Status.ready, t.run(.default, "r1").?.status);
 }
 
 /// The events `records` holds, in order.

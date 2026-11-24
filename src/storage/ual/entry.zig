@@ -142,6 +142,9 @@ pub const EntryType = enum(u8) {
     /// child its shard couldn't start.
     child_start = 0x55,
     child_refuse = 0x56,
+    /// An ended run deleted, its history with it: keyed by the run, its
+    /// incarnation in the value (`runs_machine.Delete`).
+    workflow_run_delete = 0x54,
 
     // ── Namespace ──
     namespace_create = 0x60,
@@ -158,6 +161,8 @@ pub const EntryType = enum(u8) {
     action_release = 0x76,
     action_extend = 0x77,
     action_expire = 0x78,
+    /// An ended action run deleted, its history with it.
+    action_run_delete = 0x79,
     /// A workflow step's call asked for again and dropped, on the workflow's
     /// shard; and the two messages that answer it. The call itself is
     /// recorded by the `workflow_step` that makes it.
@@ -196,7 +201,7 @@ pub const EntryType = enum(u8) {
         return switch (self) {
             .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch, .kv_reap => false,
             .namespace_create => false,
-            .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => false,
+            .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_run_delete => false,
             .step_call_retry, .step_call_clear, .call_reply, .call_done, .action_abandon_send, .action_abandon => false,
             .child_start, .child_refuse => false,
             .stream_append, .stream_trim, .stream_delete, .stream_config, .stream_clean, .stream_forget => true,
@@ -206,7 +211,7 @@ pub const EntryType = enum(u8) {
             .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean, .group_steal, .group_requeue, .group_drop => false,
             .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,
             .cg_create => true,
-            .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step, .workflow_signal => true,
+            .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step, .workflow_signal, .workflow_run_delete => true,
             .processing_submit, .processing_stop, .processing_cancel, .processing_remove => true,
             // A sink batch's payload is a schema (`protocol/processing_entries.zig`).
             .processing_sink_batch => false,

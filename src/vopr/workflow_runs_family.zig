@@ -596,6 +596,12 @@ pub const WorkflowRuns = struct {
                             }
                             return want;
                         };
+                        // A schedule's slot fires once: one at or before the
+                        // slot fired is refused, its run deleted or not.
+                        if (ev == SCHEDULE) if (k) |ki| if (SLOT_OF[ki]) |slot| {
+                            const fired = if (l.per_def[w]) |per| per.fired_ms else 0;
+                            if (slot <= fired) return refuse(.start, "a schedule's slot at or before one fired");
+                        };
                         if (l.runs[r] != null) return refuse(.start, "its run exists");
                         // A trigger's start follows the place logged, or is refused.
                         if (s.trigger) |t| {

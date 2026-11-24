@@ -27,6 +27,8 @@ const schema = @import("../../protocol/schema.zig");
 const history_read = @import("../../stream/history_read.zig");
 const wf_parser = @import("../../workflow/parser.zig");
 const wf_validator = @import("../../workflow/validator.zig");
+const gen = @import("../gen.zig");
+const workflow_ops = @import("../../protocol/workflow_ops.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -40,7 +42,7 @@ fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) c
 
 /// Create the workflow command tree
 pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
-    return try commander.newBuilder(allocator)
+    const workflow = commander.newBuilder(allocator)
         .name("workflow")
         .about("Workflow orchestration commands")
         .group("Data Commands")
@@ -160,14 +162,15 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .action(wrapHandler(runListDefinitions)),
         )
         .subcommand(
-            commander.newBuilder(allocator)
-                .name("history")
-                .about("Get workflow run history (events)")
-                .arg("run_id", "Workflow run ID")
-                .uintFlag("limit", 'l', 100, "Maximum events to show")
-                .action(wrapHandler(runHistory)),
-        )
-        .build();
+        commander.newBuilder(allocator)
+            .name("history")
+            .about("Get workflow run history (events)")
+            .arg("run_id", "Workflow run ID")
+            .uintFlag("limit", 'l', 100, "Maximum events to show")
+            .action(wrapHandler(runHistory)),
+    );
+    gen.addCommands(allocator, workflow, &workflow_ops.table, &.{});
+    return try workflow.build();
 }
 
 // =============================================================================

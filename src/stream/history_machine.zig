@@ -22,11 +22,16 @@
 //!   retention walks a workflow's or action's ended runs oldest first: its
 //!   one remaining row's locator.
 //!
+//! - `O`, a deleted run whose drop was lost three times: its rows stay,
+//!   unreachable once its run is gone, and are counted until a later drop
+//!   of that incarnation (a bulk delete) takes them and this row.
+//!
 //! A chunk or fold a repair skipped is recorded, not dropped: a skipped
 //! chunk lands as a `lost` row for its events, so reads say they're gone;
 //! a skipped fold leaves its rows as they were. A run whose fold is lost
 //! three times ends pointing at its live rows as they are (`mode` live):
-//! correct, but not one row.
+//! correct, but not one row. A skipped drop is sent again, its count in
+//! its own header, up to three times; then its run is marked `O`.
 
 const std = @import("std");
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -81,9 +86,15 @@ pub const Actions = view_mod.Family(71, "history.act", .id, delivery.Stored(Row)
 /// live rows as they are.
 pub const MAX_FOLD_RETRIES = 3;
 
+/// How many times a run's drop may be lost before its rows are marked
+/// orphaned. A drop's resend count rides in its header's `first_seq`,
+/// which a drop doesn't otherwise read: its rows may be gone, so nothing
+/// else could keep it.
+pub const MAX_DROP_RETRIES = 3;
+
 // ─── Keys ────────────────────────────────────────────────────────────────
 
-pub const Tag = enum(u8) { live = 'L', marker = 'P', final = 'F', ended = 'E' };
+pub const Tag = enum(u8) { live = 'L', marker = 'P', final = 'F', ended = 'E', orphan = 'O' };
 
 /// A run's incarnation as its keys name it, after the tag: its owner's
 /// name hash, its run id (length first, so no run's key is another's
@@ -196,6 +207,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
     };
     try out.addIn(fam, h.ns, try runKey(a, .marker, h.owner, h.run, h.created_ns));
     try out.addIn(fam, h.ns, try runKey(a, .final, h.owner, h.run, h.created_ns));
+    try out.addIn(fam, h.ns, try runKey(a, .orphan, h.owner, h.run, h.created_ns));
     // The ended row a run moves to is keyed by when it ended, which a fold
     // landing after its last chunk reads from the final row, not its own
     // header: the owner's ended rows, all of them, as a range.
@@ -383,6 +395,15 @@ fn drop(comptime F: type, view: *View, h: Head) ApplyError!void {
     try view.delete(F, try inNs(a, h.ns, try runKey(a, .marker, h.owner, h.run, h.created_ns)));
     try view.delete(F, try inNs(a, h.ns, try runKey(a, .final, h.owner, h.run, h.created_ns)));
     try view.delete(F, try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, h.completed_ms)));
+    try view.delete(F, try inNs(a, h.ns, try runKey(a, .orphan, h.owner, h.run, h.created_ns)));
+}
+
+/// `h`'s drop, sent again to this group on the history lane, its resend
+/// count `retries`.
+fn sendDrop(view: *View, msg: view_mod.Message, h: Head, retries: u64) ApplyError!void {
+    const buf = try view.arena.alloc(u8, he.Drop.max_size);
+    const payload = he.Drop.encodeInto(buf, .{ .ns = h.ns.int(), .family = @backingInt(h.family), .owner = h.owner, .run = h.run, .created_ns = h.created_ns, .first_seq = retries, .last_seq = 0, .final = false, .completed_ms = h.completed_ms }) catch return error.Halt;
+    try view.sendFlagged(.user(h.ns), msg.slot, @backingInt(EntryType.history_drop), entry_mod.Flags.HISTORY, payload);
 }
 
 // ─── A repair's skips ────────────────────────────────────────────────────
@@ -390,8 +411,8 @@ fn drop(comptime F: type, view: *View, h: Head) ApplyError!void {
 /// A history message a repair skipped: a chunk lands as a lost row for its
 /// events, so a read says they're gone; a fold leaves its rows as they
 /// were, and is sent again if its run has ended, up to its retries, after
-/// which the run ends at its live rows; a drop changes nothing, and may be
-/// sent again.
+/// which the run ends at its live rows; a drop changes nothing, and is
+/// sent again up to its retries, after which its run is marked `O`.
 fn skipped(view: *View, e: *const Entry, _: []const u8) ApplyError!void {
     const msg = view.message orelse return;
     const h = headOfEntry(e) orelse return;
@@ -423,6 +444,14 @@ fn skippedIn(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Messa
             r.mode = @backingInt(Mode.live);
             try view.put(F, try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, f.completed_ms)), .{ .v = r });
             try view.delete(F, final_key);
+        },
+        .history_drop => {
+            if (h.first_seq + 1 < MAX_DROP_RETRIES) return sendDrop(view, msg, h, h.first_seq + 1);
+            // Past its retries: its rows stay, marked, until a later drop.
+            var o = row(h.owner);
+            o.completed_ms = h.completed_ms;
+            o.retries = MAX_DROP_RETRIES;
+            try view.put(F, try inNs(a, h.ns, try runKey(a, .orphan, h.owner, h.run, h.created_ns)), .{ .v = o });
         },
         else => {},
     }
@@ -879,6 +908,39 @@ test "history: a drop takes every row of its run's incarnation and no other's" {
     try t.pump();
     try testing.expectEqual(@as(usize, 0), t.countTag(again, .live));
     try testing.expectEqual(@as(usize, 3), t.countTag(other, .live));
+}
+
+test "history: a skipped drop is sent again, and past its retries its run is marked orphaned until a later drop" {
+    for ([_]usize{ 1, 2, 3 }) |losses| {
+        var t = H.init();
+        defer t.deinit();
+        const r: H.Run = .{};
+        const other: H.Run = .{ .owner = "other" };
+        try t.chunk(r, 1, 1, true, 50);
+        try t.chunk(other, 1, 1, true, 50);
+        try t.pump();
+        try testing.expect(t.ended(r, 50) != null);
+        // Seq 3 is the drop, 4 and 5 its resends.
+        const skips = [_]u64{ 3, 4, 5 };
+        t.skip = skips[0..losses];
+        try t.dropOf(r, 50);
+        try t.pump();
+        try testing.expect(t.ended(other, 50) != null);
+        try testing.expectEqual(@as(usize, 0), t.countTag(other, .orphan));
+        if (losses < MAX_DROP_RETRIES) {
+            try testing.expect(t.ended(r, 50) == null);
+            try testing.expectEqual(@as(usize, 0), t.countTag(r, .orphan));
+        } else {
+            try testing.expect(t.ended(r, 50) != null);
+            try testing.expectEqual(@as(usize, 1), t.countTag(r, .orphan));
+            // A later drop of that incarnation takes its rows and the mark.
+            t.skip = &.{};
+            try t.dropOf(r, 50);
+            try t.pump();
+            try testing.expect(t.ended(r, 50) == null);
+            try testing.expectEqual(@as(usize, 0), t.countTag(r, .orphan));
+        }
+    }
 }
 
 test "history: a run's reads see only its own incarnation's rows, and an ended run's one row" {
