@@ -264,8 +264,6 @@ pub const WorkflowHandler = struct {
     /// The longest run id a start may choose: its key is the namespace's id
     /// and the run id.
     pub const MAX_RUN_ID: usize = MAX_START_KEY - KEY_PREFIX;
-    const MAX_DEFINITIONS: usize = 10_000;
-    const MAX_RUNS: usize = 100_000;
 
     pub const RunStatus = runs_machine.RunStatus;
 

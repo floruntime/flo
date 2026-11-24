@@ -80,7 +80,7 @@ pub const CHARGED = [_]u16{
 };
 
 /// The families the pool is not charged for: the node's own state, and
-/// workflow state, which is charged with the move of its caps to apply.
+/// workflow state, which is not charged yet.
 pub const EXEMPT = [_]u16{
     // step.calls; workflow parents, def, run
     25, 26,

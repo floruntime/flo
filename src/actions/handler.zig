@@ -57,9 +57,6 @@ pub const DEFAULT_LEASE_MS: u64 = 5 * 60 * 1000;
 /// Attempts in all, the first counted, for a register that names none (0).
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 
-/// The most actions one shard holds.
-const MAX_ACTIONS: usize = 10_000;
-
 /// The most ready runs one selection looks at before answering none: runs
 /// the worker's labels don't match are skipped, never scanned without end.
 const MAX_LOOKED_AT: usize = 256;
@@ -271,7 +268,7 @@ pub const ActionsHandler = struct {
         dispatcher.registerWithRoute(.action_status, table_run.handler("action.status", ActionsHandler, runStatus), run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.action_history, table_run.handler("action.history", history_ops.Ops, history_ops.Ops.actionHistory), run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.action_info, table_run.handler("action.info", ActionsHandler, runInfo), preRouteByAction);
-        dispatcher.registerWalk(.action_list, dispatchAction, localScanActions);
+        dispatcher.registerPagedWalk(.action_list, dispatchAction, localScanActions);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
         dispatcher.registerWithRoute(.action_list_runs, dispatchAction, preRouteByAction);
         // An await runs where its worker is registered: its labels, whether
@@ -365,8 +362,6 @@ pub const ActionsHandler = struct {
         if (name.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "action name is required" } };
         if (name.len > action_ops.MAX_ACTION_NAME) return .{ .err = .{ .code = .invalid_request, .message = "action name too long" } };
         const ns = req.ns_id;
-        if (getDef(shard, ns, name) == null and storeOf(shard).family(machine.Defs.ID).count >= MAX_ACTIONS)
-            return .{ .err = .{ .code = .too_many_actions, .ran = .no, .message = std.fmt.comptimePrint("limit: this shard holds {d} actions, the most one shard registers; delete one to register another", .{MAX_ACTIONS}) } };
         const v = req.value;
         var timeout_ms: u64 = 0;
         var max_attempts: u32 = 0;
@@ -419,29 +414,11 @@ pub const ActionsHandler = struct {
         return .{ .parked = proposed };
     }
 
-    /// `[count:u32](entry)*[has_more:u8][cursor_len:u16]`, each entry as
-    /// `writeListEntry` writes it: the actions in the namespace whose names
-    /// start with the key.
-    fn handleList(shard: *Shard, req: Request) CommandResult {
-        var w: std.Io.Writer.Allocating = .init(shard.allocator);
-        defer w.deinit();
-        writeActionList(shard, req.ns_id, req.key, &w.writer) catch
-            return .{ .err = .{ .code = .internal_error, .message = "action list serialization failed" } };
-        const data = w.toOwnedSlice() catch return .{ .err = .{ .code = .internal_error, .message = "out of memory" } };
-        return .{ .action_list_result = .{ .data = data, .cursor = null } };
-    }
-
-    fn writeActionList(shard: *Shard, ns: NamespaceId, prefix: []const u8, w: *std.Io.Writer) !void {
-        var pb: [KEY_BUF]u8 = undefined;
-        const p = storeKey(&pb, ns, prefix) orelse return error.WriteFailed;
-        var count: u32 = 0;
-        var it = readOf(shard).range(machine.Defs, p);
-        while (try it.next()) |_| count += 1;
-        try w.writeInt(u32, count, .little);
-        it = readOf(shard).range(machine.Defs, p);
-        while (try it.next()) |item| try writeEntry(item.key[@sizeOf(u32)..], item.value.v, w);
-        try w.writeByte(0);
-        try w.writeInt(u16, 0, .little);
+    /// The list is a walk: every server wires the walk's context, and the
+    /// walk pages it by name and bounds each answer's bytes. A shard built
+    /// without that context, as some tests build one, lists nothing.
+    fn handleList(_: *Shard, _: Request) CommandResult {
+        return .{ .err = .{ .code = .internal_error, .message = "action list needs the walk's context" } };
     }
 
     /// One action as its list answers it: `[name_len:u16][name][value_len:u32]`
@@ -464,21 +441,33 @@ pub const ActionsHandler = struct {
         try w.writeInt(i64, nsToMs(def.created_ns), .little);
     }
 
-    /// The action walk's names: one shard's actions in the namespace that
-    /// start with `prefix`, the request's key.
-    fn localScanActions(ctx: *anyopaque, walk_ns: dispatcher_mod.WalkNamespace, prefix: []const u8, _: ?[]const u8, _: u32) dispatcher_mod.NameWalker.ScanResult {
-        const shard: *Shard = @ptrCast(@alignCast(ctx));
-        const ns = walk_ns.id;
-        const name_buf = dispatcher_mod.scanScratch(@intCast(storeOf(shard).family(machine.Defs.ID).count));
+    /// The action walk's names: one page of one shard's actions in the
+    /// namespace that start with `prefix`, the request's key. A page starts
+    /// after `local_cursor`, the last name the page before it returned, so
+    /// each page reads only its own names and an action registered or
+    /// deleted between pages moves no other in or out of the walk.
+    fn localScanActions(ctx: *anyopaque, walk_ns: dispatcher_mod.WalkNamespace, prefix: []const u8, local_cursor: ?[]const u8, limit: u32) dispatcher_mod.NameWalker.ScanResult {
+        return scanActions(@ptrCast(@alignCast(ctx)), walk_ns.id, prefix, local_cursor, limit);
+    }
+
+    fn scanActions(shard: *Shard, ns: NamespaceId, prefix: []const u8, after: ?[]const u8, limit: u32) dispatcher_mod.NameWalker.ScanResult {
+        const cap: usize = @min(limit, dispatcher_mod.NameWalker.MAX_BATCH);
+        if (cap == 0) return .{ .items = &.{}, .next_cursor = after };
         var pb: [KEY_BUF]u8 = undefined;
-        const p = storeKey(&pb, ns, prefix) orelse return .{ .items = name_buf[0..0], .next_cursor = null };
+        const p = storeKey(&pb, ns, prefix) orelse return .{ .items = &.{}, .next_cursor = null };
+        var ab: [KEY_BUF]u8 = undefined;
+        // A cursor too long to be a name follows every action.
+        const from = if (after) |a| storeKey(&ab, ns, a) orelse return .{ .items = &.{}, .next_cursor = null } else null;
+        // One past the page shows whether more follow.
+        const name_buf = dispatcher_mod.scanScratch(cap + 1);
+        var it = if (from) |f| readOf(shard).rangeAfter(machine.Defs, p, f) else readOf(shard).range(machine.Defs, p);
         var count: usize = 0;
-        var it = readOf(shard).range(machine.Defs, p);
-        while (it.next() catch null) |item| {
-            if (count >= name_buf.len) break;
+        while (count < name_buf.len) {
+            const item = (it.next() catch null) orelse break;
             name_buf[count] = item.key[@sizeOf(u32)..];
             count += 1;
         }
+        if (count > cap) return .{ .items = name_buf[0..cap], .next_cursor = name_buf[cap - 1] };
         return .{ .items = name_buf[0..count], .next_cursor = null };
     }
 
