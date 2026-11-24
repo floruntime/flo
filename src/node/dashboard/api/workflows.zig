@@ -25,6 +25,8 @@ const client_mod = @import("../../../cli/client/mod.zig");
 const loopback = @import("loopback.zig");
 const cli_output = @import("../../../cli/output.zig");
 const WireReader = @import("../../../util/wire.zig").WireReader;
+const schema = @import("../../../protocol/schema.zig");
+const history_read = @import("../../../stream/history_read.zig");
 
 // ── Helpers ──
 
@@ -482,37 +484,31 @@ const RunState = struct {
 
 const HistoryEvent = struct { event_type: []const u8, detail: []const u8, timestamp: i64 };
 
-/// The events of a `workflow_history` answer:
-/// [count:u32]([type:u16][detail:u16][timestamp:i64])*[has_more:u8][cursor_len:u16].
+/// The events of a `workflow.history` answer, as its schema has it.
 const HistoryEvents = struct {
-    reader: WireReader,
-    left: u32,
+    page: ?history_read.Response.Value,
+    it: ?history_read.Events.Iterator,
 
     fn init(answer: []const u8) HistoryEvents {
-        var reader = WireReader.init(answer);
-        const count = reader.readU32() orelse 0;
-        return .{ .reader = reader, .left = count };
+        var diag: schema.Diagnostic = .{};
+        const page = history_read.Response.decodeAll(answer, &diag) catch return .{ .page = null, .it = null };
+        return .{ .page = page, .it = page.events.iterator() };
     }
 
     fn next(self: *HistoryEvents) error{Truncated}!?HistoryEvent {
-        if (self.left == 0) return null;
-        self.left -= 1;
-        const event_type = self.reader.readLengthPrefixed(u16) orelse return error.Truncated;
-        const detail = self.reader.readLengthPrefixed(u16) orelse return error.Truncated;
-        const timestamp = self.reader.readI64() orelse return error.Truncated;
-        return .{ .event_type = event_type, .detail = detail, .timestamp = timestamp };
+        const it = if (self.it) |*i| i else return error.Truncated;
+        const e = (it.next() catch return error.Truncated) orelse return null;
+        return .{ .event_type = e.event_type, .detail = e.detail, .timestamp = e.timestamp_ms };
     }
 
-    /// Whether the server held events back; read once every event is.
+    /// Whether the server held events back.
     fn hasMore(self: *HistoryEvents) error{Truncated}!bool {
-        return (self.reader.readU8() orelse return error.Truncated) != 0;
+        return (self.page orelse return error.Truncated).has_more;
     }
 
     /// The next page's cursor, read after `hasMore` said there is one.
     fn cursor(self: *HistoryEvents) error{Truncated}!u64 {
-        const c = self.reader.readLengthPrefixed(u16) orelse return error.Truncated;
-        if (c.len != 8) return error.Truncated;
-        return std.mem.readInt(u64, c[0..8], .little);
+        return (self.page orelse return error.Truncated).cursor orelse error.Truncated;
     }
 };
 
@@ -916,20 +912,15 @@ test "RunState reads a workflow_status answer, its optional fields absent or pre
 }
 
 test "HistorySummary: how a run started, its event count, and the error it failed with" {
-    var buf: [256]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    try w.writeInt(u32, 2, .little);
+    var eb: [128]u8 = undefined;
+    var ew: schema.Writer = .{ .buf = &eb };
     for ([_][2][]const u8{ .{ "schedule_started", "" }, .{ "step_failed", "boom" } }, 0..) |e, i| {
-        try w.writeInt(u16, @intCast(e[0].len), .little);
-        try w.writeAll(e[0]);
-        try w.writeInt(u16, @intCast(e[1].len), .little);
-        try w.writeAll(e[1]);
-        try w.writeInt(i64, @intCast(i), .little);
+        try history_read.Event.encode(&ew, .{ .event_type = e[0], .detail = e[1], .extra = "", .timestamp_ms = @intCast(i) });
     }
-    try w.writeByte(0);
-    try w.writeInt(u16, 0, .little);
+    var buf: [256]u8 = undefined;
+    const answer = try history_read.Response.encodeInto(&buf, .{ .events = .{ .bytes = ew.written(), .count = 2 }, .has_more = false, .cursor = null });
 
-    const summary = try HistorySummary.of(w.buffered());
+    const summary = try HistorySummary.of(answer);
     try std.testing.expectEqualStrings("schedule", summary.triggered_by.?);
     try std.testing.expectEqual(@as(?i64, 2), summary.event_count);
     try std.testing.expectEqualStrings("boom", summary.error_message.?);
@@ -989,18 +980,10 @@ test "HistorySummary: from a run's first and last events alone, how it started a
     var lb: [128]u8 = undefined;
     var answers: [2][]const u8 = undefined;
     for ([_][2][]const u8{ .{ "schedule_started", "" }, .{ "step_failed", "boom" } }, [_][]u8{ &fb, &lb }, 0..) |e, buf, i| {
-        var w: std.Io.Writer = .fixed(buf);
-        try w.writeInt(u32, 1, .little);
-        try w.writeInt(u16, @intCast(e[0].len), .little);
-        try w.writeAll(e[0]);
-        try w.writeInt(u16, @intCast(e[1].len), .little);
-        try w.writeAll(e[1]);
-        try w.writeInt(i64, 0, .little);
+        var eb: [64]u8 = undefined;
+        const event = try history_read.Event.encodeInto(&eb, .{ .event_type = e[0], .detail = e[1], .extra = "", .timestamp_ms = 0 });
         // More after each: a cursor.
-        try w.writeByte(1);
-        try w.writeInt(u16, 8, .little);
-        try w.writeInt(u64, 7, .little);
-        answers[i] = w.buffered();
+        answers[i] = try history_read.Response.encodeInto(buf, .{ .events = .{ .bytes = event, .count = 1 }, .has_more = true, .cursor = 7 });
     }
     var first = HistoryEvents.init(answers[0]);
     _ = try first.next();

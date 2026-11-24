@@ -14,6 +14,7 @@ const wire = @import("../../util/wire.zig");
 const Client = base.Client;
 const Response = base.Response;
 const proto = @import("../../protocol/proto.zig");
+const history_read = @import("../../stream/history_read.zig");
 const FixedWireWriter = wire.FixedWireWriter;
 
 // =============================================================================
@@ -141,31 +142,8 @@ pub fn status(
     return client.sendRequest(.workflow_status, namespace, run_id, "");
 }
 
-/// Get workflow run history
-/// Wire format in value:
-///   [limit:u32]
-///
-/// key = run_id
-pub fn history(
-    client: *Client,
-    namespace: []const u8,
-    run_id: []const u8,
-    limit: u32,
-) !Response {
-    var value_buf: [8]u8 = undefined;
-    var fbs: std.Io.Writer = .fixed(&value_buf);
-    const writer = &fbs;
-
-    try writer.writeInt(u32, limit, .little);
-
-    const value = fbs.buffered();
-    return client.sendRequest(.workflow_history, namespace, run_id, value);
-}
-
 /// One page of a run's history, from `cursor` (a page's answer gave it;
-/// null for the start), oldest first or newest first.
-/// Wire format in value:
-///   [limit:u32][cursor_len:u16][cursor][newest_first:u8]
+/// null for the start), oldest first or newest first: `workflow.history`.
 pub fn historyPage(
     client: *Client,
     namespace: []const u8,
@@ -174,16 +152,9 @@ pub fn historyPage(
     cursor: ?u64,
     newest_first: bool,
 ) !Response {
-    var value_buf: [4 + 2 + 8 + 1]u8 = undefined;
-    var fbs: std.Io.Writer = .fixed(&value_buf);
-    const writer = &fbs;
-    try writer.writeInt(u32, limit, .little);
-    if (cursor) |c| {
-        try writer.writeInt(u16, 8, .little);
-        try writer.writeInt(u64, c, .little);
-    } else try writer.writeInt(u16, 0, .little);
-    try writer.writeByte(@intFromBool(newest_first));
-    return client.sendRequest(.workflow_history, namespace, run_id, fbs.buffered());
+    var value_buf: [history_read.Request.max_size]u8 = undefined;
+    const value = try history_read.Request.encodeInto(&value_buf, .{ .limit = limit, .cursor = cursor, .newest_first = newest_first });
+    return client.sendRequest(.workflow_history, namespace, run_id, value);
 }
 
 /// List workflow runs

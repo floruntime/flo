@@ -23,6 +23,8 @@ const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const cli_config = @import("../config.zig");
 const output = @import("../output.zig");
+const schema = @import("../../protocol/schema.zig");
+const history_read = @import("../../stream/history_read.zig");
 const wf_parser = @import("../../workflow/parser.zig");
 const wf_validator = @import("../../workflow/validator.zig");
 
@@ -100,14 +102,6 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
         )
         .subcommand(
             commander.newBuilder(allocator)
-                .name("history")
-                .about("Get workflow run history (events)")
-                .arg("run_id", "Workflow run ID")
-                .uintFlag("limit", 'l', 100, "Maximum events to show")
-                .action(wrapHandler(runHistory)),
-        )
-        .subcommand(
-            commander.newBuilder(allocator)
                 .name("list-runs")
                 .about("List workflow runs")
                 .aliases(&.{"runs"})
@@ -164,6 +158,14 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                     "flo workflow list --namespace production",
                 })
                 .action(wrapHandler(runListDefinitions)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("history")
+                .about("Get workflow run history (events)")
+                .arg("run_id", "Workflow run ID")
+                .uintFlag("limit", 'l', 100, "Maximum events to show")
+                .action(wrapHandler(runHistory)),
         )
         .build();
 }
@@ -433,7 +435,7 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
         return outcome.usage(ctx, "run_id is required", .{});
     };
 
-    const limit = ctx.getUint("limit") orelse 100;
+    const limit: u32 = @intCast(@min(ctx.getUint("limit") orelse 100, std.math.maxInt(u32)));
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -442,23 +444,51 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.history(&client, namespace, run_id, @intCast(limit)) catch |err| return outcome.requestFailed(ctx, err);
-    defer result.deinit();
-
-    if (result.isNotFound()) {
-        return outcome.notFound(ctx, "Workflow run not found: {s}", .{run_id});
+    // A page holds at most 1000 events and an answer's bytes: follow the
+    // cursor until `limit` events or the last page, gathering them as one
+    // list of [type][detail][extra][timestamp].
+    var rows: std.ArrayListUnmanaged(u8) = .empty;
+    defer rows.deinit(ctx.allocator);
+    var count: u32 = 0;
+    var cursor: ?u64 = null;
+    while (count < limit) {
+        var result = client_mod.workflow.historyPage(&client, namespace, run_id, limit - count, cursor, false) catch |err| return outcome.requestFailed(ctx, err);
+        defer result.deinit();
+        if (result.isNotFound()) return outcome.notFound(ctx, "Workflow run not found: {s}", .{run_id});
+        try outcome.check(ctx, result);
+        const data = result.asRawData() orelse return outcome.malformed(ctx, "history response (empty)");
+        var diag: schema.Diagnostic = .{};
+        const page = history_read.Response.decodeAll(data, &diag) catch return outcome.malformed(ctx, "history response");
+        var it = page.events.iterator();
+        while (it.next() catch return outcome.malformed(ctx, "history response")) |e| {
+            appendRow(ctx.allocator, &rows, e) catch return outcome.malformed(ctx, "history response");
+            count += 1;
+        }
+        cursor = if (page.has_more) page.cursor else null;
+        if (cursor == null or page.events.count == 0) break;
     }
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(ctx.allocator);
+    list.appendSlice(ctx.allocator, std.mem.asBytes(&std.mem.nativeToLittle(u32, count))) catch return outcome.malformed(ctx, "history response");
+    list.appendSlice(ctx.allocator, rows.items) catch return outcome.malformed(ctx, "history response");
 
-    try outcome.check(ctx, result);
-
-    // A run with no events still answers with a count of 0.
-    const data = result.asRawData() orelse return outcome.malformed(ctx, "history response (empty)");
     if (output.getFormat(ctx) == .table) ctx.print("History for run: {s}\n", .{run_id});
-    output.printWireList(ctx, data, "(no events)", &.{
-        .{ .field = "type", .header = "TYPE", .field_type = .str_u16, .alignment = .left },
-        .{ .field = "detail", .header = "DETAIL", .field_type = .str_u16, .alignment = .left },
+    output.printWireList(ctx, list.items, "(no events)", &.{
+        .{ .field = "type", .header = "TYPE", .field_type = .str_u32, .alignment = .left },
+        .{ .field = "detail", .header = "DETAIL", .field_type = .str_u32, .alignment = .left },
+        .{ .field = "extra", .header = "EXTRA", .field_type = .str_u16, .alignment = .left },
         .{ .field = "timestamp", .header = "", .field_type = .int_i64 },
     }) catch return outcome.malformed(ctx, "list");
+}
+
+fn appendRow(a: Allocator, rows: *std.ArrayListUnmanaged(u8), e: history_read.Event.Value) !void {
+    try rows.appendSlice(a, std.mem.asBytes(&std.mem.nativeToLittle(u32, @intCast(e.event_type.len))));
+    try rows.appendSlice(a, e.event_type);
+    try rows.appendSlice(a, std.mem.asBytes(&std.mem.nativeToLittle(u32, @intCast(e.detail.len))));
+    try rows.appendSlice(a, e.detail);
+    try rows.appendSlice(a, std.mem.asBytes(&std.mem.nativeToLittle(u16, @intCast(e.extra.len))));
+    try rows.appendSlice(a, e.extra);
+    try rows.appendSlice(a, std.mem.asBytes(&std.mem.nativeToLittle(i64, e.timestamp_ms)));
 }
 
 fn runListRuns(ctx: *commander.Context) commander.Error!void {

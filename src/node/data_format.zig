@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 57;
+pub const CURRENT: u32 = 58;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -208,6 +208,10 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // `workflow.hist` row per event (family 29 is gone); its record holds
     // the pending chunk, and once it ended only a summary.
     .{ .format = 57, .segment_version = 41, .entries = 0x5c15d466a01f5d35 },
+    // An action run's history goes to the history lane in chunks, and once
+    // it ended its record keeps a summary: previews of its result or error
+    // and its result's hash. Each history record gains its `extra`.
+    .{ .format = 58, .segment_version = 42, .entries = 0x5c15d466a01f5d35 },
 };
 
 comptime {

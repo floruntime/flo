@@ -22,6 +22,7 @@ const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
 const run_id_mod = @import("../node/run_id.zig");
 const table_run = @import("../node/table_run.zig");
+const history_ops = @import("../node/history_ops.zig");
 const gather_mod = @import("../node/gather.zig");
 const waiter_pool_mod = @import("../node/waiter_pool.zig");
 const ReplyTo = @import("../node/reply_to.zig").ReplyTo;
@@ -265,6 +266,7 @@ pub const ActionsHandler = struct {
         dispatcher.registerWithRoute(.action_invoke, dispatchAction, preRouteByAction);
         // The run id's bits name the partition the run lives on.
         dispatcher.registerWithRoute(.action_status, table_run.handler("action.status", ActionsHandler, runStatus), run_id_mod.preRouteByRunId);
+        dispatcher.registerWithRoute(.action_history, table_run.handler("action.history", history_ops.Ops, history_ops.Ops.actionHistory), run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.action_info, table_run.handler("action.info", ActionsHandler, runInfo), preRouteByAction);
         dispatcher.registerPagedWalk(.action_list, dispatchAction, localScanActions);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
@@ -395,6 +397,11 @@ pub const ActionsHandler = struct {
         if (parsed.input.len > ae.MAX_INPUT) return .{ .err = .{ .code = .invalid_request, .message = "action input too large" } };
         if (parsed.labels) |l| if (l.len > ae.MAX_LABELS) return .{ .err = .{ .code = .invalid_request, .message = "invoke labels too large" } };
         var id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+        // An invoke makes history at once: held while this shard's history
+        // lane has no room for `ns`, as a workflow's start is, so one
+        // tenant's invokes don't hold every tenant's calls and starts.
+        if (shard.historyWait(ns)) |w|
+            return .{ .err = .{ .code = .overloaded, .ran = .no, .reason = .unclassified, .message = Shard.sendWaitText(w, &shard.actions_handler.refusal_buf) } };
         const run_id = shard.run_id_gen.next(.action, router.nsKeySlot(ns, name), shard.raft_node.current_term, &id_buf);
         const proposed = propose(shard, .action_invoke, ae.Invoke.Value{ .ns = ns.int(), .action = name, .run = run_id, .input = parsed.input, .labels = parsed.labels, .source = .direct, .caller_run = null, .caller_workflow = null }) catch |err|
             return .{ .err = persistence.failureError(err, "action not persisted") };
@@ -574,6 +581,8 @@ pub const ActionsHandler = struct {
                 .worker_id = worker_id,
                 .outcome = named_outcome,
                 .held = held,
+                .output_truncated = output != null and run.result_truncated,
+                .error_truncated = error_message != null and run.error_truncated,
             },
         };
     }

@@ -16,6 +16,10 @@ const channels = @import("../contract/channels.zig");
 const channel_driver = @import("../contract/channel_driver.zig");
 const ce = @import("../protocol/channel_entries.zig");
 const ae = @import("../protocol/action_entries.zig");
+const he = @import("../protocol/history_entries.zig");
+const hp = @import("../stream/history_producer.zig");
+const hm = @import("../stream/history_machine.zig");
+const action_machine = @import("../actions/machine.zig");
 
 /// The fixed overhead a shard holds before client data, measured ~5 MiB after
 /// flo#461/#462 (rings resident only as written). Scales with the node's shard
@@ -33,10 +37,16 @@ pub fn ringBytesPerShard(hot_buffer_capacity: u64) u64 {
 }
 
 /// What one workflow's call of an action adds to the action's shard beyond
-/// the bytes the call carries: its run and ready records (their keys, the
-/// run's own fields, `RESIDENT_RECORD` each). Pinned by an actions test with
-/// every field at its largest.
-pub const CALL_RECORDS_BYTES: u64 = 2 * pool.RESIDENT_RECORD + 1024;
+/// the bytes the call carries, and a second copy of its input, which its
+/// history holds: its run and ready records (their keys, the run's own
+/// fields, `RESIDENT_RECORD` each), and its first history event's record
+/// overhead, with the chunk it may go in at once and that chunk's outbox
+/// rows (the row, and on a first send the lane's meta row and its
+/// per-namespace count). Pinned by an actions test with every field at its
+/// largest.
+pub const CALL_RECORDS_BYTES: u64 = 2 * pool.RESIDENT_RECORD + 1024 + CALL_HISTORY_BYTES;
+const CALL_HISTORY_BYTES: u64 = (he.Chunk.max_size - he.MAX_CHUNK_RECORDS) + hp.recordBound(action_machine.EV_INVOKED.len, 0, 0) +
+    3 * pool.RESIDENT_RECORD + channels.OUT_KEY + channels.CHAN_KEY + channels.OUT_NS_KEY + 3 * 64;
 /// What its answer to the caller takes: the outbox row, and, on a first send
 /// to that caller's group or for that namespace, the channel's meta row and
 /// its per-namespace byte count (each value under 64 bytes).
@@ -48,12 +58,23 @@ pub const CALL_REPLY_BYTES: u64 = 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + 
 /// every call of one inbound may land though together they pass it; the
 /// next inbound's calls are then refused. An inbound carries at most
 /// `MAX_BATCH` messages and `MAX_BATCH_BYTES` of payload, its first
-/// message whatever its size (a call's is far smaller).
+/// message whatever its size (a call's is far smaller). Its payload counts
+/// twice: each call's input is in its run and in its history.
+/// The history lane's own inbound may land past the share beside it: each
+/// of its messages adds at most its run's rows and a fold
+/// (`HISTORY_LAND_BYTES`); the events themselves stay in the log.
 ///
 /// It holds while an action's invoke is the only charged write an inbound
 /// grows past the share. Anything else a channel carries that grows a
-/// charged family (a history row an invoke sends, say) adds to it.
-pub const INBOUND_OVERSHOOT_BYTES: u64 = channel_driver.MAX_BATCH_BYTES + ce.MAX_BATCH * (CALL_RECORDS_BYTES + CALL_REPLY_BYTES);
+/// charged family adds to it.
+pub const INBOUND_OVERSHOOT_BYTES: u64 = 2 * channel_driver.MAX_BATCH_BYTES + ce.MAX_BATCH * (CALL_RECORDS_BYTES + CALL_REPLY_BYTES + HISTORY_LAND_BYTES);
+/// The most one history message adds: a run's last chunk lands its live,
+/// final and marker rows, each its key (namespace, owner, run and
+/// incarnation, with its place in the log) and a row, and sends the fold
+/// of its rows to itself, an outbox row with its channel's meta and
+/// per-namespace rows (each value under 64 bytes).
+const HISTORY_ROW_BYTES: u64 = pool.RESIDENT_RECORD + 4 + he.MAX_OWNER + he.MAX_RUN + 64 + hm.Row.max_size;
+const HISTORY_LAND_BYTES: u64 = 3 * HISTORY_ROW_BYTES + 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + channels.CHAN_KEY + channels.OUT_NS_KEY + 3 * 64 + he.Index.max_size;
 
 /// A node's reserve: per shard, its floor, its configured ring sizes and the
 /// one inbound it may take past its share; plus a margin. Held back before
@@ -247,9 +268,11 @@ test "reserve: floor + rings over shards + margin" {
     try testing.expectEqual(@as(u64, 4) * (PER_SHARD_FLOOR_BYTES + 80 * 1024 * 1024 + INBOUND_OVERSHOOT_BYTES) + 256 * 1024 * 1024, r);
 }
 
-test "reserve: one inbound's overshoot is its payload bound and its calls' rows, within 256 KiB over the payload" {
-    try testing.expect(INBOUND_OVERSHOOT_BYTES > channel_driver.MAX_BATCH_BYTES);
-    try testing.expect(INBOUND_OVERSHOOT_BYTES < channel_driver.MAX_BATCH_BYTES + 256 * 1024);
+test "reserve: one inbound's overshoot is twice its payload bound, its calls' rows and the history rows beside it, within 768 KiB over that" {
+    // About 10 KiB a message on top of its payload: a call's rows and reply
+    // (~3.8 KiB) and a last chunk's landing and fold (~6.1 KiB).
+    try testing.expect(INBOUND_OVERSHOOT_BYTES > 2 * channel_driver.MAX_BATCH_BYTES);
+    try testing.expect(INBOUND_OVERSHOOT_BYTES < 2 * channel_driver.MAX_BATCH_BYTES + 768 * 1024);
 }
 
 test "ringBytesPerShard: log + raft clamp(hot/4, 2, 16 MiB)" {

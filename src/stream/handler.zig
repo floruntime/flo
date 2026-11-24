@@ -1579,10 +1579,11 @@ pub const StreamHandler = struct {
 
     /// `run`'s history in `family`, of incarnation `created_ns`, ended at
     /// `completed_ms` or live (null): its rows walked in `window`'s order,
-    /// each index row's own rows in its place, as far as `limit` pieces and
-    /// the payloads in hand go. A row wholly outside the window, an index's
-    /// included, is passed without reading it. Copies into `a`.
-    pub fn readHistory(self: *StreamHandler, a: Allocator, family: history_entries.Family, ns: router.NamespaceId, owner: []const u8, run: []const u8, created_ns: u64, completed_ms: ?u64, window: HistoryWindow, limit: usize) error{OutOfMemory}!HistoryRead {
+    /// each index row's own rows in its place, as far as `limit` pieces,
+    /// `max_bytes` of records copied, and the payloads in hand go. A row
+    /// wholly outside the window, an index's included, is passed without
+    /// reading it. Copies into `a`.
+    pub fn readHistory(self: *StreamHandler, a: Allocator, family: history_entries.Family, ns: router.NamespaceId, owner: []const u8, run: []const u8, created_ns: u64, completed_ms: ?u64, window: HistoryWindow, limit: usize, max_bytes: usize) error{OutOfMemory}!HistoryRead {
         self.beginRead();
         var rows = try history_machine.rowsOf(self.readView(), a, family, ns, owner, run, created_ns, completed_ms);
         // A stack popped in the order walked: an index's rows are walked in
@@ -1593,7 +1594,8 @@ pub const StreamHandler = struct {
         try pushWalked(a, &stack, top.items, window.newest_first);
         var pieces: std.ArrayListUnmanaged(HistoryPiece) = .empty;
         var pending = false;
-        while (pieces.items.len < limit) {
+        var copied: usize = 0;
+        while (pieces.items.len < limit and copied < max_bytes) {
             const l = stack.pop() orelse break;
             if (!window.wants(l.first_seq, l.last_seq)) continue;
             const kind = std.enums.fromInt(history_entries.Kind, l.kind) orelse continue;
@@ -1625,6 +1627,7 @@ pub const StreamHandler = struct {
                     }
                     const c = decoded.?;
                     try pieces.append(a, .{ .first_seq = c.first_seq, .last_seq = c.last_seq, .records = try a.dupe(u8, c.records), .lost = false });
+                    copied += c.records.len;
                 },
                 .index => {
                     const decoded = history_entries.Index.decodeAll(msg, &diag) catch null;

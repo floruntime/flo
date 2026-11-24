@@ -28,6 +28,16 @@ const DEAD = "x";
 /// And workers that hold a run longer than its lease, extending it, so
 /// its old deadline keys go stale behind it.
 const SLOW = "s";
+/// Past a preview: one in sixteen workers' names and errors are this
+/// long, so their history events are cut. Chosen by the entry's id, not
+/// drawn. Not under a memory share: their size changes what it refuses,
+/// and so the whole run, which then reaches a takeover's settles and
+/// expires in fewer seeds; the plain swarm cuts them.
+const PAD: [action_machine.PREVIEW + 44]u8 = @splat('-');
+
+fn long(tag: []const u8) bool {
+    return (std.fmt.parseInt(u64, tag, 16) catch 1) % 16 == 0;
+}
 /// What the expire duty waits after a term begins, as the handler does.
 const MAX_GRACE_MS: u64 = 30_000;
 
@@ -37,6 +47,8 @@ pub const Leader = struct {
     term_since_ns: u64,
     /// Its term, where a workload needs it.
     term: u64 = 0,
+    /// Whether some workers' names and errors are past a preview (`long`).
+    long_values: bool = false,
 };
 
 pub const Made = struct { entry_type: EntryType, payload: []const u8 };
@@ -166,7 +178,7 @@ fn deliver(a: *families.Actions, out: []u8, l: Leader, r: std.Random, spoil: boo
     const p = pick(a, r, if (spoil and r.boolean()) isLeased else isReady, &ib) orelse return null;
     if (!spoil and p.run.due_ns > l.now_ns) return null;
     const d = def(a, p.run.action) orelse return null;
-    var hb: [24]u8 = undefined;
+    var hb: [PAD.len + 24]u8 = undefined;
     var kb: [8]u8 = undefined;
     const payload = try ae.Deliver.encodeInto(out, .{
         .ns = NS.int(),
@@ -176,7 +188,7 @@ fn deliver(a: *families.Actions, out: []u8, l: Leader, r: std.Random, spoil: boo
         .holder = try std.fmt.bufPrint(&hb, "{s}{s}", .{ switch (r.uintLessThan(u8, 5)) {
             0, 1 => DEAD,
             2 => SLOW,
-            else => "w",
+            else => if (l.long_values and long(tag)) "w" ++ &PAD else "w",
         }, tag }),
         .request_key = if (r.uintLessThan(u8, 3) == 0) try std.fmt.bufPrint(&kb, "k{d}", .{r.uintLessThan(u8, 4)}) else null,
         .lease_ms = d.lease_ms,
@@ -216,6 +228,7 @@ fn report(a: *families.Actions, out: []u8, kind: Kind, l: Leader, r: std.Random,
     };
     const stale_seen = kind == .extend and r.uintLessThan(u8, 4) == 0;
     var rb: [24]u8 = undefined;
+    var eb: [PAD.len + 24]u8 = undefined;
     const payload = switch (kind) {
         .settle => try ae.Settle.encodeInto(out, .{
             .ns = NS.int(),
@@ -241,7 +254,7 @@ fn report(a: *families.Actions, out: []u8, kind: Kind, l: Leader, r: std.Random,
             .abandoned = r.uintLessThan(u8, 4) == 0,
             .retry = r.uintLessThan(u8, 4) != 0,
             .delay_ms = if (r.boolean()) 0 else r.uintLessThan(u64, 3_000),
-            .@"error" = try std.fmt.bufPrint(&rb, "e{s}", .{tag}),
+            .@"error" = try std.fmt.bufPrint(&eb, "e{s}{s}", .{ if (l.long_values and long(tag)) @as([]const u8, &PAD) else "", tag }),
         }),
         else => try ae.Extend.encodeInto(out, .{
             .ns = NS.int(),

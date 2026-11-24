@@ -38,6 +38,7 @@ const std = @import("std");
 const schema = @import("../protocol/schema.zig");
 const ae = @import("../protocol/action_entries.zig");
 const he = @import("../protocol/history_entries.zig");
+const hp = @import("../stream/history_producer.zig");
 const limits = @import("../protocol/limits.zig");
 const view_mod = @import("../contract/view.zig");
 const machine_mod = @import("../contract/machine.zig");
@@ -87,9 +88,7 @@ pub const RunStatus = enum(u8) {
     }
 };
 
-/// The most event bytes a run holds before sending them: a chunk. An event
-/// over half of it goes at once, with those before it.
-pub const HIST_CHUNK: usize = 4 << 10;
+pub const HIST_CHUNK = hp.HIST_CHUNK;
 
 /// How much of an ended run's output its record keeps; the whole is in its
 /// history, as `OUTPUT_EVENT`'s detail, when it is longer.
@@ -97,13 +96,11 @@ pub const OUTPUT_PREVIEW: usize = 256;
 pub const OUTPUT_EVENT = "workflow_output";
 
 comptime {
-    // A chunk holds at most a full pending chunk, or one event alone: an
-    // event that wouldn't fit beside the pending ones is sent after them,
-    // by itself. One event's type and detail come from one entry, its
-    // output's too, so the largest is an entry's payload and the record's
-    // seq, lengths and stamp.
-    const largest_event = MAX_PERSIST_PAYLOAD + 8 + 4 + 4 + 8;
-    std.debug.assert(he.MAX_CHUNK_RECORDS >= @max(HIST_CHUNK, largest_event));
+    // Every event's type and detail come from inside one entry's value, its
+    // output's too, so each record encodes, and one event alone (sent by
+    // itself when it won't fit beside the pending ones) fits a chunk.
+    std.debug.assert(hp.MAX_EVENT >= MAX_PERSIST_PAYLOAD and hp.MAX_DETAIL >= MAX_PERSIST_PAYLOAD);
+    std.debug.assert(he.MAX_CHUNK_RECORDS >= hp.recordBound(0, MAX_PERSIST_PAYLOAD, 0));
 }
 
 pub const Run = Record(&.{
@@ -248,13 +245,7 @@ pub const Step = Record(&.{
     .{ .name = "takes", .T = schema.BoundedList(Take, MAX_SIGNALS, MAX_PERSIST_PAYLOAD) },
 });
 
-/// One event of a run's history, as its chunk carries it.
-pub const HistRec = Record(&.{
-    .{ .name = "seq", .T = Int(u64) },
-    .{ .name = "event", .T = Bytes(MAX_PERSIST_PAYLOAD) },
-    .{ .name = "detail", .T = Bytes(MAX_PERSIST_PAYLOAD) },
-    .{ .name = "at_ms", .T = Int(i64) },
-});
+pub const HistRec = hp.HistRec;
 
 pub const Out = Record(&.{
     .{ .name = "outcome", .T = Bytes(MAX_PERSIST_PAYLOAD) },
@@ -922,19 +913,24 @@ fn oldestHeld(view: *View, n: Named, signal_type: []const u8, taken: []const []c
 /// sent first when it wouldn't fit there, and with it when it is over
 /// half a chunk.
 fn appendHist(view: *View, n: Named, run: *Run.Value, event: []const u8, detail: []const u8, at_ms: i64) ApplyError!void {
-    const a = view.arena;
-    const rec: HistRec.Value = .{ .seq = run.hist_next, .event = event, .detail = detail, .at_ms = at_ms };
-    const buf = try a.alloc(u8, HistRec.encodedSize(rec) catch return error.Halt);
-    var w: schema.Writer = .{ .buf = buf };
-    HistRec.encode(&w, rec) catch return error.Halt;
-    const bytes = w.written();
-    if (run.hist_pending.len + bytes.len > HIST_CHUNK and run.hist_pending.len > 0) try flushHist(view, n, run, null);
-    const joined = try a.alloc(u8, run.hist_pending.len + bytes.len);
-    @memcpy(joined[0..run.hist_pending.len], run.hist_pending);
-    @memcpy(joined[run.hist_pending.len..], bytes);
-    run.hist_pending = joined;
-    run.hist_next += 1;
-    if (bytes.len > HIST_CHUNK / 2) try flushHist(view, n, run, null);
+    var h = histOf(run);
+    try hp.append(view, ownerOf(n, run), &h, .{ .event = event, .detail = detail, .at_ms = at_ms }, .flush_on_size);
+    setHist(run, h);
+}
+
+fn histOf(run: *const Run.Value) hp.Hist {
+    return .{ .next = run.hist_next, .flushed = run.hist_flushed, .pending = run.hist_pending };
+}
+
+fn setHist(run: *Run.Value, h: hp.Hist) void {
+    run.hist_next = h.next;
+    run.hist_flushed = h.flushed;
+    run.hist_pending = h.pending;
+}
+
+/// Where `run`'s chunks go: its workflow's slot, which is the run's own.
+fn ownerOf(n: Named, run: *const Run.Value) hp.Owner {
+    return .{ .family = .workflow, .ns = n.ns, .owner = run.workflow, .run = n.run, .created_ns = run.created_ns, .slot = calls_mod.callerSlot(n.ns, run.workflow) };
 }
 
 /// An ended run's record made its summary: its output's preview, the whole
@@ -953,33 +949,12 @@ fn summarize(view: *View, n: Named, run: *Run.Value, output: ?[]const u8, has_st
     try flushHist(view, n, run, stamp_ms);
 }
 
-/// `run`'s pending events sent as one chunk on the history lane, to its
-/// workflow's slot, which is the run's own; with `ended_ms` the last, the
-/// run having ended then. A last chunk goes even with no events, so the
-/// run's rows move to its one ended row.
+/// `run`'s pending events sent as one chunk on the history lane; with
+/// `ended_ms` the last, the run having ended then.
 fn flushHist(view: *View, n: Named, run: *Run.Value, ended_ms: ?i64) ApplyError!void {
-    const final = ended_ms != null;
-    if (run.hist_pending.len == 0 and !final) return;
-    const a = view.arena;
-    // A run's events are its own seqs: none pending is an empty range at
-    // the next one.
-    const last = if (run.hist_next > run.hist_flushed) run.hist_next - 1 else run.hist_flushed;
-    const buf = try a.alloc(u8, he.Chunk.max_size);
-    const payload = he.Chunk.encodeInto(buf, .{
-        .ns = n.ns.int(),
-        .family = @backingInt(he.Family.workflow),
-        .owner = run.workflow,
-        .run = n.run,
-        .created_ns = run.created_ns,
-        .first_seq = run.hist_flushed,
-        .last_seq = last,
-        .final = final,
-        .completed_ms = if (ended_ms) |ms| @intCast(@max(ms, 0)) else 0,
-        .records = run.hist_pending,
-    }) catch return error.Halt;
-    try view.sendFlagged(.user(n.ns), calls_mod.callerSlot(n.ns, run.workflow), @backingInt(EntryType.history_chunk), entry_mod.Flags.HISTORY, payload);
-    if (comptime plant.active != .runs_hist_flushed_kept) run.hist_flushed = run.hist_next;
-    run.hist_pending = "";
+    var h = histOf(run);
+    try hp.flushKeeping(view, ownerOf(n, run), &h, ended_ms, comptime plant.active == .runs_hist_flushed_kept);
+    setHist(run, h);
 }
 
 /// A step its leader took from the run at `rev`: applied only while the
