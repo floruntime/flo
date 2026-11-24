@@ -8128,7 +8128,7 @@ test "step executor: a call first unregistered, then over its action's shard's s
             const run = h.takeRun(sh, k).?;
             const rid = run.pending_action_run_id_owned.?;
             h.retryCall(sh, run, rid, WorkflowHandler.callOf(sh, run, rid).?, @import("stdx").time.milliTimestamp());
-            h.commitRun(sh, k);
+            _ = h.commitRun(sh, k);
             settleTest(sh);
             h.checkPendingActions(sh);
             settleTest(sh);
