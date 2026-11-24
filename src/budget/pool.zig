@@ -77,23 +77,22 @@ pub const CHARGED = [_]u16{
     59,
     // history.act: an action run's history rows, charged where its runs are
     71,
-};
-
-/// The families the pool is not charged for: the node's own state, and
-/// workflow state, which is not charged yet.
-pub const EXEMPT = [_]u16{
     // step.calls; workflow parents, def, run
     25, 26,
     27, 28,
+    // workflow: idem, per_def, out, sig
+    64, 65,
+    66, 67,
+};
+
+/// The families the pool is not charged for: the node's own state, and a
+/// workflow run's history, which is bounded on disk instead.
+pub const EXEMPT = [_]u16{
     // settings: policy, node, budget, bind
     50, 51,
     52, 68,
     // channels: in (one record per sender group)
     57,
-    // workflow: idem, per_def, out, sig
-    64,
-    65, 66,
-    67,
     // history.wf: a workflow run's history rows, exempt as workflow state is
     70,
 };

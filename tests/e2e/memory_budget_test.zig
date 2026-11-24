@@ -264,3 +264,47 @@ test "e2e/memory_budget: past its share a shard takes a stream alter that adds r
     }
     try testing.expect(after < at_share);
 }
+
+test "e2e/memory_budget: past its share a shard refuses a workflow's create, keeping nothing of it" {
+    const env: []const [2][]const u8 = &.{.{ src.node.test_faults.SHARE_ENV, "262144" }};
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true, .faults = true },
+        .env = env,
+    });
+    defer ctx.deinit();
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    for (0..100) |_| {
+        var resp = try http.get("/api/v1/metrics");
+        defer resp.deinit();
+        if (std.mem.indexOf(u8, resp.body, "\"share_bytes\":262144") != null) break;
+        stdx.time.sleep(50 * std.time.ns_per_ms);
+    } else return error.ShareNeverBound;
+
+    // Definitions of 4 KiB each, till a shard holding them is full.
+    const pad: []const u8 = &@as([4000]u8, @splat('x'));
+    var name_buf: [32]u8 = undefined;
+    var file_buf: [48]u8 = undefined;
+    var refused_name: ?[]const u8 = null;
+    var taken: usize = 0;
+    while (taken < 400) : (taken += 1) {
+        const name = try std.fmt.bufPrint(&name_buf, "mbwf-{d:0>4}", .{taken});
+        const yaml = try std.fmt.allocPrint(testing.allocator, "kind: Workflow\nname: {s}\nversion: 1.0.0\nstart:\n  run: \"@actions/validate\"\n  transitions:\n    success: flo.Completed\n    failure: flo.Failed\n# {s}\n", .{ name, pad });
+        defer testing.allocator.free(yaml);
+        const path = try stdx.testing.writeTempYaml(testing.allocator, yaml, try std.fmt.bufPrint(&file_buf, "memory-budget-{s}.yaml", .{name}));
+        defer stdx.testing.cleanupTempFile(testing.allocator, path);
+        var r = try ctx.execResult(&.{ "workflow", "create", "-f", path });
+        defer r.deinit();
+        if (pastShare(r)) {
+            refused_name = name;
+            break;
+        }
+    }
+    try testing.expect(refused_name != null);
+    try testing.expect(taken > 10);
+    // The refused definition isn't kept; the first is.
+    var list = try ctx.execResult(&.{ "workflow", "list" });
+    defer list.deinit();
+    try testing.expect(std.mem.indexOf(u8, list.stdout, refused_name.?) == null);
+    try testing.expect(std.mem.indexOf(u8, list.stdout, "mbwf-0000") != null);
+}
