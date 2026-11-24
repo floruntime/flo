@@ -440,8 +440,14 @@ pub const WorkflowHandler = struct {
         /// proposed that may not apply: a step-down can drop them from the
         /// log, so another term reads from the applied cursor again, and
         /// the starts made twice are one run each by their idempotency keys.
-        /// Leader memory.
-        proposed: ?struct { at: StreamID, term: u64 } = null,
+        /// `chain` is the event of the last start proposed, which the next
+        /// start must find logged (`runs_machine.TriggerAt`): `at` can pass
+        /// events no start was made for. Leader memory.
+        proposed: ?struct { at: StreamID, term: u64, chain: StreamID } = null,
+        /// A refused start of this leader's re-reads from the place logged:
+        /// the log's last index then. The starts of the chain it broke are
+        /// all at or below it, and their refusals change nothing more.
+        resync_index: u64 = 0,
         last_poll_ms: i64,
         /// A read of a stream another shard owns, in flight (0 for none):
         /// its number and the term it was asked in. At most one at a time.
@@ -478,6 +484,16 @@ pub const WorkflowHandler = struct {
         const p = trigger.proposed orelse return applied;
         if (p.term != term or applied.greaterThan(p.at)) return applied;
         return p.at;
+    }
+
+    /// The place the next start of a read `readFrom` began must find
+    /// logged: the last start proposed in that read's run of them, else
+    /// where the read began.
+    fn chainFrom(self: *const WorkflowHandler, def_key: []const u8, trigger: *const StreamTriggerState, ns: NamespaceId, made: u64, term: u64) StreamID {
+        const applied = self.appliedCursor(def_key, ns, trigger.stream_name_owned, made);
+        const p = trigger.proposed orelse return applied;
+        if (p.term != term or applied.greaterThan(p.at)) return applied;
+        return p.chain;
     }
 
     /// The trigger's cursor in its stream in `ns`, as the logged place has
@@ -3396,6 +3412,7 @@ pub const WorkflowHandler = struct {
         // stays only in the same stream. Read numbers go on across it: a
         // page asked before carries an older one, and isn't taken.
         var proposed: @FieldType(StreamTriggerState, "proposed") = null;
+        var resync_index: u64 = 0;
         var next_read_seq: u64 = 0;
         var made: ?u64 = null;
         const stream_ns = self.otherStreamNamespace(ns, trigger.namespace);
@@ -3406,6 +3423,7 @@ pub const WorkflowHandler = struct {
             const same_ns = if (state.stream_namespace_owned) |a| (if (stream_ns) |b| std.mem.eql(u8, a, b) else false) else stream_ns == null;
             if (std.mem.eql(u8, state.stream_name_owned, trigger.stream) and same_ns) {
                 proposed = state.proposed;
+                resync_index = state.resync_index;
                 made = state.stream_made_ns;
             }
             self.freeTriggerState(&state);
@@ -3436,6 +3454,7 @@ pub const WorkflowHandler = struct {
             .batch_size = trigger.batch_size,
             .poll_interval_ms = trigger.batch_timeout_ms,
             .proposed = proposed,
+            .resync_index = resync_index,
             .next_read_seq = next_read_seq,
             .stream_made_ns = made,
             .last_poll_ms = 0,
@@ -3662,7 +3681,7 @@ pub const WorkflowHandler = struct {
             const cursor = self.readFrom(entry.key_ptr.*, trigger, stream_ns, shard.raft_node.current_term);
             const result = sh.readPayloadsForStreamIn(trigger.stream_name_owned, stream_ns, cursor, limit);
             defer result.deinit(sh.allocator);
-            self.takeRecords(shard, trigger, .{ .ns = stream_ns, .made = made, .name = trigger.stream_name_owned }, result.payloads, result.ids, result.last_id);
+            self.takeRecords(shard, entry.key_ptr.*, trigger, .{ .ns = stream_ns, .made = made, .name = trigger.stream_name_owned }, result.payloads, result.ids, result.last_id);
         }
     }
 
@@ -3791,7 +3810,7 @@ pub const WorkflowHandler = struct {
             p.* = r.payload;
             id.* = .{ .timestamp_ms = r.ms, .sequence = r.seq };
         }
-        self.takeRecords(shard, trigger, .{ .ns = trigger.read_ns, .made = page.made_ns, .name = page.source }, payloads, ids, .{ .timestamp_ms = page.last_a, .sequence = page.last_b });
+        self.takeRecords(shard, entry.key_ptr.*, trigger, .{ .ns = trigger.read_ns, .made = page.made_ns, .name = page.source }, payloads, ids, .{ .timestamp_ms = page.last_a, .sequence = page.last_b });
     }
 
     /// Starts the runs for events read from the trigger's cursor through
@@ -3801,12 +3820,14 @@ pub const WorkflowHandler = struct {
     /// leaves the cursor where the read began: the next read takes these
     /// events again, and those already started are the same runs, by their
     /// idempotency keys.
-    fn takeRecords(self: *WorkflowHandler, shard: *Shard, trigger: *StreamTriggerState, read: ReadStream, payloads: []const []const u8, ids: []const StreamID, last: StreamID) void {
+    fn takeRecords(self: *WorkflowHandler, shard: *Shard, def_key: []const u8, trigger: *StreamTriggerState, read: ReadStream, payloads: []const []const u8, ids: []const StreamID, last: StreamID) void {
+        const term = shard.raft_node.current_term;
+        var chain = self.chainFrom(def_key, trigger, read.ns, read.made, term);
         if (payloads.len > 0) {
             if (trigger.batch_size <= 1) {
                 // One run per event
                 for (payloads, ids) |payload, event_id| {
-                    if (!self.startRunFromTrigger(shard, trigger, read, payload, event_id)) return;
+                    if (!self.startRunFromTrigger(shard, trigger, read, payload, event_id, &chain)) return;
                 }
             } else {
                 // Batch mode: collect batch_size events into a JSON array per run
@@ -3817,12 +3838,12 @@ pub const WorkflowHandler = struct {
                     // Out of memory: read again, as for a log full for now.
                     const batch_json = self.buildBatchJson(payloads[i..end]) orelse return;
                     defer self.allocator.free(batch_json);
-                    if (!self.startRunFromTrigger(shard, trigger, read, batch_json, ids[end - 1])) return;
+                    if (!self.startRunFromTrigger(shard, trigger, read, batch_json, ids[end - 1], &chain)) return;
                     i = end;
                 }
             }
         }
-        trigger.proposed = .{ .at = last, .term = shard.raft_node.current_term };
+        trigger.proposed = .{ .at = last, .term = term, .chain = chain };
     }
 
     /// Build a JSON array from a batch of payloads: ["payload1","payload2",...]
@@ -3878,6 +3899,7 @@ pub const WorkflowHandler = struct {
         read: ReadStream,
         input: []const u8,
         event_id: StreamID,
+        chain: *StreamID,
     ) bool {
         // Generate run ID with the definition's slot in its bits
         var run_id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
@@ -3891,7 +3913,7 @@ pub const WorkflowHandler = struct {
             log.err("workflow {s}: trigger on stream of {d} bytes not started: its key doesn't fit", .{ trigger.workflow_name_owned, read.name.len });
             return true;
         };
-        const at: runs_machine.TriggerAt = .{ .ns = read.ns.int(), .made = read.made, .stream = read.name, .ts = event_id.timestamp_ms, .seq = event_id.sequence };
+        const at: runs_machine.TriggerAt = .{ .ns = read.ns.int(), .made = read.made, .stream = read.name, .ts = event_id.timestamp_ms, .seq = event_id.sequence, .after_ts = chain.timestamp_ms, .after_seq = chain.sequence };
 
         _ = self.proposeStart(shard, trigger.ns, run_id_str, trigger.workflow_name_owned, "latest", input, idem, "trigger_started", at) catch |err| {
             if (!shard.quietHalted(err)) log.err("workflow {s}: run {s} not started: {s}", .{ trigger.workflow_name_owned, run_id_str, @errorName(err) });
@@ -3903,6 +3925,7 @@ pub const WorkflowHandler = struct {
                 else => true,
             };
         };
+        chain.* = event_id;
         return true;
     }
 
@@ -4149,7 +4172,7 @@ pub const WorkflowHandler = struct {
             else => return error.Halt,
         };
         try contract_machine.applyEntry(m, self.defsRead().store, &self.def_scratch, entry, out);
-        self.entryApplied(entry, out);
+        self.entryApplied(entry, out, null);
     }
 
     // ── Definitions ─────────────────────────────────────────────────────
@@ -4217,8 +4240,12 @@ pub const WorkflowHandler = struct {
     /// trigger follow its record, and a run's entry keeps `to_step`, the
     /// parked index and the timers, and the schedule's fired slot, as
     /// `workflow.run` now says. A follower keeps none of them.
-    pub fn entryApplied(self: *WorkflowHandler, e: *const entry_mod.Entry, out: *const Result) void {
+    /// The leader an entry applied on: its term, and its log's last index.
+    pub const Lead = struct { term: u64, last_index: u64 };
+
+    pub fn entryApplied(self: *WorkflowHandler, e: *const entry_mod.Entry, out: *const Result, lead: ?Lead) void {
         const t = std.enums.fromInt(entry_mod.EntryType, e.header.entry_type) orelse return;
+        if (t == .workflow_start and out.refused() != null) if (lead) |l| self.triggerRefused(e, l);
         // A call's message a repair skipped is refused, and its call settled
         // refused as it is: its run is looked at all the same.
         switch (t) {
@@ -4241,6 +4268,23 @@ pub const WorkflowHandler = struct {
             .workflow_create, .workflow_enabled => self.syncProducers(cmd.key),
             else => self.runApplied(t, cmd.key),
         }
+    }
+
+    /// A trigger's start this leader proposed was refused: the starts it
+    /// proposed after it are refused too, so its next read begins at the
+    /// place logged, a new chain. Refusals of the chain it broke, at or
+    /// below the log's last index now, are passed over.
+    fn triggerRefused(self: *WorkflowHandler, e: *const entry_mod.Entry, lead: Lead) void {
+        if (e.header.term != lead.term) return;
+        const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return;
+        const s = runs_machine.Start.parse(cmd.value) orelse return;
+        if (s.trigger == null or cmd.key.len < KEY_PREFIX) return;
+        const key = self.nsKey(keyNamespace(cmd.key), s.workflow) orelse return;
+        defer self.allocator.free(key);
+        const trigger = self.stream_triggers.getPtr(key) orelse return;
+        if (e.header.index <= trigger.resync_index) return;
+        trigger.proposed = null;
+        trigger.resync_index = lead.last_index;
     }
 
     /// A call's record changed (answered, ended, asked again): the run
@@ -4940,7 +4984,7 @@ fn deliverToSelf(shard: *Shard) bool {
     @import("../contract/machine.zig").applyEntry(&@import("../contract/machines.zig").Channels.machine, &part.store, &part.apply_scratch, &e, &out) catch unreachable;
     // Each message is then an entry applied to the workflows, as the
     // shard's applier has it: a reply wakes its parked caller.
-    for (part.store.messages.items) |*m| shard.workflow_handler.entryApplied(&m.entry, &m.result);
+    for (part.store.messages.items) |*m| shard.workflow_handler.entryApplied(&m.entry, &m.result, null);
     return true;
 }
 
@@ -6001,14 +6045,14 @@ fn activeOf(handler: *WorkflowHandler, def_key: []const u8) ?u32 {
 /// A workflow_start's value, as `proposeStart` encodes it.
 /// A trigger's start of run `wf` from event (`ts`, `seq`) of stream
 /// `stream` in `ns`, made at `made`, with its key.
-fn triggerStartValue(buf: []u8, key_buf: []u8, wf: []const u8, ns: NamespaceId, made: u64, stream: []const u8, ts: u64, seq: u64) []const u8 {
+fn triggerStartValue(buf: []u8, key_buf: []u8, wf: []const u8, ns: NamespaceId, made: u64, stream: []const u8, ts: u64, seq: u64, after: [2]u64) []const u8 {
     const idem = std.fmt.bufPrint(key_buf, "_trigger:{d}:{d}:{s}@{d}:{d}", .{ ns.int(), made, stream, ts, seq }) catch unreachable;
-    return (runs_machine.Start{ .workflow = wf, .version = "1", .status = .running, .event = "trigger_started", .idem = idem, .trigger = .{ .ns = ns.int(), .made = made, .stream = stream, .ts = ts, .seq = seq }, .input = "" }).encode(buf).?;
+    return (runs_machine.Start{ .workflow = wf, .version = "1", .status = .running, .event = "trigger_started", .idem = idem, .trigger = .{ .ns = ns.int(), .made = made, .stream = stream, .ts = ts, .seq = seq, .after_ts = after[0], .after_seq = after[1] }, .input = "" }).encode(buf).?;
 }
 
 fn startValue(buf: []u8, wf: []const u8, event_type: []const u8, idem: []const u8) []const u8 {
     // A trigger's start says where it read.
-    const at: ?runs_machine.TriggerAt = if (std.mem.eql(u8, event_type, "trigger_started")) .{ .ns = NamespaceId.default.int(), .made = 1, .stream = "ev", .ts = 1, .seq = 0 } else null;
+    const at: ?runs_machine.TriggerAt = if (std.mem.eql(u8, event_type, "trigger_started")) .{ .ns = NamespaceId.default.int(), .made = 1, .stream = "ev", .ts = 1, .seq = 0, .after_ts = 0, .after_seq = 0 } else null;
     return (runs_machine.Start{ .workflow = wf, .version = "1", .status = .running, .event = event_type, .idem = if (idem.len > 0) idem else null, .trigger = at, .input = "" }).encode(buf).?;
 }
 
@@ -7401,7 +7445,7 @@ test "workflow handler: a trigger cursor restored inside an append resumes with 
     var idem_buf: [128]u8 = undefined;
     var start_buf: [256]u8 = undefined;
     var out: Result = .{};
-    try handler.replayStart(testKey(TEST_NS, "b"), triggerStartValue(&start_buf, &idem_buf, "wf", TEST_NS, 1, "events", all.ids[1].timestamp_ms, all.ids[1].sequence), 1, &out);
+    try handler.replayStart(testKey(TEST_NS, "b"), triggerStartValue(&start_buf, &idem_buf, "wf", TEST_NS, 1, "events", all.ids[1].timestamp_ms, all.ids[1].sequence, .{ 0, 0 }), 1, &out);
     const cursor = handler.triggerCursor(testKey(TEST_NS, "wf"), TEST_NS);
     try testing.expect(cursor.eql(all.ids[1]));
 
@@ -7456,7 +7500,7 @@ test "workflow handler: a trigger's place is read from what applied, so a handle
     try first.replayCreate(testKey(TEST_NS, "wf"), "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1\",\"trigger\":{\"stream\":\"events\"},\"start\":{\"run\":\"@actions/a\",\"transitions\":{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}", 1, 0, &out);
     var kb: [128]u8 = undefined;
     var sb: [256]u8 = undefined;
-    try first.replayStart(testKey(TEST_NS, "r1"), triggerStartValue(&sb, &kb, "wf", TEST_NS, 4, "events", 1700, 3), 2, &out);
+    try first.replayStart(testKey(TEST_NS, "r1"), triggerStartValue(&sb, &kb, "wf", TEST_NS, 4, "events", 1700, 3, .{ 0, 0 }), 2, &out);
 
     // None of the starts replayed into this one: only the store.
     var fresh = WorkflowHandler.init(allocator);
@@ -7478,6 +7522,61 @@ test "workflow handler: a trigger's place is read from what applied, so a handle
     try testing.expectEqual(@as(u64, 0), first.triggerCursor(testKey(TEST_NS, "wf"), TEST_NS_A).timestamp_ms);
 }
 
+test "workflow handler: a trigger's start of this leader's term refused reads again from the place logged, once for the chain it broke" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    createTestDef(&handler, testKey(.default, "wf"), "wf", "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1\",\"trigger\":{\"stream\":\"events\"},\"start\":{\"wait_for_signal\":{\"type\":\"never\"},\"transitions\":{\"success\":\"flo.Completed\"}}}");
+    const t = handler.stream_triggers.getPtr(testKey(.default, "wf")).?;
+    const read_to: StreamID = .{ .timestamp_ms = 1800, .sequence = 0 };
+    var buf: [256]u8 = undefined;
+    var kb: [128]u8 = undefined;
+    const value = triggerStartValue(&buf, &kb, "wf", .default, 1, "events", 1700, 0, .{ 0, 0 });
+    var eb: [512]u8 = undefined;
+    const refused = struct {
+        fn at(b: []u8, v: []const u8, term: u64, index: u64) entry_mod.Entry {
+            return entry_mod.buildCommandEntry(.workflow_start, entry_mod.Flags.NONE, term, index, 0, .default, testKey(.default, "r1"), v, b).?;
+        }
+    };
+    const lead: WorkflowHandler.Lead = .{ .term = 3, .last_index = 40 };
+    // An earlier leader's start: its chain isn't this one's.
+    t.proposed = .{ .at = read_to, .term = 3, .chain = read_to };
+    var e = refused.at(&eb, value, 2, 30);
+    var out = Result.start(&e);
+    out.refuse(.conflict, .unclassified, runs_machine.TRIGGER_OUT_OF_ORDER);
+    handler.entryApplied(&e, &out, lead);
+    try testing.expect(t.proposed != null);
+    // This term's: read again from the place logged.
+    e = refused.at(&eb, value, 3, 31);
+    out = Result.start(&e);
+    out.refuse(.conflict, .unclassified, runs_machine.TRIGGER_OUT_OF_ORDER);
+    handler.entryApplied(&e, &out, lead);
+    try testing.expect(t.proposed == null);
+    try testing.expectEqual(@as(u64, 40), t.resync_index);
+    // The chain it broke, refused after it: nothing more.
+    t.proposed = .{ .at = read_to, .term = 3, .chain = read_to };
+    e = refused.at(&eb, value, 3, 40);
+    out = Result.start(&e);
+    out.refuse(.conflict, .unclassified, runs_machine.TRIGGER_OUT_OF_ORDER);
+    handler.entryApplied(&e, &out, .{ .term = 3, .last_index = 55 });
+    try testing.expect(t.proposed != null);
+    try testing.expectEqual(@as(u64, 40), t.resync_index);
+    // A chain begun after it: read again.
+    e = refused.at(&eb, value, 3, 41);
+    out = Result.start(&e);
+    out.refuse(.conflict, .unclassified, runs_machine.TRIGGER_OUT_OF_ORDER);
+    handler.entryApplied(&e, &out, .{ .term = 3, .last_index = 55 });
+    try testing.expect(t.proposed == null);
+    try testing.expectEqual(@as(u64, 55), t.resync_index);
+}
+
 test "workflow handler: a trigger's start of an event in a stream made again, or of its name in another namespace, is another run than the old stream's" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
@@ -7497,7 +7596,11 @@ test "workflow handler: a trigger's start of an event in a stream made again, or
         .{ .ns = .default, .made = 1, .name = "events" },
         .{ .ns = .default, .made = 2, .name = "events" },
         .{ .ns = TEST_NS_A, .made = 1, .name = "events" },
-    }) |read| try testing.expect(handler.startRunFromTrigger(&shard, t, read, "{}", event));
+    }) |read| {
+        // Each the first of its stream's chain.
+        var chain: StreamID = .{ .timestamp_ms = 0, .sequence = 0 };
+        try testing.expect(handler.startRunFromTrigger(&shard, t, read, "{}", event, &chain));
+    }
     settleTest(&shard);
     // The same event of the same stream once; the others are their own.
     try testing.expectEqual(@as(usize, 3), handler.runCount());
@@ -7813,7 +7916,7 @@ test "workflow producers: a redefinition keeps a schedule's fired slot and a tri
     const sched_v2 = "kind: Workflow\nname: sched\nversion: 2.0.0\nschedule:\n  interval: 1000\nstart:\n  wait_for_signal:\n    type: never\n  transitions:\n    success: flo.Completed\n";
     const trig_v1 = "{\"kind\":\"Workflow\",\"name\":\"trig\",\"version\":\"1.0.0\",\"trigger\":{\"stream\":\"events\"},\"start\":{\"run\":\"@actions/a\",\"transitions\":{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}";
     const trig_v2 = "{\"kind\":\"Workflow\",\"name\":\"trig\",\"version\":\"2.0.0\",\"trigger\":{\"stream\":\"events\"},\"start\":{\"run\":\"@actions/a\",\"transitions\":{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}";
-    const Step = union(enum) { def: struct { name: []const u8, yaml: []const u8, at: i64 }, start: struct { run: []const u8, wf: []const u8, event: []const u8, idem: []const u8 = "", at: ?[2]u64 = null } };
+    const Step = union(enum) { def: struct { name: []const u8, yaml: []const u8, at: i64 }, start: struct { run: []const u8, wf: []const u8, event: []const u8, idem: []const u8 = "", at: ?[2]u64 = null, after: [2]u64 = .{ 0, 0 } } };
     const steps = [_]Step{
         .{ .def = .{ .name = "sched", .yaml = sched_v1, .at = 1000 } },
         .{ .def = .{ .name = "trig", .yaml = trig_v1, .at = 1000 } },
@@ -7822,7 +7925,7 @@ test "workflow producers: a redefinition keeps a schedule's fired slot and a tri
         .{ .def = .{ .name = "sched", .yaml = sched_v2, .at = 5000 } },
         .{ .def = .{ .name = "trig", .yaml = trig_v2, .at = 5000 } },
         .{ .start = .{ .run = "s2", .wf = "sched", .event = "schedule_started", .idem = "_schedule:16:sched:6000" } },
-        .{ .start = .{ .run = "t2", .wf = "trig", .event = "trigger_started", .at = .{ 1800, 2 } } },
+        .{ .start = .{ .run = "t2", .wf = "trig", .event = "trigger_started", .at = .{ 1800, 2 }, .after = .{ 1700, 0 } } },
     };
     {
         var handler = WorkflowHandler.init(allocator);
@@ -7836,7 +7939,7 @@ test "workflow producers: a redefinition keeps a schedule's fired slot and a tri
             },
             .start => |st| {
                 var out: Result = .{};
-                const value = if (st.at) |at| triggerStartValue(&buf, &kb, st.wf, TEST_NS_A, 1, "events", at[0], at[1]) else startValue(&buf, st.wf, st.event, st.idem);
+                const value = if (st.at) |at| triggerStartValue(&buf, &kb, st.wf, TEST_NS_A, 1, "events", at[0], at[1], st.after) else startValue(&buf, st.wf, st.event, st.idem);
                 try handler.replayStart(testKey(TEST_NS_A, st.run), value, 7000, &out);
                 try testing.expect(out.refused() == null);
             },
