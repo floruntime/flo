@@ -4445,7 +4445,10 @@ pub const WorkflowHandler = struct {
     /// Held timers whose hold has cleared, put back on `timers`, due at
     /// `now_ms`: each is asked again against its run's wait as applied, as
     /// any timer is. Every hold is asked once; the runs are walked only
-    /// when one clears.
+    /// when one clears, and at most `RELEASE_PER_TICK` go back a tick, so
+    /// thousands released at once don't take every other run's turn at the
+    /// due timers a pass handles. The rest wait for their hold to be asked
+    /// again.
     fn releaseHeld(self: *WorkflowHandler, shard: *Shard, now_ms: i64) void {
         var cleared: [32]Hold = undefined;
         var n: usize = 0;
@@ -4457,24 +4460,31 @@ pub const WorkflowHandler = struct {
             if (n == cleared.len) break;
         }
         if (n == 0) return;
-        var released: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer released.deinit(self.allocator);
+        var released: [RELEASE_PER_TICK][]const u8 = undefined;
+        var m: usize = 0;
         var it = self.held.iterator();
-        while (it.next()) |e| for (cleared[0..n]) |c| if (std.meta.eql(c, e.value_ptr.*)) {
-            // Nothing moved yet: asked again next tick.
-            released.append(self.allocator, e.key_ptr.*) catch return;
-            break;
-        };
-        for (cleared[0..n]) |h| _ = self.holds_count.remove(h);
+        while (m < released.len) {
+            const e = it.next() orelse break;
+            for (cleared[0..n]) |c| if (std.meta.eql(c, e.value_ptr.*)) {
+                released[m] = e.key_ptr.*;
+                m += 1;
+                break;
+            };
+        }
         // Each key's ownership moves from the set to the heap.
-        for (released.items) |k| {
-            _ = self.held.remove(k);
+        for (released[0..m]) |k| {
+            const kv = self.held.fetchRemove(k).?;
+            self.uncount(kv.value);
             self.timers.push(self.allocator, .{ .at_ms = now_ms, .ns_key = k }) catch {
                 self.lostIndex(k);
                 self.allocator.free(k);
             };
         }
     }
+
+    /// Held runs put back on `timers` a tick, at most: half the due timers
+    /// a pass handles, so other runs' timers keep the rest.
+    const RELEASE_PER_TICK: usize = 32;
 
     /// Run `run_key`'s step, which a timer may have taken, was refused at
     /// apply. Its timer is armed again a second out, against its wait as
@@ -6094,8 +6104,12 @@ test "workflow duty: runs held by one namespace's history share don't delay anot
     settleTest(&shard);
     try testing.expectEqual(WorkflowHandler.RunStatus.timed_out, handler.inspect(testKey(TEST_NS_A, "quiet")).?.status);
     try testing.expect(shard.historyWait(.default) == null);
-    for (0..4) |i| {
-        handler.checkPendingActionsAt(&shard, now + 5_002 + @as(i64, @intCast(i)));
+    // Back in batches: a tick puts back `RELEASE_PER_TICK`, not all.
+    handler.checkPendingActionsAt(&shard, now + 5_002);
+    try testing.expectEqual(N - WorkflowHandler.RELEASE_PER_TICK, handler.held.count());
+    settleTest(&shard);
+    for (0..8) |i| {
+        handler.checkPendingActionsAt(&shard, now + 5_003 + @as(i64, @intCast(i)));
         settleTest(&shard);
     }
     try testing.expectEqual(@as(usize, 0), handler.held.count());
