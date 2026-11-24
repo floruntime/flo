@@ -168,6 +168,13 @@ pub const WorkflowHandler = struct {
     /// owned. An entry is checked against the run's wait as applied when it
     /// comes due, so one the run moved past is dropped then.
     timers: std.PriorityQueue(Timer, void, timerCompare) = .empty,
+    /// Runs whose timer came due while their step was held, by the hold,
+    /// keys owned. Each tick asks every hold once, not every run, and a
+    /// hold that clears puts its runs back on `timers`, due then: so many
+    /// runs held in one namespace take no other run's turn at the 64 due
+    /// timers a pass handles. Leader memory, put back on a new term.
+    held: std.AutoHashMapUnmanaged(Hold, std.ArrayListUnmanaged([]const u8)) = .empty,
+    held_term: u64 = 0,
     /// An index couldn't keep an entry: the runs are walked again
     /// (`leadCaches`).
     rewatch: bool = false,
@@ -514,6 +521,9 @@ pub const WorkflowHandler = struct {
     };
 
     const Timer = struct { at_ms: i64, ns_key: []const u8 };
+    /// What holds a run's step: its namespace's share of this shard's
+    /// history lane, or (`parent_shard`) its parent's outbox.
+    const Hold = struct { ns: NamespaceId, parent_shard: ?u16 = null };
     const Ending = struct { index: u64, term: u64 };
 
     fn timerCompare(_: void, a: Timer, b: Timer) std.math.Order {
@@ -570,6 +580,12 @@ pub const WorkflowHandler = struct {
         self.stepping.deinit(self.allocator);
         while (self.timers.pop()) |t| self.allocator.free(t.ns_key);
         self.timers.deinit(self.allocator);
+        var hit = self.held.valueIterator();
+        while (hit.next()) |list| {
+            for (list.items) |k| self.allocator.free(k);
+            list.deinit(self.allocator);
+        }
+        self.held.deinit(self.allocator);
 
         // Free stream trigger state
         var tit = self.stream_triggers.iterator();
@@ -2562,6 +2578,7 @@ pub const WorkflowHandler = struct {
         self.sweepCalls(shard, now_ms);
         self.startChildren(shard);
         if (shard.raft_node.role != .leader) return;
+        self.releaseHeld(shard, now_ms);
 
         // What's due and can't be taken this pass stays for the next.
         var due_keys: [64][]const u8 = undefined;
@@ -2635,7 +2652,7 @@ pub const WorkflowHandler = struct {
             // wait: its timer was popped, and nothing else would wake it.
             // The popped entry is replaced, so a run keeps one.
             switch (self.commitRun(shard, ns_key)) {
-                .held => self.armTimer(ns_key, now_ms +| HELD_RECHECK_MS),
+                .held => |hold| self.holdTimer(hold, ns_key),
                 .retry => self.armTimer(ns_key, now_ms +| UNLOGGED_RECHECK_MS),
                 .logged, .unchanged, .failed => {},
             }
@@ -2742,10 +2759,6 @@ pub const WorkflowHandler = struct {
     }
 
     const ENDING_RECHECK_MS: i64 = 100;
-    /// How soon a timer's step held by its history lane or its parent's
-    /// outbox is tried again: either clears as its outbox drains, within a
-    /// few ticks, as an ending in flight does (`ENDING_RECHECK_MS`).
-    const HELD_RECHECK_MS: i64 = 100;
     /// How soon a timer's step the log didn't take for now (full, or this
     /// node not leading or halted) is tried again: those last longer than
     /// a hold, and a retry each tick would only fail again.
@@ -3112,7 +3125,7 @@ pub const WorkflowHandler = struct {
     /// What came of a run's step: logged; unchanged (nothing to log); held
     /// (its history lane, its parent's outbox); not logged for now
     /// (`retry`); or not logged, and won't be (`failed`, said once).
-    const Committed = enum { logged, unchanged, held, retry, failed };
+    const Committed = union(enum) { logged, unchanged, held: Hold, retry, failed };
 
     fn commitRun(self: *WorkflowHandler, shard: *Shard, run_key: []const u8) Committed {
         var kv = self.runs.fetchRemove(run_key) orelse return .unchanged;
@@ -3124,7 +3137,13 @@ pub const WorkflowHandler = struct {
         const index = self.proposeStep(shard, run) catch |err| {
             switch (err) {
                 error.Unchanged => return .unchanged,
-                error.HeldForParent, error.HeldForHistory => return .held,
+                error.HeldForHistory => return .{ .held = .{ .ns = keyNamespace(run_key) } },
+                error.HeldForParent => {
+                    const ns = keyNamespace(run_key);
+                    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+                    const p = children_mod.parentOf(read, ns, run.run_id_owned) orelse return .{ .held = .{ .ns = ns } };
+                    return .{ .held = .{ .ns = ns, .parent_shard = shard.router.slotToShard(p.parent_slot) } };
+                },
                 // For now: tried again, quietly, as each try would say it.
                 error.Overloaded, error.NotLeader, error.WritesStopped, error.Halted, error.OutOfMemory => return .retry,
                 else => {
@@ -4338,6 +4357,57 @@ pub const WorkflowHandler = struct {
         self.timers.push(self.allocator, .{ .at_ms = at_ms, .ns_key = owned }) catch {
             self.allocator.free(owned);
             self.lostIndex(run_key);
+        };
+    }
+
+    /// Run `run_key`'s timer, popped while `hold` held its step, kept until
+    /// the hold clears (`releaseHeld`).
+    fn holdTimer(self: *WorkflowHandler, hold: Hold, run_key: []const u8) void {
+        const owned = self.allocator.dupe(u8, run_key) catch return self.lostIndex(run_key);
+        const gop = self.held.getOrPut(self.allocator, hold) catch {
+            self.allocator.free(owned);
+            return self.lostIndex(run_key);
+        };
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        gop.value_ptr.append(self.allocator, owned) catch {
+            self.allocator.free(owned);
+            self.lostIndex(run_key);
+        };
+    }
+
+    fn holds(shard: *Shard, hold: Hold) bool {
+        if (hold.parent_shard) |to| return shard.sendWait(to, .main, hold.ns) != null;
+        return shard.historyWait(hold.ns) != null;
+    }
+
+    /// Held timers whose hold has cleared, or all of them on a new term,
+    /// put back on `timers`, due at `now_ms`: each is asked again against
+    /// its run's wait as applied, as any timer is.
+    fn releaseHeld(self: *WorkflowHandler, shard: *Shard, now_ms: i64) void {
+        const all = self.held_term != shard.raft_node.current_term;
+        self.held_term = shard.raft_node.current_term;
+        if (self.held.count() == 0) return;
+        var cleared: [32]Hold = undefined;
+        var n: usize = 0;
+        var it = self.held.iterator();
+        while (it.next()) |e| {
+            if (!all and e.value_ptr.items.len > 0 and holds(shard, e.key_ptr.*)) continue;
+            for (e.value_ptr.items) |k| {
+                self.timers.push(self.allocator, .{ .at_ms = now_ms, .ns_key = k }) catch {
+                    self.lostIndex(k);
+                    self.allocator.free(k);
+                };
+            }
+            e.value_ptr.clearRetainingCapacity();
+            if (n < cleared.len) {
+                cleared[n] = e.key_ptr.*;
+                n += 1;
+            }
+        }
+        // A hold past `cleared` is left empty, and dropped on a later tick.
+        for (cleared[0..n]) |h| if (self.held.fetchRemove(h)) |kv| {
+            var list = kv.value;
+            list.deinit(self.allocator);
         };
     }
 
@@ -5872,11 +5942,11 @@ test "workflow duty: a timer due while the history lane holds steps fires once t
     signalTestRun(&handler, testKey(.default, "noisy"), 4, 1000);
     try testing.expect(shard.historyWait(.default) != null);
     // Its timer comes due while steps wait: its step is held, and its
-    // timer armed again, not lost.
+    // timer kept for when the hold clears, not lost.
     handler.checkPendingActions(&shard);
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.inspect(testKey(.default, "due")).?.status);
-    try testing.expectEqual(@as(usize, 1), handler.timers.count());
-    @import("stdx").time.sleep(@as(u64, WorkflowHandler.HELD_RECHECK_MS + 20) * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 0), handler.timers.count());
+    try testing.expectEqual(@as(usize, 1), handler.held.get(.{ .ns = .default }).?.items.len);
     // Drained: the wait it timed out of ends it.
     settleTest(&shard);
     try testing.expect(shard.historyWait(.default) == null);
@@ -5885,6 +5955,58 @@ test "workflow duty: a timer due while the history lane holds steps fires once t
         settleTest(&shard);
     }
     try testing.expectEqual(WorkflowHandler.RunStatus.timed_out, handler.inspect(testKey(.default, "due")).?.status);
+}
+
+test "workflow duty: runs held by one namespace's history share don't delay another namespace's timer" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    createTestDef(&handler, testKey(TEST_NS_A, "test-wf"), "test-wf", test_workflow_json);
+    createTestRun(&handler, testKey(.default, "noisy"), "noisy", "test-wf");
+    createTestRun(&handler, testKey(TEST_NS_A, "quiet"), "quiet", "test-wf");
+    // More runs due in the noisy namespace than a pass takes, and the
+    // quiet run's timer due after them, and after any re-check of theirs.
+    const N = 100;
+    // Margins wide enough for a loaded machine, each checked.
+    const now = @import("stdx").time.milliTimestamp() + 2_000;
+    var kb: [N][KEY_PREFIX + 8]u8 = undefined;
+    for (0..N) |i| {
+        var nb: [8]u8 = undefined;
+        const k = writeKey(&kb[i], .default, std.fmt.bufPrint(&nb, "r{d}", .{i}) catch unreachable);
+        createTestRun(&handler, k, "", "test-wf");
+        testSetWait(&handler, &shard, k, .{ .signal = "go", .due = now });
+    }
+    testSetWait(&handler, &shard, testKey(TEST_NS_A, "quiet"), .{ .signal = "go", .due = now + 500 });
+    try testing.expect(@import("stdx").time.milliTimestamp() < now);
+    // The noisy namespace's chunks on the lane past its share: its steps
+    // wait, the quiet namespace's don't.
+    shard.outbox_caps.other.channel = 64;
+    signalTestRun(&handler, testKey(.default, "noisy"), 4, 1000);
+    try testing.expect(shard.historyWait(.default) != null);
+    try testing.expect(shard.historyWait(TEST_NS_A) == null);
+    while (@import("stdx").time.milliTimestamp() <= now) @import("stdx").time.sleep(5 * std.time.ns_per_ms);
+    handler.checkPendingActions(&shard);
+    handler.checkPendingActions(&shard);
+    // Any re-check of theirs a pass armed would be due before the quiet one.
+    try testing.expect(@import("stdx").time.milliTimestamp() < now + 400);
+    try testing.expectEqual(@as(usize, N), handler.held.get(.{ .ns = .default }).?.items.len);
+    // Once the quiet run's timer is due, one pass fires it: the held runs
+    // are neither ahead of it nor taken again.
+    while (@import("stdx").time.milliTimestamp() <= now + 500) @import("stdx").time.sleep(5 * std.time.ns_per_ms);
+    const taken = handler.taken;
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(taken + 1, handler.taken);
+    try testing.expectEqual(@as(usize, N), handler.held.get(.{ .ns = .default }).?.items.len);
+    settleTest(&shard);
+    try testing.expectEqual(WorkflowHandler.RunStatus.timed_out, handler.inspect(testKey(TEST_NS_A, "quiet")).?.status);
 }
 
 test "workflow duty: a child's end its timer decided, held for its parent's outbox, is logged once there is room" {
@@ -5922,14 +6044,15 @@ test "workflow duty: a child's end its timer decided, held for its parent's outb
     settleTest(&shard);
     shard.outbox_caps = .{ .other = .{ .shard = 1 << 30, .channel = 1 } };
     try testing.expect(shard.sendWait(0, .main, .default) != null);
-    // Due while held: its end isn't logged, and its timer is armed again.
+    // Due while held: its end isn't logged, and its timer is kept for its
+    // parent's outbox.
     const before = shard.raft_node.log.lastIndex();
     handler.checkPendingActions(&shard);
     try testing.expectEqual(before, shard.raft_node.log.lastIndex());
-    try testing.expectEqual(@as(usize, 1), handler.timers.count());
+    try testing.expectEqual(@as(usize, 1), handler.held.get(.{ .ns = .default, .parent_shard = 0 }).?.items.len);
     // Room: its end is logged.
     shard.outbox_caps = .{};
-    @import("stdx").time.sleep(@as(u64, WorkflowHandler.HELD_RECHECK_MS + 20) * std.time.ns_per_ms);
+    handler.checkPendingActions(&shard);
     handler.checkPendingActions(&shard);
     settleTest(&shard);
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, handler.inspect(testKey(.default, "kid")).?.status);
