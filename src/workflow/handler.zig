@@ -2366,8 +2366,10 @@ pub const WorkflowHandler = struct {
                 return false;
             },
             .over_budget => {
-                // A step that can't wait fails at once, saying why.
-                if (!c.can_wait) return true;
+                // A step that can't wait fails at once, saying why. A child's
+                // step never waits for its workflow to be created, but does
+                // wait for memory to free on the child's shard.
+                if (!c.can_wait and c.kind == .action) return true;
                 // Said once, however long the hold: memory frees when it
                 // frees, and each ask again adds nothing to history.
                 if (!run.call_over_budget_noted) {
@@ -2760,7 +2762,7 @@ pub const WorkflowHandler = struct {
                 return .{ .later = @min(due_ms, ceilMs(waited_out_ns)) };
             },
             .over_budget => {
-                if (!c.can_wait) return .step;
+                if (!c.can_wait and c.kind == .action) return .step;
                 const p = progress_mod.Progress.decode(rec.progress) catch return .step;
                 if (!p.call_over_budget_noted) return .step;
                 if (p.call_retry_index > shard.raft_node.last_applied) return .none;
@@ -8586,6 +8588,52 @@ test "step executor: a call its action's shard holds over its memory share waits
         if (std.mem.eql(u8, evt.event_type_owned, "call_held_over_budget")) held += 1;
     }
     try testing.expectEqual(@as(usize, 1), held);
+}
+
+test "a child its shard holds over its memory share is waited for, though its step can't wait, and starts once memory frees" {
+    const settings = @import("../settings/machine.zig");
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    registerTestAction(&shard, "step-a");
+    createTestDef(&handler, testKey(.default, "par-wf"), "par-wf", test_parent_json);
+    createTestDef(&handler, testKey(.default, "kid-wf"), "kid-wf", test_kid_json);
+    createTestRun(&handler, testKey(.default, "par"), "par", "par-wf");
+    try settings.bindForTest(&shard.defaultPartition().store, 1);
+    handler.advanceWorkflow(&shard, testKey(.default, "par"));
+    settleTest(&shard);
+    startTestChildren(&handler, &shard);
+    const run = handler.takeRun(&shard, testKey(.default, "par")).?;
+    var kb: [ae.MAX_RUN_ID]u8 = undefined;
+    const kid_id = kb[0..run.pending_action_run_id_owned.?.len];
+    @memcpy(kid_id, run.pending_action_run_id_owned.?);
+    const c = WorkflowHandler.callOf(&shard, run, kid_id).?;
+    try testing.expectEqual(ae.CallKind.workflow, c.kind);
+    try testing.expect(!c.can_wait);
+    try testing.expectEqual(calls_mod.State.over_budget, c.state);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    try testing.expect(children_mod.parentOf(.{ .store = &shard.defaultPartition().store }, .default, kid_id) == null);
+    var held: usize = 0;
+    for (handler.inspect(testKey(.default, "par")).?.history.items) |evt| {
+        if (std.mem.eql(u8, evt.event_type_owned, "call_held_over_budget")) held += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), held);
+    // Memory frees: asked again, the child starts.
+    try settings.bindForTest(&shard.defaultPartition().store, 1 << 40);
+    handler.retryCall(&shard, run, kid_id, c, @import("stdx").time.milliTimestamp());
+    handler.commitRun(&shard, testKey(.default, "par"));
+    settleTest(&shard);
+    startTestChildren(&handler, &shard);
+    const again = handler.inspect(testKey(.default, "par")).?.*;
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, again.status);
+    try testing.expectEqual(calls_mod.State.started, WorkflowHandler.callOf(&shard, &again, kid_id).?.state);
 }
 
 test "step executor: a call that can't wait, held over its action's shard's memory share, fails at once saying why" {

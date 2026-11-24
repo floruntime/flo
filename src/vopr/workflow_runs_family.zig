@@ -25,7 +25,9 @@
 //!   step outputs; another with the same status changes nothing, one with
 //!   another status is refused;
 //! - a child's parent hears its start (only a child start's), its refusal,
-//!   a disabled workflow, and its end, each once;
+//!   a disabled workflow, and its end, each once; a child's start that
+//!   would take its shard past its share is answered over_budget,
+//!   recording nothing;
 //! - a signal is held by its run, refused when the run is gone, has ended
 //!   or holds 64 no wait took; one of the type the run waits on wakes it,
 //!   moving its rev, and is still held. A step names the types its waits
@@ -55,6 +57,8 @@ const hm = @import("../stream/history_machine.zig");
 const history_lane = @import("history_lane.zig");
 const ce = @import("../protocol/channel_entries.zig");
 const defs_family = @import("workflow_defs_family.zig");
+const pool = @import("../budget/pool.zig");
+const settings = @import("../settings/machine.zig");
 
 const Allocator = std.mem.Allocator;
 const EntryType = entry_mod.EntryType;
@@ -230,6 +234,9 @@ pub const WorkflowRuns = struct {
         held_call_retried,
         /// A trigger's start refused for not following the place logged.
         trigger_out_of_order,
+        /// A child's start its shard answered over its memory share
+        /// (reached only under one).
+        child_held,
     };
     const PerDefL = struct { active: u32, fired_ms: i64, place: ?PlaceL = null };
     /// A trigger's place: the stream (namespace, making, name) and how far in.
@@ -425,7 +432,7 @@ pub const WorkflowRuns = struct {
 
     /// What the ledger says `e` does, made so in the ledger: a refusal
     /// returns before it writes. Null for an entry the workload never makes.
-    fn predict(self: *WorkflowRuns, defs: *const defs_family.WorkflowDefs, e: *const entry_mod.Entry, kind: Kind) ?Want {
+    fn predict(self: *WorkflowRuns, defs: *const defs_family.WorkflowDefs, store: *store_mod.Store, e: *const entry_mod.Entry, kind: Kind) ?Want {
         var want: Want = .{};
         const l = &self.ledger;
         const stamp_ms: i64 = @intCast(e.header.timestamp_ns / std.time.ns_per_ms);
@@ -441,6 +448,16 @@ pub const WorkflowRuns = struct {
                     if (f.slot == slot and f.parent_run == pr) return want;
                     want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[slot], .run = RUNS[r], .answer = .conflict };
                     return want;
+                }
+                // Its parent record past the share the shard committed to:
+                // answered over_budget, recording nothing.
+                if (settings.boundShare(.{ .store = store })) |b| {
+                    const row = rm.Parent.encodedSize(.{ .parent_slot = p.parent_slot, .parent_run = p.parent_run, .parent_workflow = p.parent_workflow, .workflow = p.workflow, .version = p.version, .input = p.input, .state = .pending }) catch return null;
+                    if (pool.useOf(store) +| (4 + p.run.len + row + pool.RESIDENT_RECORD) > b.share_bytes) {
+                        want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[slot], .run = RUNS[r], .answer = .over_budget };
+                        want.classes.insert(.child_held);
+                        return want;
+                    }
                 }
                 l.parents[r] = .{ .slot = slot, .parent_run = pr, .started = false };
             },
@@ -796,7 +813,7 @@ pub const WorkflowRuns = struct {
     /// it against the ledger. A refusal must leave every family as it was.
     pub fn apply(self: *WorkflowRuns, store: *store_mod.Store, defs: *const defs_family.WorkflowDefs, e: *const entry_mod.Entry) (persistence.ApplyError || error{RefusalChangedState})!Effect {
         const kind = kindOf(@fromBackingInt(e.header.entry_type));
-        const want = self.predict(defs, e, kind) orelse return error.Halt;
+        const want = self.predict(defs, store, e, kind) orelse return error.Halt;
         var before: [FAMILIES.len + 1]u64 = undefined;
         for (FAMILIES, before[0..FAMILIES.len]) |fam, *b| b.* = store.families[fam].commits;
         before[FAMILIES.len] = store.families[channels.OutFam.ID].commits;

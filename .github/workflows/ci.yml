@@ -485,7 +485,8 @@ jobs:
           ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --memory-gate --seed-timeout=120 --out-dir=/tmp/vopr-memory-gate
           ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --memory-gate --consumer-groups --seed-timeout=120 --out-dir=/tmp/vopr-memory-gate-groups
           ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --memory-gate --actions --seed-timeout=120 --out-dir=/tmp/vopr-memory-gate-actions
-        timeout-minutes: 15
+          ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --memory-gate --workflows --seed-timeout=120 --out-dir=/tmp/vopr-memory-gate-workflows
+        timeout-minutes: 20
       - name: Swarm with namespace creates and lagging applies
         # Nodes fall behind on applying and win elections that way; no
         # namespace create may lose its id to another.

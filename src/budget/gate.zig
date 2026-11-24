@@ -45,6 +45,8 @@ pub fn classOf(t: EntryType) Class {
         .ts_write, .ts_write_batch => .refusable,
         .group_create, .cg_create => .refusable,
         .action_register, .action_invoke => .refusable,
+        // A replace that shrinks fits: the gate weighs the exact delta.
+        .workflow_create => .refusable,
         .processing_submit => .refusable,
 
         .group_deliver => .own,
@@ -68,9 +70,18 @@ pub fn classOf(t: EntryType) Class {
         // relies on the create: a refused create would orphan its id. The
         // table is capped instead.
         .namespace_create => .never,
-        // Workflow state and calls are not charged yet, so definitions and
-        // runs have no bound at apply, by count or by memory.
-        .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step, .workflow_signal => .never,
+        // Workflow state is charged, but a run's start and a signal are not
+        // held to the share yet: past it they still land, while other
+        // writes are refused.
+        .workflow_start, .workflow_signal => .never,
+        // A run admitted is let finish: a step's outputs are keyed by its
+        // name, so a run's are bounded by its definition. Enabling is set in
+        // place.
+        .workflow_complete, .workflow_enabled, .workflow_step => .never,
+        // A child's start arrives in an inbound and holds itself to the share
+        // there. A retry rewrites its call in place and asks again, and a
+        // refused one would leave the call with nothing to ask it; the rest
+        // free, or answer a call.
         .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done => .never,
         .processing_sink_batch => .never,
         .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean, .settings_budget_bind => .never,

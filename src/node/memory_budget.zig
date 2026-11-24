@@ -64,10 +64,24 @@ pub const CALL_REPLY_BYTES: u64 = 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + 
 /// of its messages adds at most its run's rows and a fold
 /// (`HISTORY_LAND_BYTES`); the events themselves stay in the log.
 ///
-/// It holds while an action's invoke is the only charged write an inbound
-/// grows past the share. Anything else a channel carries that grows a
-/// charged family adds to it.
-pub const INBOUND_OVERSHOOT_BYTES: u64 = 2 * channel_driver.MAX_BATCH_BYTES + ce.MAX_BATCH * (CALL_RECORDS_BYTES + CALL_REPLY_BYTES + HISTORY_LAND_BYTES);
+/// A message's term is an action's call, the most any message adds: a
+/// child workflow's start and a call's answer or end each add less, pinned
+/// below. Anything else a channel carries that grows a charged family must
+/// be pinned here too.
+pub const INBOUND_OVERSHOOT_BYTES: u64 = 2 * channel_driver.MAX_BATCH_BYTES + ce.MAX_BATCH * MESSAGE_BYTES;
+const MESSAGE_BYTES: u64 = CALL_RECORDS_BYTES + CALL_REPLY_BYTES + HISTORY_LAND_BYTES;
+/// A child's start: its parent record, whose fields are its payload's,
+/// which the payload term counts, so only the record's key and overhead;
+/// or, held, its answer.
+const CHILD_START_BYTES: u64 = @max(pool.RESIDENT_RECORD + @sizeOf(u32) + ae.MAX_RUN_ID, CALL_REPLY_BYTES);
+/// A call's answer or end, on the caller's shard: its row replaced, only
+/// the outcome growing (an end's result is its payload).
+const CALL_ANSWER_BYTES: u64 = @max(ae.MAX_SKIP_WHY, ae.MAX_OUTCOME);
+
+comptime {
+    std.debug.assert(CHILD_START_BYTES <= MESSAGE_BYTES);
+    std.debug.assert(CALL_ANSWER_BYTES <= MESSAGE_BYTES);
+}
 /// The most one history message adds: a run's last chunk lands its live,
 /// final and marker rows, each its key (namespace, owner, run and
 /// incarnation, with its place in the log) and a row, and sends the fold

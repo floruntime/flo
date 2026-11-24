@@ -248,3 +248,22 @@ test "workflow definitions machine: a workflow named longer than its runs' histo
     try testing.expect((try f.apply(.workflow_create, &name, yamlOf("1.0.0"), 1)).refused() != null);
     try testing.expect(f.def(&name) == null);
 }
+
+test "workflow definitions machine: past its shard's share a new definition is refused, writing nothing, and a replace that shrinks one lands" {
+    const pool = @import("../budget/pool.zig");
+    const settings = @import("../settings/machine.zig");
+    var f = Fixture.init();
+    defer f.deinit();
+    const long = comptime yamlOf("1.0.0") ++ "# " ++ @as([512]u8, @splat('x')) ++ "\n";
+    try testing.expect((try f.apply(.workflow_create, "wf", long, 1000)).refused() == null);
+    try settings.bindForTest(&f.store, pool.useOf(&f.store));
+    const use = pool.useOf(&f.store);
+    const r = try f.apply(.workflow_create, "other", yamlOf("1.0.0"), 2000);
+    try testing.expectEqual(@import("../protocol/reason.zig").Reason.memory_budget, r.refused().?.refusal.reason);
+    try testing.expect(f.def("other") == null);
+    try testing.expectEqual(use, pool.useOf(&f.store));
+    // Replaced by a shorter one: it frees, so it lands.
+    try testing.expect((try f.apply(.workflow_create, "wf", yamlOf("2.0.0"), 3000)).refused() == null);
+    try testing.expectEqualStrings("2.0.0", f.def("wf").?.version);
+    try testing.expect(pool.useOf(&f.store) < use);
+}
