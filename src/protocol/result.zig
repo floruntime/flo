@@ -356,7 +356,6 @@ pub const CommandResult = union(enum) {
             return .{
                 .reason = e.reason orelse switch (e.code) {
                     .committed_not_applied => .committed_not_applied,
-                    .too_many_actions => .too_many_actions,
                     // What a client tells apart from a refusal to look:
                     // the thing named isn't there.
                     .not_found => .not_found,
@@ -381,8 +380,6 @@ pub const CommandResult = union(enum) {
         internal_error = 0x0006,
         unavailable = 0x0007,
         overloaded = 0x0008,
-        /// The node holds as many actions as it registers.
-        too_many_actions = 0x0009,
 
         // KV errors (0x0100-0x01FF)
         kv_key_too_large = 0x0100,
@@ -461,7 +458,6 @@ pub const CommandResult = union(enum) {
                 .partition_moved,
                 => .unavailable,
                 .overloaded => .overloaded,
-                .too_many_actions => .limit,
                 .unknown,
                 .timeout,
                 .internal_error,
@@ -545,13 +541,4 @@ test "result: an error's refusal says whether it ran: committed is yes, the site
     // Not found names its reason, which a client tells apart from a refusal by.
     try std.testing.expectEqual(flo_proto.Reason.not_found, (E{ .code = .not_found, .message = "m" }).refusal().reason);
     try std.testing.expectEqual(flo_proto.Reason.unclassified, (E{ .code = .invalid_request, .message = "m" }).refusal().reason);
-}
-
-test "a node at its action limit refuses with the limit status, saying which, and never ran" {
-    const E = CommandResult.Error;
-    const e: E = .{ .code = .too_many_actions, .ran = .no, .message = "limit: full" };
-    try std.testing.expectEqual(flo_proto.StatusCode.limit, e.code.toStatus());
-    const r = e.refusal();
-    try std.testing.expectEqual(flo_proto.Reason.too_many_actions, r.reason);
-    try std.testing.expectEqual(flo_proto.Ran.no, r.ran);
 }

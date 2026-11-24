@@ -84,18 +84,8 @@ pub const Reason = enum(u16) {
     /// The processing job is running: stop or cancel it first.
     job_running = 31,
     /// The node's memory budget is spent: delete something, or give the
-    /// node more memory. The message names the node. Defined ahead of the
-    /// check that returns it.
+    /// node more memory. The message names the node.
     memory_budget = 32,
-    /// The shard holds as many actions as one shard registers, a built-in
-    /// limit: delete one first.
-    too_many_actions = 33,
-    /// The node holds as many workflow definitions as it keeps: delete one
-    /// first. Defined ahead of the check that returns it, so clients know it.
-    too_many_workflow_definitions = 34,
-    /// The node holds as many workflow runs as it keeps: let some finish or
-    /// delete them first. Defined ahead of the check that returns it.
-    too_many_workflow_runs = 35,
     /// The queue holds as many messages or bytes as its caps allow, or the
     /// shard's queues and groups together do. It drains as messages are
     /// acked: back off and send again.
