@@ -30,8 +30,8 @@ pub const Class = enum {
     /// Its machine holds it to the share itself (a group's deliver takes no
     /// fresh records past it, but still redelivers).
     own,
-    /// Never refused for memory: it frees, it is the node's own, or what it
-    /// writes isn't charged yet.
+    /// Never refused for memory: it frees, it is the node's own, or it is
+    /// charged but not held to the share yet.
     never,
 };
 

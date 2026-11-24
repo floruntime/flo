@@ -296,6 +296,9 @@ test "e2e/memory_budget: past its share a shard refuses a workflow's create, kee
         var r = try ctx.execResult(&.{ "workflow", "create", "-f", path });
         defer r.deinit();
         if (pastShare(r)) {
+            // Refused with its status and reason, not only the text.
+            try testing.expectEqual(@as(u8, 3), r.exit_code);
+            try testing.expect(r.stderrContains("[limit/memory_budget]"));
             refused_name = name;
             break;
         }

@@ -267,3 +267,16 @@ test "workflow definitions machine: past its shard's share a new definition is r
     try testing.expectEqualStrings("2.0.0", f.def("wf").?.version);
     try testing.expect(pool.useOf(&f.store) < use);
 }
+
+test "workflow definitions machine: at its shard's share an identical re-create lands, adding nothing" {
+    const pool = @import("../budget/pool.zig");
+    const settings = @import("../settings/machine.zig");
+    var f = Fixture.init();
+    defer f.deinit();
+    try testing.expect((try f.apply(.workflow_create, "wf", yamlOf("1.0.0"), 1000)).refused() == null);
+    const use = pool.useOf(&f.store);
+    try settings.bindForTest(&f.store, use);
+    try testing.expect((try f.apply(.workflow_create, "wf", yamlOf("1.0.0"), 2000)).refused() == null);
+    try testing.expectEqualStrings("1.0.0", f.def("wf").?.version);
+    try testing.expectEqual(use, pool.useOf(&f.store));
+}
