@@ -73,6 +73,9 @@ pub const Plant = enum {
     runs_trigger_made_unchecked,
     /// A trigger's start of an earlier event moves its place back.
     runs_trigger_place_moves_back,
+    /// A trigger's start applies wherever the place logged is, not only right
+    /// after the start before it.
+    runs_trigger_order_unchecked,
     /// A signal that wakes its run leaves the run's rev where it was.
     runs_signal_wake_keeps_rev,
     /// A step's takes leave the signals it took held.

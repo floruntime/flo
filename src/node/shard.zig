@@ -6683,7 +6683,7 @@ pub const Shard = struct {
         self.namespace_handler.afterApply(entry);
         // The leader's workflow caches follow what applied; a follower,
         // and a replay at boot, keep none (`WorkflowHandler.leadCaches`).
-        if (self.raft_node.role == .leader) self.workflow_handler.entryApplied(entry, result);
+        if (self.raft_node.role == .leader) self.workflow_handler.entryApplied(entry, result, .{ .term = self.raft_node.current_term, .last_index = self.raft_node.log.lastIndex() });
         self.wakeApplied(entry);
         // The leader's own action steps: the await a deliver answers,
         // workers woken for a run ready again (once a pass: each wake is a
@@ -33852,7 +33852,9 @@ test "Shard: a trigger's page is dropped after a term change, a moved cursor or 
     const first = read.ids[0];
     read.deinit(sh.allocator);
     t.ask();
-    t.trigger().proposed = .{ .at = first, .term = a.raft_node.current_term };
+    // Read past without a start (an append it couldn't read): the chain
+    // stays at the place logged, none.
+    t.trigger().proposed = .{ .at = first, .term = a.raft_node.current_term, .chain = .{ .timestamp_ms = 0, .sequence = 0 } };
     t.two.settle();
     try std.testing.expectEqual(@as(usize, 0), t.runs());
     // Read again from where the cursor is: the two events after it.
@@ -33866,6 +33868,28 @@ test "Shard: a trigger's page is dropped after a term change, a moved cursor or 
     t.two.settle();
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(t.c, a, &out)).header.status);
     try std.testing.expectEqual(@as(usize, 2), t.runs());
+}
+
+test "Shard: a trigger's starts that don't follow the place logged are refused, and its next read starts every event, none passed over" {
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    try t.append(3);
+    const a = &t.two.shards[0];
+    const sh = t.two.shards[1].stream_handler;
+    const read = sh.readPayloadsForStreamIn(t.stream, .default, .{ .timestamp_ms = 0, .sequence = 0 }, 1);
+    const first = read.ids[0];
+    read.deinit(sh.allocator);
+    // A leader that believes it started the first event: its next starts
+    // say they follow it, and the place logged is none.
+    t.trigger().proposed = .{ .at = first, .term = a.raft_node.current_term, .chain = first };
+    t.round();
+    try std.testing.expectEqual(@as(usize, 0), t.runs());
+    try std.testing.expect(t.trigger().proposed == null);
+    // Read again from the place logged: all three, in order.
+    t.round();
+    try std.testing.expectEqual(@as(usize, 3), t.runs());
+    try std.testing.expect(t.place().trig_ts == (try t.lastId()).timestamp_ms and t.place().trig_seq == (try t.lastId()).sequence);
 }
 
 test "Shard: a trigger moved to another stream while its first read is out takes nothing from that read's page" {
