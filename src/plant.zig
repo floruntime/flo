@@ -76,6 +76,10 @@ pub const Plant = enum {
     /// A trigger's start applies wherever the place logged is, not only right
     /// after the start before it.
     runs_trigger_order_unchecked,
+    /// A child's start with no pending parent record creates its run.
+    runs_child_without_parent_starts,
+    /// A run's start is admitted past its shard's memory share.
+    start_verdict_admits,
     /// A signal that wakes its run leaves the run's rev where it was.
     runs_signal_wake_keeps_rev,
     /// A step's takes leave the signals it took held.

@@ -33892,6 +33892,73 @@ test "Shard: a trigger's starts that don't follow the place logged are refused, 
     try std.testing.expect(t.place().trig_ts == (try t.lastId()).timestamp_ms and t.place().trig_seq == (try t.lastId()).sequence);
 }
 
+test "Shard: a trigger whose starts its shard's memory share refuses at random, some part way through a read, starts every event once, none passed over" {
+    const settings = @import("../settings/machine.zig");
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    const store = &t.two.shards[0].defaultPartition().store;
+    for ([_]u64{ 1, 2, 3, 4, 5, 6, 7, 8 }) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const r = prng.random();
+        const before = t.runs();
+        var appended: usize = 0;
+        for (0..30) |_| {
+            // Events of many sizes: a large one's start refused, a small
+            // one's after it fits.
+            if (r.uintLessThan(u8, 3) == 0) {
+                const b = &t.two.shards[1];
+                for (0..1 + r.uintLessThan(usize, 4)) |_| {
+                    var xs: [1800]u8 = @splat('x');
+                    var pb: [2048]u8 = undefined;
+                    const pad = r.uintLessThan(usize, xs.len);
+                    _ = try b.stream_handler.appendPayloadToStream(t.stream, "default", try std.fmt.bufPrint(&pb, "{{\"p\":\"{s}\"}}", .{xs[0..pad]}));
+                    appended += 1;
+                }
+                t.two.settle();
+            }
+            // Unbound, at the use, or a little past it, so a read's starts
+            // are refused part way through.
+            const use = pool.useOf(store);
+            try settings.bindForTest(store, switch (r.uintLessThan(u8, 3)) {
+                0 => std.math.maxInt(u64),
+                1 => use,
+                else => use + r.uintLessThan(u64, 3000),
+            });
+            // Its wait out, as if time passed.
+            t.trigger().hold.until_ms = 0;
+            t.round();
+        }
+        try settings.bindForTest(store, std.math.maxInt(u64));
+        for (0..8) |_| {
+            t.trigger().hold.until_ms = 0;
+            t.round();
+        }
+        try std.testing.expectEqual(before + appended, t.runs());
+        // Its place is the stream's last event: nothing is read past it.
+        const sh = t.two.shards[1].stream_handler;
+        const past = sh.readPayloadsForStreamIn(t.stream, .default, .{ .timestamp_ms = t.place().trig_ts, .sequence = t.place().trig_seq }, 10);
+        defer past.deinit(sh.allocator);
+        try std.testing.expectEqual(@as(usize, 0), past.payloads.len);
+    }
+}
+
+test "Shard: a trigger's first start in a new term follows the place logged, so it lands without a resync" {
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    try t.append(3);
+    t.round();
+    try std.testing.expectEqual(@as(usize, 3), t.runs());
+    // A new term: what this leader read before is forgotten, and its first
+    // start names the place logged, three events in.
+    t.two.shards[0].raft_node.current_term += 1;
+    try t.append(2);
+    t.round();
+    try std.testing.expectEqual(@as(usize, 5), t.runs());
+    try std.testing.expectEqual(@as(u64, 0), t.trigger().resync_index);
+}
+
 test "Shard: a trigger moved to another stream while its first read is out takes nothing from that read's page" {
     var t: TriggerPair = .{};
     try t.init();

@@ -56,3 +56,5 @@ actions-hist-flushed-kept.json	actions_hist_flushed_kept	--actions	-	action_rule
 actions-end-keeps-input.json	actions_end_keeps_input	--actions	-	action_rule	an ended run keeps its input or labels
 actions-resend-rewrites-result.json	actions_resend_rewrites_result	--actions	-	action_rule	a settle naming an ended run changed the store
 workflow-runs-trigger-order.json	runs_trigger_order_unchecked	--workflows	-	workflow_run_rule	trigger.s start doesn.t follow the place logged
+workflow-runs-child-without-parent.json	runs_child_without_parent_starts	--workflows	-	workflow_run_rule	a run the ledger doesn.t hold is stored
+start-verdict-admits.json	start_verdict_admits	--memory-gate --workflows	-	workflow_run_rule	past its shard.s share

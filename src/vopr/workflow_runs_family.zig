@@ -58,6 +58,8 @@ const history_lane = @import("history_lane.zig");
 const ce = @import("../protocol/channel_entries.zig");
 const defs_family = @import("workflow_defs_family.zig");
 const pool = @import("../budget/pool.zig");
+const gate = @import("../budget/gate.zig");
+const memory_gate = @import("memory_gate.zig");
 const settings = @import("../settings/machine.zig");
 
 const Allocator = std.mem.Allocator;
@@ -237,7 +239,22 @@ pub const WorkflowRuns = struct {
         /// A child's start its shard answered over its memory share
         /// (reached only under one).
         child_held,
+        /// A client's, schedule's or trigger's start refused past its
+        /// shard's memory share (reached only under one).
+        start_held,
+        /// A child's run start held there: its parent answered over_budget.
+        child_start_held,
+        /// A child's start with no pending parent record, creating nothing.
+        child_unasked,
+        /// A definition's create refused past the share (the definitions
+        /// model's verdict, counted here so a swarm reports it).
+        create_held,
     };
+
+    /// Classes reached only under a memory share.
+    pub fn underShareOnly(c: Class) bool {
+        return c == .child_held or c == .start_held or c == .child_start_held or c == .create_held;
+    }
     const PerDefL = struct { active: u32, fired_ms: i64, place: ?PlaceL = null };
     /// A trigger's place: the stream (namespace, making, name) and how far in.
     const PlaceL = struct { ns: u32, made: u64, stream: usize, ts: u64, seq: u64 };
@@ -619,6 +636,15 @@ pub const WorkflowRuns = struct {
                             const was = placeIn(if (l.per_def[w]) |per| per.place else null, at.?);
                             if (was[0] != t.after_ts or was[1] != t.after_seq) return refuseAs(.start, "a trigger's start doesn't follow the place logged", .trigger_out_of_order);
                         }
+                        // A child's start answers its parent's pending
+                        // record, and nothing else.
+                        if (ev == CHILD) {
+                            const f = l.parents[r];
+                            if (f == null or f.?.started) {
+                                want.classes.insert(.child_unasked);
+                                return want;
+                            }
+                        }
                         const disabled = if (defs.ledger[w]) |d| !d.enabled else false;
                         if (disabled) {
                             if (ev == CHILD) {
@@ -629,6 +655,20 @@ pub const WorkflowRuns = struct {
                                 return want;
                             }
                             if (ev != TRIGGER) return refuse(.start, "its workflow is disabled");
+                        }
+                        // Past the share the shard committed to, what it
+                        // writes but its sends: nothing of it lands, and a
+                        // child's parent is answered over_budget.
+                        if (settings.boundShare(.{ .store = store })) |b| {
+                            const add = memory_gate.wouldAddData(&rm.machine, store, e) orelse return null;
+                            if (!gate.fits(pool.useOf(store), add, b.share_bytes)) {
+                                if (ev != CHILD) return refuseAs(.start, "past its shard's share", .start_held);
+                                const f = l.parents[r].?;
+                                want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[f.slot], .run = RUNS[r], .answer = .over_budget };
+                                want.classes.insert(.child_start_held);
+                                l.parents[r] = null;
+                                return want;
+                            }
                         }
                         l.runs[r] = .{ .wf = w, .status = s.status, .stepped = false, .idem = k, .created_ms = stamp_ms, .completed_ms = if (s.status.isTerminal()) stamp_ms else 0, .hist_next = 1, .started = ev };
                         if (k) |ki| l.idem[w][ki] = r;

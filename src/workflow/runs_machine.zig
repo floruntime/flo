@@ -48,6 +48,7 @@ const entry_mod = @import("../storage/ual/entry.zig");
 const defs_machine = @import("defs_machine.zig");
 const calls_mod = @import("../actions/calls_machine.zig");
 const gate = @import("../budget/gate.zig");
+const start_verdict = @import("../budget/start_verdict.zig");
 const parser = @import("parser.zig");
 const jsonpath = @import("jsonpath.zig");
 const NamespaceId = @import("../namespace/table.zig").Id;
@@ -745,6 +746,19 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
         if (ts != t.after_ts or seq != t.after_seq) return out.refuse(.conflict, .unclassified, TRIGGER_OUT_OF_ORDER);
     };
 
+    // A child's start answers its parent's pending record, and nothing
+    // else: with none (answered already, or never asked) it creates no run
+    // and tells no one, so no run is left that its parent didn't ask for.
+    var pk: [KEY_PREFIX + ae.MAX_RUN_ID]u8 = undefined;
+    const parent_key: ?[]const u8 = if (n.run.len <= ae.MAX_RUN_ID) view_mod.idKey(&pk, n.ns, n.run) catch unreachable else null;
+    if (s.isChild()) if (comptime plant.active != .runs_child_without_parent_starts) {
+        const pending = if (parent_key) |k| if (try view.get(Parents, k)) |p| p.v.state == .pending else false else false;
+        if (!pending) {
+            out.putInt(u8, 0);
+            return;
+        }
+    };
+
     // A disable or a redefinition that commits ahead of a start decides
     // it, as the handler's checks would have. Not a trigger's: its leader
     // has moved the trigger's cursor past the record already, so a trigger
@@ -765,6 +779,8 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
         };
     }
 
+    // Everything the start writes is staged before its verdict.
+    const mark = view.mark();
     var run: Run.Value = .{
         .workflow = s.workflow,
         .version = s.version,
@@ -812,15 +828,28 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
     // A child's parent hears it started. Only the child's own start: one
     // of another kind holding its id leaves the record pending, and this
     // shard's leader refuses the child, a conflict.
-    var pk: [KEY_PREFIX + ae.MAX_RUN_ID]u8 = undefined;
-    if ((s.isChild() or comptime plant.active == .runs_any_start_answers_parent) and n.run.len <= ae.MAX_RUN_ID) {
-        const k = view_mod.idKey(&pk, n.ns, n.run) catch unreachable;
+    if (s.isChild() or comptime plant.active == .runs_any_start_answers_parent) if (parent_key) |k| {
         if (try view.get(Parents, k)) |found| if (found.v.state == .pending) {
             var p = found;
             p.v.state = .started;
             try view.put(Parents, k, p);
             try reply(view, n.ns, n.run, p.v.parent_slot, .started, null);
         };
+    };
+
+    // Held past its shard's share: nothing of it is written. A child's
+    // parent is told instead, its record gone, and asks again; dropping the
+    // entry would drop that answer too.
+    if (start_verdict.startVerdict(view, n.ns)) |v| {
+        if (!s.isChild()) return v.refuse(out, view);
+        try view.rollback(mark);
+        var wb: [128]u8 = undefined;
+        const k = parent_key orelse return v.refuse(out, view);
+        const p = (try view.get(Parents, k)) orelse return v.refuse(out, view);
+        try reply(view, n.ns, n.run, p.v.parent_slot, .over_budget, v.why(&wb, view));
+        try view.delete(Parents, k);
+        out.putInt(u8, 0);
+        return;
     }
 
     out.putInt(u8, 1);
@@ -1832,11 +1861,13 @@ test "workflow runs machine: keys without a leading '_' are a client's or a chil
         .{ "c", "workflow_started", "order-17" },
         .{ "d", "workflow_started", "trigger:16:5:ev@10:2" },
         .{ "e", "workflow_started", "schedule:16:wf:4000" },
-        .{ "k", "child_started", "kid-key" },
     }) |c| {
         try testing.expect((try f.start(c[0], "wf", c[1], c[2], 2)).refused() == null);
         try testing.expect(f.get(c[0]) != null);
     }
+    // A child's, admitted: it creates nothing, with no parent waiting.
+    try testing.expect((try f.start("k", "wf", "child_started", "kid-key", 2)).refused() == null);
+    try testing.expect(f.get("k") == null);
     // Neither moves a schedule's slot or a trigger's place.
     try testing.expectEqual(@as(i64, 0), f.active("wf").?.fired_ms);
     try testing.expectEqual(@as(u64, 0), f.active("wf").?.trig_made);
@@ -2153,4 +2184,105 @@ test "workflow runs machine: a child's start past its shard's share is answered 
     e = entry_mod.buildEntry(.child_start, entry_mod.Flags.NONE, 1, f.index, 0, cs);
     try testing.expect((try Fixture.run(&machine, &f, &e)).refused() == null);
     try testing.expect(parentOf(.{ .store = &f.store }, .default, "kid1") != null);
+}
+
+/// A parent's call for child `kid` of workflow "wf", recorded on this shard.
+fn askChild(f: *Fixture, kid: []const u8) !void {
+    var cb: [ae.ChildStart.max_size]u8 = undefined;
+    const cs = try ae.ChildStart.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .parent_slot = 7, .parent_run = "par", .parent_workflow = "pwf", .workflow = "wf", .version = "", .run = kid, .input = "{}" });
+    f.index += 1;
+    const e = entry_mod.buildEntry(.child_start, entry_mod.Flags.NONE, 1, f.index, 0, cs);
+    try testing.expect((try Fixture.run(&machine, f, &e)).refused() == null);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, kid) != null);
+}
+
+/// The last answer this shard sent a parent.
+fn lastReply(f: *Fixture) ?ae.Reply.Value {
+    var it = (ReadView{ .store = &f.store }).range(channels.OutFam, "");
+    var told: ?ae.Reply.Value = null;
+    while (it.next() catch null) |item| {
+        if (item.value.v.entry_type != @backingInt(EntryType.call_reply)) continue;
+        var diag: schema.Diagnostic = .{};
+        told = ae.Reply.decodeAll(item.value.v.payload, &diag) catch null;
+    }
+    return told;
+}
+
+test "workflow runs machine: past its shard's share a client's, a schedule's and a trigger's start are refused, writing nothing" {
+    const pool = @import("../budget/pool.zig");
+    const settings = @import("../settings/machine.zig");
+    var f = Fixture.init();
+    defer f.deinit();
+    try f.create("wf");
+    try testing.expect((try f.start("first", "wf", "workflow_started", "k0", 1)).refused() == null);
+    const per = f.active("wf").?;
+    try settings.bindForTest(&f.store, pool.useOf(&f.store));
+    const use = pool.useOf(&f.store);
+    for ([_][2][]const u8{ .{ "workflow_started", "k1" }, .{ "schedule_started", "_schedule:16:wf:4000" } }) |c| {
+        const r = try f.start("x", "wf", c[0], c[1], 2);
+        try testing.expectEqual(@import("../protocol/reason.zig").Reason.memory_budget, r.refused().?.refusal.reason);
+        try testing.expect(f.get("x") == null);
+    }
+    const r = try triggerStart(&f, "t", "_trigger:16:5:ev@10:2", .{ .ns = 16, .made = 5, .stream = "ev", .ts = 10, .seq = 2 });
+    try testing.expectEqual(@import("../protocol/reason.zig").Reason.memory_budget, r.refused().?.refusal.reason);
+    try testing.expect(f.get("t") == null);
+    // Nothing moved: no slot fired, no place, no key, no count.
+    try testing.expectEqual(per.fired_ms, f.active("wf").?.fired_ms);
+    try testing.expectEqual(per.active, f.active("wf").?.active);
+    try testing.expectEqual(@as(u64, 0), f.active("wf").?.trig_made);
+    try testing.expectEqual(use, pool.useOf(&f.store));
+    // A start already made, asked again, creates nothing: answered, not held.
+    const again = try f.start("y", "wf", "workflow_started", "k0", 3);
+    try testing.expect(again.refused() == null);
+    try testing.expect(f.get("y") == null);
+    // Once memory frees, the schedule's slot starts.
+    try settings.bindForTest(&f.store, std.math.maxInt(u64));
+    try testing.expect((try f.start("x", "wf", "schedule_started", "_schedule:16:wf:4000", 4)).refused() == null);
+    try testing.expectEqual(@as(i64, 4000), f.active("wf").?.fired_ms);
+}
+
+test "workflow runs machine: a child started past its shard's share tells its parent over_budget and forgets the call; asked again once memory frees, it runs" {
+    const pool = @import("../budget/pool.zig");
+    const settings = @import("../settings/machine.zig");
+    var f = Fixture.init();
+    defer f.deinit();
+    try f.create("wf");
+    try askChild(&f, "kid");
+    try settings.bindForTest(&f.store, pool.useOf(&f.store));
+    const r = try f.start("kid", "wf", "child_started", "", 2);
+    // Not refused: the parent's answer leaves with it.
+    try testing.expect(r.refused() == null);
+    try testing.expect(f.get("kid") == null);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "kid") == null);
+    const told = lastReply(&f).?;
+    try testing.expectEqual(ae.Answer.over_budget, told.answer);
+    try testing.expectEqualStrings("kid", told.run);
+    try testing.expect(std.mem.indexOf(u8, told.why.?, "would pass its share") != null);
+    // A start of it proposed before that applied: nothing to answer.
+    const sent = f.store.families[channels.OutFam.ID].count;
+    try testing.expect((try f.start("kid", "wf", "child_started", "", 3)).refused() == null);
+    try testing.expect(f.get("kid") == null);
+    try testing.expectEqual(sent, f.store.families[channels.OutFam.ID].count);
+    // The parent asks again, memory freed.
+    try settings.bindForTest(&f.store, std.math.maxInt(u64));
+    try askChild(&f, "kid");
+    try testing.expect((try f.start("kid", "wf", "child_started", "", 4)).refused() == null);
+    try testing.expect(f.get("kid") != null);
+    try testing.expectEqual(ae.Answer.started, lastReply(&f).?.answer);
+}
+
+test "workflow runs machine: a child's start its parent's record no longer waits for creates nothing, over the share or not" {
+    var f = Fixture.init();
+    defer f.deinit();
+    try f.create("wf");
+    try askChild(&f, "kid");
+    try testing.expect((try f.start("kid", "wf", "child_started", "", 2)).refused() == null);
+    try testing.expect(f.get("kid") != null);
+    // Its record is started: another start of that id is a conflict (the
+    // run exists); one of a never-asked id creates nothing.
+    try testing.expect((try f.start("kid", "wf", "child_started", "", 3)).refused() != null);
+    const sent = f.store.families[channels.OutFam.ID].count;
+    try testing.expect((try f.start("stray", "wf", "child_started", "", 3)).refused() == null);
+    try testing.expect(f.get("stray") == null);
+    try testing.expectEqual(sent, f.store.families[channels.OutFam.ID].count);
 }

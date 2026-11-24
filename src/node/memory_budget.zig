@@ -97,15 +97,23 @@ comptime {
 const HISTORY_ROW_BYTES: u64 = pool.RESIDENT_RECORD + 4 + he.MAX_OWNER + he.MAX_RUN + 64 + hm.Row.max_size;
 const HISTORY_LAND_BYTES: u64 = 3 * HISTORY_ROW_BYTES + 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + channels.CHAN_KEY + channels.OUT_NS_KEY + 3 * 64 + he.Index.max_size;
 
-/// A node's reserve: per shard, its floor, its configured ring sizes and the
-/// one inbound it may take past its share; plus a margin. Held back before
+/// What one admitted start sends, which its verdict can't weigh: sends are
+/// written after the machine's verdict. At most one history chunk and, for
+/// a child, its parent's answer, each with its outbox rows. The next entry's
+/// verdict reads them committed, so a shard passes its share by one entry's
+/// sends at most.
+pub const OWN_SENDS_BYTES: u64 = he.Chunk.max_size + 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + channels.CHAN_KEY + channels.OUT_NS_KEY + 3 * 64 + CALL_REPLY_BYTES;
+
+/// A node's reserve: per shard, its floor, its configured ring sizes, the
+/// one inbound it may take past its share and one start's sends; plus a
+/// margin. Held back before
 /// the pool's share of RAM is taken, so a shard's overshoot fits whatever
 /// share an admin sets, up to all of it. A node computes this from its own
 /// config and reports it in its settings row; the cluster takes it as given.
 /// The margin covers the ~10 MiB a node carries once at low shard counts, so
 /// the linear `floor × shards` holds there too.
 pub fn reserve(shard_count: u32, ring_bytes_per_shard: u64, margin: u64) u64 {
-    return @as(u64, shard_count) * (PER_SHARD_FLOOR_BYTES +| ring_bytes_per_shard +| INBOUND_OVERSHOOT_BYTES) +| margin;
+    return @as(u64, shard_count) * (PER_SHARD_FLOOR_BYTES +| ring_bytes_per_shard +| INBOUND_OVERSHOOT_BYTES +| OWN_SENDS_BYTES) +| margin;
 }
 
 /// One data-holding member, for the derivation. `mem` is null when the node
@@ -286,7 +294,7 @@ test "derive: reserve ≥ ram contributes 0" {
 test "reserve: floor + rings over shards + margin" {
     // 4 shards, 80 MiB rings each, 256 MiB margin.
     const r = reserve(4, ringBytesPerShard(64 * 1024 * 1024), 256 * 1024 * 1024);
-    try testing.expectEqual(@as(u64, 4) * (PER_SHARD_FLOOR_BYTES + 80 * 1024 * 1024 + INBOUND_OVERSHOOT_BYTES) + 256 * 1024 * 1024, r);
+    try testing.expectEqual(@as(u64, 4) * (PER_SHARD_FLOOR_BYTES + 80 * 1024 * 1024 + INBOUND_OVERSHOOT_BYTES + OWN_SENDS_BYTES) + 256 * 1024 * 1024, r);
 }
 
 test "reserve: one inbound's overshoot is twice its payload bound, its calls' rows and the history rows beside it, within 768 KiB over that" {
