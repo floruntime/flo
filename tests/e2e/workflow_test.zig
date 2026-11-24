@@ -817,6 +817,53 @@ test "e2e/workflow: cancel running workflow" {
     try stdx.testing.assertSucceeded(cancel_result);
 }
 
+test "e2e/workflow: run-delete refuses a live run, deletes an ended one, and its id then starts a new run" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const workflow_def =
+        \\kind: Workflow
+        \\name: delete-wf
+        \\version: 1.0.0
+        \\start.wait_for_signal.type: proceed
+        \\start.wait_for_signal.timeout_ms: 300000
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.timeout: flo.Failed
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "delete-wf.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+    try ctx.exec(&.{ "workflow", "start", "delete-wf", "{}", "--run-id", "delete-run-1" });
+
+    var live = try ctx.cli.run(&.{ "workflow", "run-delete", "delete-run-1" });
+    defer live.deinit();
+    try stdx.testing.assertFailed(live);
+    try stdx.testing.assertContains(live, "the run hasn't ended; cancel it first");
+
+    try ctx.exec(&.{ "workflow", "cancel", "delete-run-1" });
+    var deleted = try ctx.cli.run(&.{ "workflow", "run-delete", "delete-run-1" });
+    defer deleted.deinit();
+    try stdx.testing.assertSucceeded(deleted);
+
+    var status = try ctx.cli.run(&.{ "workflow", "status", "delete-run-1" });
+    defer status.deinit();
+    try stdx.testing.assertFailed(status);
+    try stdx.testing.assertContains(status, "not found");
+    var history = try ctx.cli.run(&.{ "workflow", "history", "delete-run-1" });
+    defer history.deinit();
+    try stdx.testing.assertFailed(history);
+    try stdx.testing.assertContains(history, "not found");
+    var again = try ctx.cli.run(&.{ "workflow", "run-delete", "delete-run-1" });
+    defer again.deinit();
+    try stdx.testing.assertFailed(again);
+    try stdx.testing.assertContains(again, "not found");
+
+    try ctx.exec(&.{ "workflow", "start", "delete-wf", "{}", "--run-id", "delete-run-1" });
+    var fresh = try ctx.cli.run(&.{ "workflow", "status", "delete-run-1" });
+    defer fresh.deinit();
+    try stdx.testing.assertSucceeded(fresh);
+    try stdx.testing.assertContains(fresh, "waiting");
+}
+
 test "e2e/workflow: a cancel reason past 1024 bytes is refused and the run keeps going" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();

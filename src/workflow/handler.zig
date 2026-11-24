@@ -701,6 +701,7 @@ pub const WorkflowHandler = struct {
         dispatcher.registerWithRoute(.workflow_signal, dispatchWorkflow, run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.workflow_cancel, dispatchWorkflow, run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.workflow_history, table_run.handler("workflow.history", history_ops.Ops, history_ops.Ops.workflowHistory), run_id_mod.preRouteByRunId);
+        dispatcher.registerWithRoute(.workflow_run_delete, table_run.handler("workflow.run_delete", RunDelete, RunDelete.run), run_id_mod.preRouteByRunId);
         dispatcher.registerWalk(.workflow_list_definitions, dispatchWorkflow, localScanWorkflowDefs);
     }
 
@@ -1428,6 +1429,44 @@ pub const WorkflowHandler = struct {
         }
         return proposed;
     }
+
+    /// `workflow.run_delete`: an ended run deleted, its history with it.
+    /// Refused here for a live one, and at apply for one that isn't there
+    /// by then or is another incarnation than the one read here.
+    const RunDelete = struct {
+        pub const Error = error{ NotFound, NotLeading, OutOfMemory };
+
+        pub fn refusal(err: Error) table_run.Refused {
+            return switch (err) {
+                error.NotFound => .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = "not found: no such run" } },
+                error.NotLeading => .{ .status = .unavailable, .refusal = .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: this node's leadership isn't settled yet — retry" } },
+                error.OutOfMemory => .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "internal error: out of memory" } },
+            };
+        }
+
+        const Response = table_run.op("workflow.run_delete").response;
+
+        fn run(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(Response) {
+            const self = shard.workflow_handler;
+            if (!shard.raft_node.leaderReady()) return error.NotLeading;
+            if (req.key.len == 0) return error.NotFound;
+            const run_key = self.nsKey(req.ns_id, req.key) orelse return error.OutOfMemory;
+            defer self.allocator.free(run_key);
+            const rec = self.appliedRun(run_key) orelse return error.NotFound;
+            if (!appliedStatus(rec).isTerminal()) return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .run_live, .ran = .no, .message = runs_machine.RUN_LIVE } } };
+            const d: runs_machine.Delete = .{ .workflow = rec.workflow, .idem = rec.idempotency_key, .created_ns = rec.created_ns };
+            const vbuf = try self.allocator.alloc(u8, d.size());
+            defer self.allocator.free(vbuf);
+            const value = d.encode(vbuf).?;
+            const proposed = persistence_mod.proposeEntryIn(shard, .workflow_run_delete, entry_mod.Flags.NONE, req.ns_id, run_key, value) catch |err|
+                return .{ .refused = .{ .status = persistence_mod.failureStatus(err), .refusal = persistence_mod.failureRefusal(err, "delete not persisted") } };
+            return .{ .park = .{ .proposed = proposed, .answer = answerEmpty } };
+        }
+
+        fn answerEmpty(shard: *Shard, conn: *Connection, request_id: u64, _: *const persistence_mod.Result) void {
+            table_run.answer(Response, shard, conn, request_id, .{});
+        }
+    };
 
     fn noteEnding(self: *WorkflowHandler, run_key: []const u8, proposed: persistence_mod.ProposeResult) void {
         const gop = self.ending.getOrPut(self.allocator, run_key) catch return;
@@ -4268,7 +4307,7 @@ pub const WorkflowHandler = struct {
         const etype = std.enums.fromInt(entry_mod.EntryType, entry.header.entry_type) orelse return error.Halt;
         const m: *const contract_machine.Machine = switch (etype) {
             .workflow_create, .workflow_enabled => &defs_machine.machine,
-            .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done => &runs_machine.machine,
+            .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .workflow_run_delete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done => &runs_machine.machine,
             else => return error.Halt,
         };
         try contract_machine.applyEntry(m, self.defsRead().store, &self.def_scratch, entry, out);
@@ -4354,7 +4393,7 @@ pub const WorkflowHandler = struct {
         }
         if (out.refused() != null) return;
         switch (t) {
-            .workflow_create, .workflow_enabled, .workflow_start, .workflow_step, .workflow_signal, .workflow_complete => {},
+            .workflow_create, .workflow_enabled, .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .workflow_run_delete => {},
             // A run waiting on an action not registered may now go on.
             .action_register => {
                 var it = self.parked.keyIterator();
@@ -4414,7 +4453,14 @@ pub const WorkflowHandler = struct {
     fn runApplied(self: *WorkflowHandler, t: entry_mod.EntryType, run_key: []const u8) void {
         self.unhold(run_key);
         if (self.refusals.fetchRemove(run_key)) |kv| self.allocator.free(kv.key);
-        const run = runs_machine.runOf(self.defsRead(), run_key) orelse return;
+        // Gone (deleted): nothing of it stays indexed.
+        const run = runs_machine.runOf(self.defsRead(), run_key) orelse {
+            self.unindexToStep(run_key);
+            unindexKey(self, &self.parked, run_key);
+            unindexKey(self, &self.call_dirty, run_key);
+            self.dropCallTimer(run_key);
+            return;
+        };
         const live = !appliedStatus(run).isTerminal();
         if (live and run.wait == .none) self.indexToStep(run_key) else self.unindexToStep(run_key);
         if (live and run.wait == .call) {
@@ -4993,8 +5039,9 @@ test "workflow handler: dispatcher registration" {
     try testing.expect(dispatcher.hasHandler(OpCode.workflow_disable));
     try testing.expect(dispatcher.hasHandler(OpCode.workflow_enable));
     try testing.expect(dispatcher.hasHandler(OpCode.workflow_list_definitions));
+    try testing.expect(dispatcher.hasHandler(OpCode.workflow_run_delete));
 
-    try testing.expectEqual(@as(u16, 11), dispatcher.handler_count);
+    try testing.expectEqual(@as(u16, 12), dispatcher.handler_count);
 }
 
 test "workflow handler: init and deinit" {
@@ -6703,6 +6750,13 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     try testing.expectEqual(@as(?u32, 1), activeOf(&handler, testKey(TEST_NS_A, "wf")));
     // Room now: it fires once.
     try testing.expectEqual(@as(usize, 1), runsOf(&handler, &shard));
+    // The ended run deleted through the same seam: gone.
+    const r1 = handler.appliedRun(testKey(TEST_NS_A, "r1")).?;
+    const d: runs_machine.Delete = .{ .workflow = r1.workflow, .idem = r1.idempotency_key, .created_ns = r1.created_ns };
+    var del_buf: [128]u8 = undefined;
+    try handler.applyDirect(.workflow_run_delete, 0, testKey(TEST_NS_A, "r1"), d.encode(&del_buf).?, 8, &out);
+    try testing.expect(out.refused() == null);
+    try testing.expect(handler.appliedRun(testKey(TEST_NS_A, "r1")) == null);
 }
 
 /// The runs of workflow `def_key` not ended, as applied; null before any started.

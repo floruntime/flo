@@ -1459,6 +1459,31 @@ test "e2e/action/worker: fail retries unless told not to, and --abandoned counts
     try testing.expect(both.exit_code != 0);
 }
 
+test "e2e/action/run-delete: a live run is refused; an ended one goes, with its history" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "action", "register", "gone" });
+    try ctx.exec(&.{ "worker", "register", "gw", "gone" });
+    var rb: [64]u8 = undefined;
+    var tb: [256]u8 = undefined;
+    const t = try takeOne(ctx, "gone", "gw", &rb, &tb);
+    var live = try ctx.cli.run(&.{ "action", "run-delete", t.run });
+    defer live.deinit();
+    try stdx.testing.assertFailed(live);
+    try stdx.testing.assertContains(live, "the run hasn't ended; cancel it first");
+
+    try ctx.exec(&.{ "worker", "complete", t.task, "--worker-id", "gw" });
+    var deleted = try ctx.cli.run(&.{ "action", "run-delete", t.run });
+    defer deleted.deinit();
+    try stdx.testing.assertSucceeded(deleted);
+    for ([_][]const u8{ "status", "history", "run-delete" }) |verb| {
+        var r = try ctx.cli.run(&.{ "action", verb, t.run });
+        defer r.deinit();
+        try stdx.testing.assertFailed(r);
+        try stdx.testing.assertContains(r, "not found");
+    }
+}
+
 test "e2e/action/status: a completed run's named outcome is shown" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();

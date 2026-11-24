@@ -203,6 +203,7 @@ pub const OpCode = enum(u16) {
     action_deliver = 0x30E,
     action_info = 0x30F,
     action_history = 0x310,
+    action_run_delete = 0x311,
 
     // ── Workers (0x320 – 0x33F) ──────────────────────────────────────────────
     worker_register = 0x320,
@@ -224,6 +225,7 @@ pub const OpCode = enum(u16) {
     workflow_disable = 0x348,
     workflow_enable = 0x349,
     workflow_list_definitions = 0x34A,
+    workflow_run_delete = 0x34B,
 
     // ── Processing (0x360 – 0x37F) ───────────────────────────────────────────
     processing_submit = 0x360,

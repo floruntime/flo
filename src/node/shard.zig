@@ -11795,7 +11795,7 @@ fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8)
             body.block_ms = ms;
             return table_run.op("action.await").request.encodeInto(buf, body) catch unreachable;
         },
-        .action_complete, .action_fail, .action_touch, .action_deliver, .action_history, .action_status, .workflow_history => return value,
+        .action_complete, .action_fail, .action_touch, .action_deliver, .action_history, .action_status, .workflow_history, .action_run_delete, .workflow_run_delete => return value,
         // A dequeue's count and wait from its options, encoded as the op's
         // body would be but with the wait unbounded, so one past its bound
         // reaches the server.
@@ -22876,6 +22876,46 @@ test "actions: an action run's history reads back whole, a page at a time by its
     const newest = try history_read.Response.decodeAll((try t.ok(.action_history, run_id, try R.encodeInto(&rb, .{ .limit = 1, .cursor = null, .newest_first = true }))).data, &diag);
     it = newest.events.iterator();
     try std.testing.expectEqualStrings(action_machine.EV_ENDED, (try it.next()).?.event_type);
+}
+
+test "actions: a delete of a live run is refused run_live; of an ended one, its status and history then answer not found, a held history read too, and a resend not found" {
+    var t: ActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    _ = try t.ok(.action_register, "act", "");
+    _ = try t.ok(.action_invoke, "act", "\x00in");
+    var task = (try t.take("w1", "act", 0, null)).?;
+    var run_buf: [64]u8 = undefined;
+    const run_id = run_buf[0..task.run.len];
+    @memcpy(run_id, task.run);
+    task.run = run_id;
+    var action_buf: [16]u8 = undefined;
+    @memcpy(action_buf[0..3], "act");
+    task.action = action_buf[0..3];
+    const live = try t.call(.action_run_delete, run_id, "");
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), live.header.status);
+    try std.testing.expectEqual(proto.Reason.run_live, (try live.refused()).reason);
+    var body: [1024]u8 = undefined;
+    _ = try t.ok(.action_complete, run_id, try ActionsHandler.for_tests.completeBody(&body, task, "w1", "", "done"));
+    // A history read held while its last chunk is on the lane.
+    const R = history_read.Request;
+    var rb: [R.max_size]u8 = undefined;
+    try t.feed(.action_history, run_id, try R.encodeInto(&rb, .{ .limit = 10, .cursor = null, .newest_first = false }));
+    try std.testing.expectEqual(@as(u16, 1), t.shard.waiter_pool.countByKind(.history_read));
+    // The delete applies before the chunk lands: the drop follows it on
+    // the lane, and the held read is answered not found.
+    _ = try t.ok(.action_run_delete, run_id, "");
+    try ParkTest.deliverOwn(&t.shard);
+    try std.testing.expectEqual(@as(u16, 0), t.shard.waiter_pool.countByKind(.history_read));
+    const held = try nextAnswer(t.c, &t.shard, &t.out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), held.header.status);
+    for ([_]proto.OpCode{ .action_status, .action_run_delete }) |op| {
+        const r = try t.call(op, run_id, "");
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), r.header.status);
+    }
+    const h = try t.call(.action_history, run_id, try R.encodeInto(&rb, .{ .limit = 10, .cursor = null, .newest_first = false }));
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), h.header.status);
+    try std.testing.expect(ActionsHandler.for_tests.run(&t.shard, .default, run_id) == null);
 }
 
 test "actions: a direct invoke is refused overloaded, not run, while its namespace's history waits on the lane, and goes once it drains" {
@@ -34132,6 +34172,69 @@ test "Shard: a workflow run's history read waits while its chunks are on the his
     try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.history_read));
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u32, 5), (try history_read.Response.decodeAll(one[0].data, &hd)).events.count);
+}
+
+test "Shard: a workflow run's delete is refused while it runs; once it ended, its status and history answer not found and its id starts a new run" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [16 * 1024]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    const def =
+        \\{"kind":"Workflow","name":"gate","version":"1.0.0",
+        \\"start":{"wait_for_signal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    shard.runRequest(conn, try ParkTest.request(.workflow_create, 1, "a", "gate", def, ""), .client);
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    const named = [_]u8{ 0, 0, 0, 1, 2, 0, 'r', '1' };
+    shard.runRequest(conn, try ParkTest.request(.workflow_start, 2, "a", "gate", &named, ""), .client);
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+
+    // Live: refused, nothing proposed.
+    const last = shard.raft_node.log.lastIndex();
+    shard.runRequest(conn, try ParkTest.request(.workflow_run_delete, 3, "a", "r1", "", ""), .client);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
+    try std.testing.expectEqual(proto.Reason.run_live, (try one[0].refused()).reason);
+    try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
+
+    shard.runRequest(conn, try ParkTest.request(.workflow_cancel, 4, "a", "r1", "", ""), .client);
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    shard.runRequest(conn, try ParkTest.request(.workflow_run_delete, 5, "a", "r1", "", ""), .client);
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    try ParkTest.deliverOwn(&shard);
+
+    var lb: [history_read.Request.max_size]u8 = undefined;
+    const limit = try history_read.Request.encodeInto(&lb, .{ .limit = 100, .cursor = null, .newest_first = false });
+    for ([_]struct { op: proto.OpCode, value: []const u8 }{ .{ .op = .workflow_status, .value = "" }, .{ .op = .workflow_history, .value = limit }, .{ .op = .workflow_run_delete, .value = "" } }, 0..) |q, i| {
+        shard.runRequest(conn, try ParkTest.request(q.op, 6 + i, "a", "r1", q.value, ""), .client);
+        try ParkTest.ack(&shard);
+        try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), one[0].header.status);
+    }
+    // The id starts a new run.
+    shard.runRequest(conn, try ParkTest.request(.workflow_start, 20, "a", "gate", &named, ""), .client);
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
 }
 
 test "Shard: a workflow named longer than its runs' history may name is refused at create and at start, before anything is proposed" {

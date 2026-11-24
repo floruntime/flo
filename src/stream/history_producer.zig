@@ -137,6 +137,25 @@ pub fn flushKeeping(view: *View, o: Owner, h: *Hist, ended_ms: ?i64, keep_flushe
     h.pending = "";
 }
 
+/// A deleted run's history dropped: a `history_drop` to its owner's group
+/// on the history lane, after any chunk of its already there.
+/// `completed_ms` is when the run ended, which keys its ended row.
+pub fn sendDrop(view: *View, o: Owner, completed_ms: i64) ApplyError!void {
+    const buf = try view.arena.alloc(u8, he.Drop.max_size);
+    const payload = he.Drop.encodeInto(buf, .{
+        .ns = o.ns.int(),
+        .family = @backingInt(o.family),
+        .owner = o.owner,
+        .run = o.run,
+        .created_ns = o.created_ns,
+        .first_seq = 0,
+        .last_seq = 0,
+        .final = false,
+        .completed_ms = @intCast(@max(completed_ms, 0)),
+    }) catch return error.Halt;
+    try view.sendFlagged(.user(o.ns), o.slot, @backingInt(entry_mod.EntryType.history_drop), entry_mod.Flags.HISTORY, payload);
+}
+
 /// The bytes a chunk message carries for `records` bytes of events, its
 /// header at its largest.
 pub fn chunkBound(records: usize) usize {
