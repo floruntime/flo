@@ -93,7 +93,7 @@ pub const EXEMPT = [_]u16{
     52, 68,
     // channels: in (one record per sender group)
     57,
-    // history.wf: a workflow run's history rows, exempt as workflow state is
+    // history.wf: a workflow run's history rows, bounded on disk instead
     70,
 };
 
@@ -106,7 +106,7 @@ fn listed(comptime set: []const u16, comptime id: u16) bool {
 pub const charged: store_mod.FamilySet = blk: {
     var set: store_mod.FamilySet = .empty;
     for (CHARGED) |id| set.set(id);
-    if (plant.active == .pool_counts_exempt_family) set.set(28);
+    if (plant.active == .pool_counts_exempt_family) set.set(70);
     break :blk set;
 };
 

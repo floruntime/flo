@@ -385,7 +385,7 @@ pub fn perDefOf(read: ReadView, def_key: []const u8) ?PerDef.Value {
 
 /// A `workflow_start` value:
 /// `[wf_len:u16][wf][ver_len:u16][ver][status:u8][evt_len:u16][evt][idem_len:u16][idem]`
-/// `[has_trigger:u8]([ns:u32][made:u64][stream_len:u16][stream][ts:u64][seq:u64])?[input]`,
+/// `[has_trigger:u8]([ns:u32][made:u64][stream_len:u16][stream][ts:u64][seq:u64][after_ts:u64][after_seq:u64])?[input]`,
 /// little-endian. The input is "{}" when none follows.
 pub const Start = struct {
     workflow: []const u8,
@@ -414,6 +414,8 @@ pub const Start = struct {
                 .stream = c.take(c.int(u16) orelse return null) orelse return null,
                 .ts = c.int(u64) orelse return null,
                 .seq = c.int(u64) orelse return null,
+                .after_ts = c.int(u64) orelse return null,
+                .after_seq = c.int(u64) orelse return null,
             },
             else => return null,
         };
@@ -453,6 +455,8 @@ pub const Start = struct {
             w.writeAll(t.stream) catch return null;
             w.writeInt(u64, t.ts, .little) catch return null;
             w.writeInt(u64, t.seq, .little) catch return null;
+            w.writeInt(u64, t.after_ts, .little) catch return null;
+            w.writeInt(u64, t.after_seq, .little) catch return null;
         } else w.writeByte(0) catch return null;
         w.writeAll(s.input) catch return null;
         return w.buffered();
@@ -463,14 +467,22 @@ pub const Start = struct {
     }
 };
 
-/// Where a trigger's start read: the stream, and the event.
+/// Where a trigger's start read: the stream, and the event; and the place
+/// in that stream it must find logged, (0, 0) for none: the event of the
+/// start its leader proposed just before it, or, for the first of a
+/// leader's chain, the place logged when it was proposed. So a start whose
+/// predecessor was refused is refused too, and no event is passed over.
 pub const TriggerAt = struct {
     ns: u32,
     made: u64,
     stream: []const u8,
     ts: u64,
     seq: u64,
+    after_ts: u64,
+    after_seq: u64,
 };
+
+pub const TRIGGER_OUT_OF_ORDER = "conflict: a trigger's start doesn't follow the place logged";
 
 /// Whether an idempotency key is the server's: a leading '_', as for
 /// signal types. A schedule's start keys its slot ("_schedule:..."), a
@@ -720,6 +732,18 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
     // client chose, which the handler let through while the first was
     // uncommitted. The log's order decides; the later is refused.
     if (try view.get(RunFam, cmd.key) != null) return out.refuse(.conflict, .unclassified, "conflict: a run with this id already exists");
+
+    // A trigger's start applies only right after the one before it: the
+    // place logged in its stream (another stream or making reads as none)
+    // must be where its leader read from. Refused, its leader reads again
+    // from the place logged.
+    if (s.trigger) |t| if (comptime plant.active != .runs_trigger_order_unchecked) {
+        const per = if (try view.get(PerDefFam, try idKeyAlloc(arena, n.ns, s.workflow))) |p| p.v else PER_DEF_NONE;
+        const here = per.trig_ns == t.ns and per.trig_made == t.made and std.mem.eql(u8, per.trig_stream, t.stream);
+        const ts: u64 = if (here) per.trig_ts else 0;
+        const seq: u64 = if (here) per.trig_seq else 0;
+        if (ts != t.after_ts or seq != t.after_seq) return out.refuse(.conflict, .unclassified, TRIGGER_OUT_OF_ORDER);
+    };
 
     // A disable or a redefinition that commits ahead of a start decides
     // it, as the handler's checks would have. Not a trigger's: its leader
@@ -1389,7 +1413,7 @@ const StepSpec = struct {
 
 fn startValue(buf: []u8, wf: []const u8, event: []const u8, idem: []const u8) []const u8 {
     // A trigger's start says where it read.
-    const at: ?TriggerAt = if (std.mem.eql(u8, event, "trigger_started")) .{ .ns = NamespaceId.default.int(), .made = 1, .stream = "ev", .ts = 1, .seq = 0 } else null;
+    const at: ?TriggerAt = if (std.mem.eql(u8, event, "trigger_started")) .{ .ns = NamespaceId.default.int(), .made = 1, .stream = "ev", .ts = 1, .seq = 0, .after_ts = 0, .after_seq = 0 } else null;
     return (Start{ .workflow = wf, .version = "1", .status = .running, .event = event, .idem = if (idem.len > 0) idem else null, .trigger = at, .input = "" }).encode(buf).?;
 }
 
@@ -1704,8 +1728,26 @@ test "workflow runs machine: a disabled workflow refuses a client or schedule st
     try testing.expectEqualStrings("workflow is disabled", told.?.why.?);
 }
 
-/// A trigger's start of run `run_id` from where `at` says it read.
-fn triggerStart(f: *Fixture, run_id: []const u8, idem: []const u8, at: TriggerAt) !Result {
+/// The place a trigger start reading where `at` says must find logged, as
+/// its leader would name it.
+const Read = struct { ns: u32, made: u64, stream: []const u8, ts: u64, seq: u64 };
+
+fn following(f: *Fixture, at: Read) TriggerAt {
+    var t: TriggerAt = .{ .ns = at.ns, .made = at.made, .stream = at.stream, .ts = at.ts, .seq = at.seq, .after_ts = 0, .after_seq = 0 };
+    if (f.active("wf")) |p| if (p.trig_ns == at.ns and p.trig_made == at.made and std.mem.eql(u8, p.trig_stream, at.stream)) {
+        t.after_ts = p.trig_ts;
+        t.after_seq = p.trig_seq;
+    };
+    return t;
+}
+
+/// A trigger's start of run `run_id` from where `at` says it read,
+/// following the place logged.
+fn triggerStart(f: *Fixture, run_id: []const u8, idem: []const u8, read: Read) !Result {
+    return triggerStartAt(f, run_id, idem, following(f, read));
+}
+
+fn triggerStartAt(f: *Fixture, run_id: []const u8, idem: []const u8, at: TriggerAt) !Result {
     var kb: [64]u8 = undefined;
     var vb: [512]u8 = undefined;
     const value = (Start{ .workflow = "wf", .version = "1", .status = .running, .event = "trigger_started", .idem = if (idem.len > 0) idem else null, .trigger = at, .input = "" }).encode(&vb).?;
@@ -1807,7 +1849,7 @@ test "workflow runs machine: a trigger's start that doesn't say where it read, o
     var vb: [256]u8 = undefined;
     const bare = (Start{ .workflow = "wf", .version = "1", .status = .running, .event = "trigger_started", .idem = null, .input = "" }).encode(&vb).?;
     try testing.expectError(error.Halt, f.command(.workflow_start, view_mod.idKey(&kb, .default, "a") catch unreachable, bare, 1));
-    const said = (Start{ .workflow = "wf", .version = "1", .status = .running, .event = "workflow_started", .idem = null, .trigger = .{ .ns = 16, .made = 1, .stream = "ev", .ts = 1, .seq = 0 }, .input = "" }).encode(&vb).?;
+    const said = (Start{ .workflow = "wf", .version = "1", .status = .running, .event = "workflow_started", .idem = null, .trigger = .{ .ns = 16, .made = 1, .stream = "ev", .ts = 1, .seq = 0, .after_ts = 0, .after_seq = 0 }, .input = "" }).encode(&vb).?;
     try testing.expectError(error.Halt, f.command(.workflow_start, view_mod.idKey(&kb, .default, "b") catch unreachable, said, 1));
 }
 
@@ -2047,6 +2089,40 @@ test "workflow runs machine: a step's call of an action named longer than an act
             try testing.expectEqual(sent, f.store.families[channels.OutFam.ID].count);
         }
     }
+}
+
+test "workflow runs machine: a trigger's start applies only right after the one before it, and another making of its stream starts at none" {
+    var f = Fixture.init();
+    defer f.deinit();
+    const ev5: TriggerAt = .{ .ns = 16, .made = 5, .stream = "ev", .ts = 10, .seq = 2, .after_ts = 0, .after_seq = 0 };
+    try testing.expect((try triggerStartAt(&f, "a", "", ev5)).refused() == null);
+    // Its leader read past a start not logged: refused, and nothing moves.
+    var past = ev5;
+    past.ts = 12;
+    past.after_ts = 11;
+    const r = try triggerStartAt(&f, "b", "", past);
+    try testing.expectEqualStrings(TRIGGER_OUT_OF_ORDER, r.refused().?.refusal.message);
+    try testing.expectEqual(@as(?Run.Value, null), f.get("b"));
+    try testing.expectEqual([5]u64{ 16, 5, 1, 10, 2 }, placeOf(&f));
+    // Right after it: applies.
+    past.after_ts = 10;
+    past.after_seq = 2;
+    try testing.expect((try triggerStartAt(&f, "c", "", past)).refused() == null);
+    try testing.expectEqual([5]u64{ 16, 5, 1, 12, 2 }, placeOf(&f));
+    // The stream made again: the place there is none.
+    var remade: TriggerAt = .{ .ns = 16, .made = 9, .stream = "ev", .ts = 1, .seq = 0, .after_ts = 12, .after_seq = 2 };
+    try testing.expect((try triggerStartAt(&f, "d", "", remade)).refused() != null);
+    remade.after_ts = 0;
+    remade.after_seq = 0;
+    try testing.expect((try triggerStartAt(&f, "d", "", remade)).refused() == null);
+    try testing.expectEqual([5]u64{ 16, 9, 1, 1, 0 }, placeOf(&f));
+    // A start read again, its run started: an idempotency hit, whatever it
+    // says came before.
+    const key = "_trigger:16:9:ev@1:0";
+    _ = try triggerStartAt(&f, "e", key, .{ .ns = 16, .made = 9, .stream = "ev", .ts = 2, .seq = 0, .after_ts = 1, .after_seq = 0 });
+    const again = try triggerStartAt(&f, "g", key, .{ .ns = 16, .made = 9, .stream = "ev", .ts = 2, .seq = 0, .after_ts = 77, .after_seq = 7 });
+    try testing.expect(again.refused() == null);
+    try testing.expectEqual(@as(?Run.Value, null), f.get("g"));
 }
 
 test "workflow runs machine: a child's start past its shard's share is answered over_budget, recording nothing; once memory frees it is recorded" {

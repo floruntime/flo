@@ -232,6 +232,8 @@ pub const WorkflowRuns = struct {
         call_held,
         /// A held call asked for again.
         held_call_retried,
+        /// A trigger's start refused for not following the place logged.
+        trigger_out_of_order,
         /// A child's start its shard answered over its memory share
         /// (reached only under one).
         child_held,
@@ -244,6 +246,14 @@ pub const WorkflowRuns = struct {
     /// stream, or a later making of this one, is a new place; an earlier
     /// making is a stale read and changes nothing; in this making the place
     /// only goes forward.
+    /// Where `place` is in the stream `at` read, as a trigger's start
+    /// checks it: (0, 0) in another stream or making, or none.
+    fn placeIn(place: ?PlaceL, at: PlaceL) struct { u64, u64 } {
+        const p = place orelse return .{ 0, 0 };
+        if (p.ns != at.ns or p.stream != at.stream or p.made != at.made) return .{ 0, 0 };
+        return .{ p.ts, p.seq };
+    }
+
     fn placeAfter(was: ?PlaceL, at: PlaceL) PlaceL {
         const p = was orelse return at;
         if (p.ns != at.ns or p.stream != at.stream) return at;
@@ -604,6 +614,11 @@ pub const WorkflowRuns = struct {
                             return want;
                         };
                         if (l.runs[r] != null) return refuse(.start, "its run exists");
+                        // A trigger's start follows the place logged, or is refused.
+                        if (s.trigger) |t| {
+                            const was = placeIn(if (l.per_def[w]) |per| per.place else null, at.?);
+                            if (was[0] != t.after_ts or was[1] != t.after_seq) return refuseAs(.start, "a trigger's start doesn't follow the place logged", .trigger_out_of_order);
+                        }
                         const disabled = if (defs.ledger[w]) |d| !d.enabled else false;
                         if (disabled) {
                             if (ev == CHILD) {
@@ -1225,16 +1240,29 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
     const ev = r.uintLessThan(usize, EVENTS.len);
     const run = if (ev == CHILD) pending.or_(r, 70, any) else free.or_(r, 75, any);
     const idem: []const u8 = if (ev == CHILD or r.boolean()) "" else IDEMS[r.uintLessThan(usize, IDEMS.len)];
-    // A trigger's start says where it read.
-    const at: ?rm.TriggerAt = if (ev == TRIGGER) .{
-        .ns = T_NS[r.uintLessThan(usize, T_NS.len)],
-        .made = T_MADE[r.uintLessThan(usize, T_MADE.len)],
-        .stream = T_STREAMS[r.uintLessThan(usize, T_STREAMS.len)],
-        .ts = r.uintLessThan(u64, 4),
-        .seq = r.uintLessThan(u64, 2),
+    const w = r.uintLessThan(usize, NAMES.len);
+    // A trigger's start says where it read, and mostly follows the place
+    // the leader has logged, as a leader's chain does; now and then not.
+    const at: ?rm.TriggerAt = if (ev == TRIGGER) blk: {
+        const stream = r.uintLessThan(usize, T_STREAMS.len);
+        var t: rm.TriggerAt = .{
+            .ns = T_NS[r.uintLessThan(usize, T_NS.len)],
+            .made = T_MADE[r.uintLessThan(usize, T_MADE.len)],
+            .stream = T_STREAMS[stream],
+            .ts = r.uintLessThan(u64, 4),
+            .seq = r.uintLessThan(u64, 2),
+            .after_ts = r.uintLessThan(u64, 4),
+            .after_seq = r.uintLessThan(u64, 2),
+        };
+        if (r.uintLessThan(u8, 100) < 80) {
+            const was = WorkflowRuns.placeIn(if (l.per_def[w]) |per| per.place else null, .{ .ns = t.ns, .made = t.made, .stream = stream, .ts = 0, .seq = 0 });
+            t.after_ts = was[0];
+            t.after_seq = was[1];
+        }
+        break :blk t;
     } else null;
     var vb: [160]u8 = undefined;
-    return command(buf, .workflow_start, view_mod.idKey(&kb, NS, RUNS[run]) catch unreachable, startValue(&vb, NAMES[r.uintLessThan(usize, NAMES.len)], EVENTS[ev], idem, at));
+    return command(buf, .workflow_start, view_mod.idKey(&kb, NS, RUNS[run]) catch unreachable, startValue(&vb, NAMES[w], EVENTS[ev], idem, at));
 }
 
 /// A callee's answer to a call (a reply or its end), its step's retry, or

@@ -73,6 +73,9 @@ pub const Plant = enum {
     runs_trigger_made_unchecked,
     /// A trigger's start of an earlier event moves its place back.
     runs_trigger_place_moves_back,
+    /// A trigger's start applies wherever the place logged is, not only right
+    /// after the start before it.
+    runs_trigger_order_unchecked,
     /// A signal that wakes its run leaves the run's rev where it was.
     runs_signal_wake_keeps_rev,
     /// A step's takes leave the signals it took held.
@@ -110,7 +113,7 @@ pub const Plant = enum {
     /// A KV reap drops every key it names, gone or not: it trusts the
     /// leader's clock over the entry's stamp.
     kv_reap_trusts_leader,
-    /// The memory pool counts a family it exempts (workflow runs).
+    /// The memory pool counts a family it exempts (workflow history).
     pool_counts_exempt_family,
     /// Records reach a store without its link, as a loader that skipped the
     /// store's counters would leave them.
