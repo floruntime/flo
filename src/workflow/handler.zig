@@ -2633,7 +2633,12 @@ pub const WorkflowHandler = struct {
             }
             // A step held or not logged is decided again from its applied
             // wait: its timer was popped, and nothing else would wake it.
-            if (self.commitRun(shard, ns_key) == .again) self.armTimer(ns_key, now_ms +| HELD_RECHECK_MS);
+            // The popped entry is replaced, so a run keeps one.
+            switch (self.commitRun(shard, ns_key)) {
+                .held => self.armTimer(ns_key, now_ms +| HELD_RECHECK_MS),
+                .retry => self.armTimer(ns_key, now_ms +| UNLOGGED_RECHECK_MS),
+                .logged, .unchanged, .failed => {},
+            }
         }
     }
 
@@ -2737,9 +2742,14 @@ pub const WorkflowHandler = struct {
     }
 
     const ENDING_RECHECK_MS: i64 = 100;
-    /// How soon a timer's step that was held (its history lane, its
-    /// parent's outbox) or not logged is tried again.
+    /// How soon a timer's step held by its history lane or its parent's
+    /// outbox is tried again: either clears as its outbox drains, within a
+    /// few ticks, as an ending in flight does (`ENDING_RECHECK_MS`).
     const HELD_RECHECK_MS: i64 = 100;
+    /// How soon a timer's step the log didn't take for now (full, or this
+    /// node not leading or halted) is tried again: those last longer than
+    /// a hold, and a retry each tick would only fail again.
+    const UNLOGGED_RECHECK_MS: i64 = 1_000;
 
     /// Which of a run's timers has come due, if any.
     fn timerDue(run: *const RunRecord, now_ms: i64) enum { none, poll, wait } {
@@ -3099,9 +3109,10 @@ pub const WorkflowHandler = struct {
     /// Logs the step the decision on `run_key`'s copy took, at the rev it
     /// was taken at, and drops the copy. A step the log can't take now is
     /// decided again on a later tick: nothing changed.
-    /// Whether a run's step was logged, unchanged (nothing to log), or is
-    /// to be tried again: held, or not logged.
-    const Committed = enum { logged, unchanged, again };
+    /// What came of a run's step: logged; unchanged (nothing to log); held
+    /// (its history lane, its parent's outbox); not logged for now
+    /// (`retry`); or not logged, and won't be (`failed`, said once).
+    const Committed = enum { logged, unchanged, held, retry, failed };
 
     fn commitRun(self: *WorkflowHandler, shard: *Shard, run_key: []const u8) Committed {
         var kv = self.runs.fetchRemove(run_key) orelse return .unchanged;
@@ -3111,10 +3122,16 @@ pub const WorkflowHandler = struct {
         }
         const run = &kv.value;
         const index = self.proposeStep(shard, run) catch |err| {
-            if (err == error.Unchanged) return .unchanged;
-            if (err == error.HeldForParent or err == error.HeldForHistory) return .again;
-            if (!shard.quietHalted(err)) log.warn("shard {d}: workflow run {f}: step not logged: {s}; taken again later", .{ shard.id, shown(run_key), @errorName(err) });
-            return .again;
+            switch (err) {
+                error.Unchanged => return .unchanged,
+                error.HeldForParent, error.HeldForHistory => return .held,
+                // For now: tried again, quietly, as each try would say it.
+                error.Overloaded, error.NotLeader, error.WritesStopped, error.Halted, error.OutOfMemory => return .retry,
+                else => {
+                    if (!shard.quietHalted(err)) log.warn("shard {d}: workflow run {f}: step not logged: {s}", .{ shard.id, shown(run_key), @errorName(err) });
+                    return .failed;
+                },
+            }
         };
         _ = index;
         const owned = self.allocator.dupe(u8, run_key) catch return .logged;
@@ -5867,6 +5884,86 @@ test "workflow duty: a timer due while the history lane holds steps fires once t
         handler.checkPendingActions(&shard);
         settleTest(&shard);
     }
+    try testing.expectEqual(WorkflowHandler.RunStatus.timed_out, handler.inspect(testKey(.default, "due")).?.status);
+}
+
+test "workflow duty: a child's end its timer decided, held for its parent's outbox, is logged once there is room" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    registerTestAction(&shard, "step-a");
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    createTestRun(&handler, testKey(.default, "kid"), "kid", "test-wf");
+    createTestRun(&handler, testKey(.default, "caller"), "caller", "test-wf");
+    // A parent waits on "kid": its end goes to the parent's slot.
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var ks = contract_view.KeySet.init(arena.allocator());
+        var view = contract_view.View.init(&shard.defaultPartition().store, arena.allocator(), &ks);
+        view.strict = false;
+        var kb: [64]u8 = undefined;
+        const k = try contract_view.idKey(&kb, .default, "kid");
+        try view.put(children_mod.Parents, k, .{ .v = .{ .parent_slot = 0, .parent_run = "par", .parent_workflow = "par-wf", .workflow = "test-wf", .version = "", .input = "", .state = .started } });
+        try view.commit();
+    }
+    // Its wait times out to its end.
+    const now = @import("stdx").time.milliTimestamp();
+    testSetWait(&handler, &shard, testKey(.default, "kid"), .{ .signal = "go", .due = now - 1, .to = "flo.Completed" });
+    // The parent's outbox at its cap: one call's start left in it.
+    handler.advanceWorkflow(&shard, testKey(.default, "caller"));
+    settleTest(&shard);
+    shard.outbox_caps = .{ .other = .{ .shard = 1 << 30, .channel = 1 } };
+    try testing.expect(shard.sendWait(0, .main, .default) != null);
+    // Due while held: its end isn't logged, and its timer is armed again.
+    const before = shard.raft_node.log.lastIndex();
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(before, shard.raft_node.log.lastIndex());
+    try testing.expectEqual(@as(usize, 1), handler.timers.count());
+    // Room: its end is logged.
+    shard.outbox_caps = .{};
+    @import("stdx").time.sleep(@as(u64, WorkflowHandler.HELD_RECHECK_MS + 20) * std.time.ns_per_ms);
+    handler.checkPendingActions(&shard);
+    settleTest(&shard);
+    try testing.expectEqual(WorkflowHandler.RunStatus.completed, handler.inspect(testKey(.default, "kid")).?.status);
+}
+
+test "workflow duty: a timer's step the log doesn't take is tried again, once a second, not lost" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    createTestRun(&handler, testKey(.default, "due"), "due", "test-wf");
+    const now = @import("stdx").time.milliTimestamp();
+    testSetWait(&handler, &shard, testKey(.default, "due"), .{ .signal = "go", .due = now - 1 });
+    shard.raft_node.writes_stopped = true;
+    const before = shard.raft_node.log.lastIndex();
+    handler.checkPendingActions(&shard);
+    // Not taken, and armed again, one entry, a second out.
+    try testing.expectEqual(before, shard.raft_node.log.lastIndex());
+    try testing.expectEqual(@as(usize, 1), handler.timers.count());
+    try testing.expect(handler.timers.peek().?.at_ms >= now + WorkflowHandler.UNLOGGED_RECHECK_MS);
+    // Passes before it is due do nothing and add no entry.
+    for (0..5) |_| handler.checkPendingActions(&shard);
+    try testing.expectEqual(@as(usize, 1), handler.timers.count());
+    shard.raft_node.writes_stopped = false;
+    @import("stdx").time.sleep(@as(u64, WorkflowHandler.UNLOGGED_RECHECK_MS + 20) * std.time.ns_per_ms);
+    handler.checkPendingActions(&shard);
+    settleTest(&shard);
     try testing.expectEqual(WorkflowHandler.RunStatus.timed_out, handler.inspect(testKey(.default, "due")).?.status);
 }
 
