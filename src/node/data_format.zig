@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 59;
+pub const CURRENT: u32 = 60;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -214,6 +214,10 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     .{ .format = 58, .segment_version = 42, .entries = 0x5c15d466a01f5d35 },
     // A trigger's start names the place it must find logged.
     .{ .format = 59, .segment_version = 42, .entries = 0x5c15d466a01f5d35 },
+    // Workflow state is charged to the memory pool: a create past a shard's
+    // share is refused and a child's start there answered `over_budget`, so
+    // a log from before would apply differently here.
+    .{ .format = 60, .segment_version = 42, .entries = 0x5c15d466a01f5d35 },
 };
 
 comptime {
