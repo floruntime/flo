@@ -7313,6 +7313,7 @@ pub const Shard = struct {
         if (leads or holds) self.runProducers() else {
             self.duties.clear();
             self.processing_handler.stopLeading(self);
+            if (self.workflow_handler.memory_held > 0) self.workflow_handler.dropHolds(self);
         }
 
         // Shard 0's leader keeps the memory-budget settings rows current. It
@@ -7405,6 +7406,8 @@ pub const Shard = struct {
         // Drive workflow stream triggers (poll streams → start runs) and
         // scheduled ones (interval → start runs), once the caches are built.
         const built = self.workflow_handler.caches_built;
+        // Halted, nothing is held at the share: the halt holds it.
+        if (self.halted != null and self.workflow_handler.memory_held > 0) self.workflow_handler.dropHolds(self);
         if (!self.heldIfHalted(.stream_triggers, self.workflow_handler.stream_triggers.count() > 0)) {
             if (built) self.workflow_handler.tickStreamTriggers(self);
             self.duties.note(.stream_triggers, null, now);
@@ -33899,10 +33902,13 @@ test "Shard: a trigger whose starts its shard's memory share refuses at random, 
     defer t.deinit();
     const store = &t.two.shards[0].defaultPartition().store;
     for ([_]u64{ 1, 2, 3, 4, 5, 6, 7, 8 }) |seed| {
+        errdefer std.debug.print("trigger refusal test failed at seed {d}\n", .{seed});
         var prng = std.Random.DefaultPrng.init(seed);
         const r = prng.random();
         const before = t.runs();
         var appended: usize = 0;
+        var refusals: usize = 0;
+        var resyncs: usize = 0;
         for (0..30) |_| {
             // Events of many sizes: a large one's start refused, a small
             // one's after it fits.
@@ -33927,8 +33933,13 @@ test "Shard: a trigger whose starts its shard's memory share refuses at random, 
             });
             // Its wait out, as if time passed.
             t.trigger().hold.until_ms = 0;
+            const resync = t.trigger().resync_index;
             t.round();
+            if (t.trigger().resync_index != resync) resyncs += 1;
+            if (t.trigger().hold.refusals > 0) refusals += 1;
         }
+        // The share refused some of the starts, part way through a read.
+        try std.testing.expect(refusals > 0 and resyncs > 0);
         try settings.bindForTest(store, std.math.maxInt(u64));
         for (0..8) |_| {
             t.trigger().hold.until_ms = 0;
@@ -33941,6 +33952,24 @@ test "Shard: a trigger whose starts its shard's memory share refuses at random, 
         defer past.deinit(sh.allocator);
         try std.testing.expectEqual(@as(usize, 0), past.payloads.len);
     }
+}
+
+test "Shard: a halted leader holds no trigger at its memory share: the halt holds it" {
+    const settings = @import("../settings/machine.zig");
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    const a = &t.two.shards[0];
+    const store = &a.defaultPartition().store;
+    try settings.bindForTest(store, pool.useOf(store));
+    t.ask();
+    a.workflow_handler.tickSchedules(a);
+    try std.testing.expectEqual(@as(u64, 1), a.workflow_handler.memory_held);
+    a.halted = .{ .index = 1, .term = a.raft_node.current_term, .crc = 0 };
+    defer a.halted = null;
+    a.runProducers();
+    try std.testing.expectEqual(@as(u64, 0), a.workflow_handler.memory_held);
+    try std.testing.expectEqual(@as(?u64, null), t.trigger().hold.share);
 }
 
 test "Shard: a trigger's first start in a new term follows the place logged, so it lands without a resync" {

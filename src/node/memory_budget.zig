@@ -98,11 +98,18 @@ const HISTORY_ROW_BYTES: u64 = pool.RESIDENT_RECORD + 4 + he.MAX_OWNER + he.MAX_
 const HISTORY_LAND_BYTES: u64 = 3 * HISTORY_ROW_BYTES + 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + channels.CHAN_KEY + channels.OUT_NS_KEY + 3 * 64 + he.Index.max_size;
 
 /// What one admitted start sends, which its verdict can't weigh: sends are
-/// written after the machine's verdict. At most one history chunk and, for
-/// a child, its parent's answer, each with its outbox rows. The next entry's
-/// verdict reads them committed, so a shard passes its share by one entry's
-/// sends at most.
-pub const OWN_SENDS_BYTES: u64 = he.Chunk.max_size + 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + channels.CHAN_KEY + channels.OUT_NS_KEY + 3 * 64 + CALL_REPLY_BYTES;
+/// written after the machine's verdict. Its first event, sent at once when
+/// large; for a run that starts ended, its last chunk, which holds no
+/// events then; and for a child, its parent's answer. Each send is an
+/// outbox row, and on a first send to its channel or namespace that
+/// channel's meta row and its per-namespace count. The next entry's verdict
+/// reads them committed, so a shard passes its share by one entry's sends
+/// at most. Loose on purpose: the last chunk goes on the first's channel,
+/// adding only its row, and only a run that starts ended sends one; a
+/// figure that names every send stays an upper bound if that changes.
+/// Pinned by a runs machine test.
+pub const OWN_SENDS_BYTES: u64 = (he.Chunk.max_size + SEND_ROWS_BYTES) + (he.Chunk.max_size - he.MAX_CHUNK_RECORDS + SEND_ROWS_BYTES) + CALL_REPLY_BYTES;
+const SEND_ROWS_BYTES: u64 = 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + channels.CHAN_KEY + channels.OUT_NS_KEY + 3 * 64;
 
 /// A node's reserve: per shard, its floor, its configured ring sizes, the
 /// one inbound it may take past its share and one start's sends; plus a

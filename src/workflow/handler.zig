@@ -200,7 +200,7 @@ pub const WorkflowHandler = struct {
     /// Where the next pass over parent records resumes.
     child_scan_after: std.ArrayListUnmanaged(u8) = .empty,
     /// The schedules and triggers this shard last counted held.
-    duties_held: u64 = 0,
+    memory_held: u64 = 0,
     /// Holds said in the log, one per episode.
     holds_said: u64 = 0,
 
@@ -531,29 +531,38 @@ pub const WorkflowHandler = struct {
         term: u64 = 0,
         refusals: u32 = 0,
         until_ms: i64 = std.math.minInt(i64),
-        /// The share it is held at; null while it isn't held.
+        /// The share it is held at, at it or waiting after a refusal there;
+        /// null while it isn't held.
         share: ?u64 = null,
-        /// Said in the log this episode: from its first hold until a run of
-        /// it starts or the term moves, however often the share is passed.
-        said: bool = false,
+        /// Said in the log until then: at most once a minute, however often
+        /// a shard hovering at its share holds it, and across a new term.
+        said_until_ms: i64 = std.math.minInt(i64),
+
+        const SAY_EVERY_MS: i64 = 60_000;
+
+        /// Begun again, in `term`: what was said stands.
+        fn reset(h: *MemoryHold, term: u64) void {
+            h.* = .{ .term = term, .said_until_ms = h.said_until_ms };
+        }
 
         /// Whether it waits out a refusal now, in `term`.
         fn waiting(h: *MemoryHold, term: u64, now_ms: i64) bool {
-            if (h.term != term) h.* = .{ .term = term };
+            if (h.term != term) h.reset(term);
             return now_ms < h.until_ms;
         }
 
-        /// Held at `share`; true once an episode, to be said.
-        fn held(h: *MemoryHold, share: u64) bool {
+        /// Held at `share`; true when it is to be said.
+        fn held(h: *MemoryHold, share: u64, now_ms: i64) bool {
             h.share = share;
-            defer h.said = true;
-            return !h.said;
+            if (now_ms < h.said_until_ms) return false;
+            h.said_until_ms = now_ms +| SAY_EVERY_MS;
+            return true;
         }
 
         /// A start of it refused for memory in `term`: it waits.
         fn refused(h: *MemoryHold, term: u64, now_ms: i64, share: u64) bool {
-            if (h.term != term) h.* = .{ .term = term };
-            const first = h.held(share);
+            if (h.term != term) h.reset(term);
+            const first = h.held(share, now_ms);
             h.refusals +|= 1;
             h.until_ms = now_ms +| @as(i64, @intCast(callRetryMs(h.refusals)));
             return first;
@@ -3662,10 +3671,12 @@ pub const WorkflowHandler = struct {
         // A redefinition replaces the schedule; the slots it fired stay
         // fired.
         var fired_ms: i64 = std.math.minInt(i64);
+        var hold: MemoryHold = .{};
         if (self.schedules.fetchRemove(sched_key)) |old| {
             self.allocator.free(old.key);
             var state = old.value;
             fired_ms = state.fired_ms;
+            hold = state.hold;
             self.freeScheduleState(&state);
         }
 
@@ -3688,6 +3699,7 @@ pub const WorkflowHandler = struct {
             .input_owned = owned_input,
             .anchor_ms = anchor_ms,
             .fired_ms = fired_ms,
+            .hold = hold,
         }) catch {
             self.allocator.free(sched_key);
             self.allocator.free(owned_wf);
@@ -3742,13 +3754,16 @@ pub const WorkflowHandler = struct {
             if (schedule.proposed_term == term and slot <= schedule.proposed_ms) continue;
 
             // Skip disabled workflows
-            if (self.isDisabled(entry.key_ptr.*)) continue;
+            if (self.isDisabled(entry.key_ptr.*)) {
+                schedule.hold.clear();
+                continue;
+            }
 
             // Held at the share: the slot fires, once and late, when memory
             // frees, as one missed while no leader was ready.
             if (schedule.hold.waiting(term, now_ms)) continue;
             if (at_share) |o| {
-                if (schedule.hold.held(o.share)) self.noteStartsHeld("schedule", schedule.ns, schedule.workflow_name_owned, shard.id, o.share);
+                if (schedule.hold.held(o.share, now_ms)) self.noteStartsHeld("schedule", schedule.ns, schedule.workflow_name_owned, shard.id, o.share);
                 continue;
             }
             schedule.hold.clear();
@@ -3768,7 +3783,18 @@ pub const WorkflowHandler = struct {
 
     fn noteStartsHeld(self: *WorkflowHandler, what: []const u8, ns: NamespaceId, workflow: []const u8, shard_id: u16, share: u64) void {
         self.holds_said += 1;
-        log.warn("workflow {s} (namespace {d}): its {s} starts no run while shard {d} is at its memory share ({d} bytes); it starts again once memory frees", .{ workflow, ns.int(), what, shard_id, share });
+        log.warn("workflow {s} (namespace {d}): its {s} holds its starts while shard {d} is at its memory share ({d} bytes); they go on once memory frees", .{ workflow, ns.int(), what, shard_id, share });
+    }
+
+    /// This node no longer runs the duties (it stepped down, or its shard
+    /// halted): none is held at the share here, and the gauge drops this
+    /// shard's count. The next term that leads begins its holds again.
+    pub fn dropHolds(self: *WorkflowHandler, shard: *Shard) void {
+        var sit = self.schedules.valueIterator();
+        while (sit.next()) |s| s.hold.reset(0);
+        var tit = self.stream_triggers.valueIterator();
+        while (tit.next()) |t| t.hold.reset(0);
+        self.countDutiesHeld(shard);
     }
 
     /// The schedules and triggers held at the share, into the gauge: each
@@ -3779,9 +3805,9 @@ pub const WorkflowHandler = struct {
         while (sit.next()) |s| n += @intFromBool(s.hold.share != null);
         var tit = self.stream_triggers.valueIterator();
         while (tit.next()) |t| n += @intFromBool(t.hold.share != null);
-        defer self.duties_held = n;
+        defer self.memory_held = n;
         const m = shard.metrics_registry orelse return;
-        if (n > self.duties_held) _ = m.workflow.duties_held.fetchAdd(n - self.duties_held, .monotonic) else _ = m.workflow.duties_held.fetchSub(self.duties_held - n, .monotonic);
+        if (n > self.memory_held) _ = m.workflow.duties_memory_held.fetchAdd(n - self.memory_held, .monotonic) else _ = m.workflow.duties_memory_held.fetchSub(self.memory_held - n, .monotonic);
     }
 
     /// Start a workflow run for a schedule's slot. Its idempotency key
@@ -3832,12 +3858,15 @@ pub const WorkflowHandler = struct {
             }
 
             // Skip disabled workflows
-            if (self.isDisabled(entry.key_ptr.*)) continue;
+            if (self.isDisabled(entry.key_ptr.*)) {
+                trigger.hold.clear();
+                continue;
+            }
 
             // Held at the share: its place stays where it is.
             if (trigger.hold.waiting(shard.raft_node.current_term, now_ms)) continue;
             if (at_share) |o| {
-                if (trigger.hold.held(o.share)) self.noteStartsHeld("trigger", trigger.ns, trigger.workflow_name_owned, shard.id, o.share);
+                if (trigger.hold.held(o.share, now_ms)) self.noteStartsHeld("trigger", trigger.ns, trigger.workflow_name_owned, shard.id, o.share);
                 continue;
             }
             trigger.hold.clear();
@@ -4456,6 +4485,8 @@ pub const WorkflowHandler = struct {
         if (e.header.term != lead.term) return;
         const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return;
         const s = runs_machine.Start.parse(cmd.value) orelse return;
+        // A client's or a child's start: its leader keeps nothing of it.
+        if (s.trigger == null and !std.mem.eql(u8, s.event, "schedule_started")) return;
         if (cmd.key.len < KEY_PREFIX) return;
         const key = self.nsKey(keyNamespace(cmd.key), s.workflow) orelse return;
         defer self.allocator.free(key);
@@ -4467,10 +4498,10 @@ pub const WorkflowHandler = struct {
         if (s.trigger != null) {
             const trigger = self.stream_triggers.getPtr(key) orelse return;
             if (out.refused() != null) return self.triggerRefused(trigger, e, lead, memory, now_ms);
-            if (made and e.header.index > trigger.resync_index) trigger.hold = .{};
+            if (made and e.header.index > trigger.resync_index) trigger.hold.reset(lead.term);
         } else if (std.mem.eql(u8, s.event, "schedule_started")) {
             const schedule = self.schedules.getPtr(key) orelse return;
-            if (made) schedule.hold = .{};
+            if (made) schedule.hold.reset(lead.term);
             if (!memory) return;
             // Its slot may be proposed again, once its wait is out.
             const idem = s.idem orelse return;
@@ -9214,14 +9245,14 @@ test "workflow schedule: at its shard's memory share a slot isn't proposed; refu
     handler.tickSchedules(&shard);
     try testing.expectEqual(before, shard.raft_node.log.lastIndex());
     try testing.expect(sched.hold.share != null);
-    try testing.expectEqual(@as(u64, 1), handler.duties_held);
+    try testing.expectEqual(@as(u64, 1), handler.memory_held);
 
     // Memory frees: the latest slot is proposed.
     try settings.bindForTest(store, std.math.maxInt(u64));
     handler.tickSchedules(&shard);
     try testing.expectEqual(before + 1, shard.raft_node.log.lastIndex());
     try testing.expectEqual(latest, sched.proposed_ms);
-    try testing.expectEqual(@as(u64, 0), handler.duties_held);
+    try testing.expectEqual(@as(u64, 0), handler.memory_held);
 
     // Refused at apply for memory: the slot is free to propose again, after
     // a wait. Another term's refusal, or another slot's, changes nothing.
@@ -9358,7 +9389,7 @@ test "workflow handler: at its shard's memory share a trigger reads nothing, its
     try testing.expectEqual(@as(i64, 0), t.last_poll_ms);
     try testing.expect(t.hold.share != null);
     handler.tickSchedules(&shard);
-    try testing.expectEqual(@as(u64, 1), handler.duties_held);
+    try testing.expectEqual(@as(u64, 1), handler.memory_held);
     // Held five ticks: said once.
     try testing.expectEqual(@as(u64, 1), handler.holds_said);
     try settings.bindForTest(store, std.math.maxInt(u64));
@@ -9366,17 +9397,40 @@ test "workflow handler: at its shard's memory share a trigger reads nothing, its
     handler.tickStreamTriggers(&shard);
     try testing.expectEqual(@as(?u64, null), t.hold.share);
     handler.tickSchedules(&shard);
-    try testing.expectEqual(@as(u64, 0), handler.duties_held);
+    try testing.expectEqual(@as(u64, 0), handler.memory_held);
     // At the share again before a run of it started: the same episode.
     try settings.bindForTest(store, pool.useOf(store));
     handler.triggers_dirty = true;
     handler.tickStreamTriggers(&shard);
     try testing.expectEqual(@as(u64, 1), handler.holds_said);
-    // A new term is a new episode.
+    // A new term within the minute: not said again.
     shard.raft_node.current_term += 1;
     handler.triggers_dirty = true;
     handler.tickStreamTriggers(&shard);
+    try testing.expectEqual(@as(u64, 1), handler.holds_said);
+    // Past it: said again.
+    t.hold.said_until_ms = 0;
+    handler.triggers_dirty = true;
+    handler.tickStreamTriggers(&shard);
     try testing.expectEqual(@as(u64, 2), handler.holds_said);
+    // The node steps down: nothing of it is held here, the gauge drops.
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(@as(u64, 1), handler.memory_held);
+    handler.dropHolds(&shard);
+    try testing.expectEqual(@as(u64, 0), handler.memory_held);
+    try testing.expectEqual(@as(?u64, null), t.hold.share);
+}
+
+test "workflow schedule: re-created, a schedule keeps its hold, as a trigger does" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    try handler.registerSchedule(TEST_NS_A, "wf", .{ .interval_ms = 60_000, .max_concurrent = 0 }, 0);
+    handler.schedules.getPtr(testKey(TEST_NS_A, "wf")).?.hold = .{ .term = 3, .refusals = 2, .until_ms = 99, .share = 7, .said_until_ms = 5 };
+    try handler.registerSchedule(TEST_NS_A, "wf", .{ .interval_ms = 30_000, .max_concurrent = 0 }, 10);
+    const h = handler.schedules.getPtr(testKey(TEST_NS_A, "wf")).?.hold;
+    try testing.expectEqual(@as(u32, 2), h.refusals);
+    try testing.expectEqual(@as(i64, 5), h.said_until_ms);
 }
 
 test "a child its shard is at its memory share for is answered over_budget by its leader, not started, and its parent waits" {

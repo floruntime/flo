@@ -2286,3 +2286,26 @@ test "workflow runs machine: a child's start its parent's record no longer waits
     try testing.expect(f.get("stray") == null);
     try testing.expectEqual(sent, f.store.families[channels.OutFam.ID].count);
 }
+
+test "workflow runs machine: what a start sends after its verdict, a run that starts ended with its largest first event, is within the reserve's term for it" {
+    const pool = @import("../budget/pool.zig");
+    const memory_budget = @import("../node/memory_budget.zig");
+    var f = Fixture.init();
+    defer f.deinit();
+    try f.create("wf");
+    // Its input as large as a first event the history takes at once.
+    const input = try testing.allocator.alloc(u8, 60 * 1024);
+    defer testing.allocator.free(input);
+    @memset(input, 'x');
+    var kb: [64]u8 = undefined;
+    const vb = try testing.allocator.alloc(u8, input.len + 512);
+    defer testing.allocator.free(vb);
+    const value = (Start{ .workflow = "wf", .version = "1", .status = .completed, .event = "workflow_started", .idem = null, .input = input }).encode(vb).?;
+    const before = pool.useOf(&f.store) - pool.dataUseOf(&f.store);
+    const r = try f.command(.workflow_start, view_mod.idKey(&kb, .default, "big") catch unreachable, value, 1);
+    try testing.expect(r.refused() == null);
+    const sent = pool.useOf(&f.store) - pool.dataUseOf(&f.store) - before;
+    // Two chunks went: the first event, then the run's last.
+    try testing.expect(sent > input.len);
+    try testing.expect(sent <= memory_budget.OWN_SENDS_BYTES);
+}
