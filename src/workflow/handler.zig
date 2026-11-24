@@ -8628,7 +8628,7 @@ test "a child its shard holds over its memory share is waited for, though its st
     // Memory frees: asked again, the child starts.
     try settings.bindForTest(&shard.defaultPartition().store, 1 << 40);
     handler.retryCall(&shard, run, kid_id, c, @import("stdx").time.milliTimestamp());
-    handler.commitRun(&shard, testKey(.default, "par"));
+    try testing.expectEqual(WorkflowHandler.Committed.logged, handler.commitRun(&shard, testKey(.default, "par")));
     settleTest(&shard);
     startTestChildren(&handler, &shard);
     const again = handler.inspect(testKey(.default, "par")).?.*;
