@@ -1148,6 +1148,8 @@ fn applyParent(view: *View, e: *const Entry, n: Named) ApplyError!void {
             }
             // Held to the share against the use before its inbound, as an
             // action's call is: the parent's step waits and asks again.
+            // Every variable field is a slice of the start's payload, which
+            // the inbound reserve counts; one that isn't must grow it.
             const mark = view.mark();
             try view.put(Parents, k, .{ .v = .{
                 .parent_slot = p.parent_slot,
