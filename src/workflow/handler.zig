@@ -1800,7 +1800,7 @@ pub const WorkflowHandler = struct {
         if (self.runs.getPtr(run_ns_key)) |run| return self.advanceCopy(shard, run_ns_key, run);
         const run = self.takeRun(shard, run_ns_key) orelse return;
         if (run.ending == null and !self.endingInFlight(shard, run_ns_key)) self.advanceCopy(shard, run_ns_key, run);
-        self.commitRun(shard, run_ns_key);
+        _ = self.commitRun(shard, run_ns_key);
     }
 
     fn advanceCopy(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8, run: *RunRecord) void {
@@ -2593,7 +2593,7 @@ pub const WorkflowHandler = struct {
                         continue;
                     };
                     if (self.callSettled(shard, run, rid, now_ms)) self.resumeFromAction(shard, ns_key, now_ms);
-                    self.commitRun(shard, ns_key);
+                    _ = self.commitRun(shard, ns_key);
                     // Not logged (the log was full): looked at again.
                     if (self.steppingAt(shard, ns_key) == null) self.indexKey(&self.call_dirty, ns_key);
                 },
@@ -2631,7 +2631,9 @@ pub const WorkflowHandler = struct {
                 },
                 .wait => self.handleWaitTimeout(shard, ns_key, now_ms),
             }
-            self.commitRun(shard, ns_key);
+            // A step held or not logged is decided again from its applied
+            // wait: its timer was popped, and nothing else would wake it.
+            if (self.commitRun(shard, ns_key) == .again) self.armTimer(ns_key, now_ms +| HELD_RECHECK_MS);
         }
     }
 
@@ -2735,6 +2737,9 @@ pub const WorkflowHandler = struct {
     }
 
     const ENDING_RECHECK_MS: i64 = 100;
+    /// How soon a timer's step that was held (its history lane, its
+    /// parent's outbox) or not logged is tried again.
+    const HELD_RECHECK_MS: i64 = 100;
 
     /// Which of a run's timers has come due, if any.
     fn timerDue(run: *const RunRecord, now_ms: i64) enum { none, poll, wait } {
@@ -3094,26 +3099,32 @@ pub const WorkflowHandler = struct {
     /// Logs the step the decision on `run_key`'s copy took, at the rev it
     /// was taken at, and drops the copy. A step the log can't take now is
     /// decided again on a later tick: nothing changed.
-    fn commitRun(self: *WorkflowHandler, shard: *Shard, run_key: []const u8) void {
-        var kv = self.runs.fetchRemove(run_key) orelse return;
+    /// Whether a run's step was logged, unchanged (nothing to log), or is
+    /// to be tried again: held, or not logged.
+    const Committed = enum { logged, unchanged, again };
+
+    fn commitRun(self: *WorkflowHandler, shard: *Shard, run_key: []const u8) Committed {
+        var kv = self.runs.fetchRemove(run_key) orelse return .unchanged;
         defer {
             self.freeRunRecord(&kv.value);
             self.allocator.free(kv.key);
         }
         const run = &kv.value;
         const index = self.proposeStep(shard, run) catch |err| {
-            if (err == error.Unchanged or err == error.HeldForParent or err == error.HeldForHistory) return;
+            if (err == error.Unchanged) return .unchanged;
+            if (err == error.HeldForParent or err == error.HeldForHistory) return .again;
             if (!shard.quietHalted(err)) log.warn("shard {d}: workflow run {f}: step not logged: {s}; taken again later", .{ shard.id, shown(run_key), @errorName(err) });
-            return;
+            return .again;
         };
         _ = index;
-        const owned = self.allocator.dupe(u8, run_key) catch return;
+        const owned = self.allocator.dupe(u8, run_key) catch return .logged;
         const gop = self.stepping.getOrPut(self.allocator, owned) catch {
             self.allocator.free(owned);
-            return;
+            return .logged;
         };
         if (gop.found_existing) self.allocator.free(owned);
         gop.value_ptr.* = run.rev;
+        return .logged;
     }
 
     /// The `workflow_step` value for `run`'s copy, proposed.
@@ -4392,7 +4403,7 @@ pub const WorkflowHandler = struct {
     pub fn endRunForTests(self: *WorkflowHandler, shard: *Shard, run_key: []const u8, status: RunStatus, detail: []const u8) void {
         const run = self.takeRun(shard, run_key) orelse return;
         self.completeRun(shard, run_key, run, status, detail, 0);
-        self.commitRun(shard, run_key);
+        _ = self.commitRun(shard, run_key);
     }
 
     /// For tests: `run`'s history, all of it, as a read with no deadline
@@ -5659,7 +5670,7 @@ test "step executor: a step whose action isn't registered doesn't give up while 
     handler.retryCall(&shard, run, rid, WorkflowHandler.callOf(&shard, run, rid).?, @import("stdx").time.milliTimestamp());
     try testing.expect(run.call_retry_index > shard.raft_node.last_applied);
     // Logged with the decision's step, as the duty would.
-    handler.commitRun(&shard, testKey(.default, "run-r"));
+    _ = handler.commitRun(&shard, testKey(.default, "run-r"));
     handler.checkPendingActions(&shard);
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.inspect(testKey(.default, "run-r")).?.status);
     // Applied, and answered again (no action): now it gives up.
@@ -5821,6 +5832,42 @@ test "workflow duty: a timer fires when due, and one the run moved past is dropp
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.inspect(testKey(.default, "later")).?.status);
     // The later one's timer is still held.
     try testing.expectEqual(@as(usize, 1), handler.timers.count());
+}
+
+test "workflow duty: a timer due while the history lane holds steps fires once the lane drains" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    createTestRun(&handler, testKey(.default, "due"), "due", "test-wf");
+    createTestRun(&handler, testKey(.default, "noisy"), "noisy", "test-wf");
+    const now = @import("stdx").time.milliTimestamp();
+    testSetWait(&handler, &shard, testKey(.default, "due"), .{ .signal = "go", .due = now - 1 });
+    // Another run's chunks on the lane, past its cap: steps wait.
+    shard.outbox_caps.other.channel = 64;
+    signalTestRun(&handler, testKey(.default, "noisy"), 4, 1000);
+    try testing.expect(shard.historyWait(.default) != null);
+    // Its timer comes due while steps wait: its step is held, and its
+    // timer armed again, not lost.
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.inspect(testKey(.default, "due")).?.status);
+    try testing.expectEqual(@as(usize, 1), handler.timers.count());
+    @import("stdx").time.sleep(@as(u64, WorkflowHandler.HELD_RECHECK_MS + 20) * std.time.ns_per_ms);
+    // Drained: the wait it timed out of ends it.
+    settleTest(&shard);
+    try testing.expect(shard.historyWait(.default) == null);
+    for (0..3) |_| {
+        handler.checkPendingActions(&shard);
+        settleTest(&shard);
+    }
+    try testing.expectEqual(WorkflowHandler.RunStatus.timed_out, handler.inspect(testKey(.default, "due")).?.status);
 }
 
 test "workflow duty: a run with two timers due fires once" {
@@ -7628,7 +7675,7 @@ fn testSetWait(handler: *WorkflowHandler, shard: *Shard, key: []const u8, w: Tes
     run.wait_timeout_target_owned = if (w.to) |t| a.dupe(u8, t) catch unreachable else null;
     run.wait_timeout_at_ms = w.due;
     run.poll_next_at_ms = w.poll;
-    handler.commitRun(shard, key);
+    _ = handler.commitRun(shard, key);
     settleTest(shard);
 }
 
@@ -7650,7 +7697,7 @@ fn testEnd(handler: *WorkflowHandler, shard: *Shard, key: []const u8, status: Wo
 fn testEndProposed(handler: *WorkflowHandler, shard: *Shard, key: []const u8, status: WorkflowHandler.RunStatus, detail: []const u8) void {
     const run = handler.takeRun(shard, key) orelse return;
     handler.completeRun(shard, key, run, status, detail, 0);
-    handler.commitRun(shard, key);
+    _ = handler.commitRun(shard, key);
 }
 
 /// Run `key` as a read shows it.
@@ -8004,13 +8051,13 @@ test "step executor: a call its action's shard holds over its memory share waits
     // Memory frees: asked again, it starts.
     try settings.bindForTest(&shard.defaultPartition().store, 1 << 40);
     handler.retryCall(&shard, run, rid, c, @import("stdx").time.milliTimestamp());
-    handler.commitRun(&shard, testKey(.default, "run-m"));
+    _ = handler.commitRun(&shard, testKey(.default, "run-m"));
     settleTest(&shard);
     const again = handler.takeRun(&shard, testKey(.default, "run-m")).?;
     try testing.expectEqual(calls_mod.State.started, WorkflowHandler.callOf(&shard, again, again.pending_action_run_id_owned.?).?.state);
     // The ask again added nothing to history.
     held = 0;
-    handler.commitRun(&shard, testKey(.default, "run-m"));
+    _ = handler.commitRun(&shard, testKey(.default, "run-m"));
     settleTest(&shard);
     for (handler.inspect(testKey(.default, "run-m")).?.history.items) |evt| {
         try testing.expect(!std.mem.eql(u8, evt.event_type_owned, "action_call_retry"));
@@ -8273,7 +8320,7 @@ test "workflow history: past its history lane's cap, a shard holds new runs and 
     try testing.expect(handler.proposeRun(&shard, .default, "run-r", "test-wf", "latest", "{}", null, "schedule_started") == null);
     const run = handler.takeRun(&shard, key).?;
     try testing.expectError(error.HeldForHistory, handler.proposeStep(&shard, run));
-    handler.commitRun(&shard, key);
+    _ = handler.commitRun(&shard, key);
     try testing.expect(handler.steppingAt(&shard, key) == null);
     // Drained: both go.
     settleTest(&shard);
