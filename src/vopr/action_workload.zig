@@ -30,10 +30,9 @@ const DEAD = "x";
 const SLOW = "s";
 /// Past a preview: one in sixteen workers' names and errors are this
 /// long, so their history events are cut. Chosen by the entry's id, not
-/// drawn, though their size still changes what a memory share refuses.
-/// Rare, so a memory-gated swarm isn't held at its share by them: at one
-/// in four, a run kept near full was refused and retried four times as
-/// long.
+/// drawn. Not under a memory share: their size changes what it refuses,
+/// and so the whole run, which then reaches a takeover's settles and
+/// expires in fewer seeds; the plain swarm cuts them.
 const PAD: [action_machine.PREVIEW + 44]u8 = @splat('-');
 
 fn long(tag: []const u8) bool {
@@ -48,6 +47,8 @@ pub const Leader = struct {
     term_since_ns: u64,
     /// Its term, where a workload needs it.
     term: u64 = 0,
+    /// Whether some workers' names and errors are past a preview (`long`).
+    long_values: bool = false,
 };
 
 pub const Made = struct { entry_type: EntryType, payload: []const u8 };
@@ -187,7 +188,7 @@ fn deliver(a: *families.Actions, out: []u8, l: Leader, r: std.Random, spoil: boo
         .holder = try std.fmt.bufPrint(&hb, "{s}{s}", .{ switch (r.uintLessThan(u8, 5)) {
             0, 1 => DEAD,
             2 => SLOW,
-            else => if (long(tag)) "w" ++ &PAD else "w",
+            else => if (l.long_values and long(tag)) "w" ++ &PAD else "w",
         }, tag }),
         .request_key = if (r.uintLessThan(u8, 3) == 0) try std.fmt.bufPrint(&kb, "k{d}", .{r.uintLessThan(u8, 4)}) else null,
         .lease_ms = d.lease_ms,
@@ -253,7 +254,7 @@ fn report(a: *families.Actions, out: []u8, kind: Kind, l: Leader, r: std.Random,
             .abandoned = r.uintLessThan(u8, 4) == 0,
             .retry = r.uintLessThan(u8, 4) != 0,
             .delay_ms = if (r.boolean()) 0 else r.uintLessThan(u64, 3_000),
-            .@"error" = try std.fmt.bufPrint(&eb, "e{s}{s}", .{ if (long(tag)) @as([]const u8, &PAD) else "", tag }),
+            .@"error" = try std.fmt.bufPrint(&eb, "e{s}{s}", .{ if (l.long_values and long(tag)) @as([]const u8, &PAD) else "", tag }),
         }),
         else => try ae.Extend.encodeInto(out, .{
             .ns = NS.int(),

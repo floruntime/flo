@@ -2163,7 +2163,7 @@ pub const Simulator = struct {
             target.actions_term = target.raft.current_term;
             target.actions_term_since_ns = now;
         }
-        const leader: action_workload.Leader = .{ .now_ns = now, .term_since_ns = target.actions_term_since_ns };
+        const leader: action_workload.Leader = .{ .now_ns = now, .term_since_ns = target.actions_term_since_ns, .long_values = self.scenario.memory_share == 0 };
         const op_id = self.workload.next_op_id;
         const made = action_workload.make(&target.actions, leader, self.action_prng.random(), op_id, self.action_buf, self.scenario.payload_max) orelse return;
         const id = try self.workload.nextActionOp(made.entry_type, made.payload);
