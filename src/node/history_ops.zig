@@ -44,6 +44,10 @@ pub const Ops = struct {
     }
 };
 
+/// The most of a read's scratch kept for the next: a page or two of small
+/// events; a larger read's is freed as the next begins.
+pub const SCRATCH_KEPT: usize = 256 << 10;
+
 /// The answer's events live in the shard's history scratch until the next
 /// read, which is after the table encodes this one.
 fn asked(shard: *Shard, conn: *Connection, req: Request, family: he.Family, q: history.Query) Ops.Error!table_run.Outcome(Response) {
@@ -51,8 +55,10 @@ fn asked(shard: *Shard, conn: *Connection, req: Request, family: he.Family, q: h
     // that namespace only.
     var kb: [history.KEY_LEN]u8 = undefined;
     const key = history.waiterKey(&kb, family, req.ns_id, req.key) catch return error.NotFound;
+    // What a large read took isn't kept past the next: the budget holds
+    // only `SCRATCH_KEPT`.
     const scratch = &shard.history_scratch;
-    _ = scratch.reset(.retain_capacity);
+    _ = scratch.reset(.{ .retain_with_limit = SCRATCH_KEPT });
     switch (try readOf(shard, scratch.allocator(), family, key[1..], q, false)) {
         .page => |p| return .{ .answer = try history.response(scratch.allocator(), p) },
         .disk_late => return error.DiskLate,

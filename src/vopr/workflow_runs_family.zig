@@ -316,7 +316,7 @@ pub const WorkflowRuns = struct {
     /// Replay re-applies from the start: the ledger goes with the store.
     pub fn reset(self: *WorkflowRuns) void {
         self.ledger = .{};
-        self.landed.clear();
+        self.landed.clear(self.scratch.child_allocator);
     }
 
     pub fn owns(entry_type: u8) bool {

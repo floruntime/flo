@@ -20137,7 +20137,7 @@ test "Shard: a run's history read that meets a blocked disk read stops, answered
     }
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const landed = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, .{}, 10);
+    const landed = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, .{}, 10, std.math.maxInt(usize));
     try std.testing.expectEqual(@as(usize, 1), landed.pieces.len);
     // Pushed out of the ring and the warm store, onto disk only.
     for (0..80) |_| {
@@ -20149,13 +20149,13 @@ test "Shard: a run's history read that meets a blocked disk read stops, answered
     // tried again, and says nothing of it as lost.
     s.durable_log.?.test_open_error = error.SystemResources;
     // Asked for, its read fails; asked again, it is held back.
-    var held = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, .{}, 10);
+    var held = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, .{}, 10, std.math.maxInt(usize));
     var tries: usize = 0;
     while (s.stream_handler.held != .blocked and tries < 2_000) : (tries += 1) {
         try std.testing.expect(held.pending);
         _ = s.stream_disk.?.drain();
         @import("stdx").time.sleep(std.time.ns_per_ms);
-        held = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, .{}, 10);
+        held = try s.stream_handler.readHistory(arena.allocator(), .action, .default, "act", "r1", 3, 77, .{}, 10, std.math.maxInt(usize));
     }
     try std.testing.expect(s.stream_handler.held == .blocked);
     try std.testing.expect(held.pending);
@@ -22876,6 +22876,30 @@ test "actions: an action run's history reads back whole, a page at a time by its
     const newest = try history_read.Response.decodeAll((try t.ok(.action_history, run_id, try R.encodeInto(&rb, .{ .limit = 1, .cursor = null, .newest_first = true }))).data, &diag);
     it = newest.events.iterator();
     try std.testing.expectEqualStrings(action_machine.EV_ENDED, (try it.next()).?.event_type);
+}
+
+test "actions: a direct invoke is refused overloaded, not run, while its namespace's history waits on the lane, and goes once it drains" {
+    var t: ActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    t.shard.outbox_caps = .{ .other = .{ .shard = 1 << 30, .channel = 400 } };
+    _ = try t.ok(.action_register, "act", "");
+    // An input over half a chunk goes to the lane as it is invoked, past
+    // twice the cap.
+    var value: [1 + 3000]u8 = @splat('i');
+    value[0] = 0;
+    _ = try t.ok(.action_invoke, "act", &value);
+    try std.testing.expect(t.shard.historyWait(.default) != null);
+    const last = t.shard.raft_node.log.lastIndex();
+    const held = try t.call(.action_invoke, "act", &value);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), held.header.status);
+    const why = try held.refused();
+    try std.testing.expectEqual(proto.Ran.no, why.ran);
+    try std.testing.expect(std.mem.indexOf(u8, why.message, "history") != null);
+    try std.testing.expectEqual(last, t.shard.raft_node.log.lastIndex());
+    try ParkTest.deliverOwn(&t.shard);
+    try std.testing.expect(t.shard.historyWait(.default) == null);
+    _ = try t.ok(.action_invoke, "act", &value);
 }
 
 test "actions: an await with block_ms 0 answers at once with no task; one that waits is answered when a run is invoked" {
@@ -31897,14 +31921,14 @@ test "Shard: a run's history, sent to its own shard as it goes and folded, reads
         pumpChannels(&two);
         // Live, halfway: what landed so far, in order.
         if (i + 1 == 10) {
-            const live = try a.stream_handler.readHistory(arena.allocator(), .action, .default, owner, "r1", 5, null, .{}, 100);
+            const live = try a.stream_handler.readHistory(arena.allocator(), .action, .default, owner, "r1", 5, null, .{}, 100, std.math.maxInt(usize));
             try std.testing.expect(!live.pending);
             try std.testing.expectEqual(@as(usize, 10), live.pieces.len);
             for (live.pieces, 1..) |piece, n| try std.testing.expectEqual(@as(u64, n), piece.first_seq);
         }
     }
     for (0..4) |_| pumpChannels(&two);
-    const read = try a.stream_handler.readHistory(arena.allocator(), .action, .default, owner, "r1", 5, 4242, .{}, 100);
+    const read = try a.stream_handler.readHistory(arena.allocator(), .action, .default, owner, "r1", 5, 4242, .{}, 100, std.math.maxInt(usize));
     try std.testing.expect(!read.pending);
     try std.testing.expectEqual(@as(usize, CHUNKS), read.pieces.len);
     for (read.pieces, 1..) |piece, n| {
@@ -31914,7 +31938,7 @@ test "Shard: a run's history, sent to its own shard as it goes and folded, reads
         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want, "chunk-{d:0>2}", .{n}), piece.records);
     }
     // A limit stops the walk where it says.
-    const some = try a.stream_handler.readHistory(arena.allocator(), .action, .default, owner, "r1", 5, 4242, .{}, 3);
+    const some = try a.stream_handler.readHistory(arena.allocator(), .action, .default, owner, "r1", 5, 4242, .{}, 3, std.math.maxInt(usize));
     try std.testing.expectEqual(@as(usize, 3), some.pieces.len);
     try std.testing.expectEqual(@as(u64, 3), some.pieces[2].last_seq);
     // The ended run is one row.
@@ -31964,10 +31988,10 @@ test "Shard: a run's history, sent to its own shard as it goes and folded, reads
         stolen.last_seq = 20;
         try view2.put(hm.Actions, borrowed, .{ .v = stolen });
         try view2.commit();
-        const other = try a.stream_handler.readHistory(al, .action, .default, owner, "r4", 8, null, .{}, 10);
+        const other = try a.stream_handler.readHistory(al, .action, .default, owner, "r4", 8, null, .{}, 10, std.math.maxInt(usize));
         try std.testing.expectEqual(@as(usize, 1), other.pieces.len);
         try std.testing.expect(other.pieces[0].lost);
-        const lost = try a.stream_handler.readHistory(al, .action, .default, owner, "r3", 7, null, .{}, 10);
+        const lost = try a.stream_handler.readHistory(al, .action, .default, owner, "r3", 7, null, .{}, 10, std.math.maxInt(usize));
         try std.testing.expect(!lost.pending);
         try std.testing.expectEqual(@as(usize, 2), lost.pieces.len);
         for (lost.pieces) |piece| try std.testing.expect(piece.lost);

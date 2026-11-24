@@ -57,6 +57,17 @@ pub const Request = Record(&.{
 
 pub const Events = schema.BoundedList(Event, MAX_PAGE, PAGE_BYTES);
 
+/// The record bytes a read copies before it stops: past twice a page, the
+/// page is full. A record is its event's answer plus a fixed overhead (its
+/// seq, and its lengths' widths), at most two fifths of the smallest
+/// record, so an answer is at least three fifths of its record: twice a
+/// page of records answers more than a page.
+pub const READ_BYTES: usize = 2 * @as(usize, PAGE_BYTES);
+comptime {
+    const overhead = hp.HistRec.min_size - Event.min_size;
+    std.debug.assert(5 * overhead <= 2 * hp.HistRec.min_size);
+}
+
 pub const Response = Record(&.{
     .{ .name = "events", .T = Events, .doc = "The events, in the order asked" },
     .{ .name = "has_more", .T = schema.Bool, .doc = "Whether more follow" },
@@ -152,7 +163,10 @@ fn wireSize(e: SeqEvent) usize {
 /// rest is said missing. Points into `a`.
 pub fn read(a: Allocator, stream: *StreamHandler, rv: contract_view.ReadView, src: Source, window: Window, asked: u32, final: bool) error{OutOfMemory}!Answer {
     const limit = std.math.clamp(asked, 1, MAX_PAGE);
-    const landed = try stream.readHistory(a, src.family, src.ns, src.owner, src.run, src.created_ns, src.ended_ms, window, @as(usize, limit) + 1);
+    // One piece past the page says more follow; twice a page's record
+    // bytes fill it, whatever they hold, an event's answer taking at least
+    // three fifths of its record (`READ_BYTES`).
+    const landed = try stream.readHistory(a, src.family, src.ns, src.owner, src.run, src.created_ns, src.ended_ms, window, @as(usize, limit) + 1, READ_BYTES);
     if (landed.pending and !final) return .wait;
     if (landed.pending) return .disk_late;
     // Every seq below `flushed` was sent: those past what landed are still

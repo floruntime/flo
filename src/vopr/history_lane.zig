@@ -3,7 +3,8 @@
 //! it, as a channel inbound, and checked as it lands against what landed
 //! before it for that run: its first seq is the next the run hasn't
 //! landed, its records are its seqs in order, and nothing lands after the
-//! run's last chunk.
+//! run's last chunk. The records each apply landed are kept until the
+//! next, for its family to check against the entry that sent them.
 
 const std = @import("std");
 const schema = @import("../protocol/schema.zig");
@@ -28,15 +29,34 @@ pub const STRIDE = 1 << 16;
 /// and whether its last chunk did.
 pub const Landed = struct {
     runs: std.AutoHashMapUnmanaged(u64, Inc) = .empty,
+    /// The records of each chunk the last `deliver` landed, by run.
+    fresh: std.ArrayListUnmanaged(Fresh) = .empty,
+
+    const Fresh = struct { id: u64, records: []u8 };
 
     const Inc = struct { next: u64 = 0, ended: bool = false };
 
     pub fn deinit(self: *Landed, a: std.mem.Allocator) void {
+        self.dropFresh(a);
+        self.fresh.deinit(a);
         self.runs.deinit(a);
     }
 
-    pub fn clear(self: *Landed) void {
+    pub fn clear(self: *Landed, a: std.mem.Allocator) void {
+        self.dropFresh(a);
         self.runs.clearRetainingCapacity();
+    }
+
+    fn dropFresh(self: *Landed, a: std.mem.Allocator) void {
+        for (self.fresh.items) |f| a.free(f.records);
+        self.fresh.clearRetainingCapacity();
+    }
+
+    /// The records the last `deliver` landed for one run incarnation, in
+    /// the order they landed; each slice holds until the next `deliver`.
+    pub fn freshOf(self: *const Landed, out: *std.ArrayListUnmanaged([]const u8), a: std.mem.Allocator, ns: u32, family: he.Family, owner: []const u8, run: []const u8, created_ns: u64) !void {
+        const id = idOf(.{ .ns = ns, .family = @backingInt(family), .owner = owner, .run = run, .created_ns = created_ns, .first_seq = 0, .last_seq = 0, .final = false, .completed_ms = 0 });
+        for (self.fresh.items) |f| if (f.id == id) try out.append(a, f.records);
     }
 
     fn idOf(h: he.Header.Value) u64 {
@@ -57,6 +77,7 @@ pub const Landed = struct {
         const rv: view_mod.ReadView = .{ .store = store };
         // Not in `scratch`: each apply resets it.
         const a = store.allocator;
+        self.dropFresh(a);
         var k: u64 = 0;
         while (true) : (k += 1) {
             if (k + 1 >= STRIDE) return error.Halt;
@@ -106,6 +127,7 @@ pub const Landed = struct {
         if (seq > c.first_seq and seq - 1 != c.last_seq) return "a run's history chunk's records aren't its seqs in order";
         inc.next = seq;
         inc.ended = c.final;
+        try self.fresh.append(a, .{ .id = got.key_ptr.*, .records = try a.dupe(u8, c.records) });
         return null;
     }
 };

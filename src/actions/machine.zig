@@ -122,8 +122,9 @@ pub const Run = Record(&.{
     .{ .name = "hist_next", .T = Int(u64) },
     .{ .name = "hist_flushed", .T = Int(u64) },
     .{ .name = "hist_pending", .T = Bytes(hp.HIST_CHUNK) },
-    // Hand-backs, which count no failure, and deliveries past those its
-    // history records (`RECORDED_DELIVERIES`): both said once, as it ends.
+    // Hand-backs, which count no failure (its history records the first
+    // `max_attempts`), and deliveries past those it records
+    // (`recordedDeliveries`): both said once, as it ends.
     .{ .name = "abandons", .T = Int(u32) },
     .{ .name = "deliveries_unrecorded", .T = Int(u32) },
 });
@@ -370,7 +371,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 return out.refuse(.conflict, .unclassified, NOT_READY);
             try M.deliver(view, .of(p.ns), p.run, &run.v, p.holder, p.request_key, .{ .term = e.header.term, .index = e.header.index }, p.lease_ms, stamp);
             if (run.v.deliveries <= recordedDeliveries(run.v.max_attempts))
-                try record(view, .of(p.ns), p.run, &run.v, .{ .event = EV_DELIVERED, .detail = p.holder, .at_ms = msOf(stamp) }, .flush_on_size)
+                try record(view, .of(p.ns), p.run, &run.v, attemptEvent(EV_DELIVERED, p.holder, msOf(stamp)), .flush_on_size)
             else
                 run.v.deliveries_unrecorded +|= 1;
             try view.put(Runs, rk, run);
@@ -421,9 +422,10 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             if (p.abandoned) {
                 run.v.ended = .abandoned;
                 // A hand-back counts no failure, so they may go on without
-                // end: past its attempts, one is only counted.
+                // end: its first `max_attempts` are recorded, and the rest
+                // only counted.
                 if (run.v.abandons < run.v.max_attempts)
-                    try record(view, .of(p.ns), p.run, &run.v, .{ .event = EV_ABANDONED, .detail = p.@"error", .at_ms = at_ms }, .flush_on_size);
+                    try record(view, .of(p.ns), p.run, &run.v, attemptEvent(EV_ABANDONED, p.@"error", at_ms), .flush_on_size);
                 run.v.abandons +|= 1;
                 preview(&run.v.@"error", &run.v.error_truncated, p.@"error");
                 try M.readyAgain(view, .of(p.ns), p.run, &run.v, after(stamp, p.delay_ms));
@@ -431,7 +433,12 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 run.v.ended = .released;
                 run.v.failures +|= 1;
                 const ends = !p.retry or run.v.failures >= run.v.max_attempts;
-                try record(view, .of(p.ns), p.run, &run.v, .{ .event = EV_RELEASED, .detail = p.@"error", .at_ms = at_ms }, if (ends) .hold else .flush_on_size);
+                // The failure that ends it goes whole; one retried, as a
+                // preview.
+                if (ends)
+                    try record(view, .of(p.ns), p.run, &run.v, .{ .event = EV_RELEASED, .detail = p.@"error", .at_ms = at_ms }, .hold)
+                else
+                    try record(view, .of(p.ns), p.run, &run.v, attemptEvent(EV_RELEASED, p.@"error", at_ms), .flush_on_size);
                 preview(&run.v.@"error", &run.v.error_truncated, p.@"error");
                 if (ends) try endRun(view, .of(p.ns), p.run, &run.v, .failed, stamp, "") else try M.readyAgain(view, .of(p.ns), p.run, &run.v, after(stamp, p.delay_ms));
             }
@@ -563,10 +570,12 @@ pub const EV_ABANDONED = "action_abandoned";
 pub const EV_EXPIRED = "action_expired";
 pub const EV_ENDED = "action_ended";
 pub const LEASE_EXPIRED = "lease expired";
+/// An attempt's event's `extra` when its detail is a preview.
+pub const TRUNCATED = "truncated";
 
 /// `action_ended`'s detail: the hand-backs and the deliveries its history
 /// didn't record. The longest, both at u32's largest, is `ENDED_DETAIL_MAX`.
-const ENDED_FMT = "{{\"abandons\":{d},\"deliveries_unrecorded\":{d}}}";
+pub const ENDED_FMT = "{{\"abandons\":{d},\"deliveries_unrecorded\":{d}}}";
 const ENDED_DETAIL_MAX = std.fmt.count(ENDED_FMT, .{ std.math.maxInt(u32), std.math.maxInt(u32) });
 
 /// A run's deliveries its history records: its history is then bounded by
@@ -580,6 +589,9 @@ comptime {
     const C = he.MAX_CHUNK_RECORDS;
     std.debug.assert(ae.MAX_INPUT <= hp.MAX_DETAIL and action_ops.MAX_OUTPUT <= hp.MAX_DETAIL and action_ops.MAX_ERROR <= hp.MAX_DETAIL);
     std.debug.assert(ae.MAX_OUTCOME <= hp.MAX_EXTRA);
+    std.debug.assert(TRUNCATED.len <= hp.MAX_EXTRA and PREVIEW <= hp.MAX_DETAIL);
+    // A run's history is owned by its action, by name: every name fits.
+    std.debug.assert(ae.MAX_ACTION_NAME <= he.MAX_OWNER);
     // An event over half a chunk goes alone: an invoke's input, at most.
     std.debug.assert(rb(EV_INVOKED.len, ae.MAX_INPUT, 0) <= C);
     std.debug.assert(rb(EV_RELEASED.len, action_ops.MAX_ERROR, 0) <= C and rb(EV_ABANDONED.len, action_ops.MAX_ERROR, 0) <= C);
@@ -628,6 +640,15 @@ fn record(view: *View, ns: NamespaceId, id: []const u8, run: *Run.Value, ev: hp.
     var h = histOf(run);
     try hp.append(view, ownerOf(ns, id, run), &h, ev, mode);
     setHist(run, h);
+}
+
+/// An event of one attempt that doesn't end its run: its worker or error
+/// as a preview, `extra` saying when it was cut. With its deliveries and
+/// hand-backs bounded by its attempts, a run's history is then bounded by
+/// its attempts and its invoke and end, whatever its workers report.
+fn attemptEvent(name: []const u8, whole: []const u8, at_ms: i64) hp.Event {
+    const cut = whole.len > PREVIEW;
+    return .{ .event = name, .detail = whole[0..@min(whole.len, PREVIEW)], .extra = if (cut) TRUNCATED else "", .at_ms = at_ms };
 }
 
 /// `field` set to `whole`'s preview.
@@ -1551,18 +1572,24 @@ test "actions machine: deliveries past twice its attempts and hand-backs past it
     try testing.expectEqualStrings("{\"abandons\":5,\"deliveries_unrecorded\":4}", events[events.len - 1].detail);
 }
 
-test "actions machine: an expire of 24 runs, each with a near-full pending chunk and a caller, applies within an apply's sends" {
+test "actions machine: an expire of 24 runs, each with a pending chunk two-thirds full and a caller, applies within an apply's sends" {
     var t = TestActions.init(testing.allocator);
     defer t.deinit();
     try register(&t, 1);
-    const input: [2000]u8 = @splat('i');
+    // The largest input that waits in its chunk, and worker names and an
+    // error cut to their previews.
+    const input: [hp.HIST_CHUNK / 2 - 40]u8 = @splat('i');
     const holder: [1900]u8 = @splat('h');
     var ids: [ae.MAX_EXPIRE_ITEMS][8]u8 = undefined;
     for (&ids, 0..) |*id, i| {
         _ = try std.fmt.bufPrint(id, "r{d:0>7}", .{i});
         try testing.expect((try t.apply(.action_invoke, ae.Invoke.Value{ .ns = DEFAULT, .action = "send", .run = id, .input = &input, .labels = null, .source = .workflow, .caller_run = "wr", .caller_workflow = "wf" }, 10 * ms)).refused() == null);
-        try testing.expect((try t.apply(.action_deliver, ae.Deliver.Value{ .ns = DEFAULT, .action = "send", .run = id, .due_ns = 10 * ms, .holder = &holder, .request_key = null, .lease_ms = LEASE_MS }, 20 * ms)).refused() == null);
-        try testing.expect(t.run(.default, id).?.hist_pending.len > hp.HIST_CHUNK - 200);
+        try testing.expect((try t.apply(.action_deliver, ae.Deliver.Value{ .ns = DEFAULT, .action = "send", .run = id, .due_ns = 10 * ms, .holder = &holder, .request_key = null, .lease_ms = LEASE_MS }, 11 * ms)).refused() == null);
+        const r = t.run(.default, id).?;
+        const back: ae.Release.Value = .{ .ns = DEFAULT, .action = "send", .run = id, .holder = &holder, .request_key = null, .deliveries = r.deliveries, .token = r.token, .expiry_ns = r.expiry_ns, .abandoned = true, .retry = true, .delay_ms = 0, .@"error" = &holder };
+        try testing.expect((try t.apply(.action_release, back, 12 * ms)).refused() == null);
+        try testing.expect((try t.apply(.action_deliver, ae.Deliver.Value{ .ns = DEFAULT, .action = "send", .run = id, .due_ns = 12 * ms, .holder = &holder, .request_key = null, .lease_ms = LEASE_MS }, 20 * ms)).refused() == null);
+        try testing.expect(t.run(.default, id).?.hist_pending.len > hp.HIST_CHUNK * 2 / 3);
     }
     try testing.expectEqual(@as(u64, 0), sendCount(&t));
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -1660,4 +1687,113 @@ test "actions machine: a run's history is its action's, by a name with a brace a
         try testing.expectEqual(@as(usize, 1), chunks.len);
         try testing.expectEqualStrings(name, chunks[0].owner);
     }
+}
+
+test "actions machine: an attempt's worker and retried error are recorded as previews; the error that ends it, whole" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 3);
+    try invoke(&t, "r1", 10 * ms);
+    const err: [action_ops.MAX_ERROR]u8 = @splat('e');
+    const holder: [PREVIEW + 9]u8 = @splat('h');
+    var due: u64 = 10 * ms;
+    var stamp: u64 = 20 * ms;
+    for (0..3) |i| {
+        try testing.expect((try t.apply(.action_deliver, ae.Deliver.Value{ .ns = DEFAULT, .action = "send", .run = "r1", .due_ns = due, .holder = &holder, .request_key = null, .lease_ms = LEASE_MS }, stamp)).refused() == null);
+        var rel = releaseOf(&t, "r1", false);
+        rel.holder = &holder;
+        rel.delay_ms = 0;
+        rel.@"error" = &err;
+        rel.retry = i < 2;
+        try testing.expect((try t.apply(.action_release, rel, stamp + ms)).refused() == null);
+        due = stamp + ms;
+        stamp += 10 * ms;
+    }
+    try testing.expectEqual(Status.failed, t.run(.default, "r1").?.status);
+    const events = try sentEvents(&t, arena.allocator());
+    // invoked, then delivered and released three times, then ended.
+    try testing.expectEqual(@as(usize, 8), events.len);
+    for (events[1..7], 0..) |e, i| {
+        const whole = i == 5;
+        try testing.expectEqualStrings(if (i % 2 == 0) EV_DELIVERED else EV_RELEASED, e.event);
+        try testing.expectEqual(@as(usize, if (whole) action_ops.MAX_ERROR else PREVIEW), e.detail.len);
+        try testing.expectEqualStrings(if (whole) "" else TRUNCATED, e.extra);
+    }
+    try testing.expectEqualStrings(EV_ENDED, events[7].event);
+}
+
+/// `body`, an invoke, applied as a call's start: a message on the main lane
+/// from the calling namespace.
+fn applyCall(t: *TestActions, body: ae.Invoke.Value, stamp: u64) !Result {
+    const ce = @import("../protocol/channel_entries.zig");
+    const a = t.scratch.child_allocator;
+    const payload = try a.alloc(u8, try ae.Invoke.encodedSize(body));
+    defer a.free(payload);
+    _ = try ae.Invoke.encodeInto(payload, body);
+    const mb = try a.alloc(u8, payload.len + 64);
+    defer a.free(mb);
+    var w: schema.Writer = .{ .buf = mb };
+    try ce.Message.encode(&w, .{ .slot = @intCast(router.nsKeySlot(.of(body.ns), body.action)), .entry_type = @backingInt(EntryType.action_invoke), .layout_epoch = 0, .flags = 0, .origin_kind = @backingInt(view_mod.Origin.Kind.user), .origin_ns = body.ns, .payload = payload });
+    const rv: view_mod.ReadView = .{ .store = &t.store };
+    const seq = (if (channels.inOf(rv, 0, .main)) |i| i.applied else 0) + 1;
+    const ib = try a.alloc(u8, w.written().len + 64);
+    defer a.free(ib);
+    const inbound = try ce.Inbound.encodeInto(ib, .{ .from = 0, .lane = @backingInt(channels.Lane.main), .first_seq = seq, .messages = .{ .bytes = w.written(), .count = 1 } });
+    t.index += 1;
+    const e = entry_mod.buildEntry(.channel_inbound, entry_mod.Flags.NONE, t.term, t.index, stamp, inbound);
+    var out: Result = .{};
+    out.reset(&e);
+    try machine_mod.applyEntry(&channels.Channels(&.{machine}).machine, &t.store, &t.scratch, &e, &out);
+    return out;
+}
+
+/// The answer the group last sent to a call's start.
+fn lastReply(t: *TestActions, a: std.mem.Allocator) !ae.Reply.Value {
+    var pb: [channels.CHAN_KEY]u8 = undefined;
+    var it = (view_mod.ReadView{ .store = &t.store }).range(channels.OutFam, channels.outPrefix(&pb, 0, .main));
+    var last: ?ae.Reply.Value = null;
+    while (try it.next()) |item| {
+        if (item.value.v.entry_type != @backingInt(EntryType.call_reply)) continue;
+        var diag: schema.Diagnostic = .{};
+        last = try ae.Reply.decodeAll(try a.dupe(u8, item.value.v.payload), &diag);
+    }
+    return last orelse error.TestNoReply;
+}
+
+test "actions machine: a call past its namespace's share of the history lane is answered over_budget, creating nothing; another namespace's call starts" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    const busy: NamespaceId = .of(7);
+    const quiet: NamespaceId = .of(8);
+    try registerIn(&t, busy, 3);
+    try registerIn(&t, quiet, 3);
+    // A cap of 16 KB, a quarter of the bound share: past it, a namespace
+    // holding three quarters of it is held.
+    try settings.bindForTest(&t.store, 64_000);
+    const input: [3000]u8 = @splat('i');
+    const Call = struct {
+        fn of(ns: NamespaceId, run_id: []const u8, in: []const u8) ae.Invoke.Value {
+            return .{ .ns = ns.int(), .action = "send", .run = run_id, .input = in, .labels = null, .source = .workflow, .caller_run = "wr", .caller_workflow = "wf" };
+        }
+    };
+    // Each input is over half a chunk, so goes to the lane as it starts.
+    for ([_][]const u8{ "b1", "b2", "b3", "b4", "b5", "b6" }) |id| {
+        try testing.expect((try applyCall(&t, Call.of(busy, id, &input), 10 * ms)).refused() == null);
+        try testing.expectEqual(ae.Answer.started, (try lastReply(&t, a)).answer);
+    }
+    try testing.expect((try applyCall(&t, Call.of(busy, "b7", &input), 10 * ms)).refused() == null);
+    const held = try lastReply(&t, a);
+    try testing.expectEqual(ae.Answer.over_budget, held.answer);
+    try testing.expectEqualStrings("b7", held.run);
+    try testing.expect(std.mem.indexOf(u8, held.why.?, "history lane") != null);
+    try testing.expect(t.run(busy, "b7") == null);
+    // The namespace holding none of the lane is not held by it.
+    try testing.expect((try applyCall(&t, Call.of(quiet, "q1", &input), 10 * ms)).refused() == null);
+    try testing.expectEqual(ae.Answer.started, (try lastReply(&t, a)).answer);
+    try testing.expect(t.run(quiet, "q1") != null);
 }

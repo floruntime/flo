@@ -773,7 +773,7 @@ pub const Actions = struct {
 
     pub fn reset(self: *Actions) void {
         self.store.clear();
-        self.landed.clear();
+        self.landed.clear(self.store.allocator);
         std.debug.assert(self.store.strict_keys);
         std.debug.assert(std.meta.eql(self.store.place, PLACE));
     }
@@ -1047,6 +1047,105 @@ pub const Actions = struct {
             if (post.failures != pre.failures + failed) return "a run's failures don't count the deliveries that failed";
         }
         for (touched) |t| if (self.run(t.ns, t.id)) |post| if (self.ruleOfRun(t.ns, t.id, post)) |why| return why;
+        for (touched) |t| if (self.run(t.ns, t.id)) |post| if (self.eventsRule(e, stamp, t, post)) |why| return why;
+        return null;
+    }
+
+    const Want = struct { event: []const u8, detail: []const u8, extra: []const u8 };
+
+    /// An attempt's event as its entry carried it: a preview, `extra`
+    /// saying when it was cut.
+    fn attempt(event: []const u8, whole: []const u8) Want {
+        return .{ .event = event, .detail = preview(whole), .extra = if (whole.len > action_machine.PREVIEW) action_machine.TRUNCATED else "" };
+    }
+
+    /// The events entry `e` added to run `t`'s history, landed or pending,
+    /// against what it carried, at its stamp.
+    fn eventsRule(self: *Actions, e: *const entry_mod.Entry, stamp: u64, t: Touched, post: action_machine.Run.Value) ?[]const u8 {
+        var arena = std.heap.ArenaAllocator.init(self.store.allocator);
+        defer arena.deinit();
+        return self.eventsRuleOrOom(arena.allocator(), e, stamp, t, post) catch "a run's history could not be read";
+    }
+
+    fn eventsRuleOrOom(self: *Actions, a: Allocator, e: *const entry_mod.Entry, stamp: u64, t: Touched, post: action_machine.Run.Value) !?[]const u8 {
+        var diag: schema.Diagnostic = .{};
+        var want: [2]Want = undefined;
+        var n: usize = 0;
+        var ended_buf: [128]u8 = undefined;
+        const ended: Want = .{ .event = action_machine.EV_ENDED, .detail = std.fmt.bufPrint(&ended_buf, action_machine.ENDED_FMT, .{ post.abandons, post.deliveries_unrecorded }) catch unreachable, .extra = "" };
+        switch (kindOf(e.header.entry_type)) {
+            .invoke => if (t.before == null) {
+                const p = ae.Invoke.decodeAll(e.payload, &diag) catch unreachable;
+                want[0] = .{ .event = action_machine.EV_INVOKED, .detail = p.input, .extra = "" };
+                n = 1;
+            },
+            .deliver => {
+                const p = ae.Deliver.decodeAll(e.payload, &diag) catch unreachable;
+                const pre = t.before orelse return null;
+                if (post.deliveries <= action_machine.recordedDeliveries(post.max_attempts)) {
+                    want[0] = attempt(action_machine.EV_DELIVERED, p.holder);
+                    n = 1;
+                } else if (post.deliveries_unrecorded != pre.deliveries_unrecorded + 1) return "a delivery its history doesn't record isn't counted";
+            },
+            .settle => {
+                const p = ae.Settle.decodeAll(e.payload, &diag) catch unreachable;
+                const pre = t.before orelse return null;
+                if (holdsDelivery(pre, p.holder, p.deliveries, p.token)) {
+                    want[0] = .{ .event = action_machine.EV_SETTLED, .detail = p.result, .extra = p.outcome };
+                    want[1] = ended;
+                    n = 2;
+                }
+            },
+            .release => {
+                const p = ae.Release.decodeAll(e.payload, &diag) catch unreachable;
+                const pre = t.before orelse return null;
+                if (holdsDelivery(pre, p.holder, p.deliveries, p.token)) {
+                    if (p.abandoned) {
+                        if (pre.abandons < pre.max_attempts) {
+                            want[0] = attempt(action_machine.EV_ABANDONED, p.@"error");
+                            n = 1;
+                        }
+                    } else if (!p.retry or pre.failures + 1 >= pre.max_attempts) {
+                        want[0] = .{ .event = action_machine.EV_RELEASED, .detail = p.@"error", .extra = "" };
+                        want[1] = ended;
+                        n = 2;
+                    } else {
+                        want[0] = attempt(action_machine.EV_RELEASED, p.@"error");
+                        n = 1;
+                    }
+                }
+            },
+            .expire => {
+                const pre = t.before orelse return null;
+                if (pre.status == .leased and post.status != .leased) {
+                    want[0] = .{ .event = action_machine.EV_EXPIRED, .detail = action_machine.LEASE_EXPIRED, .extra = "" };
+                    want[1] = ended;
+                    n = if (post.completed_ns != 0) 2 else 1;
+                }
+            },
+            .register, .delete, .extend => {},
+        }
+        // What it added: the records past the run's seq before it, in the
+        // chunks it landed and then still pending.
+        const from = if (t.before) |b| b.hist_next else 0;
+        var parts: std.ArrayListUnmanaged([]const u8) = .empty;
+        try self.landed.freshOf(&parts, a, t.ns.int(), .action, post.action, t.id, post.created_ns);
+        try parts.append(a, post.hist_pending);
+        var got: usize = 0;
+        const at_ms: i64 = @intCast(stamp / std.time.ns_per_ms);
+        for (parts.items) |bytes| {
+            var r: schema.Reader = .{ .bytes = bytes, .diag = &diag };
+            while (r.pos < bytes.len) {
+                const rec = hp.HistRec.decode(&r, "event") catch return "a run's history doesn't decode";
+                if (rec.seq < from) continue;
+                if (got == n) return "an entry added events to a run's history it didn't carry";
+                const w = want[got];
+                if (!std.mem.eql(u8, rec.event, w.event) or !std.mem.eql(u8, rec.detail, w.detail) or !std.mem.eql(u8, rec.extra, w.extra) or rec.at_ms != at_ms)
+                    return "a run's history event isn't what its entry carried";
+                got += 1;
+            }
+        }
+        if (got != n) return "a run's history is missing an event its entry carried";
         return null;
     }
 

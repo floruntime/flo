@@ -18,6 +18,7 @@ const ce = @import("../protocol/channel_entries.zig");
 const ae = @import("../protocol/action_entries.zig");
 const he = @import("../protocol/history_entries.zig");
 const hp = @import("../stream/history_producer.zig");
+const hm = @import("../stream/history_machine.zig");
 const action_machine = @import("../actions/machine.zig");
 
 /// The fixed overhead a shard holds before client data, measured ~5 MiB after
@@ -59,11 +60,17 @@ pub const CALL_REPLY_BYTES: u64 = 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + 
 /// `MAX_BATCH` messages and `MAX_BATCH_BYTES` of payload, its first
 /// message whatever its size (a call's is far smaller). Its payload counts
 /// twice: each call's input is in its run and in its history.
+/// The history lane's own inbound may land past the share beside it: each
+/// of its messages adds its run's live row and, at a run's end, its ended
+/// row (`HISTORY_LAND_BYTES`); the events themselves stay in the log.
 ///
 /// It holds while an action's invoke is the only charged write an inbound
 /// grows past the share. Anything else a channel carries that grows a
 /// charged family adds to it.
-pub const INBOUND_OVERSHOOT_BYTES: u64 = 2 * channel_driver.MAX_BATCH_BYTES + ce.MAX_BATCH * (CALL_RECORDS_BYTES + CALL_REPLY_BYTES);
+pub const INBOUND_OVERSHOOT_BYTES: u64 = 2 * channel_driver.MAX_BATCH_BYTES + ce.MAX_BATCH * (CALL_RECORDS_BYTES + CALL_REPLY_BYTES + HISTORY_LAND_BYTES);
+/// One history message's rows, each its key (namespace, owner, run and
+/// incarnation, with its place in the log) and its locator.
+const HISTORY_LAND_BYTES: u64 = 2 * (pool.RESIDENT_RECORD + 4 + he.MAX_OWNER + he.MAX_RUN + 64 + hm.Row.max_size);
 
 /// A node's reserve: per shard, its floor, its configured ring sizes and the
 /// one inbound it may take past its share; plus a margin. Held back before
@@ -257,9 +264,9 @@ test "reserve: floor + rings over shards + margin" {
     try testing.expectEqual(@as(u64, 4) * (PER_SHARD_FLOOR_BYTES + 80 * 1024 * 1024 + INBOUND_OVERSHOOT_BYTES) + 256 * 1024 * 1024, r);
 }
 
-test "reserve: one inbound's overshoot is twice its payload bound and its calls' rows, within 256 KiB over that" {
+test "reserve: one inbound's overshoot is twice its payload bound, its calls' rows and the history rows beside it, within 512 KiB over that" {
     try testing.expect(INBOUND_OVERSHOOT_BYTES > 2 * channel_driver.MAX_BATCH_BYTES);
-    try testing.expect(INBOUND_OVERSHOOT_BYTES < 2 * channel_driver.MAX_BATCH_BYTES + 256 * 1024);
+    try testing.expect(INBOUND_OVERSHOOT_BYTES < 2 * channel_driver.MAX_BATCH_BYTES + 512 * 1024);
 }
 
 test "ringBytesPerShard: log + raft clamp(hot/4, 2, 16 MiB)" {
