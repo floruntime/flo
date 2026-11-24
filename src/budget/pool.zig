@@ -225,7 +225,7 @@ test "pool: use is what the charged records hold, and exempt families add nothin
     try testing.expectEqual(want, recount(&store));
 
     // An exempt family's records aren't charged.
-    store.link(28, try store.allocRecord("run"), try testing.allocator.dupe(u8, "a workflow run"));
+    store.link(70, try store.allocRecord("row"), try testing.allocator.dupe(u8, "a workflow run's history"));
     try testing.expectEqual(want, useOf(&store));
 
     // A smaller value gives bytes back; a removed record gives all of it.

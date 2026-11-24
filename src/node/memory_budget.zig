@@ -20,6 +20,8 @@ const he = @import("../protocol/history_entries.zig");
 const hp = @import("../stream/history_producer.zig");
 const hm = @import("../stream/history_machine.zig");
 const action_machine = @import("../actions/machine.zig");
+const runs_machine = @import("../workflow/runs_machine.zig");
+const schema = @import("../protocol/schema.zig");
 
 /// The fixed overhead a shard holds before client data, measured ~5 MiB after
 /// flo#461/#462 (rings resident only as written). Scales with the node's shard
@@ -81,7 +83,12 @@ const CALL_ANSWER_BYTES: u64 = @max(ae.MAX_SKIP_WHY, ae.MAX_OUTCOME);
 comptime {
     std.debug.assert(CHILD_START_BYTES <= MESSAGE_BYTES);
     std.debug.assert(CALL_ANSWER_BYTES <= MESSAGE_BYTES);
+    // The parent record is no larger than the start it copies: the payload
+    // fields it drops (namespace, run) cover the state it adds.
+    std.debug.assert(runs_machine.Parent.max_size <= ae.ChildStart.max_size);
+    std.debug.assert(schema.Enum(runs_machine.ParentState).max_size <= ae.NamespaceId.max_size + ae.RunId.max_size);
 }
+
 /// The most one history message adds: a run's last chunk lands its live,
 /// final and marker rows, each its key (namespace, owner, run and
 /// incarnation, with its place in the log) and a row, and sends the fold
