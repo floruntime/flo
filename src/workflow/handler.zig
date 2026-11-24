@@ -5947,6 +5947,15 @@ test "workflow duty: a timer due while the history lane holds steps fires once t
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.inspect(testKey(.default, "due")).?.status);
     try testing.expectEqual(@as(usize, 0), handler.timers.count());
     try testing.expectEqual(@as(usize, 1), handler.held.get(.{ .ns = .default }).?.items.len);
+    // Passes while the hold stands don't take it again; a new term does,
+    // once, and holds it again.
+    const taken = handler.taken;
+    for (0..3) |_| handler.checkPendingActions(&shard);
+    try testing.expectEqual(taken, handler.taken);
+    shard.raft_node.current_term += 1;
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(taken + 1, handler.taken);
+    try testing.expectEqual(@as(usize, 1), handler.held.get(.{ .ns = .default }).?.items.len);
     // Drained: the wait it timed out of ends it.
     settleTest(&shard);
     try testing.expect(shard.historyWait(.default) == null);
