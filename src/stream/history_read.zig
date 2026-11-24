@@ -38,7 +38,7 @@ pub const MISSING = "history_missing";
 pub const Event = Record(&.{
     .{ .name = "event_type", .T = Bytes(hp.MAX_EVENT), .doc = "What happened" },
     .{ .name = "detail", .T = Bytes(hp.MAX_DETAIL), .doc = "Its detail: an input, a result, an error, a worker" },
-    .{ .name = "extra", .T = Bytes(hp.MAX_EXTRA), .doc = "An action's settle: the outcome its worker named; empty for every other event" },
+    .{ .name = "extra", .T = Bytes(hp.MAX_EXTRA), .doc = "An action's settle: the outcome its worker named. An action's delivery, retried failure or hand-back: \"truncated\" when its detail is only the first 256 bytes. Empty otherwise" },
     .{ .name = "timestamp_ms", .T = Int(i64), .doc = "When, in Unix milliseconds" },
 });
 
@@ -57,15 +57,17 @@ pub const Request = Record(&.{
 
 pub const Events = schema.BoundedList(Event, MAX_PAGE, PAGE_BYTES);
 
-/// The record bytes a read copies before it stops: past twice a page, the
-/// page is full. A record is its event's answer plus a fixed overhead (its
-/// seq, and its lengths' widths), at most two fifths of the smallest
-/// record, so an answer is at least three fifths of its record: twice a
-/// page of records answers more than a page.
+/// The record bytes a read copies before it stops, which still fill the
+/// page, so `has_more` is never lost to the stop. Only the first chunk can
+/// hold records outside the window (a cursor mid-chunk), so at least
+/// `READ_BYTES` less one chunk are in it. A record is its answer plus a
+/// fixed overhead (its seq, its lengths' widths), and a page holds at most
+/// `MAX_PAGE` events: either more events are in hand than the page asks, or
+/// their answers come to more than `PAGE_BYTES`. Both cut the page short.
 pub const READ_BYTES: usize = 2 * @as(usize, PAGE_BYTES);
 comptime {
     const overhead = hp.HistRec.min_size - Event.min_size;
-    std.debug.assert(5 * overhead <= 2 * hp.HistRec.min_size);
+    std.debug.assert(READ_BYTES - he.MAX_CHUNK_RECORDS - overhead * MAX_PAGE > PAGE_BYTES);
 }
 
 pub const Response = Record(&.{

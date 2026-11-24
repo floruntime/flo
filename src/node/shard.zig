@@ -31894,6 +31894,74 @@ fn sendFromApplyFlagged(a: *Shard, slot: u16, etype: entry_mod.EntryType, flags:
     try view.commit();
 }
 
+test "Shard: a history read stops at its record bytes with a cursor mid-chunk, says there is more, and pages on without skipping or repeating" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    const a = &two.shards[0];
+    const he = @import("../protocol/history_entries.zig");
+    const hp = @import("../stream/history_producer.zig");
+    var nb: [16]u8 = undefined;
+    var ni: usize = 0;
+    const owner = while (true) : (ni += 1) {
+        const n = try std.fmt.bufPrint(&nb, "act{d}", .{ni});
+        if (a.router.hashToShard(node_router.routeNsKey(.default, n)) == 0) break n;
+    };
+    const slot: u16 = @intCast(node_router.nsKeySlot(.default, owner));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    // Chunks of three 30 KiB events: more than twice a page's bytes in all.
+    const CHUNKS = 8;
+    const PER = 3;
+    const detail = try al.alloc(u8, 30 << 10);
+    @memset(detail, 'd');
+    for (0..CHUNKS) |c| {
+        var records: std.ArrayListUnmanaged(u8) = .empty;
+        for (0..PER) |k| {
+            const rec: hp.HistRec.Value = .{ .seq = c * PER + k, .event = "action_delivered", .detail = detail, .extra = "", .at_ms = 1 };
+            const rb = try al.alloc(u8, try hp.HistRec.encodedSize(rec));
+            var w: schema.Writer = .{ .buf = rb };
+            try hp.HistRec.encode(&w, rec);
+            try records.appendSlice(al, w.written());
+        }
+        const buf = try al.alloc(u8, he.Chunk.max_size);
+        const p = try he.Chunk.encodeInto(buf, .{ .ns = ns_table.DEFAULT.int(), .family = @backingInt(he.Family.action), .owner = owner, .run = "r1", .created_ns = 5, .first_seq = c * PER, .last_seq = c * PER + PER - 1, .final = c + 1 == CHUNKS, .completed_ms = 4242, .records = records.items });
+        try sendFromApplyFlagged(a, slot, .history_chunk, entry_mod.Flags.HISTORY, p);
+        pumpChannels(&two);
+    }
+    for (0..4) |_| pumpChannels(&two);
+    const total = CHUNKS * PER;
+    // The walk stops at its record bytes, short of every chunk.
+    const walked = try a.stream_handler.readHistory(al, .action, .default, owner, "r1", 5, 4242, .{ .from = 1 }, history_read.MAX_PAGE + 1, history_read.READ_BYTES);
+    try std.testing.expect(walked.pieces.len < CHUNKS);
+    const src: history_read.Source = .{ .family = .action, .ns = .default, .owner = owner, .run = "r1", .created_ns = 5, .ended_ms = 4242, .flushed = total, .pending = "" };
+    const rv: contract_view.ReadView = .{ .store = &a.defaultPartition().store };
+    // From seq 1, mid its first chunk, a page at a time: each says there
+    // is more until the last, and together they are seqs 1.. once each.
+    var next: u64 = 1;
+    var cursor: ?u64 = 1;
+    var pages: usize = 0;
+    while (cursor) |from| : (pages += 1) {
+        const q: history_read.Query = .{ .limit = history_read.MAX_PAGE, .cursor = from };
+        const page = switch (try history_read.read(al, a.stream_handler, rv, src, q.window(), q.limit, false)) {
+            .page => |pg| pg,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expect(page.events.len > 0);
+        for (page.events) |e| {
+            try std.testing.expectEqual(next, e.seq);
+            next += 1;
+        }
+        cursor = page.more;
+        if (cursor != null) try std.testing.expectEqual(next, cursor.?);
+    }
+    try std.testing.expectEqual(@as(u64, total), next);
+    try std.testing.expect(pages > 1);
+}
+
 test "Shard: a run's history, sent to its own shard as it goes and folded, reads back oldest first, live and after it ends" {
     var two: TwoShards = undefined;
     try two.init();
