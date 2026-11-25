@@ -437,8 +437,14 @@ test "e2e/memory_budget: past its share a shard refuses a signal, but takes one 
         try testing.expectEqual(@as(u8, 3), r.exit_code);
         try testing.expect(r.stderrContains("[limit/memory_budget]"));
     }
-    // The one it waits for: taken, and the run ends.
-    try ctx.exec(&.{ "workflow", "signal", "mb-wait-1", "--type", "go" });
+    // The one it waits for, as large: past the share too, but it wakes the
+    // run, so the slack takes it, and the run ends.
+    {
+        const payload = "{\"p\":\"" ++ @as([4000]u8, @splat('p')) ++ "\"}";
+        var r = try ctx.execResult(&.{ "workflow", "signal", "mb-wait-1", "--type", "go", "--payload", payload });
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 0), r.exit_code);
+    }
     var done = false;
     for (0..100) |_| {
         var h = try ctx.execResult(&.{ "workflow", "history", "mb-wait-1" });

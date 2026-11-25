@@ -35,6 +35,12 @@
 //!   naming one the run doesn't hold, or waiting on a type the run still
 //!   holds after its takes, is refused, and only a step that applies takes
 //!   anything. A run's end drops every signal it holds;
+//! - a delete takes only an ended run, of the incarnation it names: its
+//!   record, its idempotency key and, once its drop lands, every history
+//!   row; a drop lost past its retries leaves the rows, marked orphaned.
+//!   One for a run not there, a resend included, changes nothing. Its id
+//!   and key may start a new run, and no apply sends history for a run
+//!   ended before it or not there;
 //! - the store holds what the ledger holds, and on its own: each workflow's
 //!   count is its runs not ended, each run's history is its last seqs, each
 //!   idempotency key names a run of that workflow with that key, a run
@@ -54,6 +60,7 @@ const router = @import("../node/router.zig");
 const rm = @import("../workflow/runs_machine.zig");
 const calls_mod = @import("../actions/calls_machine.zig");
 const hm = @import("../stream/history_machine.zig");
+const he = @import("../protocol/history_entries.zig");
 const history_lane = @import("history_lane.zig");
 const ce = @import("../protocol/channel_entries.zig");
 const defs_family = @import("workflow_defs_family.zig");
@@ -69,7 +76,7 @@ const RunStatus = rm.RunStatus;
 const NS: @import("../namespace/table.zig").Id = .default;
 const NAMES = defs_family.NAMES;
 
-/// Runs are never removed, so the workload has room for each to start.
+/// Room for each run to start; a delete frees its id for another.
 const RUNS = blk: {
     @setEvalBranchQuota(100_000);
     var out: [128][]const u8 = undefined;
@@ -182,6 +189,8 @@ pub const WorkflowRuns = struct {
         stepped: bool,
         idem: ?usize,
         created_ms: i64,
+        /// The stamp its start applied at: its incarnation.
+        created_ns: u64,
         completed_ms: i64 = 0,
         output: ?usize = null,
         hist_next: u64,
@@ -250,21 +259,31 @@ pub const WorkflowRuns = struct {
         /// A definition's create refused past the share (the definitions
         /// model's verdict, counted here so a swarm reports it).
         create_held,
+        /// A delete of a run not there: never one, or deleted already.
+        delete_missing,
+        /// A delete naming another incarnation than the run's.
+        delete_other_incarnation,
+        /// A delete of a run not ended.
+        delete_live,
+        /// A delete whose drop is lost past its retries.
+        delete_orphaned,
+        /// A start of a deleted run's id.
+        deleted_id_reused,
         /// A signal refused past the share.
         signal_held,
         /// A signal that wakes its run, taken past the share within the slack.
         wake_in_slack,
     };
 
-    /// Classes a memory share keeps from being reached: past the share a
-    /// signal is refused before a run holds as many as it may.
-    pub fn hiddenByShare(c: Class) bool {
-        return c == .signal_full;
-    }
-
     /// Classes reached only under a memory share.
     pub fn underShareOnly(c: Class) bool {
         return c == .child_held or c == .start_held or c == .child_start_held or c == .create_held or c == .signal_held or c == .wake_in_slack;
+    }
+
+    /// Reached only without a share: held at one, most signals are refused,
+    /// so a run seldom holds as many as it may. The plain swarm requires it.
+    pub fn withoutShareOnly(c: Class) bool {
+        return c == .signal_full;
     }
     const PerDefL = struct { active: u32, fired_ms: i64, place: ?PlaceL = null };
     /// A trigger's place: the stream (namespace, making, name) and how far in.
@@ -295,6 +314,8 @@ pub const WorkflowRuns = struct {
     const CallL = struct {
         kind: ae.CallKind,
         caller: usize,
+        /// The caller's incarnation when its step made the call.
+        caller_created_ns: u64,
         wf: usize,
         step: usize,
         can_wait: bool,
@@ -314,12 +335,19 @@ pub const WorkflowRuns = struct {
         parents: [RUNS.len]?ParentL = @splat(null),
         /// By `slotOwner` of the caller's workflow, then callee.
         calls: [NAMES.len][CALLEES.len]?CallL = @splat(@splat(null)),
+        /// Runs deleted since an id last started, and the last incarnations
+        /// deleted, newest at `gone_next - 1`: their rows are checked gone.
+        deleted: [RUNS.len]bool = @splat(false),
+        gone: [GONE]?GoneL = @splat(null),
+        gone_next: usize = 0,
     };
+    const GONE = 32;
+    const GoneL = struct { wf: usize, run: usize, idem: ?usize, created_ns: u64, completed_ms: i64, orphaned: bool };
 
     pub const FAMILIES = [_]u16{ rm.RunFam.ID, hm.Workflows.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID, calls_mod.Calls.ID, rm.SigFam.ID };
     pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "history.wf", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents", "step.calls", "workflow.sig" };
 
-    pub const Kind = enum { start, step, complete, child_start, child_refuse, reply, done, retry, clear, signal };
+    pub const Kind = enum { start, step, complete, child_start, child_refuse, reply, done, retry, clear, signal, delete };
 
     pub const Effect = struct {
         kind: Kind,
@@ -366,7 +394,7 @@ pub const WorkflowRuns = struct {
 
     pub fn owns(entry_type: u8) bool {
         return switch (@as(EntryType, @fromBackingInt(entry_type))) {
-            .workflow_start, .workflow_step, .workflow_complete, .child_start, .child_refuse, .workflow_signal => true,
+            .workflow_start, .workflow_step, .workflow_complete, .child_start, .child_refuse, .workflow_signal, .workflow_run_delete => true,
             .call_reply, .call_done, .step_call_retry, .step_call_clear => true,
             else => false,
         };
@@ -498,14 +526,17 @@ pub const WorkflowRuns = struct {
                 l.parents[r] = null;
             },
             .reply, .done, .retry, .clear => return self.predictCall(e, kind),
-            .start, .step, .complete, .signal => {
+            .start, .step, .complete, .signal, .delete => {
                 const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return null;
                 const r = indexOf(&RUNS, cmd.key[4..]) orelse return null;
                 switch (kind) {
                     .step => {
                         const st = rm.Step.decodeAll(cmd.value, &diag) catch return null;
                         var run = l.runs[r] orelse return refuse(.step, "the run isn't there");
-                        if (!std.mem.eql(u8, st.workflow, NAMES[run.wf])) return null;
+                        // Decided for an earlier incarnation of the id: this
+                        // simulator's leader proposes from a lagging view, as a
+                        // ready one never does.
+                        if (!std.mem.eql(u8, st.workflow, NAMES[run.wf])) return refuse(.step, "it names an earlier incarnation's workflow");
                         const ends: ?RunStatus = if (st.ends == 0) null else blk: {
                             const s = std.enums.fromInt(RunStatus, st.ends) orelse return null;
                             if (!s.isTerminal()) return null;
@@ -575,6 +606,7 @@ pub const WorkflowRuns = struct {
                                 const call: CallL = .{
                                     .kind = p.kind,
                                     .caller = r,
+                                    .caller_created_ns = run.created_ns,
                                     .wf = run.wf,
                                     .step = indexOf(&STEPS, p.step) orelse return null,
                                     .can_wait = p.can_wait,
@@ -687,7 +719,9 @@ pub const WorkflowRuns = struct {
                                 return want;
                             }
                         }
-                        l.runs[r] = .{ .wf = w, .status = s.status, .stepped = false, .idem = k, .created_ms = stamp_ms, .completed_ms = if (s.status.isTerminal()) stamp_ms else 0, .hist_next = 1, .started = ev };
+                        if (l.deleted[r]) want.classes.insert(.deleted_id_reused);
+                        l.deleted[r] = false;
+                        l.runs[r] = .{ .wf = w, .status = s.status, .stepped = false, .idem = k, .created_ms = stamp_ms, .created_ns = e.header.timestamp_ns, .completed_ms = if (s.status.isTerminal()) stamp_ms else 0, .hist_next = 1, .started = ev };
                         if (k) |ki| l.idem[w][ki] = r;
                         var per = l.per_def[w] orelse PerDefL{ .active = 0, .fired_ms = 0 };
                         if (!s.status.isTerminal()) per.active += 1;
@@ -703,7 +737,8 @@ pub const WorkflowRuns = struct {
                     },
                     .complete => {
                         const c = rm.Complete.parse(cmd.value) orelse return null;
-                        var run = l.runs[r] orelse return null;
+                        var run = l.runs[r] orelse return refuse(.complete, "its run isn't there");
+                        if (!std.mem.eql(u8, c.workflow, NAMES[run.wf])) return refuse(.complete, "it names an earlier incarnation's workflow");
                         if (run.status.isTerminal()) {
                             if (run.status == c.status) return want;
                             return refuse(.complete, "its run ended otherwise");
@@ -748,6 +783,23 @@ pub const WorkflowRuns = struct {
                             run.woken_rev = run.rev;
                         }
                         l.runs[r] = run;
+                    },
+                    .delete => {
+                        const d = rm.Delete.parse(cmd.value) orelse return null;
+                        const run = l.runs[r] orelse return refuseAs(.delete, "its run isn't there", .delete_missing);
+                        const idem: []const u8 = if (run.idem) |k| IDEMS[k] else "";
+                        if (run.created_ns != d.created_ns or !std.mem.eql(u8, NAMES[run.wf], d.workflow) or !std.mem.eql(u8, idem, d.idem))
+                            return refuseAs(.delete, "it names another incarnation", .delete_other_incarnation);
+                        if (!run.status.isTerminal()) return refuseAs(.delete, "its run hasn't ended", .delete_live);
+                        if (run.idem) |k| if (l.idem[run.wf][k] == r) {
+                            l.idem[run.wf][k] = null;
+                        };
+                        l.runs[r] = null;
+                        l.deleted[r] = true;
+                        const orphan = history_lane.orphaned(NAMES[run.wf], RUNS[r], run.created_ns);
+                        if (orphan) want.classes.insert(.delete_orphaned);
+                        l.gone[l.gone_next % GONE] = .{ .wf = run.wf, .run = r, .idem = run.idem, .created_ns = run.created_ns, .completed_ms = run.completed_ms, .orphaned = orphan };
+                        l.gone_next += 1;
                     },
                     else => unreachable,
                 }
@@ -874,6 +926,7 @@ pub const WorkflowRuns = struct {
             .step_call_retry => .retry,
             .step_call_clear => .clear,
             .workflow_signal => .signal,
+            .workflow_run_delete => .delete,
             else => .child_refuse,
         };
     }
@@ -882,6 +935,12 @@ pub const WorkflowRuns = struct {
     /// it against the ledger. A refusal must leave every family as it was.
     pub fn apply(self: *WorkflowRuns, store: *store_mod.Store, defs: *const defs_family.WorkflowDefs, e: *const entry_mod.Entry) (persistence.ApplyError || error{RefusalChangedState})!Effect {
         const kind = kindOf(@fromBackingInt(e.header.entry_type));
+        // The incarnations live before it: only they, and a run it starts,
+        // may send history.
+        var live_before: [RUNS.len]?u64 = @splat(null);
+        for (self.ledger.runs, &live_before, 0..) |x, *id, i| if (x) |run| if (!run.status.isTerminal()) {
+            id.* = incarnation(run, i);
+        };
         const want = self.predict(defs, store, e, kind) orelse return error.Halt;
         var before: [FAMILIES.len + 1]u64 = undefined;
         for (FAMILIES, before[0..FAMILIES.len]) |fam, *b| b.* = store.families[fam].commits;
@@ -900,11 +959,31 @@ pub const WorkflowRuns = struct {
             if (want.refused == null) effect.broke = REFUSED_APPLIES[@backingInt(kind)];
         } else if (want.refused) |why| effect.broke = why;
         if (effect.broke == null) effect.broke = landed;
+        if (effect.broke == null) effect.broke = self.sentBy(live_before, e, kind);
         if (effect.broke == null) effect.broke = sentRule(store, seqs, want.sends);
         // The whole store at the indices the checksums are sampled at; the
         // run the entry names, and the calls, at every one.
         if (effect.broke == null) effect.broke = self.rule(store, runOf(e, kind), e.header.index % SWEEP_EVERY == 0);
         return effect;
+    }
+
+    fn incarnation(run: RunL, r: usize) u64 {
+        return history_lane.Landed.idOf(.{ .ns = NS.int(), .family = @backingInt(he.Family.workflow), .owner = NAMES[run.wf], .run = RUNS[r], .created_ns = run.created_ns, .first_seq = 0, .last_seq = 0, .final = false, .completed_ms = 0 });
+    }
+
+    /// Why the history `e`'s apply landed breaks the rule that no apply
+    /// sends history for a run ended before it or not there, or null.
+    fn sentBy(self: *const WorkflowRuns, live_before: [RUNS.len]?u64, e: *const entry_mod.Entry, kind: Kind) ?[]const u8 {
+        const started: ?u64 = if (kind == .start) blk: {
+            const r = runOf(e, kind) orelse break :blk null;
+            const run = self.ledger.runs[r] orelse break :blk null;
+            break :blk if (run.created_ns == e.header.timestamp_ns) incarnation(run, r) else null;
+        } else null;
+        for (self.landed.freshIds()) |f| {
+            if (started == f.id) continue;
+            if (std.mem.indexOfScalar(?u64, &live_before, f.id) == null) return "an apply sent history for a run ended before it or not there";
+        }
+        return null;
     }
 
     /// The groups a message's slot can be in, under the store's place.
@@ -1023,6 +1102,18 @@ pub const WorkflowRuns = struct {
             if (!std.mem.eql(u8, want, item.key)) return "an idempotency key names a run of another workflow or key";
         }
 
+        // A deleted run's history rows are gone once its drop landed, or
+        // stay, marked orphaned, when it was lost past its retries.
+        for (l.gone) |x| {
+            const gn = x orelse continue;
+            const owner = NAMES[gn.wf];
+            const at: u64 = @intCast(@max(gn.completed_ms, 0));
+            if (gn.orphaned) {
+                if (hm.orphanRow(rv, a, .workflow, NS, owner, RUNS[gn.run], gn.created_ns) == null) return "a deleted run whose drop was lost past its retries isn't marked orphaned";
+                if (hm.endedRow(rv, a, .workflow, NS, owner, RUNS[gn.run], gn.created_ns, at) == null) return "an orphaned run's history rows are gone";
+            } else if (try hm.holdsAny(rv, a, .workflow, NS, owner, RUNS[gn.run], gn.created_ns, at)) return "a deleted run's history rows aren't gone";
+        }
+
         // Against the ledger, run by run.
         var want_runs: usize = 0;
         var want_idems: usize = 0;
@@ -1059,6 +1150,12 @@ pub const WorkflowRuns = struct {
             if (v.state != want.state or v.attempts != want.attempts or v.first_ns != want.first_ns or v.last_ns != want.last_ns or
                 v.status != want.status or !std.mem.eql(u8, v.outcome, want.outcome) or !std.mem.eql(u8, v.result, want.result))
                 return "a call's state is not the ledger's";
+            // A call whose caller the ledger deleted, or deleted and started
+            // again since the call was made, stays recorded: the leader's
+            // sweep clears a call only once its caller has ended or is gone,
+            // so one whose id started again keeps it until that run ends.
+            const ledger_caller = l.runs[want.caller] orelse continue;
+            if (ledger_caller.created_ns != want.caller_created_ns) continue;
             const caller = rm.runOf(rv, view_mod.idKey(try a.alloc(u8, 4 + v.caller_run.len), NS, v.caller_run) catch unreachable) orelse
                 return "a call's caller run is gone";
             const s = std.enums.fromInt(RunStatus, caller.status) orelse return "a run's status is not a status";
@@ -1305,6 +1402,24 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
         const vb = buf[buf.len / 2 ..];
         const value = completeValue(r, vb, ENDS[r.uintLessThan(usize, ENDS.len)], NAMES[l.runs[c].?.wf]) orelse return null;
         return command(buf[0 .. buf.len / 2], .workflow_complete, view_mod.idKey(&kb, NS, RUNS[c]) catch unreachable, value);
+    }
+    // A delete: mostly of an ended run, as the leader holds it; now and
+    // then of a live one, of another incarnation, or sent again.
+    if (roll < 72 and held.n > 0) {
+        var ended: Pick = .{};
+        for (held.ids[0..held.n]) |i| if (l.runs[i].?.status.isTerminal()) ended.add(i);
+        const k = r.uintLessThan(u8, 100);
+        var vb: [128]u8 = undefined;
+        if (k < 12 and l.gone_next > 0) {
+            const g = l.gone[(l.gone_next - 1 - r.uintLessThan(usize, @min(l.gone_next, WorkflowRuns.GONE))) % WorkflowRuns.GONE].?;
+            const d: rm.Delete = .{ .workflow = NAMES[g.wf], .idem = if (g.idem) |i| IDEMS[i] else "", .created_ns = g.created_ns };
+            return command(buf, .workflow_run_delete, view_mod.idKey(&kb, NS, RUNS[g.run]) catch unreachable, d.encode(&vb).?);
+        }
+        const c = if (k < 85) ended.or_(r, 100, held.at(r)) else held.at(r);
+        const run = l.runs[c].?;
+        var d: rm.Delete = .{ .workflow = NAMES[run.wf], .idem = if (run.idem) |i| IDEMS[i] else "", .created_ns = run.created_ns };
+        if (k >= 94) d.created_ns +%= 1;
+        return command(buf, .workflow_run_delete, view_mod.idKey(&kb, NS, RUNS[c]) catch unreachable, d.encode(&vb).?);
     }
     const ev = r.uintLessThan(usize, EVENTS.len);
     const run = if (ev == CHILD) pending.or_(r, 70, any) else free.or_(r, 75, any);

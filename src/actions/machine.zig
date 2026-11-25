@@ -703,6 +703,7 @@ fn applyRunDelete(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     if (run.v.created_ns != p.created_ns) return out.refuse(.not_found, .not_found, NO_RUN);
     if (run.v.completed_ns == 0) return out.refuse(.bad_request, .run_live, RUN_LIVE);
     try view.delete(Runs, rk);
+    if (comptime plant.active == .actions_delete_keeps_history) return;
     try hp.sendDrop(view, ownerOf(ns, p.run, &run.v), msOf(run.v.completed_ns));
 }
 

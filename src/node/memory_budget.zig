@@ -22,6 +22,7 @@ const hp = @import("../stream/history_producer.zig");
 const hm = @import("../stream/history_machine.zig");
 const action_machine = @import("../actions/machine.zig");
 const runs_machine = @import("../workflow/runs_machine.zig");
+const WorkflowHandler = @import("../workflow/handler.zig").WorkflowHandler;
 const schema = @import("../protocol/schema.zig");
 
 /// The fixed overhead a shard holds before client data, measured ~5 MiB after
@@ -99,10 +100,10 @@ const HISTORY_ROW_BYTES: u64 = pool.RESIDENT_RECORD + 4 + he.MAX_OWNER + he.MAX_
 const HISTORY_LAND_BYTES: u64 = 3 * HISTORY_ROW_BYTES + 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + channels.CHAN_KEY + channels.OUT_NS_KEY + 3 * 64 + he.Index.max_size;
 
 /// What one admitted start or signal sends, which its verdict can't weigh:
-/// sends are written after the machine's verdict. A signal sends at most
-/// one chunk, so a start's figure holds for both. Its first event, sent at once when
-/// large; for a run that starts ended, its last chunk, which holds no
-/// events then; and for a child, its parent's answer. Each send is an
+/// sends are written after the machine's verdict. A start sends its first
+/// event, at once when large; for a run that starts ended, its last chunk,
+/// which holds no events then; and for a child, its parent's answer. A
+/// signal sends at most one chunk, so a start's figure holds for both. Each send is an
 /// outbox row, and on a first send to its channel or namespace that
 /// channel's meta row and its per-namespace count. The next entry's verdict
 /// reads them committed, so a shard passes its share by one entry's sends
@@ -118,7 +119,7 @@ const SEND_ROWS_BYTES: u64 = 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + chann
 /// two history events in its run's pending chunk, each naming the signal's
 /// type; the run's own fields only shrink as its wait clears. The wake
 /// slack holds at least one.
-const MAX_WAKE_BYTES: u64 = pool.RESIDENT_RECORD + @import("../workflow/handler.zig").WorkflowHandler.MAX_START_KEY + 2 + 8 + runs_machine.Sig.max_size +
+const MAX_WAKE_BYTES: u64 = pool.RESIDENT_RECORD + WorkflowHandler.MAX_START_KEY + 2 + 8 + runs_machine.Sig.max_size +
     hp.recordBound("signal_received".len, runs_machine.MAX_NAME, 0) + hp.recordBound("signal_matched".len, runs_machine.MAX_NAME, 0);
 
 comptime {

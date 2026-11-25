@@ -42,6 +42,7 @@ const view_mod = @import("../contract/view.zig");
 const machine_mod = @import("../contract/machine.zig");
 const delivery = @import("../contract/delivery.zig");
 const router = @import("../node/router.zig");
+const plant = @import("../plant.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -446,6 +447,7 @@ fn skippedIn(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Messa
             try view.delete(F, final_key);
         },
         .history_drop => {
+            if (comptime plant.active == .history_drop_not_resent) return;
             if (h.first_seq < MAX_DROP_RETRIES - 1) return sendDrop(view, msg, h, h.first_seq + 1);
             // Past its retries: its rows stay, marked, until a later drop.
             var o = row(h.owner);
@@ -543,6 +545,36 @@ pub fn endedRow(read: ReadView, a: std.mem.Allocator, family: he.Family, ns: Nam
     };
     const g = got orelse return null;
     return if (std.mem.eql(u8, g.v.owner, owner)) g.v else null;
+}
+
+/// The orphan mark of `run`'s incarnation `created_ns`: its drop was lost
+/// past its retries, so its rows stay. Null for none.
+pub fn orphanRow(read: ReadView, a: std.mem.Allocator, family: he.Family, ns: NamespaceId, owner: []const u8, run: []const u8, created_ns: u64) ?Row.Value {
+    const k = inNs(a, ns, runKey(a, .orphan, owner, run, created_ns) catch return null) catch return null;
+    const got = switch (family) {
+        .workflow => read.get(Workflows, k) catch null,
+        .action => read.get(Actions, k) catch null,
+    };
+    const g = got orelse return null;
+    return if (std.mem.eql(u8, g.v.owner, owner)) g.v else null;
+}
+
+/// Whether `run`'s incarnation `created_ns` holds any row: live, marker,
+/// final, orphan, or ended at `completed_ms`.
+pub fn holdsAny(read: ReadView, a: std.mem.Allocator, family: he.Family, ns: NamespaceId, owner: []const u8, run: []const u8, created_ns: u64, completed_ms: u64) error{OutOfMemory}!bool {
+    if (endedRow(read, a, family, ns, owner, run, created_ns, completed_ms) != null) return true;
+    return switch (family) {
+        .workflow => holdsAnyIn(Workflows, read, a, ns, owner, run, created_ns),
+        .action => holdsAnyIn(Actions, read, a, ns, owner, run, created_ns),
+    };
+}
+
+fn holdsAnyIn(comptime F: type, read: ReadView, a: std.mem.Allocator, ns: NamespaceId, owner: []const u8, run: []const u8, created_ns: u64) error{OutOfMemory}!bool {
+    for ([_]Tag{ .live, .marker, .final, .orphan }) |tag| {
+        var it = read.range(F, try inNs(a, ns, try runKey(a, tag, owner, run, created_ns)));
+        if ((it.next() catch return true) != null) return true;
+    }
+    return false;
 }
 
 /// Why `F`'s rows break what a run's history keeps, or null: a run with

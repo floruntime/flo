@@ -53,14 +53,14 @@ pub const Leader = struct {
 
 pub const Made = struct { entry_type: EntryType, payload: []const u8 };
 
-const Kind = enum { register, delete, invoke, deliver, settle, release, extend, expire };
+const Kind = enum { register, delete, invoke, deliver, settle, release, extend, expire, run_delete };
 /// Out of 100. Reports need leases, so delivers come often; an action is
-/// deleted now and then, and registered again.
-const WEIGHTS = [_]u8{ 3, 1, 25, 27, 12, 12, 8, 12 };
+/// deleted now and then, and registered again; an ended run now and then.
+const WEIGHTS = [_]u8{ 3, 1, 25, 27, 12, 12, 6, 12, 2 };
 /// Percent of entries spoiled, by kind: enough that each kind the machine
 /// can refuse is refused a fifth to a third of the time, counting those a
 /// lagging leader's state spoils on its own.
-const SPOIL = [_]u8{ 0, 0, 15, 15, 15, 15, 10, 15 };
+const SPOIL = [_]u8{ 0, 0, 15, 15, 15, 15, 10, 15, 30 };
 
 /// An action entry for op `op_id`, in `buf`, at most `max_len` bytes; null
 /// when the leader has nothing of the kind drawn to propose.
@@ -88,6 +88,7 @@ pub fn make(a: *families.Actions, l: Leader, r: std.Random, op_id: u64, buf: []u
         .deliver => deliver(a, out, l, r, spoil, tag),
         .settle, .release, .extend => report(a, out, kind, l, r, spoil, tag),
         .expire => expire(a, out, l, spoil),
+        .run_delete => runDelete(a, out, r, spoil, tag),
     } catch null;
 }
 
@@ -148,6 +149,35 @@ fn pick(a: *families.Actions, r: std.Random, want: *const fn (action_machine.Run
         chosen = .{ .id = id_buf[0..id.len], .run = item.value.v };
     }
     return chosen;
+}
+
+/// A delete of an ended run, as the leader read it; spoiled, of a live
+/// run, of another incarnation, or of a run not there (one deleted
+/// already, or never invoked).
+fn runDelete(a: *families.Actions, out: []u8, r: std.Random, spoil: bool, tag: []const u8) !?Made {
+    var ib: [ae.MAX_RUN_ID]u8 = undefined;
+    var rb: [24]u8 = undefined;
+    const how = if (spoil) r.uintLessThan(u8, 3) else 3;
+    const p = pick(a, r, if (how == 0) isLive else isEnded, &ib) orelse {
+        if (how != 2) return null;
+        const payload = try ae.RunDelete.encodeInto(out, .{ .ns = NS.int(), .action = ACTIONS[r.uintLessThan(usize, ACTIONS.len)], .run = try std.fmt.bufPrint(&rb, "r{s}", .{tag}), .created_ns = 1 });
+        return .{ .entry_type = .action_run_delete, .payload = payload };
+    };
+    const payload = try ae.RunDelete.encodeInto(out, .{
+        .ns = NS.int(),
+        .action = p.run.action,
+        .run = if (how == 2) try std.fmt.bufPrint(&rb, "r{s}", .{tag}) else p.id,
+        .created_ns = if (how == 1) p.run.created_ns + 1 else p.run.created_ns,
+    });
+    return .{ .entry_type = .action_run_delete, .payload = payload };
+}
+
+fn isLive(v: action_machine.Run.Value) bool {
+    return v.completed_ns == 0;
+}
+
+fn isEnded(v: action_machine.Run.Value) bool {
+    return v.completed_ns != 0;
 }
 
 fn any(_: action_machine.Run.Value) bool {

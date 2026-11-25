@@ -24,6 +24,8 @@ pub const Verdict = struct {
     /// The refusal for a client's, a schedule's or a trigger's start, or a
     /// signal.
     pub fn refuse(v: Verdict, out: *persistence.Result, view: *const view_mod.View) void {
+        // Counted with the gate's refusals (`flo_shard_memory_refusals_total`).
+        view.store.memory_refusals += 1;
         switch (v.bound) {
             .memory_budget => gate.refuse(out, if (view.store.place) |pl| pl.group else null, v.over),
         }
@@ -58,7 +60,6 @@ pub fn signalVerdict(view: *view_mod.View, ns: NamespaceId, wakes: bool) ?Verdic
 pub fn startVerdict(view: *view_mod.View, ns: NamespaceId) ?Verdict {
     // The quota arm, per namespace, goes first.
     _ = ns;
-    if (comptime plant.active == .start_verdict_admits) return null;
     if (gate.over(view)) |o| return .{ .bound = .memory_budget, .over = o };
     return null;
 }

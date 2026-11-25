@@ -6,8 +6,8 @@
 //! carries is refused here (a sink's message is held before it is proposed,
 //! `channels.sinkRoom`), nor anything the node writes for itself: a duty, a
 //! delete, a channel's own entries. A type whose machine caps itself (`own`)
-//! applies its own rule: a run's start, which a duty may propose, is held
-//! by the runs machine (`start_verdict.zig`).
+//! applies its own rule: a run's start, which a duty may propose, and a
+//! signal are held by the runs machine (`start_verdict.zig`).
 //!
 //! The verdict reads only the committed store and the bound share, so every
 //! replica, replay included, reaches the same one.
