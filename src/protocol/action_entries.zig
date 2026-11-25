@@ -75,6 +75,15 @@ pub const Delete = Record(&.{
     .{ .name = "name", .T = ActionName },
 });
 
+/// An ended run deleted, its history with it: the incarnation its leader
+/// read, so only that one goes.
+pub const RunDelete = Record(&.{
+    .{ .name = "ns", .T = NamespaceId },
+    .{ .name = "action", .T = ActionName },
+    .{ .name = "run", .T = RunId },
+    .{ .name = "created_ns", .T = Int(u64) },
+});
+
 pub const Invoke = Record(&.{
     .{ .name = "ns", .T = NamespaceId },
     .{ .name = "action", .T = ActionName },
@@ -329,6 +338,7 @@ pub const table = [_]entries.Entry{
     .{ .name = "action.release", .type_code = 0x76, .payload = Release, .max_payload = Release.max_size, .doc = "A delivery failed or abandoned by its holder." },
     .{ .name = "action.extend", .type_code = 0x77, .payload = Extend, .max_payload = Extend.max_size, .doc = "A delivery's lease moved out by its holder." },
     .{ .name = "action.expire", .type_code = 0x78, .payload = Expire, .max_payload = Expire.max_size, .doc = "Leases past their deadline ended, as failures." },
+    .{ .name = "action.run_delete", .type_code = 0x79, .payload = RunDelete, .max_payload = RunDelete.max_size, .doc = "An ended run deleted, its history with it." },
     .{ .name = "step.call_retry", .type_code = 0x7A, .payload = CallRetry, .max_payload = CallRetry.max_size, .doc = "A call whose action wasn't registered, its start sent again." },
     .{ .name = "step.call_clear", .type_code = 0x7B, .payload = CallClear, .max_payload = CallClear.max_size, .doc = "A call its step is done with, its record dropped." },
     .{ .name = "call.reply", .type_code = 0x7C, .payload = Reply, .max_payload = Reply.max_size, .doc = "A message: the callee's shard's answer to a call's start." },

@@ -179,6 +179,11 @@ pub const WorkflowHandler = struct {
     /// each. Leader memory (`clearCaches`).
     held: std.StringHashMapUnmanaged(Hold) = .empty,
     holds_count: std.AutoHashMapUnmanaged(Hold, u32) = .empty,
+    /// How many times in a row each run's timer step was refused at apply,
+    /// keys owned: its recheck backs off, so a step refused the same way
+    /// every time costs a log entry a minute, not a second. Cleared when an
+    /// entry of the run's own applies. Leader memory (`clearCaches`).
+    refusals: std.StringHashMapUnmanaged(u8) = .empty,
     /// An index couldn't keep an entry: the runs are walked again
     /// (`leadCaches`).
     rewatch: bool = false,
@@ -663,6 +668,7 @@ pub const WorkflowHandler = struct {
         self.clearHeld();
         self.held.deinit(self.allocator);
         self.holds_count.deinit(self.allocator);
+        self.refusals.deinit(self.allocator);
 
         // Free stream trigger state
         var tit = self.stream_triggers.iterator();
@@ -756,6 +762,7 @@ pub const WorkflowHandler = struct {
         dispatcher.registerWithRoute(.workflow_signal, dispatchWorkflow, run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.workflow_cancel, dispatchWorkflow, run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.workflow_history, table_run.handler("workflow.history", history_ops.Ops, history_ops.Ops.workflowHistory), run_id_mod.preRouteByRunId);
+        dispatcher.registerWithRoute(.workflow_run_delete, table_run.handler("workflow.run_delete", RunDelete, RunDelete.run), run_id_mod.preRouteByRunId);
         dispatcher.registerWalk(.workflow_list_definitions, dispatchWorkflow, localScanWorkflowDefs);
     }
 
@@ -1483,6 +1490,44 @@ pub const WorkflowHandler = struct {
         }
         return proposed;
     }
+
+    /// `workflow.run_delete`: an ended run deleted, its history with it.
+    /// Refused here for a live one, and at apply for one that isn't there
+    /// by then or is another incarnation than the one read here.
+    const RunDelete = struct {
+        pub const Error = error{ NotFound, NotLeading, OutOfMemory };
+
+        pub fn refusal(err: Error) table_run.Refused {
+            return switch (err) {
+                error.NotFound => .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = "not found: no such run" } },
+                error.NotLeading => .{ .status = .unavailable, .refusal = .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: this node's leadership isn't settled yet — retry" } },
+                error.OutOfMemory => .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "internal error: out of memory" } },
+            };
+        }
+
+        const Response = table_run.op("workflow.run_delete").response;
+
+        fn run(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(Response) {
+            const self = shard.workflow_handler;
+            if (!shard.raft_node.leaderReady()) return error.NotLeading;
+            if (req.key.len == 0) return error.NotFound;
+            const run_key = self.nsKey(req.ns_id, req.key) orelse return error.OutOfMemory;
+            defer self.allocator.free(run_key);
+            const rec = self.appliedRun(run_key) orelse return error.NotFound;
+            if (!appliedStatus(rec).isTerminal()) return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .run_live, .ran = .no, .message = runs_machine.RUN_LIVE } } };
+            const d: runs_machine.Delete = .{ .workflow = rec.workflow, .idem = rec.idempotency_key, .created_ns = rec.created_ns };
+            const vbuf = try self.allocator.alloc(u8, d.size());
+            defer self.allocator.free(vbuf);
+            const value = d.encode(vbuf).?;
+            const proposed = persistence_mod.proposeEntryIn(shard, .workflow_run_delete, entry_mod.Flags.NONE, req.ns_id, run_key, value) catch |err|
+                return .{ .refused = .{ .status = persistence_mod.failureStatus(err), .refusal = persistence_mod.failureRefusal(err, "delete not persisted") } };
+            return .{ .park = .{ .proposed = proposed, .answer = answerEmpty } };
+        }
+
+        fn answerEmpty(shard: *Shard, conn: *Connection, request_id: u64, _: *const persistence_mod.Result) void {
+            table_run.answer(Response, shard, conn, request_id, .{});
+        }
+    };
 
     fn noteEnding(self: *WorkflowHandler, run_key: []const u8, proposed: persistence_mod.ProposeResult) void {
         const gop = self.ending.getOrPut(self.allocator, run_key) catch return;
@@ -2697,7 +2742,11 @@ pub const WorkflowHandler = struct {
                 .none => {},
                 .later => |at| self.armCallTimer(ns_key, at),
                 .step => {
-                    const run = self.takeRun(shard, ns_key) orelse continue;
+                    const run = (self.tryTakeRun(shard, ns_key) catch {
+                        // Out of the dirty set already: looked at again.
+                        self.indexKey(&self.call_dirty, ns_key);
+                        continue;
+                    }) orelse continue;
                     const rid = run.pending_action_run_id_owned orelse {
                         self.dropRun(ns_key);
                         continue;
@@ -2734,7 +2783,11 @@ pub const WorkflowHandler = struct {
                 self.holdTimer(.{ .ns = keyNamespace(ns_key) }, ns_key);
                 continue;
             }
-            const r = self.takeRun(shard, ns_key) orelse continue;
+            const r = (self.tryTakeRun(shard, ns_key) catch {
+                // Its timer was popped: armed again, as an unlogged step's is.
+                self.armTimer(ns_key, now_ms +| UNLOGGED_RECHECK_MS);
+                continue;
+            }) orelse continue;
             switch (timerDue(r, now_ms)) {
                 .none => {},
                 // Re-invoke the current step's action.
@@ -3197,6 +3250,13 @@ pub const WorkflowHandler = struct {
     /// it. Null for a run that isn't there or has ended, or one whose step
     /// this leader logged and is yet to apply.
     fn takeRun(self: *WorkflowHandler, shard: *Shard, run_key: []const u8) ?*RunRecord {
+        return self.tryTakeRun(shard, run_key) catch null;
+    }
+
+    /// `takeRun`, saying when the copy ran out of memory, for a caller
+    /// whose wake is gone once it fails: a popped timer, a call's look.
+    /// Other callers' runs stay indexed and are taken again.
+    fn tryTakeRun(self: *WorkflowHandler, shard: *Shard, run_key: []const u8) error{OutOfMemory}!?*RunRecord {
         std.debug.assert(!self.runs.contains(run_key));
         const rec = runs_machine.runOf(self.defsRead(), run_key) orelse return null;
         if (appliedStatus(rec).isTerminal()) return null;
@@ -3204,9 +3264,7 @@ pub const WorkflowHandler = struct {
         self.taken += 1;
         self.copyRun(run_key, rec) catch {
             log.err("workflow run {f}: not taken on (out of memory)", .{shown(run_key)});
-            // Its wake (a popped timer) may be gone: the runs are walked again.
-            self.rewatch = true;
-            return null;
+            return error.OutOfMemory;
         };
         return self.runs.getPtr(run_key);
     }
@@ -4377,7 +4435,7 @@ pub const WorkflowHandler = struct {
         const etype = std.enums.fromInt(entry_mod.EntryType, entry.header.entry_type) orelse return error.Halt;
         const m: *const contract_machine.Machine = switch (etype) {
             .workflow_create, .workflow_enabled => &defs_machine.machine,
-            .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done => &runs_machine.machine,
+            .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .workflow_run_delete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done => &runs_machine.machine,
             else => return error.Halt,
         };
         try contract_machine.applyEntry(m, self.defsRead().store, &self.def_scratch, entry, out);
@@ -4463,7 +4521,7 @@ pub const WorkflowHandler = struct {
         }
         if (out.refused() != null) return;
         switch (t) {
-            .workflow_create, .workflow_enabled, .workflow_start, .workflow_step, .workflow_signal, .workflow_complete => {},
+            .workflow_create, .workflow_enabled, .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .workflow_run_delete => {},
             // A run waiting on an action not registered may now go on.
             .action_register => {
                 var it = self.parked.keyIterator();
@@ -4560,7 +4618,15 @@ pub const WorkflowHandler = struct {
 
     fn runApplied(self: *WorkflowHandler, t: entry_mod.EntryType, run_key: []const u8) void {
         self.unhold(run_key);
-        const run = runs_machine.runOf(self.defsRead(), run_key) orelse return;
+        if (self.refusals.fetchRemove(run_key)) |kv| self.allocator.free(kv.key);
+        // Gone (deleted): nothing of it stays indexed.
+        const run = runs_machine.runOf(self.defsRead(), run_key) orelse {
+            self.unindexToStep(run_key);
+            unindexKey(self, &self.parked, run_key);
+            unindexKey(self, &self.call_dirty, run_key);
+            self.dropCallTimer(run_key);
+            return;
+        };
         const live = !appliedStatus(run).isTerminal();
         if (live and run.wait == .none) self.indexToStep(run_key) else self.unindexToStep(run_key);
         if (live and run.wait == .call) {
@@ -4645,6 +4711,9 @@ pub const WorkflowHandler = struct {
         while (it.next()) |k| self.allocator.free(k.*);
         self.held.clearRetainingCapacity();
         self.holds_count.clearRetainingCapacity();
+        var rit = self.refusals.keyIterator();
+        while (rit.next()) |k| self.allocator.free(k.*);
+        self.refusals.clearRetainingCapacity();
     }
 
     fn holds(shard: *Shard, hold: Hold) bool {
@@ -4655,7 +4724,7 @@ pub const WorkflowHandler = struct {
     /// Held timers whose hold has cleared, put back on `timers`, due at
     /// `now_ms`: each is asked again against its run's wait as applied, as
     /// any timer is. Every hold is asked once; the runs are walked only
-    /// when one clears, and at most `RELEASE_PER_TICK` go back a tick, so
+    /// when one clears, and at most `RELEASE_PER_PASS` go back a pass, so
     /// thousands released at once don't take every other run's turn at the
     /// due timers a pass handles. The rest wait for their hold to be asked
     /// again.
@@ -4670,7 +4739,7 @@ pub const WorkflowHandler = struct {
             if (n == cleared.len) break;
         }
         if (n == 0) return;
-        var released: [RELEASE_PER_TICK][]const u8 = undefined;
+        var released: [RELEASE_PER_PASS][]const u8 = undefined;
         var m: usize = 0;
         var it = self.held.iterator();
         while (m < released.len) {
@@ -4692,19 +4761,53 @@ pub const WorkflowHandler = struct {
         }
     }
 
-    /// Held runs put back on `timers` a tick, at most: half the due timers
-    /// a pass handles, so other runs' timers keep the rest.
-    const RELEASE_PER_TICK: usize = 32;
+    /// Held runs put back on `timers` a pass, at most: half the due timers
+    /// a pass handles, so other runs' timers keep the rest. A tick runs up
+    /// to four passes, so up to 128 a tick; the ratio is what holds.
+    const RELEASE_PER_PASS: usize = 32;
 
     /// Run `run_key`'s step, which a timer may have taken, was refused at
-    /// apply. Its timer is armed again a second out, against its wait as
-    /// applied.
+    /// apply. Its timer is armed again against its wait as applied: a
+    /// second out, doubling with each refusal in a row up to
+    /// `REFUSED_RECHECK_MAX_MS`, with a warning once it gets there.
     fn recheckRefused(self: *WorkflowHandler, run_key: []const u8) void {
         const rec = self.appliedRun(run_key) orelse return;
         if (appliedStatus(rec).isTerminal() or rec.wait_due_ms == 0) return;
         if (rec.wait != .timer and rec.wait != .signal) return;
-        self.armTimer(run_key, @import("stdx").time.milliTimestamp() +| UNLOGGED_RECHECK_MS);
+        const now = @import("stdx").time.milliTimestamp();
+        self.armTimer(run_key, now +| self.refusedDelay(run_key));
     }
+
+    /// The wait before run `run_key`'s next recheck, counting this refusal.
+    /// Not counted (out of memory): the longest, the safe side.
+    fn refusedDelay(self: *WorkflowHandler, run_key: []const u8) i64 {
+        const n: u8 = blk: {
+            if (self.refusals.getPtr(run_key)) |c| {
+                c.* +|= 1;
+                break :blk c.*;
+            }
+            const owned = self.allocator.dupe(u8, run_key) catch return REFUSED_RECHECK_MAX_MS;
+            self.refusals.put(self.allocator, owned, 1) catch {
+                self.allocator.free(owned);
+                return REFUSED_RECHECK_MAX_MS;
+            };
+            break :blk 1;
+        };
+        const shift: u6 = @intCast(@min(n - 1, 16));
+        const delay = @min(UNLOGGED_RECHECK_MS << shift, REFUSED_RECHECK_MAX_MS);
+        if (n == REFUSED_WARN_AT)
+            log.warn("workflow run {f}: its timer's step was refused {d} times in a row; looked at again every {d} s", .{ shown(run_key), n, @divTrunc(REFUSED_RECHECK_MAX_MS, 1000) });
+        return delay;
+    }
+
+    const REFUSED_RECHECK_MAX_MS: i64 = 60_000;
+    /// The refusal in a row whose recheck first waits the longest: warned
+    /// at once, then not again for that run (the count saturates).
+    const REFUSED_WARN_AT: u8 = blk: {
+        var n: u8 = 1;
+        while ((UNLOGGED_RECHECK_MS << (n - 1)) < REFUSED_RECHECK_MAX_MS) n += 1;
+        break :blk n;
+    };
 
     /// `armTimer` for a parked run's call, unless one at or before `at_ms`
     /// is armed already.
@@ -5102,8 +5205,9 @@ test "workflow handler: dispatcher registration" {
     try testing.expect(dispatcher.hasHandler(OpCode.workflow_disable));
     try testing.expect(dispatcher.hasHandler(OpCode.workflow_enable));
     try testing.expect(dispatcher.hasHandler(OpCode.workflow_list_definitions));
+    try testing.expect(dispatcher.hasHandler(OpCode.workflow_run_delete));
 
-    try testing.expectEqual(@as(u16, 11), dispatcher.handler_count);
+    try testing.expectEqual(@as(u16, 12), dispatcher.handler_count);
 }
 
 test "workflow handler: init and deinit" {
@@ -6300,8 +6404,11 @@ test "workflow duty: runs held by one namespace's history share don't delay anot
     signalTestRun(&handler, testKey(.default, "noisy"), 4, 1000);
     try testing.expect(shard.historyWait(.default) != null);
     try testing.expect(shard.historyWait(TEST_NS_A) == null);
+    // Held as they come due, none copied to find out.
+    const taken0 = handler.taken;
     handler.checkPendingActionsAt(&shard, now + 1);
     handler.checkPendingActionsAt(&shard, now + 2);
+    try testing.expectEqual(taken0, handler.taken);
     try testing.expectEqual(@as(usize, N), handler.held.count());
     try testing.expectEqual(@as(?u32, N), handler.holds_count.get(.{ .ns = .default }));
     // Once the quiet run's timer is due, one pass fires it: the held runs
@@ -6314,9 +6421,9 @@ test "workflow duty: runs held by one namespace's history share don't delay anot
     settleTest(&shard);
     try testing.expectEqual(WorkflowHandler.RunStatus.timed_out, handler.inspect(testKey(TEST_NS_A, "quiet")).?.status);
     try testing.expect(shard.historyWait(.default) == null);
-    // Back in batches: a tick puts back `RELEASE_PER_TICK`, not all.
+    // Back in batches: a pass puts back `RELEASE_PER_PASS`, not all.
     handler.checkPendingActionsAt(&shard, now + 5_002);
-    try testing.expectEqual(N - WorkflowHandler.RELEASE_PER_TICK, handler.held.count());
+    try testing.expectEqual(N - WorkflowHandler.RELEASE_PER_PASS, handler.held.count());
     settleTest(&shard);
     for (0..8) |i| {
         handler.checkPendingActionsAt(&shard, now + 5_003 + @as(i64, @intCast(i)));
@@ -6387,6 +6494,149 @@ test "workflow duty: a timer's step refused at apply is armed again" {
     handler.startApplied(&shard, &entry, &out);
     try testing.expectEqual(@as(usize, 1), handler.timers.count());
     try testing.expect(handler.timers.peek().?.at_ms >= now + WorkflowHandler.UNLOGGED_RECHECK_MS);
+}
+
+/// Run `key`'s step, logged and not applied, refused at apply.
+fn testRefuseStep(handler: *WorkflowHandler, shard: *Shard, key: []const u8) void {
+    const cmd: entry_mod.CommandPayload = .{ .namespace_id = .default, .key_length = @intCast(key.len), .value_length = 0, .key = key, .value = "" };
+    var pb: [128]u8 = undefined;
+    const len = cmd.serialize(&pb).?;
+    const entry: entry_mod.Entry = .{ .header = .{ .magic = 0, .version = 0, .entry_type = @backingInt(entry_mod.EntryType.workflow_step), .flags = 0, .term = shard.raft_node.current_term, .index = shard.raft_node.log.lastIndex(), .timestamp_ns = 0, .payload_len = @intCast(len), .crc32c = 0 }, .payload = pb[0..len] };
+    var out: Result = .{};
+    out.refuse(.bad_request, .unclassified, "a step's counters are past their bound");
+    handler.startApplied(shard, &entry, &out);
+}
+
+test "workflow duty: a timer's step refused every time backs off to a minute, and starts over once the run moves" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    const key = testKey(.default, "due");
+    createTestRun(&handler, key, "due", "test-wf");
+    testSetWait(&handler, &shard, key, .{ .signal = "go", .due = @import("stdx").time.milliTimestamp() - 1 });
+    // Each refusal in a row doubles the wait, up to the cap.
+    const want = [_]i64{ 1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000 };
+    var at: i64 = @import("stdx").time.milliTimestamp();
+    for (want) |delay| {
+        handler.checkPendingActionsAt(&shard, at);
+        try testing.expect(handler.stepping.contains(key));
+        const before = @import("stdx").time.milliTimestamp();
+        testRefuseStep(&handler, &shard, key);
+        try testing.expectEqual(@as(usize, 1), handler.timers.count());
+        at = handler.timers.peek().?.at_ms;
+        try testing.expect(at >= before + delay);
+        try testing.expect(at < before + delay + 1_000);
+    }
+    try testing.expectEqual(@as(?u8, want.len), handler.refusals.get(key));
+    // An entry of its own applies: the count goes.
+    try testSignal(&handler, key, "go");
+    try testing.expect(handler.refusals.get(key) == null);
+}
+
+/// Fails the next allocation it is told to, and no other.
+const FailOnce = struct {
+    inner: Allocator,
+    fail_next: bool = false,
+    failed: bool = false,
+    fn allocator(self: *FailOnce) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FailOnce = @ptrCast(@alignCast(ctx));
+        if (self.fail_next) {
+            self.fail_next = false;
+            self.failed = true;
+            return null;
+        }
+        return self.inner.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *FailOnce = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *FailOnce = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(m, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *FailOnce = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(m, a, ra);
+    }
+};
+
+test "workflow duty: a timer's run not copied (out of memory) is armed again, without walking the runs" {
+    var fail: FailOnce = .{ .inner = testing.allocator };
+    var handler = WorkflowHandler.init(fail.allocator());
+    defer handler.deinit();
+    var actions = ActionsHandler.init(testing.allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    const key = testKey(.default, "due");
+    createTestRun(&handler, key, "due", "test-wf");
+    const now = @import("stdx").time.milliTimestamp();
+    testSetWait(&handler, &shard, key, .{ .signal = "go", .due = now - 1 });
+    // The pass's first allocation is the run's copy.
+    const taken = handler.taken;
+    fail.fail_next = true;
+    handler.checkPendingActionsAt(&shard, now);
+    try testing.expect(fail.failed);
+    try testing.expectEqual(taken + 1, handler.taken);
+    try testing.expect(!handler.stepping.contains(key));
+    try testing.expect(!handler.rewatch);
+    try testing.expectEqual(@as(usize, 1), handler.timers.count());
+    try testing.expectEqual(now + WorkflowHandler.UNLOGGED_RECHECK_MS, handler.timers.peek().?.at_ms);
+    // Then it fires.
+    handler.checkPendingActionsAt(&shard, now + WorkflowHandler.UNLOGGED_RECHECK_MS);
+    try testing.expect(handler.stepping.contains(key));
+}
+
+test "workflow duty: a hold that clears puts back only its own runs" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    createTestRun(&handler, testKey(.default, "noisy"), "noisy", "test-wf");
+    shard.outbox_caps.other.channel = 64;
+    signalTestRun(&handler, testKey(.default, "noisy"), 4, 1000);
+    try testing.expect(shard.historyWait(.default) != null);
+    try testing.expect(shard.historyWait(TEST_NS_A) == null);
+    // Two runs under a hold that holds, two under one that doesn't.
+    handler.holdTimer(.{ .ns = .default }, testKey(.default, "a"));
+    handler.holdTimer(.{ .ns = .default }, testKey(.default, "b"));
+    handler.holdTimer(.{ .ns = TEST_NS_A }, testKey(TEST_NS_A, "c"));
+    handler.holdTimer(.{ .ns = TEST_NS_A }, testKey(TEST_NS_A, "d"));
+    // Held again under the same hold: still once.
+    handler.holdTimer(.{ .ns = TEST_NS_A }, testKey(TEST_NS_A, "d"));
+    try testing.expectEqual(@as(?u32, 2), handler.holds_count.get(.{ .ns = TEST_NS_A }));
+    const now = @import("stdx").time.milliTimestamp();
+    handler.releaseHeld(&shard, now);
+    try testing.expectEqual(@as(usize, 2), handler.held.count());
+    try testing.expect(handler.held.contains(testKey(.default, "a")));
+    try testing.expect(handler.held.contains(testKey(.default, "b")));
+    try testing.expectEqual(@as(?u32, 2), handler.holds_count.get(.{ .ns = .default }));
+    try testing.expect(handler.holds_count.get(.{ .ns = TEST_NS_A }) == null);
+    try testing.expectEqual(@as(usize, 2), handler.timers.count());
+    try testing.expectEqual(now, handler.timers.peek().?.at_ms);
 }
 
 test "workflow duty: a step whose events are past its buffer ends its run too large to log" {
@@ -6666,6 +6916,13 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     try testing.expectEqual(@as(?u32, 1), activeOf(&handler, testKey(TEST_NS_A, "wf")));
     // Room now: it fires once.
     try testing.expectEqual(@as(usize, 1), runsOf(&handler, &shard));
+    // The ended run deleted through the same seam: gone.
+    const r1 = handler.appliedRun(testKey(TEST_NS_A, "r1")).?;
+    const d: runs_machine.Delete = .{ .workflow = r1.workflow, .idem = r1.idempotency_key, .created_ns = r1.created_ns };
+    var del_buf: [128]u8 = undefined;
+    try handler.applyDirect(.workflow_run_delete, 0, testKey(TEST_NS_A, "r1"), d.encode(&del_buf).?, 8, &out);
+    try testing.expect(out.refused() == null);
+    try testing.expect(handler.appliedRun(testKey(TEST_NS_A, "r1")) == null);
 }
 
 /// The runs of workflow `def_key` not ended, as applied; null before any started.

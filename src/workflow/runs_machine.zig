@@ -551,6 +551,42 @@ pub const Complete = struct {
     }
 };
 
+/// A `workflow_run_delete`'s value: the incarnation its leader read, so a
+/// delete applies only to that one, and names the rows it removes before
+/// it reads the run.
+pub const Delete = struct {
+    workflow: []const u8,
+    idem: []const u8,
+    created_ns: u64,
+
+    pub fn parse(value: []const u8) ?Delete {
+        var c: Cursor = .{ .bytes = value };
+        const workflow = c.take(c.int(u16) orelse return null) orelse return null;
+        const idem = c.take(c.int(u16) orelse return null) orelse return null;
+        const created_ns = c.int(u64) orelse return null;
+        if (c.off != value.len or workflow.len == 0) return null;
+        return .{ .workflow = workflow, .idem = idem, .created_ns = created_ns };
+    }
+
+    /// Its encoding into `buf`, or null when it doesn't fit.
+    pub fn encode(d: Delete, buf: []u8) ?[]const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        for ([_][]const u8{ d.workflow, d.idem }) |part| {
+            w.writeInt(u16, std.math.cast(u16, part.len) orelse return null, .little) catch return null;
+            w.writeAll(part) catch return null;
+        }
+        w.writeInt(u64, d.created_ns, .little) catch return null;
+        return w.buffered();
+    }
+
+    pub fn size(d: Delete) usize {
+        return 4 + d.workflow.len + d.idem.len + 8;
+    }
+};
+
+/// The answer to a delete of a run that hasn't ended.
+pub const RUN_LIVE = "bad request: the run hasn't ended; cancel it first";
+
 /// How a run ended, for its parent's `call_done`. An output past what a
 /// call's result holds goes as none.
 pub const Ended = struct { status: ae.DoneStatus, output: []const u8 };
@@ -600,7 +636,7 @@ fn named(e: *const Entry) ?Named {
             const p = ae.ChildRefuse.decodeAll(e.payload, &diag) catch return null;
             break :blk .{ .ns = .of(p.ns), .run = p.run };
         },
-        .workflow_start, .workflow_step, .workflow_signal, .workflow_complete => blk: {
+        .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .workflow_run_delete => blk: {
             const cmd = command(e) orelse return null;
             break :blk .{ .ns = cmd.namespace_id, .run = cmd.key[KEY_PREFIX..] };
         },
@@ -664,6 +700,15 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             const c = Complete.parse(cmd.value) orelse return;
             try out.addIn(PerDefFam.ID, n.ns, c.workflow);
         },
+        .workflow_run_delete => {
+            const cmd = command(e).?;
+            try out.addIn(RunFam.ID, n.ns, n.run);
+            const range = (try runRange(arena, n.ns, n.run))[KEY_PREFIX..];
+            out.addRangeIn(OutFam.ID, n.ns, range) catch return error.OutOfMemory;
+            out.addRangeIn(SigFam.ID, n.ns, range) catch return error.OutOfMemory;
+            const d = Delete.parse(cmd.value) orelse return;
+            if (d.idem.len > 0) try out.addIn(IdemFam.ID, n.ns, (try idemKey(arena, n.ns, d.workflow, d.idem))[KEY_PREFIX..]);
+        },
         else => {},
     }
 }
@@ -689,6 +734,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         .workflow_step => return applyStep(view, n, command(e).?, stamp_ms, out),
         .workflow_signal => return applySignal(view, n, command(e).?, stamp_ms, out),
         .workflow_complete => return applyComplete(view, n, command(e).?, stamp_ms, out),
+        .workflow_run_delete => return applyDelete(view, n, command(e).?, out),
         else => return error.Halt,
     }
 }
@@ -727,6 +773,14 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
         out.putInt(u8, 0);
         out.putBytes(earlier.v.run);
         return;
+    };
+
+    // A schedule's slot fires once: its run's key row may be gone (a
+    // delete), and its place isn't. One that commits after a later slot is
+    // refused too, as no run takes it.
+    if (comptime plant.active != .runs_fired_moves_back) if (std.mem.eql(u8, s.event, "schedule_started")) if (s.idem) |k| if (scheduleSlot(k)) |slot| {
+        const per = if (try view.get(PerDefFam, try idKeyAlloc(arena, n.ns, s.workflow))) |p| p.v else PER_DEF_NONE;
+        if (slot <= per.fired_ms) return out.refuse(.conflict, .unclassified, SLOT_FIRED);
     };
 
     // Already present: a re-apply, or a second start with a run id the
@@ -860,11 +914,19 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
 /// back.
 fn noteFired(per: *PerDef.Value, event: []const u8, idem: []const u8) void {
     const any_fires = comptime plant.active == .runs_any_start_fires;
-    if ((!any_fires and !std.mem.eql(u8, event, "schedule_started")) or !std.mem.startsWith(u8, idem, "_schedule:")) return;
-    const colon = std.mem.lastIndexOfScalar(u8, idem, ':') orelse return;
-    const slot = std.fmt.parseInt(i64, idem[colon + 1 ..], 10) catch return;
+    if (!any_fires and !std.mem.eql(u8, event, "schedule_started")) return;
+    const slot = scheduleSlot(idem) orelse return;
     per.fired_ms = if (comptime plant.active == .runs_fired_moves_back) slot else @max(per.fired_ms, slot);
 }
+
+/// The slot a schedule's key names, its last part.
+fn scheduleSlot(idem: []const u8) ?i64 {
+    if (!std.mem.startsWith(u8, idem, "_schedule:")) return null;
+    const colon = std.mem.lastIndexOfScalar(u8, idem, ':') orelse return null;
+    return std.fmt.parseInt(i64, idem[colon + 1 ..], 10) catch null;
+}
+
+pub const SLOT_FIRED = "conflict: a schedule's slot at or before one already fired";
 
 /// A trigger's start moves its place: on in the stream it read, or to that
 /// stream when it is another. Made stamps rise in one stream's log, so a
@@ -1108,6 +1170,33 @@ fn applyComplete(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms:
     return endRun(view, n, cmd.key, &run, c.status, c.output, stamp_ms);
 }
 
+/// An ended run deleted: its summary, any rows under it and its
+/// idempotency row go, and its history is dropped on the history lane,
+/// after its last chunk. A start with that key, or that run id, then
+/// starts a new run; a schedule's or trigger's start that was this run's
+/// is held off by its workflow's place, which stays. Answers `not_found`
+/// for a run that isn't there, a delete resent included, or that is
+/// another incarnation than the one asked for.
+fn applyDelete(view: *View, n: Named, cmd: entry_mod.CommandPayload, out: *Result) ApplyError!void {
+    // Only a leader proposes one: one that doesn't decode is a Flo bug.
+    const d = Delete.parse(cmd.value) orelse return error.Halt;
+    const run = ((try view.get(RunFam, cmd.key)) orelse return out.refuse(.not_found, .not_found, "run not found")).v;
+    if (run.created_ns != d.created_ns or !std.mem.eql(u8, run.workflow, d.workflow) or !std.mem.eql(u8, run.idempotency_key, d.idem))
+        return out.refuse(.not_found, .not_found, "run not found");
+    if (!statusOf(run).isTerminal()) return out.refuse(.bad_request, .run_live, RUN_LIVE);
+    const arena = view.arena;
+    if (d.idem.len > 0) {
+        const k = try idemKey(arena, n.ns, d.workflow, d.idem);
+        // Only this run's: a key is only ever one run's at a time.
+        if (try view.get(IdemFam, k)) |i| if (std.mem.eql(u8, i.v.run, n.run)) try view.delete(IdemFam, k);
+    }
+    const range = try runRange(arena, n.ns, n.run);
+    try view.deleteRange(OutFam, range, null);
+    try view.deleteRange(SigFam, range, null);
+    try view.delete(RunFam, cmd.key);
+    try hp.sendDrop(view, ownerOf(n, &run), run.completed_at_ms);
+}
+
 /// `run` ended `status` at `stamp_ms`: no longer counted among its
 /// workflow's, and a child's parent hears how, its record gone.
 fn endRun(view: *View, n: Named, run_key: []const u8, run: *Run.Value, status: RunStatus, output: ?[]const u8, stamp_ms: i64) ApplyError!void {
@@ -1269,7 +1358,7 @@ fn writeJsonEscaped(w: *std.Io.Writer, s: []const u8) !void {
 
 pub const machine: machine_mod.Machine = .{
     .name = "workflow runs",
-    .entry_types = &.{ .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done },
+    .entry_types = &.{ .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .workflow_run_delete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done },
     .families = &.{
         machine_mod.info(calls_mod.Calls),
         machine_mod.info(Parents),
@@ -1409,10 +1498,44 @@ const Fixture = struct {
         var it = (ReadView{ .store = &f.store }).range(channels.OutFam, prefix);
         var got: std.ArrayListUnmanaged(he.Chunk.Value) = .empty;
         while (try it.next()) |item| {
+            if (item.value.v.entry_type != @backingInt(EntryType.history_chunk)) continue;
             var diag: schema.Diagnostic = .{};
             try got.append(a, try he.Chunk.decodeAll(try a.dupe(u8, item.value.v.payload), &diag));
         }
         return got.items;
+    }
+
+    /// The history drops this group has sent itself, oldest first.
+    fn drops(f: *Fixture) ![]he.Drop.Value {
+        const a = f.scratch.allocator();
+        var pb: [channels.CHAN_KEY]u8 = undefined;
+        const prefix = channels.outPrefix(&pb, f.store.place.?.group, .history);
+        var it = (ReadView{ .store = &f.store }).range(channels.OutFam, prefix);
+        var got: std.ArrayListUnmanaged(he.Drop.Value) = .empty;
+        while (try it.next()) |item| {
+            if (item.value.v.entry_type != @backingInt(EntryType.history_drop)) continue;
+            var diag: schema.Diagnostic = .{};
+            try got.append(a, try he.Drop.decodeAll(try a.dupe(u8, item.value.v.payload), &diag));
+        }
+        return got.items;
+    }
+
+    /// A delete of run `run_id` as its leader read it.
+    fn delete(f: *Fixture, run_id: []const u8, d: Delete) !Result {
+        var kb: [64]u8 = undefined;
+        var vb: [256]u8 = undefined;
+        return f.command(.workflow_run_delete, view_mod.idKey(&kb, .default, run_id) catch unreachable, d.encode(&vb).?, 90);
+    }
+
+    fn deleteOf(f: *Fixture, run_id: []const u8) !Result {
+        const r = f.get(run_id).?;
+        return f.delete(run_id, .{ .workflow = r.workflow, .idem = r.idempotency_key, .created_ns = r.created_ns });
+    }
+
+    fn idemOf(f: *Fixture, wf: []const u8, key: []const u8) ?[]const u8 {
+        const k = idemKey(f.scratch.allocator(), .default, wf, key) catch unreachable;
+        const i = (ReadView{ .store = &f.store }).get(IdemFam, k) catch unreachable;
+        return if (i) |v| v.v.run else null;
     }
 
     /// The seqs `records` (a chunk's, or a run's pending) holds, in order.
@@ -1578,6 +1701,64 @@ test "workflow runs machine: a step, a signal or a completion for a run not ther
     try testing.expect((try f.command(.workflow_signal, view_mod.idKey(&kb, .default, "gone") catch unreachable, sig, 5)).refused() != null);
     try testing.expectEqual(sent, (try f.chunks()).len);
     try testing.expect(f.get("gone") == null);
+}
+
+test "workflow runs machine: a delete of an ended run removes it and its key, and drops its history after its last chunk" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "k1", 1);
+    _ = try f.start("live", "wf", "workflow_started", "", 1);
+    var vb: [512]u8 = undefined;
+    _ = try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 50);
+    const r1 = f.get("r1").?;
+    try testing.expectEqualStrings("r1", f.idemOf("wf", "k1").?);
+    // A live run is refused, changing nothing.
+    const live = try f.deleteOf("live");
+    try testing.expectEqual(@import("../protocol/proto.zig").Reason.run_live, live.refused().?.refusal.reason);
+    try testing.expect(f.get("live") != null);
+    // Another incarnation than the one asked for: not found.
+    const other = try f.delete("r1", .{ .workflow = "wf", .idem = "k1", .created_ns = r1.created_ns + 1 });
+    try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, other.refused().?.status);
+    try testing.expectEqual(@as(usize, 0), (try f.drops()).len);
+
+    try testing.expect((try f.deleteOf("r1")).refused() == null);
+    try testing.expect(f.get("r1") == null);
+    try testing.expect(f.idemOf("wf", "k1") == null);
+    // Its drop names its incarnation and end, after its last chunk.
+    const d = (try f.drops())[0];
+    try testing.expectEqualStrings("wf", d.owner);
+    try testing.expectEqualStrings("r1", d.run);
+    try testing.expectEqual(r1.created_ns, d.created_ns);
+    try testing.expectEqual(@as(u64, 50), d.completed_ms);
+    try testing.expectEqual(@as(u64, 0), d.first_seq);
+    // Sent again: not found, nothing sent.
+    const again = try f.delete("r1", .{ .workflow = "wf", .idem = "k1", .created_ns = r1.created_ns });
+    try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, again.refused().?.status);
+    try testing.expectEqual(@as(usize, 1), (try f.drops()).len);
+    // Its key and id start a new run.
+    try testing.expect((try f.start("r1", "wf", "workflow_started", "k1", 100)).refused() == null);
+    try testing.expectEqualStrings("r1", f.idemOf("wf", "k1").?);
+    try testing.expect(f.get("r1").?.created_ns != r1.created_ns);
+    // The count of its workflow's live runs moved only at its end.
+    try testing.expectEqual(@as(u32, 2), f.active("wf").?.active);
+}
+
+test "workflow runs machine: a schedule's slot fires once, its run deleted or not; an older slot after a newer one is refused" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("a", "wf", "schedule_started", "_schedule:16:wf:4000", 1);
+    var vb: [512]u8 = undefined;
+    _ = try f.complete("a", completeValue(&vb, .cancelled, "wf"), 5);
+    try testing.expect((try f.deleteOf("a")).refused() == null);
+    try testing.expect(f.idemOf("wf", "_schedule:16:wf:4000") == null);
+    // That slot's start again, its key row gone: refused by the place.
+    const again = try f.start("a2", "wf", "schedule_started", "_schedule:16:wf:4000", 6);
+    try testing.expectEqualStrings(SLOT_FIRED, again.refused().?.refusal.message);
+    const older = try f.start("b", "wf", "schedule_started", "_schedule:16:wf:2000", 6);
+    try testing.expectEqualStrings(SLOT_FIRED, older.refused().?.refusal.message);
+    try testing.expect(f.get("a2") == null and f.get("b") == null);
+    try testing.expect((try f.start("c", "wf", "schedule_started", "_schedule:16:wf:5000", 7)).refused() == null);
+    try testing.expectEqual(@as(i64, 5000), f.active("wf").?.fired_ms);
 }
 
 test "workflow runs machine: a run's largest output, an entry's whole payload, goes to its history in one chunk" {

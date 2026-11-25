@@ -62,7 +62,7 @@ pub fn classOf(t: EntryType) Class {
         .kv_expire => .never,
         // Deletes and trims.
         .kv_delete, .stream_trim, .stream_delete, .stream_clean, .stream_forget => .never,
-        .ts_delete, .ts_retention, .queue_purge, .group_delete, .action_delete => .never,
+        .ts_delete, .ts_retention, .queue_purge, .group_delete, .action_delete, .workflow_run_delete, .action_run_delete => .never,
         .processing_stop, .processing_cancel, .processing_remove => .never,
         // Duties, each bounded by what was admitted before it.
         .kv_reap, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_requeue, .queue_drop => .never,

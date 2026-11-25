@@ -267,6 +267,7 @@ pub const ActionsHandler = struct {
         // The run id's bits name the partition the run lives on.
         dispatcher.registerWithRoute(.action_status, table_run.handler("action.status", ActionsHandler, runStatus), run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.action_history, table_run.handler("action.history", history_ops.Ops, history_ops.Ops.actionHistory), run_id_mod.preRouteByRunId);
+        dispatcher.registerWithRoute(.action_run_delete, table_run.handler("action.run_delete", ActionsHandler, runRunDelete), run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.action_info, table_run.handler("action.info", ActionsHandler, runInfo), preRouteByAction);
         dispatcher.registerPagedWalk(.action_list, dispatchAction, localScanActions);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
@@ -1436,6 +1437,17 @@ pub const ActionsHandler = struct {
         };
         self.extending.putAssumeCapacity(owned, {});
         return .{ .park = .{ .proposed = proposed, .answer = answerTouch } };
+    }
+
+    /// Delete an ended run: refused here for a live one, and at apply for
+    /// one that isn't there by then or is another incarnation.
+    fn runRunDelete(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(EmptyResponse) {
+        if (!shard.raft_node.leaderReady()) return error.NotLeading;
+        const run = getRun(shard, req.ns_id, req.key) orelse return error.NotFound;
+        if (run.completed_ns == 0) return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .run_live, .ran = .no, .message = machine.RUN_LIVE } } };
+        const proposed = propose(shard, .action_run_delete, ae.RunDelete.Value{ .ns = req.ns_id.int(), .action = run.action, .run = req.key, .created_ns = run.created_ns }) catch |err|
+            return .{ .refused = .{ .status = persistence.failureStatus(err), .refusal = persistence.failureRefusal(err, "delete not persisted") } };
+        return .{ .park = .{ .proposed = proposed, .answer = answerEmpty } };
     }
 
     fn answerEmpty(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
