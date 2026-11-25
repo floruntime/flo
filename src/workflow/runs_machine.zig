@@ -1082,7 +1082,10 @@ fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64
     // Only a leader proposes one: one that doesn't decode is a Flo bug.
     const st = Step.decodeAll(cmd.value, &diag) catch return error.Halt;
     var run = ((try view.get(RunFam, cmd.key)) orelse return out.refuse(.not_found, .not_found, "run not found")).v;
-    if (!std.mem.eql(u8, run.workflow, st.workflow)) return error.Halt;
+    // Another workflow's: decided for an earlier incarnation of this id,
+    // deleted since. A ready leader decides only from what it applied, so
+    // its own come before the delete; the simulator's leader lags.
+    if (!std.mem.eql(u8, run.workflow, st.workflow)) return out.refuse(.not_found, .not_found, "run not found");
     const ends: ?RunStatus = if (st.ends == 0) null else blk: {
         const status = std.enums.fromInt(RunStatus, st.ends) orelse return error.Halt;
         if (!status.isTerminal()) return error.Halt;
@@ -1157,7 +1160,8 @@ fn applyComplete(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms:
     // A run deleted since its completion was proposed: refused, as a step
     // or a signal to it is.
     var run = ((try view.get(RunFam, cmd.key)) orelse return out.refuse(.not_found, .not_found, "run not found")).v;
-    if (!std.mem.eql(u8, run.workflow, c.workflow)) return error.Halt;
+    // Another workflow's: for an earlier incarnation, as a step's may be.
+    if (!std.mem.eql(u8, run.workflow, c.workflow)) return out.refuse(.not_found, .not_found, "run not found");
     // The first completion in the log ends the run; a cancel and a
     // completion in flight together leave it as the first left it. A second
     // with the same outcome (two cancels) succeeds, changing nothing.
@@ -1183,9 +1187,9 @@ fn applyDelete(view: *View, n: Named, cmd: entry_mod.CommandPayload, out: *Resul
     const run = ((try view.get(RunFam, cmd.key)) orelse return out.refuse(.not_found, .not_found, "run not found")).v;
     if (run.created_ns != d.created_ns or !std.mem.eql(u8, run.workflow, d.workflow) or !std.mem.eql(u8, run.idempotency_key, d.idem))
         return out.refuse(.not_found, .not_found, "run not found");
-    if (!statusOf(run).isTerminal()) return out.refuse(.bad_request, .run_live, RUN_LIVE);
+    if (comptime plant.active != .runs_delete_takes_live) if (!statusOf(run).isTerminal()) return out.refuse(.bad_request, .run_live, RUN_LIVE);
     const arena = view.arena;
-    if (d.idem.len > 0) {
+    if ((comptime plant.active != .runs_delete_keeps_idem) and d.idem.len > 0) {
         const k = try idemKey(arena, n.ns, d.workflow, d.idem);
         // Only this run's: a key is only ever one run's at a time.
         if (try view.get(IdemFam, k)) |i| if (std.mem.eql(u8, i.v.run, n.run)) try view.delete(IdemFam, k);
@@ -1618,8 +1622,10 @@ test "workflow runs machine: a step applies only at its run's rev, and never aft
     try testing.expectEqualStrings("conflict: the run moved on from that step", stale.refused().?.refusal.message);
     try testing.expectEqualStrings("a", f.get("r1").?.step);
     try testing.expect((try f.step("nope", .{ .rev = 0 })).refused() != null);
-    // One naming another workflow is a broken log.
-    try testing.expectError(error.Halt, f.step("r1", .{ .rev = 1, .workflow = "other" }));
+    // One naming another workflow is an earlier incarnation's: refused.
+    const other = try f.step("r1", .{ .rev = 1, .workflow = "other" });
+    try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, other.refused().?.status);
+    try testing.expectEqualStrings("a", f.get("r1").?.step);
 
     // A step that ends its run: counted no longer, and no step after it.
     try testing.expect((try f.step("r1", .{ .rev = 1, .ends = .completed })).refused() == null);
@@ -1680,9 +1686,12 @@ test "workflow runs machine: a run's history is sent in chunks, each event once 
     try testing.expectEqual(commits, f.store.families[RunFam.ID].commits);
     const other = try f.complete("r1", completeValue(&vb, .failed, "wf"), 70);
     try testing.expectEqualStrings("run already finished", other.refused().?.refusal.message);
-    // One naming another workflow is a broken log; one for a run not
-    // there (deleted since it was proposed) is refused, changing nothing.
-    try testing.expectError(error.Halt, f.complete("r2", completeValue(&vb, .cancelled, "other"), 80));
+    // One naming another workflow (an earlier incarnation's, the id
+    // deleted and started again since), or a run not there, is refused,
+    // changing nothing.
+    const mismatched = try f.complete("r2", completeValue(&vb, .cancelled, "other"), 80);
+    try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, mismatched.refused().?.status);
+    try testing.expectEqual(@as(u8, @backingInt(RunStatus.running)), f.get("r2").?.status);
     const gone = try f.complete("nope", completeValue(&vb, .cancelled, "wf"), 80);
     try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, gone.refused().?.status);
     try testing.expect(f.get("nope") == null);
@@ -1862,6 +1871,55 @@ test "workflow runs machine: a call settled refused stays refused when its run's
     try testing.expectEqual(calls_mod.State.refused, c.state);
     try testing.expectEqualStrings("repaired", c.outcome);
     try testing.expectEqualStrings("", c.result);
+}
+
+test "workflow runs machine: what arrives late for a deleted run is refused or changes nothing, never halts" {
+    var f = Fixture.init();
+    defer f.deinit();
+    const Status = @import("../protocol/proto.zig").StatusCode;
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    var cb: [ae.Call.max_size]u8 = undefined;
+    const call = try ae.Call.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .kind = .action, .caller_run = "r1", .caller_workflow = "wf", .step = "s", .target = "act", .version = "", .run = "a1", .input = "{}", .can_wait = false });
+    _ = try f.step("r1", .{ .rev = 0, .wait = .call, .wait_on = "a1", .call = call });
+    var vb: [512]u8 = undefined;
+    _ = try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 5);
+    try testing.expect((try f.deleteOf("r1")).refused() == null);
+    // Its call's answers, to a caller deleted: no halt.
+    const slot = calls_mod.callerSlot(.default, "wf");
+    var rb: [ae.Reply.max_size]u8 = undefined;
+    _ = try f.answer(.call_reply, try ae.Reply.encodeInto(&rb, .{ .ns = NamespaceId.default.int(), .slot = slot, .run = "a1", .answer = .started, .why = "" }));
+    var db: [ae.Done.max_size]u8 = undefined;
+    _ = try f.answer(.call_done, try ae.Done.encodeInto(&db, .{ .ns = NamespaceId.default.int(), .slot = slot, .run = "a1", .status = .completed, .outcome = "", .result = "{}" }));
+    // A step, a signal or a completion: not found.
+    try testing.expectEqual(Status.not_found, (try f.step("r1", .{ .rev = 1 })).refused().?.status);
+    try testing.expectEqual(Status.not_found, (try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 6)).refused().?.status);
+    var kb: [64]u8 = undefined;
+    var sb: [64]u8 = undefined;
+    const sig = try Signal.encodeInto(&sb, .{ .type = "go", .payload = "" });
+    try testing.expectEqual(Status.not_found, (try f.command(.workflow_signal, view_mod.idKey(&kb, .default, "r1") catch unreachable, sig, 6)).refused().?.status);
+    try testing.expect(f.get("r1") == null);
+    // Its id started again, under another workflow: the earlier
+    // incarnation's step and completion find another run, and are refused.
+    try testing.expect((try f.start("r1", "wf2", "workflow_started", "", 8)).refused() == null);
+    try testing.expectEqual(Status.not_found, (try f.step("r1", .{ .rev = 0 })).refused().?.status);
+    try testing.expectEqual(Status.not_found, (try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 9)).refused().?.status);
+    try testing.expectEqualStrings("wf2", f.get("r1").?.workflow);
+    try testing.expectEqual(@as(u8, @backingInt(RunStatus.running)), f.get("r1").?.status);
+
+    // A child, ended and deleted: its start's late refusal finds no parent
+    // record, and changes nothing.
+    var csb: [ae.ChildStart.max_size]u8 = undefined;
+    _ = try f.answer(.child_start, try ae.ChildStart.encodeInto(&csb, .{ .ns = NamespaceId.default.int(), .parent_slot = 3, .parent_run = "p0", .parent_workflow = "pwf", .workflow = "wf", .version = "", .run = "c1", .input = "{}" }));
+    // Its leader starts it from the record.
+    try testing.expect((try f.start("c1", "wf", "child_started", "", 6)).refused() == null);
+    try testing.expect(f.get("c1") != null);
+    _ = try f.complete("c1", completeValue(&vb, .cancelled, "wf"), 7);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "c1") == null);
+    try testing.expect((try f.deleteOf("c1")).refused() == null);
+    var crb: [ae.ChildRefuse.max_size]u8 = undefined;
+    _ = try f.answer(.child_refuse, try ae.ChildRefuse.encodeInto(&crb, .{ .ns = NamespaceId.default.int(), .run = "c1", .answer = .conflict }));
+    try testing.expect(f.get("c1") == null);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "c1") == null);
 }
 
 test "workflow runs machine: a repair skip leaves a call held over its callee's memory share as it is" {
