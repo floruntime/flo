@@ -324,9 +324,9 @@ test "e2e/workflow: signal not found workflow" {
     var result = try ctx.cli.run(&.{ "workflow", "signal", "fake-run-id-12345", "--type", "approve" });
     defer result.deinit();
 
-    // Should fail with not found
+    // Should fail with not found, as every op by a run's id answers it
     try stdx.testing.assertFailed(result);
-    try stdx.testing.assertContains(result, "Not found");
+    try stdx.testing.assertContains(result, "not found: no such run [not_found/not_found]");
 }
 
 // =============================================================================
