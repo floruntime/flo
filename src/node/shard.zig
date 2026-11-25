@@ -14742,6 +14742,42 @@ test "Shard: records whose operators emit nothing aren't read again while their 
     try std.testing.expectEqual(@as(u64, 5), job.records_processed);
 }
 
+test "Shard: a TS sink drops a record lacking a tag's field, counted and shown on its job, and its cursor passes it as the rest land" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    // One batch: two records carry the tag's field, two don't.
+    for ([_][]const u8{ "{\"h\":\"a\",\"v\":1}", "{\"v\":2}", "{\"h\":\"b\",\"v\":3}", "{\"v\":4}" }) |r|
+        _ = try a.stream_handler.appendPayloadToStream(source, "default", r);
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    const pipe = try sinkJob(&two, c, source, "  - name: out\n    ts: { measurement: load, value_field: v, tags: { host: h } }");
+    tickNow(a, pipe);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 4), pipe.records_in);
+    try std.testing.expectEqual(@as(u64, 2), a.processing_handler.sink_drops);
+    const job = a.processing_handler.firstJob().?;
+    try std.testing.expectEqual(@as(u64, 2), job.write_drops);
+    try std.testing.expect(std.mem.indexOf(u8, job.last_write_drop, "ts sink 'load': the record has no string field \"h\" for a tag") != null);
+    var nb: [512]u8 = undefined;
+    const note = a.processing_handler.liveNote(&job, &nb).?;
+    try std.testing.expect(std.mem.indexOf(u8, note, "2 records dropped by a sink, the last by ts sink 'load'") != null);
+    // The cursor went past every record, the dropped ones too.
+    pipe.last_batch_ms = 0;
+    tickNow(a, pipe);
+    two.settle();
+    const at = @import("../processing/sinks_machine.zig").cursorOf(.{ .store = &a.defaultPartition().store }, .default, job.job_id_owned);
+    try std.testing.expectEqual(pipe.stream_cursor_seq, at.b);
+    try std.testing.expectEqual(pipe.stream_cursor_ts, at.a);
+    try std.testing.expectEqual(@as(u64, 4), job.records_processed);
+}
+
 test "Shard: a job's processed count takes each record once, across batches not logged, logged, and refused" {
     var two: TwoShards = undefined;
     try two.init();

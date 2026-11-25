@@ -760,6 +760,19 @@ fn parseOneSink(allocator: Allocator, d: D, item: JsonValue, index: usize, defau
         snk.ts_value_field = try dupe(allocator, try optString(d, obj, "value_field") orelse "value");
         snk.ts_tag_keys = try parseStringPairs(allocator, d, obj, "tags");
         snk.ts_field_keys = try parseStringPairs(allocator, d, obj, "fields");
+        // A point's tags are a TS read's: past its count no read finds them.
+        if (snk.ts_tag_keys.len / 2 > ts_mod.MAX_TAGS) return d.fail(ParseError.InvalidFormat, "\"tags\" takes at most {d} tags, not {d}", .{ ts_mod.MAX_TAGS, snk.ts_tag_keys.len / 2 });
+        // The record fields the sink reads, each named in `"name":` form
+        // when a record is searched for it: one longer never matches.
+        try fieldNameFits(d, "value_field", snk.ts_value_field);
+        for (snk.ts_tag_keys, 0..) |v, i| if (i % 2 == 1) try fieldNameFits(d, "tags", v);
+        // A point's tags are one `key=value,…` string, split again on `,`
+        // and each pair at its first `=`: a tag named with either is two.
+        for (snk.ts_tag_keys, 0..) |t, i| {
+            if (t.len == 0) return d.fail(ParseError.InvalidFormat, "a tag's {s} can't be empty", .{if (i % 2 == 0) "name" else "record field"});
+            if (i % 2 == 0) if (mem.indexOfAny(u8, t, ",=") != null) return d.fail(ParseError.InvalidFormat, "a tag's name can't hold ',' or '=': \"{s}\"", .{t});
+        }
+        for (snk.ts_field_keys, 0..) |v, i| if (i % 2 == 1) try fieldNameFits(d, "fields", v);
     } else {
         try checkKeys(d, obj, &.{ "name", "namespace" });
         snk.kind = .stream;
@@ -768,6 +781,13 @@ fn parseOneSink(allocator: Allocator, d: D, item: JsonValue, index: usize, defau
     }
 
     sinks.append(allocator, snk) catch return ParseError.OutOfMemory;
+}
+
+/// The longest record field a TS sink reads by name.
+pub const MAX_SINK_FIELD_NAME: usize = 253;
+
+fn fieldNameFits(d: D, key: []const u8, name: []const u8) ParseError!void {
+    if (name.len > MAX_SINK_FIELD_NAME) return d.fail(ParseError.InvalidFormat, "\"{s}\" names a record field of at most {d} bytes, not {d}", .{ key, MAX_SINK_FIELD_NAME, name.len });
 }
 
 /// `match:` as a list of tags (a single tag is sugar for a one-tag list).
@@ -2399,4 +2419,68 @@ test "parser: a TS source at either limit names its series: the runtime's tag ha
         var buf: [ts_mod.MAX_TAG_STRING]u8 = undefined;
         try std.testing.expect(ts_mod.canonicalTagHashPairs(pairs[0 .. tags.len / 2], &buf) != 0);
     }
+}
+
+test "parser: a TS sink takes at most 32 tags, and reads no record field named past 253 bytes" {
+    const allocator = std.testing.allocator;
+    var tags: std.ArrayList(u8) = .empty;
+    defer tags.deinit(allocator);
+    var at_limit: std.ArrayList(u8) = .empty;
+    defer at_limit.deinit(allocator);
+    for (0..ts_mod.MAX_TAGS) |i| try at_limit.print(allocator, "        {c}{c}: f\n", .{ @as(u8, 'a') + @as(u8, @intCast(i / 26)), @as(u8, 'a') + @as(u8, @intCast(i % 26)) });
+    const thirty_two = try std.fmt.allocPrint(allocator, "      tags:\n{s}", .{at_limit.items});
+    defer allocator.free(thirty_two);
+    for (0..ts_mod.MAX_TAGS + 1) |i| try tags.print(allocator, "        {c}{c}: f\n", .{ @as(u8, 'a') + @as(u8, @intCast(i / 26)), @as(u8, 'a') + @as(u8, @intCast(i % 26)) });
+    const long_name: []const u8 = &@as([MAX_SINK_FIELD_NAME + 1]u8, @splat('f'));
+    const Case = struct { body: []const u8, says: ?[]const u8 };
+    const fits_name: []const u8 = &@as([MAX_SINK_FIELD_NAME]u8, @splat('f'));
+    const many = try std.fmt.allocPrint(allocator, "      tags:\n{s}", .{tags.items});
+    defer allocator.free(many);
+    const long_value = try std.fmt.allocPrint(allocator, "      value_field: {s}\n", .{long_name});
+    defer allocator.free(long_value);
+    const long_tag = try std.fmt.allocPrint(allocator, "      tags:\n        host: {s}\n", .{long_name});
+    defer allocator.free(long_tag);
+    const long_field = try std.fmt.allocPrint(allocator, "      fields:\n        load: {s}\n", .{long_name});
+    defer allocator.free(long_field);
+    const fits = try std.fmt.allocPrint(allocator, "      value_field: {s}\n", .{fits_name});
+    defer allocator.free(fits);
+    for ([_]Case{
+        .{ .body = thirty_two, .says = null },
+        .{ .body = many, .says = "\"tags\" takes at most 32 tags, not 33" },
+        .{ .body = "      tags:\n        host: \"\"\n", .says = "a tag's record field can't be empty" },
+        .{ .body = long_value, .says = "\"value_field\" names a record field of at most 253 bytes, not 254" },
+        .{ .body = long_tag, .says = "\"tags\" names a record field of at most 253 bytes, not 254" },
+        .{ .body = long_field, .says = "\"fields\" names a record field of at most 253 bytes, not 254" },
+        .{ .body = fits, .says = null },
+        .{ .body = "      tags:\n        \"a,b\": h\n", .says = "a tag's name can't hold ',' or '='" },
+        .{ .body = "      tags:\n        \"a=b\": h\n", .says = "a tag's name can't hold ',' or '='" },
+    }) |c| {
+        const text = try std.fmt.allocPrint(allocator,
+            \\kind: Processing
+            \\sources:
+            \\  - stream:
+            \\      name: in
+            \\sinks:
+            \\  - ts:
+            \\      measurement: m
+            \\{s}
+        , .{c.body});
+        defer allocator.free(text);
+        if (c.says) |says| {
+            var diag: Diagnostic = .{};
+            try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, &diag));
+            try std.testing.expect(mem.indexOf(u8, diag.message(), says) != null);
+        } else {
+            var def = try parseJobDefinition(allocator, text, null);
+            def.deinit(allocator);
+        }
+    }
+}
+
+test "parser: a TS sink's tag can't be named empty, in JSON, where an empty key is kept" {
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(std.testing.allocator,
+        \\{"kind":"Processing","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m","tags":{"":"h"}}}]}
+    , &diag));
+    try std.testing.expect(mem.indexOf(u8, diag.message(), "a tag's name can't be empty") != null);
 }
