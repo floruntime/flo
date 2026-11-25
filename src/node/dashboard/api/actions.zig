@@ -257,13 +257,13 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
     if ((info.latency_count orelse 0) == 0) try obj.nullField("latency") else {
         var lat = try obj.objectField("latency");
         try lat.begin();
-        // From the newest 10,000 runs, not all of them.
-        try lat.boolField("sampled", info.latency_sampled);
         try lat.intField("count", @as(i64, @intCast(info.latency_count.?)));
         try lat.intField("avg_ms", @as(i64, @intCast(info.latency_avg_ms.?)));
         try lat.intField("p50_ms", @as(i64, @intCast(info.latency_p50_ms.?)));
         try lat.intField("p95_ms", @as(i64, @intCast(info.latency_p95_ms.?)));
         try lat.intField("max_ms", @as(i64, @intCast(info.latency_max_ms.?)));
+        // From the newest 10,000 runs, not all of them.
+        try lat.boolField("sampled", info.latency_sampled);
         try lat.end();
     }
     {

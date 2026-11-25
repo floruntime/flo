@@ -7649,11 +7649,23 @@ test "workflow replay: a start that runs out of memory fails and creates nothing
     }
 }
 
-test "workflow replay: a start answers with its run id whole, at the longest key an entry carries" {
+/// A completion's incarnation, last in its value: a start at `ms`.
+fn incarnationAt(comptime ms: u64) [8]u8 {
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, ms * std.time.ns_per_ms, .little);
+    return b;
+}
+
+test "workflow replay: a start answers with its run id whole, at the longest a run may have; a longer one is refused" {
     var handler = WorkflowHandler.init(testing.allocator);
     defer handler.deinit();
     const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0, 0 };
-    var key: [persistence_mod.MAX_ENTRY_KEY]u8 = undefined;
+    var long: [persistence_mod.MAX_ENTRY_KEY]u8 = undefined;
+    _ = writeKey(&long, .default, &@as([long.len - KEY_PREFIX]u8, @splat('l')));
+    var refused: Result = .{};
+    try handler.replayStart(&long, &start, 1, &refused);
+    try testing.expectEqualStrings(runs_machine.RUN_ID_TOO_LONG, refused.refused().?.refusal.message);
+    var key: [KEY_PREFIX + runs_machine.MAX_RUN_ID]u8 = undefined;
     _ = writeKey(&key, .default, &@as([key.len - KEY_PREFIX]u8, @splat('r')));
     var out: Result = .{};
     try handler.replayStart(&key, &start, 1, &out);
@@ -7722,7 +7734,10 @@ test "workflow replay: a run starts and completes at its entries' stamps, not th
         try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, stamp_ns, .default, testKey(.default, "r1"), &start, &pbuf).?, &out);
         try testing.expectEqual(stamp_ms, shownOf(&handler, testKey(.default, "r1")).?.created_at_ms);
         // completed, no output, no event, workflow "wf"
-        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, .default, testKey(.default, "r1"), &[_]u8{ 3, 0, 0, 0, 0, 0, 2, 0, 'w', 'f' }, &pbuf).?, &out);
+        // Its incarnation, the start's stamp, last.
+        var complete = [_]u8{ 3, 0, 0, 0, 0, 0, 2, 0, 'w', 'f' } ++ @as([8]u8, @splat(0));
+        std.mem.writeInt(u64, complete[10..18], stamp_ns, .little);
+        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, .default, testKey(.default, "r1"), &complete, &pbuf).?, &out);
         const run = shownOf(&handler, testKey(.default, "r1")).?;
         try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
         try testing.expectEqual(@as(?i64, stamp_ms + 9), run.completed_at_ms);
@@ -7740,7 +7755,8 @@ test "workflow replay: a complete entry cut short leaves the run as it was, and 
     try handler.replayStart(testKey(.default, "r1"), &start, 1, &start_out);
 
     // completed, output "ok", last event "e"/"d", workflow "wf"
-    const whole = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++ [_]u8{ 1, 0, 'e', 1, 0, 'd' } ++ [_]u8{ 2, 0, 'w', 'f' };
+    // Its incarnation last: the start's stamp, 1 ms.
+    const whole = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++ [_]u8{ 1, 0, 'e', 1, 0, 'd' } ++ [_]u8{ 2, 0, 'w', 'f' } ++ incarnationAt(1);
 
     var events: std.ArrayListUnmanaged(WorkflowHandler.HistoryEvent) = .empty;
     defer events.deinit(allocator);
@@ -7775,8 +7791,8 @@ test "workflow replay: a cancel logged after a completion is refused and changes
     // next leader took while that completion hadn't applied there.
     const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0, 0 };
     const wf = [_]u8{ 2, 0, 'w', 'f' };
-    const completed = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ wf;
-    const cancelled = [_]u8{5} ++ [_]u8{0} ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ wf;
+    const completed = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ wf ++ incarnationAt(1);
+    const cancelled = [_]u8{5} ++ [_]u8{0} ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ wf ++ incarnationAt(1);
 
     // Two replicas apply the same log.
     for (0..2) |_| {

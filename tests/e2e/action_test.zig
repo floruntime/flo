@@ -1470,7 +1470,7 @@ test "e2e/action/run-delete: a live run is refused; an ended one goes, with its 
     var live = try ctx.cli.run(&.{ "action", "run-delete", t.run });
     defer live.deinit();
     try stdx.testing.assertFailed(live);
-    try stdx.testing.assertContains(live, "the run hasn't ended; cancel it first");
+    try stdx.testing.assertContains(live, "the run hasn't ended; delete it once it ends");
 
     try ctx.exec(&.{ "worker", "complete", t.task, "--worker-id", "gw" });
     var deleted = try ctx.cli.run(&.{ "action", "run-delete", t.run });

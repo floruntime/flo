@@ -284,10 +284,12 @@ pub const WorkflowRuns = struct {
         return c == .child_held or c == .start_held or c == .child_start_held or c == .create_held or c == .signal_held or c == .wake_in_slack;
     }
 
-    /// Reached only without a share: held at one, most signals are refused,
-    /// so a run seldom holds as many as it may. The plain swarm requires it.
+    /// Reached only without a share, which the plain swarm requires: held
+    /// at one, most signals are refused, so a run seldom holds as many as
+    /// it may; and most starts are, so a deleted run's id seldom starts
+    /// again, and a step for its earlier incarnation seldom meets one.
     pub fn withoutShareOnly(c: Class) bool {
-        return c == .signal_full;
+        return c == .signal_full or c == .deleted_id_reused or c == .workflow_mismatch or c == .stale_incarnation;
     }
     const PerDefL = struct { active: u32, fired_ms: i64, place: ?PlaceL = null };
     /// A trigger's place: the stream (namespace, making, name) and how far in.

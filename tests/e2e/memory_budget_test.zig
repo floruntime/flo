@@ -348,6 +348,14 @@ test "e2e/memory_budget: past its share a shard holds a run's child, its parent 
         if (pastShare(r)) break;
     }
     try testing.expect(filled < 400);
+    // Then small writes, so less room is left than a run's start takes,
+    // whatever the bytes before it came to.
+    while (filled < 800) : (filled += 1) {
+        var r = try ctx.execResult(&.{ "kv", "set", try std.fmt.bufPrint(&key_buf, "wfill-{d}", .{filled}), "v" });
+        defer r.deinit();
+        if (pastShare(r)) break;
+    }
+    try testing.expect(filled < 800);
     // A new run is refused there, with its status and reason.
     {
         var r = try ctx.execResult(&.{ "workflow", "start", "mb-kid", "{}", "--run-id", "mb-refused" });

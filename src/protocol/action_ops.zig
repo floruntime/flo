@@ -165,7 +165,7 @@ pub const table = [_]ops.Op{
         .request = Record(&.{}),
         .response = Record(&.{}),
         .cli = .{ .key = .{ .name = "run_id", .doc = "The run's id" }, .examples = &.{"flo action run-delete act-1a2b3c4d5e6f00-3-1c"} },
-        .doc = "Delete an ended action run and its history; a live run is refused (cancel it first). Its id may then name a new run.",
+        .doc = "Delete an ended action run and its history; a live run is refused (delete it once it ends). Its id may then name a new run.",
     },
     .{
         .name = "action.await",

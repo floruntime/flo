@@ -779,7 +779,8 @@ fn inScope(view: *View, rk: []const u8, action: []const u8) ApplyError!?Stored(R
 }
 
 pub const OTHER_RESULT = "stale report: the run was completed with another result";
-pub const RUN_LIVE = "bad request: the run hasn't ended; cancel it first";
+/// An action run has no cancel: it ends by its worker or its attempts.
+pub const RUN_LIVE = "bad request: the run hasn't ended; delete it once it ends";
 
 /// An ended run deleted: its row goes, and its history is dropped on the
 /// history lane, after its last chunk. Its id is then free for a new run.
