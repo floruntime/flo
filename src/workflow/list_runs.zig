@@ -132,16 +132,28 @@ fn walk(comptime F: type, handler: *WorkflowHandler, rv: view_mod.ReadView, ns: 
         // answered, as the walk and its answer run in one call.
         const at: RunAt.Value = .{ .created_at = created_at, .run_id = tail[8..] };
         const run_key = view_mod.idKey(&kb, ns, at.run_id) catch unreachable; // bounded at start
-        const run = handler.listedRun(run_key, at.run_id, q.status, q.search) orelse {
-            if (handler.appliedRun(run_key) == null) missingRun(at);
-            read += 1;
-            stop = at;
-            continue;
+        const run = switch (handler.listedRun(run_key, at.run_id, q.status, q.search)) {
+            .shown => |r| r,
+            .filtered => {
+                read += 1;
+                stop = at;
+                continue;
+            },
+            .missing => {
+                missingRun(handler, at);
+                read += 1;
+                stop = at;
+                continue;
+            },
         };
         var eb: [system_ops.MAX_RUN_ENTRY]u8 = undefined;
         const entry = writeEntry(&eb, run);
-        if (shown == q.limit or used + entry.len > room or !(b.add(.{ .at = at, .entry = entry }) catch false))
+        if (shown == q.limit or used + entry.len > room or !(b.add(.{ .at = at, .entry = entry }) catch false)) {
+            // Its limit is at least one and its room one entry: it has
+            // consumed a row, so a page with more says where it stopped.
+            std.debug.assert(stop != null);
             return .{ .runs = b.value(), .more = true, .stop = stop };
+        }
         used += entry.len;
         shown += 1;
         read += 1;
@@ -150,14 +162,12 @@ fn walk(comptime F: type, handler: *WorkflowHandler, rv: view_mod.ReadView, ns: 
     return .{ .runs = b.value(), .more = false, .stop = null };
 }
 
-/// An index row whose run isn't there: a Flo bug, said once, and skipped.
-fn missingRun(at: RunAt.Value) void {
-    const said = struct {
-        var once = false;
-    };
-    if (said.once) return;
-    said.once = true;
-    log.err("workflow run list: run {s} is indexed but not there; skipped", .{at.run_id});
+/// An index row whose run isn't there: a Flo bug, said once per shard,
+/// and skipped.
+fn missingRun(handler: *WorkflowHandler, at: RunAt.Value) void {
+    if (handler.missing_run_said) return;
+    handler.missing_run_said = true;
+    log.warn("workflow run list: run {s} is indexed but not there; skipped", .{at.run_id});
 }
 
 fn atOf(r: WorkflowHandler.RunInfo) RunAt.Value {

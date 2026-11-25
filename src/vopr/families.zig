@@ -1080,6 +1080,12 @@ pub const Actions = struct {
         }
         const got = action_machine.countsOf(self.read(), ns, action);
         if (!std.meta.eql(got, want)) return "an action's counts are not a recount of its runs";
+        // None left: its row is gone, not kept at zero.
+        if (std.meta.eql(want, std.mem.zeroes(action_machine.CountsRec.Value))) {
+            var b: [@sizeOf(u32) + 256]u8 = undefined;
+            const k = view_mod.idKey(&b, ns, action) catch return null;
+            if ((self.read().get(action_machine.Counts, k) catch null) != null) return "an action with no runs keeps its counts row";
+        }
         return null;
     }
 

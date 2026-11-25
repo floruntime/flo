@@ -531,7 +531,9 @@ pub const ActionsHandler = struct {
                 .started_at_ms = if (run.started_ns != 0) nsToMs(run.started_ns) else null,
                 .completed_at_ms = if (run.completed_ns != 0) nsToMs(run.completed_ns) else null,
             };
-            if (shown == limit or !(b.add(listed) catch false)) return .{ .answer = .{ .runs = b.value(), .cursor = last } };
+            if (shown == limit) return .{ .answer = .{ .runs = b.value(), .cursor = last } };
+            // Sized for a page's most: past it, the page ends here.
+            if (!(b.add(listed) catch return error.OutOfMemory)) return .{ .answer = .{ .runs = b.value(), .cursor = last } };
             shown += 1;
             read += 1;
             last = at;
@@ -604,10 +606,9 @@ pub const ActionsHandler = struct {
 
     // ── Info ────────────────────────────────────────────────────────────
 
-    /// An action's definition and its runs. Ready runs are its ready keys,
-    /// up to READY_COUNTED. The other counts and the latency read every run
-    /// in the namespace, so they are none past RUNS_SCANNED: runs are kept,
-    /// and a namespace's grow without bound.
+    /// An action's definition, its runs by status from its counts row, one
+    /// read however many it has, and how long its newest completed runs
+    /// took, from a walk of at most RUNS_SCANNED of its index rows.
     fn runInfo(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(InfoResponse) {
         const ns = req.ns_id;
         const def = getDef(shard, ns, req.key) orelse

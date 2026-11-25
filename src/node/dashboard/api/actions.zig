@@ -253,10 +253,10 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
         }
         try runs.end();
     }
-    if ((info.latency_count orelse 0) == 0) try obj.nullField("latency") else {
+    if (info.latency_count == 0) try obj.nullField("latency") else {
         var lat = try obj.objectField("latency");
         try lat.begin();
-        try lat.intField("count", @as(i64, @intCast(info.latency_count.?)));
+        try lat.intField("count", @as(i64, @intCast(info.latency_count)));
         try lat.intField("avg_ms", @as(i64, @intCast(info.latency_avg_ms.?)));
         try lat.intField("p50_ms", @as(i64, @intCast(info.latency_p50_ms.?)));
         try lat.intField("p95_ms", @as(i64, @intCast(info.latency_p95_ms.?)));
@@ -287,40 +287,51 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
     return try allocator.dupe(u8, json_aw.written());
 }
 
-/// GET /actions/:name/runs — Execution history (`action_list_runs`, on the
-/// action's shard). The op takes a count and no offset, so a page past
-/// `offset` asks for `offset + limit` runs and skips the first `offset`.
+/// GET /actions/:name/runs — Execution history (`action.list_runs`, on the
+/// action's shard), newest first: `limit` runs past the first `offset`,
+/// following the op's cursor across as many of its pages as that takes.
 pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const limit = @min(h.parseQueryParam(u64, query_string, "limit") orelse 100, MAX_RUNS_PAGE);
     const offset = h.parseQueryParam(u64, query_string, "offset") orelse 0;
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
-    const want: u32 = @intCast(@min(offset +| limit, std.math.maxInt(u32)));
 
     var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "action runs", err);
     defer reader.deinit();
-    const client = reader.next() catch |err| return try loopback.readFailed(allocator, "action runs", err);
-    var listed = client_mod.action.listRuns(client, ns, name, @min(want, action_ops.MAX_LIST_RUNS), null) catch |err|
-        return try loopback.readFailed(allocator, "action runs", err);
-    defer listed.deinit();
-    if (listed.isError() and !listed.isNotFound()) return try h.jsonError(allocator, listed.errorMessage());
-    // A namespace never created holds no runs.
-    const run_data: []const u8 = if (listed.isNotFound()) &NO_RUNS else listed.data;
-    if (!RunList.whole(run_data)) return try h.jsonError(allocator, "action runs: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     defer json_aw.deinit();
     const writer = &json_aw.writer;
-
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
-    var runs = RunList.init(run_data);
-    runs.action = name;
-    var seen: u64 = 0;
-    while (runs.next() catch unreachable) |run| {
-        seen += 1;
-        if (seen <= offset) continue;
-        try arr.next();
-        writeRun(&reader, writer, ns, run, .page) catch |err| return try loopback.readFailed(allocator, "action run status", err);
+    var after: ?action_ops.RunCursor.Value = null;
+    var cursor_run: [action_ops.RunCursor.max_size]u8 = undefined;
+    var skipped: u64 = 0;
+    var shown: u64 = 0;
+    while (shown < limit) {
+        const ask: u32 = @intCast(@max(1, @min((offset - skipped) + (limit - shown), action_ops.MAX_LIST_RUNS)));
+        var listed = reader.call(ListRuns, ns, name, .{ .limit = ask, .after = after }) catch |err|
+            return try loopback.readFailed(allocator, "action runs", err);
+        defer listed.deinit();
+        // A namespace never created holds no runs.
+        if (listed.isNotFound()) break;
+        if (listed.isError()) return try h.jsonError(allocator, listed.errorMessage());
+        var diag: schema.Diagnostic = .{};
+        const page = ListRuns.response.decodeAll(listed.data, &diag) catch return try h.jsonError(allocator, "action runs: malformed answer");
+        var it = page.runs.iterator();
+        while (it.next() catch return try h.jsonError(allocator, "action runs: malformed answer")) |r| {
+            if (skipped < offset) {
+                skipped += 1;
+                continue;
+            }
+            if (shown == limit) break;
+            try arr.next();
+            const run: ListedRun = .{ .run_id = r.run, .action = name, .status = @backingInt(r.status), .created_at = r.created_at_ms, .started_at = r.started_at_ms, .completed_at = r.completed_at_ms };
+            writeRun(&reader, writer, ns, run, .page) catch |err| return try loopback.readFailed(allocator, "action run status", err);
+            shown += 1;
+        }
+        const next = page.cursor orelse break;
+        @memcpy(cursor_run[0..next.run.len], next.run);
+        after = .{ .created_at_ms = next.created_at_ms, .run = cursor_run[0..next.run.len] };
     }
     try arr.end();
     return try allocator.dupe(u8, json_aw.written());

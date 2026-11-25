@@ -271,7 +271,7 @@ pub const table = [_]ops.Op{
             // one to its completion; none until one completes. Sampled from
             // its newest runs, a bounded read per ask.
             .{ .name = "latency_sampled", .T = schema.Bool, .doc = "The latencies are from the newest 10,000 runs, not all of them" },
-            .{ .name = "latency_count", .T = Optional(Int(u64)), .doc = "Completed runs measured" },
+            .{ .name = "latency_count", .T = Int(u64), .doc = "Completed runs measured; the latencies below are none while it is 0" },
             .{ .name = "latency_avg_ms", .T = Optional(Int(u64)), .doc = "Their mean duration" },
             .{ .name = "latency_p50_ms", .T = Optional(Int(u64)), .doc = "Their median duration" },
             .{ .name = "latency_p95_ms", .T = Optional(Int(u64)), .doc = "Their 95th percentile duration" },

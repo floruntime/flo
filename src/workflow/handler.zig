@@ -187,6 +187,9 @@ pub const WorkflowHandler = struct {
     /// An index couldn't keep an entry: the runs are walked again
     /// (`leadCaches`).
     rewatch: bool = false,
+    /// Set once a run list met an index row with no run: a Flo bug, warned
+    /// once per shard, not every page.
+    missing_run_said: bool = false,
     /// The cancel this leader proposed last for a run, by key, owned: its
     /// end is counted when that entry applies. Leader memory.
     ending: std.StringHashMapUnmanaged(Ending) = .empty,
@@ -313,7 +316,7 @@ pub const WorkflowHandler = struct {
         created_at_ms: i64,
         /// Its incarnation, as applied: a step names it, so one decided for
         /// a run since deleted, its id started again, applies to nothing.
-        created_ns: u64 = 0,
+        created_ns: u64,
         started_at_ms: ?i64,
         completed_at_ms: ?i64,
         idempotency_key_owned: ?[]const u8,
@@ -1712,24 +1715,27 @@ pub const WorkflowHandler = struct {
     /// status and the lowercased search; null for one that doesn't, or that
     /// isn't there. The search reads at most `SEARCH_SPAN` bytes of each
     /// field, so a page's cost is bounded whatever a run holds.
-    pub fn listedRun(self: *WorkflowHandler, run_key: []const u8, run_id: []const u8, status_filter: []const u8, search_lower: []const u8) ?RunInfo {
-        const run = self.shownRun(run_key, run_id) orelse return null;
-        if (status_filter.len > 0 and !std.mem.eql(u8, run.status.toString(), status_filter)) return null;
+    pub fn listedRun(self: *WorkflowHandler, run_key: []const u8, run_id: []const u8, status_filter: []const u8, search_lower: []const u8) Listed {
+        const run = self.shownRun(run_key, run_id) orelse return .missing;
+        if (status_filter.len > 0 and !std.mem.eql(u8, run.status.toString(), status_filter)) return .filtered;
         if (search_lower.len > 0) {
             const matched = containsLower(span(run.run_id_owned), search_lower) or
                 containsLower(span(run.workflow_name_owned), search_lower) or
                 (if (run.current_step_name_owned) |step| containsLower(span(step), search_lower) else false) or
                 containsLower(span(run.input_owned), search_lower) or
                 (if (run.search_tags_owned) |tags| containsLower(span(tags), search_lower) else false);
-            if (!matched) return null;
+            if (!matched) return .filtered;
         }
-        return .{
+        return .{ .shown = .{
             .run_id = run.run_id_owned,
             .workflow = run.workflow_name_owned,
             .status = run.status.toString(),
             .created_at = run.started_at_ms orelse run.created_at_ms,
-        };
+        } };
     }
+
+    /// A list's verdict on one indexed run: shown, filtered out, or not there.
+    pub const Listed = union(enum) { shown: RunInfo, filtered, missing };
 
     /// The most of one field a list's search reads.
     pub const SEARCH_SPAN: usize = 4096;

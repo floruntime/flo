@@ -312,7 +312,6 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                     )}
                   </span>
                 </div>
-
               </div>
             </div>
           )}

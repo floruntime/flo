@@ -441,16 +441,24 @@ fn runRuns(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?; // validated by commander
     const namespace = cli_config.getNamespace(ctx);
     const most: u64 = ctx.getUint("limit") orelse 50;
+    if (most == 0) return outcome.usage(ctx, "--limit is at least 1", .{});
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    const json_output = cli_output.getFormat(ctx) == .json;
-    if (json_output) ctx.print("[", .{});
+    // Every page is read before anything is printed, so a refusal part way
+    // leaves no half-written JSON or table.
+    const format = cli_output.getFormat(ctx);
+    var table = cli_output.Table.init(ctx.allocator);
+    defer table.deinit();
+    for ([_][]const u8{ "RUN ID", "ACTION", "STATUS", "CREATED", "STARTED", "COMPLETED" }) |h|
+        table.addColumn(h, .left) catch return outcome.malformed(ctx, "action.list_runs answer");
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(ctx.allocator);
     var after: ?action_ops.RunCursor.Value = null;
-    var run_buf: [128]u8 = undefined;
+    var run_buf: [action_ops.RunCursor.max_size]u8 = undefined;
     var shown: u64 = 0;
     while (shown < most) {
         const ask: u32 = @intCast(@min(most - shown, action_ops.MAX_LIST_RUNS));
@@ -462,16 +470,28 @@ fn runRuns(ctx: *commander.Context) commander.Error!void {
         var it = page.runs.iterator();
         while (it.next() catch return outcome.malformed(ctx, "action.list_runs answer")) |r| : (shown += 1) {
             const status = @tagName(r.status);
-            if (json_output) {
-                ctx.print("{s}{{\"run_id\":{f},\"action\":{f},\"status\":\"{s}\",\"created_at_ms\":{d},\"started_at_ms\":", .{ if (shown == 0) "" else ",", cli_output.jsonString(r.run), cli_output.jsonString(name), status, r.created_at_ms });
-                if (r.started_at_ms) |t| ctx.print("{d}", .{t}) else ctx.print("null", .{});
-                ctx.print(",\"completed_at_ms\":", .{});
-                if (r.completed_at_ms) |t| ctx.print("{d}}}", .{t}) else ctx.print("null}}", .{});
-            } else {
-                if (shown == 0) ctx.print("RUN ID\tACTION\tSTATUS\tCREATED (ms)\tSTARTED (ms)\tCOMPLETED (ms)\n", .{});
-                ctx.print("{s}\t{s}\t{s}\t{d}\t", .{ r.run, name, status, r.created_at_ms });
-                if (r.started_at_ms) |t| ctx.print("{d}\t", .{t}) else ctx.print("-\t", .{});
-                if (r.completed_at_ms) |t| ctx.print("{d}\n", .{t}) else ctx.print("-\n", .{});
+            switch (format) {
+                .json => {
+                    if (shown > 0) out.append(ctx.allocator, ',') catch return outcome.malformed(ctx, "action.list_runs answer");
+                    out.print(ctx.allocator, "{{\"run_id\":{f},\"action\":{f},\"status\":\"{s}\",\"created_at_ms\":{d},\"started_at_ms\":", .{ cli_output.jsonString(r.run), cli_output.jsonString(name), status, r.created_at_ms }) catch return outcome.malformed(ctx, "action.list_runs answer");
+                    (if (r.started_at_ms) |t| out.print(ctx.allocator, "{d}", .{t}) else out.appendSlice(ctx.allocator, "null")) catch return outcome.malformed(ctx, "action.list_runs answer");
+                    out.appendSlice(ctx.allocator, ",\"completed_at_ms\":") catch return outcome.malformed(ctx, "action.list_runs answer");
+                    (if (r.completed_at_ms) |t| out.print(ctx.allocator, "{d}}}", .{t}) else out.appendSlice(ctx.allocator, "null}")) catch return outcome.malformed(ctx, "action.list_runs answer");
+                },
+                .raw => out.print(ctx.allocator, "{s}\n", .{r.run}) catch return outcome.malformed(ctx, "action.list_runs answer"),
+                .table => {
+                    var cb: [24]u8 = undefined;
+                    var sb: [24]u8 = undefined;
+                    var db: [24]u8 = undefined;
+                    table.addRow(&.{
+                        r.run,
+                        name,
+                        status,
+                        cli_output.formatRelativeTimeBuf(r.created_at_ms, &cb),
+                        if (r.started_at_ms) |t| cli_output.formatRelativeTimeBuf(t, &sb) else "—",
+                        if (r.completed_at_ms) |t| cli_output.formatRelativeTimeBuf(t, &db) else "—",
+                    }) catch return outcome.malformed(ctx, "action.list_runs answer");
+                },
             }
         }
         const next = page.cursor orelse break;
@@ -482,7 +502,11 @@ fn runRuns(ctx: *commander.Context) commander.Error!void {
         @memcpy(run_buf[0..next.run.len], next.run);
         after = .{ .created_at_ms = next.created_at_ms, .run = run_buf[0..next.run.len] };
     }
-    if (json_output) ctx.print("]\n", .{}) else if (shown == 0) cli_output.printEmptyList(ctx, "(no runs)");
+    switch (format) {
+        .json => ctx.print("[{s}]\n", .{out.items}),
+        .raw => ctx.print("{s}", .{out.items}),
+        .table => if (shown == 0) cli_output.printEmptyList(ctx, "(no runs)") else table.print(ctx),
+    }
 }
 
 // Worker handlers
