@@ -384,3 +384,70 @@ test "e2e/memory_budget: past its share a shard holds a run's child, its parent 
     }
     try testing.expect(done);
 }
+
+test "e2e/memory_budget: past its share a shard refuses a signal, but takes one that wakes its run" {
+    const env: []const [2][]const u8 = &.{.{ src.node.test_faults.SHARE_ENV, "262144" }};
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true, .faults = true },
+        .env = env,
+    });
+    defer ctx.deinit();
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    for (0..100) |_| {
+        var resp = try http.get("/api/v1/metrics");
+        defer resp.deinit();
+        if (std.mem.indexOf(u8, resp.body, "\"share_bytes\":262144") != null) break;
+        stdx.time.sleep(50 * std.time.ns_per_ms);
+    } else return error.ShareNeverBound;
+
+    const wf = "kind: Workflow\nname: mb-wait\nversion: 1.0.0\nstart:\n  wait_for_signal:\n    type: go\n  transitions:\n    success: flo.Completed\n";
+    const path = try stdx.testing.writeTempYaml(testing.allocator, wf, "memory-budget-wait.yaml");
+    defer stdx.testing.cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+    try ctx.exec(&.{ "workflow", "start", "mb-wait", "{}", "--run-id", "mb-wait-1" });
+    // It waits on "go" before the shard fills.
+    var waiting = false;
+    for (0..100) |_| {
+        var h = try ctx.execResult(&.{ "workflow", "history", "mb-wait-1" });
+        defer h.deinit();
+        if (std.mem.indexOf(u8, h.stdout, "waiting_for_signal") != null) {
+            waiting = true;
+            break;
+        }
+        stdx.time.sleep(50 * std.time.ns_per_ms);
+    }
+    try testing.expect(waiting);
+
+    const value: []const u8 = &@as([2000]u8, @splat('v'));
+    var key_buf: [32]u8 = undefined;
+    var filled: usize = 0;
+    while (filled < 400) : (filled += 1) {
+        var r = try ctx.execResult(&.{ "kv", "set", try std.fmt.bufPrint(&key_buf, "sfill-{d}", .{filled}), value });
+        defer r.deinit();
+        if (pastShare(r)) break;
+    }
+    try testing.expect(filled < 400);
+    // One it doesn't wait for, larger than a fill value, so past the share
+    // whatever room the last fill left: refused, with its status and reason.
+    {
+        const payload = "{\"p\":\"" ++ @as([4000]u8, @splat('p')) ++ "\"}";
+        var r = try ctx.execResult(&.{ "workflow", "signal", "mb-wait-1", "--type", "other", "--payload", payload });
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 3), r.exit_code);
+        try testing.expect(r.stderrContains("[limit/memory_budget]"));
+    }
+    // The one it waits for: taken, and the run ends.
+    try ctx.exec(&.{ "workflow", "signal", "mb-wait-1", "--type", "go" });
+    var done = false;
+    for (0..100) |_| {
+        var h = try ctx.execResult(&.{ "workflow", "history", "mb-wait-1" });
+        defer h.deinit();
+        if (std.mem.indexOf(u8, h.stdout, "signal_matched") != null) {
+            done = true;
+            break;
+        }
+        stdx.time.sleep(50 * std.time.ns_per_ms);
+    }
+    try testing.expect(done);
+}

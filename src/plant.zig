@@ -80,6 +80,8 @@ pub const Plant = enum {
     runs_child_without_parent_starts,
     /// A run's start is admitted past its shard's memory share.
     start_verdict_admits,
+    /// A signal is admitted past its shard's memory share.
+    signal_verdict_admits,
     /// A signal that wakes its run leaves the run's rev where it was.
     runs_signal_wake_keeps_rev,
     /// A step's takes leave the signals it took held.

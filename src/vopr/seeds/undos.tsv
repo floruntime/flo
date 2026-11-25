@@ -58,3 +58,4 @@ actions-resend-rewrites-result.json	actions_resend_rewrites_result	--actions	-	a
 workflow-runs-trigger-order.json	runs_trigger_order_unchecked	--workflows	-	workflow_run_rule	trigger.s start doesn.t follow the place logged
 workflow-runs-child-without-parent.json	runs_child_without_parent_starts	--workflows	-	workflow_run_rule	a run the ledger doesn.t hold is stored
 start-verdict-admits.json	start_verdict_admits	--memory-gate --workflows	-	workflow_run_rule	past its shard.s share
+workflow-runs-signal-admitted.json	signal_verdict_admits	--memory-gate --workflows	-	workflow_run_rule	past its shard.s share
