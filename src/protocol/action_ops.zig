@@ -260,12 +260,11 @@ pub const table = [_]ops.Op{
             .{ .name = "timeout_ms", .T = Int(u64), .doc = "How long a worker holds a run before it times out" },
             .{ .name = "max_attempts", .T = Int(u32), .doc = "Attempts a run gets before it fails" },
             .{ .name = "created_at_ms", .T = Int(i64), .doc = "When it was first registered, in Unix milliseconds" },
-            .{ .name = "ready", .T = Int(u64), .doc = "Its runs waiting for a worker, counted up to 100,000" },
-            .{ .name = "ready_capped", .T = schema.Bool, .doc = "More runs are waiting than were counted: ready is at least that" },
-            // The counts below read every run of the namespace's that the
-            // action's shard holds, so past 10,000 they aren't taken: a
-            // sample of the oldest would stop moving while new runs come and go.
-            .{ .name = "too_many_runs", .T = schema.Bool, .doc = "The action's shard holds more than 10,000 of the namespace's runs, so the counts and latency below are none" },
+            .{ .name = "ready", .T = Int(u64), .doc = "Its runs waiting for a worker" },
+            .{ .name = "ready_capped", .T = schema.Bool, .doc = "Always false: ready is exact" },
+            // The counts are kept as runs move, so exact; the latency is
+            // sampled from the newest runs, a bounded read per ask.
+            .{ .name = "too_many_runs", .T = schema.Bool, .doc = "It has more than 10,000 runs, so the latency below is of its newest 10,000; the counts are exact" },
             .{ .name = "running", .T = Optional(Int(u64)), .doc = "Its runs a worker holds" },
             .{ .name = "completed", .T = Optional(Int(u64)), .doc = "Its runs that completed" },
             .{ .name = "failed", .T = Optional(Int(u64)), .doc = "Its runs that failed for good" },

@@ -719,8 +719,8 @@ pub const Actions = struct {
     /// which sends its history to itself.
     landed: history_lane.Landed = .{},
 
-    pub const FAMILIES = [_]u16{ action_machine.Defs.ID, action_machine.Runs.ID, action_machine.Ready.ID, action_machine.Deadlines.ID, action_machine.Requests.ID, hm.Actions.ID, action_machine.RunAt.ID };
-    pub const NAMES = [_][]const u8{ "action.def", "action.run", "action.ready", "action.deadline", "action.request", "history.act", "action.run_at" };
+    pub const FAMILIES = [_]u16{ action_machine.Defs.ID, action_machine.Runs.ID, action_machine.Ready.ID, action_machine.Deadlines.ID, action_machine.Requests.ID, hm.Actions.ID, action_machine.RunAt.ID, action_machine.Counts.ID };
+    pub const NAMES = [_][]const u8{ "action.def", "action.run", "action.ready", "action.deadline", "action.request", "history.act", "action.run_at", "action.counts" };
     const PLACE: view_mod.Place = .{ .group = 0, .count = 1 };
 
     pub const Kind = enum { register, delete, invoke, deliver, settle, release, extend, expire, run_delete };
@@ -1055,7 +1055,31 @@ pub const Actions = struct {
             if (post.failures != pre.failures + failed) return "a run's failures don't count the deliveries that failed";
         }
         for (touched) |t| if (self.run(t.ns, t.id)) |post| if (self.ruleOfRun(t.ns, t.id, post)) |why| return why;
+        for (touched) |t| {
+            const action = if (self.run(t.ns, t.id)) |post| post.action else if (t.before) |pre| pre.action else continue;
+            if (self.countsRule(t.ns, action)) |why| return why;
+        }
         for (touched) |t| if (self.run(t.ns, t.id)) |post| if (self.eventsRule(e, stamp, t, post)) |why| return why;
+        return null;
+    }
+
+    /// Action `action`'s counts against a recount of its runs: each move
+    /// once, so a missed or doubled move is a rule broken, not a floor hit.
+    fn countsRule(self: *Actions, ns: NamespaceId, action: []const u8) ?[]const u8 {
+        var want = std.mem.zeroes(action_machine.CountsRec.Value);
+        var it = self.read().range(action_machine.Runs, &ns.bytes());
+        while (it.next() catch return "a run could not be read") |item| {
+            if (!std.mem.eql(u8, item.value.v.action, action)) continue;
+            switch (item.value.v.status) {
+                .ready => want.ready += 1,
+                .leased => want.leased += 1,
+                .completed => want.completed += 1,
+                .failed => want.failed += 1,
+                .timed_out => want.timed_out += 1,
+            }
+        }
+        const got = action_machine.countsOf(self.read(), ns, action);
+        if (!std.meta.eql(got, want)) return "an action's counts are not a recount of its runs";
         return null;
     }
 

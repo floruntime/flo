@@ -611,40 +611,26 @@ pub const ActionsHandler = struct {
         const owner = owner_buf[0..@min(def.owner.len, owner_buf.len)];
         @memcpy(owner, def.owner[0..owner.len]);
 
-        var ready: u64 = 0;
-        var ready_capped = false;
-        var pb: [KEY_BUF]u8 = undefined;
-        var rb: [machine.MAX_KEY_LEN]u8 = undefined;
-        if (storeKey(&pb, ns, machine.readyPrefix(&rb, req.key))) |prefix| {
-            var it = readOf(shard).range(machine.Ready, prefix);
-            while (it.next() catch null) |_| {
-                if (ready == action_ops.READY_COUNTED) {
-                    ready_capped = true;
-                    break;
-                }
-                ready += 1;
-            }
-        }
-
+        // Kept as its runs move, so exact whatever their number.
+        const c = machine.countsOf(readOf(shard), ns, req.key);
         const durations = try shard.allocator.alloc(u64, action_ops.RUNS_SCANNED);
         defer shard.allocator.free(durations);
-        const counts = countRuns(shard, ns, req.key, durations);
-        const lat = if (counts.sampled) null else latencyOf(durations[0..counts.measured]);
-        const counted = !counts.sampled;
+        const sample = sampleLatencies(shard, ns, req.key, durations);
+        const lat = latencyOf(durations[0..sample.measured]);
         return .{ .answer = .{
             .owner = owner,
             .version = def.version,
             .timeout_ms = def.lease_ms,
             .max_attempts = def.max_attempts,
             .created_at_ms = nsToMs(def.created_ns),
-            .ready = ready,
-            .ready_capped = ready_capped,
-            .too_many_runs = counts.sampled,
-            .running = if (counted) counts.running else null,
-            .completed = if (counted) counts.completed else null,
-            .failed = if (counted) counts.failed else null,
-            .timed_out = if (counted) counts.timed_out else null,
-            .latency_count = if (counted) counts.measured else null,
+            .ready = c.ready,
+            .ready_capped = false,
+            .too_many_runs = sample.more,
+            .running = c.leased,
+            .completed = c.completed,
+            .failed = c.failed,
+            .timed_out = c.timed_out,
+            .latency_count = sample.measured,
             .latency_avg_ms = if (lat) |l| l.avg_ms else null,
             .latency_p50_ms = if (lat) |l| l.p50_ms else null,
             .latency_p95_ms = if (lat) |l| l.p95_ms else null,
@@ -652,48 +638,31 @@ pub const ActionsHandler = struct {
         } };
     }
 
-    const RunCounts = struct {
-        scanned: u32 = 0,
-        sampled: bool = false,
-        running: u64 = 0,
-        completed: u64 = 0,
-        failed: u64 = 0,
-        timed_out: u64 = 0,
-        measured: usize = 0,
-    };
+    const Sample = struct { measured: u32 = 0, more: bool = false };
 
-    /// `action`'s runs by status among the first `durations.len` of the
-    /// namespace's, and the completed ones' durations in ms.
-    fn countRuns(shard: *Shard, ns: NamespaceId, action: []const u8, durations: []u64) RunCounts {
-        var c: RunCounts = .{};
-        var pb: [KEY_BUF]u8 = undefined;
-        const p = storeKey(&pb, ns, "") orelse return c;
-        var it = readOf(shard).range(machine.Runs, p);
-        while (it.next() catch null) |item| {
-            if (c.scanned == durations.len) {
-                c.sampled = true;
+    /// The durations of the newest `durations.len` runs of `action` that a
+    /// worker completed, by its list's index: one bounded walk per ask.
+    /// `more` when older runs weren't read.
+    fn sampleLatencies(shard: *Shard, ns: NamespaceId, action: []const u8, durations: []u64) Sample {
+        var out: Sample = .{};
+        var pb: machine.RunAtBuf = undefined;
+        var kb: [@sizeOf(u32) + @sizeOf(machine.RunAtBuf)]u8 = undefined;
+        const prefix = storeKey(&kb, ns, machine.runAtPrefix(&pb, action)) orelse return out;
+        var it = readOf(shard).range(machine.RunAt, prefix);
+        var read: usize = 0;
+        var rb: [KEY_BUF]u8 = undefined;
+        while (it.next() catch null) |item| : (read += 1) {
+            if (read == durations.len) {
+                out.more = true;
                 break;
             }
-            c.scanned += 1;
-            const run = item.value.v;
-            if (!std.mem.eql(u8, run.action, action)) continue;
-            switch (run.status) {
-                .ready => {},
-                .leased => c.running += 1,
-                .failed => c.failed += 1,
-                .timed_out => c.timed_out += 1,
-                .completed => {
-                    c.completed += 1;
-                    // A run completed without a worker taking it has no
-                    // duration to measure.
-                    if (run.started_ns != 0 and run.completed_ns >= run.started_ns) {
-                        durations[c.measured] = (run.completed_ns - run.started_ns) / std.time.ns_per_ms;
-                        c.measured += 1;
-                    }
-                },
-            }
+            const run = getRunAt(shard, &rb, ns, item.key[prefix.len + 8 ..]) orelse continue;
+            // A run completed without a worker taking it has no duration.
+            if (run.status != .completed or run.started_ns == 0 or run.completed_ns < run.started_ns) continue;
+            durations[out.measured] = (run.completed_ns - run.started_ns) / std.time.ns_per_ms;
+            out.measured += 1;
         }
-        return c;
+        return out;
     }
 
     const Latency = struct { avg_ms: u64, p50_ms: u64, p95_ms: u64, max_ms: u64 };

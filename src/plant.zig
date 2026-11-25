@@ -140,6 +140,8 @@ pub const Plant = enum {
     history_drop_not_resent,
     /// An action run's delete sends no history drop.
     actions_delete_keeps_history,
+    /// An action's counts don't move as its runs do.
+    actions_counts_unmoved,
 };
 
 pub const active: Plant = std.meta.stringToEnum(Plant, @import("build_options").vopr_plant) orelse
