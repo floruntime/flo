@@ -2760,8 +2760,9 @@ pub const ProcessingHandler = struct {
     /// commas, from the record's fields that `tag_keys` names (flat pairs,
     /// tag name then field), for the projection to canonicalise. Every tag is
     /// the record's or none is: a field it lacks names `missing`. A value's
-    /// trailing space or tab is trimmed there, as for any TS write, so "a",
-    /// "a " and "a\t" are one series.
+    /// trailing space is trimmed there, as for any TS write, so "a" and "a "
+    /// are one series; a value holding a tab or any control character is
+    /// dropped here.
     fn computeTsSinkTags(tag_keys: []const u8, values: []const ?record_fields.Field, buf: []u8, missing: *[]const u8) error{ TagsTooLong, NoTagField, TagValueComma, TagValueControl }![]const u8 {
         if (tag_keys.len == 0) return "";
         var pos: usize = 0;

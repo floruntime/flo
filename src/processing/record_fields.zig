@@ -103,7 +103,10 @@ pub fn read(record: []const u8, names: []const []const u8, out: []?Field, buf: [
         // still a fault.
         if (left == 0) {
             const next = scanner.peekNextTokenType() catch |e| return mapError(e);
-            if (next != .object_end and next != .string) return error.NotObject;
+            // At its end, the record is held to ending there, as a read of
+            // every field would be.
+            if (next == .object_end) return finish(&scanner);
+            if (next != .string) return error.NotObject;
             return;
         }
     }
@@ -334,4 +337,14 @@ test "record fields: a bare number is a JSON number, not a looser form" {
     try testing.expectEqual(@as(?f64, 12), bareNumber("12", &st));
     try testing.expectEqual(@as(?f64, -500), bareNumber(" -0.5e3\n", &st));
     for ([_][]const u8{ "0x10", "inf", "nan", "1_000", "+1", ".5", "1.", "012", "1 2", "" }) |s| try testing.expectEqual(@as(?f64, null), bareNumber(s, &st));
+}
+
+test "record fields: a record that runs on past its object is a fault, whether every name is found or not" {
+    for ([_][]const u8{ "{\"h\":\"a\"} garbage", "{\"h\":\"a\"}}", "{\"h\":\"a\"}{\"h\":\"b\"}" }) |r| {
+        // Every name found, at the last field.
+        try testing.expectError(error.NotObject, one(r, "h"));
+        // A name missing: read to the end.
+        var out: [2]?Field = undefined;
+        try testing.expectError(error.NotObject, read(r, &.{ "h", "missing" }, &out, &sink_buf));
+    }
 }
