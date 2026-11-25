@@ -1153,9 +1153,9 @@ fn applyDelete(view: *View, n: Named, cmd: entry_mod.CommandPayload, out: *Resul
     const run = ((try view.get(RunFam, cmd.key)) orelse return out.refuse(.not_found, .not_found, "run not found")).v;
     if (run.created_ns != d.created_ns or !std.mem.eql(u8, run.workflow, d.workflow) or !std.mem.eql(u8, run.idempotency_key, d.idem))
         return out.refuse(.not_found, .not_found, "run not found");
-    if (!statusOf(run).isTerminal()) return out.refuse(.bad_request, .run_live, RUN_LIVE);
+    if (comptime plant.active != .runs_delete_takes_live) if (!statusOf(run).isTerminal()) return out.refuse(.bad_request, .run_live, RUN_LIVE);
     const arena = view.arena;
-    if (d.idem.len > 0) {
+    if ((comptime plant.active != .runs_delete_keeps_idem) and d.idem.len > 0) {
         const k = try idemKey(arena, n.ns, d.workflow, d.idem);
         // Only this run's: a key is only ever one run's at a time.
         if (try view.get(IdemFam, k)) |i| if (std.mem.eql(u8, i.v.run, n.run)) try view.delete(IdemFam, k);
@@ -1820,6 +1820,48 @@ test "workflow runs machine: a call settled refused stays refused when its run's
     try testing.expectEqual(calls_mod.State.refused, c.state);
     try testing.expectEqualStrings("repaired", c.outcome);
     try testing.expectEqualStrings("", c.result);
+}
+
+test "workflow runs machine: what arrives late for a deleted run is refused or changes nothing, never halts" {
+    var f = Fixture.init();
+    defer f.deinit();
+    const Status = @import("../protocol/proto.zig").StatusCode;
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    var cb: [ae.Call.max_size]u8 = undefined;
+    const call = try ae.Call.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .kind = .action, .caller_run = "r1", .caller_workflow = "wf", .step = "s", .target = "act", .version = "", .run = "a1", .input = "{}", .can_wait = false });
+    _ = try f.step("r1", .{ .rev = 0, .wait = .call, .wait_on = "a1", .call = call });
+    var vb: [512]u8 = undefined;
+    _ = try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 5);
+    try testing.expect((try f.deleteOf("r1")).refused() == null);
+    // Its call's answers, to a caller deleted: no halt.
+    const slot = calls_mod.callerSlot(.default, "wf");
+    var rb: [ae.Reply.max_size]u8 = undefined;
+    _ = try f.answer(.call_reply, try ae.Reply.encodeInto(&rb, .{ .ns = NamespaceId.default.int(), .slot = slot, .run = "a1", .answer = .started, .why = "" }));
+    var db: [ae.Done.max_size]u8 = undefined;
+    _ = try f.answer(.call_done, try ae.Done.encodeInto(&db, .{ .ns = NamespaceId.default.int(), .slot = slot, .run = "a1", .status = .completed, .outcome = "", .result = "{}" }));
+    // A step, a signal or a completion: not found.
+    try testing.expectEqual(Status.not_found, (try f.step("r1", .{ .rev = 1 })).refused().?.status);
+    try testing.expectEqual(Status.not_found, (try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 6)).refused().?.status);
+    var kb: [64]u8 = undefined;
+    var sb: [64]u8 = undefined;
+    const sig = try Signal.encodeInto(&sb, .{ .type = "go", .payload = "" });
+    try testing.expectEqual(Status.not_found, (try f.command(.workflow_signal, view_mod.idKey(&kb, .default, "r1") catch unreachable, sig, 6)).refused().?.status);
+    try testing.expect(f.get("r1") == null);
+
+    // A child, ended and deleted: its start's late refusal finds no parent
+    // record, and changes nothing.
+    var csb: [ae.ChildStart.max_size]u8 = undefined;
+    _ = try f.answer(.child_start, try ae.ChildStart.encodeInto(&csb, .{ .ns = NamespaceId.default.int(), .parent_slot = 3, .parent_run = "p0", .parent_workflow = "pwf", .workflow = "wf", .version = "", .run = "c1", .input = "{}" }));
+    // Its leader starts it from the record.
+    try testing.expect((try f.start("c1", "wf", "child_started", "", 6)).refused() == null);
+    try testing.expect(f.get("c1") != null);
+    _ = try f.complete("c1", completeValue(&vb, .cancelled, "wf"), 7);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "c1") == null);
+    try testing.expect((try f.deleteOf("c1")).refused() == null);
+    var crb: [ae.ChildRefuse.max_size]u8 = undefined;
+    _ = try f.answer(.child_refuse, try ae.ChildRefuse.encodeInto(&crb, .{ .ns = NamespaceId.default.int(), .run = "c1", .answer = .conflict }));
+    try testing.expect(f.get("c1") == null);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "c1") == null);
 }
 
 test "workflow runs machine: a repair skip leaves a call held over its callee's memory share as it is" {

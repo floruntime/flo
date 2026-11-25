@@ -55,4 +55,8 @@ group-deliver-uncapped.json	group_deliver_uncapped	--consumer-groups	memory_shar
 actions-hist-flushed-kept.json	actions_hist_flushed_kept	--actions	-	action_rule	a run.s pending history is missing events
 actions-end-keeps-input.json	actions_end_keeps_input	--actions	-	action_rule	an ended run keeps its input or labels
 actions-resend-rewrites-result.json	actions_resend_rewrites_result	--actions	-	action_rule	a settle naming an ended run changed the store
+actions-delete-keeps-history.json	actions_delete_keeps_history	--actions	-	action_rule	a deleted run.s history rows aren.t gone
 workflow-runs-trigger-order.json	runs_trigger_order_unchecked	--workflows	-	workflow_run_rule	trigger.s start doesn.t follow the place logged
+workflow-runs-delete-keeps-idem.json	runs_delete_keeps_idem	--workflows	-	workflow_run_rule	idempotency key
+workflow-runs-delete-takes-live.json	runs_delete_takes_live	--workflows	-	workflow_run_rule	applied a delete the ledger refuses: its run hasn.t ended
+workflow-history-drop-not-resent.json	history_drop_not_resent	--workflows	-	workflow_run_rule	(isn.t marked orphaned|history rows aren.t gone)

@@ -5,6 +5,11 @@
 //! landed, its records are its seqs in order, and nothing lands after the
 //! run's last chunk. The records each apply landed are kept until the
 //! next, for its family to check against the entry that sent them.
+//!
+//! A deleted run's drop is lost, as a repair's skip loses it, as many times
+//! as `dropLosses` says for its incarnation: none for some, past the
+//! machine's retries for others, so each family sees a drop land, land
+//! after resends, and leave its run's rows orphaned.
 
 const std = @import("std");
 const schema = @import("../protocol/schema.zig");
@@ -32,7 +37,7 @@ pub const Landed = struct {
     /// The records of each chunk the last `deliver` landed, by run.
     fresh: std.ArrayListUnmanaged(Fresh) = .empty,
 
-    const Fresh = struct { id: u64, records: []u8 };
+    pub const Fresh = struct { id: u64, records: []u8 };
 
     const Inc = struct { next: u64 = 0, ended: bool = false };
 
@@ -59,7 +64,7 @@ pub const Landed = struct {
         for (self.fresh.items) |f| if (f.id == id) try out.append(a, f.records);
     }
 
-    fn idOf(h: he.Header.Value) u64 {
+    pub fn idOf(h: he.Header.Value) u64 {
         var w = std.hash.Wyhash.init(0);
         w.update(std.mem.asBytes(&h.ns));
         w.update(&.{h.family});
@@ -103,10 +108,22 @@ pub const Landed = struct {
             h.timestamp_ns = e.header.timestamp_ns;
             h.payload_len = @intCast(inbound.len);
             const ie: entry_mod.Entry = .{ .header = h, .payload = inbound };
+            if (o.entry_type == @backingInt(entry_mod.EntryType.history_drop)) {
+                var diag: schema.Diagnostic = .{};
+                const d = he.Drop.decodeAll(o.payload, &diag) catch return "a history drop doesn't decode";
+                if (d.first_seq < dropLosses(d)) store.inbound_skip = .all(h.index);
+            }
+            defer store.inbound_skip = null;
             var res = persistence.Result.start(&ie);
             try machine_mod.applyEntry(&Lane.machine, store, scratch, &ie, &res);
             if (res.refused() != null) return error.Halt;
         }
+    }
+
+    /// The ids of the run incarnations whose chunks the last `deliver`
+    /// landed, as `idOf` names them.
+    pub fn freshIds(self: *const Landed) []const Fresh {
+        return self.fresh.items;
     }
 
     /// Chunk `payload` against what landed of its run before it.
@@ -131,3 +148,20 @@ pub const Landed = struct {
         return null;
     }
 };
+
+/// How many times a run incarnation's drop is lost: 0 to 4, by its
+/// incarnation, so every replica loses the same ones. From
+/// `hm.MAX_DROP_RETRIES` up, its rows are orphaned.
+pub fn dropLosses(h: anytype) u64 {
+    var w = std.hash.Wyhash.init(0xd0d0);
+    w.update(h.owner);
+    w.update(&.{0});
+    w.update(h.run);
+    w.update(std.mem.asBytes(&h.created_ns));
+    return w.final() % (hm.MAX_DROP_RETRIES + 2);
+}
+
+/// Whether a run incarnation's drop is lost past its retries.
+pub fn orphaned(owner: []const u8, run: []const u8, created_ns: u64) bool {
+    return dropLosses(.{ .owner = owner, .run = run, .created_ns = created_ns }) >= hm.MAX_DROP_RETRIES;
+}

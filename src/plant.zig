@@ -126,6 +126,14 @@ pub const Plant = enum {
     memory_delta_first_write,
     /// A group's deliver takes fresh records past its shard's share.
     group_deliver_uncapped,
+    /// A workflow run's delete leaves its idempotency key.
+    runs_delete_keeps_idem,
+    /// A workflow run's delete takes a run that hasn't ended.
+    runs_delete_takes_live,
+    /// A history drop a repair skipped is neither sent again nor marked.
+    history_drop_not_resent,
+    /// An action run's delete sends no history drop.
+    actions_delete_keeps_history,
 };
 
 pub const active: Plant = std.meta.stringToEnum(Plant, @import("build_options").vopr_plant) orelse
