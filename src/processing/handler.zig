@@ -351,7 +351,9 @@ pub const ProcessingHandler = struct {
         /// and reason, for its status (`JobRun`).
         drops: u64 = 0,
         last_drop: []const u8 = "",
+        /// Single sink writes dropped, and the last one's sink and reason.
         write_drops: u64 = 0,
+        last_write_drop: []const u8 = "",
     };
 
     /// How long a run held for want of memory waits to be built again.
@@ -370,9 +372,11 @@ pub const ProcessingHandler = struct {
         drops: u64 = 0,
         last_drop: [160]u8 = undefined,
         last_drop_len: usize = 0,
-        /// Single sink writes this leader dropped, and when one was last
-        /// logged.
+        /// Single sink writes this leader dropped, the last one's sink and
+        /// reason, and when one was last logged.
         write_drops: u64 = 0,
+        last_write_drop: [160]u8 = undefined,
+        last_write_drop_len: usize = 0,
         drop_warn_ms: i64 = 0,
         /// Held for want of memory: built again at a later look
         /// (`reconcileAt`), not only when the jobs change.
@@ -498,6 +502,7 @@ pub const ProcessingHandler = struct {
             v.drops = run.drops;
             v.last_drop = run.last_drop[0..run.last_drop_len];
             v.write_drops = run.write_drops;
+            v.last_write_drop = run.last_write_drop[0..run.last_write_drop_len];
         };
         return v;
     }
@@ -1136,6 +1141,10 @@ pub const ProcessingHandler = struct {
         if (job.drops > 0) {
             if (w.end > 0) w.writeAll("; ") catch {};
             w.print("{d} record{s} skipped, the last {s}", .{ job.drops, if (job.drops == 1) "" else "s", job.last_drop }) catch {};
+        }
+        if (job.write_drops > 0) {
+            if (w.end > 0) w.writeAll("; ") catch {};
+            w.print("{d} record{s} dropped by a sink, the last by {s}", .{ job.write_drops, if (job.write_drops == 1) "" else "s", job.last_write_drop }) catch {};
         }
         return if (w.end == 0) null else w.buffered();
     }
@@ -2529,10 +2538,13 @@ pub const ProcessingHandler = struct {
         const job = self.runs.getPtr(self.ticking_job) orelse return;
         self.reported = true;
         job.write_drops += 1;
+        const text = std.fmt.bufPrint(&job.last_write_drop, "{s} sink '{s}': {s}", .{ kind, target, why }) catch null;
+        job.last_write_drop_len = if (text) |t| t.len else job.last_write_drop.len;
         const now = @import("stdx").time.milliTimestamp();
         if (now - job.drop_warn_ms < 30_000) return;
         job.drop_warn_ms = now;
-        log.err("job '{s}': {s} sink '{s}': record dropped: {s} ({d} dropped by this job so far)", .{ self.ticking_job, kind, target, why, job.write_drops });
+        // Its records' doing, not the server's.
+        log.warn("job '{s}': {s} sink '{s}': record dropped: {s} ({d} dropped by this job so far)", .{ self.ticking_job, kind, target, why, job.write_drops });
     }
 
     /// A whole record skipped by every sink: counted as dropped, said in
@@ -2613,7 +2625,17 @@ pub const ProcessingHandler = struct {
     fn writeTsSinkFromJson(self: *ProcessingHandler, batch: *Batch, pipe: *PipelineState, snk: SinkConfig, shard: *Shard, payload: []const u8) void {
         _ = pipe;
         var sink_tag_buf: [ts_mod.MAX_TAG_STRING]u8 = undefined;
-        const sink_tags = computeTsSinkTags(snk.ts_tag_keys, payload, &sink_tag_buf);
+        var missing: []const u8 = "";
+        // Its tags name its series: a point without all of them would land
+        // in another, which no read of these tags finds.
+        const sink_tags = computeTsSinkTags(snk.ts_tag_keys, payload, &sink_tag_buf, &missing) catch |err| {
+            var wb: [parser.MAX_SINK_FIELD_NAME + 64]u8 = undefined;
+            return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, switch (err) {
+                error.TagsTooLong => std.fmt.comptimePrint("its tags pass {d} bytes", .{ts_mod.MAX_TAG_STRING}),
+                error.NoTagField => std.fmt.bufPrint(&wb, "the record has no string field \"{s}\" for a tag", .{missing}) catch "the record has no field for a tag",
+                error.TagValueComma => std.fmt.bufPrint(&wb, "the record's field \"{s}\" holds ',', which would split its tag", .{missing}) catch "a tag's value holds ','",
+            });
+        };
 
         if (snk.ts_field_keys.len > 0) {
             var it = FlatPairIterator.init(snk.ts_field_keys);
@@ -2710,29 +2732,28 @@ pub const ProcessingHandler = struct {
         }
     };
 
-    /// Compute the TS tag hash for a sink write from its `tags:` map and the record
-    /// payload. Builds `tagname=value,…` (config order) and Wyhashes it — the SAME
-    /// algorithm the TS source filter and `ts read --tags` use, so writes are queryable.
-    /// Build the sink's tag set as a `k=v,k=v` string from the configured tag
-    /// keys and the record payload.
-    ///
-    /// This used to return a raw `Wyhash` of the string — NOT the canonical
-    /// hash the write and read paths use — so every point a TS sink wrote
-    /// landed in a series that no query could ever address. Returning the
-    /// string and letting the projection canonicalize is what keeps the one
-    /// hashing rule in one place.
-    fn computeTsSinkTags(tag_keys: []const u8, payload: []const u8, buf: []u8) []const u8 {
+    /// A point's tags, as a TS write takes them: `name=value` pairs joined by
+    /// commas, from the record's fields that `tag_keys` names (flat pairs,
+    /// tag name then field), for the projection to canonicalise. Every tag is
+    /// the record's or none is: a field it lacks names `missing`. A value's
+    /// trailing space or tab is trimmed there, as for any TS write, so "a",
+    /// "a " and "a\t" are one series.
+    fn computeTsSinkTags(tag_keys: []const u8, payload: []const u8, buf: []u8, missing: *[]const u8) error{ TagsTooLong, NoTagField, TagValueComma }![]const u8 {
         if (tag_keys.len == 0) return "";
         var pos: usize = 0;
         var it = FlatPairIterator.init(tag_keys);
         while (it.next()) |pair| {
             // pair.key = TS tag name, pair.value = JSON field to read the tag value from.
-            const tag_val = extractJsonString(payload, pair.value) orelse continue;
-            if (pos > 0 and pos < buf.len) {
-                buf[pos] = ',';
-                pos += 1;
+            const tag_val = extractJsonString(payload, pair.value) orelse {
+                missing.* = pair.value;
+                return error.NoTagField;
+            };
+            // Tags are split again on `,`: one in a value would make two.
+            if (std.mem.indexOfScalar(u8, tag_val, ',') != null) {
+                missing.* = pair.value;
+                return error.TagValueComma;
             }
-            const kv = std.fmt.bufPrint(buf[pos..], "{s}={s}", .{ pair.key, tag_val }) catch break;
+            const kv = std.fmt.bufPrint(buf[pos..], "{s}{s}={s}", .{ if (pos > 0) "," else "", pair.key, tag_val }) catch return error.TagsTooLong;
             pos += kv.len;
         }
         return buf[0..pos];
@@ -2741,7 +2762,7 @@ pub const ProcessingHandler = struct {
     /// Extract a string field value from a JSON payload (unescaped, first match).
     fn extractJsonString(payload: []const u8, field_name: []const u8) ?[]const u8 {
         if (field_name.len == 0) return null;
-        var search_buf: [256]u8 = undefined;
+        var search_buf: [parser.MAX_SINK_FIELD_NAME + 3]u8 = undefined;
         const pattern = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{field_name}) catch return null;
         const idx = std.mem.indexOf(u8, payload, pattern) orelse return null;
         const after = payload[idx + pattern.len ..];
@@ -2762,7 +2783,7 @@ pub const ProcessingHandler = struct {
         if (field_name.len == 0) return null;
 
         // Build the search pattern: "field_name":
-        var search_buf: [256]u8 = undefined;
+        var search_buf: [parser.MAX_SINK_FIELD_NAME + 3]u8 = undefined;
         const pattern = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{field_name}) catch return null;
 
         const idx = std.mem.indexOf(u8, payload, pattern) orelse return null;
@@ -3764,4 +3785,26 @@ test "processing: a namespace may hold three quarters of an outbox, and past a q
     try std.testing.expect(!raft_node_mod.shareHeld(0, 0, 1));
     try std.testing.expect(!raft_node_mod.shareHeld(0, 1 << 20, 1));
     try std.testing.expect(raft_node_mod.shareHeld(1, 1, 1));
+}
+
+test "processing: a TS sink's tags are the record's, every one or none, and never cut short" {
+    var buf: [ts_mod.MAX_TAG_STRING]u8 = undefined;
+    var missing: []const u8 = "";
+    const keys = "host\x00h\x00region\x00r";
+    try std.testing.expectEqualStrings("host=a,region=eu", try ProcessingHandler.computeTsSinkTags(keys, "{\"h\":\"a\",\"r\":\"eu\"}", &buf, &missing));
+    // A record without one of them: no point, naming the field it lacks.
+    try std.testing.expectError(error.NoTagField, ProcessingHandler.computeTsSinkTags(keys, "{\"h\":\"a\"}", &buf, &missing));
+    try std.testing.expectEqualStrings("r", missing);
+    // Tags up to what a read can name: `host=` and 1019 bytes is 1024, kept;
+    // one more is dropped, rather than written under fewer.
+    var long: [ts_mod.MAX_TAG_STRING + 16]u8 = undefined;
+    const at_limit = try std.fmt.bufPrint(&long, "{{\"h\":\"{s}\"}}", .{@as([ts_mod.MAX_TAG_STRING - 5]u8, @splat('a'))});
+    try std.testing.expectEqual(ts_mod.MAX_TAG_STRING, (try ProcessingHandler.computeTsSinkTags("host\x00h", at_limit, &buf, &missing)).len);
+    const past = try std.fmt.bufPrint(&long, "{{\"h\":\"{s}\"}}", .{@as([ts_mod.MAX_TAG_STRING - 4]u8, @splat('a'))});
+    try std.testing.expectError(error.TagsTooLong, ProcessingHandler.computeTsSinkTags("host\x00h", past, &buf, &missing));
+    // A comma in a value would read as another tag.
+    try std.testing.expectError(error.TagValueComma, ProcessingHandler.computeTsSinkTags(keys, "{\"h\":\"a,zz=q\",\"r\":\"eu\"}", &buf, &missing));
+    try std.testing.expectEqualStrings("h", missing);
+    // An `=` in a value is the value's.
+    try std.testing.expectEqualStrings("host=a=b,region=eu", try ProcessingHandler.computeTsSinkTags(keys, "{\"h\":\"a=b\",\"r\":\"eu\"}", &buf, &missing));
 }
