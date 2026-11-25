@@ -57,6 +57,8 @@ actions-end-keeps-input.json	actions_end_keeps_input	--actions	-	action_rule	an 
 actions-resend-rewrites-result.json	actions_resend_rewrites_result	--actions	-	action_rule	a settle naming an ended run changed the store
 actions-delete-keeps-history.json	actions_delete_keeps_history	--actions	-	action_rule	a deleted run.s history rows aren.t gone
 workflow-runs-trigger-order.json	runs_trigger_order_unchecked	--workflows	-	workflow_run_rule	trigger.s start doesn.t follow the place logged
-workflow-runs-delete-keeps-idem.json	runs_delete_keeps_idem	--workflows	-	workflow_run_rule	idempotency key
+workflow-runs-child-without-parent.json	runs_child_without_parent_starts	--workflows	-	workflow_run_rule	a run the ledger doesn.t hold is stored
+start-verdict-admits.json	start_verdict_admits	--memory-gate --workflows	-	workflow_run_rule	past its shard.s share
+workflow-runs-delete-keeps-idem.json	runs_delete_keeps_idem	--workflows	-	workflow_run_rule	an idempotency key names no run
 workflow-runs-delete-takes-live.json	runs_delete_takes_live	--workflows	-	workflow_run_rule	applied a delete the ledger refuses: its run hasn.t ended
 workflow-history-drop-not-resent.json	history_drop_not_resent	--workflows	-	workflow_run_rule	(isn.t marked orphaned|history rows aren.t gone)

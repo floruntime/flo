@@ -2664,6 +2664,7 @@ pub const Simulator = struct {
         });
         if (is_op and workflow_defs_family.WorkflowDefs.owns(e.header.entry_type)) if (node.wf_defs.apply(e)) |effect| {
             if (first) self.wf_def_counts.count(effect);
+            if (first and effect.memory) self.wf_run_counts.classes[@backingInt(workflow_runs_family.WorkflowRuns.Class.create_held)] += 1;
             if (effect.broke) |why| self.checker.fail(.{ .invariant = .workflow_rule, .node = node.id, .index = idx, .tick = self.now, .detail = why });
         } else |err| self.checker.fail(switch (err) {
             error.RefusalChangedState => .{

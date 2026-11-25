@@ -7,8 +7,8 @@
 //! next, for its family to check against the entry that sent them.
 //!
 //! A deleted run's drop is lost, as a repair's skip loses it, as many times
-//! as `dropLosses` says for its incarnation: none for some, past the
-//! machine's retries for others, so each family sees a drop land, land
+//! as `dropLosses` says for its incarnation: none, once or twice for some,
+//! as many as the machine's retries for others, so each family sees a drop land, land
 //! after resends, and leave its run's rows orphaned.
 
 const std = @import("std");
@@ -149,16 +149,17 @@ pub const Landed = struct {
     }
 };
 
-/// How many times a run incarnation's drop is lost: 0 to 4, by its
-/// incarnation, so every replica loses the same ones. From
-/// `hm.MAX_DROP_RETRIES` up, its rows are orphaned.
+/// How many times a run incarnation's drop is lost, by its incarnation, so
+/// every replica loses the same ones: none, once, twice (each then resent
+/// and landed), or `hm.MAX_DROP_RETRIES` times, past which its rows are
+/// orphaned.
 pub fn dropLosses(h: anytype) u64 {
     var w = std.hash.Wyhash.init(0xd0d0);
     w.update(h.owner);
     w.update(&.{0});
     w.update(h.run);
     w.update(std.mem.asBytes(&h.created_ns));
-    return w.final() % (hm.MAX_DROP_RETRIES + 2);
+    return w.final() % (hm.MAX_DROP_RETRIES + 1);
 }
 
 /// Whether a run incarnation's drop is lost past its retries.

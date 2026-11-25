@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 60;
+pub const CURRENT: u32 = 63;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -218,6 +218,17 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // a history drop's resend count in its `first_seq`, and a deleted run
     // whose drop was lost marked `O` in its history family.
     .{ .format = 60, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
+    // Workflow state is charged to the memory pool: a create past a shard's
+    // share is refused and a child's start there answered `over_budget`, so
+    // a log from before would apply differently here.
+    .{ .format = 61, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
+    // A run's start past its shard's share is refused, or its child's
+    // parent answered `over_budget`; a child's start with no pending parent
+    // record creates nothing.
+    .{ .format = 62, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
+    // A step or completion naming another workflow than its run's is
+    // refused, where it halted: a log from before would apply differently.
+    .{ .format = 63, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
 };
 
 comptime {

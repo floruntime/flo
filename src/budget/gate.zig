@@ -6,7 +6,8 @@
 //! carries is refused here (a sink's message is held before it is proposed,
 //! `channels.sinkRoom`), nor anything the node writes for itself: a duty, a
 //! delete, a channel's own entries. A type whose machine caps itself (`own`)
-//! applies its own rule.
+//! applies its own rule: a run's start, which a duty may propose, is held
+//! by the runs machine (`start_verdict.zig`).
 //!
 //! The verdict reads only the committed store and the bound share, so every
 //! replica, replay included, reaches the same one.
@@ -30,8 +31,8 @@ pub const Class = enum {
     /// Its machine holds it to the share itself (a group's deliver takes no
     /// fresh records past it, but still redelivers).
     own,
-    /// Never refused for memory: it frees, it is the node's own, or what it
-    /// writes isn't charged yet.
+    /// Never refused for memory: it frees, it is the node's own, or it is
+    /// charged but not held to the share yet.
     never,
 };
 
@@ -45,9 +46,16 @@ pub fn classOf(t: EntryType) Class {
         .ts_write, .ts_write_batch => .refusable,
         .group_create, .cg_create => .refusable,
         .action_register, .action_invoke => .refusable,
+        // A replace that shrinks fits: the gate weighs the exact delta.
+        .workflow_create => .refusable,
         .processing_submit => .refusable,
 
         .group_deliver => .own,
+        // A run's start creates for a user, whoever proposed it (a client, a
+        // schedule, a trigger or a parent): the runs machine holds it to the
+        // share after staging it, answering a child's parent rather than
+        // dropping the reply.
+        .workflow_start => .own,
 
         // A TTL set on a live key's current value, in place: no history
         // version kept, its size unchanged. It is how a user frees memory.
@@ -68,9 +76,17 @@ pub fn classOf(t: EntryType) Class {
         // relies on the create: a refused create would orphan its id. The
         // table is capped instead.
         .namespace_create => .never,
-        // Workflow state and calls are not charged yet, so definitions and
-        // runs have no bound at apply, by count or by memory.
-        .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step, .workflow_signal => .never,
+        // Charged, but not held to the share yet: past it a signal still
+        // lands, while other writes are refused.
+        .workflow_signal => .never,
+        // A run admitted is let finish: a step's outputs are keyed by its
+        // name, so a run's are bounded by its definition. Enabling is set in
+        // place.
+        .workflow_complete, .workflow_enabled, .workflow_step => .never,
+        // A child's start arrives in an inbound and holds itself to the share
+        // there. A retry rewrites its call in place and asks again, and a
+        // refused one would leave the call with nothing to ask it; the rest
+        // free, or answer a call.
         .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done => .never,
         .processing_sink_batch => .never,
         .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean, .settings_budget_bind => .never,
@@ -179,8 +195,9 @@ test "gate: what a client writes is refusable, what frees or the node writes for
     // Every type has a class (the switch is exhaustive); these are the ones
     // whose class decides a refusal.
     for ([_]EntryType{ .kv_put, .kv_batch, .stream_append, .queue_enqueue, .ts_write, .group_create, .action_invoke, .processing_submit }) |t| try testing.expectEqual(Class.refusable, classOf(t));
-    for ([_]EntryType{ .kv_delete, .kv_reap, .kv_expire, .stream_trim, .queue_deliver, .action_settle, .action_release, .namespace_create, .channel_inbound, .channel_unpark, .workflow_start, .settings_budget_bind }) |t| try testing.expectEqual(Class.never, classOf(t));
+    for ([_]EntryType{ .kv_delete, .kv_reap, .kv_expire, .stream_trim, .queue_deliver, .action_settle, .action_release, .namespace_create, .channel_inbound, .channel_unpark, .settings_budget_bind }) |t| try testing.expectEqual(Class.never, classOf(t));
     try testing.expectEqual(Class.own, classOf(.group_deliver));
+    try testing.expectEqual(Class.own, classOf(.workflow_start));
 }
 
 test "gate: nothing that adds nothing is held back, whatever the use" {

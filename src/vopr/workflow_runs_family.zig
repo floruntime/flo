@@ -25,7 +25,9 @@
 //!   step outputs; another with the same status changes nothing, one with
 //!   another status is refused;
 //! - a child's parent hears its start (only a child start's), its refusal,
-//!   a disabled workflow, and its end, each once;
+//!   a disabled workflow, and its end, each once; a child's start that
+//!   would take its shard past its share is answered over_budget,
+//!   recording nothing;
 //! - a signal is held by its run, refused when the run is gone, has ended
 //!   or holds 64 no wait took; one of the type the run waits on wakes it,
 //!   moving its rev, and is still held. A step names the types its waits
@@ -62,6 +64,10 @@ const he = @import("../protocol/history_entries.zig");
 const history_lane = @import("history_lane.zig");
 const ce = @import("../protocol/channel_entries.zig");
 const defs_family = @import("workflow_defs_family.zig");
+const pool = @import("../budget/pool.zig");
+const gate = @import("../budget/gate.zig");
+const memory_gate = @import("memory_gate.zig");
+const settings = @import("../settings/machine.zig");
 
 const Allocator = std.mem.Allocator;
 const EntryType = entry_mod.EntryType;
@@ -239,6 +245,19 @@ pub const WorkflowRuns = struct {
         held_call_retried,
         /// A trigger's start refused for not following the place logged.
         trigger_out_of_order,
+        /// A child's start its shard answered over its memory share
+        /// (reached only under one).
+        child_held,
+        /// A client's, schedule's or trigger's start refused past its
+        /// shard's memory share (reached only under one).
+        start_held,
+        /// A child's run start held there: its parent answered over_budget.
+        child_start_held,
+        /// A child's start with no pending parent record, creating nothing.
+        child_unasked,
+        /// A definition's create refused past the share (the definitions
+        /// model's verdict, counted here so a swarm reports it).
+        create_held,
         /// A delete of a run not there: never one, or deleted already.
         delete_missing,
         /// A delete naming another incarnation than the run's.
@@ -250,6 +269,17 @@ pub const WorkflowRuns = struct {
         /// A start of a deleted run's id.
         deleted_id_reused,
     };
+
+    /// Classes reached only under a memory share.
+    pub fn underShareOnly(c: Class) bool {
+        return c == .child_held or c == .start_held or c == .child_start_held or c == .create_held;
+    }
+
+    /// Reached only without a share: held at one, most signals are refused,
+    /// so a run seldom holds as many as it may. The plain swarm requires it.
+    pub fn withoutShareOnly(c: Class) bool {
+        return c == .signal_full;
+    }
     const PerDefL = struct { active: u32, fired_ms: i64, place: ?PlaceL = null };
     /// A trigger's place: the stream (namespace, making, name) and how far in.
     const PlaceL = struct { ns: u32, made: u64, stream: usize, ts: u64, seq: u64 };
@@ -279,6 +309,8 @@ pub const WorkflowRuns = struct {
     const CallL = struct {
         kind: ae.CallKind,
         caller: usize,
+        /// The caller's incarnation when its step made the call.
+        caller_created_ns: u64,
         wf: usize,
         step: usize,
         can_wait: bool,
@@ -451,7 +483,7 @@ pub const WorkflowRuns = struct {
 
     /// What the ledger says `e` does, made so in the ledger: a refusal
     /// returns before it writes. Null for an entry the workload never makes.
-    fn predict(self: *WorkflowRuns, defs: *const defs_family.WorkflowDefs, e: *const entry_mod.Entry, kind: Kind) ?Want {
+    fn predict(self: *WorkflowRuns, defs: *const defs_family.WorkflowDefs, store: *store_mod.Store, e: *const entry_mod.Entry, kind: Kind) ?Want {
         var want: Want = .{};
         const l = &self.ledger;
         const stamp_ms: i64 = @intCast(e.header.timestamp_ns / std.time.ns_per_ms);
@@ -467,6 +499,16 @@ pub const WorkflowRuns = struct {
                     if (f.slot == slot and f.parent_run == pr) return want;
                     want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[slot], .run = RUNS[r], .answer = .conflict };
                     return want;
+                }
+                // Its parent record past the share the shard committed to:
+                // answered over_budget, recording nothing.
+                if (settings.boundShare(.{ .store = store })) |b| {
+                    const row = rm.Parent.encodedSize(.{ .parent_slot = p.parent_slot, .parent_run = p.parent_run, .parent_workflow = p.parent_workflow, .workflow = p.workflow, .version = p.version, .input = p.input, .state = .pending }) catch return null;
+                    if (pool.useOf(store) +| (4 + p.run.len + row + pool.RESIDENT_RECORD) > b.share_bytes) {
+                        want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[slot], .run = RUNS[r], .answer = .over_budget };
+                        want.classes.insert(.child_held);
+                        return want;
+                    }
                 }
                 l.parents[r] = .{ .slot = slot, .parent_run = pr, .started = false };
             },
@@ -486,7 +528,10 @@ pub const WorkflowRuns = struct {
                     .step => {
                         const st = rm.Step.decodeAll(cmd.value, &diag) catch return null;
                         var run = l.runs[r] orelse return refuse(.step, "the run isn't there");
-                        if (!std.mem.eql(u8, st.workflow, NAMES[run.wf])) return null;
+                        // Decided for an earlier incarnation of the id: this
+                        // simulator's leader proposes from a lagging view, as a
+                        // ready one never does.
+                        if (!std.mem.eql(u8, st.workflow, NAMES[run.wf])) return refuse(.step, "it names an earlier incarnation's workflow");
                         const ends: ?RunStatus = if (st.ends == 0) null else blk: {
                             const s = std.enums.fromInt(RunStatus, st.ends) orelse return null;
                             if (!s.isTerminal()) return null;
@@ -556,6 +601,7 @@ pub const WorkflowRuns = struct {
                                 const call: CallL = .{
                                     .kind = p.kind,
                                     .caller = r,
+                                    .caller_created_ns = run.created_ns,
                                     .wf = run.wf,
                                     .step = indexOf(&STEPS, p.step) orelse return null,
                                     .can_wait = p.can_wait,
@@ -634,6 +680,15 @@ pub const WorkflowRuns = struct {
                             const was = placeIn(if (l.per_def[w]) |per| per.place else null, at.?);
                             if (was[0] != t.after_ts or was[1] != t.after_seq) return refuseAs(.start, "a trigger's start doesn't follow the place logged", .trigger_out_of_order);
                         }
+                        // A child's start answers its parent's pending
+                        // record, and nothing else.
+                        if (ev == CHILD) {
+                            const f = l.parents[r];
+                            if (f == null or f.?.started) {
+                                want.classes.insert(.child_unasked);
+                                return want;
+                            }
+                        }
                         const disabled = if (defs.ledger[w]) |d| !d.enabled else false;
                         if (disabled) {
                             if (ev == CHILD) {
@@ -644,6 +699,20 @@ pub const WorkflowRuns = struct {
                                 return want;
                             }
                             if (ev != TRIGGER) return refuse(.start, "its workflow is disabled");
+                        }
+                        // Past the share the shard committed to, what it
+                        // writes but its sends: nothing of it lands, and a
+                        // child's parent is answered over_budget.
+                        if (settings.boundShare(.{ .store = store })) |b| {
+                            const add = memory_gate.wouldAddData(&rm.machine, store, e) orelse return null;
+                            if (!gate.fits(pool.useOf(store), add, b.share_bytes)) {
+                                if (ev != CHILD) return refuseAs(.start, "past its shard's share", .start_held);
+                                const f = l.parents[r].?;
+                                want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[f.slot], .run = RUNS[r], .answer = .over_budget };
+                                want.classes.insert(.child_start_held);
+                                l.parents[r] = null;
+                                return want;
+                            }
                         }
                         if (l.deleted[r]) want.classes.insert(.deleted_id_reused);
                         l.deleted[r] = false;
@@ -664,6 +733,7 @@ pub const WorkflowRuns = struct {
                     .complete => {
                         const c = rm.Complete.parse(cmd.value) orelse return null;
                         var run = l.runs[r] orelse return refuse(.complete, "its run isn't there");
+                        if (!std.mem.eql(u8, c.workflow, NAMES[run.wf])) return refuse(.complete, "it names an earlier incarnation's workflow");
                         if (run.status.isTerminal()) {
                             if (run.status == c.status) return want;
                             return refuse(.complete, "its run ended otherwise");
@@ -854,7 +924,7 @@ pub const WorkflowRuns = struct {
         for (self.ledger.runs, &live_before, 0..) |x, *id, i| if (x) |run| if (!run.status.isTerminal()) {
             id.* = incarnation(run, i);
         };
-        const want = self.predict(defs, e, kind) orelse return error.Halt;
+        const want = self.predict(defs, store, e, kind) orelse return error.Halt;
         var before: [FAMILIES.len + 1]u64 = undefined;
         for (FAMILIES, before[0..FAMILIES.len]) |fam, *b| b.* = store.families[fam].commits;
         before[FAMILIES.len] = store.families[channels.OutFam.ID].commits;
@@ -1063,10 +1133,14 @@ pub const WorkflowRuns = struct {
             if (v.state != want.state or v.attempts != want.attempts or v.first_ns != want.first_ns or v.last_ns != want.last_ns or
                 v.status != want.status or !std.mem.eql(u8, v.outcome, want.outcome) or !std.mem.eql(u8, v.result, want.result))
                 return "a call's state is not the ledger's";
-            // A caller deleted, or deleted and started again since the call
-            // was made, is one the leader's sweep clears the call of.
-            const caller = rm.runOf(rv, view_mod.idKey(try a.alloc(u8, 4 + v.caller_run.len), NS, v.caller_run) catch unreachable) orelse continue;
-            if (caller.created_ns > v.first_ns) continue;
+            // A call whose caller the ledger deleted, or deleted and started
+            // again since the call was made, stays recorded: the leader's
+            // sweep clears a call only once its caller has ended or is gone,
+            // so one whose id started again keeps it until that run ends.
+            const ledger_caller = l.runs[want.caller] orelse continue;
+            if (ledger_caller.created_ns != want.caller_created_ns) continue;
+            const caller = rm.runOf(rv, view_mod.idKey(try a.alloc(u8, 4 + v.caller_run.len), NS, v.caller_run) catch unreachable) orelse
+                return "a call's caller run is gone";
             const s = std.enums.fromInt(RunStatus, caller.status) orelse return "a run's status is not a status";
             if (!s.isTerminal() and !(caller.wait == .call and std.mem.eql(u8, caller.wait_on, callee))) return "a call is recorded that its caller doesn't wait on";
         }
@@ -1314,7 +1388,7 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
     }
     // A delete: mostly of an ended run, as the leader holds it; now and
     // then of a live one, of another incarnation, or sent again.
-    if (roll < 75 and held.n > 0) {
+    if (roll < 72 and held.n > 0) {
         var ended: Pick = .{};
         for (held.ids[0..held.n]) |i| if (l.runs[i].?.status.isTerminal()) ended.add(i);
         const k = r.uintLessThan(u8, 100);

@@ -47,6 +47,8 @@ const persistence = @import("../storage/persistence.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const defs_machine = @import("defs_machine.zig");
 const calls_mod = @import("../actions/calls_machine.zig");
+const gate = @import("../budget/gate.zig");
+const start_verdict = @import("../budget/start_verdict.zig");
 const parser = @import("parser.zig");
 const jsonpath = @import("jsonpath.zig");
 const NamespaceId = @import("../namespace/table.zig").Id;
@@ -798,6 +800,19 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
         if (ts != t.after_ts or seq != t.after_seq) return out.refuse(.conflict, .unclassified, TRIGGER_OUT_OF_ORDER);
     };
 
+    // A child's start answers its parent's pending record, and nothing
+    // else: with none (answered already, or never asked) it creates no run
+    // and tells no one, so no run is left that its parent didn't ask for.
+    var pk: [KEY_PREFIX + ae.MAX_RUN_ID]u8 = undefined;
+    const parent_key: ?[]const u8 = if (n.run.len <= ae.MAX_RUN_ID) view_mod.idKey(&pk, n.ns, n.run) catch unreachable else null;
+    if (s.isChild()) if (comptime plant.active != .runs_child_without_parent_starts) {
+        const pending = if (parent_key) |k| if (try view.get(Parents, k)) |p| p.v.state == .pending else false else false;
+        if (!pending) {
+            out.putInt(u8, 0);
+            return;
+        }
+    };
+
     // A disable or a redefinition that commits ahead of a start decides
     // it, as the handler's checks would have. Not a trigger's: its leader
     // has moved the trigger's cursor past the record already, so a trigger
@@ -818,6 +833,8 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
         };
     }
 
+    // Everything the start writes is staged before its verdict.
+    const mark = view.mark();
     var run: Run.Value = .{
         .workflow = s.workflow,
         .version = s.version,
@@ -865,15 +882,28 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
     // A child's parent hears it started. Only the child's own start: one
     // of another kind holding its id leaves the record pending, and this
     // shard's leader refuses the child, a conflict.
-    var pk: [KEY_PREFIX + ae.MAX_RUN_ID]u8 = undefined;
-    if ((s.isChild() or comptime plant.active == .runs_any_start_answers_parent) and n.run.len <= ae.MAX_RUN_ID) {
-        const k = view_mod.idKey(&pk, n.ns, n.run) catch unreachable;
+    if (s.isChild() or comptime plant.active == .runs_any_start_answers_parent) if (parent_key) |k| {
         if (try view.get(Parents, k)) |found| if (found.v.state == .pending) {
             var p = found;
             p.v.state = .started;
             try view.put(Parents, k, p);
             try reply(view, n.ns, n.run, p.v.parent_slot, .started, null);
         };
+    };
+
+    // Held past its shard's share: nothing of it is written. A child's
+    // parent is told instead, its record gone, and asks again; dropping the
+    // entry would drop that answer too.
+    if (start_verdict.startVerdict(view, n.ns)) |v| {
+        if (!s.isChild()) return v.refuse(out, view);
+        try view.rollback(mark);
+        var wb: [128]u8 = undefined;
+        const k = parent_key orelse return v.refuse(out, view);
+        const p = (try view.get(Parents, k)) orelse return v.refuse(out, view);
+        try reply(view, n.ns, n.run, p.v.parent_slot, .over_budget, v.why(&wb, view));
+        try view.delete(Parents, k);
+        out.putInt(u8, 0);
+        return;
     }
 
     out.putInt(u8, 1);
@@ -1052,7 +1082,10 @@ fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64
     // Only a leader proposes one: one that doesn't decode is a Flo bug.
     const st = Step.decodeAll(cmd.value, &diag) catch return error.Halt;
     var run = ((try view.get(RunFam, cmd.key)) orelse return out.refuse(.not_found, .not_found, "run not found")).v;
-    if (!std.mem.eql(u8, run.workflow, st.workflow)) return error.Halt;
+    // Another workflow's: decided for an earlier incarnation of this id,
+    // deleted since. A ready leader decides only from what it applied, so
+    // its own come before the delete; the simulator's leader lags.
+    if (!std.mem.eql(u8, run.workflow, st.workflow)) return out.refuse(.not_found, .not_found, "run not found");
     const ends: ?RunStatus = if (st.ends == 0) null else blk: {
         const status = std.enums.fromInt(RunStatus, st.ends) orelse return error.Halt;
         if (!status.isTerminal()) return error.Halt;
@@ -1127,7 +1160,8 @@ fn applyComplete(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms:
     // A run deleted since its completion was proposed: refused, as a step
     // or a signal to it is.
     var run = ((try view.get(RunFam, cmd.key)) orelse return out.refuse(.not_found, .not_found, "run not found")).v;
-    if (!std.mem.eql(u8, run.workflow, c.workflow)) return error.Halt;
+    // Another workflow's: for an earlier incarnation, as a step's may be.
+    if (!std.mem.eql(u8, run.workflow, c.workflow)) return out.refuse(.not_found, .not_found, "run not found");
     // The first completion in the log ends the run; a cancel and a
     // completion in flight together leave it as the first left it. A second
     // with the same outcome (two cancels) succeeds, changing nothing.
@@ -1234,6 +1268,11 @@ fn applyParent(view: *View, e: *const Entry, n: Named) ApplyError!void {
                 if (f.v.parent_slot == p.parent_slot and std.mem.eql(u8, f.v.parent_run, p.parent_run)) return;
                 return reply(view, n.ns, n.run, p.parent_slot, .conflict, null);
             }
+            // Held to the share against the use before its inbound, as an
+            // action's call is: the parent's step waits and asks again.
+            // Every variable field is a slice of the start's payload, which
+            // the inbound reserve counts; one that isn't must grow it.
+            const mark = view.mark();
             try view.put(Parents, k, .{ .v = .{
                 .parent_slot = p.parent_slot,
                 .parent_run = p.parent_run,
@@ -1243,6 +1282,13 @@ fn applyParent(view: *View, e: *const Entry, n: Named) ApplyError!void {
                 .input = p.input,
                 .state = .pending,
             } });
+            if (gate.overSince(view, mark)) |o| {
+                try view.rollback(mark);
+                var wb: [128]u8 = undefined;
+                const shard: u16 = if (view.store.place) |pl| pl.group else 0;
+                const why = std.fmt.bufPrint(&wb, "shard {d} memory: {d} + {d} would pass its share {d}", .{ shard, o.use, o.delta, o.share }) catch "shard memory: past its share";
+                return reply(view, n.ns, n.run, p.parent_slot, .over_budget, why);
+            }
         },
         .child_refuse => {
             const p = ae.ChildRefuse.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -1576,8 +1622,10 @@ test "workflow runs machine: a step applies only at its run's rev, and never aft
     try testing.expectEqualStrings("conflict: the run moved on from that step", stale.refused().?.refusal.message);
     try testing.expectEqualStrings("a", f.get("r1").?.step);
     try testing.expect((try f.step("nope", .{ .rev = 0 })).refused() != null);
-    // One naming another workflow is a broken log.
-    try testing.expectError(error.Halt, f.step("r1", .{ .rev = 1, .workflow = "other" }));
+    // One naming another workflow is an earlier incarnation's: refused.
+    const other = try f.step("r1", .{ .rev = 1, .workflow = "other" });
+    try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, other.refused().?.status);
+    try testing.expectEqualStrings("a", f.get("r1").?.step);
 
     // A step that ends its run: counted no longer, and no step after it.
     try testing.expect((try f.step("r1", .{ .rev = 1, .ends = .completed })).refused() == null);
@@ -1638,9 +1686,12 @@ test "workflow runs machine: a run's history is sent in chunks, each event once 
     try testing.expectEqual(commits, f.store.families[RunFam.ID].commits);
     const other = try f.complete("r1", completeValue(&vb, .failed, "wf"), 70);
     try testing.expectEqualStrings("run already finished", other.refused().?.refusal.message);
-    // One naming another workflow is a broken log; one for a run not
-    // there (deleted since it was proposed) is refused, changing nothing.
-    try testing.expectError(error.Halt, f.complete("r2", completeValue(&vb, .cancelled, "other"), 80));
+    // One naming another workflow (an earlier incarnation's, the id
+    // deleted and started again since), or a run not there, is refused,
+    // changing nothing.
+    const mismatched = try f.complete("r2", completeValue(&vb, .cancelled, "other"), 80);
+    try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, mismatched.refused().?.status);
+    try testing.expectEqual(@as(u8, @backingInt(RunStatus.running)), f.get("r2").?.status);
     const gone = try f.complete("nope", completeValue(&vb, .cancelled, "wf"), 80);
     try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, gone.refused().?.status);
     try testing.expect(f.get("nope") == null);
@@ -1847,6 +1898,13 @@ test "workflow runs machine: what arrives late for a deleted run is refused or c
     const sig = try Signal.encodeInto(&sb, .{ .type = "go", .payload = "" });
     try testing.expectEqual(Status.not_found, (try f.command(.workflow_signal, view_mod.idKey(&kb, .default, "r1") catch unreachable, sig, 6)).refused().?.status);
     try testing.expect(f.get("r1") == null);
+    // Its id started again, under another workflow: the earlier
+    // incarnation's step and completion find another run, and are refused.
+    try testing.expect((try f.start("r1", "wf2", "workflow_started", "", 8)).refused() == null);
+    try testing.expectEqual(Status.not_found, (try f.step("r1", .{ .rev = 0 })).refused().?.status);
+    try testing.expectEqual(Status.not_found, (try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 9)).refused().?.status);
+    try testing.expectEqualStrings("wf2", f.get("r1").?.workflow);
+    try testing.expectEqual(@as(u8, @backingInt(RunStatus.running)), f.get("r1").?.status);
 
     // A child, ended and deleted: its start's late refusal finds no parent
     // record, and changes nothing.
@@ -2042,11 +2100,13 @@ test "workflow runs machine: keys without a leading '_' are a client's or a chil
         .{ "c", "workflow_started", "order-17" },
         .{ "d", "workflow_started", "trigger:16:5:ev@10:2" },
         .{ "e", "workflow_started", "schedule:16:wf:4000" },
-        .{ "k", "child_started", "kid-key" },
     }) |c| {
         try testing.expect((try f.start(c[0], "wf", c[1], c[2], 2)).refused() == null);
         try testing.expect(f.get(c[0]) != null);
     }
+    // A child's, admitted: it creates nothing, with no parent waiting.
+    try testing.expect((try f.start("k", "wf", "child_started", "kid-key", 2)).refused() == null);
+    try testing.expect(f.get("k") == null);
     // Neither moves a schedule's slot or a trigger's place.
     try testing.expectEqual(@as(i64, 0), f.active("wf").?.fired_ms);
     try testing.expectEqual(@as(u64, 0), f.active("wf").?.trig_made);
@@ -2333,4 +2393,158 @@ test "workflow runs machine: a trigger's start applies only right after the one 
     const again = try triggerStartAt(&f, "g", key, .{ .ns = 16, .made = 9, .stream = "ev", .ts = 2, .seq = 0, .after_ts = 77, .after_seq = 7 });
     try testing.expect(again.refused() == null);
     try testing.expectEqual(@as(?Run.Value, null), f.get("g"));
+}
+
+test "workflow runs machine: a child's start past its shard's share is answered over_budget, recording nothing; once memory frees it is recorded" {
+    const pool = @import("../budget/pool.zig");
+    const settings = @import("../settings/machine.zig");
+    var f = Fixture.init();
+    defer f.deinit();
+    var cb: [ae.ChildStart.max_size]u8 = undefined;
+    const cs = try ae.ChildStart.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .parent_slot = 7, .parent_run = "par", .parent_workflow = "pwf", .workflow = "kid", .version = "", .run = "kid1", .input = "{}" });
+    try settings.bindForTest(&f.store, pool.useOf(&f.store));
+    f.index += 1;
+    var e = entry_mod.buildEntry(.child_start, entry_mod.Flags.NONE, 1, f.index, 0, cs);
+    try testing.expect((try Fixture.run(&machine, &f, &e)).refused() == null);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "kid1") == null);
+    var it = (ReadView{ .store = &f.store }).range(channels.OutFam, "");
+    var told: ?ae.Reply.Value = null;
+    while (try it.next()) |item| {
+        if (item.value.v.entry_type != @backingInt(EntryType.call_reply)) continue;
+        var diag: schema.Diagnostic = .{};
+        told = try ae.Reply.decodeAll(item.value.v.payload, &diag);
+    }
+    try testing.expectEqual(ae.Answer.over_budget, told.?.answer);
+    try testing.expectEqualStrings("kid1", told.?.run);
+    try testing.expect(std.mem.indexOf(u8, told.?.why.?, "would pass its share") != null);
+    // Asked again once memory frees: recorded, to be started.
+    try settings.bindForTest(&f.store, std.math.maxInt(u64));
+    f.index += 1;
+    e = entry_mod.buildEntry(.child_start, entry_mod.Flags.NONE, 1, f.index, 0, cs);
+    try testing.expect((try Fixture.run(&machine, &f, &e)).refused() == null);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "kid1") != null);
+}
+
+/// A parent's call for child `kid` of workflow "wf", recorded on this shard.
+fn askChild(f: *Fixture, kid: []const u8) !void {
+    var cb: [ae.ChildStart.max_size]u8 = undefined;
+    const cs = try ae.ChildStart.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .parent_slot = 7, .parent_run = "par", .parent_workflow = "pwf", .workflow = "wf", .version = "", .run = kid, .input = "{}" });
+    f.index += 1;
+    const e = entry_mod.buildEntry(.child_start, entry_mod.Flags.NONE, 1, f.index, 0, cs);
+    try testing.expect((try Fixture.run(&machine, f, &e)).refused() == null);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, kid) != null);
+}
+
+/// The last answer this shard sent a parent.
+fn lastReply(f: *Fixture) ?ae.Reply.Value {
+    var it = (ReadView{ .store = &f.store }).range(channels.OutFam, "");
+    var told: ?ae.Reply.Value = null;
+    while (it.next() catch null) |item| {
+        if (item.value.v.entry_type != @backingInt(EntryType.call_reply)) continue;
+        var diag: schema.Diagnostic = .{};
+        told = ae.Reply.decodeAll(item.value.v.payload, &diag) catch null;
+    }
+    return told;
+}
+
+test "workflow runs machine: past its shard's share a client's, a schedule's and a trigger's start are refused, writing nothing" {
+    const pool = @import("../budget/pool.zig");
+    const settings = @import("../settings/machine.zig");
+    var f = Fixture.init();
+    defer f.deinit();
+    try f.create("wf");
+    try testing.expect((try f.start("first", "wf", "workflow_started", "k0", 1)).refused() == null);
+    const per = f.active("wf").?;
+    try settings.bindForTest(&f.store, pool.useOf(&f.store));
+    const use = pool.useOf(&f.store);
+    for ([_][2][]const u8{ .{ "workflow_started", "k1" }, .{ "schedule_started", "_schedule:16:wf:4000" } }) |c| {
+        const r = try f.start("x", "wf", c[0], c[1], 2);
+        try testing.expectEqual(@import("../protocol/reason.zig").Reason.memory_budget, r.refused().?.refusal.reason);
+        try testing.expect(f.get("x") == null);
+    }
+    const r = try triggerStart(&f, "t", "_trigger:16:5:ev@10:2", .{ .ns = 16, .made = 5, .stream = "ev", .ts = 10, .seq = 2 });
+    try testing.expectEqual(@import("../protocol/reason.zig").Reason.memory_budget, r.refused().?.refusal.reason);
+    try testing.expect(f.get("t") == null);
+    // Nothing moved: no slot fired, no place, no key, no count.
+    try testing.expectEqual(per.fired_ms, f.active("wf").?.fired_ms);
+    try testing.expectEqual(per.active, f.active("wf").?.active);
+    try testing.expectEqual(@as(u64, 0), f.active("wf").?.trig_made);
+    try testing.expectEqual(use, pool.useOf(&f.store));
+    // A start already made, asked again, creates nothing: answered, not held.
+    const again = try f.start("y", "wf", "workflow_started", "k0", 3);
+    try testing.expect(again.refused() == null);
+    try testing.expect(f.get("y") == null);
+    // Once memory frees, the schedule's slot starts.
+    try settings.bindForTest(&f.store, std.math.maxInt(u64));
+    try testing.expect((try f.start("x", "wf", "schedule_started", "_schedule:16:wf:4000", 4)).refused() == null);
+    try testing.expectEqual(@as(i64, 4000), f.active("wf").?.fired_ms);
+}
+
+test "workflow runs machine: a child started past its shard's share tells its parent over_budget and forgets the call; asked again once memory frees, it runs" {
+    const pool = @import("../budget/pool.zig");
+    const settings = @import("../settings/machine.zig");
+    var f = Fixture.init();
+    defer f.deinit();
+    try f.create("wf");
+    try askChild(&f, "kid");
+    try settings.bindForTest(&f.store, pool.useOf(&f.store));
+    const r = try f.start("kid", "wf", "child_started", "", 2);
+    // Not refused: the parent's answer leaves with it.
+    try testing.expect(r.refused() == null);
+    try testing.expect(f.get("kid") == null);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "kid") == null);
+    const told = lastReply(&f).?;
+    try testing.expectEqual(ae.Answer.over_budget, told.answer);
+    try testing.expectEqualStrings("kid", told.run);
+    try testing.expect(std.mem.indexOf(u8, told.why.?, "would pass its share") != null);
+    // A start of it proposed before that applied: nothing to answer.
+    const sent = f.store.families[channels.OutFam.ID].count;
+    try testing.expect((try f.start("kid", "wf", "child_started", "", 3)).refused() == null);
+    try testing.expect(f.get("kid") == null);
+    try testing.expectEqual(sent, f.store.families[channels.OutFam.ID].count);
+    // The parent asks again, memory freed.
+    try settings.bindForTest(&f.store, std.math.maxInt(u64));
+    try askChild(&f, "kid");
+    try testing.expect((try f.start("kid", "wf", "child_started", "", 4)).refused() == null);
+    try testing.expect(f.get("kid") != null);
+    try testing.expectEqual(ae.Answer.started, lastReply(&f).?.answer);
+}
+
+test "workflow runs machine: a child's start its parent's record no longer waits for creates nothing, over the share or not" {
+    var f = Fixture.init();
+    defer f.deinit();
+    try f.create("wf");
+    try askChild(&f, "kid");
+    try testing.expect((try f.start("kid", "wf", "child_started", "", 2)).refused() == null);
+    try testing.expect(f.get("kid") != null);
+    // Its record is started: another start of that id is a conflict (the
+    // run exists); one of a never-asked id creates nothing.
+    try testing.expect((try f.start("kid", "wf", "child_started", "", 3)).refused() != null);
+    const sent = f.store.families[channels.OutFam.ID].count;
+    try testing.expect((try f.start("stray", "wf", "child_started", "", 3)).refused() == null);
+    try testing.expect(f.get("stray") == null);
+    try testing.expectEqual(sent, f.store.families[channels.OutFam.ID].count);
+}
+
+test "workflow runs machine: what a start sends after its verdict, a run that starts ended with its largest first event, is within the reserve's term for it" {
+    const pool = @import("../budget/pool.zig");
+    const memory_budget = @import("../node/memory_budget.zig");
+    var f = Fixture.init();
+    defer f.deinit();
+    try f.create("wf");
+    // Its input as large as a first event the history takes at once.
+    const input = try testing.allocator.alloc(u8, 60 * 1024);
+    defer testing.allocator.free(input);
+    @memset(input, 'x');
+    var kb: [64]u8 = undefined;
+    const vb = try testing.allocator.alloc(u8, input.len + 512);
+    defer testing.allocator.free(vb);
+    const value = (Start{ .workflow = "wf", .version = "1", .status = .completed, .event = "workflow_started", .idem = null, .input = input }).encode(vb).?;
+    const before = pool.useOf(&f.store) - pool.dataUseOf(&f.store);
+    const r = try f.command(.workflow_start, view_mod.idKey(&kb, .default, "big") catch unreachable, value, 1);
+    try testing.expect(r.refused() == null);
+    const sent = pool.useOf(&f.store) - pool.dataUseOf(&f.store) - before;
+    // Two chunks went: the first event, then the run's last.
+    try testing.expect(sent > input.len);
+    try testing.expect(sent <= memory_budget.OWN_SENDS_BYTES);
 }

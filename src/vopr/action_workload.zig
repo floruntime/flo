@@ -56,7 +56,7 @@ pub const Made = struct { entry_type: EntryType, payload: []const u8 };
 const Kind = enum { register, delete, invoke, deliver, settle, release, extend, expire, run_delete };
 /// Out of 100. Reports need leases, so delivers come often; an action is
 /// deleted now and then, and registered again; an ended run now and then.
-const WEIGHTS = [_]u8{ 3, 1, 22, 27, 12, 12, 8, 12, 3 };
+const WEIGHTS = [_]u8{ 3, 1, 25, 27, 12, 12, 6, 12, 2 };
 /// Percent of entries spoiled, by kind: enough that each kind the machine
 /// can refuse is refused a fifth to a third of the time, counting those a
 /// lagging leader's state spoils on its own.

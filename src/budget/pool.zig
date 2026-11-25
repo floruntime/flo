@@ -77,24 +77,23 @@ pub const CHARGED = [_]u16{
     59,
     // history.act: an action run's history rows, charged where its runs are
     71,
-};
-
-/// The families the pool is not charged for: the node's own state, and
-/// workflow state, which is not charged yet.
-pub const EXEMPT = [_]u16{
     // step.calls; workflow parents, def, run
     25, 26,
     27, 28,
+    // workflow: idem, per_def, out, sig
+    64, 65,
+    66, 67,
+};
+
+/// The families the pool is not charged for: the node's own state, and a
+/// workflow run's history, which is bounded on disk instead.
+pub const EXEMPT = [_]u16{
     // settings: policy, node, budget, bind
     50, 51,
     52, 68,
     // channels: in (one record per sender group)
     57,
-    // workflow: idem, per_def, out, sig
-    64,
-    65, 66,
-    67,
-    // history.wf: a workflow run's history rows, exempt as workflow state is
+    // history.wf: a workflow run's history rows, bounded on disk instead
     70,
 };
 
@@ -107,7 +106,7 @@ fn listed(comptime set: []const u16, comptime id: u16) bool {
 pub const charged: store_mod.FamilySet = blk: {
     var set: store_mod.FamilySet = .empty;
     for (CHARGED) |id| set.set(id);
-    if (plant.active == .pool_counts_exempt_family) set.set(28);
+    if (plant.active == .pool_counts_exempt_family) set.set(70);
     break :blk set;
 };
 
@@ -226,7 +225,7 @@ test "pool: use is what the charged records hold, and exempt families add nothin
     try testing.expectEqual(want, recount(&store));
 
     // An exempt family's records aren't charged.
-    store.link(28, try store.allocRecord("run"), try testing.allocator.dupe(u8, "a workflow run"));
+    store.link(70, try store.allocRecord("row"), try testing.allocator.dupe(u8, "a workflow run's history"));
     try testing.expectEqual(want, useOf(&store));
 
     // A smaller value gives bytes back; a removed record gives all of it.

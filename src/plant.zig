@@ -76,6 +76,10 @@ pub const Plant = enum {
     /// A trigger's start applies wherever the place logged is, not only right
     /// after the start before it.
     runs_trigger_order_unchecked,
+    /// A child's start with no pending parent record creates its run.
+    runs_child_without_parent_starts,
+    /// A run's start is admitted past its shard's memory share.
+    start_verdict_admits,
     /// A signal that wakes its run leaves the run's rev where it was.
     runs_signal_wake_keeps_rev,
     /// A step's takes leave the signals it took held.
@@ -113,7 +117,7 @@ pub const Plant = enum {
     /// A KV reap drops every key it names, gone or not: it trusts the
     /// leader's clock over the entry's stamp.
     kv_reap_trusts_leader,
-    /// The memory pool counts a family it exempts (workflow runs).
+    /// The memory pool counts a family it exempts (workflow history).
     pool_counts_exempt_family,
     /// Records reach a store without its link, as a loader that skipped the
     /// store's counters would leave them.

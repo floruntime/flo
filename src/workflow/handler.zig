@@ -30,6 +30,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
+const gate = @import("../budget/gate.zig");
 const raft_node_mod = @import("../raft/node.zig");
 const proto = @import("../protocol/proto.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
@@ -203,6 +204,10 @@ pub const WorkflowHandler = struct {
     child_starting_term: u64 = 0,
     /// Where the next pass over parent records resumes.
     child_scan_after: std.ArrayListUnmanaged(u8) = .empty,
+    /// The schedules and triggers this shard last counted held.
+    memory_held: u64 = 0,
+    /// Holds said in the log, one per episode.
+    holds_said: u64 = 0,
 
     /// The shard's contract state, where the definitions machine keeps each
     /// workflow (`defs_machine.zig`), keyed `writeKey`: namespace id ‖ name.
@@ -463,6 +468,8 @@ pub const WorkflowHandler = struct {
         /// the log's last index then. The starts of the chain it broke are
         /// all at or below it, and their refusals change nothing more.
         resync_index: u64 = 0,
+        /// Kept with `proposed` and `resync_index`, as one.
+        hold: MemoryHold = .{},
         last_poll_ms: i64,
         /// A read of a stream another shard owns, in flight (0 for none):
         /// its number and the term it was asked in. At most one at a time.
@@ -519,6 +526,59 @@ pub const WorkflowHandler = struct {
         return self.appliedCursor(def_key, ns, t.stream_name_owned, t.stream_made_ns);
     }
 
+    /// A schedule's or trigger's starts held to its shard's memory share.
+    /// At the share it proposes none. After a start refused for memory it
+    /// waits before the next, each wait twice the last (`callRetryMs`): the
+    /// share is only checked before proposing, and a start just under it
+    /// is still refused at apply. A start of it admitted, or a new term,
+    /// begins again. Leader memory.
+    pub const MemoryHold = struct {
+        term: u64 = 0,
+        refusals: u32 = 0,
+        until_ms: i64 = std.math.minInt(i64),
+        /// The share it is held at, at it or waiting after a refusal there;
+        /// null while it isn't held.
+        share: ?u64 = null,
+        /// Said in the log until then: at most once a minute, however often
+        /// a shard hovering at its share holds it, and across a new term.
+        said_until_ms: i64 = std.math.minInt(i64),
+
+        const SAY_EVERY_MS: i64 = 60_000;
+
+        /// Begun again, in `term`: what was said stands.
+        fn reset(h: *MemoryHold, term: u64) void {
+            h.* = .{ .term = term, .said_until_ms = h.said_until_ms };
+        }
+
+        /// Whether it waits out a refusal now, in `term`.
+        fn waiting(h: *MemoryHold, term: u64, now_ms: i64) bool {
+            if (h.term != term) h.reset(term);
+            return now_ms < h.until_ms;
+        }
+
+        /// Held at `share`; true when it is to be said.
+        fn held(h: *MemoryHold, share: u64, now_ms: i64) bool {
+            h.share = share;
+            if (now_ms < h.said_until_ms) return false;
+            h.said_until_ms = now_ms +| SAY_EVERY_MS;
+            return true;
+        }
+
+        /// A start of it refused for memory in `term`: it waits.
+        fn refused(h: *MemoryHold, term: u64, now_ms: i64, share: u64) bool {
+            if (h.term != term) h.reset(term);
+            const first = h.held(share, now_ms);
+            h.refusals +|= 1;
+            h.until_ms = now_ms +| @as(i64, @intCast(callRetryMs(h.refusals)));
+            return first;
+        }
+
+        /// Not at the share now; a wait still stands until a run starts.
+        fn clear(h: *MemoryHold) void {
+            h.share = null;
+        }
+    };
+
     pub const ScheduleState = struct {
         workflow_name_owned: []const u8,
         ns: NamespaceId,
@@ -542,6 +602,7 @@ pub const WorkflowHandler = struct {
         /// not proposed again while that term lasts.
         proposed_ms: i64 = std.math.minInt(i64),
         proposed_term: u64 = 0,
+        hold: MemoryHold = .{},
     };
 
     const Timer = struct { at_ms: i64, ns_key: []const u8 };
@@ -2411,8 +2472,10 @@ pub const WorkflowHandler = struct {
                 return false;
             },
             .over_budget => {
-                // A step that can't wait fails at once, saying why.
-                if (!c.can_wait) return true;
+                // A step that can't wait fails at once, saying why. A child's
+                // step never waits for its workflow to be created, but does
+                // wait for memory to free on the child's shard.
+                if (!c.can_wait and c.kind == .action) return true;
                 // Said once, however long the hold: memory frees when it
                 // frees, and each ask again adds nothing to history.
                 if (!run.call_over_budget_noted) {
@@ -2519,7 +2582,8 @@ pub const WorkflowHandler = struct {
 
     /// A child's start, as its parent asked: the workflow and version this
     /// shard holds; or a refusal when it holds no such workflow, or not that
-    /// version, or a run already holds the child's id.
+    /// version, or a run already holds the child's id, or the shard is at
+    /// its memory share.
     fn startChild(self: *WorkflowHandler, shard: *Shard, ns: NamespaceId, run_id: []const u8, p: children_mod.Parent.Value) !persistence_mod.ProposeResult {
         const def_key = self.nsKey(ns, p.workflow) orelse return error.OutOfMemory;
         defer self.allocator.free(def_key);
@@ -2531,11 +2595,14 @@ pub const WorkflowHandler = struct {
         const run_key = self.nsKey(ns, run_id) orelse return error.OutOfMemory;
         defer self.allocator.free(run_key);
         const taken = self.appliedRun(run_key) != null;
-        if (!held or taken) {
+        // At its shard's memory share the start would be held at apply: the
+        // parent is told now, and asks again.
+        const answer: ?ae.Answer = if (taken) .conflict else if (!held) .no_action else if (gate.atShare(&shard.defaultPartition().store) != null) .over_budget else null;
+        if (answer) |a| {
             // A refusal is told to the parent: not past its outbox's room.
             if (shard.sendWait(shard.router.slotToShard(p.parent_slot), .main, ns) != null) return error.Overloaded;
             var buf: [ae.ChildRefuse.max_size]u8 = undefined;
-            const payload = try ae.ChildRefuse.encodeInto(&buf, .{ .ns = ns.int(), .run = run_id, .answer = if (taken) .conflict else .no_action });
+            const payload = try ae.ChildRefuse.encodeInto(&buf, .{ .ns = ns.int(), .run = run_id, .answer = a });
             return shard.raft_node.propose(.child_refuse, entry_mod.Flags.NONE, payload);
         }
         return self.proposeStart(shard, ns, run_id, p.workflow, if (p.version.len > 0) p.version else "latest", p.input, null, "child_started", null);
@@ -2813,7 +2880,7 @@ pub const WorkflowHandler = struct {
                 return .{ .later = @min(due_ms, ceilMs(waited_out_ns)) };
             },
             .over_budget => {
-                if (!c.can_wait) return .step;
+                if (!c.can_wait and c.kind == .action) return .step;
                 const p = progress_mod.Progress.decode(rec.progress) catch return .step;
                 if (!p.call_over_budget_noted) return .step;
                 if (p.call_retry_index > shard.raft_node.last_applied) return .none;
@@ -3552,6 +3619,7 @@ pub const WorkflowHandler = struct {
         // page asked before carries an older one, and isn't taken.
         var proposed: @FieldType(StreamTriggerState, "proposed") = null;
         var resync_index: u64 = 0;
+        var hold: MemoryHold = .{};
         var next_read_seq: u64 = 0;
         var made: ?u64 = null;
         const stream_ns = self.otherStreamNamespace(ns, trigger.namespace);
@@ -3563,6 +3631,7 @@ pub const WorkflowHandler = struct {
             if (std.mem.eql(u8, state.stream_name_owned, trigger.stream) and same_ns) {
                 proposed = state.proposed;
                 resync_index = state.resync_index;
+                hold = state.hold;
                 made = state.stream_made_ns;
             }
             self.freeTriggerState(&state);
@@ -3594,6 +3663,7 @@ pub const WorkflowHandler = struct {
             .poll_interval_ms = trigger.batch_timeout_ms,
             .proposed = proposed,
             .resync_index = resync_index,
+            .hold = hold,
             .next_read_seq = next_read_seq,
             .stream_made_ns = made,
             .last_poll_ms = 0,
@@ -3659,10 +3729,12 @@ pub const WorkflowHandler = struct {
         // A redefinition replaces the schedule; the slots it fired stay
         // fired.
         var fired_ms: i64 = std.math.minInt(i64);
+        var hold: MemoryHold = .{};
         if (self.schedules.fetchRemove(sched_key)) |old| {
             self.allocator.free(old.key);
             var state = old.value;
             fired_ms = state.fired_ms;
+            hold = state.hold;
             self.freeScheduleState(&state);
         }
 
@@ -3685,6 +3757,7 @@ pub const WorkflowHandler = struct {
             .input_owned = owned_input,
             .anchor_ms = anchor_ms,
             .fired_ms = fired_ms,
+            .hold = hold,
         }) catch {
             self.allocator.free(sched_key);
             self.allocator.free(owned_wf);
@@ -3728,6 +3801,8 @@ pub const WorkflowHandler = struct {
     pub fn tickSchedules(self: *WorkflowHandler, shard: *Shard) void {
         const now_ms: i64 = @import("stdx").time.milliTimestamp();
         const term = shard.raft_node.current_term;
+        defer self.countDutiesHeld(shard);
+        const at_share = gate.atShare(&shard.defaultPartition().store);
 
         var it = self.schedules.iterator();
         while (it.next()) |entry| {
@@ -3737,7 +3812,19 @@ pub const WorkflowHandler = struct {
             if (schedule.proposed_term == term and slot <= schedule.proposed_ms) continue;
 
             // Skip disabled workflows
-            if (self.isDisabled(entry.key_ptr.*)) continue;
+            if (self.isDisabled(entry.key_ptr.*)) {
+                schedule.hold.clear();
+                continue;
+            }
+
+            // Held at the share: the slot fires, once and late, when memory
+            // frees, as one missed while no leader was ready.
+            if (schedule.hold.waiting(term, now_ms)) continue;
+            if (at_share) |o| {
+                if (schedule.hold.held(o.share, now_ms)) self.noteStartsHeld("schedule", schedule.ns, schedule.workflow_name_owned, shard.id, o.share);
+                continue;
+            }
+            schedule.hold.clear();
 
             // Check max_concurrent
             if (schedule.max_concurrent > 0) {
@@ -3750,6 +3837,35 @@ pub const WorkflowHandler = struct {
                 schedule.proposed_term = term;
             }
         }
+    }
+
+    fn noteStartsHeld(self: *WorkflowHandler, what: []const u8, ns: NamespaceId, workflow: []const u8, shard_id: u16, share: u64) void {
+        self.holds_said += 1;
+        log.warn("workflow {s} (namespace {d}): its {s} holds its starts while shard {d} is at its memory share ({d} bytes); they go on once memory frees", .{ workflow, ns.int(), what, shard_id, share });
+    }
+
+    /// This node no longer runs the duties (it stepped down, or its shard
+    /// halted): none is held at the share here, and the gauge drops this
+    /// shard's count. The next term that leads begins its holds again.
+    pub fn dropHolds(self: *WorkflowHandler, shard: *Shard) void {
+        var sit = self.schedules.valueIterator();
+        while (sit.next()) |s| s.hold.reset(0);
+        var tit = self.stream_triggers.valueIterator();
+        while (tit.next()) |t| t.hold.reset(0);
+        self.countDutiesHeld(shard);
+    }
+
+    /// The schedules and triggers held at the share, into the gauge: each
+    /// shard adds what moved since it last counted.
+    fn countDutiesHeld(self: *WorkflowHandler, shard: *Shard) void {
+        var n: u64 = 0;
+        var sit = self.schedules.valueIterator();
+        while (sit.next()) |s| n += @intFromBool(s.hold.share != null);
+        var tit = self.stream_triggers.valueIterator();
+        while (tit.next()) |t| n += @intFromBool(t.hold.share != null);
+        defer self.memory_held = n;
+        const m = shard.metrics_registry orelse return;
+        if (n > self.memory_held) _ = m.workflow.duties_memory_held.fetchAdd(n - self.memory_held, .monotonic) else _ = m.workflow.duties_memory_held.fetchSub(self.memory_held - n, .monotonic);
     }
 
     /// Start a workflow run for a schedule's slot. Its idempotency key
@@ -3787,6 +3903,7 @@ pub const WorkflowHandler = struct {
         // notification (e.g. appended before the trigger registered).
         const forced = self.triggers_dirty;
         self.triggers_dirty = false;
+        const at_share = gate.atShare(&shard.defaultPartition().store);
 
         var it = self.stream_triggers.iterator();
         while (it.next()) |entry| {
@@ -3799,7 +3916,18 @@ pub const WorkflowHandler = struct {
             }
 
             // Skip disabled workflows
-            if (self.isDisabled(entry.key_ptr.*)) continue;
+            if (self.isDisabled(entry.key_ptr.*)) {
+                trigger.hold.clear();
+                continue;
+            }
+
+            // Held at the share: its place stays where it is.
+            if (trigger.hold.waiting(shard.raft_node.current_term, now_ms)) continue;
+            if (at_share) |o| {
+                if (trigger.hold.held(o.share, now_ms)) self.noteStartsHeld("trigger", trigger.ns, trigger.workflow_name_owned, shard.id, o.share);
+                continue;
+            }
+            trigger.hold.clear();
 
             // As many events as this shard can start runs for now; with room
             // for none the trigger waits, its cursor where it is.
@@ -4384,7 +4512,7 @@ pub const WorkflowHandler = struct {
 
     pub fn entryApplied(self: *WorkflowHandler, e: *const entry_mod.Entry, out: *const Result, lead: ?Lead) void {
         const t = std.enums.fromInt(entry_mod.EntryType, e.header.entry_type) orelse return;
-        if (t == .workflow_start and out.refused() != null) if (lead) |l| self.triggerRefused(e, l);
+        if (t == .workflow_start) if (lead) |l| self.startDecided(e, out, l);
         // A call's message a repair skipped is refused, and its call settled
         // refused as it is: its run is looked at all the same.
         switch (t) {
@@ -4409,21 +4537,59 @@ pub const WorkflowHandler = struct {
         }
     }
 
-    /// A trigger's start this leader proposed was refused: the starts it
-    /// proposed after it are refused too, so its next read begins at the
-    /// place logged, a new chain. Refusals of the chain it broke, at or
-    /// below the log's last index now, are passed over.
-    fn triggerRefused(self: *WorkflowHandler, e: *const entry_mod.Entry, lead: Lead) void {
+    /// A schedule's or trigger's start of this leader's term applied, or
+    /// was refused.
+    fn startDecided(self: *WorkflowHandler, e: *const entry_mod.Entry, out: *const Result, lead: Lead) void {
         if (e.header.term != lead.term) return;
         const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return;
         const s = runs_machine.Start.parse(cmd.value) orelse return;
-        if (s.trigger == null or cmd.key.len < KEY_PREFIX) return;
+        // A client's or a child's start: its leader keeps nothing of it.
+        if (s.trigger == null and !std.mem.eql(u8, s.event, "schedule_started")) return;
+        if (cmd.key.len < KEY_PREFIX) return;
         const key = self.nsKey(keyNamespace(cmd.key), s.workflow) orelse return;
         defer self.allocator.free(key);
-        const trigger = self.stream_triggers.getPtr(key) orelse return;
+        const memory = if (out.refused()) |r| r.refusal.reason == .memory_budget else false;
+        // A run made, not an answer from an earlier one.
+        var r = out.reader();
+        const made = out.refused() == null and (r.int(u8) orelse 0) == 1;
+        const now_ms = @import("stdx").time.milliTimestamp();
+        if (s.trigger != null) {
+            const trigger = self.stream_triggers.getPtr(key) orelse return;
+            if (out.refused() != null) return self.triggerRefused(trigger, e, lead, memory, now_ms);
+            if (made and e.header.index > trigger.resync_index) trigger.hold.reset(lead.term);
+        } else if (std.mem.eql(u8, s.event, "schedule_started")) {
+            const schedule = self.schedules.getPtr(key) orelse return;
+            if (made) schedule.hold.reset(lead.term);
+            if (!memory) return;
+            // Its slot may be proposed again, once its wait is out.
+            const idem = s.idem orelse return;
+            const colon = std.mem.lastIndexOfScalar(u8, idem, ':') orelse return;
+            const slot = std.fmt.parseInt(i64, idem[colon + 1 ..], 10) catch return;
+            if (schedule.proposed_term != lead.term or schedule.proposed_ms != slot) return;
+            schedule.proposed_ms = std.math.minInt(i64);
+            if (schedule.hold.refused(lead.term, now_ms, self.boundShare())) self.noteStartsHeld("schedule", schedule.ns, schedule.workflow_name_owned, self.shardOf(), self.boundShare());
+        }
+    }
+
+    /// A trigger's start this leader proposed was refused: the starts it
+    /// proposed after it are refused too, so its next read begins at the
+    /// place logged, a new chain. Refusals of the chain it broke, at or
+    /// below the log's last index now, are passed over: one refusal is one
+    /// re-read, and, for memory, one wait before it.
+    fn triggerRefused(self: *WorkflowHandler, trigger: *StreamTriggerState, e: *const entry_mod.Entry, lead: Lead, memory: bool, now_ms: i64) void {
         if (e.header.index <= trigger.resync_index) return;
         trigger.proposed = null;
         trigger.resync_index = lead.last_index;
+        if (memory) if (trigger.hold.refused(lead.term, now_ms, self.boundShare())) self.noteStartsHeld("trigger", trigger.ns, trigger.workflow_name_owned, self.shardOf(), self.boundShare());
+    }
+
+    fn shardOf(self: *const WorkflowHandler) u16 {
+        return if (self.defsRead().store.place) |pl| pl.group else 0;
+    }
+
+    /// The share bound on this shard, 0 for none.
+    fn boundShare(self: *const WorkflowHandler) u64 {
+        return if (@import("../settings/machine.zig").boundShare(self.defsRead())) |b| b.share_bytes else 0;
     }
 
     /// A call's record changed (answered, ended, asked again): the run
@@ -8845,6 +9011,52 @@ test "step executor: a call its action's shard holds over its memory share waits
     try testing.expectEqual(@as(usize, 1), held);
 }
 
+test "a child its shard holds over its memory share is waited for, though its step can't wait, and starts once memory frees" {
+    const settings = @import("../settings/machine.zig");
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    registerTestAction(&shard, "step-a");
+    createTestDef(&handler, testKey(.default, "par-wf"), "par-wf", test_parent_json);
+    createTestDef(&handler, testKey(.default, "kid-wf"), "kid-wf", test_kid_json);
+    createTestRun(&handler, testKey(.default, "par"), "par", "par-wf");
+    try settings.bindForTest(&shard.defaultPartition().store, 1);
+    handler.advanceWorkflow(&shard, testKey(.default, "par"));
+    settleTest(&shard);
+    startTestChildren(&handler, &shard);
+    const run = handler.takeRun(&shard, testKey(.default, "par")).?;
+    var kb: [ae.MAX_RUN_ID]u8 = undefined;
+    const kid_id = kb[0..run.pending_action_run_id_owned.?.len];
+    @memcpy(kid_id, run.pending_action_run_id_owned.?);
+    const c = WorkflowHandler.callOf(&shard, run, kid_id).?;
+    try testing.expectEqual(ae.CallKind.workflow, c.kind);
+    try testing.expect(!c.can_wait);
+    try testing.expectEqual(calls_mod.State.over_budget, c.state);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    try testing.expect(children_mod.parentOf(.{ .store = &shard.defaultPartition().store }, .default, kid_id) == null);
+    var held: usize = 0;
+    for (handler.inspect(testKey(.default, "par")).?.history.items) |evt| {
+        if (std.mem.eql(u8, evt.event_type_owned, "call_held_over_budget")) held += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), held);
+    // Memory frees: asked again, the child starts.
+    try settings.bindForTest(&shard.defaultPartition().store, 1 << 40);
+    handler.retryCall(&shard, run, kid_id, c, @import("stdx").time.milliTimestamp());
+    try testing.expectEqual(WorkflowHandler.Committed.logged, handler.commitRun(&shard, testKey(.default, "par")));
+    settleTest(&shard);
+    startTestChildren(&handler, &shard);
+    const again = handler.inspect(testKey(.default, "par")).?.*;
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, again.status);
+    try testing.expectEqual(calls_mod.State.started, WorkflowHandler.callOf(&shard, &again, kid_id).?.state);
+}
+
 test "step executor: a call that can't wait, held over its action's shard's memory share, fails at once saying why" {
     const settings = @import("../settings/machine.zig");
     const allocator = testing.allocator;
@@ -9245,4 +9457,271 @@ test "a step calling an action named longer than an action may be fails, saying 
             try testing.expect(run.pending_action_run_id_owned == null);
         }
     }
+}
+
+/// A start of `run` as this leader's entry `index` in `term`, applied: refused
+/// for memory, or admitted, `made` saying whether it created its run.
+fn decidedStart(handler: *WorkflowHandler, eb: []u8, comptime ns: NamespaceId, comptime run: []const u8, value: []const u8, term: u64, index: u64, verdict: enum { memory, made, idem }) void {
+    const e = entry_mod.buildCommandEntry(.workflow_start, entry_mod.Flags.NONE, term, index, 0, ns, testKey(ns, run), value, eb).?;
+    var out = Result.start(&e);
+    switch (verdict) {
+        .memory => out.refuse(.limit, .memory_budget, "shard 0 memory: past its share"),
+        .made => out.putInt(u8, 1),
+        .idem => out.putInt(u8, 0),
+    }
+    handler.entryApplied(&e, &out, .{ .term = term, .last_index = index + 9 });
+}
+
+test "workflow schedule: at its shard's memory share a slot isn't proposed; refused for memory it waits, then fires once, late" {
+    const settings = @import("../settings/machine.zig");
+    const pool = @import("../budget/pool.zig");
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    const store = &shard.defaultPartition().store;
+
+    const interval: i64 = 3_600_000;
+    const now = @import("stdx").time.milliTimestamp();
+    const anchor = now - 10 * interval;
+    try testing.expectEqual(.created, shard.namespace_handler.applyCreate("a"));
+    try handler.registerSchedule(TEST_NS_A, "wf", .{ .interval_ms = interval, .max_concurrent = 0 }, anchor);
+    const sched = handler.schedules.getPtr(testKey(TEST_NS_A, "wf")).?;
+    const latest = anchor + 10 * interval;
+    const term = shard.raft_node.current_term;
+
+    // At the share: nothing proposed, and the schedule counted held.
+    try settings.bindForTest(store, pool.useOf(store));
+    var before = shard.raft_node.log.lastIndex();
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before, shard.raft_node.log.lastIndex());
+    try testing.expect(sched.hold.share != null);
+    try testing.expectEqual(@as(u64, 1), handler.memory_held);
+
+    // Memory frees: the latest slot is proposed.
+    try settings.bindForTest(store, std.math.maxInt(u64));
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before + 1, shard.raft_node.log.lastIndex());
+    try testing.expectEqual(latest, sched.proposed_ms);
+    try testing.expectEqual(@as(u64, 0), handler.memory_held);
+
+    // Refused at apply for memory: the slot is free to propose again, after
+    // a wait. Another term's refusal, or another slot's, changes nothing.
+    var buf: [256]u8 = undefined;
+    var key_buf: [128]u8 = undefined;
+    var eb: [512]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "_schedule:16:wf:{d}", .{latest});
+    const value = startValue(&buf, "wf", "schedule_started", key);
+    decidedStart(&handler, &eb, TEST_NS_A, "r1", value, term + 1, 50, .memory);
+    try testing.expectEqual(latest, sched.proposed_ms);
+    var other: [256]u8 = undefined;
+    decidedStart(&handler, &eb, TEST_NS_A, "r1", startValue(&other, "wf", "schedule_started", "_schedule:16:wf:5"), term, 50, .memory);
+    try testing.expectEqual(latest, sched.proposed_ms);
+    decidedStart(&handler, &eb, TEST_NS_A, "r1", value, term, 50, .memory);
+    try testing.expectEqual(std.math.minInt(i64), sched.proposed_ms);
+    try testing.expectEqual(@as(u32, 1), sched.hold.refusals);
+    before = shard.raft_node.log.lastIndex();
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before, shard.raft_node.log.lastIndex());
+    // Its wait out: the same slot, once.
+    sched.hold.until_ms = 0;
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before + 1, shard.raft_node.log.lastIndex());
+    try testing.expectEqual(latest, sched.proposed_ms);
+    // Refused again, it waits twice as long.
+    decidedStart(&handler, &eb, TEST_NS_A, "r2", value, term, 60, .memory);
+    try testing.expectEqual(@as(u32, 2), sched.hold.refusals);
+    try testing.expect(sched.hold.until_ms >= now + @as(i64, @intCast(WorkflowHandler.callRetryMs(2))));
+    // A run it started ends the wait.
+    decidedStart(&handler, &eb, TEST_NS_A, "r3", value, term, 70, .made);
+    try testing.expectEqual(@as(u32, 0), sched.hold.refusals);
+}
+
+test "workflow handler: a trigger's start refused for memory waits before reading again, once for the chain it broke; a run it starts ends the wait" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    createTestDef(&handler, testKey(.default, "wf"), "wf", "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1\",\"trigger\":{\"stream\":\"events\"},\"start\":{\"wait_for_signal\":{\"type\":\"never\"},\"transitions\":{\"success\":\"flo.Completed\"}}}");
+    const t = handler.stream_triggers.getPtr(testKey(.default, "wf")).?;
+    const at: StreamID = .{ .timestamp_ms = 1800, .sequence = 0 };
+    var buf: [256]u8 = undefined;
+    var kb: [128]u8 = undefined;
+    var eb: [512]u8 = undefined;
+    const value = triggerStartValue(&buf, &kb, "wf", .default, 1, "events", 1700, 0, .{ 0, 0 });
+    t.proposed = .{ .at = at, .term = 3, .chain = at };
+    decidedStart(&handler, &eb, .default, "r1", value, 3, 31, .memory);
+    try testing.expect(t.proposed == null);
+    try testing.expectEqual(@as(u32, 1), t.hold.refusals);
+    try testing.expect(t.hold.share != null);
+    // The rest of its chain, refused: no more waiting.
+    decidedStart(&handler, &eb, .default, "r2", value, 3, 35, .memory);
+    try testing.expectEqual(@as(u32, 1), t.hold.refusals);
+    // A chain begun after it, refused: waits longer.
+    decidedStart(&handler, &eb, .default, "r3", value, 3, 41, .memory);
+    try testing.expectEqual(@as(u32, 2), t.hold.refusals);
+    // A start read again whose run was made already doesn't end it, nor
+    // one of the broken chain; a run made above it does.
+    decidedStart(&handler, &eb, .default, "r4", value, 3, 51, .idem);
+    try testing.expectEqual(@as(u32, 2), t.hold.refusals);
+    decidedStart(&handler, &eb, .default, "r5", value, 3, 49, .made);
+    try testing.expectEqual(@as(u32, 2), t.hold.refusals);
+    decidedStart(&handler, &eb, .default, "r6", value, 3, 51, .made);
+    try testing.expectEqual(@as(u32, 0), t.hold.refusals);
+    // Another term's start doesn't touch this one's.
+    t.proposed = .{ .at = at, .term = 3, .chain = at };
+    const e = entry_mod.buildCommandEntry(.workflow_start, entry_mod.Flags.NONE, 2, 60, 0, .default, testKey(.default, "r7"), value, &eb).?;
+    var out = Result.start(&e);
+    out.refuse(.limit, .memory_budget, "past its share");
+    handler.entryApplied(&e, &out, .{ .term = 3, .last_index = 70 });
+    try testing.expect(t.proposed != null);
+    try testing.expectEqual(@as(u32, 0), t.hold.refusals);
+}
+
+test "workflow handler: a trigger re-created on its stream keeps what its leader read, its resync and its wait; moved to another stream it begins again" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    const json = "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1\",\"trigger\":{\"stream\":\"events\"},\"start\":{\"wait_for_signal\":{\"type\":\"never\"},\"transitions\":{\"success\":\"flo.Completed\"}}}";
+    createTestDef(&handler, testKey(.default, "wf"), "wf", json);
+    var t = handler.stream_triggers.getPtr(testKey(.default, "wf")).?;
+    const at: StreamID = .{ .timestamp_ms = 1800, .sequence = 0 };
+    const chain: StreamID = .{ .timestamp_ms = 1700, .sequence = 4 };
+    t.proposed = .{ .at = at, .term = 3, .chain = chain };
+    t.resync_index = 40;
+    t.hold = .{ .term = 3, .refusals = 2, .until_ms = 99, .share = 7 };
+    createTestDef(&handler, testKey(.default, "wf"), "wf", json);
+    t = handler.stream_triggers.getPtr(testKey(.default, "wf")).?;
+    try testing.expectEqual(chain, t.proposed.?.chain);
+    try testing.expectEqual(at, t.proposed.?.at);
+    try testing.expectEqual(@as(u64, 40), t.resync_index);
+    try testing.expectEqual(@as(u32, 2), t.hold.refusals);
+    createTestDef(&handler, testKey(.default, "wf"), "wf", "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1\",\"trigger\":{\"stream\":\"other\"},\"start\":{\"wait_for_signal\":{\"type\":\"never\"},\"transitions\":{\"success\":\"flo.Completed\"}}}");
+    t = handler.stream_triggers.getPtr(testKey(.default, "wf")).?;
+    try testing.expect(t.proposed == null);
+    try testing.expectEqual(@as(u64, 0), t.resync_index);
+    try testing.expectEqual(@as(u32, 0), t.hold.refusals);
+}
+
+test "workflow handler: at its shard's memory share a trigger reads nothing, its place where it is, and is counted held" {
+    const settings = @import("../settings/machine.zig");
+    const pool = @import("../budget/pool.zig");
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    createTestDef(&handler, testKey(.default, "wf"), "wf", "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1\",\"trigger\":{\"stream\":\"events\"},\"start\":{\"wait_for_signal\":{\"type\":\"never\"},\"transitions\":{\"success\":\"flo.Completed\"}}}");
+    const t = handler.stream_triggers.getPtr(testKey(.default, "wf")).?;
+    const store = &shard.defaultPartition().store;
+    try settings.bindForTest(store, pool.useOf(store));
+    for (0..5) |_| {
+        handler.triggers_dirty = true;
+        handler.tickStreamTriggers(&shard);
+    }
+    try testing.expectEqual(@as(i64, 0), t.last_poll_ms);
+    try testing.expect(t.hold.share != null);
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(@as(u64, 1), handler.memory_held);
+    // Held five ticks: said once.
+    try testing.expectEqual(@as(u64, 1), handler.holds_said);
+    try settings.bindForTest(store, std.math.maxInt(u64));
+    handler.triggers_dirty = true;
+    handler.tickStreamTriggers(&shard);
+    try testing.expectEqual(@as(?u64, null), t.hold.share);
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(@as(u64, 0), handler.memory_held);
+    // At the share again before a run of it started: the same episode.
+    try settings.bindForTest(store, pool.useOf(store));
+    handler.triggers_dirty = true;
+    handler.tickStreamTriggers(&shard);
+    try testing.expectEqual(@as(u64, 1), handler.holds_said);
+    // A new term within the minute: not said again.
+    shard.raft_node.current_term += 1;
+    handler.triggers_dirty = true;
+    handler.tickStreamTriggers(&shard);
+    try testing.expectEqual(@as(u64, 1), handler.holds_said);
+    // Past it: said again.
+    t.hold.said_until_ms = 0;
+    handler.triggers_dirty = true;
+    handler.tickStreamTriggers(&shard);
+    try testing.expectEqual(@as(u64, 2), handler.holds_said);
+    // The node steps down: nothing of it is held here, the gauge drops.
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(@as(u64, 1), handler.memory_held);
+    handler.dropHolds(&shard);
+    try testing.expectEqual(@as(u64, 0), handler.memory_held);
+    try testing.expectEqual(@as(?u64, null), t.hold.share);
+}
+
+test "workflow schedule: re-created, a schedule keeps its hold, as a trigger does" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    try handler.registerSchedule(TEST_NS_A, "wf", .{ .interval_ms = 60_000, .max_concurrent = 0 }, 0);
+    handler.schedules.getPtr(testKey(TEST_NS_A, "wf")).?.hold = .{ .term = 3, .refusals = 2, .until_ms = 99, .share = 7, .said_until_ms = 5 };
+    try handler.registerSchedule(TEST_NS_A, "wf", .{ .interval_ms = 30_000, .max_concurrent = 0 }, 10);
+    const h = handler.schedules.getPtr(testKey(TEST_NS_A, "wf")).?.hold;
+    try testing.expectEqual(@as(u32, 2), h.refusals);
+    try testing.expectEqual(@as(i64, 5), h.said_until_ms);
+}
+
+test "a child its shard is at its memory share for is answered over_budget by its leader, not started, and its parent waits" {
+    const settings = @import("../settings/machine.zig");
+    const pool = @import("../budget/pool.zig");
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    registerTestAction(&shard, "step-a");
+    createTestDef(&handler, testKey(.default, "par-wf"), "par-wf", test_parent_json);
+    createTestDef(&handler, testKey(.default, "kid-wf"), "kid-wf", test_kid_json);
+    createTestRun(&handler, testKey(.default, "par"), "par", "par-wf");
+    handler.advanceWorkflow(&shard, testKey(.default, "par"));
+    settleTest(&shard);
+    const run = handler.inspect(testKey(.default, "par")).?;
+    var kb: [ae.MAX_RUN_ID]u8 = undefined;
+    const kid_id = kb[0..run.pending_action_run_id_owned.?.len];
+    @memcpy(kid_id, run.pending_action_run_id_owned.?);
+    const store = &shard.defaultPartition().store;
+    try testing.expect(children_mod.parentOf(.{ .store = store }, .default, kid_id) != null);
+    // At the share: the leader answers the call itself.
+    try settings.bindForTest(store, pool.useOf(store));
+    startTestChildren(&handler, &shard);
+    try testing.expect(children_mod.parentOf(.{ .store = store }, .default, kid_id) == null);
+    var rk: [KEY_PREFIX + ae.MAX_RUN_ID]u8 = undefined;
+    try testing.expect(handler.appliedRun(writeKey(&rk, .default, kid_id)) == null);
+    const c = WorkflowHandler.callOf(&shard, handler.inspect(testKey(.default, "par")).?, kid_id).?;
+    try testing.expectEqual(calls_mod.State.over_budget, c.state);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.inspect(testKey(.default, "par")).?.status);
 }

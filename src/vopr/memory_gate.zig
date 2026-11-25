@@ -8,7 +8,10 @@
 //!   share;
 //! - a taken refusable entry freed bytes or stayed within the share;
 //! - nothing never refused is refused for memory;
-//! - a group's deliver at its share takes no fresh record.
+//! - a group's deliver at its share takes no fresh record;
+//! - a run's start is refused or held for memory only past the share, and
+//!   one that made its run stayed within it, its sends apart (they are
+//!   written after its verdict, `memory_budget.OWN_SENDS_BYTES`).
 
 const std = @import("std");
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -52,11 +55,13 @@ const WATCH: machine_mod.GateWatch = .{ .before = noteBefore, .after = watch };
 
 /// The store's pool use and group items before the entry being applied.
 var use_before: u64 = 0;
+var data_before: u64 = 0;
 var items_before: u64 = 0;
 
 fn noteBefore(store: *Store) void {
     if (checking) return;
     use_before = pool.useOf(store);
+    data_before = pool.dataUseOf(store);
     items_before = store.family(group_machine.Items.ID).count;
 }
 
@@ -76,6 +81,7 @@ fn watch(m: *const machine_mod.Machine, store: *Store, e: *const Entry, out: *co
     if (memory) refused += 1;
     if (refusable) judged += 1;
     if (t == .group_deliver) return judgeDeliver(store, e, memory, before, share);
+    if (t == .workflow_start) return judgeStart(m, store, e, out, memory, before, share);
     if (memory and !refusable) return fail(e, "an entry never refused for memory was refused for it");
     if (!refusable) return;
     if (out.refused() != null and !memory) return;
@@ -92,13 +98,37 @@ fn judgeDeliver(store: *Store, e: *const Entry, memory: bool, before: u64, share
     if (store.family(group_machine.Items.ID).count > items_before) return fail(e, "a group's deliver at its shard's share took a fresh record");
 }
 
-/// What `e` would add to the pool of `store`, applied on a copy of it with
-/// no share bound: null when the copy can't be made.
-fn wouldAdd(m: *const machine_mod.Machine, store: *Store, e: *const Entry, before: u64) ?i64 {
-    checking = true;
-    defer checking = false;
-    var copy = Store.init(allocator);
-    defer copy.deinit();
+/// A start's own rule: refused for memory only when what it writes but its
+/// sends would pass the share; taken, having made its run, only within it.
+fn judgeStart(m: *const machine_mod.Machine, store: *Store, e: *const Entry, out: *const persistence.Result, memory: bool, before: u64, share: u64) void {
+    judged += 1;
+    if (memory) {
+        const add = wouldAddData(m, store, e) orelse return;
+        if (gate.fits(before, add, share)) return fail(e, "a run's start within its shard's share was refused for memory");
+        return;
+    }
+    if (out.refused() != null) return;
+    var r = out.reader();
+    if ((r.int(u8) orelse 0) != 1) return;
+    const add = @as(i64, @intCast(pool.dataUseOf(store))) - @as(i64, @intCast(data_before));
+    if (!gate.fits(before, add, share)) return fail(e, "a run's start past its shard's share made its run");
+}
+
+/// What `e` would add to the charged families but the channels' of `store`,
+/// applied on a copy of it with no share bound: what a run's start is judged
+/// by, its sends written after. Null when the copy can't be made.
+pub fn wouldAddData(m: *const machine_mod.Machine, store: *Store, e: *const Entry) ?i64 {
+    const before = pool.dataUseOf(store);
+    // Thrown away whole: one arena, freed at once (see `wouldAdd`).
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var copy = copyUnbound(arena.allocator(), store) orelse return null;
+    applyOnCopy(arena.allocator(), m, &copy, e) orelse return null;
+    return @as(i64, @intCast(pool.dataUseOf(&copy))) - @as(i64, @intCast(before));
+}
+
+fn copyUnbound(a: std.mem.Allocator, store: *Store) ?Store {
+    var copy = Store.init(a);
     copy.strict_keys = false;
     copy.place = store.place;
     for (0..store_mod.MAX_FAMILIES) |id| {
@@ -106,10 +136,44 @@ fn wouldAdd(m: *const machine_mod.Machine, store: *Store, e: *const Entry, befor
         var it = store.range(@intCast(id), "");
         while (it.next()) |rec| {
             const r = copy.allocRecord(rec.key()) catch return null;
-            copy.link(@intCast(id), r, allocator.dupe(u8, rec.value) catch return null);
+            copy.link(@intCast(id), r, a.dupe(u8, rec.value) catch return null);
         }
     }
-    var scratch = std.heap.ArenaAllocator.init(allocator);
+    return copy;
+}
+
+fn applyOnCopy(a: std.mem.Allocator, m: *const machine_mod.Machine, copy: *Store, e: *const Entry) ?void {
+    checking = true;
+    defer checking = false;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var out: persistence.Result = .{};
+    out.reset(e);
+    machine_mod.applyEntry(m, copy, &scratch, e, &out) catch return null;
+}
+
+/// What `e` would add to the pool of `store`, applied on a copy of it with
+/// no share bound: null when the copy can't be made.
+fn wouldAdd(m: *const machine_mod.Machine, store: *Store, e: *const Entry, before: u64) ?i64 {
+    checking = true;
+    defer checking = false;
+    // The copy is thrown away whole: one arena, freed at once, not a free
+    // per record (a swarm judges hundreds of thousands of writes).
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var copy = Store.init(a);
+    copy.strict_keys = false;
+    copy.place = store.place;
+    for (0..store_mod.MAX_FAMILIES) |id| {
+        if (id == settings.BindFam.ID) continue;
+        var it = store.range(@intCast(id), "");
+        while (it.next()) |rec| {
+            const r = copy.allocRecord(rec.key()) catch return null;
+            copy.link(@intCast(id), r, a.dupe(u8, rec.value) catch return null);
+        }
+    }
+    var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     var out: persistence.Result = .{};
     out.reset(e);

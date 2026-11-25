@@ -33,7 +33,9 @@ fn yamlOf(comptime version: []const u8) []const u8 {
     return "kind: Workflow\nname: w\nversion: " ++ version ++ "\nstart:\n  wait_for_signal:\n    type: never\n  transitions:\n    success: flo.Completed\n";
 }
 
-const YAMLS = [_][]const u8{ yamlOf(VERSIONS[0]), yamlOf(VERSIONS[1]), yamlOf(VERSIONS[2]) };
+// The last is longer: under a memory share, a replace by it grows, and
+// may be refused.
+const YAMLS = [_][]const u8{ yamlOf(VERSIONS[0]), yamlOf(VERSIONS[1]), yamlOf(VERSIONS[2]) ++ "# " ++ @as([256]u8, @splat('x')) ++ "\n" };
 
 pub const WorkflowDefs = struct {
     store: store_mod.Store,
@@ -50,6 +52,8 @@ pub const WorkflowDefs = struct {
     pub const Effect = struct {
         kind: Kind,
         refused: bool,
+        /// Refused for memory: past the share.
+        memory: bool = false,
         broke: ?[]const u8 = null,
     };
 
@@ -136,6 +140,14 @@ pub const WorkflowDefs = struct {
         out.reset(e);
         try machine_mod.applyEntry(&dm.machine, &self.store, &self.scratch, e, &out);
         var effect: Effect = .{ .kind = kind, .refused = out.refused() != null };
+        // Past its share a create is refused whatever it asks: the memory
+        // checker judges that verdict (`memory_gate.zig`).
+        if (out.refused()) |rf| if (rf.refusal.reason == .memory_budget) {
+            effect.memory = true;
+            if (before != self.store.families[dm.DefFam.ID].commits) return error.RefusalChangedState;
+            if (kind != .create) effect.broke = "a definition's enable was refused for memory";
+            return effect;
+        };
         if (effect.refused) {
             if (before != self.store.families[dm.DefFam.ID].commits) return error.RefusalChangedState;
             if (want != .refused) effect.broke = "the definitions machine refused an entry the ledger applies";
