@@ -473,8 +473,12 @@ test "e2e/list: every workflow's runs page through every shard, newest first, ea
 
     // The CLI follows the cursor until it has the runs asked for.
     try expectEachListedOnce(ctx, &.{ "workflow", "list-runs", "--search", "lr-run-", "--limit", "30", "-o", "json" }, "lr-run-", runs);
-    // And through pages of seven, each cursor moving on.
+    // And through pages of seven, each cursor moving on: at least five
+    // pages, told on stderr, where one read would do without paging.
     try expectEachListedOnce(ctx, &.{ "workflow", "list-runs", "--search", "lr-run-", "--limit", "30", "--page", "7", "-o", "json" }, "lr-run-", runs);
+    var paged = try ctx.cli.run(&.{ "workflow", "list-runs", "--search", "lr-run-", "--limit", "30", "--page", "7", "-o", "json", "--verbose" });
+    defer paged.deinit();
+    try testing.expect(paged.stderrCount("page: ") >= 5);
 }
 
 /// A run id of `RUN_ID_LEN` bytes: `lp-NNN-`, `needle-` for every 200th,

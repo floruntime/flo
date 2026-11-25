@@ -29,6 +29,7 @@ const wf_parser = @import("../../workflow/parser.zig");
 const wf_validator = @import("../../workflow/validator.zig");
 const gen = @import("../gen.zig");
 const workflow_ops = @import("../../protocol/workflow_ops.zig");
+const system_ops = @import("../../protocol/system_ops.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -511,7 +512,9 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
     }
 
     const limit = ctx.getUint("limit") orelse 100;
+    if (limit == 0) return outcome.usage(ctx, "--limit is at least 1", .{});
     const page_size = ctx.getUint("page") orelse 0;
+    if (page_size > system_ops.MAX_PAGE) return outcome.usage(ctx, "--page is at most {d}", .{system_ops.MAX_PAGE});
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -534,7 +537,8 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
         // No matching runs still answers with a count of 0.
         const page = result.asRawData() orelse return outcome.malformed(ctx, "list-runs response (empty)");
         const split = splitRunsPage(page) orelse return outcome.malformed(ctx, "list-runs response");
-        rows.appendSlice(ctx.allocator, split.rows) catch return outcome.malformed(ctx, "list-runs response (out of memory)");
+        if (output.isVerbose(ctx)) ctx.printErr("page: {d} runs, {s}\n", .{ split.count, if (split.cursor != null) "more" else "the last" });
+        rows.appendSlice(ctx.allocator, split.rows) catch return error.OutOfMemory;
         count += split.count;
         const next = split.cursor orelse break;
         if (next.len > cursor_buf.len or next.len <= 8) return outcome.malformed(ctx, "list-runs cursor");
@@ -546,7 +550,7 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
     }
     var data: std.ArrayListUnmanaged(u8) = .empty;
     defer data.deinit(ctx.allocator);
-    data.ensureTotalCapacity(ctx.allocator, 4 + rows.items.len + 3) catch return outcome.malformed(ctx, "list-runs response (out of memory)");
+    data.ensureTotalCapacity(ctx.allocator, 4 + rows.items.len + 3) catch return error.OutOfMemory;
     var count_le: [4]u8 = undefined;
     std.mem.writeInt(u32, &count_le, count, .little);
     data.appendSliceAssumeCapacity(&count_le);

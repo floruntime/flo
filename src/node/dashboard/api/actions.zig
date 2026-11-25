@@ -34,6 +34,16 @@ const RECENT_RUNS: u32 = 20;
 /// The most runs one page of `/runs` shows: each is asked its status, a
 /// read on the dashboard's one thread.
 const MAX_RUNS_PAGE: u64 = 100;
+/// The most runs `/runs` skips: each skipped run is read and walked past on
+/// the dashboard's one thread, a list page of them at a time.
+const MAX_RUNS_OFFSET: u64 = 10_000;
+
+/// How many runs to ask the next list page for: what is left to skip and to
+/// show, at least one, at most a page.
+fn runsAsk(offset: u64, skipped: u64, limit: u64, shown: u64) u32 {
+    const left = @min(offset - skipped, action_ops.MAX_LIST_RUNS) +| @min(limit - shown, action_ops.MAX_LIST_RUNS);
+    return @intCast(@max(1, @min(left, action_ops.MAX_LIST_RUNS)));
+}
 
 /// `action_list`'s entry: `[key_len:u16][key][value_len:u32][value]`, the
 /// value as `ListedAction` reads it.
@@ -293,6 +303,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
 pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const limit = @min(h.parseQueryParam(u64, query_string, "limit") orelse 100, MAX_RUNS_PAGE);
     const offset = h.parseQueryParam(u64, query_string, "offset") orelse 0;
+    if (offset > MAX_RUNS_OFFSET) return try h.jsonError(allocator, std.fmt.comptimePrint("action runs: offset is at most {d}", .{MAX_RUNS_OFFSET}));
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
     var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "action runs", err);
@@ -308,7 +319,7 @@ pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]co
     var skipped: u64 = 0;
     var shown: u64 = 0;
     while (shown < limit) {
-        const ask: u32 = @intCast(@max(1, @min((offset - skipped) + (limit - shown), action_ops.MAX_LIST_RUNS)));
+        const ask = runsAsk(offset, skipped, limit, shown);
         var listed = reader.call(ListRuns, ns, name, .{ .limit = ask, .after = after }) catch |err|
             return try loopback.readFailed(allocator, "action runs", err);
         defer listed.deinit();
@@ -401,6 +412,23 @@ test "action reads say they failed when the node can't be reached" {
     const runs = try getActionRuns(allocator, "my_action", "offset=5", &ctx);
     defer allocator.free(runs);
     try std.testing.expect(std.mem.startsWith(u8, runs, "{\"error\":\"action runs"));
+}
+
+test "action runs: an offset past the most it skips is refused before anything is read, and a page's ask stays within a page" {
+    const allocator = std.testing.allocator;
+    var metrics = h.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var ctx = unreachableContext(allocator, &metrics);
+    for ([_][]const u8{ "offset=18446744073709551615", "offset=10001&limit=100" }) |q| {
+        const runs = try getActionRuns(allocator, "my_action", q, &ctx);
+        defer allocator.free(runs);
+        try std.testing.expectEqualStrings("{\"error\":\"action runs: offset is at most 10000\"}", runs);
+    }
+    const most = std.math.maxInt(u64);
+    try std.testing.expectEqual(@as(u32, action_ops.MAX_LIST_RUNS), runsAsk(most, 0, most, 0));
+    try std.testing.expectEqual(@as(u32, action_ops.MAX_LIST_RUNS), runsAsk(MAX_RUNS_OFFSET, 0, MAX_RUNS_PAGE, 0));
+    try std.testing.expectEqual(@as(u32, 1), runsAsk(5, 5, 3, 3));
+    try std.testing.expectEqual(@as(u32, 7), runsAsk(5, 2, 4, 0));
 }
 
 test "action.list_runs' answer decodes run by run, and a cut one is refused" {

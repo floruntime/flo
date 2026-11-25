@@ -444,6 +444,7 @@ fn runRuns(ctx: *commander.Context) commander.Error!void {
     const most: u64 = ctx.getUint("limit") orelse 50;
     if (most == 0) return outcome.usage(ctx, "--limit is at least 1", .{});
     const page_size: u64 = ctx.getUint("page") orelse 0;
+    if (page_size > action_ops.MAX_LIST_RUNS) return outcome.usage(ctx, "--page is at most {d}", .{action_ops.MAX_LIST_RUNS});
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -456,7 +457,7 @@ fn runRuns(ctx: *commander.Context) commander.Error!void {
     var table = cli_output.Table.init(ctx.allocator);
     defer table.deinit();
     for ([_][]const u8{ "RUN ID", "ACTION", "STATUS", "CREATED", "STARTED", "COMPLETED" }) |h|
-        table.addColumn(h, .left) catch return outcome.malformed(ctx, "action.list_runs answer");
+        table.addColumn(h, .left) catch return error.OutOfMemory;
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(ctx.allocator);
     var after: ?action_ops.RunCursor.Value = null;
@@ -469,18 +470,19 @@ fn runRuns(ctx: *commander.Context) commander.Error!void {
         try outcome.check(ctx, result);
         var diag: schema.Diagnostic = .{};
         const page = action_ops.op("action.list_runs").response.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "action.list_runs answer");
+        if (cli_output.isVerbose(ctx)) ctx.printErr("page: {d} runs, {s}\n", .{ page.runs.count, if (page.cursor != null) "more" else "the last" });
         var it = page.runs.iterator();
         while (it.next() catch return outcome.malformed(ctx, "action.list_runs answer")) |r| : (shown += 1) {
             const status = @tagName(r.status);
             switch (format) {
                 .json => {
-                    if (shown > 0) out.append(ctx.allocator, ',') catch return outcome.malformed(ctx, "action.list_runs answer");
-                    out.print(ctx.allocator, "{{\"run_id\":{f},\"action\":{f},\"status\":\"{s}\",\"created_at_ms\":{d},\"started_at_ms\":", .{ cli_output.jsonString(r.run), cli_output.jsonString(name), status, r.created_at_ms }) catch return outcome.malformed(ctx, "action.list_runs answer");
-                    (if (r.started_at_ms) |t| out.print(ctx.allocator, "{d}", .{t}) else out.appendSlice(ctx.allocator, "null")) catch return outcome.malformed(ctx, "action.list_runs answer");
-                    out.appendSlice(ctx.allocator, ",\"completed_at_ms\":") catch return outcome.malformed(ctx, "action.list_runs answer");
-                    (if (r.completed_at_ms) |t| out.print(ctx.allocator, "{d}}}", .{t}) else out.appendSlice(ctx.allocator, "null}")) catch return outcome.malformed(ctx, "action.list_runs answer");
+                    if (shown > 0) out.append(ctx.allocator, ',') catch return error.OutOfMemory;
+                    out.print(ctx.allocator, "{{\"run_id\":{f},\"action\":{f},\"status\":\"{s}\",\"created_at_ms\":{d},\"started_at_ms\":", .{ cli_output.jsonString(r.run), cli_output.jsonString(name), status, r.created_at_ms }) catch return error.OutOfMemory;
+                    (if (r.started_at_ms) |t| out.print(ctx.allocator, "{d}", .{t}) else out.appendSlice(ctx.allocator, "null")) catch return error.OutOfMemory;
+                    out.appendSlice(ctx.allocator, ",\"completed_at_ms\":") catch return error.OutOfMemory;
+                    (if (r.completed_at_ms) |t| out.print(ctx.allocator, "{d}}}", .{t}) else out.appendSlice(ctx.allocator, "null}")) catch return error.OutOfMemory;
                 },
-                .raw => out.print(ctx.allocator, "{s}\n", .{r.run}) catch return outcome.malformed(ctx, "action.list_runs answer"),
+                .raw => out.print(ctx.allocator, "{s}\n", .{r.run}) catch return error.OutOfMemory,
                 .table => {
                     var cb: [24]u8 = undefined;
                     var sb: [24]u8 = undefined;
@@ -490,9 +492,9 @@ fn runRuns(ctx: *commander.Context) commander.Error!void {
                         name,
                         status,
                         cli_output.formatRelativeTimeBuf(r.created_at_ms, &cb),
-                        if (r.started_at_ms) |t| cli_output.formatRelativeTimeBuf(t, &sb) else "—",
-                        if (r.completed_at_ms) |t| cli_output.formatRelativeTimeBuf(t, &db) else "—",
-                    }) catch return outcome.malformed(ctx, "action.list_runs answer");
+                        if (r.started_at_ms) |t| cli_output.formatRelativeTimeBuf(t, &sb) else "-",
+                        if (r.completed_at_ms) |t| cli_output.formatRelativeTimeBuf(t, &db) else "-",
+                    }) catch return error.OutOfMemory;
                 },
             }
         }

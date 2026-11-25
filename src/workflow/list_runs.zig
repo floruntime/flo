@@ -148,7 +148,13 @@ fn walk(comptime F: type, handler: *WorkflowHandler, rv: view_mod.ReadView, ns: 
         };
         var eb: [system_ops.MAX_RUN_ENTRY]u8 = undefined;
         const entry = writeEntry(&eb, run);
-        if (shown == q.limit or used + entry.len > room or !(b.add(.{ .at = at, .entry = entry }) catch false)) {
+        const added = if (shown == q.limit or used + entry.len > room) false else b.add(.{ .at = at, .entry = entry }) catch |err| {
+            unlistable(handler, at, err);
+            read += 1;
+            stop = at;
+            continue;
+        };
+        if (!added) {
             // Its limit is at least one and its room one entry: it has
             // consumed a row, so a page with more says where it stopped.
             std.debug.assert(stop != null);
@@ -165,9 +171,26 @@ fn walk(comptime F: type, handler: *WorkflowHandler, rv: view_mod.ReadView, ns: 
 /// An index row whose run isn't there: a Flo bug, said once per shard,
 /// and skipped.
 fn missingRun(handler: *WorkflowHandler, at: RunAt.Value) void {
-    if (handler.missing_run_said) return;
-    handler.missing_run_said = true;
-    log.warn("workflow run list: run {s} is indexed but not there; skipped", .{at.run_id});
+    handler.missing_runs += 1;
+    if (handler.missing_runs_logged > 0) return;
+    handler.missing_runs_logged += 1;
+    // A Flo bug, so an error; a test that plants one expects it.
+    if (@import("builtin").is_test)
+        log.warn("workflow run list: run {s} is indexed but not there; skipped", .{at.run_id})
+    else
+        log.err("workflow run list: run {s} is indexed but not there; skipped", .{at.run_id});
+}
+
+/// A run whose entry breaks the page's schema (a Flo bug): logged, and
+/// skipped like a missing one, so one bad run never fails every page.
+fn unlistable(handler: *WorkflowHandler, at: RunAt.Value, err: anyerror) void {
+    handler.missing_runs += 1;
+    if (handler.missing_runs_logged > 0) return;
+    handler.missing_runs_logged += 1;
+    if (@import("builtin").is_test)
+        log.warn("workflow run list: run {s} can't be listed ({s}); skipped", .{ at.run_id, @errorName(err) })
+    else
+        log.err("workflow run list: run {s} can't be listed ({s}); skipped", .{ at.run_id, @errorName(err) });
 }
 
 fn atOf(r: WorkflowHandler.RunInfo) RunAt.Value {

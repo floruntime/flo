@@ -34445,8 +34445,12 @@ test "Shard: a run list's cursor no run can be at is refused bad_request, at the
     @memcpy(cursors[0][8..9], "r");
     std.mem.writeInt(i64, cursors[1][0..8], 1, .little);
     @memcpy(cursors[1][8..][0..597], &long);
-    const bad = [_][]const u8{ cursors[0][0..9], cursors[1][0 .. 8 + 597], cursors[1][0..5] };
-    for (bad, 0..) |c, i| {
+    var good: [9]u8 = undefined;
+    std.mem.writeInt(i64, good[0..8], 1, .little);
+    good[8] = 'r';
+    // The last is the control: a cursor a run can be at is answered.
+    const asked = [_][]const u8{ cursors[0][0..9], cursors[1][0 .. 8 + 597], cursors[1][0..5], &good };
+    for (asked, 0..) |c, i| {
         // [limit][status_len][cursor_len][cursor][search_len]
         var vb: [4 + 2 + 2 + 8 + 597 + 2]u8 = undefined;
         var w: std.Io.Writer = .fixed(&vb);
@@ -34457,16 +34461,22 @@ test "Shard: a run list's cursor no run can be at is refused bad_request, at the
         try w.writeInt(u16, 0, .little);
         shard.runRequest(conn, try ParkTest.request(.workflow_list_runs, 1 + i, "default", "wf", w.buffered(), ""), .client);
         try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-        try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
+        const want: proto.StatusCode = if (i == asked.len - 1) .ok else .bad_request;
+        try std.testing.expectEqual(@backingInt(want), one[0].header.status);
     }
-    // A shard's page, asked by another shard: the schema bounds the id,
-    // the handler the stamp.
+    // A shard's page, asked by another shard. Only a stamp before 1970 is
+    // sent here: `RunAt`'s schema bounds the id at 596 bytes, so a longer
+    // one can't be encoded, and one cut short is refused by the schema's
+    // decode like any table op's. The control is answered.
     const Page = table_run.op("system.runs_page").request;
     var pb: [Page.max_size]u8 = undefined;
-    const ask = try Page.encodeInto(&pb, .{ .status = "", .search = "", .after = .{ .created_at = -1, .run_id = "r" }, .limit = 10, .room = 1 << 16 });
-    shard.runRequest(conn, try ParkTest.request(.system_runs_page, 9, "default", "", ask, ""), .shard);
-    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
+    for ([_]i64{ -1, 1 }, 0..) |stamp, i| {
+        const ask = try Page.encodeInto(&pb, .{ .status = "", .search = "", .after = .{ .created_at = stamp, .run_id = "r" }, .limit = 10, .room = 1 << 16 });
+        shard.runRequest(conn, try ParkTest.request(.system_runs_page, 9 + i, "default", "", ask, ""), .shard);
+        try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+        const want: proto.StatusCode = if (stamp < 0) .bad_request else .ok;
+        try std.testing.expectEqual(@backingInt(want), one[0].header.status);
+    }
 }
 
 test "Shard: a workflow named longer than its runs' history may name is refused at create and at start, before anything is proposed" {

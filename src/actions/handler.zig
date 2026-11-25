@@ -202,6 +202,9 @@ pub const ActionsHandler = struct {
     status_buf: ?[]u8 = null,
     /// `action.list_runs`'s page, reused: its answer is encoded from it.
     list_buf: ?[]u8 = null,
+    /// Set once a run list met a run its page's schema can't hold (a Flo
+    /// bug): logged once, not every page.
+    unlistable_said: bool = false,
     /// action.info copies the action's owner here: the answer is encoded
     /// after the handler returns, so its own stack is gone.
     info_owner_buf: [action_ops.MAX_OWNER]u8 = undefined,
@@ -533,7 +536,21 @@ pub const ActionsHandler = struct {
             };
             if (shown == limit) return .{ .answer = .{ .runs = b.value(), .cursor = last } };
             // Sized for a page's most: past it, the page ends here.
-            if (!(b.add(listed) catch return error.OutOfMemory)) return .{ .answer = .{ .runs = b.value(), .cursor = last } };
+            const added = b.add(listed) catch |err| {
+                // A Flo bug: skipped like a missing run, so one bad run
+                // never fails every page.
+                if (!self.unlistable_said) {
+                    self.unlistable_said = true;
+                    if (@import("builtin").is_test)
+                        log.warn("action run list: run {s} can't be listed ({s}); skipped", .{ at.run, @errorName(err) })
+                    else
+                        log.err("action run list: run {s} can't be listed ({s}); skipped", .{ at.run, @errorName(err) });
+                }
+                read += 1;
+                last = at;
+                continue;
+            };
+            if (!added) return .{ .answer = .{ .runs = b.value(), .cursor = last } };
             shown += 1;
             read += 1;
             last = at;

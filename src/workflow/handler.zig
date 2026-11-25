@@ -187,9 +187,10 @@ pub const WorkflowHandler = struct {
     /// An index couldn't keep an entry: the runs are walked again
     /// (`leadCaches`).
     rewatch: bool = false,
-    /// Set once a run list met an index row with no run: a Flo bug, warned
-    /// once per shard, not every page.
-    missing_run_said: bool = false,
+    /// Index rows a run list met with no run (a Flo bug), and how many of
+    /// them were logged: the first, not every page's.
+    missing_runs: u64 = 0,
+    missing_runs_logged: u32 = 0,
     /// The cancel this leader proposed last for a run, by key, owned: its
     /// end is counted when that entry applies. Leader memory.
     ending: std.StringHashMapUnmanaged(Ending) = .empty,
@@ -8767,7 +8768,11 @@ test "list runs: an index row whose run is gone is skipped, said once" {
     var out: [4][]const u8 = undefined;
     const got = try walkAll(&handler, "", "", 10, 1 << 20, &ids_buf, &out);
     try expectRunIds(&.{ "r1", "r3" }, got.ids);
-    try testing.expect(handler.missing_run_said);
+    // Each list meets it again; only the first logs it.
+    const again = try walkAll(&handler, "", "", 10, 1 << 20, &ids_buf, &out);
+    try expectRunIds(&.{ "r1", "r3" }, again.ids);
+    try testing.expectEqual(@as(u64, 2), handler.missing_runs);
+    try testing.expectEqual(@as(u32, 1), handler.missing_runs_logged);
 }
 
 test "list runs: runs started in one ms with ids of other lengths on two shards, walked through their index keys and merged, are each listed once in order" {
