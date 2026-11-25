@@ -260,17 +260,16 @@ pub const table = [_]ops.Op{
             .{ .name = "timeout_ms", .T = Int(u64), .doc = "How long a worker holds a run before it times out" },
             .{ .name = "max_attempts", .T = Int(u32), .doc = "Attempts a run gets before it fails" },
             .{ .name = "created_at_ms", .T = Int(i64), .doc = "When it was first registered, in Unix milliseconds" },
+            // Its runs by status, kept as they move, so exact.
             .{ .name = "ready", .T = Int(u64), .doc = "Its runs waiting for a worker" },
-            .{ .name = "ready_capped", .T = schema.Bool, .doc = "Always false: ready is exact" },
-            // The counts are kept as runs move, so exact; the latency is
-            // sampled from the newest runs, a bounded read per ask.
-            .{ .name = "too_many_runs", .T = schema.Bool, .doc = "It has more than 10,000 runs, so the latency below is of its newest 10,000; the counts are exact" },
-            .{ .name = "running", .T = Optional(Int(u64)), .doc = "Its runs a worker holds" },
-            .{ .name = "completed", .T = Optional(Int(u64)), .doc = "Its runs that completed" },
-            .{ .name = "failed", .T = Optional(Int(u64)), .doc = "Its runs that failed for good" },
-            .{ .name = "timed_out", .T = Optional(Int(u64)), .doc = "Its runs whose last attempt timed out" },
+            .{ .name = "leased", .T = Int(u64), .doc = "Its runs a worker holds" },
+            .{ .name = "completed", .T = Int(u64), .doc = "Its runs that completed" },
+            .{ .name = "failed", .T = Int(u64), .doc = "Its runs that failed for good" },
+            .{ .name = "timed_out", .T = Int(u64), .doc = "Its runs whose last attempt timed out" },
             // How long its completed runs took, from a worker first taking
-            // one to its completion; none until one completes.
+            // one to its completion; none until one completes. Sampled from
+            // its newest runs, a bounded read per ask.
+            .{ .name = "latency_sampled", .T = schema.Bool, .doc = "The latencies are from the newest 10,000 runs, not all of them" },
             .{ .name = "latency_count", .T = Optional(Int(u64)), .doc = "Completed runs measured" },
             .{ .name = "latency_avg_ms", .T = Optional(Int(u64)), .doc = "Their mean duration" },
             .{ .name = "latency_p50_ms", .T = Optional(Int(u64)), .doc = "Their median duration" },
@@ -278,15 +277,13 @@ pub const table = [_]ops.Op{
             .{ .name = "latency_max_ms", .T = Optional(Int(u64)), .doc = "The longest" },
         }),
         .cli = .{ .expose = .command, .key = .{ .name = "action", .doc = "The action's name" }, .render = .record, .examples = &.{"flo action info send-email"} },
-        .doc = "An action's definition, its runs by status and how long completed runs took. Counts other than ready are none when the action's shard holds more than 10,000 of the namespace's runs.",
+        .doc = "An action's definition, its runs by status and how long its newest completed runs took.",
     },
 };
 
-/// The most runs `action.info` reads for its counts and latency, so one
-/// answer is bounded however many runs a namespace keeps.
+/// The most runs `action.info` reads for its latency sample, its newest,
+/// so one answer is bounded however many runs an action keeps.
 pub const RUNS_SCANNED: u32 = 10_000;
-/// The most ready runs `action.info` counts.
-pub const READY_COUNTED: u64 = 100_000;
 
 /// The longest owner an action registers with.
 pub const MAX_OWNER: u32 = 256;

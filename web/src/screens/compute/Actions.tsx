@@ -18,17 +18,9 @@ import './compute.css'
 
 type Tab = 'overview' | 'runs'
 
-const errCount = (r: ActionRunCounts): number | null =>
-  r.failed == null || r.timed_out == null ? null : r.failed + r.timed_out
-const invCount = (r: ActionRunCounts): number | null => {
-  const done = errCount(r)
-  return done == null || r.running == null || r.completed == null ? null : r.pending + r.running + r.completed + done
-}
-/** Past 10,000 of the namespace's runs on the action's shard only pending is counted; say why the rest show a dash. */
-const scanSub = (r: ActionRunCounts | undefined, fallback: string): string =>
-  r?.too_many_runs ? "too many of this namespace's runs on the action's shard to count" : fallback
-const pendingText = (r: ActionRunCounts | undefined): string =>
-  r ? (r.pending_capped ? '≥' : '') + afmtN(r.pending) : DASH
+const errCount = (r: ActionRunCounts): number => r.failed + r.timed_out
+const invCount = (r: ActionRunCounts): number => r.pending + r.leased + r.completed + errCount(r)
+const pendingText = (r: ActionRunCounts | undefined): string => (r ? afmtN(r.pending) : DASH)
 const durMs = (run: ActionRun): number | null =>
   run.completed_at != null && run.started_at != null ? run.completed_at - run.started_at : null
 const fmtDur = (ms: number): string => (ms < 1000 ? Math.round(ms) + 'ms' : (ms / 1000).toFixed(1) + 's')
@@ -221,13 +213,13 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
       </div>
 
       <Stats>
-        <Stat label="Invocations" value={orDash(inv, afmtN)} sub={scanSub(counts, 'all time')} />
+        <Stat label="Invocations" value={orDash(inv, afmtN)} sub="all time" />
         <Stat label="Completed" value={orDash(counts?.completed, afmtN)} sub={`${pendingText(counts)} pending`} />
         <Stat
           label="Errors"
           value={orDash(errs)}
           valueColor={errs ? 'var(--crit)' : undefined}
-          sub={counts?.too_many_runs ? scanSub(counts, '') : errRate}
+          sub={errRate}
         />
         <Stat label="Workers" value={a?.workers?.length ?? 0} sub="handling this action" />
       </Stats>
@@ -287,6 +279,7 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                     ['Workers', String(a?.workers?.length ?? 0)],
                     ['Latency p50 · p95', lat ? `${fmtDur(lat.p50_ms)} · ${fmtDur(lat.p95_ms)}` : DASH],
                     ['Latency avg · max', lat ? `${fmtDur(lat.avg_ms)} · ${fmtDur(lat.max_ms)}` : DASH],
+                    ...(lat?.sampled ? ([['Latency of', 'its newest 10,000 runs']] as [string, string][]) : []),
                   ] as [string, string][]
                 ).map(([k, v]) => (
                   <div className="kvrow2" key={k}>
@@ -300,11 +293,11 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                   <span>Run states</span>
                   <span style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                     {counts &&
-                      (['pending', 'running', 'completed', 'failed', 'timed_out'] as const)
+                      (['pending', 'leased', 'completed', 'failed', 'timed_out'] as const)
                         .filter((s) => (counts[s] ?? 0) > 0)
                         .map((s) => (
                           <span key={s} className="tag">
-                            {A_RUNST[s]?.[1] ?? s} {counts[s]}
+                            {A_RUNST[s === 'leased' ? 'running' : s]?.[1] ?? s} {counts[s]}
                           </span>
                         ))}
                     {!counts && a && (
@@ -319,11 +312,7 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                     )}
                   </span>
                 </div>
-                {counts?.too_many_runs && (
-                  <div className="mono" style={{ fontSize: 11, color: 'var(--tx-faint)', marginTop: 8 }}>
-                    This action&apos;s shard holds more than 10,000 of the namespace&apos;s runs, so only pending is counted.
-                  </div>
-                )}
+
               </div>
             </div>
           )}

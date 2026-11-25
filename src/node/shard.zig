@@ -22958,6 +22958,9 @@ test "actions: an action's runs list newest first by cursor, to the last page; a
     try std.testing.expect(!std.mem.eql(u8, ids[1][0..lens[1]], ids[2][0..lens[2]]));
     const bad = try t.call(.action_list_runs, "act", try Op.request.encodeInto(&rb, .{ .limit = 2, .after = .{ .created_at_ms = -1, .run = "r" } }));
     try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), bad.header.status);
+    // With no action named, refused: its runs are on its name's shard.
+    const keyless = try t.call(.action_list_runs, "", try Op.request.encodeInto(&rb, .{ .limit = 2, .after = null }));
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), keyless.header.status);
 }
 
 test "actions: a direct invoke is refused overloaded, not run, while its namespace's history waits on the lane, and goes once it drains" {

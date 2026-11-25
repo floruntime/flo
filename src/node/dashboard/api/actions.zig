@@ -249,18 +249,16 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
         var runs = try obj.objectField("runs");
         try runs.begin();
         try runs.intField("pending", @as(i64, @intCast(info.ready)));
-        // Pending is at least that many.
-        try runs.boolField("pending_capped", info.ready_capped);
-        // Null when the action's shard holds too many of the namespace's runs to count.
-        for ([_][]const u8{ "running", "completed", "failed", "timed_out" }, [_]?u64{ info.running, info.completed, info.failed, info.timed_out }) |field, v| {
-            if (v) |n| try runs.intField(field, @as(i64, @intCast(n))) else try runs.nullField(field);
+        for ([_][]const u8{ "leased", "completed", "failed", "timed_out" }, [_]u64{ info.leased, info.completed, info.failed, info.timed_out }) |field, n| {
+            try runs.intField(field, @as(i64, @intCast(n)));
         }
-        try runs.boolField("too_many_runs", info.too_many_runs);
         try runs.end();
     }
     if ((info.latency_count orelse 0) == 0) try obj.nullField("latency") else {
         var lat = try obj.objectField("latency");
         try lat.begin();
+        // From the newest 10,000 runs, not all of them.
+        try lat.boolField("sampled", info.latency_sampled);
         try lat.intField("count", @as(i64, @intCast(info.latency_count.?)));
         try lat.intField("avg_ms", @as(i64, @intCast(info.latency_avg_ms.?)));
         try lat.intField("p50_ms", @as(i64, @intCast(info.latency_p50_ms.?)));

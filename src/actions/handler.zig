@@ -490,6 +490,9 @@ pub const ActionsHandler = struct {
     /// `WALK_MAX` rows. With more, the cursor is the last run shown.
     fn runListRuns(shard: *Shard, _: *Connection, req: Request, limit: u32, after: ?RunCursor.Value) Error!table_run.Outcome(ListRunsResponse) {
         const self = shard.actions_handler;
+        // An action's runs are on its name's shard: a list with no name
+        // would see only the shard it landed on.
+        if (req.key.len == 0) return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .malformed, .ran = .no, .message = "bad request: action name is required" } } };
         if (after) |c| if (c.created_at_ms < 0 or c.run.len == 0)
             return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .out_of_range, .ran = .no, .message = "bad request: a cursor no run can be at" } } };
         if (req.key.len > ae.MAX_ACTION_NAME) return error.NotFound;
@@ -624,12 +627,11 @@ pub const ActionsHandler = struct {
             .max_attempts = def.max_attempts,
             .created_at_ms = nsToMs(def.created_ns),
             .ready = c.ready,
-            .ready_capped = false,
-            .too_many_runs = sample.more,
-            .running = c.leased,
+            .leased = c.leased,
             .completed = c.completed,
             .failed = c.failed,
             .timed_out = c.timed_out,
+            .latency_sampled = sample.more,
             .latency_count = sample.measured,
             .latency_avg_ms = if (lat) |l| l.avg_ms else null,
             .latency_p50_ms = if (lat) |l| l.p50_ms else null,
@@ -2016,14 +2018,4 @@ test "an action entry naming no namespace is refused before it is proposed" {
     const shard: *Shard = undefined;
     try std.testing.expectError(error.NamespaceUnknown, propose(shard, .action_register, ae.Register.Value{ .ns = 0, .name = "a", .owner = "", .lease_ms = 1000, .max_attempts = 1 }));
     try std.testing.expectError(error.NamespaceUnknown, propose(shard, .action_delete, ae.Delete.Value{ .ns = 0, .name = "a" }));
-}
-
-test "listing action runs with no action name is refused, not answered from one shard" {
-    // An action's runs are on its name's shard: a keyless list would see
-    // only the shard it landed on. Refused before the shard is read.
-    const shard: *Shard = undefined;
-    const req: Request = .{ .header = proto.RequestHeader.init(.action_list_runs, 1), .namespace = "", .key = "", .value = "" };
-    const r = ActionsHandler.handleListRuns(shard, req);
-    try std.testing.expectEqual(@as(@TypeOf(r.err.code), .invalid_request), r.err.code);
-    try std.testing.expectEqualStrings("action name is required", r.err.message);
 }
