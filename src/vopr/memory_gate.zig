@@ -88,7 +88,7 @@ fn watch(m: *const machine_mod.Machine, store: *Store, e: *const Entry, out: *co
     if (memory and !refusable) return fail(e, "an entry never refused for memory was refused for it");
     if (!refusable) return;
     if (out.refused() != null and !memory) return;
-    const delta: i64 = if (memory) wouldAdd(m, store, e, before) orelse return else @as(i64, @intCast(pool.useOf(store))) - @as(i64, @intCast(before));
+    const delta: i64 = if (memory) wouldAdd(m, store, e) orelse return else @as(i64, @intCast(pool.useOf(store))) - @as(i64, @intCast(before));
     if (memory and gate.fits(before, delta, share)) return fail(e, "a write within its shard's share was refused for memory");
     if (!memory and !gate.fits(before, delta, share)) return fail(e, "a write past its shard's share was taken");
 }
@@ -135,13 +135,41 @@ fn judgeSignal(m: *const machine_mod.Machine, store: *Store, e: *const Entry, ou
 /// applied on a copy of it with no share bound: what a run's start is judged
 /// by, its sends written after. Null when the copy can't be made.
 pub fn wouldAddData(m: *const machine_mod.Machine, store: *Store, e: *const Entry) ?i64 {
-    const before = pool.dataUseOf(store);
-    // Thrown away whole: one arena, freed at once (see `wouldAdd`).
+    return (deltas(m, store, e) orelse return null).data;
+}
+
+/// What `e` adds, applied on a copy of `store` with no share bound: to the
+/// whole pool, and to its families but the channels'.
+const Deltas = struct { use: i64, data: i64 };
+
+/// An entry as applied to a store: every replica applies one at the same
+/// place to the same store (the state checks hold them to it), and the
+/// runs model asks of a start before the checker does, so one copy serves
+/// them all. The uses before make a store that drifted ask again.
+const Key = struct { term: u64, index: u64, crc: u32, machine: usize, use: u64, data: u64 };
+var known: std.AutoHashMapUnmanaged(Key, Deltas) = .empty;
+/// Past this many, the map starts again: entries far behind aren't asked of.
+const KNOWN_MAX = 4096;
+/// Copies made, for a swarm's cost.
+pub var copies: u64 = 0;
+
+fn deltas(m: *const machine_mod.Machine, store: *Store, e: *const Entry) ?Deltas {
+    const key: Key = .{ .term = e.header.term, .index = e.header.index, .crc = e.header.crc32c, .machine = @intFromPtr(m), .use = pool.useOf(store), .data = pool.dataUseOf(store) };
+    if (known.get(key)) |d| return d;
+    // Thrown away whole: one arena, freed at once, not a free per record.
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     var copy = copyUnbound(arena.allocator(), store) orelse return null;
     applyOnCopy(arena.allocator(), m, &copy, e) orelse return null;
-    return @as(i64, @intCast(pool.dataUseOf(&copy))) - @as(i64, @intCast(before));
+    copies += 1;
+    const d: Deltas = .{
+        .use = @as(i64, @intCast(pool.useOf(&copy))) - @as(i64, @intCast(key.use)),
+        .data = @as(i64, @intCast(pool.dataUseOf(&copy))) - @as(i64, @intCast(key.data)),
+    };
+    if (known.count() >= KNOWN_MAX) known.clearRetainingCapacity();
+    // The process's own: it lives as long as the swarm's seed does.
+    known.put(std.heap.page_allocator, key, d) catch {};
+    return d;
 }
 
 fn copyUnbound(a: std.mem.Allocator, store: *Store) ?Store {
@@ -171,29 +199,6 @@ fn applyOnCopy(a: std.mem.Allocator, m: *const machine_mod.Machine, copy: *Store
 
 /// What `e` would add to the pool of `store`, applied on a copy of it with
 /// no share bound: null when the copy can't be made.
-fn wouldAdd(m: *const machine_mod.Machine, store: *Store, e: *const Entry, before: u64) ?i64 {
-    checking = true;
-    defer checking = false;
-    // The copy is thrown away whole: one arena, freed at once, not a free
-    // per record (a swarm judges hundreds of thousands of writes).
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var copy = Store.init(a);
-    copy.strict_keys = false;
-    copy.place = store.place;
-    for (0..store_mod.MAX_FAMILIES) |id| {
-        if (id == settings.BindFam.ID) continue;
-        var it = store.range(@intCast(id), "");
-        while (it.next()) |rec| {
-            const r = copy.allocRecord(rec.key()) catch return null;
-            copy.link(@intCast(id), r, a.dupe(u8, rec.value) catch return null);
-        }
-    }
-    var scratch = std.heap.ArenaAllocator.init(a);
-    defer scratch.deinit();
-    var out: persistence.Result = .{};
-    out.reset(e);
-    machine_mod.applyEntry(m, &copy, &scratch, e, &out) catch return null;
-    return @as(i64, @intCast(pool.useOf(&copy))) - @as(i64, @intCast(before));
+fn wouldAdd(m: *const machine_mod.Machine, store: *Store, e: *const Entry) ?i64 {
+    return (deltas(m, store, e) orelse return null).use;
 }
