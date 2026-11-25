@@ -1354,14 +1354,14 @@ pub const ProcessingHandler = struct {
         // Canonical tag hash for TS source selection — must match the write
         // path exactly (ts_mod.canonicalTagHash), or the series won't be found.
         const tag_hash: u64 = if (src.ts_tags.len >= 2) blk: {
-            var pairs_buf: [32]ts_mod.TagPair = undefined;
+            var pairs_buf: [ts_mod.MAX_TAGS]ts_mod.TagPair = undefined;
             var n: usize = 0;
             var i: usize = 0;
             while (i + 1 < src.ts_tags.len and n < pairs_buf.len) : (i += 2) {
                 pairs_buf[n] = .{ .key = src.ts_tags[i], .value = src.ts_tags[i + 1] };
                 n += 1;
             }
-            var tag_buf: [1024]u8 = undefined;
+            var tag_buf: [ts_mod.MAX_TAG_STRING]u8 = undefined;
             break :blk if (n > 0) ts_mod.canonicalTagHashPairs(pairs_buf[0..n], &tag_buf) else 0;
         } else 0;
 

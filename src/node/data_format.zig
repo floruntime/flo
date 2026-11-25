@@ -232,11 +232,14 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // A signal past its shard's share is refused, one that wakes its run
     // taken within a slack.
     .{ .format = 64, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
+    // A processing job's TS source with more tags than a TS read takes is
+    // refused where its submit applies, kept failed.
+    .{ .format = 65, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
     // Every run in its lists' index (workflow.run_at and .run_all, and
     // action.run_at) and an action's counts kept (action.counts); a step
     // and a cancel name their run's incarnation; a start's run id is held
     // to 596 bytes at apply.
-    .{ .format = 65, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
+    .{ .format = 66, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
 };
 
 comptime {
