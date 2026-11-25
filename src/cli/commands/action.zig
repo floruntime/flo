@@ -470,7 +470,7 @@ fn runRuns(ctx: *commander.Context) commander.Error!void {
         try outcome.check(ctx, result);
         var diag: schema.Diagnostic = .{};
         const page = action_ops.op("action.list_runs").response.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "action.list_runs answer");
-        if (cli_output.isVerbose(ctx)) ctx.printErr("page: {d} runs, {s}\n", .{ page.runs.count, if (page.cursor != null) "more" else "the last" });
+        if (cli_output.isVerbose(ctx)) ctx.printErr("[verbose] page: {d} runs, {s}\n", .{ page.runs.count, if (page.cursor != null) "more" else "the last" });
         var it = page.runs.iterator();
         while (it.next() catch return outcome.malformed(ctx, "action.list_runs answer")) |r| : (shown += 1) {
             const status = @tagName(r.status);

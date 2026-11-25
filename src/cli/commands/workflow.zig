@@ -537,7 +537,7 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
         // No matching runs still answers with a count of 0.
         const page = result.asRawData() orelse return outcome.malformed(ctx, "list-runs response (empty)");
         const split = splitRunsPage(page) orelse return outcome.malformed(ctx, "list-runs response");
-        if (output.isVerbose(ctx)) ctx.printErr("page: {d} runs, {s}\n", .{ split.count, if (split.cursor != null) "more" else "the last" });
+        if (output.isVerbose(ctx)) ctx.printErr("[verbose] page: {d} runs, {s}\n", .{ split.count, if (split.cursor != null) "more" else "the last" });
         rows.appendSlice(ctx.allocator, split.rows) catch return error.OutOfMemory;
         count += split.count;
         const next = split.cursor orelse break;
