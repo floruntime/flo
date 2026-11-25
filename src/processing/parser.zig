@@ -269,8 +269,11 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
             if (snk.kind == .kv) return d.fail(ParseError.InvalidFormat, "KV sink '{s}' can't take TS source '{s}': its records have no key to write under; use a stream, queue or TS sink", .{ snk.name, src.name });
             // A TS source's point goes on with its own value and tags, so
             // a TS sink's map of a record's fields would go unread.
-            if (snk.kind == .ts and (snk.ts_tag_keys.len > 0 or snk.ts_field_keys.len > 0))
-                return d.fail(ParseError.InvalidFormat, "TS sink '{s}' can't map tags or fields from TS source '{s}': a point keeps its own value and tags, written under `value_field`; split the job to map a stream source's records", .{ snk.name, src.name });
+            // The advice comes first so long names can't cut it off.
+            if (snk.kind == .ts and (snk.ts_tag_keys.len > 0 or snk.ts_field_keys.len > 0)) {
+                const maps: []const u8 = if (snk.ts_field_keys.len == 0) "tags" else if (snk.ts_tag_keys.len == 0) "fields" else "tags and fields";
+                return d.fail(ParseError.InvalidFormat, "split the job to map a stream source's records: TS sink '{s}' maps {s}, but TS source '{s}' gives points, which keep their own value and tags", .{ snk.name, maps, src.name });
+            }
         }
     }
 
@@ -2501,9 +2504,14 @@ test "parser: a TS sink's field can't read a record field named empty" {
     try std.testing.expect(mem.indexOf(u8, diag.message(), "a field's record field can't be empty") != null);
 }
 
-test "parser: a TS sink fed by a TS source can't map tags or fields, which its points would leave unread" {
+test "parser: a TS sink in a job with a TS source can't map tags or fields, which its points would leave unread" {
     const allocator = std.testing.allocator;
-    for ([_][]const u8{ "      tags: { host: h }\n", "      fields: { load: l }\n" }) |map| {
+    const Case = struct { map: []const u8, says: []const u8 };
+    for ([_]Case{
+        .{ .map = "      tags: { host: h }\n", .says = "maps tags," },
+        .{ .map = "      fields: { load: l }\n", .says = "maps fields," },
+        .{ .map = "      tags: { host: h }\n      fields: { load: l }\n", .says = "maps tags and fields," },
+    }) |c| {
         const text = try std.fmt.allocPrint(allocator,
             \\kind: Processing
             \\sources:
@@ -2514,11 +2522,60 @@ test "parser: a TS sink fed by a TS source can't map tags or fields, which its p
             \\    ts:
             \\      measurement: cpu_copy
             \\{s}
-        , .{map});
+        , .{c.map});
         defer allocator.free(text);
         var diag: Diagnostic = .{};
         try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, &diag));
-        try std.testing.expect(mem.indexOf(u8, diag.message(), "TS sink 'out' can't map tags or fields from TS source 'points'") != null);
+        try std.testing.expect(mem.startsWith(u8, diag.message(), "split the job to map a stream source's records: TS sink 'out' "));
+        try std.testing.expect(mem.indexOf(u8, diag.message(), c.says) != null);
+        try std.testing.expect(mem.indexOf(u8, diag.message(), "TS source 'points'") != null);
+    }
+    // A stream source beside the TS source, in either order: still refused.
+    const stream_src = "  - name: events\n    stream: { name: ev }\n";
+    const ts_src = "  - name: points\n    ts: { measurement: cpu }\n";
+    for ([_][2][]const u8{ .{ stream_src, ts_src }, .{ ts_src, stream_src } }) |order| {
+        const text = try std.fmt.allocPrint(allocator,
+            \\kind: Processing
+            \\sources:
+            \\{s}{s}sinks:
+            \\  - name: out
+            \\    ts: {{ measurement: cpu_copy, tags: {{ host: h }} }}
+            \\
+        , .{ order[0], order[1] });
+        defer allocator.free(text);
+        var diag: Diagnostic = .{};
+        try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, &diag));
+        try std.testing.expect(mem.indexOf(u8, diag.message(), "TS sink 'out' maps tags, but TS source 'points'") != null);
+
+        const plain = try std.fmt.allocPrint(allocator,
+            \\kind: Processing
+            \\sources:
+            \\{s}{s}sinks:
+            \\  - ts: {{ measurement: cpu_copy, value_field: usage }}
+            \\
+        , .{ order[0], order[1] });
+        defer allocator.free(plain);
+        var def = try parseJobDefinition(allocator, plain, null);
+        def.deinit(allocator);
+    }
+    // The advice survives the longest names a diagnostic can hold.
+    {
+        const long_name: [255]u8 = @splat('n');
+        const long: []const u8 = &long_name;
+        const text = try std.fmt.allocPrint(allocator,
+            \\kind: Processing
+            \\sources:
+            \\  - name: {s}
+            \\    ts: {{ measurement: cpu }}
+            \\sinks:
+            \\  - name: {s}
+            \\    ts: {{ measurement: cpu_copy, fields: {{ load: l }} }}
+            \\
+        , .{ long, long });
+        defer allocator.free(text);
+        var diag: Diagnostic = .{};
+        try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, &diag));
+        try std.testing.expect(mem.startsWith(u8, diag.message(), "split the job to map a stream source's records"));
     }
     // `value_field` alone is the field its points are written under: taken.
     var def = try parseJobDefinition(allocator,
