@@ -267,6 +267,10 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
         if (src.kind != .ts) continue;
         for (def.sinks.items) |snk| {
             if (snk.kind == .kv) return d.fail(ParseError.InvalidFormat, "KV sink '{s}' can't take TS source '{s}': its records have no key to write under; use a stream, queue or TS sink", .{ snk.name, src.name });
+            // A TS source's point goes on with its own value and tags, so
+            // a TS sink's map of a record's fields would go unread.
+            if (snk.kind == .ts and (snk.ts_tag_keys.len > 0 or snk.ts_field_keys.len > 0))
+                return d.fail(ParseError.InvalidFormat, "TS sink '{s}' can't map tags or fields from TS source '{s}': a point keeps its own value and tags, written under `value_field`; split the job to map a stream source's records", .{ snk.name, src.name });
         }
     }
 
@@ -2495,4 +2499,35 @@ test "parser: a TS sink's field can't read a record field named empty" {
         \\{"kind":"Processing","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m","fields":{"load":""}}}]}
     , &diag));
     try std.testing.expect(mem.indexOf(u8, diag.message(), "a field's record field can't be empty") != null);
+}
+
+test "parser: a TS sink fed by a TS source can't map tags or fields, which its points would leave unread" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "      tags: { host: h }\n", "      fields: { load: l }\n" }) |map| {
+        const text = try std.fmt.allocPrint(allocator,
+            \\kind: Processing
+            \\sources:
+            \\  - name: points
+            \\    ts: {{ measurement: cpu }}
+            \\sinks:
+            \\  - name: out
+            \\    ts:
+            \\      measurement: cpu_copy
+            \\{s}
+        , .{map});
+        defer allocator.free(text);
+        var diag: Diagnostic = .{};
+        try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, &diag));
+        try std.testing.expect(mem.indexOf(u8, diag.message(), "TS sink 'out' can't map tags or fields from TS source 'points'") != null);
+    }
+    // `value_field` alone is the field its points are written under: taken.
+    var def = try parseJobDefinition(allocator,
+        \\kind: Processing
+        \\sources:
+        \\  - ts: { measurement: cpu }
+        \\sinks:
+        \\  - ts: { measurement: cpu_copy, value_field: usage }
+        \\
+    , null);
+    def.deinit(allocator);
 }
