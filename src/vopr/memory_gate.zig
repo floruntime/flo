@@ -97,8 +97,12 @@ fn judgeDeliver(store: *Store, e: *const Entry, memory: bool, before: u64, share
 fn wouldAdd(m: *const machine_mod.Machine, store: *Store, e: *const Entry, before: u64) ?i64 {
     checking = true;
     defer checking = false;
-    var copy = Store.init(allocator);
-    defer copy.deinit();
+    // The copy is thrown away whole: one arena, freed at once, not a free
+    // per record (a swarm judges hundreds of thousands of writes).
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var copy = Store.init(a);
     copy.strict_keys = false;
     copy.place = store.place;
     for (0..store_mod.MAX_FAMILIES) |id| {
@@ -106,10 +110,10 @@ fn wouldAdd(m: *const machine_mod.Machine, store: *Store, e: *const Entry, befor
         var it = store.range(@intCast(id), "");
         while (it.next()) |rec| {
             const r = copy.allocRecord(rec.key()) catch return null;
-            copy.link(@intCast(id), r, allocator.dupe(u8, rec.value) catch return null);
+            copy.link(@intCast(id), r, a.dupe(u8, rec.value) catch return null);
         }
     }
-    var scratch = std.heap.ArenaAllocator.init(allocator);
+    var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     var out: persistence.Result = .{};
     out.reset(e);
