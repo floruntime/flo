@@ -112,7 +112,7 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("status", 's', "", "Filter by status (running, completed, failed, cancelled)")
                 .stringFlag("search", 'q', "", "Search runs by keyword")
                 .uintFlag("limit", 'l', 100, "Maximum runs to show")
-                .uintFlag("page", 0, 0, "Most runs to ask for a page (0: all that are left)")
+                .uintFlag("page", 0, 0, "Most runs to ask for a page, at most 1024 (0: the most a page holds)")
                 .action(wrapHandler(runListRuns)),
         )
         .subcommand(

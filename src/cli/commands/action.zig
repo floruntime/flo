@@ -103,7 +103,7 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
             .aliases(&.{"tasks"})
             .arg("name", "Action name")
             .uintFlag("limit", 'l', 50, "Maximum runs to show")
-            .uintFlag("page", 0, 0, "Most runs to ask for a page (0: the most a page holds)")
+            .uintFlag("page", 0, 0, "Most runs to ask for a page, at most 1024 (0: the most a page holds)")
             .action(wrapHandler(runRuns)),
     );
     gen.addCommands(allocator, action, &action_ops.table, &.{});

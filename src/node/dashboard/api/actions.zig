@@ -38,6 +38,12 @@ const MAX_RUNS_PAGE: u64 = 100;
 /// the dashboard's one thread, a list page of them at a time.
 const MAX_RUNS_OFFSET: u64 = 10_000;
 
+/// Whether cursor `next` comes after `prev` in the list's order: older, or
+/// as old with a greater id.
+pub fn cursorMovedOn(prev: action_ops.RunCursor.Value, next: action_ops.RunCursor.Value) bool {
+    return next.created_at_ms < prev.created_at_ms or (next.created_at_ms == prev.created_at_ms and std.mem.order(u8, next.run, prev.run) == .gt);
+}
+
 /// How many runs to ask the next list page for: what is left to skip and to
 /// show, at least one, at most a page.
 fn runsAsk(offset: u64, skipped: u64, limit: u64, shown: u64) u32 {
@@ -341,6 +347,9 @@ pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]co
             shown += 1;
         }
         const next = page.cursor orelse break;
+        // Pages run newest first: a cursor that doesn't move on would ask
+        // for the same page forever on the dashboard's one thread.
+        if (after) |prev| if (!cursorMovedOn(prev, next)) return try h.jsonError(allocator, "action runs: malformed answer (its cursor didn't move on)");
         @memcpy(cursor_run[0..next.run.len], next.run);
         after = .{ .created_at_ms = next.created_at_ms, .run = cursor_run[0..next.run.len] };
     }
@@ -429,6 +438,15 @@ test "action runs: an offset past the most it skips is refused before anything i
     try std.testing.expectEqual(@as(u32, action_ops.MAX_LIST_RUNS), runsAsk(MAX_RUNS_OFFSET, 0, MAX_RUNS_PAGE, 0));
     try std.testing.expectEqual(@as(u32, 1), runsAsk(5, 5, 3, 3));
     try std.testing.expectEqual(@as(u32, 7), runsAsk(5, 2, 4, 0));
+}
+
+test "action runs: a cursor moves on only to an older run, or as old with a greater id" {
+    const at = action_ops.RunCursor.Value{ .created_at_ms = 10, .run = "b" };
+    try std.testing.expect(cursorMovedOn(at, .{ .created_at_ms = 9, .run = "a" }));
+    try std.testing.expect(cursorMovedOn(at, .{ .created_at_ms = 10, .run = "c" }));
+    try std.testing.expect(!cursorMovedOn(at, at));
+    try std.testing.expect(!cursorMovedOn(at, .{ .created_at_ms = 10, .run = "a" }));
+    try std.testing.expect(!cursorMovedOn(at, .{ .created_at_ms = 11, .run = "z" }));
 }
 
 test "action.list_runs' answer decodes run by run, and a cut one is refused" {
