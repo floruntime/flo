@@ -119,37 +119,33 @@ fn judgeStart(m: *const machine_mod.Machine, store: *Store, e: *const Entry, out
 /// by, its sends written after. Null when the copy can't be made.
 pub fn wouldAddData(m: *const machine_mod.Machine, store: *Store, e: *const Entry) ?i64 {
     const before = pool.dataUseOf(store);
-    var copy = copyUnbound(store) orelse return null;
-    defer copy.deinit();
-    applyOnCopy(m, &copy, e) orelse return null;
+    // Thrown away whole: one arena, freed at once (see `wouldAdd`).
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var copy = copyUnbound(arena.allocator(), store) orelse return null;
+    applyOnCopy(arena.allocator(), m, &copy, e) orelse return null;
     return @as(i64, @intCast(pool.dataUseOf(&copy))) - @as(i64, @intCast(before));
 }
 
-fn copyUnbound(store: *Store) ?Store {
-    var copy = Store.init(allocator);
+fn copyUnbound(a: std.mem.Allocator, store: *Store) ?Store {
+    var copy = Store.init(a);
     copy.strict_keys = false;
     copy.place = store.place;
     for (0..store_mod.MAX_FAMILIES) |id| {
         if (id == settings.BindFam.ID) continue;
         var it = store.range(@intCast(id), "");
         while (it.next()) |rec| {
-            const r = copy.allocRecord(rec.key()) catch {
-                copy.deinit();
-                return null;
-            };
-            copy.link(@intCast(id), r, allocator.dupe(u8, rec.value) catch {
-                copy.deinit();
-                return null;
-            });
+            const r = copy.allocRecord(rec.key()) catch return null;
+            copy.link(@intCast(id), r, a.dupe(u8, rec.value) catch return null);
         }
     }
     return copy;
 }
 
-fn applyOnCopy(m: *const machine_mod.Machine, copy: *Store, e: *const Entry) ?void {
+fn applyOnCopy(a: std.mem.Allocator, m: *const machine_mod.Machine, copy: *Store, e: *const Entry) ?void {
     checking = true;
     defer checking = false;
-    var scratch = std.heap.ArenaAllocator.init(allocator);
+    var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     var out: persistence.Result = .{};
     out.reset(e);
@@ -161,8 +157,12 @@ fn applyOnCopy(m: *const machine_mod.Machine, copy: *Store, e: *const Entry) ?vo
 fn wouldAdd(m: *const machine_mod.Machine, store: *Store, e: *const Entry, before: u64) ?i64 {
     checking = true;
     defer checking = false;
-    var copy = Store.init(allocator);
-    defer copy.deinit();
+    // The copy is thrown away whole: one arena, freed at once, not a free
+    // per record (a swarm judges hundreds of thousands of writes).
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var copy = Store.init(a);
     copy.strict_keys = false;
     copy.place = store.place;
     for (0..store_mod.MAX_FAMILIES) |id| {
@@ -170,10 +170,10 @@ fn wouldAdd(m: *const machine_mod.Machine, store: *Store, e: *const Entry, befor
         var it = store.range(@intCast(id), "");
         while (it.next()) |rec| {
             const r = copy.allocRecord(rec.key()) catch return null;
-            copy.link(@intCast(id), r, allocator.dupe(u8, rec.value) catch return null);
+            copy.link(@intCast(id), r, a.dupe(u8, rec.value) catch return null);
         }
     }
-    var scratch = std.heap.ArenaAllocator.init(allocator);
+    var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     var out: persistence.Result = .{};
     out.reset(e);
