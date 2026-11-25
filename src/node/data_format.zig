@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 65;
+pub const CURRENT: u32 = 66;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -232,10 +232,13 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // A signal past its shard's share is refused, one that wakes its run
     // taken within a slack.
     .{ .format = 64, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
-    // A processing job's TS sink with more tags than a TS read takes, or
-    // naming a record field too long to find, is refused where its submit
-    // applies, kept failed.
+    // A processing job's TS source with more tags than a TS read takes is
+    // refused where its submit applies, kept failed.
     .{ .format = 65, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
+    // A processing job's TS sink with more tags than a TS read takes, a tag
+    // named with ',' or '=' or empty, or a record field too long to find, is
+    // refused where its submit applies, kept failed.
+    .{ .format = 66, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
 };
 
 comptime {

@@ -615,6 +615,21 @@ fn appendTsSource(
     src.ts_measurement = try dupe(allocator, measurement);
     src.ts_field = try dupe(allocator, field);
     src.ts_tags = try parseStringPairs(allocator, d, ts_obj, "tags");
+    // The series the source reads is named by its tags as a TS write and
+    // read name them: one string of `key=value` pairs joined by commas, split
+    // again on `,` and each pair at its first `=`. A comma in a key or value,
+    // or an `=` in a key, would split one tag into others; past the read's
+    // limits the string is cut, or its hash is 0, which filters nothing and
+    // reads every series of the measurement.
+    for (src.ts_tags, 0..) |t, i| {
+        const key = i % 2 == 0;
+        if (mem.indexOfScalar(u8, t, ',') != null) return d.fail(ParseError.InvalidFormat, "a tag's {s} can't hold ',': \"{s}\"", .{ if (key) "name" else "value", t });
+        if (key and mem.indexOfScalar(u8, t, '=') != null) return d.fail(ParseError.InvalidFormat, "a tag's name can't hold '=': \"{s}\"", .{t});
+    }
+    if (src.ts_tags.len / 2 > ts_mod.MAX_TAGS) return d.fail(ParseError.InvalidFormat, "\"tags\" takes at most {d} tags, not {d}", .{ ts_mod.MAX_TAGS, src.ts_tags.len / 2 });
+    var canonical: usize = 0;
+    for (src.ts_tags, 0..) |t, i| canonical += t.len + if (i % 2 == 0) @as(usize, @intFromBool(i > 0)) else 1;
+    if (canonical > ts_mod.MAX_TAG_STRING) return d.fail(ParseError.InvalidFormat, "\"tags\" is at most {d} bytes written as key=value pairs joined by commas, not {d}", .{ ts_mod.MAX_TAG_STRING, canonical });
     try sources.append(allocator, src);
 }
 
@@ -753,9 +768,10 @@ fn parseOneSink(allocator: Allocator, d: D, item: JsonValue, index: usize, defau
         for (snk.ts_tag_keys, 0..) |v, i| if (i % 2 == 1) try fieldNameFits(d, "tags", v);
         // A point's tags are one `key=value,…` string, split again on `,`
         // and each pair at its first `=`: a tag named with either is two.
-        for (snk.ts_tag_keys, 0..) |t, i| if (i % 2 == 0) {
-            if (mem.indexOfAny(u8, t, ",=") != null) return d.fail(ParseError.InvalidFormat, "a tag's name can't hold ',' or '=': \"{s}\"", .{t});
-        };
+        for (snk.ts_tag_keys, 0..) |t, i| {
+            if (t.len == 0) return d.fail(ParseError.InvalidFormat, "a tag's {s} can't be empty", .{if (i % 2 == 0) "name" else "record field"});
+            if (i % 2 == 0) if (mem.indexOfAny(u8, t, ",=") != null) return d.fail(ParseError.InvalidFormat, "a tag's name can't hold ',' or '=': \"{s}\"", .{t});
+        }
         for (snk.ts_field_keys, 0..) |v, i| if (i % 2 == 1) try fieldNameFits(d, "fields", v);
     } else {
         try checkKeys(d, obj, &.{ "name", "namespace" });
@@ -2295,10 +2311,125 @@ test "parser: a job name the list page can't hold is refused at submit" {
     }
 }
 
+test "parser: a TS source's tags are held to a TS read's limits, refused past 32 tags or 1024 bytes by name" {
+    const allocator = std.testing.allocator;
+    const Case = struct { tags: usize, value_len: usize, says: ?[]const u8 };
+    for ([_]Case{
+        // 32 tags of 25-byte values: 32 * (2 + 1 + 25) + 31 = 927 bytes.
+        .{ .tags = ts_mod.MAX_TAGS, .value_len = 25, .says = null },
+        .{ .tags = ts_mod.MAX_TAGS + 1, .value_len = 1, .says = "\"tags\" takes at most 32 tags, not 33" },
+        // Two tags come to 7 + 2v bytes: 1023 is taken, 1025 refused.
+        .{ .tags = 2, .value_len = 508, .says = null },
+        .{ .tags = 2, .value_len = 509, .says = "\"tags\" is at most 1024 bytes written as key=value pairs joined by commas, not 1025" },
+    }) |c| {
+        // Two-letter keys, each its own.
+        var keyed: std.ArrayList(u8) = .empty;
+        defer keyed.deinit(allocator);
+        for (0..c.tags) |i| {
+            try keyed.print(allocator, "        {c}{c}: \"", .{ @as(u8, 'a') + @as(u8, @intCast(i / 26)), @as(u8, 'a') + @as(u8, @intCast(i % 26)) });
+            try keyed.appendNTimes(allocator, 'v', c.value_len);
+            try keyed.appendSlice(allocator, "\"\n");
+        }
+        const text = try std.fmt.allocPrint(allocator,
+            \\kind: Processing
+            \\sources:
+            \\  - ts:
+            \\      measurement: cpu
+            \\      tags:
+            \\{s}sinks:
+            \\  - stream:
+            \\      name: out
+            \\
+        , .{keyed.items});
+        defer allocator.free(text);
+        if (c.says) |says| {
+            var diag: Diagnostic = .{};
+            try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, &diag));
+            try std.testing.expect(mem.indexOf(u8, diag.message(), says) != null);
+        } else {
+            var def = try parseJobDefinition(allocator, text, null);
+            defer def.deinit(allocator);
+            try std.testing.expectEqual(c.tags * 2, def.primarySource().?.ts_tags.len);
+        }
+    }
+}
+
+/// A TS source of `values.len` tags with two-letter keys, the i-th value
+/// `values[i]` bytes of `v`, or the YAML `raw` for its tags.
+fn tsSourceJob(allocator: Allocator, values: []const usize, raw: []const u8) ![]u8 {
+    var tags: std.ArrayList(u8) = .empty;
+    defer tags.deinit(allocator);
+    for (values, 0..) |len, i| {
+        try tags.print(allocator, "        {c}{c}: \"", .{ @as(u8, 'a') + @as(u8, @intCast(i / 26)), @as(u8, 'a') + @as(u8, @intCast(i % 26)) });
+        try tags.appendNTimes(allocator, 'v', len);
+        try tags.appendSlice(allocator, "\"\n");
+    }
+    try tags.appendSlice(allocator, raw);
+    return std.fmt.allocPrint(allocator,
+        \\kind: Processing
+        \\sources:
+        \\  - ts:
+        \\      measurement: cpu
+        \\      tags:
+        \\{s}sinks:
+        \\  - stream:
+        \\      name: out
+        \\
+    , .{tags.items});
+}
+
+test "parser: a TS source's tags take exactly 1024 bytes, and one tag can't be read as two" {
+    const allocator = std.testing.allocator;
+    const Case = struct { values: []const usize, raw: []const u8 = "", says: ?[]const u8 };
+    for ([_]Case{
+        // 3 + 500, 3 + 500, 3 + 13 and two commas: 1024 exactly.
+        .{ .values = &.{ 500, 500, 13 }, .says = null },
+        .{ .values = &.{ 500, 500, 14 }, .says = "not 1025" },
+        // A comma would split a tag in two, read as another series.
+        .{ .values = &.{}, .raw = "        aa: \"x,zz=q\"\n", .says = "a tag's value can't hold ','" },
+        .{ .values = &.{}, .raw = "        \"a,b\": x\n", .says = "a tag's name can't hold ','" },
+        .{ .values = &.{}, .raw = "        \"a=b\": x\n", .says = "a tag's name can't hold '='" },
+        // An `=` in a value is the value's: a pair splits at its first.
+        .{ .values = &.{}, .raw = "        aa: \"x=y\"\n", .says = null },
+    }) |c| {
+        const text = try tsSourceJob(allocator, c.values, c.raw);
+        defer allocator.free(text);
+        if (c.says) |says| {
+            var diag: Diagnostic = .{};
+            try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, &diag));
+            try std.testing.expect(mem.indexOf(u8, diag.message(), says) != null);
+        } else {
+            var def = try parseJobDefinition(allocator, text, null);
+            def.deinit(allocator);
+        }
+    }
+}
+
+test "parser: a TS source at either limit names its series: the runtime's tag hash isn't 0" {
+    const allocator = std.testing.allocator;
+    var at_count: [ts_mod.MAX_TAGS]usize = @splat(1);
+    for ([_][]const usize{ &at_count, &.{ 500, 500, 13 } }) |values| {
+        const text = try tsSourceJob(allocator, values, "");
+        defer allocator.free(text);
+        var def = try parseJobDefinition(allocator, text, null);
+        defer def.deinit(allocator);
+        const tags = def.primarySource().?.ts_tags;
+        var pairs: [ts_mod.MAX_TAGS]ts_mod.TagPair = undefined;
+        for (0..tags.len / 2) |i| pairs[i] = .{ .key = tags[2 * i], .value = tags[2 * i + 1] };
+        var buf: [ts_mod.MAX_TAG_STRING]u8 = undefined;
+        try std.testing.expect(ts_mod.canonicalTagHashPairs(pairs[0 .. tags.len / 2], &buf) != 0);
+    }
+}
+
 test "parser: a TS sink takes at most 32 tags, and reads no record field named past 253 bytes" {
     const allocator = std.testing.allocator;
     var tags: std.ArrayList(u8) = .empty;
     defer tags.deinit(allocator);
+    var at_limit: std.ArrayList(u8) = .empty;
+    defer at_limit.deinit(allocator);
+    for (0..ts_mod.MAX_TAGS) |i| try at_limit.print(allocator, "        {c}{c}: f\n", .{ @as(u8, 'a') + @as(u8, @intCast(i / 26)), @as(u8, 'a') + @as(u8, @intCast(i % 26)) });
+    const thirty_two = try std.fmt.allocPrint(allocator, "      tags:\n{s}", .{at_limit.items});
+    defer allocator.free(thirty_two);
     for (0..ts_mod.MAX_TAGS + 1) |i| try tags.print(allocator, "        {c}{c}: f\n", .{ @as(u8, 'a') + @as(u8, @intCast(i / 26)), @as(u8, 'a') + @as(u8, @intCast(i % 26)) });
     const long_name: []const u8 = &@as([MAX_SINK_FIELD_NAME + 1]u8, @splat('f'));
     const Case = struct { body: []const u8, says: ?[]const u8 };
@@ -2314,7 +2445,9 @@ test "parser: a TS sink takes at most 32 tags, and reads no record field named p
     const fits = try std.fmt.allocPrint(allocator, "      value_field: {s}\n", .{fits_name});
     defer allocator.free(fits);
     for ([_]Case{
+        .{ .body = thirty_two, .says = null },
         .{ .body = many, .says = "\"tags\" takes at most 32 tags, not 33" },
+        .{ .body = "      tags:\n        host: \"\"\n", .says = "a tag's record field can't be empty" },
         .{ .body = long_value, .says = "\"value_field\" names a record field of at most 253 bytes, not 254" },
         .{ .body = long_tag, .says = "\"tags\" names a record field of at most 253 bytes, not 254" },
         .{ .body = long_field, .says = "\"fields\" names a record field of at most 253 bytes, not 254" },
@@ -2342,4 +2475,12 @@ test "parser: a TS sink takes at most 32 tags, and reads no record field named p
             def.deinit(allocator);
         }
     }
+}
+
+test "parser: a TS sink's tag can't be named empty, in JSON, where an empty key is kept" {
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(std.testing.allocator,
+        \\{"kind":"Processing","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m","tags":{"":"h"}}}]}
+    , &diag));
+    try std.testing.expect(mem.indexOf(u8, diag.message(), "a tag's name can't be empty") != null);
 }
