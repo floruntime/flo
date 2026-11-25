@@ -200,6 +200,8 @@ pub const ActionsHandler = struct {
     /// action.status copies a run's output and error here: the answer is
     /// encoded after the store may have moved.
     status_buf: ?[]u8 = null,
+    /// `action.list_runs`'s page, reused: its answer is encoded from it.
+    list_buf: ?[]u8 = null,
     /// action.info copies the action's owner here: the answer is encoded
     /// after the handler returns, so its own stack is gone.
     info_owner_buf: [action_ops.MAX_OWNER]u8 = undefined,
@@ -253,6 +255,7 @@ pub const ActionsHandler = struct {
         for (self.reruns.items) |r| self.allocator.free(r.bytes);
         self.reruns.deinit(self.allocator);
         if (self.status_buf) |b| self.allocator.free(b);
+        if (self.list_buf) |b| self.allocator.free(b);
     }
 
     fn freeKeys(allocator: Allocator, map: anytype) void {
@@ -271,7 +274,7 @@ pub const ActionsHandler = struct {
         dispatcher.registerWithRoute(.action_info, table_run.handler("action.info", ActionsHandler, runInfo), preRouteByAction);
         dispatcher.registerPagedWalk(.action_list, dispatchAction, localScanActions);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
-        dispatcher.registerWithRoute(.action_list_runs, dispatchAction, preRouteByAction);
+        dispatcher.registerWithRoute(.action_list_runs, table_run.handler("action.list_runs", ActionsHandler, runListRuns), preRouteByAction);
         // An await runs where its worker is registered: its labels, whether
         // it drains, the actions it runs. The runs it takes live on their
         // actions' shards, which it asks.
@@ -319,7 +322,6 @@ pub const ActionsHandler = struct {
             .action_register => handleRegister(shard, req),
             .action_invoke => handleInvoke(shard, req),
             .action_list => handleList(shard, req),
-            .action_list_runs => handleListRuns(shard, req),
             .action_delete => handleDelete(shard, req),
             else => CommandResult{ .err = .{ .code = .invalid_request, .message = "unknown action opcode" } },
         };
@@ -477,58 +479,65 @@ pub const ActionsHandler = struct {
         return .{ .items = name_buf[0..count], .next_cursor = null };
     }
 
-    /// One shard's runs of an action (or every action, for an empty key):
-    ///   [count:u32] ([run_id_len:u16][run_id][action_name_len:u16][action_name]
-    ///                [status:u8][created_at:i64][has_started:u8][started_at?:i64]
-    ///                [has_completed:u8][completed_at?:i64])*
-    fn handleListRuns(shard: *Shard, req: Request) CommandResult {
-        // An action's runs are on its name's shard; with no name this would
-        // list only the shard it landed on.
-        if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "action name is required" } };
-        const ns = req.ns_id;
-        const limit: u32 = if (req.value.len >= 4) std.mem.readInt(u32, req.value[0..4], .little) else 100;
-        var w: std.Io.Writer.Allocating = .init(shard.allocator);
-        defer w.deinit();
-        writeRuns(shard, ns, req.key, limit, &w.writer) catch
-            return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
-        const data = w.toOwnedSlice() catch return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
-        return .{ .action_list_result = .{ .data = data, .cursor = null } };
+    const ListRunsResponse = table_run.op("action.list_runs").response;
+    const RunCursor = action_ops.RunCursor;
+
+    /// The most index rows one page reads.
+    pub const WALK_MAX: u32 = 4096;
+
+    /// `action.list_runs`: an action's runs, newest first, from the cursor,
+    /// by its index (`machine.RunAt`): at most `limit`, reading at most
+    /// `WALK_MAX` rows. With more, the cursor is the last run shown.
+    fn runListRuns(shard: *Shard, _: *Connection, req: Request, limit: u32, after: ?RunCursor.Value) Error!table_run.Outcome(ListRunsResponse) {
+        const self = shard.actions_handler;
+        if (after) |c| if (c.created_at_ms < 0 or c.run.len == 0)
+            return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .out_of_range, .ran = .no, .message = "bad request: a cursor no run can be at" } } };
+        if (req.key.len > ae.MAX_ACTION_NAME) return error.NotFound;
+        const buf = self.list_buf orelse blk: {
+            const b = try self.allocator.alloc(u8, action_ops.ListedRuns.max_size);
+            self.list_buf = b;
+            break :blk b;
+        };
+        var pb: machine.RunAtBuf = undefined;
+        var kb: [@sizeOf(u32) + @sizeOf(machine.RunAtBuf)]u8 = undefined;
+        const prefix = storeKey(&kb, req.ns_id, machine.runAtPrefix(&pb, req.key)) orelse return error.NotFound;
+        var ab: machine.RunAtBuf = undefined;
+        var akb: [@sizeOf(u32) + @sizeOf(machine.RunAtBuf)]u8 = undefined;
+        const from: ?[]const u8 = if (after) |c| storeKey(&akb, req.ns_id, machine.runAtKey(&ab, req.key, c.created_at_ms, c.run)) orelse return error.NotFound else null;
+        var it = if (from) |k| readOf(shard).rangeAfter(machine.RunAt, prefix, k) else readOf(shard).range(machine.RunAt, prefix);
+        var b = action_ops.ListedRuns.Builder.init(buf);
+        var shown: u32 = 0;
+        var read: u32 = 0;
+        var last: ?RunCursor.Value = null;
+        var rb: [KEY_BUF]u8 = undefined;
+        while (it.next() catch unreachable) |item| { // written by the machine alone
+            if (read == WALK_MAX) return .{ .answer = .{ .runs = b.value(), .cursor = last } };
+            const tail = item.key[prefix.len..];
+            const at: RunCursor.Value = .{ .created_at_ms = @intCast(std.math.maxInt(u64) - std.mem.readInt(u64, tail[0..8], .big)), .run = tail[8..] };
+            const run = getRunAt(shard, &rb, req.ns_id, at.run) orelse {
+                read += 1;
+                last = at;
+                continue;
+            };
+            const listed: action_ops.ListedRun.Value = .{
+                .run = at.run,
+                .status = @fromBackingInt(@backingInt(statusOf(run))),
+                .created_at_ms = nsToMs(run.created_ns),
+                .started_at_ms = if (run.started_ns != 0) nsToMs(run.started_ns) else null,
+                .completed_at_ms = if (run.completed_ns != 0) nsToMs(run.completed_ns) else null,
+            };
+            if (shown == limit or !(b.add(listed) catch false)) return .{ .answer = .{ .runs = b.value(), .cursor = last } };
+            shown += 1;
+            read += 1;
+            last = at;
+        }
+        return .{ .answer = .{ .runs = b.value(), .cursor = null } };
     }
 
-    fn writeRuns(shard: *Shard, ns: NamespaceId, action: []const u8, limit: u32, w: *std.Io.Writer) !void {
-        var pb: [KEY_BUF]u8 = undefined;
-        const p = storeKey(&pb, ns, "") orelse return error.WriteFailed;
-        var count: u32 = 0;
-        var it = readOf(shard).range(machine.Runs, p);
-        while (try it.next()) |item| {
-            if (count >= limit) break;
-            if (action.len > 0 and !std.mem.eql(u8, item.value.v.action, action)) continue;
-            count += 1;
-        }
-        try w.writeInt(u32, count, .little);
-        var emitted: u32 = 0;
-        it = readOf(shard).range(machine.Runs, p);
-        while (try it.next()) |item| {
-            if (emitted >= count) break;
-            const run = item.value.v;
-            if (action.len > 0 and !std.mem.eql(u8, run.action, action)) continue;
-            emitted += 1;
-            const id = item.key[@sizeOf(u32)..];
-            try w.writeInt(u16, @intCast(id.len), .little);
-            try w.writeAll(id);
-            try w.writeInt(u16, @intCast(run.action.len), .little);
-            try w.writeAll(run.action);
-            try w.writeByte(@backingInt(statusOf(run)));
-            try w.writeInt(i64, nsToMs(run.created_ns), .little);
-            try writeOptionalMs(w, run.started_ns);
-            try writeOptionalMs(w, run.completed_ns);
-        }
-    }
-
-    fn writeOptionalMs(w: *std.Io.Writer, at_ns: u64) !void {
-        if (at_ns == 0) return w.writeByte(0);
-        try w.writeByte(1);
-        try w.writeInt(i64, nsToMs(at_ns), .little);
+    fn getRunAt(shard: *Shard, b: *[KEY_BUF]u8, ns: NamespaceId, id: []const u8) ?Run {
+        const k = storeKey(b, ns, id) orelse return null;
+        const r = readOf(shard).get(machine.Runs, k) catch return null;
+        return if (r) |x| x.v else null;
     }
 
     /// A run's status as the wire says it.

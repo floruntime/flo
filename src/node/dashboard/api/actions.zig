@@ -120,7 +120,7 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
     return try json_aw.toOwnedSlice();
 }
 
-/// One run as `action_list_runs` lists it.
+/// One run as `action.list_runs` lists it.
 const ListedRun = struct {
     run_id: []const u8,
     action: []const u8,
@@ -135,51 +135,43 @@ const ListedRun = struct {
     }
 };
 
-/// `action_list_runs`'s answer: [count:u32] then per run [run_id_len:u16]
-/// [run_id][action_len:u16][action][status:u8][created_at:i64]
-/// [has:u8][started_at:i64]?[has:u8][completed_at:i64]?.
+const ListRuns = action_ops.op("action.list_runs");
+
+/// `action.list_runs`'s answer, run by run; `NO_RUNS` for a namespace with
+/// none.
 const RunList = struct {
-    reader: WireReader,
-    left: u32,
+    it: ?action_ops.ListedRuns.Iterator = null,
+    /// The action asked for, which each run is of.
+    action: []const u8 = "",
 
     fn init(data: []const u8) RunList {
-        var r = WireReader.init(data);
-        const count = r.readU32() orelse 0;
-        return .{ .reader = r, .left = count };
+        if (data.len == 0) return .{};
+        var diag: schema.Diagnostic = .{};
+        const page = ListRuns.response.decodeAll(data, &diag) catch return .{};
+        return .{ .it = page.runs.iterator() };
     }
 
     fn next(self: *RunList) error{Malformed}!?ListedRun {
-        if (self.left == 0) return null;
-        self.left -= 1;
-        const r = &self.reader;
-        return .{
-            .run_id = r.readLengthPrefixed(u16) orelse return error.Malformed,
-            .action = r.readLengthPrefixed(u16) orelse return error.Malformed,
-            .status = r.readU8() orelse return error.Malformed,
-            .created_at = r.readI64() orelse return error.Malformed,
-            .started_at = try optionalI64(r),
-            .completed_at = try optionalI64(r),
-        };
+        const it = if (self.it) |*i| i else return null;
+        const r = (it.next() catch return error.Malformed) orelse return null;
+        return .{ .run_id = r.run, .action = self.action, .status = @backingInt(r.status), .created_at = r.created_at_ms, .started_at = r.started_at_ms, .completed_at = r.completed_at_ms };
     }
 
-    fn optionalI64(r: *WireReader) error{Malformed}!?i64 {
-        const has = r.readU8() orelse return error.Malformed;
-        if (has == 0) return null;
-        return r.readI64() orelse error.Malformed;
-    }
-
-    /// Whether every run the count names is there whole.
+    /// Whether the answer decodes, every run whole.
     fn whole(data: []const u8) bool {
-        var runs = RunList.init(data);
-        while (runs.next() catch return false) |_| {}
+        if (data.len == 0) return true;
+        var diag: schema.Diagnostic = .{};
+        const page = ListRuns.response.decodeAll(data, &diag) catch return false;
+        var it = page.runs.iterator();
+        while (it.next() catch return false) |_| {}
         return true;
     }
 };
 
 const RunsShape = enum { recent, page };
 
-/// A run list holding none: its count, 0.
-const NO_RUNS = [_]u8{ 0, 0, 0, 0 };
+/// A run list holding none.
+const NO_RUNS = [_]u8{};
 
 /// One run, from its listing and its `action.status` (its attempt, worker,
 /// output and error). What no op answers about a run yet — its input,
@@ -236,7 +228,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
     const info = Info.response.decodeAll(info_got.data, &diag) catch return try h.jsonError(allocator, "action detail: malformed answer");
 
     const client = reader.next() catch |err| return try loopback.readFailed(allocator, "action runs", err);
-    var listed = client_mod.action.listRuns(client, ns, name, RECENT_RUNS) catch |err|
+    var listed = client_mod.action.listRuns(client, ns, name, RECENT_RUNS, null) catch |err|
         return try loopback.readFailed(allocator, "action runs", err);
     defer listed.deinit();
     if (listed.isError() and !listed.isNotFound()) return try h.jsonError(allocator, listed.errorMessage());
@@ -280,6 +272,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
         var recent_arr = try obj.arrayField("recent_runs");
         try recent_arr.begin();
         var runs = RunList.init(run_data);
+        runs.action = name;
         while (runs.next() catch unreachable) |run| {
             try recent_arr.next();
             writeRun(&reader, writer, ns, run, .recent) catch |err| return try loopback.readFailed(allocator, "action run status", err);
@@ -309,7 +302,7 @@ pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]co
     var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "action runs", err);
     defer reader.deinit();
     const client = reader.next() catch |err| return try loopback.readFailed(allocator, "action runs", err);
-    var listed = client_mod.action.listRuns(client, ns, name, want) catch |err|
+    var listed = client_mod.action.listRuns(client, ns, name, @min(want, action_ops.MAX_LIST_RUNS), null) catch |err|
         return try loopback.readFailed(allocator, "action runs", err);
     defer listed.deinit();
     if (listed.isError() and !listed.isNotFound()) return try h.jsonError(allocator, listed.errorMessage());
@@ -324,6 +317,7 @@ pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]co
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
     var runs = RunList.init(run_data);
+    runs.action = name;
     var seen: u64 = 0;
     while (runs.next() catch unreachable) |run| {
         seen += 1;
@@ -401,11 +395,14 @@ test "action reads say they failed when the node can't be reached" {
     try std.testing.expect(std.mem.startsWith(u8, runs, "{\"error\":\"action runs"));
 }
 
-test "action_list_runs' answer decodes run by run, and a cut one is refused" {
-    // One run: "r1" of "a", completed (2), created at 5, started at 6, not completed.
-    const answer = [_]u8{ 1, 0, 0, 0, 2, 0, 'r', '1', 1, 0, 'a', 2 } ++ [_]u8{ 5, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{1} ++ [_]u8{ 6, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{0};
-    try std.testing.expect(RunList.whole(&answer));
-    var runs = RunList.init(&answer);
+test "action.list_runs' answer decodes run by run, and a cut one is refused" {
+    var rb: [256]u8 = undefined;
+    var b = action_ops.ListedRuns.Builder.init(&rb);
+    try std.testing.expect(try b.add(.{ .run = "r1", .status = .completed, .created_at_ms = 5, .started_at_ms = 6, .completed_at_ms = null }));
+    var buf: [512]u8 = undefined;
+    const answer = try ListRuns.response.encodeInto(&buf, .{ .runs = b.value(), .cursor = null });
+    try std.testing.expect(RunList.whole(answer));
+    var runs = RunList.init(answer);
     const run = (try runs.next()).?;
     try std.testing.expectEqualStrings("r1", run.run_id);
     try std.testing.expectEqualStrings("completed", run.statusName());

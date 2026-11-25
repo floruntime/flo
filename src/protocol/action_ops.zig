@@ -84,7 +84,42 @@ const delivery_fields = [_]schema.Field{
     .{ .name = "index", .T = Int(u64), .doc = "The task's index" },
 };
 
+/// Where an action's run list stands: newest first, then by id.
+pub const RunCursor = Record(&.{
+    .{ .name = "created_at_ms", .T = Int(i64), .doc = "The run's invoke time, in Unix milliseconds" },
+    .{ .name = "run", .T = Bytes(@import("action_entries.zig").MAX_RUN_ID), .doc = "The run's id" },
+});
+
+/// One run as an action's list shows it.
+pub const ListedRun = Record(&.{
+    .{ .name = "run", .T = Bytes(@import("action_entries.zig").MAX_RUN_ID), .doc = "The run's id" },
+    .{ .name = "status", .T = schema.Enum(RunStatus), .doc = "Where the run is" },
+    .{ .name = "created_at_ms", .T = Int(i64), .doc = "When it was invoked, in Unix milliseconds" },
+    .{ .name = "started_at_ms", .T = Optional(Int(i64)), .doc = "When a worker first took it" },
+    .{ .name = "completed_at_ms", .T = Optional(Int(i64)), .doc = "When it ended" },
+});
+
+/// The most runs one page of an action's list holds.
+pub const MAX_LIST_RUNS: u32 = 1024;
+pub const ListedRuns = schema.BoundedList(ListedRun, MAX_LIST_RUNS, MAX_LIST_RUNS * ListedRun.max_size);
+
 pub const table = [_]ops.Op{
+    .{
+        .name = "action.list_runs",
+        .code = 0x304,
+        .class = .read,
+        .route = .key,
+        .request = Record(&.{
+            .{ .name = "limit", .T = Defaulted(schema.Range(u32, 1, MAX_LIST_RUNS), 100), .doc = "Most runs to show" },
+            .{ .name = "after", .T = Optional(RunCursor), .doc = "Go on past this run, as the last answer's cursor named it" },
+        }),
+        .response = Record(&.{
+            .{ .name = "runs", .T = ListedRuns, .doc = "The action's runs, newest first; may be none while more follow" },
+            .{ .name = "cursor", .T = Optional(RunCursor), .doc = "Where the next page starts; none on the last page" },
+        }),
+        .cli = .{ .expose = .hand, .key = .{ .name = "action", .doc = "The action's name" } },
+        .doc = "An action's runs, newest first, a page at a time: each run's id, status and times.",
+    },
     .{
         .name = "action.status",
         .code = 0x302,

@@ -535,7 +535,10 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
         rows.appendSlice(ctx.allocator, split.rows) catch return outcome.malformed(ctx, "list-runs response (out of memory)");
         count += split.count;
         const next = split.cursor orelse break;
-        if (next.len > cursor_buf.len) return outcome.malformed(ctx, "list-runs cursor");
+        if (next.len > cursor_buf.len or next.len <= 8) return outcome.malformed(ctx, "list-runs cursor");
+        // Pages run newest first: a cursor that doesn't move on would ask
+        // for the same page forever.
+        if (cursor) |prev| if (!cursorMovedOn(prev, next)) return outcome.malformed(ctx, "list-runs answer (its cursor didn't move on)");
         @memcpy(cursor_buf[0..next.len], next);
         cursor = cursor_buf[0..next.len];
     }
@@ -565,6 +568,15 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
 /// A list-runs page: its rows' bytes, their count, and the cursor when
 /// more follow. Rows are `[run_id][workflow][status]` (u16-prefixed each)
 /// then `[created_at:i64]`.
+/// Whether cursor `next` (`[created_at:i64][run_id]`) comes after `prev`
+/// in a run list's order: older, or as old with a greater id.
+fn cursorMovedOn(prev: []const u8, next: []const u8) bool {
+    const p = std.mem.readInt(i64, prev[0..8], .little);
+    const n = std.mem.readInt(i64, next[0..8], .little);
+    if (n != p) return n < p;
+    return std.mem.order(u8, next[8..], prev[8..]) == .gt;
+}
+
 fn splitRunsPage(page: []const u8) ?struct { count: u32, rows: []const u8, cursor: ?[]const u8 } {
     if (page.len < 4) return null;
     const count = std.mem.readInt(u32, page[0..4], .little);

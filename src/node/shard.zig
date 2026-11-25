@@ -11798,7 +11798,7 @@ fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8)
             body.block_ms = ms;
             return table_run.op("action.await").request.encodeInto(buf, body) catch unreachable;
         },
-        .action_complete, .action_fail, .action_touch, .action_deliver, .action_history, .action_status, .workflow_history, .action_run_delete, .workflow_run_delete => return value,
+        .action_complete, .action_fail, .action_touch, .action_deliver, .action_history, .action_status, .workflow_history, .action_run_delete, .workflow_run_delete, .action_list_runs => return value,
         // A dequeue's count and wait from its options, encoded as the op's
         // body would be but with the wait unbounded, so one past its bound
         // reaches the server.
@@ -22919,6 +22919,42 @@ test "actions: a delete of a live run is refused run_live; of an ended one, its 
     const h = try t.call(.action_history, run_id, try R.encodeInto(&rb, .{ .limit = 10, .cursor = null, .newest_first = false }));
     try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), h.header.status);
     try std.testing.expect(ActionsHandler.for_tests.run(&t.shard, .default, run_id) == null);
+}
+
+test "actions: an action's runs list newest first by cursor, to the last page; a cursor no run can be at is refused" {
+    var t: ActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    _ = try t.ok(.action_register, "act", "");
+    for (0..3) |_| _ = try t.ok(.action_invoke, "act", "\x00in");
+    const Op = table_run.op("action.list_runs");
+    var rb: [Op.request.max_size]u8 = undefined;
+    var diag: schema.Diagnostic = .{};
+    var ids: [3][64]u8 = undefined;
+    var lens: [3]usize = undefined;
+    var n: usize = 0;
+    var after: ?@import("../protocol/action_ops.zig").RunCursor.Value = null;
+    var cb: [64]u8 = undefined;
+    var pages: usize = 0;
+    while (true) : (pages += 1) {
+        const page = try Op.response.decodeAll((try t.ok(.action_list_runs, "act", try Op.request.encodeInto(&rb, .{ .limit = 2, .after = after }))).data, &diag);
+        var it = page.runs.iterator();
+        while (try it.next()) |r| : (n += 1) {
+            @memcpy(ids[n][0..r.run.len], r.run);
+            lens[n] = r.run.len;
+            try std.testing.expectEqual(@import("../protocol/action_ops.zig").RunStatus.pending, r.status);
+        }
+        const c = page.cursor orelse break;
+        @memcpy(cb[0..c.run.len], c.run);
+        after = .{ .created_at_ms = c.created_at_ms, .run = cb[0..c.run.len] };
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(@as(usize, 1), pages);
+    // Each once.
+    try std.testing.expect(!std.mem.eql(u8, ids[0][0..lens[0]], ids[1][0..lens[1]]));
+    try std.testing.expect(!std.mem.eql(u8, ids[1][0..lens[1]], ids[2][0..lens[2]]));
+    const bad = try t.call(.action_list_runs, "act", try Op.request.encodeInto(&rb, .{ .limit = 2, .after = .{ .created_at_ms = -1, .run = "r" } }));
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), bad.header.status);
 }
 
 test "actions: a direct invoke is refused overloaded, not run, while its namespace's history waits on the lane, and goes once it drains" {
