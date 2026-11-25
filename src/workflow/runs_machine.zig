@@ -47,6 +47,7 @@ const persistence = @import("../storage/persistence.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const defs_machine = @import("defs_machine.zig");
 const calls_mod = @import("../actions/calls_machine.zig");
+const gate = @import("../budget/gate.zig");
 const parser = @import("parser.zig");
 const jsonpath = @import("jsonpath.zig");
 const NamespaceId = @import("../namespace/table.zig").Id;
@@ -1234,6 +1235,11 @@ fn applyParent(view: *View, e: *const Entry, n: Named) ApplyError!void {
                 if (f.v.parent_slot == p.parent_slot and std.mem.eql(u8, f.v.parent_run, p.parent_run)) return;
                 return reply(view, n.ns, n.run, p.parent_slot, .conflict, null);
             }
+            // Held to the share against the use before its inbound, as an
+            // action's call is: the parent's step waits and asks again.
+            // Every variable field is a slice of the start's payload, which
+            // the inbound reserve counts; one that isn't must grow it.
+            const mark = view.mark();
             try view.put(Parents, k, .{ .v = .{
                 .parent_slot = p.parent_slot,
                 .parent_run = p.parent_run,
@@ -1243,6 +1249,13 @@ fn applyParent(view: *View, e: *const Entry, n: Named) ApplyError!void {
                 .input = p.input,
                 .state = .pending,
             } });
+            if (gate.overSince(view, mark)) |o| {
+                try view.rollback(mark);
+                var wb: [128]u8 = undefined;
+                const shard: u16 = if (view.store.place) |pl| pl.group else 0;
+                const why = std.fmt.bufPrint(&wb, "shard {d} memory: {d} + {d} would pass its share {d}", .{ shard, o.use, o.delta, o.share }) catch "shard memory: past its share";
+                return reply(view, n.ns, n.run, p.parent_slot, .over_budget, why);
+            }
         },
         .child_refuse => {
             const p = ae.ChildRefuse.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -2291,4 +2304,34 @@ test "workflow runs machine: a trigger's start applies only right after the one 
     const again = try triggerStartAt(&f, "g", key, .{ .ns = 16, .made = 9, .stream = "ev", .ts = 2, .seq = 0, .after_ts = 77, .after_seq = 7 });
     try testing.expect(again.refused() == null);
     try testing.expectEqual(@as(?Run.Value, null), f.get("g"));
+}
+
+test "workflow runs machine: a child's start past its shard's share is answered over_budget, recording nothing; once memory frees it is recorded" {
+    const pool = @import("../budget/pool.zig");
+    const settings = @import("../settings/machine.zig");
+    var f = Fixture.init();
+    defer f.deinit();
+    var cb: [ae.ChildStart.max_size]u8 = undefined;
+    const cs = try ae.ChildStart.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .parent_slot = 7, .parent_run = "par", .parent_workflow = "pwf", .workflow = "kid", .version = "", .run = "kid1", .input = "{}" });
+    try settings.bindForTest(&f.store, pool.useOf(&f.store));
+    f.index += 1;
+    var e = entry_mod.buildEntry(.child_start, entry_mod.Flags.NONE, 1, f.index, 0, cs);
+    try testing.expect((try Fixture.run(&machine, &f, &e)).refused() == null);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "kid1") == null);
+    var it = (ReadView{ .store = &f.store }).range(channels.OutFam, "");
+    var told: ?ae.Reply.Value = null;
+    while (try it.next()) |item| {
+        if (item.value.v.entry_type != @backingInt(EntryType.call_reply)) continue;
+        var diag: schema.Diagnostic = .{};
+        told = try ae.Reply.decodeAll(item.value.v.payload, &diag);
+    }
+    try testing.expectEqual(ae.Answer.over_budget, told.?.answer);
+    try testing.expectEqualStrings("kid1", told.?.run);
+    try testing.expect(std.mem.indexOf(u8, told.?.why.?, "would pass its share") != null);
+    // Asked again once memory frees: recorded, to be started.
+    try settings.bindForTest(&f.store, std.math.maxInt(u64));
+    f.index += 1;
+    e = entry_mod.buildEntry(.child_start, entry_mod.Flags.NONE, 1, f.index, 0, cs);
+    try testing.expect((try Fixture.run(&machine, &f, &e)).refused() == null);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "kid1") != null);
 }

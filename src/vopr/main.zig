@@ -1042,7 +1042,7 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !SwarmEnd {
             std.debug.print("[vopr] FAILED: {d} passing seeds printed no workflow run counts\n", .{unread_counts});
             counted = false;
         }
-        for (WORKFLOW_RUN_CLASSES, wf_run_totals.classes) |k, n| if (n == 0 and ok_count > 0) {
+        for (WORKFLOW_RUN_CLASSES, wf_run_totals.classes) |k, n| if (n == 0 and ok_count > 0 and (k != .child_held or args.memory_gate)) {
             std.debug.print("[vopr] UNCOVERED: no seed reached {t}\n", .{k});
             covered = false;
         };

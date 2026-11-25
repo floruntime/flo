@@ -113,7 +113,7 @@ pub const Plant = enum {
     /// A KV reap drops every key it names, gone or not: it trusts the
     /// leader's clock over the entry's stamp.
     kv_reap_trusts_leader,
-    /// The memory pool counts a family it exempts (workflow runs).
+    /// The memory pool counts a family it exempts (workflow history).
     pool_counts_exempt_family,
     /// Records reach a store without its link, as a loader that skipped the
     /// store's counters would leave them.
