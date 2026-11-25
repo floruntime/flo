@@ -185,8 +185,8 @@ fn missingRun(handler: *WorkflowHandler, at: RunAt.Value) void {
 /// skipped like a missing one, so one bad run never fails every page.
 fn unlistable(handler: *WorkflowHandler, at: RunAt.Value, err: anyerror) void {
     handler.missing_runs += 1;
-    if (handler.missing_runs_logged > 0) return;
-    handler.missing_runs_logged += 1;
+    if (handler.unlistable_said) return;
+    handler.unlistable_said = true;
     if (@import("builtin").is_test)
         log.warn("workflow run list: run {s} can't be listed ({s}); skipped", .{ at.run_id, @errorName(err) })
     else

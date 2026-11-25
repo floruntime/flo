@@ -205,6 +205,10 @@ pub const ActionsHandler = struct {
     /// Set once a run list met a run its page's schema can't hold (a Flo
     /// bug): logged once, not every page.
     unlistable_said: bool = false,
+    /// Set once a run list met an index row with no run (a Flo bug).
+    missing_run_said: bool = false,
+    /// Runs a run list passed over, for either reason.
+    unlisted_runs: u64 = 0,
     /// action.info copies the action's owner here: the answer is encoded
     /// after the handler returns, so its own stack is gone.
     info_owner_buf: [action_ops.MAX_OWNER]u8 = undefined,
@@ -523,6 +527,15 @@ pub const ActionsHandler = struct {
             const tail = item.key[prefix.len..];
             const at: RunCursor.Value = .{ .created_at_ms = @intCast(std.math.maxInt(u64) - std.mem.readInt(u64, tail[0..8], .big)), .run = tail[8..] };
             const run = getRunAt(shard, &rb, req.ns_id, at.run) orelse {
+                // A Flo bug a list survives: logged once, counted.
+                self.unlisted_runs += 1;
+                if (!self.missing_run_said) {
+                    self.missing_run_said = true;
+                    if (@import("builtin").is_test)
+                        log.warn("action run list: run {s} is indexed but not there; skipped", .{at.run})
+                    else
+                        log.err("action run list: run {s} is indexed but not there; skipped", .{at.run});
+                }
                 read += 1;
                 last = at;
                 continue;
@@ -539,6 +552,7 @@ pub const ActionsHandler = struct {
             const added = b.add(listed) catch |err| {
                 // A Flo bug: skipped like a missing run, so one bad run
                 // never fails every page.
+                self.unlisted_runs += 1;
                 if (!self.unlistable_said) {
                     self.unlistable_said = true;
                     if (@import("builtin").is_test)

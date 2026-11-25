@@ -187,10 +187,11 @@ pub const WorkflowHandler = struct {
     /// An index couldn't keep an entry: the runs are walked again
     /// (`leadCaches`).
     rewatch: bool = false,
-    /// Index rows a run list met with no run (a Flo bug), and how many of
-    /// them were logged: the first, not every page's.
+    /// Index rows a run list passed over (a Flo bug): its run gone, or its
+    /// entry unlistable. Each kind is logged once, not every page.
     missing_runs: u64 = 0,
     missing_runs_logged: u32 = 0,
+    unlistable_said: bool = false,
     /// The cancel this leader proposed last for a run, by key, owned: its
     /// end is counted when that entry applies. Leader memory.
     ending: std.StringHashMapUnmanaged(Ending) = .empty,
