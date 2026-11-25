@@ -615,9 +615,17 @@ fn appendTsSource(
     src.ts_measurement = try dupe(allocator, measurement);
     src.ts_field = try dupe(allocator, field);
     src.ts_tags = try parseStringPairs(allocator, d, ts_obj, "tags");
-    // The series the source reads is named by its tags as a TS read names
-    // them, `key=value` joined by commas: past the read's limits it would
-    // read another series, or none.
+    // The series the source reads is named by its tags as a TS write and
+    // read name them: one string of `key=value` pairs joined by commas, split
+    // again on `,` and each pair at its first `=`. A comma in a key or value,
+    // or an `=` in a key, would split one tag into others; past the read's
+    // limits the string is cut, or its hash is 0, which filters nothing and
+    // reads every series of the measurement.
+    for (src.ts_tags, 0..) |t, i| {
+        const key = i % 2 == 0;
+        if (mem.indexOfScalar(u8, t, ',') != null) return d.fail(ParseError.InvalidFormat, "a tag's {s} can't hold ',': \"{s}\"", .{ if (key) "name" else "value", t });
+        if (key and mem.indexOfScalar(u8, t, '=') != null) return d.fail(ParseError.InvalidFormat, "a tag's name can't hold '=': \"{s}\"", .{t});
+    }
     if (src.ts_tags.len / 2 > ts_mod.MAX_TAGS) return d.fail(ParseError.InvalidFormat, "\"tags\" takes at most {d} tags, not {d}", .{ ts_mod.MAX_TAGS, src.ts_tags.len / 2 });
     var canonical: usize = 0;
     for (src.ts_tags, 0..) |t, i| canonical += t.len + if (i % 2 == 0) @as(usize, @intFromBool(i > 0)) else 1;
@@ -2323,5 +2331,72 @@ test "parser: a TS source's tags are held to a TS read's limits, refused past 32
             defer def.deinit(allocator);
             try std.testing.expectEqual(c.tags * 2, def.primarySource().?.ts_tags.len);
         }
+    }
+}
+
+/// A TS source of `values.len` tags with two-letter keys, the i-th value
+/// `values[i]` bytes of `v`, or the YAML `raw` for its tags.
+fn tsSourceJob(allocator: Allocator, values: []const usize, raw: []const u8) ![]u8 {
+    var tags: std.ArrayList(u8) = .empty;
+    defer tags.deinit(allocator);
+    for (values, 0..) |len, i| {
+        try tags.print(allocator, "        {c}{c}: \"", .{ @as(u8, 'a') + @as(u8, @intCast(i / 26)), @as(u8, 'a') + @as(u8, @intCast(i % 26)) });
+        try tags.appendNTimes(allocator, 'v', len);
+        try tags.appendSlice(allocator, "\"\n");
+    }
+    try tags.appendSlice(allocator, raw);
+    return std.fmt.allocPrint(allocator,
+        \\kind: Processing
+        \\sources:
+        \\  - ts:
+        \\      measurement: cpu
+        \\      tags:
+        \\{s}sinks:
+        \\  - stream:
+        \\      name: out
+        \\
+    , .{tags.items});
+}
+
+test "parser: a TS source's tags take exactly 1024 bytes, and one tag can't be read as two" {
+    const allocator = std.testing.allocator;
+    const Case = struct { values: []const usize, raw: []const u8 = "", says: ?[]const u8 };
+    for ([_]Case{
+        // 3 + 500, 3 + 500, 3 + 13 and two commas: 1024 exactly.
+        .{ .values = &.{ 500, 500, 13 }, .says = null },
+        .{ .values = &.{ 500, 500, 14 }, .says = "not 1025" },
+        // A comma would split a tag in two, read as another series.
+        .{ .values = &.{}, .raw = "        aa: \"x,zz=q\"\n", .says = "a tag's value can't hold ','" },
+        .{ .values = &.{}, .raw = "        \"a,b\": x\n", .says = "a tag's name can't hold ','" },
+        .{ .values = &.{}, .raw = "        \"a=b\": x\n", .says = "a tag's name can't hold '='" },
+        // An `=` in a value is the value's: a pair splits at its first.
+        .{ .values = &.{}, .raw = "        aa: \"x=y\"\n", .says = null },
+    }) |c| {
+        const text = try tsSourceJob(allocator, c.values, c.raw);
+        defer allocator.free(text);
+        if (c.says) |says| {
+            var diag: Diagnostic = .{};
+            try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, &diag));
+            try std.testing.expect(mem.indexOf(u8, diag.message(), says) != null);
+        } else {
+            var def = try parseJobDefinition(allocator, text, null);
+            def.deinit(allocator);
+        }
+    }
+}
+
+test "parser: a TS source at either limit names its series: the runtime's tag hash isn't 0" {
+    const allocator = std.testing.allocator;
+    var at_count: [ts_mod.MAX_TAGS]usize = @splat(1);
+    for ([_][]const usize{ &at_count, &.{ 500, 500, 13 } }) |values| {
+        const text = try tsSourceJob(allocator, values, "");
+        defer allocator.free(text);
+        var def = try parseJobDefinition(allocator, text, null);
+        defer def.deinit(allocator);
+        const tags = def.primarySource().?.ts_tags;
+        var pairs: [ts_mod.MAX_TAGS]ts_mod.TagPair = undefined;
+        for (0..tags.len / 2) |i| pairs[i] = .{ .key = tags[2 * i], .value = tags[2 * i + 1] };
+        var buf: [ts_mod.MAX_TAG_STRING]u8 = undefined;
+        try std.testing.expect(ts_mod.canonicalTagHashPairs(pairs[0 .. tags.len / 2], &buf) != 0);
     }
 }
