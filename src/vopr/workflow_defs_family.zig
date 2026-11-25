@@ -52,6 +52,8 @@ pub const WorkflowDefs = struct {
     pub const Effect = struct {
         kind: Kind,
         refused: bool,
+        /// Refused for memory: past the share.
+        memory: bool = false,
         broke: ?[]const u8 = null,
     };
 
@@ -141,6 +143,7 @@ pub const WorkflowDefs = struct {
         // Past its share a create is refused whatever it asks: the memory
         // checker judges that verdict (`memory_gate.zig`).
         if (out.refused()) |rf| if (rf.refusal.reason == .memory_budget) {
+            effect.memory = true;
             if (before != self.store.families[dm.DefFam.ID].commits) return error.RefusalChangedState;
             if (kind != .create) effect.broke = "a definition's enable was refused for memory";
             return effect;

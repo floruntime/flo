@@ -197,6 +197,10 @@ pub const WorkflowMetrics = struct {
     /// Leases past due a leader leaves running, since ending them would
     /// send a called run's end where there's no room: as of its last pass.
     action_expires_held: Atomic(u64) = Atomic(u64).init(0),
+    /// Schedules and triggers holding their starts, at their last attempt:
+    /// their shard at its memory share, or waiting after a start refused
+    /// there. As of the leader's last pass.
+    duties_memory_held: Atomic(u64) = Atomic(u64).init(0),
 
     pub fn init() WorkflowMetrics {
         return .{};
@@ -274,6 +278,7 @@ pub const WorkflowMetrics = struct {
         action_answers_without_call_total: u64,
         active_schedules: u64,
         action_expires_held: u64,
+        duties_memory_held: u64,
     };
 
     pub fn snapshot(self: *const WorkflowMetrics) Snapshot {
@@ -291,6 +296,7 @@ pub const WorkflowMetrics = struct {
             .action_answers_without_call_total = self.action_answers_without_call_total.load(.monotonic),
             .active_schedules = self.active_schedules.load(.monotonic),
             .action_expires_held = self.action_expires_held.load(.monotonic),
+            .duties_memory_held = self.duties_memory_held.load(.monotonic),
         };
     }
 };
@@ -1868,6 +1874,9 @@ fn writeWorkflowMetrics(writer: anytype, snapshot: WorkflowMetrics.Snapshot) !vo
     try writer.print("# HELP flo_action_expires_held Past-due leases of called runs left running while their end has no room to be sent\n", .{});
     try writer.print("# TYPE flo_action_expires_held gauge\n", .{});
     try writer.print("flo_action_expires_held {d}\n", .{snapshot.action_expires_held});
+    try writer.print("# HELP flo_workflow_duties_memory_held Schedules and triggers holding their starts at their last attempt: their shard at its memory share, or waiting after a start refused there\n", .{});
+    try writer.print("# TYPE flo_workflow_duties_memory_held gauge\n", .{});
+    try writer.print("flo_workflow_duties_memory_held {d}\n", .{snapshot.duties_memory_held});
 }
 
 /// Write processing metrics in Prometheus format
