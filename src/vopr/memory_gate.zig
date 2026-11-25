@@ -11,7 +11,8 @@
 //! - a group's deliver at its share takes no fresh record;
 //! - a run's start is refused or held for memory only past the share, and
 //!   one that made its run stayed within it, its sends apart (they are
-//!   written after its verdict, `memory_budget.OWN_SENDS_BYTES`).
+//!   written after its verdict, `memory_budget.OWN_SENDS_BYTES`);
+//! - a signal likewise, but taken within the share and the wake slack.
 
 const std = @import("std");
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -19,6 +20,7 @@ const persistence = @import("../storage/persistence.zig");
 const store_mod = @import("../contract/store.zig");
 const machine_mod = @import("../contract/machine.zig");
 const gate = @import("../budget/gate.zig");
+const start_verdict = @import("../budget/start_verdict.zig");
 const pool = @import("../budget/pool.zig");
 const settings = @import("../settings/machine.zig");
 const group_machine = @import("../stream/group_machine.zig");
@@ -82,6 +84,7 @@ fn watch(m: *const machine_mod.Machine, store: *Store, e: *const Entry, out: *co
     if (refusable) judged += 1;
     if (t == .group_deliver) return judgeDeliver(store, e, memory, before, share);
     if (t == .workflow_start) return judgeStart(m, store, e, out, memory, before, share);
+    if (t == .workflow_signal) return judgeSignal(m, store, e, out, memory, before, share);
     if (memory and !refusable) return fail(e, "an entry never refused for memory was refused for it");
     if (!refusable) return;
     if (out.refused() != null and !memory) return;
@@ -112,6 +115,20 @@ fn judgeStart(m: *const machine_mod.Machine, store: *Store, e: *const Entry, out
     if ((r.int(u8) orelse 0) != 1) return;
     const add = @as(i64, @intCast(pool.dataUseOf(store))) - @as(i64, @intCast(data_before));
     if (!gate.fits(before, add, share)) return fail(e, "a run's start past its shard's share made its run");
+}
+
+/// A signal's: refused for memory only past the share, and taken only
+/// within it and the slack a wake may use.
+fn judgeSignal(m: *const machine_mod.Machine, store: *Store, e: *const Entry, out: *const persistence.Result, memory: bool, before: u64, share: u64) void {
+    judged += 1;
+    if (memory) {
+        const add = wouldAddData(m, store, e) orelse return;
+        if (gate.fits(before, add, share)) return fail(e, "a signal within its shard's share was refused for memory");
+        return;
+    }
+    if (out.refused() != null) return;
+    const add = @as(i64, @intCast(pool.dataUseOf(store))) - @as(i64, @intCast(data_before));
+    if (!gate.fits(before, add, share +| start_verdict.WAKE_SLACK_BYTES)) return fail(e, "a signal past its shard's share and slack was taken");
 }
 
 /// What `e` would add to the charged families but the channels' of `store`,

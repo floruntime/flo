@@ -6,8 +6,8 @@
 //! carries is refused here (a sink's message is held before it is proposed,
 //! `channels.sinkRoom`), nor anything the node writes for itself: a duty, a
 //! delete, a channel's own entries. A type whose machine caps itself (`own`)
-//! applies its own rule: a run's start, which a duty may propose, is held
-//! by the runs machine (`start_verdict.zig`).
+//! applies its own rule: a run's start, which a duty may propose, and a
+//! signal are held by the runs machine (`start_verdict.zig`).
 //!
 //! The verdict reads only the committed store and the bound share, so every
 //! replica, replay included, reaches the same one.
@@ -76,9 +76,9 @@ pub fn classOf(t: EntryType) Class {
         // relies on the create: a refused create would orphan its id. The
         // table is capped instead.
         .namespace_create => .never,
-        // Charged, but not held to the share yet: past it a signal still
-        // lands, while other writes are refused.
-        .workflow_signal => .never,
+        // Held by the runs machine too: past the share a signal is refused,
+        // but one that wakes its run is taken within a slack.
+        .workflow_signal => .own,
         // A run admitted is let finish: a step's outputs are keyed by its
         // name, so a run's are bounded by its definition. Enabling is set in
         // place.
@@ -198,6 +198,7 @@ test "gate: what a client writes is refusable, what frees or the node writes for
     for ([_]EntryType{ .kv_delete, .kv_reap, .kv_expire, .stream_trim, .queue_deliver, .action_settle, .action_release, .namespace_create, .channel_inbound, .channel_unpark, .settings_budget_bind }) |t| try testing.expectEqual(Class.never, classOf(t));
     try testing.expectEqual(Class.own, classOf(.group_deliver));
     try testing.expectEqual(Class.own, classOf(.workflow_start));
+    try testing.expectEqual(Class.own, classOf(.workflow_signal));
 }
 
 test "gate: nothing that adds nothing is held back, whatever the use" {

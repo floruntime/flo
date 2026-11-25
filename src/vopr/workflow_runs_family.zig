@@ -67,6 +67,7 @@ const defs_family = @import("workflow_defs_family.zig");
 const pool = @import("../budget/pool.zig");
 const gate = @import("../budget/gate.zig");
 const memory_gate = @import("memory_gate.zig");
+const start_verdict = @import("../budget/start_verdict.zig");
 const settings = @import("../settings/machine.zig");
 
 const Allocator = std.mem.Allocator;
@@ -268,11 +269,15 @@ pub const WorkflowRuns = struct {
         delete_orphaned,
         /// A start of a deleted run's id.
         deleted_id_reused,
+        /// A signal refused past the share.
+        signal_held,
+        /// A signal that wakes its run, taken past the share within the slack.
+        wake_in_slack,
     };
 
     /// Classes reached only under a memory share.
     pub fn underShareOnly(c: Class) bool {
-        return c == .child_held or c == .start_held or c == .child_start_held or c == .create_held;
+        return c == .child_held or c == .start_held or c == .child_start_held or c == .create_held or c == .signal_held or c == .wake_in_slack;
     }
 
     /// Reached only without a share: held at one, most signals are refused,
@@ -756,8 +761,20 @@ pub const WorkflowRuns = struct {
                         run.sig_next += 1;
                         run.hist[run.hist_next % HIST_RING] = .{ .kind = .received, .type = @intCast(ty), .at_ms = stamp_ms };
                         run.hist_next += 1;
+                        // Past the share the shard committed to, what it
+                        // writes but its sends: refused, unless it wakes its
+                        // run and the slack holds it.
+                        const wakes = run.wait.wait == .signal and std.mem.eql(u8, run.wait.on, SIG_TYPES[ty]);
+                        if (settings.boundShare(.{ .store = store })) |b| {
+                            const add = memory_gate.wouldAddData(&rm.machine, store, e) orelse return null;
+                            const use = pool.useOf(store);
+                            if (!gate.fits(use, add, b.share_bytes)) {
+                                if (!wakes or !gate.fits(use, add, b.share_bytes +| start_verdict.WAKE_SLACK_BYTES)) return refuseAs(.signal, "past its shard's share", .signal_held);
+                                want.classes.insert(.wake_in_slack);
+                            }
+                        }
                         // Its type is the one the run waits on: it wakes.
-                        if (run.wait.wait == .signal and std.mem.eql(u8, run.wait.on, SIG_TYPES[ty])) {
+                        if (wakes) {
                             run.hist[run.hist_next % HIST_RING] = .{ .kind = .matched, .type = @intCast(ty), .at_ms = stamp_ms };
                             run.hist_next += 1;
                             run.wait = .{};

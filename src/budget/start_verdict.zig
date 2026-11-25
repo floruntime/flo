@@ -21,8 +21,11 @@ pub const Verdict = struct {
     bound: Bound,
     over: gate.Over,
 
-    /// The refusal for a client's, a schedule's or a trigger's start.
+    /// The refusal for a client's, a schedule's or a trigger's start, or a
+    /// signal.
     pub fn refuse(v: Verdict, out: *persistence.Result, view: *const view_mod.View) void {
+        // Counted with the gate's refusals (`flo_shard_memory_refusals_total`).
+        view.store.memory_refusals += 1;
         switch (v.bound) {
             .memory_budget => gate.refuse(out, if (view.store.place) |pl| pl.group else null, v.over),
         }
@@ -37,12 +40,26 @@ pub const Verdict = struct {
     }
 };
 
+/// How far past its share a shard takes a signal that wakes a run waiting
+/// on its type: refusing it could strand a run that would end and free
+/// memory. Past this the wake is refused like any signal. At least one
+/// largest wake fits it (`memory_budget`), and every shard's reserve holds it.
+pub const WAKE_SLACK_BYTES: u64 = 1 << 20;
+
+/// A signal's verdict, `startVerdict`'s with the slack for one that wakes
+/// its run: admitted while the committed use and what it adds stay within
+/// the share and the slack.
+pub fn signalVerdict(view: *view_mod.View, ns: NamespaceId, wakes: bool) ?Verdict {
+    const v = startVerdict(view, ns) orelse return null;
+    if (wakes and gate.fits(v.over.use, v.over.delta, v.over.share +| WAKE_SLACK_BYTES)) return null;
+    return v;
+}
+
 /// Null when what is staged in `view` may commit for a run of namespace
 /// `ns`; otherwise the bound it would pass.
 pub fn startVerdict(view: *view_mod.View, ns: NamespaceId) ?Verdict {
     // The quota arm, per namespace, goes first.
     _ = ns;
-    if (comptime plant.active == .start_verdict_admits) return null;
     if (gate.over(view)) |o| return .{ .bound = .memory_budget, .over = o };
     return null;
 }

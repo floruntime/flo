@@ -191,7 +191,7 @@ pub const Wait = enum(u8) {
 pub const MAX_PROGRESS: usize = 1024;
 
 /// The most a logged event's type, a step's name or an outcome holds.
-const MAX_NAME = 1024;
+pub const MAX_NAME = 1024;
 /// The most a step's event detail or output holds: an entry, less the
 /// rest of the step.
 const MAX_BODY = MAX_PERSIST_PAYLOAD - 4 * MAX_NAME;
@@ -894,7 +894,7 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
     // Held past its shard's share: nothing of it is written. A child's
     // parent is told instead, its record gone, and asks again; dropping the
     // entry would drop that answer too.
-    if (start_verdict.startVerdict(view, n.ns)) |v| {
+    if (comptime plant.active != .start_verdict_admits) if (start_verdict.startVerdict(view, n.ns)) |v| {
         if (!s.isChild()) return v.refuse(out, view);
         try view.rollback(mark);
         var wb: [128]u8 = undefined;
@@ -904,7 +904,7 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
         try view.delete(Parents, k);
         out.putInt(u8, 0);
         return;
-    }
+    };
 
     out.putInt(u8, 1);
     out.putBytes(n.run);
@@ -977,7 +977,8 @@ fn applySignal(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i
     run.sig_held += 1;
     try appendHist(view, n, &run, "signal_received", sig.type, stamp_ms);
     const any_type = comptime plant.active == .runs_wake_any_type;
-    if (run.wait == .signal and (any_type or std.mem.eql(u8, run.wait_on, sig.type))) {
+    const wakes = run.wait == .signal and (any_type or std.mem.eql(u8, run.wait_on, sig.type));
+    if (wakes) {
         try appendHist(view, n, &run, "signal_matched", sig.type, stamp_ms);
         run.wait = .none;
         run.wait_on = "";
@@ -987,6 +988,10 @@ fn applySignal(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i
         if (comptime plant.active != .runs_signal_wake_keeps_rev) run.rev += 1;
     }
     try view.put(RunFam, cmd.key, .{ .v = run });
+    // Held past its shard's share once all of it is staged: nothing lands,
+    // and its client sends it again once memory frees. One that wakes its
+    // run is taken within the slack.
+    if (comptime plant.active != .signal_verdict_admits) if (start_verdict.signalVerdict(view, n.ns, wakes)) |v| return v.refuse(out, view);
 }
 
 /// Whether run `run_key` holds a signal of `signal_type` no wait has
@@ -2547,4 +2552,42 @@ test "workflow runs machine: what a start sends after its verdict, a run that st
     // Two chunks went: the first event, then the run's last.
     try testing.expect(sent > input.len);
     try testing.expect(sent <= memory_budget.OWN_SENDS_BYTES);
+}
+
+test "workflow runs machine: past its shard's share a signal is refused, writing nothing; one that wakes its run is taken within the slack, and refused past it" {
+    const pool = @import("../budget/pool.zig");
+    const settings = @import("../settings/machine.zig");
+    const start_verdict_mod = @import("../budget/start_verdict.zig");
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    try testing.expect((try f.step("r1", .{ .rev = 0, .wait = .signal, .wait_on = "go" })).refused() == null);
+    // More held than the slack, so a share can sit below the use by it.
+    const big = try f.store.allocator.alloc(u8, start_verdict_mod.WAKE_SLACK_BYTES + 4096);
+    @memset(big, 'x');
+    f.store.link(10, try f.store.allocRecord("filler"), big);
+    var kb: [64]u8 = undefined;
+    const key = view_mod.idKey(&kb, .default, "r1") catch unreachable;
+    var sb: [128]u8 = undefined;
+    const use = pool.useOf(&f.store);
+    try settings.bindForTest(&f.store, use);
+    // At the share: one it doesn't wait for is refused, and nothing moves.
+    const r = try f.command(.workflow_signal, key, try Signal.encodeInto(&sb, .{ .type = "early", .payload = "p" }), 5);
+    try testing.expectEqual(@import("../protocol/reason.zig").Reason.memory_budget, r.refused().?.refusal.reason);
+    try testing.expect(!try hasSignal(testing.allocator, .{ .store = &f.store }, key, "early"));
+    try testing.expectEqual(use, pool.useOf(&f.store));
+    // Past its slack, the wake is refused too: the run still waits.
+    try settings.bindForTest(&f.store, use - start_verdict_mod.WAKE_SLACK_BYTES);
+    const past = try f.command(.workflow_signal, key, try Signal.encodeInto(&sb, .{ .type = "go", .payload = "" }), 6);
+    try testing.expectEqual(@import("../protocol/reason.zig").Reason.memory_budget, past.refused().?.refusal.reason);
+    try testing.expectEqual(Wait.signal, f.get("r1").?.wait);
+    try testing.expect(!try hasSignal(testing.allocator, .{ .store = &f.store }, key, "go"));
+    try testing.expectEqual(use, pool.useOf(&f.store));
+    // Both refusals counted with the gate's.
+    try testing.expectEqual(@as(u64, 2), f.store.memory_refusals);
+    // Within it, the wake is taken: the run goes on.
+    try settings.bindForTest(&f.store, use);
+    try testing.expect((try f.command(.workflow_signal, key, try Signal.encodeInto(&sb, .{ .type = "go", .payload = "" }), 7)).refused() == null);
+    try testing.expectEqual(Wait.none, f.get("r1").?.wait);
+    try testing.expect(pool.useOf(&f.store) > use);
 }

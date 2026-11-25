@@ -17,10 +17,12 @@ const channel_driver = @import("../contract/channel_driver.zig");
 const ce = @import("../protocol/channel_entries.zig");
 const ae = @import("../protocol/action_entries.zig");
 const he = @import("../protocol/history_entries.zig");
+const start_verdict = @import("../budget/start_verdict.zig");
 const hp = @import("../stream/history_producer.zig");
 const hm = @import("../stream/history_machine.zig");
 const action_machine = @import("../actions/machine.zig");
 const runs_machine = @import("../workflow/runs_machine.zig");
+const WorkflowHandler = @import("../workflow/handler.zig").WorkflowHandler;
 const schema = @import("../protocol/schema.zig");
 
 /// The fixed overhead a shard holds before client data, measured ~5 MiB after
@@ -97,10 +99,11 @@ comptime {
 const HISTORY_ROW_BYTES: u64 = pool.RESIDENT_RECORD + 4 + he.MAX_OWNER + he.MAX_RUN + 64 + hm.Row.max_size;
 const HISTORY_LAND_BYTES: u64 = 3 * HISTORY_ROW_BYTES + 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + channels.CHAN_KEY + channels.OUT_NS_KEY + 3 * 64 + he.Index.max_size;
 
-/// What one admitted start sends, which its verdict can't weigh: sends are
-/// written after the machine's verdict. Its first event, sent at once when
-/// large; for a run that starts ended, its last chunk, which holds no
-/// events then; and for a child, its parent's answer. Each send is an
+/// What one admitted start or signal sends, which its verdict can't weigh:
+/// sends are written after the machine's verdict. A start sends its first
+/// event, at once when large; for a run that starts ended, its last chunk,
+/// which holds no events then; and for a child, its parent's answer. A
+/// signal sends at most one chunk, so a start's figure holds for both. Each send is an
 /// outbox row, and on a first send to its channel or namespace that
 /// channel's meta row and its per-namespace count. The next entry's verdict
 /// reads them committed, so a shard passes its share by one entry's sends
@@ -111,16 +114,28 @@ const HISTORY_LAND_BYTES: u64 = 3 * HISTORY_ROW_BYTES + 3 * pool.RESIDENT_RECORD
 pub const OWN_SENDS_BYTES: u64 = (he.Chunk.max_size + SEND_ROWS_BYTES) + (he.Chunk.max_size - he.MAX_CHUNK_RECORDS + SEND_ROWS_BYTES) + CALL_REPLY_BYTES;
 const SEND_ROWS_BYTES: u64 = 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + channels.CHAN_KEY + channels.OUT_NS_KEY + 3 * 64;
 
+/// The most one signal that wakes its run adds: its signal row (its key the
+/// run's, at most a start's, with a length and a seq; and its value), and
+/// two history events in its run's pending chunk, each naming the signal's
+/// type; the run's own fields only shrink as its wait clears. The wake
+/// slack holds at least one.
+const MAX_WAKE_BYTES: u64 = pool.RESIDENT_RECORD + WorkflowHandler.MAX_START_KEY + 2 + 8 + runs_machine.Sig.max_size +
+    hp.recordBound("signal_received".len, runs_machine.MAX_NAME, 0) + hp.recordBound("signal_matched".len, runs_machine.MAX_NAME, 0);
+
+comptime {
+    std.debug.assert(start_verdict.WAKE_SLACK_BYTES >= MAX_WAKE_BYTES);
+}
+
 /// A node's reserve: per shard, its floor, its configured ring sizes, the
-/// one inbound it may take past its share and one start's sends; plus a
-/// margin. Held back before
+/// one inbound it may take past its share, one start's sends and the wake
+/// slack; plus a margin. Held back before
 /// the pool's share of RAM is taken, so a shard's overshoot fits whatever
 /// share an admin sets, up to all of it. A node computes this from its own
 /// config and reports it in its settings row; the cluster takes it as given.
 /// The margin covers the ~10 MiB a node carries once at low shard counts, so
 /// the linear `floor × shards` holds there too.
 pub fn reserve(shard_count: u32, ring_bytes_per_shard: u64, margin: u64) u64 {
-    return @as(u64, shard_count) * (PER_SHARD_FLOOR_BYTES +| ring_bytes_per_shard +| INBOUND_OVERSHOOT_BYTES +| OWN_SENDS_BYTES) +| margin;
+    return @as(u64, shard_count) * (PER_SHARD_FLOOR_BYTES +| ring_bytes_per_shard +| INBOUND_OVERSHOOT_BYTES +| OWN_SENDS_BYTES +| start_verdict.WAKE_SLACK_BYTES) +| margin;
 }
 
 /// One data-holding member, for the derivation. `mem` is null when the node
@@ -301,7 +316,7 @@ test "derive: reserve ≥ ram contributes 0" {
 test "reserve: floor + rings over shards + margin" {
     // 4 shards, 80 MiB rings each, 256 MiB margin.
     const r = reserve(4, ringBytesPerShard(64 * 1024 * 1024), 256 * 1024 * 1024);
-    try testing.expectEqual(@as(u64, 4) * (PER_SHARD_FLOOR_BYTES + 80 * 1024 * 1024 + INBOUND_OVERSHOOT_BYTES + OWN_SENDS_BYTES) + 256 * 1024 * 1024, r);
+    try testing.expectEqual(@as(u64, 4) * (PER_SHARD_FLOOR_BYTES + 80 * 1024 * 1024 + INBOUND_OVERSHOOT_BYTES + OWN_SENDS_BYTES + start_verdict.WAKE_SLACK_BYTES) + 256 * 1024 * 1024, r);
 }
 
 test "reserve: one inbound's overshoot is twice its payload bound, its calls' rows and the history rows beside it, within 768 KiB over that" {
