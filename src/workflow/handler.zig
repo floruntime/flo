@@ -311,6 +311,9 @@ pub const WorkflowHandler = struct {
         status: RunStatus,
         input_owned: []const u8,
         created_at_ms: i64,
+        /// Its incarnation, as applied: a step names it, so one decided for
+        /// a run since deleted, its id started again, applies to nothing.
+        created_ns: u64 = 0,
         started_at_ms: ?i64,
         completed_at_ms: ?i64,
         idempotency_key_owned: ?[]const u8,
@@ -1472,8 +1475,8 @@ pub const WorkflowHandler = struct {
             return null;
         }
         const reason = if (req.value.len > 0) req.value else "cancelled by user";
-        const c: runs_machine.Complete = .{ .status = .cancelled, .output = null, .event = terminalEventType(.cancelled), .detail = reason, .workflow = run.workflow };
-        var vbuf: [MAX_CANCEL_REASON + MAX_WORKFLOW_NAME_LEN + 64]u8 = undefined;
+        const c: runs_machine.Complete = .{ .status = .cancelled, .output = null, .event = terminalEventType(.cancelled), .detail = reason, .workflow = run.workflow, .created_ns = run.created_ns };
+        var vbuf: [MAX_CANCEL_REASON + MAX_WORKFLOW_NAME_LEN + 72]u8 = undefined;
         const value = c.encode(&vbuf) orelse {
             shard.sendRefusal(conn, req.header.request_id, .internal_error, proto.notRun("internal error: a cancel that doesn't encode"));
             return null;
@@ -3422,6 +3425,7 @@ pub const WorkflowHandler = struct {
         defer if (output) |o| self.allocator.free(o);
 
         const value: Step.Value = .{
+            .created_ns = run.created_ns,
             .rev = run.rev,
             .step = run.current_step_name_owned orelse "",
             .events = .{ .bytes = events.written(), .count = event_count },
@@ -3466,6 +3470,7 @@ pub const WorkflowHandler = struct {
         var events: wire_schema.Writer = .{ .buf = try a.alloc(u8, 512) };
         try runs_machine.Event.encode(&events, .{ .event = terminalEventType(.failed), .detail = "step record too large to log", .at_ms = now_ms });
         const value: runs_machine.Step.Value = .{
+            .created_ns = run.created_ns,
             .rev = run.rev,
             .step = run.current_step_name_owned orelse "",
             .events = .{ .bytes = events.written(), .count = 1 },
@@ -4951,6 +4956,7 @@ pub const WorkflowHandler = struct {
             .status = appliedStatus(rec),
             .input_owned = "",
             .created_at_ms = rec.created_at_ms,
+            .created_ns = rec.created_ns,
             .started_at_ms = rec.created_at_ms,
             .completed_at_ms = if (rec.completed_at_ms != 0) rec.completed_at_ms else null,
             .idempotency_key_owned = null,
@@ -6902,7 +6908,7 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     // Two unfinished here: it holds, though another namespace's run makes three.
     try testing.expectEqual(@as(usize, 0), runsOf(&handler, &shard));
 
-    const c: runs_machine.Complete = .{ .status = .cancelled, .output = null, .event = "workflow_cancelled", .detail = "stop", .workflow = "wf" };
+    const c: runs_machine.Complete = .{ .status = .cancelled, .output = null, .event = "workflow_cancelled", .detail = "stop", .workflow = "wf", .created_ns = handler.appliedRun(testKey(TEST_NS_A, "r1")).?.created_ns };
     var record_buf: [128]u8 = undefined;
     const record = c.encode(&record_buf).?;
     // Applied twice (a second cancel): one run finished.
@@ -8013,6 +8019,7 @@ test "a step's logged counters that won't decode end the run failed, saying why,
     createTestRun(&handler, testKey(.default, "r"), "r", "test-wf");
     // A step whose counters are of a version this build doesn't read.
     const step: runs_machine.Step.Value = .{
+        .created_ns = handler.appliedRun(testKey(.default, "r")).?.created_ns,
         .rev = 0,
         .step = "",
         .events = .{ .bytes = "", .count = 0 },
@@ -8566,6 +8573,7 @@ fn createTestRunAt(handler: *WorkflowHandler, run_id: []const u8, wf_name: []con
         // A step that waits on a signal.
         .waiting => {
             const step: runs_machine.Step.Value = .{
+                .created_ns = handler.appliedRun(ns_key).?.created_ns,
                 .rev = 0,
                 .step = "",
                 .events = .{ .bytes = "", .count = 0 },
@@ -8590,7 +8598,7 @@ fn createTestRunAt(handler: *WorkflowHandler, run_id: []const u8, wf_name: []con
             try handler.applyDirect(.workflow_step, 0, ns_key, try runs_machine.Step.encodeInto(&sb, step), started_at, &out);
         },
         else => {
-            const c: runs_machine.Complete = .{ .status = status, .output = null, .event = "ended", .detail = "", .workflow = wf_name };
+            const c: runs_machine.Complete = .{ .status = status, .output = null, .event = "ended", .detail = "", .workflow = wf_name, .created_ns = handler.appliedRun(ns_key).?.created_ns };
             var cb: [256]u8 = undefined;
             try handler.replayComplete(ns_key, c.encode(&cb).?, started_at, &out);
         },
@@ -9325,6 +9333,7 @@ fn stepTestRun(handler: *WorkflowHandler, key: []const u8, wf: []const u8, rev: 
     var ew: wire_schema.Writer = .{ .buf = eb };
     runs_machine.Event.encode(&ew, .{ .event = "big", .detail = detail, .at_ms = 0 }) catch unreachable;
     const value: Step.Value = .{
+        .created_ns = handler.appliedRun(key).?.created_ns,
         .rev = rev,
         .step = "s",
         .events = .{ .bytes = ew.written(), .count = 1 },

@@ -142,6 +142,8 @@ pub const Plant = enum {
     actions_delete_keeps_history,
     /// An action's counts don't move as its runs do.
     actions_counts_unmoved,
+    /// A step applies to its run whatever incarnation it was decided for.
+    runs_step_incarnation_unchecked,
 };
 
 pub const active: Plant = std.meta.stringToEnum(Plant, @import("build_options").vopr_plant) orelse

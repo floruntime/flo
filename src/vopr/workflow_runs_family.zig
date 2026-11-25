@@ -273,6 +273,10 @@ pub const WorkflowRuns = struct {
         signal_held,
         /// A signal that wakes its run, taken past the share within the slack.
         wake_in_slack,
+        /// A step or cancel naming an earlier incarnation's workflow.
+        workflow_mismatch,
+        /// A step or cancel for an earlier incarnation of its workflow.
+        stale_incarnation,
     };
 
     /// Classes reached only under a memory share.
@@ -342,7 +346,7 @@ pub const WorkflowRuns = struct {
         gone_next: usize = 0,
     };
     const GONE = 32;
-    const GoneL = struct { wf: usize, run: usize, idem: ?usize, created_ns: u64, completed_ms: i64, orphaned: bool };
+    pub const GoneL = struct { wf: usize, run: usize, idem: ?usize, created_ns: u64, completed_ms: i64, orphaned: bool };
 
     pub const FAMILIES = [_]u16{ rm.RunFam.ID, hm.Workflows.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID, calls_mod.Calls.ID, rm.SigFam.ID, rm.RunAtFam.ID, rm.RunAllFam.ID };
     pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "history.wf", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents", "step.calls", "workflow.sig", "workflow.run_at", "workflow.run_all" };
@@ -536,7 +540,8 @@ pub const WorkflowRuns = struct {
                         // Decided for an earlier incarnation of the id: this
                         // simulator's leader proposes from a lagging view, as a
                         // ready one never does.
-                        if (!std.mem.eql(u8, st.workflow, NAMES[run.wf])) return refuse(.step, "it names an earlier incarnation's workflow");
+                        if (!std.mem.eql(u8, st.workflow, NAMES[run.wf])) return refuseAs(.step, "it names an earlier incarnation's workflow", .workflow_mismatch);
+                        if (st.created_ns != run.created_ns) return refuseAs(.step, "it names another incarnation", .stale_incarnation);
                         const ends: ?RunStatus = if (st.ends == 0) null else blk: {
                             const s = std.enums.fromInt(RunStatus, st.ends) orelse return null;
                             if (!s.isTerminal()) return null;
@@ -738,7 +743,8 @@ pub const WorkflowRuns = struct {
                     .complete => {
                         const c = rm.Complete.parse(cmd.value) orelse return null;
                         var run = l.runs[r] orelse return refuse(.complete, "its run isn't there");
-                        if (!std.mem.eql(u8, c.workflow, NAMES[run.wf])) return refuse(.complete, "it names an earlier incarnation's workflow");
+                        if (!std.mem.eql(u8, c.workflow, NAMES[run.wf])) return refuseAs(.complete, "it names an earlier incarnation's workflow", .workflow_mismatch);
+                        if (c.created_ns != run.created_ns) return refuseAs(.complete, "it names another incarnation", .stale_incarnation);
                         if (run.status.isTerminal()) {
                             if (run.status == c.status) return want;
                             return refuse(.complete, "its run ended otherwise");
@@ -1385,7 +1391,14 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
         const c = if (longest != null and pick < 25) longest.? else if (pick < 45) waiting.or_(r, 100, live.or_(r, 80, held.at(r))) else live.or_(r, 80, unstepped.or_(r, 30, held.at(r)));
         const vb = buf[buf.len / 2 ..];
         const spare = hoard == c and r.uintLessThan(u8, 100) < 90;
-        const value = stepValue(r, vb, c, l.runs[c].?, spare) orelse return null;
+        // Now and then one decided for an incarnation of this id deleted
+        // since: refused for its incarnation, or its workflow.
+        var as = l.runs[c].?;
+        if (staleOf(l, c)) |g| if (r.uintLessThan(u8, 100) < 8) {
+            as.wf = g.wf;
+            as.created_ns = g.created_ns;
+        };
+        const value = stepValue(r, vb, c, as, spare) orelse return null;
         return command(buf[0 .. buf.len / 2], .workflow_step, view_mod.idKey(&kb, NS, RUNS[c]) catch unreachable, value);
     }
     // A call's answer, retry or clear: mostly of a call the leader holds.
@@ -1415,7 +1428,13 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
         var c = live.or_(r, 75, held.at(r));
         if (hoard == c and r.uintLessThan(u8, 100) < 95) c = held.at(r);
         const vb = buf[buf.len / 2 ..];
-        const value = completeValue(r, vb, ENDS[r.uintLessThan(usize, ENDS.len)], NAMES[l.runs[c].?.wf]) orelse return null;
+        var wf = l.runs[c].?.wf;
+        var created_ns = l.runs[c].?.created_ns;
+        if (staleOf(l, c)) |g| if (r.uintLessThan(u8, 100) < 8) {
+            wf = g.wf;
+            created_ns = g.created_ns;
+        };
+        const value = completeValue(r, vb, ENDS[r.uintLessThan(usize, ENDS.len)], NAMES[wf], created_ns) orelse return null;
         return command(buf[0 .. buf.len / 2], .workflow_complete, view_mod.idKey(&kb, NS, RUNS[c]) catch unreachable, value);
     }
     // A delete: mostly of an ended run, as the leader holds it; now and
@@ -1579,6 +1598,7 @@ fn stepValue(r: std.Random, buf: []u8, c: usize, run: WorkflowRuns.RunL, spare: 
         outs += 1;
     };
     var value: rm.Step.Value = .{
+        .created_ns = run.created_ns,
         // Now and then a rev another leader moved past; for a run a signal
         // woke, often the rev from before the wake, as a step decided from
         // the wait and applied after the signal is.
@@ -1678,14 +1698,22 @@ fn endStep(r: std.Random, v: *rm.Step.Value) void {
     if (v.has_output) v.output = OUTPUTS[r.uintLessThan(usize, OUTPUTS.len)];
 }
 
+/// A deleted incarnation of run `c`'s id, another than the run's now.
+fn staleOf(l: *const WorkflowRuns.Ledger, c: usize) ?WorkflowRuns.GoneL {
+    const now = l.runs[c] orelse return null;
+    for (l.gone) |x| if (x) |g| if (g.run == c and g.created_ns != now.created_ns) return g;
+    return null;
+}
+
 /// A cancel's completion, as `Complete.parse` reads it: maybe an output.
-fn completeValue(r: std.Random, buf: []u8, status: RunStatus, wf: []const u8) ?[]const u8 {
+fn completeValue(r: std.Random, buf: []u8, status: RunStatus, wf: []const u8, created_ns: u64) ?[]const u8 {
     const c: rm.Complete = .{
         .status = status,
         .output = if (r.boolean()) OUTPUTS[r.uintLessThan(usize, OUTPUTS.len)] else null,
         .event = CANCEL_EVENT,
         .detail = "",
         .workflow = wf,
+        .created_ns = created_ns,
     };
     return c.encode(buf);
 }

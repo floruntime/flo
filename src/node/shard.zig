@@ -22395,7 +22395,10 @@ test "Shard: a leader that built its workflow caches while halted keeps what app
     try proposeCall(&shard, "act", "wf", "a1", false);
     _ = try persistence_mod.proposeEntryIn(&shard, .workflow_start, entry_mod.Flags.NONE, .default, wf_test_key(.default, "r3"), start);
     const runs_machine = @import("../workflow/runs_machine.zig");
+    // Applied, so the timer's step names the run's incarnation.
+    _ = shard.applyCommitted();
     const timer: runs_machine.Step.Value = .{
+        .created_ns = runs_machine.runOf(.{ .store = &shard.defaultPartition().store }, wf_test_key(.default, "r3")).?.created_ns,
         .rev = 0,
         .step = "s",
         .events = .{ .bytes = "", .count = 0 },
@@ -32724,7 +32727,10 @@ fn proposeCallOf(s: *Shard, kind: action_entries.CallKind, target: []const u8, w
     defer a.free(call_buf);
     const call = try action_entries.Call.encodeInto(call_buf, .{ .ns = ns_table.DEFAULT.int(), .kind = kind, .caller_run = caller, .caller_workflow = workflow, .step = "s", .target = target, .version = "", .run = run, .input = "{}", .can_wait = can_wait });
     const runs_machine = @import("../workflow/runs_machine.zig");
+    // Applied, so the step names the run's incarnation.
+    _ = s.applyCommitted();
     const step: runs_machine.Step.Value = .{
+        .created_ns = runs_machine.runOf(.{ .store = &s.defaultPartition().store }, key).?.created_ns,
         .rev = 0,
         .step = "s",
         .events = .{ .bytes = "", .count = 0 },

@@ -245,6 +245,9 @@ pub const Step = Record(&.{
     // The signals its waits took, in order: each the oldest of its type the
     // run holds, gone from `workflow.sig` in this apply.
     .{ .name = "takes", .T = schema.BoundedList(Take, MAX_SIGNALS, MAX_PERSIST_PAYLOAD) },
+    // The run's incarnation, its start's stamp: a step decided for one
+    // that was deleted, its id started again since, applies to nothing.
+    .{ .name = "created_ns", .T = Int(u64) },
 });
 
 pub const HistRec = hp.HistRec;
@@ -567,6 +570,8 @@ pub const Complete = struct {
     event: []const u8,
     detail: []const u8,
     workflow: []const u8,
+    /// The run's incarnation, as the cancel read it.
+    created_ns: u64,
 
     pub fn parse(value: []const u8) ?Complete {
         var c: Cursor = .{ .bytes = value };
@@ -578,8 +583,9 @@ pub const Complete = struct {
         const event = c.take(c.int(u16) orelse return null) orelse return null;
         const detail = c.take(c.int(u16) orelse return null) orelse return null;
         const workflow = c.take(c.int(u16) orelse return null) orelse return null;
+        const created_ns = c.int(u64) orelse return null;
         if (c.off != value.len) return null;
-        return .{ .status = status, .output = output, .event = event, .detail = detail, .workflow = workflow };
+        return .{ .status = status, .output = output, .event = event, .detail = detail, .workflow = workflow, .created_ns = created_ns };
     }
 
     /// Its encoding into `buf`, or null when it doesn't fit.
@@ -595,11 +601,12 @@ pub const Complete = struct {
             w.writeInt(u16, std.math.cast(u16, part.len) orelse return null, .little) catch return null;
             w.writeAll(part) catch return null;
         }
+        w.writeInt(u64, c.created_ns, .little) catch return null;
         return w.buffered();
     }
 
     pub fn size(c: Complete) usize {
-        return 2 + (if (c.output) |o| 4 + o.len else 0) + 6 + c.event.len + c.detail.len + c.workflow.len;
+        return 2 + (if (c.output) |o| 4 + o.len else 0) + 6 + c.event.len + c.detail.len + c.workflow.len + 8;
     }
 };
 
@@ -1155,6 +1162,7 @@ fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64
     // deleted since. A ready leader decides only from what it applied, so
     // its own come before the delete; the simulator's leader lags.
     if (!std.mem.eql(u8, run.workflow, st.workflow)) return out.refuse(.not_found, .not_found, "run not found");
+    if (comptime plant.active != .runs_step_incarnation_unchecked) if (run.created_ns != st.created_ns) return out.refuse(.not_found, .not_found, "run not found");
     const ends: ?RunStatus = if (st.ends == 0) null else blk: {
         const status = std.enums.fromInt(RunStatus, st.ends) orelse return error.Halt;
         if (!status.isTerminal()) return error.Halt;
@@ -1231,6 +1239,8 @@ fn applyComplete(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms:
     var run = ((try view.get(RunFam, cmd.key)) orelse return out.refuse(.not_found, .not_found, "run not found")).v;
     // Another workflow's: for an earlier incarnation, as a step's may be.
     if (!std.mem.eql(u8, run.workflow, c.workflow)) return out.refuse(.not_found, .not_found, "run not found");
+    // Another incarnation's: the id deleted and started again since.
+    if (run.created_ns != c.created_ns) return out.refuse(.not_found, .not_found, "run not found");
     // The first completion in the log ends the run; a cancel and a
     // completion in flight together leave it as the first left it. A second
     // with the same outcome (two cancels) succeeds, changing nothing.
@@ -1496,7 +1506,17 @@ const Fixture = struct {
         return f.command(.workflow_start, view_mod.idKey(&kb, .default, run_id) catch unreachable, startValue(&vb, wf, event, idem), stamp_ms);
     }
 
+    /// A completion of run `run_id`, naming its incarnation as applied.
     fn complete(f: *Fixture, run_id: []const u8, value: []const u8, stamp_ms: u64) !Result {
+        var kb: [64]u8 = undefined;
+        var vb: [MAX_PERSIST_PAYLOAD]u8 = undefined;
+        var c = Complete.parse(value).?;
+        if (f.get(run_id)) |r| c.created_ns = r.created_ns;
+        return f.command(.workflow_complete, view_mod.idKey(&kb, .default, run_id) catch unreachable, c.encode(&vb).?, stamp_ms);
+    }
+
+    /// A completion as given, its incarnation unpatched.
+    fn completeAs(f: *Fixture, run_id: []const u8, value: []const u8, stamp_ms: u64) !Result {
         var kb: [64]u8 = undefined;
         return f.command(.workflow_complete, view_mod.idKey(&kb, .default, run_id) catch unreachable, value, stamp_ms);
     }
@@ -1513,6 +1533,7 @@ const Fixture = struct {
         var tw: schema.Writer = .{ .buf = &takes_buf };
         for (spec.takes) |t| try Take.encode(&tw, .{ .type = t });
         const value: Step.Value = .{
+            .created_ns = spec.created_ns orelse if (f.get(run_id)) |r| r.created_ns else 0,
             .rev = spec.rev,
             .step = spec.at,
             .events = .{ .bytes = ew.written(), .count = spec.events },
@@ -1627,6 +1648,8 @@ const Fixture = struct {
 
 const StepSpec = struct {
     rev: u64,
+    /// The run's incarnation as applied, unless given.
+    created_ns: ?u64 = null,
     at: []const u8 = "s",
     events: u32 = 1,
     wait: Wait = .none,
@@ -1648,7 +1671,7 @@ fn startValue(buf: []u8, wf: []const u8, event: []const u8, idem: []const u8) []
 
 /// A cancel's completion of a run of `wf`.
 fn completeValue(buf: []u8, status: RunStatus, wf: []const u8) []const u8 {
-    const c: Complete = .{ .status = status, .output = null, .event = "workflow_cancelled", .detail = "stop", .workflow = wf };
+    const c: Complete = .{ .status = status, .output = null, .event = "workflow_cancelled", .detail = "stop", .workflow = wf, .created_ns = 0 };
     return c.encode(buf).?;
 }
 
@@ -1825,6 +1848,30 @@ test "workflow runs machine: a delete of an ended run removes it and its key, an
     try testing.expectEqual(@as(u32, 2), f.active("wf").?.active);
 }
 
+test "workflow runs machine: a step or cancel decided for a deleted incarnation, its id started again under the same workflow, is refused" {
+    var f = Fixture.init();
+    defer f.deinit();
+    const Status = @import("../protocol/proto.zig").StatusCode;
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    const old = f.get("r1").?.created_ns;
+    var vb: [512]u8 = undefined;
+    _ = try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 5);
+    try testing.expect((try f.deleteOf("r1")).refused() == null);
+    try testing.expect((try f.start("r1", "wf", "workflow_started", "", 8)).refused() == null);
+    try testing.expect(f.get("r1").?.created_ns != old);
+    // Rev 0 and the workflow match the new run: only the incarnation tells.
+    try testing.expectEqual(Status.not_found, (try f.step("r1", .{ .rev = 0, .created_ns = old })).refused().?.status);
+    var c = Complete.parse(completeValue(&vb, .cancelled, "wf")).?;
+    c.created_ns = old;
+    var cb: [512]u8 = undefined;
+    try testing.expectEqual(Status.not_found, (try f.completeAs("r1", c.encode(&cb).?, 9)).refused().?.status);
+    const now = f.get("r1").?;
+    try testing.expectEqual(@as(u64, 0), now.rev);
+    try testing.expectEqual(@as(u8, @backingInt(RunStatus.running)), now.status);
+    // Its own incarnation's step applies.
+    try testing.expect((try f.step("r1", .{ .rev = 0 })).refused() == null);
+}
+
 test "workflow runs machine: a run's start puts it in both lists' index, its delete takes it out, and a start that creates nothing indexes nothing" {
     var f = Fixture.init();
     defer f.deinit();
@@ -1876,13 +1923,13 @@ test "workflow runs machine: a run's largest output, an entry's whole payload, g
     // Some events pending, then the largest completion an entry holds.
     try testing.expect((try f.step("r1", .{ .rev = 0, .events = 40 })).refused() == null);
     const room = MAX_PERSIST_PAYLOAD - entry_mod.COMMAND_PREFIX_SIZE - 4 - 2;
-    const fixed = (Complete{ .status = .completed, .output = "", .event = "workflow_completed", .detail = "", .workflow = "wf" }).size();
+    const fixed = (Complete{ .status = .completed, .output = "", .event = "workflow_completed", .detail = "", .workflow = "wf", .created_ns = 0 }).size();
     const ob = try testing.allocator.alloc(u8, room - fixed);
     defer testing.allocator.free(ob);
     @memset(ob, 'o');
     const vb = try testing.allocator.alloc(u8, room);
     defer testing.allocator.free(vb);
-    const value = (Complete{ .status = .completed, .output = ob, .event = "workflow_completed", .detail = "", .workflow = "wf" }).encode(vb).?;
+    const value = (Complete{ .status = .completed, .output = ob, .event = "workflow_completed", .detail = "", .workflow = "wf", .created_ns = 0 }).encode(vb).?;
     try testing.expect((try f.complete("r1", value, 9)).refused() == null);
     const run = f.get("r1").?;
     try testing.expect(run.output_truncated);
@@ -1902,7 +1949,7 @@ test "workflow runs machine: an ended run keeps a summary: a preview of its outp
     var ob: [3000]u8 = undefined;
     @memset(&ob, 'o');
     var vb: [4096]u8 = undefined;
-    const value = (Complete{ .status = .completed, .output = &ob, .event = "workflow_completed", .detail = "", .workflow = "wf" }).encode(&vb).?;
+    const value = (Complete{ .status = .completed, .output = &ob, .event = "workflow_completed", .detail = "", .workflow = "wf", .created_ns = 0 }).encode(&vb).?;
     try testing.expect((try f.complete("r1", value, 9)).refused() == null);
     const run = f.get("r1").?;
     try testing.expectEqual(@as(usize, OUTPUT_PREVIEW), run.output.len);
