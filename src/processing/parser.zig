@@ -36,6 +36,7 @@
 const std = @import("std");
 const stdx = @import("stdx");
 const limits = @import("../protocol/limits.zig");
+const ts_mod = @import("../projection/ts.zig");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
@@ -614,6 +615,13 @@ fn appendTsSource(
     src.ts_measurement = try dupe(allocator, measurement);
     src.ts_field = try dupe(allocator, field);
     src.ts_tags = try parseStringPairs(allocator, d, ts_obj, "tags");
+    // The series the source reads is named by its tags as a TS read names
+    // them, `key=value` joined by commas: past the read's limits it would
+    // read another series, or none.
+    if (src.ts_tags.len / 2 > ts_mod.MAX_TAGS) return d.fail(ParseError.InvalidFormat, "\"tags\" takes at most {d} tags, not {d}", .{ ts_mod.MAX_TAGS, src.ts_tags.len / 2 });
+    var canonical: usize = 0;
+    for (src.ts_tags, 0..) |t, i| canonical += t.len + if (i % 2 == 0) @as(usize, @intFromBool(i > 0)) else 1;
+    if (canonical > ts_mod.MAX_TAG_STRING) return d.fail(ParseError.InvalidFormat, "\"tags\" is at most {d} bytes written as key=value pairs joined by commas, not {d}", .{ ts_mod.MAX_TAG_STRING, canonical });
     try sources.append(allocator, src);
 }
 
@@ -2272,5 +2280,48 @@ test "parser: a job name the list page can't hold is refused at submit" {
             defer def.deinit(allocator);
             try std.testing.expectEqual(len, def.name.len);
         } else try std.testing.expectError(ParseError.InvalidFieldType, parseJobDefinition(allocator, text, null));
+    }
+}
+
+test "parser: a TS source's tags are held to a TS read's limits, refused past 32 tags or 1024 bytes by name" {
+    const allocator = std.testing.allocator;
+    const Case = struct { tags: usize, value_len: usize, says: ?[]const u8 };
+    for ([_]Case{
+        // 32 tags of 25-byte values: 32 * (2 + 1 + 25) + 31 = 927 bytes.
+        .{ .tags = ts_mod.MAX_TAGS, .value_len = 25, .says = null },
+        .{ .tags = ts_mod.MAX_TAGS + 1, .value_len = 1, .says = "\"tags\" takes at most 32 tags, not 33" },
+        // Two tags come to 7 + 2v bytes: 1023 is taken, 1025 refused.
+        .{ .tags = 2, .value_len = 508, .says = null },
+        .{ .tags = 2, .value_len = 509, .says = "\"tags\" is at most 1024 bytes written as key=value pairs joined by commas, not 1025" },
+    }) |c| {
+        // Two-letter keys, each its own.
+        var keyed: std.ArrayList(u8) = .empty;
+        defer keyed.deinit(allocator);
+        for (0..c.tags) |i| {
+            try keyed.print(allocator, "        {c}{c}: \"", .{ @as(u8, 'a') + @as(u8, @intCast(i / 26)), @as(u8, 'a') + @as(u8, @intCast(i % 26)) });
+            try keyed.appendNTimes(allocator, 'v', c.value_len);
+            try keyed.appendSlice(allocator, "\"\n");
+        }
+        const text = try std.fmt.allocPrint(allocator,
+            \\kind: Processing
+            \\sources:
+            \\  - ts:
+            \\      measurement: cpu
+            \\      tags:
+            \\{s}sinks:
+            \\  - stream:
+            \\      name: out
+            \\
+        , .{keyed.items});
+        defer allocator.free(text);
+        if (c.says) |says| {
+            var diag: Diagnostic = .{};
+            try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, &diag));
+            try std.testing.expect(mem.indexOf(u8, diag.message(), says) != null);
+        } else {
+            var def = try parseJobDefinition(allocator, text, null);
+            defer def.deinit(allocator);
+            try std.testing.expectEqual(c.tags * 2, def.primarySource().?.ts_tags.len);
+        }
     }
 }
