@@ -28,6 +28,7 @@ const log = @import("stdx").log;
 const proto = @import("../protocol/proto.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const parser = @import("parser.zig");
+const record_fields = @import("record_fields.zig");
 const definition = @import("definition.zig");
 const SourceKind = definition.SourceKind;
 const SinkKind = definition.SinkKind;
@@ -116,6 +117,8 @@ pub const ProcessingHandler = struct {
     short_runs: bool = false,
     short_at_ms: u64 = 0,
     sink_drops: u64 = 0,
+    /// See `sinkRead`.
+    sink_read: ?*SinkRead = null,
     chain_errors: u64 = 0,
     chain_warn_ms: i64 = 0,
     /// The job whose pipeline is ticking, so a drop or chain error names it.
@@ -395,6 +398,7 @@ pub const ProcessingHandler = struct {
     }
 
     pub fn deinit(self: *ProcessingHandler) void {
+        if (self.sink_read) |r| self.allocator.destroy(r);
         self.dropRuns();
         self.runs.deinit();
         self.pipelines.deinit();
@@ -2624,24 +2628,44 @@ pub const ProcessingHandler = struct {
     /// Each point takes the stamp of the entry its target applies.
     fn writeTsSinkFromJson(self: *ProcessingHandler, batch: *Batch, pipe: *PipelineState, snk: SinkConfig, shard: *Shard, payload: []const u8) void {
         _ = pipe;
+        // Every field the sink reads, in one pass over the record: the tags'
+        // first, then the fields' or the value's. Its buffer is the
+        // handler's, kept between records, not on the stack.
+        const fr = self.sinkRead() orelse return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "out of memory");
+        defer fr.release(self.allocator);
+        const n_tags = flatPairCount(snk.ts_tag_keys);
+        // A record that is a JSON number alone is its value, for a sink with
+        // no tags or fields to read from it.
+        if (snk.ts_tag_keys.len == 0 and snk.ts_field_keys.len == 0) if (record_fields.bareNumber(payload, fr.buf[0..SinkRead.STATE])) |v| {
+            if (!std.math.isFinite(v)) return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the value is not a finite number");
+            return self.sendTsPoint(batch, shard, snk, "value", v, 0, "");
+        };
+        const read = fr.read(self.allocator, payload, snk.ts_tag_keys, snk.ts_field_keys, snk.value_field) catch |err| return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, switch (err) {
+            error.NotObject => "the record is not a JSON object",
+            error.TooLong => std.fmt.comptimePrint("an escaped field it reads decodes past {d} bytes", .{SinkRead.BUF - SinkRead.STATE}),
+            error.TooDeep => std.fmt.comptimePrint("the record nests past {d} levels", .{record_fields.MAX_DEPTH}),
+            error.OutOfMemory => "out of memory",
+        });
         var sink_tag_buf: [ts_mod.MAX_TAG_STRING]u8 = undefined;
         var missing: []const u8 = "";
         // Its tags name its series: a point without all of them would land
         // in another, which no read of these tags finds.
-        const sink_tags = computeTsSinkTags(snk.ts_tag_keys, payload, &sink_tag_buf, &missing) catch |err| {
+        const sink_tags = computeTsSinkTags(snk.ts_tag_keys, read[0..n_tags], &sink_tag_buf, &missing) catch |err| {
             var wb: [parser.MAX_SINK_FIELD_NAME + 64]u8 = undefined;
             return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, switch (err) {
                 error.TagsTooLong => std.fmt.comptimePrint("its tags pass {d} bytes", .{ts_mod.MAX_TAG_STRING}),
                 error.NoTagField => std.fmt.bufPrint(&wb, "the record has no string field \"{s}\" for a tag", .{missing}) catch "the record has no field for a tag",
                 error.TagValueComma => std.fmt.bufPrint(&wb, "the record's field \"{s}\" holds ',', which would split its tag", .{missing}) catch "a tag's value holds ','",
+                error.TagValueControl => std.fmt.bufPrint(&wb, "the record's field \"{s}\" holds a control character, which no read of a tag can name", .{missing}) catch "a tag's value holds a control character",
             });
         };
 
         if (snk.ts_field_keys.len > 0) {
             var it = FlatPairIterator.init(snk.ts_field_keys);
-            while (it.next()) |pair| {
+            var i: usize = n_tags;
+            while (it.next()) |pair| : (i += 1) {
                 // pair.key = TS field name, pair.value = JSON field to extract from.
-                const value = extractJsonFloat(payload, pair.value) orelse {
+                const value = (if (read[i]) |f| f.float() else null) orelse {
                     self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the record has no numeric field for it");
                     continue;
                 };
@@ -2654,9 +2678,9 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        // value_field shorthand — extract the named JSON field and store it as "value".
-        const value = extractJsonFloat(payload, snk.value_field) orelse
-            (std.fmt.parseFloat(f64, payload) catch return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the record is not a number"));
+        // value_field shorthand: the named field, stored as "value".
+        const value = (if (read[n_tags]) |f| f.float() else null) orelse
+            return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the record has no numeric field for it");
         if (!std.math.isFinite(value)) return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the value is not a finite number");
         self.sendTsPoint(batch, shard, snk, "value", value, 0, sink_tags);
     }
@@ -2736,72 +2760,101 @@ pub const ProcessingHandler = struct {
     /// commas, from the record's fields that `tag_keys` names (flat pairs,
     /// tag name then field), for the projection to canonicalise. Every tag is
     /// the record's or none is: a field it lacks names `missing`. A value's
-    /// trailing space or tab is trimmed there, as for any TS write, so "a",
-    /// "a " and "a\t" are one series.
-    fn computeTsSinkTags(tag_keys: []const u8, payload: []const u8, buf: []u8, missing: *[]const u8) error{ TagsTooLong, NoTagField, TagValueComma }![]const u8 {
+    /// trailing space is trimmed there, as for any TS write, so "a" and "a "
+    /// are one series; a value holding a tab or any control character is
+    /// dropped here.
+    fn computeTsSinkTags(tag_keys: []const u8, values: []const ?record_fields.Field, buf: []u8, missing: *[]const u8) error{ TagsTooLong, NoTagField, TagValueComma, TagValueControl }![]const u8 {
         if (tag_keys.len == 0) return "";
         var pos: usize = 0;
         var it = FlatPairIterator.init(tag_keys);
-        while (it.next()) |pair| {
-            // pair.key = TS tag name, pair.value = JSON field to read the tag value from.
-            const tag_val = extractJsonString(payload, pair.value) orelse {
+        var i: usize = 0;
+        while (it.next()) |pair| : (i += 1) {
+            // pair.key = TS tag name, pair.value = the record field it reads.
+            const tag_val = if (values[i]) |f| switch (f) {
+                .string => |s| s,
+                else => null,
+            } else null;
+            const v = tag_val orelse {
                 missing.* = pair.value;
                 return error.NoTagField;
             };
             // Tags are split again on `,`: one in a value would make two.
-            if (std.mem.indexOfScalar(u8, tag_val, ',') != null) {
+            if (std.mem.indexOfScalar(u8, v, ',') != null) {
                 missing.* = pair.value;
                 return error.TagValueComma;
             }
-            const kv = std.fmt.bufPrint(buf[pos..], "{s}{s}={s}", .{ if (pos > 0) "," else "", pair.key, tag_val }) catch return error.TagsTooLong;
+            // A decoded value can hold any character; a TS write keeps one
+            // with a control character, but no read can name its series.
+            for (v) |c| if (c < 0x20 or c == 0x7f) {
+                missing.* = pair.value;
+                return error.TagValueControl;
+            };
+            const kv = std.fmt.bufPrint(buf[pos..], "{s}{s}={s}", .{ if (pos > 0) "," else "", pair.key, v }) catch return error.TagsTooLong;
             pos += kv.len;
         }
         return buf[0..pos];
     }
 
-    /// Extract a string field value from a JSON payload (unescaped, first match).
-    fn extractJsonString(payload: []const u8, field_name: []const u8) ?[]const u8 {
-        if (field_name.len == 0) return null;
-        var search_buf: [parser.MAX_SINK_FIELD_NAME + 3]u8 = undefined;
-        const pattern = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{field_name}) catch return null;
-        const idx = std.mem.indexOf(u8, payload, pattern) orelse return null;
-        const after = payload[idx + pattern.len ..];
-
-        var start: usize = 0;
-        while (start < after.len and (after[start] == ' ' or after[start] == '\t')) start += 1;
-        if (start >= after.len or after[start] != '"') return null;
-        start += 1; // skip opening quote
-        var end = start;
-        while (end < after.len and after[end] != '"') end += 1;
-        if (end >= after.len) return null;
-        return after[start..end];
+    /// The pairs in a flat-pair string.
+    fn flatPairCount(pairs: []const u8) usize {
+        var n: usize = 0;
+        var it = FlatPairIterator.init(pairs);
+        while (it.next()) |_| n += 1;
+        return n;
     }
 
-    /// Extract a float value from a JSON payload by field name.
-    /// Handles the TS sink's value_field extraction (e.g., "cpu_percent" from {"cpu_percent":72.5}).
-    fn extractJsonFloat(payload: []const u8, field_name: []const u8) ?f64 {
-        if (field_name.len == 0) return null;
+    /// A TS sink's read of one record: each field it names, the tags'
+    /// first, then its fields' (or its value's), all in one pass
+    /// (`record_fields.read`). A sink naming more than `NAMES` fields asks
+    /// the heap.
+    const SinkRead = struct {
+        const NAMES = 64;
+        /// Room for the reader's own state and for decoding escaped values
+        /// (an unescaped one is read in place): a tag past `MAX_TAG_STRING`
+        /// is refused after anyway.
+        const BUF = 8 * 1024;
+        const STATE = record_fields.STATE;
+        names_fixed: [NAMES][]const u8 = undefined,
+        out_fixed: [NAMES]?record_fields.Field = undefined,
+        names_heap: [][]const u8 = &.{},
+        out_heap: []?record_fields.Field = &.{},
+        buf: [BUF]u8 = undefined,
 
-        // Build the search pattern: "field_name":
-        var search_buf: [parser.MAX_SINK_FIELD_NAME + 3]u8 = undefined;
-        const pattern = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{field_name}) catch return null;
+        /// What a record past `NAMES` took from the heap, given back.
+        fn release(r: *SinkRead, a: Allocator) void {
+            if (r.names_heap.len > 0) a.free(r.names_heap);
+            if (r.out_heap.len > 0) a.free(r.out_heap);
+            r.names_heap = &.{};
+            r.out_heap = &.{};
+        }
 
-        const idx = std.mem.indexOf(u8, payload, pattern) orelse return null;
-        const after = payload[idx + pattern.len ..];
-
-        // Skip whitespace
-        var start: usize = 0;
-        while (start < after.len and (after[start] == ' ' or after[start] == '\t')) : (start += 1) {}
-        if (start >= after.len) return null;
-
-        // Find end of number
-        var end: usize = start;
-        while (end < after.len and (after[end] == '-' or after[end] == '.' or
-            (after[end] >= '0' and after[end] <= '9') or after[end] == 'e' or after[end] == 'E' or after[end] == '+')) : (end += 1)
-        {}
-
-        if (end <= start) return null;
-        return std.fmt.parseFloat(f64, after[start..end]) catch null;
+        fn read(r: *SinkRead, a: Allocator, payload: []const u8, tag_keys: []const u8, field_keys: []const u8, value_field: []const u8) (record_fields.Error || error{OutOfMemory})![]const ?record_fields.Field {
+            const n = flatPairCount(tag_keys) + if (field_keys.len > 0) flatPairCount(field_keys) else 1;
+            const names: [][]const u8 = if (n <= NAMES) r.names_fixed[0..n] else blk: {
+                r.names_heap = try a.alloc([]const u8, n);
+                r.out_heap = try a.alloc(?record_fields.Field, n);
+                break :blk r.names_heap;
+            };
+            const out: []?record_fields.Field = if (n <= NAMES) r.out_fixed[0..n] else r.out_heap;
+            var i: usize = 0;
+            var tags = FlatPairIterator.init(tag_keys);
+            while (tags.next()) |p| : (i += 1) names[i] = p.value;
+            if (field_keys.len > 0) {
+                var fields = FlatPairIterator.init(field_keys);
+                while (fields.next()) |p| : (i += 1) names[i] = p.value;
+            } else names[i] = value_field;
+            try record_fields.read(payload, names, out, &r.buf);
+            return out;
+        }
+    };
+    /// The handler's one sink read, made on first use and kept: a record at
+    /// a time, as pipelines tick on one thread.
+    fn sinkRead(self: *ProcessingHandler) ?*SinkRead {
+        if (self.sink_read) |r| return r;
+        const r = self.allocator.create(SinkRead) catch return null;
+        r.* = .{};
+        self.sink_read = r;
+        return r;
     }
 
     /// Serialize flat pairs ([]const []const u8) to a single owned string.
@@ -3787,24 +3840,42 @@ test "processing: a namespace may hold three quarters of an outbox, and past a q
     try std.testing.expect(raft_node_mod.shareHeld(1, 1, 1));
 }
 
+/// A TS sink's tags for `record`, its fields read as the sink reads them.
+fn sinkTagsOf(keys: []const u8, record: []const u8, buf: []u8, missing: *[]const u8) ![]const u8 {
+    var r: ProcessingHandler.SinkRead = .{};
+    defer r.release(std.testing.allocator);
+    const read = try r.read(std.testing.allocator, record, keys, "", "value");
+    return ProcessingHandler.computeTsSinkTags(keys, read[0 .. read.len - 1], buf, missing);
+}
+
 test "processing: a TS sink's tags are the record's, every one or none, and never cut short" {
     var buf: [ts_mod.MAX_TAG_STRING]u8 = undefined;
     var missing: []const u8 = "";
     const keys = "host\x00h\x00region\x00r";
-    try std.testing.expectEqualStrings("host=a,region=eu", try ProcessingHandler.computeTsSinkTags(keys, "{\"h\":\"a\",\"r\":\"eu\"}", &buf, &missing));
+    try std.testing.expectEqualStrings("host=a,region=eu", try sinkTagsOf(keys, "{\"h\":\"a\",\"r\":\"eu\"}", &buf, &missing));
     // A record without one of them: no point, naming the field it lacks.
-    try std.testing.expectError(error.NoTagField, ProcessingHandler.computeTsSinkTags(keys, "{\"h\":\"a\"}", &buf, &missing));
+    try std.testing.expectError(error.NoTagField, sinkTagsOf(keys, "{\"h\":\"a\"}", &buf, &missing));
     try std.testing.expectEqualStrings("r", missing);
+    // A tag's field that isn't a string is none.
+    try std.testing.expectError(error.NoTagField, sinkTagsOf(keys, "{\"h\":\"a\",\"r\":7}", &buf, &missing));
     // Tags up to what a read can name: `host=` and 1019 bytes is 1024, kept;
     // one more is dropped, rather than written under fewer.
     var long: [ts_mod.MAX_TAG_STRING + 16]u8 = undefined;
     const at_limit = try std.fmt.bufPrint(&long, "{{\"h\":\"{s}\"}}", .{@as([ts_mod.MAX_TAG_STRING - 5]u8, @splat('a'))});
-    try std.testing.expectEqual(ts_mod.MAX_TAG_STRING, (try ProcessingHandler.computeTsSinkTags("host\x00h", at_limit, &buf, &missing)).len);
+    try std.testing.expectEqual(ts_mod.MAX_TAG_STRING, (try sinkTagsOf("host\x00h", at_limit, &buf, &missing)).len);
     const past = try std.fmt.bufPrint(&long, "{{\"h\":\"{s}\"}}", .{@as([ts_mod.MAX_TAG_STRING - 4]u8, @splat('a'))});
-    try std.testing.expectError(error.TagsTooLong, ProcessingHandler.computeTsSinkTags("host\x00h", past, &buf, &missing));
+    try std.testing.expectError(error.TagsTooLong, sinkTagsOf("host\x00h", past, &buf, &missing));
     // A comma in a value would read as another tag.
-    try std.testing.expectError(error.TagValueComma, ProcessingHandler.computeTsSinkTags(keys, "{\"h\":\"a,zz=q\",\"r\":\"eu\"}", &buf, &missing));
+    try std.testing.expectError(error.TagValueComma, sinkTagsOf(keys, "{\"h\":\"a,zz=q\",\"r\":\"eu\"}", &buf, &missing));
     try std.testing.expectEqualStrings("h", missing);
     // An `=` in a value is the value's.
-    try std.testing.expectEqualStrings("host=a=b,region=eu", try ProcessingHandler.computeTsSinkTags(keys, "{\"h\":\"a=b\",\"r\":\"eu\"}", &buf, &missing));
+    try std.testing.expectEqualStrings("host=a=b,region=eu", try sinkTagsOf(keys, "{\"h\":\"a=b\",\"r\":\"eu\"}", &buf, &missing));
+    // Escapes decoded, nesting passed over: two values that differ by an
+    // escaped quote stay two, and a nested `h` isn't the record's.
+    try std.testing.expectEqualStrings("host=web\"1", try sinkTagsOf("host\x00h", "{\"h\":\"web\\\"1\"}", &buf, &missing));
+    try std.testing.expectEqualStrings("host=y", try sinkTagsOf("host\x00h", "{\"meta\":{\"h\":\"x\"},\"h\":\"y\"}", &buf, &missing)); // A decoded control character: no read of a tag can name it.
+    try std.testing.expectError(error.TagValueControl, sinkTagsOf("host\x00h", "{\"h\":\"a\\u0000b\"}", &buf, &missing));
+    try std.testing.expectError(error.TagValueControl, sinkTagsOf("host\x00h", "{\"h\":\"a\\nb\"}", &buf, &missing));
+    // Two tags reading one field each get it.
+    try std.testing.expectEqualStrings("a=x,b=x", try sinkTagsOf("a\x00h\x00b\x00h", "{\"h\":\"x\"}", &buf, &missing));
 }
