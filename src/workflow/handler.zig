@@ -8688,6 +8688,122 @@ fn expectRunIds(want: []const []const u8, got: []const []const u8) !void {
     for (want, got) |w, g| try testing.expectEqualStrings(w, g);
 }
 
+/// Every run `ownPage` lists of `workflow` ("" for all) matching `search`,
+/// a page at a time at `limit` and `room`, each page after the last's
+/// stop, into `out` as owned ids (`ids_buf`): the list's whole walk.
+fn walkAll(handler: *WorkflowHandler, workflow: []const u8, search: []const u8, limit: u32, room: u32, ids_buf: [][16]u8, out: [][]const u8) !struct { ids: []const []const u8, pages: usize, empty_pages: usize } {
+    const buf = try testing.allocator.alloc(u8, system_ops.Runs.max_size);
+    defer testing.allocator.free(buf);
+    var n: usize = 0;
+    var pages: usize = 0;
+    var empty: usize = 0;
+    var after_buf: [16]u8 = undefined;
+    var after: ?list_runs.RunAt.Value = null;
+    while (pages < 100_000) : (pages += 1) {
+        const page = try list_runs.ownPage(handler, .default, workflow, .{ .limit = limit, .status = "", .search = search, .after = after }, room, buf);
+        var it = page.runs.iterator();
+        var got: usize = 0;
+        while (try it.next()) |run| : (got += 1) {
+            @memcpy(ids_buf[n][0..run.at.run_id.len], run.at.run_id);
+            out[n] = ids_buf[n][0..run.at.run_id.len];
+            n += 1;
+        }
+        if (got == 0) empty += 1;
+        if (!page.more) return .{ .ids = out[0..n], .pages = pages + 1, .empty_pages = empty };
+        const stop = page.stop.?;
+        @memcpy(after_buf[0..stop.run_id.len], stop.run_id);
+        after = .{ .created_at = stop.created_at, .run_id = after_buf[0..stop.run_id.len] };
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "list runs: a search matching one run past the walk bound answers a page of none with more, and the next page finds it" {
+    var handler = WorkflowHandler.init(testing.allocator);
+    defer handler.deinit();
+    // The one that matches is the oldest, behind more than a page reads.
+    try createTestRunAt(&handler, "needle", "wf", 1, .running);
+    var id: [16]u8 = undefined;
+    for (0..list_runs.WALK_MAX + 4) |i| try createTestRunAt(&handler, try std.fmt.bufPrint(&id, "w-{d}", .{i}), "wf", @intCast(i + 2), .running);
+    var ids_buf: [4][16]u8 = undefined;
+    var out: [4][]const u8 = undefined;
+    const got = try walkAll(&handler, "", "needle", 10, 1 << 20, &ids_buf, &out);
+    try expectRunIds(&.{"needle"}, got.ids);
+    try testing.expectEqual(@as(usize, 2), got.pages);
+    try testing.expectEqual(@as(usize, 1), got.empty_pages);
+}
+
+test "list runs: a named workflow's list holds its own runs, each once in the list's order, at every limit and room, not another's sharing its prefix" {
+    var handler = WorkflowHandler.init(testing.allocator);
+    defer handler.deinit();
+    // Started together, ids of other lengths; and "wfx", whose key's name
+    // part starts as "wf"'s does.
+    for ([_][]const u8{ "b", "ab", "zzz", "c" }) |r| try createTestRunAt(&handler, r, "wf", 7, .running);
+    try createTestRunAt(&handler, "q", "wf", 8, .running);
+    for ([_][]const u8{ "a", "bb" }) |r| try createTestRunAt(&handler, r, "wfx", 7, .running);
+    const want = [_][]const u8{ "q", "ab", "b", "c", "zzz" };
+    // One entry: [len]id[len]"wf"[len]"running"[i64].
+    for ([_]u32{ 1, 2, 3, 10 }) |limit| for ([_]u32{ 2 + 3 + 2 + 2 + 2 + 7 + 8, 1 << 20 }) |room| {
+        var ids_buf: [8][16]u8 = undefined;
+        var out: [8][]const u8 = undefined;
+        const got = try walkAll(&handler, "wf", "", limit, room, &ids_buf, &out);
+        try expectRunIds(&want, got.ids);
+    };
+}
+
+test "list runs: an index row whose run is gone is skipped, said once" {
+    var handler = WorkflowHandler.init(testing.allocator);
+    defer handler.deinit();
+    for ([_][]const u8{ "r1", "r2", "r3" }) |r| try createTestRunAt(&handler, r, "wf", 5, .running);
+    // r2's run row gone, its index rows left: a Flo bug a list survives.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ks = contract_view.KeySet.init(arena.allocator());
+    try ks.addIn(runs_machine.RunFam.ID, .default, "r2");
+    var view = contract_view.View.init(&handler.own_store, arena.allocator(), &ks);
+    var kb: [64]u8 = undefined;
+    try view.delete(runs_machine.RunFam, writeKey(&kb, .default, "r2"));
+    try view.commit();
+    var ids_buf: [4][16]u8 = undefined;
+    var out: [4][]const u8 = undefined;
+    const got = try walkAll(&handler, "", "", 10, 1 << 20, &ids_buf, &out);
+    try expectRunIds(&.{ "r1", "r3" }, got.ids);
+    try testing.expect(handler.missing_run_said);
+}
+
+test "list runs: runs started in one ms with ids of other lengths on two shards, walked through their index keys and merged, are each listed once in order" {
+    var one = WorkflowHandler.init(testing.allocator);
+    defer one.deinit();
+    var two = WorkflowHandler.init(testing.allocator);
+    defer two.deinit();
+    for ([_][]const u8{ "b", "ab" }) |r| try createTestRunAt(&one, r, "wf", 7, .running);
+    for ([_][]const u8{ "c", "zz" }) |r| try createTestRunAt(&two, r, "wg", 7, .running);
+    const bufs = [_][]u8{ try testing.allocator.alloc(u8, system_ops.Runs.max_size), try testing.allocator.alloc(u8, system_ops.Runs.max_size) };
+    defer for (bufs) |b| testing.allocator.free(b);
+    var seen: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (seen.items) |x| testing.allocator.free(x);
+        seen.deinit(testing.allocator);
+    }
+    var after_buf: [16]u8 = undefined;
+    var after: ?list_runs.RunAt.Value = null;
+    var rounds: usize = 0;
+    while (rounds < 10) : (rounds += 1) {
+        const q: list_runs.Query = .{ .limit = 2, .status = "", .search = "", .after = after };
+        const pages = [_]list_runs.PageResponse.Value{
+            try list_runs.ownPage(&one, .default, "", q, 1 << 20, bufs[0]),
+            try list_runs.ownPage(&two, .default, "", q, 1 << 20, bufs[1]),
+        };
+        var entries: [4][]const u8 = undefined;
+        const m = try list_runs.mergeRuns(&pages, 2, 1 << 20, &entries);
+        // Each entry leads with its id: [len:u16][id].
+        for (entries[0..m.taken]) |e| try seen.append(testing.allocator, try testing.allocator.dupe(u8, e[2..][0..std.mem.readInt(u16, e[0..2], .little)]));
+        const c = m.cursor orelse break;
+        @memcpy(after_buf[0..c.run_id.len], c.run_id);
+        after = .{ .created_at = c.created_at, .run_id = after_buf[0..c.run_id.len] };
+    }
+    try expectRunIds(&.{ "ab", "b", "c", "zz" }, seen.items);
+}
+
 test "list runs: a shard's page is newest first, by id among runs started together, and resumes after the run given" {
     var handler = WorkflowHandler.init(testing.allocator);
     defer handler.deinit();

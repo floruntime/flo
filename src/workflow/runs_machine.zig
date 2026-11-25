@@ -1877,6 +1877,62 @@ test "workflow runs machine: a step or cancel decided for a deleted incarnation,
     try testing.expect((try f.step("r1", .{ .rev = 0 })).refused() == null);
 }
 
+/// Whether run `id`'s start at `ms` put it in both lists' index, under `wf`.
+fn indexed(f: *Fixture, wf: []const u8, ms: i64, id: []const u8) !bool {
+    const rv: ReadView = .{ .store = &f.store };
+    const a = f.scratch.allocator();
+    const at = (try rv.get(RunAtFam, try runAtKey(a, .default, wf, ms, id))) != null;
+    const all = (try rv.get(RunAllFam, try runAllKey(a, .default, ms, id))) != null;
+    try testing.expectEqual(at, all);
+    return at;
+}
+
+test "workflow runs machine: every kind of start indexes its run, and none that creates nothing does" {
+    const pool = @import("../budget/pool.zig");
+    const settings = @import("../settings/machine.zig");
+    var f = Fixture.init();
+    defer f.deinit();
+    try f.create("wf");
+    // A schedule's, a trigger's, and one that starts ended.
+    _ = try f.start("s1", "wf", "schedule_started", "_schedule:16:wf:4000", 5);
+    try testing.expect(try indexed(&f, "wf", 5, "s1"));
+    try testing.expect((try triggerStart(&f, "t1", "_trigger:16:5:ev@10:2", .{ .ns = 16, .made = 5, .stream = "ev", .ts = 10, .seq = 2 })).refused() == null);
+    try testing.expect(try indexed(&f, "wf", 1, "t1"));
+    var kb: [64]u8 = undefined;
+    var vb: [512]u8 = undefined;
+    const ended = (Start{ .workflow = "wf", .version = "1", .status = .completed, .event = "workflow_started", .idem = null, .input = "" }).encode(&vb).?;
+    try testing.expect((try f.command(.workflow_start, view_mod.idKey(&kb, .default, "e1") catch unreachable, ended, 6)).refused() == null);
+    try testing.expect(try indexed(&f, "wf", 6, "e1"));
+    // A child's, from its parent's record.
+    var csb: [ae.ChildStart.max_size]u8 = undefined;
+    _ = try f.answer(.child_start, try ae.ChildStart.encodeInto(&csb, .{ .ns = NamespaceId.default.int(), .parent_slot = 3, .parent_run = "p0", .parent_workflow = "pwf", .workflow = "wf", .version = "", .run = "c1", .input = "{}" }));
+    try testing.expect((try f.start("c1", "wf", "child_started", "", 7)).refused() == null);
+    try testing.expect(try indexed(&f, "wf", 7, "c1"));
+    // A child with no parent record creates nothing, and indexes nothing.
+    _ = try f.start("c2", "wf", "child_started", "", 8);
+    try testing.expect(f.get("c2") == null);
+    try testing.expect(!try indexed(&f, "wf", 8, "c2"));
+    // Past the share, the verdict rolls back the start, its index rows too.
+    try settings.bindForTest(&f.store, pool.useOf(&f.store));
+    const held = try f.start("h1", "wf", "workflow_started", "", 9);
+    try testing.expect(held.refused() != null);
+    try testing.expect(!try indexed(&f, "wf", 9, "h1"));
+    try testing.expectEqual(@as(usize, 4), f.store.families[RunAtFam.ID].count);
+}
+
+test "workflow runs machine: the lists' index keys are the bytes the list's order needs" {
+    const a = testing.allocator;
+    const at = try runAtKey(a, .default, "wf", 1, "r1");
+    defer a.free(at);
+    const all = try runAllKey(a, .default, 1, "r1");
+    defer a.free(all);
+    // ns ‖ len ‖ "wf" ‖ ~1 ‖ "r1", and ns ‖ ~1 ‖ "r1": no length before the id.
+    const ns = NamespaceId.default.bytes();
+    const not1 = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe };
+    try testing.expectEqualSlices(u8, &(ns ++ [_]u8{ 0, 2, 'w', 'f' } ++ not1 ++ [_]u8{ 'r', '1' }), at);
+    try testing.expectEqualSlices(u8, &(ns ++ not1 ++ [_]u8{ 'r', '1' }), all);
+}
+
 test "workflow runs machine: a run's start puts it in both lists' index, its delete takes it out, and a start that creates nothing indexes nothing" {
     var f = Fixture.init();
     defer f.deinit();

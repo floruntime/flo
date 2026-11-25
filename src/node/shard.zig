@@ -11798,7 +11798,7 @@ fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8)
             body.block_ms = ms;
             return table_run.op("action.await").request.encodeInto(buf, body) catch unreachable;
         },
-        .action_complete, .action_fail, .action_touch, .action_deliver, .action_history, .action_status, .workflow_history, .action_run_delete, .workflow_run_delete, .action_list_runs => return value,
+        .action_complete, .action_fail, .action_touch, .action_deliver, .action_history, .action_status, .workflow_history, .action_run_delete, .workflow_run_delete, .action_list_runs, .system_runs_page => return value,
         // A dequeue's count and wait from its options, encoded as the op's
         // body would be but with the wait unbounded, so one past its bound
         // reaches the server.
@@ -22939,6 +22939,7 @@ test "actions: an action's runs list newest first by cursor, to the last page; a
     var after: ?@import("../protocol/action_ops.zig").RunCursor.Value = null;
     var cb: [64]u8 = undefined;
     var pages: usize = 0;
+    var prev_at: i64 = std.math.maxInt(i64);
     while (true) : (pages += 1) {
         const page = try Op.response.decodeAll((try t.ok(.action_list_runs, "act", try Op.request.encodeInto(&rb, .{ .limit = 2, .after = after }))).data, &diag);
         var it = page.runs.iterator();
@@ -22946,6 +22947,12 @@ test "actions: an action's runs list newest first by cursor, to the last page; a
             @memcpy(ids[n][0..r.run.len], r.run);
             lens[n] = r.run.len;
             try std.testing.expectEqual(@import("../protocol/action_ops.zig").RunStatus.pending, r.status);
+            // Newest first, then by id: no earlier one comes after.
+            if (n > 0) {
+                try std.testing.expect(r.created_at_ms <= prev_at);
+                if (r.created_at_ms == prev_at) try std.testing.expect(std.mem.order(u8, r.run, ids[n - 1][0..lens[n - 1]]) == .gt);
+            }
+            prev_at = r.created_at_ms;
         }
         const c = page.cursor orelse break;
         @memcpy(cb[0..c.run.len], c.run);
@@ -34376,6 +34383,54 @@ test "Shard: a workflow run's delete is refused while it runs; once it ended, it
     try ParkTest.ack(&shard);
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+}
+
+test "Shard: a run list's cursor no run can be at is refused bad_request, at the client's op and at a shard's page" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [16 * 1024]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    // A stamp before 1970, an id longer than a run's, a cursor cut short.
+    const long: [597]u8 = @splat('r');
+    var cursors: [3][8 + 597]u8 = undefined;
+    std.mem.writeInt(i64, cursors[0][0..8], -1, .little);
+    @memcpy(cursors[0][8..9], "r");
+    std.mem.writeInt(i64, cursors[1][0..8], 1, .little);
+    @memcpy(cursors[1][8..][0..597], &long);
+    const bad = [_][]const u8{ cursors[0][0..9], cursors[1][0 .. 8 + 597], cursors[1][0..5] };
+    for (bad, 0..) |c, i| {
+        // [limit][status_len][cursor_len][cursor][search_len]
+        var vb: [4 + 2 + 2 + 8 + 597 + 2]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&vb);
+        try w.writeInt(u32, 10, .little);
+        try w.writeInt(u16, 0, .little);
+        try w.writeInt(u16, @intCast(c.len), .little);
+        try w.writeAll(c);
+        try w.writeInt(u16, 0, .little);
+        shard.runRequest(conn, try ParkTest.request(.workflow_list_runs, 1 + i, "default", "wf", w.buffered(), ""), .client);
+        try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
+    }
+    // A shard's page, asked by another shard: the schema bounds the id,
+    // the handler the stamp.
+    const Page = table_run.op("system.runs_page").request;
+    var pb: [Page.max_size]u8 = undefined;
+    const ask = try Page.encodeInto(&pb, .{ .status = "", .search = "", .after = .{ .created_at = -1, .run_id = "r" }, .limit = 10, .room = 1 << 16 });
+    shard.runRequest(conn, try ParkTest.request(.system_runs_page, 9, "default", "", ask, ""), .shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
 }
 
 test "Shard: a workflow named longer than its runs' history may name is refused at create and at start, before anything is proposed" {

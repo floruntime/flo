@@ -111,6 +111,7 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("status", 's', "", "Filter by status (running, completed, failed, cancelled)")
                 .stringFlag("search", 'q', "", "Search runs by keyword")
                 .uintFlag("limit", 'l', 100, "Maximum runs to show")
+                .uintFlag("page", 0, 0, "Most runs to ask for a page (0: all that are left)")
                 .action(wrapHandler(runListRuns)),
         )
         .subcommand(
@@ -510,6 +511,7 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
     }
 
     const limit = ctx.getUint("limit") orelse 100;
+    const page_size = ctx.getUint("page") orelse 0;
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -526,7 +528,7 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
     var cursor_buf: [64 * 1024 + 8]u8 = undefined;
     var cursor: ?[]const u8 = null;
     while (count < limit) {
-        var result = client_mod.workflow.listRuns(&client, namespace, name, @intCast(limit - count), status_val, cursor, search_val) catch |err| return outcome.requestFailed(ctx, err);
+        var result = client_mod.workflow.listRuns(&client, namespace, name, @intCast(if (page_size == 0) limit - count else @min(limit - count, page_size)), status_val, cursor, search_val) catch |err| return outcome.requestFailed(ctx, err);
         defer result.deinit();
         try outcome.check(ctx, result);
         // No matching runs still answers with a count of 0.

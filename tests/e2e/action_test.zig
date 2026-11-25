@@ -865,6 +865,28 @@ test "e2e/action/runs: limit flag restricts output" {
     try testing.expect(pending_count == 2);
 }
 
+test "e2e/action/runs: pages of two list every run once, newest first" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const action_name = "runs-page-test";
+    try ctx.exec(&.{ "action", "register", action_name });
+    for (0..5) |_| try ctx.exec(&.{ "action", "invoke", action_name, "{}" });
+
+    var result = try ctx.cli.run(&.{ "action", "runs", action_name, "--page", "2", "-o", "json" });
+    defer result.deinit();
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    const parsed = try std.json.parseFromSlice([]const struct { run_id: []const u8, created_at_ms: i64 }, testing.allocator, result.stdout, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const runs = parsed.value;
+    try testing.expectEqual(@as(usize, 5), runs.len);
+    for (runs, 0..) |r, i| {
+        if (i == 0) continue;
+        const prev = runs[i - 1];
+        try testing.expect(r.created_at_ms < prev.created_at_ms or (r.created_at_ms == prev.created_at_ms and std.mem.order(u8, r.run_id, prev.run_id) == .gt));
+    }
+}
+
 test "e2e/action/runs: only shows runs for specified action" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();

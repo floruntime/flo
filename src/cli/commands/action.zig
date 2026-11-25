@@ -103,6 +103,7 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
             .aliases(&.{"tasks"})
             .arg("name", "Action name")
             .uintFlag("limit", 'l', 50, "Maximum runs to show")
+            .uintFlag("page", 0, 0, "Most runs to ask for a page (0: the most a page holds)")
             .action(wrapHandler(runRuns)),
     );
     gen.addCommands(allocator, action, &action_ops.table, &.{});
@@ -442,6 +443,7 @@ fn runRuns(ctx: *commander.Context) commander.Error!void {
     const namespace = cli_config.getNamespace(ctx);
     const most: u64 = ctx.getUint("limit") orelse 50;
     if (most == 0) return outcome.usage(ctx, "--limit is at least 1", .{});
+    const page_size: u64 = ctx.getUint("page") orelse 0;
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -461,7 +463,7 @@ fn runRuns(ctx: *commander.Context) commander.Error!void {
     var run_buf: [action_ops.RunCursor.max_size]u8 = undefined;
     var shown: u64 = 0;
     while (shown < most) {
-        const ask: u32 = @intCast(@min(most - shown, action_ops.MAX_LIST_RUNS));
+        const ask: u32 = @intCast(@min(most - shown, if (page_size == 0) action_ops.MAX_LIST_RUNS else page_size));
         var result = client_mod.action.listRuns(&client, namespace, name, ask, after) catch |err| return outcome.requestFailed(ctx, err);
         defer result.deinit();
         try outcome.check(ctx, result);
