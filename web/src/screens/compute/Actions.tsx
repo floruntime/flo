@@ -19,7 +19,7 @@ import './compute.css'
 type Tab = 'overview' | 'runs'
 
 const errCount = (r: ActionRunCounts): number => r.failed + r.timed_out
-const invCount = (r: ActionRunCounts): number => r.pending + r.leased + r.completed + errCount(r)
+const invCount = (r: ActionRunCounts): number => r.pending + r.running + r.completed + errCount(r)
 const pendingText = (r: ActionRunCounts | undefined): string => (r ? afmtN(r.pending) : DASH)
 const durMs = (run: ActionRun): number | null =>
   run.completed_at != null && run.started_at != null ? run.completed_at - run.started_at : null
@@ -293,11 +293,11 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                   <span>Run states</span>
                   <span style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                     {counts &&
-                      (['pending', 'leased', 'completed', 'failed', 'timed_out'] as const)
+                      (['pending', 'running', 'completed', 'failed', 'timed_out'] as const)
                         .filter((s) => (counts[s] ?? 0) > 0)
                         .map((s) => (
                           <span key={s} className="tag">
-                            {A_RUNST[s === 'leased' ? 'running' : s]?.[1] ?? s} {counts[s]}
+                            {A_RUNST[s]?.[1] ?? s} {counts[s]}
                           </span>
                         ))}
                     {!counts && a && (

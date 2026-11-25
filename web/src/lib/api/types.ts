@@ -293,7 +293,7 @@ export type ActionRunStatus = 'pending' | 'running' | 'completed' | 'failed' | '
 /** An action's runs by status, kept as they move: exact. */
 export interface ActionRunCounts {
   pending: number
-  leased: number
+  running: number
   completed: number
   failed: number
   timed_out: number

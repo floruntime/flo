@@ -261,8 +261,9 @@ pub const table = [_]ops.Op{
             .{ .name = "max_attempts", .T = Int(u32), .doc = "Attempts a run gets before it fails" },
             .{ .name = "created_at_ms", .T = Int(i64), .doc = "When it was first registered, in Unix milliseconds" },
             // Its runs by status, kept as they move, so exact.
-            .{ .name = "ready", .T = Int(u64), .doc = "Its runs waiting for a worker" },
-            .{ .name = "leased", .T = Int(u64), .doc = "Its runs a worker holds" },
+            // Named for the status each counts, as action.status says it.
+            .{ .name = "pending", .T = Int(u64), .doc = "Its runs waiting for a worker" },
+            .{ .name = "running", .T = Int(u64), .doc = "Its runs a worker holds" },
             .{ .name = "completed", .T = Int(u64), .doc = "Its runs that completed" },
             .{ .name = "failed", .T = Int(u64), .doc = "Its runs that failed for good" },
             .{ .name = "timed_out", .T = Int(u64), .doc = "Its runs whose last attempt timed out" },

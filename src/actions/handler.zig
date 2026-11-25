@@ -493,7 +493,9 @@ pub const ActionsHandler = struct {
         // An action's runs are on its name's shard: a list with no name
         // would see only the shard it landed on.
         if (req.key.len == 0) return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .malformed, .ran = .no, .message = "bad request: action name is required" } } };
-        if (after) |c| if (c.created_at_ms < 0 or c.run.len == 0)
+        // A cursor builds an index key: held to what a run's own key can be
+        // here, not only by the schema's bound.
+        if (after) |c| if (c.created_at_ms < 0 or c.run.len == 0 or c.run.len > ae.MAX_RUN_ID)
             return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .out_of_range, .ran = .no, .message = "bad request: a cursor no run can be at" } } };
         if (req.key.len > ae.MAX_ACTION_NAME) return error.NotFound;
         const buf = self.list_buf orelse blk: {
@@ -626,8 +628,8 @@ pub const ActionsHandler = struct {
             .timeout_ms = def.lease_ms,
             .max_attempts = def.max_attempts,
             .created_at_ms = nsToMs(def.created_ns),
-            .ready = c.ready,
-            .leased = c.leased,
+            .pending = c.ready,
+            .running = c.leased,
             .completed = c.completed,
             .failed = c.failed,
             .timed_out = c.timed_out,

@@ -595,10 +595,10 @@ fn verifyActions(ctx: *stdx.testing.TestContext, restarted: bool) !void {
         // Its own definition and runs.
         const info = try run(ctx, &.{ "action", "info", "same", "-o", "json", "-n", ns }, 0);
         defer testing.allocator.free(info);
-        const def = try parse(struct { max_attempts: u64, ready: u64, completed: ?u64 }, info);
+        const def = try parse(struct { max_attempts: u64, pending: u64, completed: ?u64 }, info);
         defer def.deinit();
         try testing.expectEqual(@as(u64, i + 1), def.value.max_attempts);
-        try testing.expectEqual(@as(u64, count(i) - prior), def.value.ready);
+        try testing.expectEqual(@as(u64, count(i) - prior), def.value.pending);
         try testing.expectEqual(@as(?u64, prior), def.value.completed);
 
         const runs_out = try run(ctx, &.{ "action", "runs", "same", "-o", "json", "-n", ns }, 0);

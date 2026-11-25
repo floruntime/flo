@@ -161,6 +161,8 @@ pub const RunAt = view_mod.Family(74, "action.run_at", .id, delivery.Empty);
 /// `len ‖ action ‖ ~created_ms ‖ run`, the id last with no length before
 /// it, so the key's order is the list's.
 pub fn runAtKey(buf: *RunAtBuf, action: []const u8, created_ms: i64, run: []const u8) []const u8 {
+    // Its callers hold both to their bounds; past them it would overrun.
+    std.debug.assert(action.len <= ae.MAX_ACTION_NAME and run.len <= ae.MAX_RUN_ID);
     std.mem.writeInt(u16, buf[0..2], @intCast(action.len), .big);
     @memcpy(buf[2..][0..action.len], action);
     std.mem.writeInt(u64, buf[2 + action.len ..][0..8], std.math.maxInt(u64) - @as(u64, @intCast(@max(created_ms, 0))), .big);
@@ -170,6 +172,7 @@ pub fn runAtKey(buf: *RunAtBuf, action: []const u8, created_ms: i64, run: []cons
 
 /// `len ‖ action`: every run of one action in its list.
 pub fn runAtPrefix(buf: *RunAtBuf, action: []const u8) []const u8 {
+    std.debug.assert(action.len <= ae.MAX_ACTION_NAME);
     std.mem.writeInt(u16, buf[0..2], @intCast(action.len), .big);
     @memcpy(buf[2..][0..action.len], action);
     return buf[0 .. 2 + action.len];

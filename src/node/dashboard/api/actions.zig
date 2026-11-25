@@ -248,8 +248,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
     {
         var runs = try obj.objectField("runs");
         try runs.begin();
-        try runs.intField("pending", @as(i64, @intCast(info.ready)));
-        for ([_][]const u8{ "leased", "completed", "failed", "timed_out" }, [_]u64{ info.leased, info.completed, info.failed, info.timed_out }) |field, n| {
+        for ([_][]const u8{ "pending", "running", "completed", "failed", "timed_out" }, [_]u64{ info.pending, info.running, info.completed, info.failed, info.timed_out }) |field, n| {
             try runs.intField(field, @as(i64, @intCast(n)));
         }
         try runs.end();
