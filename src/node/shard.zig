@@ -2603,7 +2603,9 @@ pub const Shard = struct {
                 owner = @intCast(i);
             }
             const req = try proto.Request.parse(self.bytes);
-            const to = owner orelse return shard.sendErrorResponse(conn, request_id, .not_found, "");
+            // No shard holds it: the op runs here, where it finds no run and
+            // answers as it does for one by any id.
+            const to = owner orelse shard.id;
             // Held for room, it goes on to the shard found for it.
             const prev = shard.reentry;
             shard.reentry = Reentry.of(conn, req.header.request_id, shard.merging_since_ms orelse nowMs(), self.auth.origin, .forward);
@@ -29980,6 +29982,9 @@ test "Shard: every op routed by a run's id is either a workflow run's, found by 
         try std.testing.expect(a.runIdUnplaced(.{ .header = proto.RequestHeader.init(op, 1), .namespace = "", .key = "rd-1", .value = "" }));
         try std.testing.expect(!a.runIdUnplaced(.{ .header = proto.RequestHeader.init(op, 1), .namespace = "", .key = generated, .value = "" }));
     }
+    // No workflow op is among those only the server mints ids for: a
+    // workflow run's id may be the client's.
+    for (Shard.GENERATED_ID_OPS) |op| try std.testing.expect(!std.mem.startsWith(u8, @tagName(op), "workflow_"));
     for (Shard.GENERATED_ID_OPS) |op| try std.testing.expect(!a.runIdUnplaced(.{ .header = proto.RequestHeader.init(op, 1), .namespace = "", .key = "rd-1", .value = "" }));
 }
 

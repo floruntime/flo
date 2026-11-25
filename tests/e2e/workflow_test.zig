@@ -864,6 +864,12 @@ test "e2e/workflow: run-delete refuses a live run, deletes an ended one, and its
     try stdx.testing.assertContains(fresh, "waiting");
 }
 
+/// The table's `workflow.run_delete`.
+fn runDeleteOp() @import("src").protocol.ops.Op {
+    for (@import("src").protocol.workflow_ops.table) |o| if (std.mem.eql(u8, o.name, "workflow.run_delete")) return o;
+    unreachable;
+}
+
 test "e2e/workflow: on 12 shards, in a namespace of its own, a run by an id the client chose is deleted once ended and refused while live, on its workflow's shard and off shard 0" {
     const shards = 12;
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards } });
@@ -874,7 +880,7 @@ test "e2e/workflow: on 12 shards, in a namespace of its own, a run by an id the 
     // workflows' shards follow from it, as the server routes them.
     const src = @import("src");
     const router = src.node.router.Router.init(shards, 0);
-    const first: src.node.router.NamespaceId = .of(16);
+    const first = src.namespace_table.FIRST_ALLOCATED;
     const shardOf = struct {
         fn f(r: src.node.router.Router, id: src.node.router.NamespaceId, name: []const u8) u16 {
             return switch (r.route(src.node.router.routeNsKey(id, name))) {
@@ -920,10 +926,26 @@ test "e2e/workflow: on 12 shards, in a namespace of its own, a run by an id the 
         var deleted = try ctx.cli.run(&.{ "workflow", "run-delete", rid, "-n", ns });
         defer deleted.deinit();
         try stdx.testing.assertSucceeded(deleted);
-        try testing.expect(!deleted.contains("not found"));
-        var status = try ctx.cli.run(&.{ "workflow", "status", rid, "-n", ns });
-        defer status.deinit();
-        try stdx.testing.assertContains(status, "not found");
+        try testing.expectEqualStrings("OK", std.mem.trim(u8, deleted.stdout, &std.ascii.whitespace));
+        // Gone, every op by its id answers as for any run no shard holds:
+        // the same status, reason and text, as an SDK reads them.
+        var conn = src.cli_client.Client.init(testing.allocator, ctx.endpoint);
+        defer conn.deinit();
+        try conn.connect();
+        const wc = src.cli_client.workflow;
+        var answers = [_]src.cli_client.Response{
+            try wc.status(&conn, ns, rid),
+            try wc.historyPage(&conn, ns, rid, 10, null, false),
+            try wc.signal(&conn, ns, rid, "proceed", null),
+            try wc.cancel(&conn, ns, rid, null),
+            try conn.call(comptime runDeleteOp(), ns, rid, .{}),
+        };
+        for (&answers) |*r| {
+            defer r.deinit();
+            try testing.expectEqual(src.protocol.proto.StatusCode.not_found, r.status);
+            try testing.expectEqual(src.protocol.proto.Reason.not_found, r.reason());
+            try testing.expectEqualStrings("not found: no such run", r.errorMessage());
+        }
     }
 }
 

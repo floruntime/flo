@@ -14,6 +14,7 @@ pub const protocol = struct {
     pub const kv_ops = @import("protocol/kv_ops.zig");
     pub const action_ops = @import("protocol/action_ops.zig");
     pub const namespace_ops = @import("protocol/namespace_ops.zig");
+    pub const workflow_ops = @import("protocol/workflow_ops.zig");
     pub const ts_ops = @import("protocol/ts_ops.zig");
     pub const stream_ops = @import("protocol/stream_ops.zig");
     pub const ops = @import("protocol/ops.zig");
@@ -30,6 +31,7 @@ pub const protocol = struct {
 // Node Layer: Acceptor, Reactor, Shard, Dispatcher, Router, Inbox (NEW)
 // =============================================================================
 pub const node = @import("node/mod.zig");
+pub const namespace_table = @import("namespace/table.zig");
 
 // =============================================================================
 // Storage Layer: UAL, Partition, Snapshot, Memory Controller (NEW)
