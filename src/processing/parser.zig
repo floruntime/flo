@@ -772,7 +772,11 @@ fn parseOneSink(allocator: Allocator, d: D, item: JsonValue, index: usize, defau
             if (t.len == 0) return d.fail(ParseError.InvalidFormat, "a tag's {s} can't be empty", .{if (i % 2 == 0) "name" else "record field"});
             if (i % 2 == 0) if (mem.indexOfAny(u8, t, ",=") != null) return d.fail(ParseError.InvalidFormat, "a tag's name can't hold ',' or '=': \"{s}\"", .{t});
         }
-        for (snk.ts_field_keys, 0..) |v, i| if (i % 2 == 1) try fieldNameFits(d, "fields", v);
+        for (snk.ts_field_keys, 0..) |v, i| if (i % 2 == 1) {
+            // No record field is named "": the sink would drop every record.
+            if (v.len == 0) return d.fail(ParseError.InvalidFormat, "a field's record field can't be empty", .{});
+            try fieldNameFits(d, "fields", v);
+        };
     } else {
         try checkKeys(d, obj, &.{ "name", "namespace" });
         snk.kind = .stream;
@@ -2483,4 +2487,12 @@ test "parser: a TS sink's tag can't be named empty, in JSON, where an empty key 
         \\{"kind":"Processing","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m","tags":{"":"h"}}}]}
     , &diag));
     try std.testing.expect(mem.indexOf(u8, diag.message(), "a tag's name can't be empty") != null);
+}
+
+test "parser: a TS sink's field can't read a record field named empty" {
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(std.testing.allocator,
+        \\{"kind":"Processing","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m","fields":{"load":""}}}]}
+    , &diag));
+    try std.testing.expect(mem.indexOf(u8, diag.message(), "a field's record field can't be empty") != null);
 }
