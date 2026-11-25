@@ -98,9 +98,11 @@ comptime {
 /// final and marker rows, each its key (namespace, owner, run and
 /// incarnation, with its place in the log) and a row, and sends the fold
 /// of its rows to itself, an outbox row with its channel's meta and
-/// per-namespace rows (each value under 64 bytes).
+/// per-namespace rows (each value under 64 bytes); and on its namespace's
+/// first, that namespace's usage row.
 const HISTORY_ROW_BYTES: u64 = pool.RESIDENT_RECORD + 4 + he.MAX_OWNER + he.MAX_RUN + 64 + hm.Row.max_size;
-const HISTORY_LAND_BYTES: u64 = 3 * HISTORY_ROW_BYTES + 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + channels.CHAN_KEY + channels.OUT_NS_KEY + 3 * 64 + he.Index.max_size;
+const HISTORY_LAND_BYTES: u64 = 3 * HISTORY_ROW_BYTES + 3 * pool.RESIDENT_RECORD + channels.OUT_KEY + channels.CHAN_KEY + channels.OUT_NS_KEY + 3 * 64 + he.Index.max_size + HISTORY_USAGE_BYTES;
+const HISTORY_USAGE_BYTES: u64 = pool.RESIDENT_RECORD + 4 + hm.Usage.max_size;
 
 /// What one admitted start or signal sends, which its verdict can't weigh:
 /// sends are written after the machine's verdict. A start sends its first

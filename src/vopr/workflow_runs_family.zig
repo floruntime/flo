@@ -1082,6 +1082,7 @@ pub const WorkflowRuns = struct {
         if (try self.callsRule(store, a)) |why| return why;
         if (try hm.ruleOf(hm.Workflows, rv, a)) |why| return why;
         if (!sweep) return if (touched) |t| self.runRule(store, a, t, true) else null;
+        if (try hm.usageRule(rv, a)) |why| return why;
         // On the store alone: counts, idempotency keys naming their run, and
         // a run's wait agreeing with its status.
         var active: [NAMES.len]u32 = @splat(0);

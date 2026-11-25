@@ -88,6 +88,8 @@ pub const CHARGED = [_]u16{
     74,
     // action.counts: an action's runs by where they are
     75,
+    // history.usage: a namespace's history bytes on this shard
+    76,
 };
 
 /// The families the pool is not charged for: the node's own state, and a

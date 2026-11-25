@@ -1275,7 +1275,8 @@ pub const Actions = struct {
     pub fn historyRows(self: *Actions) ?[]const u8 {
         var arena = std.heap.ArenaAllocator.init(self.store.allocator);
         defer arena.deinit();
-        return hm.ruleOf(hm.Actions, self.read(), arena.allocator()) catch "the history rows could not be read";
+        if (hm.ruleOf(hm.Actions, self.read(), arena.allocator()) catch return "the history rows could not be read") |why| return why;
+        return hm.usageRule(self.read(), arena.allocator()) catch "the history rows could not be read";
     }
 
     /// Every request record names its run's live delivery. Walks the

@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 68;
+pub const CURRENT: u32 = 69;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -247,6 +247,9 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // and a cancel name their run's incarnation; a start's run id is held
     // to 596 bytes at apply.
     .{ .format = 68, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
+    // Every history row counts the log bytes it references (`total`), and
+    // each namespace's sum is kept on its shard (history.usage).
+    .{ .format = 69, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
 };
 
 comptime {

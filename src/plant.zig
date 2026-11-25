@@ -148,6 +148,10 @@ pub const Plant = enum {
     runs_delete_keeps_index,
     /// A child's start puts no place in the lists.
     runs_child_unindexed,
+    /// A history fold's row counts only its own message, not the rows it folded.
+    history_fold_total_dropped,
+    /// A history drop takes its run's rows off nothing: usage keeps them.
+    history_drop_unread,
 };
 
 pub const active: Plant = std.meta.stringToEnum(Plant, @import("build_options").vopr_plant) orelse
