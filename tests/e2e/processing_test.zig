@@ -3659,3 +3659,91 @@ test "e2e/processing: on 4 shards, a job lives on its source's shard, runs there
         try expectRun(ctx.cli, &.{ "processing", "status", job_id }, 1, "");
     }
 }
+
+test "e2e/processing/routing: on 12 shards, in a namespace of its own, jobs homed off shard 0 go through every op keyed by the job" {
+    const shards = 12;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards } });
+    defer ctx.deinit();
+    const ns = "pr-ns";
+    try ctx.exec(&.{ "namespace", "create", ns });
+    // The first namespace created takes the first allocated id. A job's
+    // home is its first source's shard, which follows from the stream's
+    // name as the server's router places it.
+    const router = @import("src").node.router;
+    const first: router.NamespaceId = .of(16);
+    const r = router.Router.init(shards, 0);
+
+    var found: usize = 0;
+    var used: [shards]bool = @splat(false);
+    var i: usize = 0;
+    while (found < 4) : (i += 1) {
+        if (i == 256) return error.TooFewShards;
+        var sb: [16]u8 = undefined;
+        const stream = try std.fmt.bufPrint(&sb, "pr-in-{d}", .{i});
+        const home: u16 = switch (r.route(router.routeNsKey(first, stream))) {
+            .local => 0,
+            .shard => |s| s.shard_id,
+        };
+        if (home == 0 or used[home]) continue;
+        used[home] = true;
+        found += 1;
+        // Half are stopped, half cancelled; each is removed after.
+        const cancel = found % 2 == 0;
+
+        var jb: [16]u8 = undefined;
+        const job = try std.fmt.bufPrint(&jb, "pr-job-{d}", .{i});
+        try ctx.exec(&.{ "stream", "append", stream, "{\"a\":1}", "-n", ns });
+        var def_buf: [256]u8 = undefined;
+        const def = try std.fmt.bufPrint(&def_buf,
+            \\kind: Processing
+            \\name: {s}
+            \\namespace: {s}
+            \\sources.[0].stream.name: {s}
+            \\sinks.[0].stream.name: {s}-out
+        , .{ job, ns, stream, stream });
+        var fb: [32]u8 = undefined;
+        const path = try writeDottedToTempYaml(testing.allocator, def, try std.fmt.bufPrint(&fb, "{s}.yaml", .{job}));
+        defer cleanupTempFile(testing.allocator, path);
+
+        var id_buf: [64]u8 = undefined;
+        const id = blk: {
+            const out = try ctx.execCapture(&.{ "processing", "submit", path, "-n", ns });
+            const got = extractJobId(out) orelse {
+                std.debug.print("\nno job id in '{s}'\n", .{out});
+                return error.NoJobId;
+            };
+            @memcpy(id_buf[0..got.len], got);
+            break :blk id_buf[0..got.len];
+        };
+        {
+            var s = try ctx.cli.run(&.{ "processing", "status", id, "-n", ns });
+            defer s.deinit();
+            try stdx.testing.assertContains(s, job);
+            try stdx.testing.assertContains(s, "RUNNING");
+            var other = try ctx.cli.run(&.{ "processing", "status", id });
+            defer other.deinit();
+            try stdx.testing.assertContains(other, "Job not found");
+        }
+        // A running job isn't removed.
+        var running = try ctx.cli.run(&.{ "processing", "remove", id, "-n", ns });
+        defer running.deinit();
+        try stdx.testing.assertContains(running, "job is running: stop or cancel it, then remove it");
+
+        var ended = try ctx.cli.run(&.{ "processing", if (cancel) "cancel" else "stop", id, "-n", ns });
+        defer ended.deinit();
+        try stdx.testing.assertContains(ended, if (cancel) "cancelled" else "Job stopped");
+        {
+            var s = try ctx.cli.run(&.{ "processing", "status", id, "-n", ns });
+            defer s.deinit();
+            try stdx.testing.assertContains(s, if (cancel) "CANCELLED" else "STOPPED");
+        }
+        var removed = try ctx.cli.run(&.{ "processing", "remove", id, "-n", ns });
+        defer removed.deinit();
+        try stdx.testing.assertContains(removed, "Job removed: ");
+        {
+            var s = try ctx.cli.run(&.{ "processing", "status", id, "-n", ns });
+            defer s.deinit();
+            try stdx.testing.assertContains(s, "Job not found");
+        }
+    }
+}
