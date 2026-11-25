@@ -865,6 +865,48 @@ test "e2e/action/runs: limit flag restricts output" {
     try testing.expect(pending_count == 2);
 }
 
+test "e2e/action/runs: pages of two, three of them, list every run once, newest first" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const action_name = "runs-page-test";
+    try ctx.exec(&.{ "action", "register", action_name });
+    for (0..5) |_| try ctx.exec(&.{ "action", "invoke", action_name, "{}" });
+
+    var result = try ctx.cli.run(&.{ "action", "runs", action_name, "--page", "2", "-o", "json", "--verbose" });
+    defer result.deinit();
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    // Three pages, each told on stderr: only paging reads more than one.
+    try testing.expectEqual(@as(usize, 2), result.stderrCount("page: 2 runs, more"));
+    try testing.expectEqual(@as(usize, 1), result.stderrCount("page: 1 runs, the last"));
+    const parsed = try std.json.parseFromSlice([]const struct { run_id: []const u8, created_at_ms: i64 }, testing.allocator, result.stdout, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const runs = parsed.value;
+    try testing.expectEqual(@as(usize, 5), runs.len);
+    for (runs, 0..) |r, i| {
+        if (i == 0) continue;
+        const prev = runs[i - 1];
+        try testing.expect(r.created_at_ms < prev.created_at_ms or (r.created_at_ms == prev.created_at_ms and std.mem.order(u8, r.run_id, prev.run_id) == .gt));
+    }
+}
+
+test "e2e/action/runs: a page past the most one holds, or a limit of 0, is refused saying so" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "action", "register", "runs-page-bound" });
+    for ([_][]const []const u8{
+        &.{ "action", "runs", "runs-page-bound", "--page", "2000", "--limit", "5000" },
+        &.{ "action", "runs", "runs-page-bound", "--limit", "0" },
+        &.{ "workflow", "list-runs", "--search", "x", "--page", "2000" },
+        &.{ "workflow", "list-runs", "--search", "x", "--limit", "0" },
+    }, [_][]const u8{ "--page is at most 1024", "--limit is at least 1", "--page is at most 1024", "--limit is at least 1" }) |args, want| {
+        var r = try ctx.cli.run(args);
+        defer r.deinit();
+        try testing.expect(r.exit_code != 0);
+        try testing.expectEqual(@as(usize, 1), r.stderrCount(want));
+    }
+}
+
 test "e2e/action/runs: only shows runs for specified action" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
@@ -1470,7 +1512,7 @@ test "e2e/action/run-delete: a live run is refused; an ended one goes, with its 
     var live = try ctx.cli.run(&.{ "action", "run-delete", t.run });
     defer live.deinit();
     try stdx.testing.assertFailed(live);
-    try stdx.testing.assertContains(live, "the run hasn't ended; cancel it first");
+    try stdx.testing.assertContains(live, "the run hasn't ended; delete it once it ends");
 
     try ctx.exec(&.{ "worker", "complete", t.task, "--worker-id", "gw" });
     var deleted = try ctx.cli.run(&.{ "action", "run-delete", t.run });

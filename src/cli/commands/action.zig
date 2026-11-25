@@ -103,6 +103,7 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
             .aliases(&.{"tasks"})
             .arg("name", "Action name")
             .uintFlag("limit", 'l', 50, "Maximum runs to show")
+            .uintFlag("page", 0, 0, "Most runs to ask for a page, at most 1024 (0: the most a page holds)")
             .action(wrapHandler(runRuns)),
     );
     gen.addCommands(allocator, action, &action_ops.table, &.{});
@@ -440,34 +441,76 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
 fn runRuns(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?; // validated by commander
     const namespace = cli_config.getNamespace(ctx);
-    const limit: u32 = @intCast(ctx.getUint("limit") orelse 50);
+    const most: u64 = ctx.getUint("limit") orelse 50;
+    if (most == 0) return outcome.usage(ctx, "--limit is at least 1", .{});
+    const page_size: u64 = ctx.getUint("page") orelse 0;
+    if (page_size > action_ops.MAX_LIST_RUNS) return outcome.usage(ctx, "--page is at most {d}", .{action_ops.MAX_LIST_RUNS});
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
-
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.action.listRuns(&client, namespace, name, limit) catch |err| return outcome.requestFailed(ctx, err);
-    defer result.deinit();
-
-    try outcome.check(ctx, result);
-
-    const data = result.asRawData() orelse {
-        cli_output.printEmptyList(ctx, "(no runs)");
-        return;
-    };
-
-    // Server wire format is read directly — enum_u8 maps status byte to string,
-    // timestamp_i64 formats as relative time, optional_timestamp_i64 handles has:u8 + i64.
-    cli_output.printWireList(ctx, data, "(no runs)", &.{
-        .{ .field = "run_id", .header = "RUN ID", .field_type = .str_u16 },
-        .{ .field = "action", .header = "ACTION", .field_type = .str_u16 },
-        .{ .field = "status", .header = "STATUS", .field_type = .enum_u8, .enum_labels = &.{ "pending", "running", "completed", "failed", "cancelled", "timed_out" } },
-        .{ .field = "created", .header = "CREATED", .field_type = .timestamp_i64 },
-        .{ .field = "started", .header = "STARTED", .field_type = .optional_timestamp_i64 },
-        .{ .field = "completed", .header = "COMPLETED", .field_type = .optional_timestamp_i64 },
-    }) catch return outcome.malformed(ctx, "list");
+    // Every page is read before anything is printed, so a refusal part way
+    // leaves no half-written JSON or table.
+    const format = cli_output.getFormat(ctx);
+    var table = cli_output.Table.init(ctx.allocator);
+    defer table.deinit();
+    for ([_][]const u8{ "RUN ID", "ACTION", "STATUS", "CREATED", "STARTED", "COMPLETED" }) |h|
+        table.addColumn(h, .left) catch return error.OutOfMemory;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(ctx.allocator);
+    var after: ?action_ops.RunCursor.Value = null;
+    var run_buf: [action_ops.RunCursor.max_size]u8 = undefined;
+    var shown: u64 = 0;
+    while (shown < most) {
+        const ask: u32 = @intCast(@min(most - shown, if (page_size == 0) action_ops.MAX_LIST_RUNS else page_size));
+        var result = client_mod.action.listRuns(&client, namespace, name, ask, after) catch |err| return outcome.requestFailed(ctx, err);
+        defer result.deinit();
+        try outcome.check(ctx, result);
+        var diag: schema.Diagnostic = .{};
+        const page = action_ops.op("action.list_runs").response.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "action.list_runs answer");
+        if (cli_output.isVerbose(ctx)) ctx.printErr("[verbose] page: {d} runs, {s}\n", .{ page.runs.count, if (page.cursor != null) "more" else "the last" });
+        var it = page.runs.iterator();
+        while (it.next() catch return outcome.malformed(ctx, "action.list_runs answer")) |r| : (shown += 1) {
+            const status = @tagName(r.status);
+            switch (format) {
+                .json => {
+                    if (shown > 0) out.append(ctx.allocator, ',') catch return error.OutOfMemory;
+                    out.print(ctx.allocator, "{{\"run_id\":{f},\"action\":{f},\"status\":\"{s}\",\"created_at_ms\":{d},\"started_at_ms\":", .{ cli_output.jsonString(r.run), cli_output.jsonString(name), status, r.created_at_ms }) catch return error.OutOfMemory;
+                    (if (r.started_at_ms) |t| out.print(ctx.allocator, "{d}", .{t}) else out.appendSlice(ctx.allocator, "null")) catch return error.OutOfMemory;
+                    out.appendSlice(ctx.allocator, ",\"completed_at_ms\":") catch return error.OutOfMemory;
+                    (if (r.completed_at_ms) |t| out.print(ctx.allocator, "{d}}}", .{t}) else out.appendSlice(ctx.allocator, "null}")) catch return error.OutOfMemory;
+                },
+                .raw => out.print(ctx.allocator, "{s}\n", .{r.run}) catch return error.OutOfMemory,
+                .table => {
+                    var cb: [24]u8 = undefined;
+                    var sb: [24]u8 = undefined;
+                    var db: [24]u8 = undefined;
+                    table.addRow(&.{
+                        r.run,
+                        name,
+                        status,
+                        cli_output.formatRelativeTimeBuf(r.created_at_ms, &cb),
+                        if (r.started_at_ms) |t| cli_output.formatRelativeTimeBuf(t, &sb) else "-",
+                        if (r.completed_at_ms) |t| cli_output.formatRelativeTimeBuf(t, &db) else "-",
+                    }) catch return error.OutOfMemory;
+                },
+            }
+        }
+        const next = page.cursor orelse break;
+        // Pages run newest first: a cursor that doesn't move on would ask
+        // for the same page forever.
+        if (after) |prev| if (!(next.created_at_ms < prev.created_at_ms or (next.created_at_ms == prev.created_at_ms and std.mem.order(u8, next.run, prev.run) == .gt)))
+            return outcome.malformed(ctx, "action.list_runs answer (its cursor didn't move on)");
+        @memcpy(run_buf[0..next.run.len], next.run);
+        after = .{ .created_at_ms = next.created_at_ms, .run = run_buf[0..next.run.len] };
+    }
+    switch (format) {
+        .json => ctx.print("[{s}]\n", .{out.items}),
+        .raw => ctx.print("{s}", .{out.items}),
+        .table => if (shown == 0) cli_output.printEmptyList(ctx, "(no runs)") else table.print(ctx),
+    }
 }
 
 // Worker handlers

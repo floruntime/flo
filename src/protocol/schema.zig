@@ -447,15 +447,14 @@ fn ListOf(comptime T: type, comptime max: u32, comptime max_bytes: ?u32) type {
             }
 
             /// Adds `item`; false, with nothing added, when it wouldn't fit.
+            /// An item its schema refuses is an error, and nothing of it is
+            /// kept either: an encode stops part way through a record.
             pub fn add(b: *Builder, item: T.Value) EncodeError!bool {
                 if (b.count == max) return false;
                 const before = b.w.pos;
-                T.encode(&b.w, item) catch |err| switch (err) {
-                    error.NoSpaceLeft => {
-                        b.w.pos = before;
-                        return false;
-                    },
-                    else => return err,
+                T.encode(&b.w, item) catch |err| {
+                    b.w.pos = before;
+                    return if (err == error.NoSpaceLeft) false else err;
                 };
                 if (max_bytes) |bytes| if (b.w.pos > bytes) {
                     b.w.pos = before;
@@ -936,6 +935,28 @@ test "schema: a list builder takes elements until the next one wouldn't fit, and
     var t = L.Builder.init(&tiny);
     try std.testing.expect(try t.add("ab"));
     try std.testing.expect(!try t.add("c"));
+}
+
+test "schema: a list builder keeps nothing of an element its schema refuses part way, and the next is whole" {
+    const E = Record(&.{
+        .{ .name = "id", .T = Int(u64) },
+        .{ .name = "name", .T = Bytes(4) },
+    });
+    const L = BoundedList(E, 4, 256);
+    var buf: [256]u8 = undefined;
+    var b = L.Builder.init(&buf);
+    try std.testing.expect(try b.add(.{ .id = 1, .name = "a" }));
+    // Its id is written before its name is found too long.
+    try std.testing.expectError(error.TooLong, b.add(.{ .id = 2, .name = "toolong" }));
+    try std.testing.expect(try b.add(.{ .id = 3, .name = "c" }));
+    var out: [256]u8 = undefined;
+    var w: Writer = .{ .buf = &out };
+    try L.encode(&w, b.value());
+    var diag: Diagnostic = .{};
+    var r: Reader = .{ .bytes = w.written(), .diag = &diag };
+    var it = (try L.decode(&r, "")).iterator();
+    for ([_]u64{ 1, 3 }) |want| try std.testing.expectEqual(want, (try it.next()).?.id);
+    try std.testing.expect((try it.next()) == null);
 }
 
 test "schema: encodedSize is what encodeInto writes, and refuses what it refuses" {

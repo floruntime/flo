@@ -84,7 +84,42 @@ const delivery_fields = [_]schema.Field{
     .{ .name = "index", .T = Int(u64), .doc = "The task's index" },
 };
 
+/// Where an action's run list stands: newest first, then by id.
+pub const RunCursor = Record(&.{
+    .{ .name = "created_at_ms", .T = Int(i64), .doc = "The run's invoke time, in Unix milliseconds" },
+    .{ .name = "run", .T = Bytes(@import("action_entries.zig").MAX_RUN_ID), .doc = "The run's id" },
+});
+
+/// One run as an action's list shows it.
+pub const ListedRun = Record(&.{
+    .{ .name = "run", .T = Bytes(@import("action_entries.zig").MAX_RUN_ID), .doc = "The run's id" },
+    .{ .name = "status", .T = schema.Enum(RunStatus), .doc = "Where the run is" },
+    .{ .name = "created_at_ms", .T = Int(i64), .doc = "When it was invoked, in Unix milliseconds" },
+    .{ .name = "started_at_ms", .T = Optional(Int(i64)), .doc = "When a worker first took it" },
+    .{ .name = "completed_at_ms", .T = Optional(Int(i64)), .doc = "When it ended" },
+});
+
+/// The most runs one page of an action's list holds.
+pub const MAX_LIST_RUNS: u32 = 1024;
+pub const ListedRuns = schema.BoundedList(ListedRun, MAX_LIST_RUNS, MAX_LIST_RUNS * ListedRun.max_size);
+
 pub const table = [_]ops.Op{
+    .{
+        .name = "action.list_runs",
+        .code = 0x304,
+        .class = .read,
+        .route = .key,
+        .request = Record(&.{
+            .{ .name = "limit", .T = Defaulted(schema.Range(u32, 1, MAX_LIST_RUNS), 100), .doc = "Most runs to show" },
+            .{ .name = "after", .T = Optional(RunCursor), .doc = "Go on past this run, as the last answer's cursor named it" },
+        }),
+        .response = Record(&.{
+            .{ .name = "runs", .T = ListedRuns, .doc = "The action's runs, newest first; may be none while more follow" },
+            .{ .name = "cursor", .T = Optional(RunCursor), .doc = "Where the next page starts; none on the last page" },
+        }),
+        .cli = .{ .expose = .hand, .key = .{ .name = "action", .doc = "The action's name" } },
+        .doc = "An action's runs, newest first, a page at a time: each run's id, status and times.",
+    },
     .{
         .name = "action.status",
         .code = 0x302,
@@ -130,7 +165,7 @@ pub const table = [_]ops.Op{
         .request = Record(&.{}),
         .response = Record(&.{}),
         .cli = .{ .key = .{ .name = "run_id", .doc = "The run's id" }, .examples = &.{"flo action run-delete act-1a2b3c4d5e6f00-3-1c"} },
-        .doc = "Delete an ended action run and its history; a live run is refused (cancel it first). Its id may then name a new run.",
+        .doc = "Delete an ended action run and its history; a live run is refused (delete it once it ends). Its id may then name a new run.",
     },
     .{
         .name = "action.await",
@@ -225,34 +260,31 @@ pub const table = [_]ops.Op{
             .{ .name = "timeout_ms", .T = Int(u64), .doc = "How long a worker holds a run before it times out" },
             .{ .name = "max_attempts", .T = Int(u32), .doc = "Attempts a run gets before it fails" },
             .{ .name = "created_at_ms", .T = Int(i64), .doc = "When it was first registered, in Unix milliseconds" },
-            .{ .name = "ready", .T = Int(u64), .doc = "Its runs waiting for a worker, counted up to 100,000" },
-            .{ .name = "ready_capped", .T = schema.Bool, .doc = "More runs are waiting than were counted: ready is at least that" },
-            // The counts below read every run of the namespace's that the
-            // action's shard holds, so past 10,000 they aren't taken: a
-            // sample of the oldest would stop moving while new runs come and go.
-            .{ .name = "too_many_runs", .T = schema.Bool, .doc = "The action's shard holds more than 10,000 of the namespace's runs, so the counts and latency below are none" },
-            .{ .name = "running", .T = Optional(Int(u64)), .doc = "Its runs a worker holds" },
-            .{ .name = "completed", .T = Optional(Int(u64)), .doc = "Its runs that completed" },
-            .{ .name = "failed", .T = Optional(Int(u64)), .doc = "Its runs that failed for good" },
-            .{ .name = "timed_out", .T = Optional(Int(u64)), .doc = "Its runs whose last attempt timed out" },
+            // Its runs by status, kept as they move, so exact.
+            // Named for the status each counts, as action.status says it.
+            .{ .name = "pending", .T = Int(u64), .doc = "Its runs waiting for a worker" },
+            .{ .name = "running", .T = Int(u64), .doc = "Its runs a worker holds" },
+            .{ .name = "completed", .T = Int(u64), .doc = "Its runs that completed" },
+            .{ .name = "failed", .T = Int(u64), .doc = "Its runs that failed for good" },
+            .{ .name = "timed_out", .T = Int(u64), .doc = "Its runs whose last attempt timed out" },
             // How long its completed runs took, from a worker first taking
-            // one to its completion; none until one completes.
-            .{ .name = "latency_count", .T = Optional(Int(u64)), .doc = "Completed runs measured" },
+            // one to its completion; none until one completes. Sampled from
+            // its newest runs, a bounded read per ask.
+            .{ .name = "latency_sampled", .T = schema.Bool, .doc = "The latencies are from the newest 10,000 runs, not all of them" },
+            .{ .name = "latency_count", .T = Int(u64), .doc = "Completed runs measured; the latencies below are none while it is 0" },
             .{ .name = "latency_avg_ms", .T = Optional(Int(u64)), .doc = "Their mean duration" },
             .{ .name = "latency_p50_ms", .T = Optional(Int(u64)), .doc = "Their median duration" },
             .{ .name = "latency_p95_ms", .T = Optional(Int(u64)), .doc = "Their 95th percentile duration" },
             .{ .name = "latency_max_ms", .T = Optional(Int(u64)), .doc = "The longest" },
         }),
         .cli = .{ .expose = .command, .key = .{ .name = "action", .doc = "The action's name" }, .render = .record, .examples = &.{"flo action info send-email"} },
-        .doc = "An action's definition, its runs by status and how long completed runs took. Counts other than ready are none when the action's shard holds more than 10,000 of the namespace's runs.",
+        .doc = "An action's definition, its runs by status and how long its newest completed runs took.",
     },
 };
 
-/// The most runs `action.info` reads for its counts and latency, so one
-/// answer is bounded however many runs a namespace keeps.
+/// The most runs `action.info` reads for its latency sample, its newest,
+/// so one answer is bounded however many runs an action keeps.
 pub const RUNS_SCANNED: u32 = 10_000;
-/// The most ready runs `action.info` counts.
-pub const READY_COUNTED: u64 = 100_000;
 
 /// The longest owner an action registers with.
 pub const MAX_OWNER: u32 = 256;

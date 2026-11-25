@@ -63,3 +63,7 @@ workflow-runs-delete-keeps-idem.json	runs_delete_keeps_idem	--workflows	-	workfl
 workflow-runs-delete-takes-live.json	runs_delete_takes_live	--workflows	-	workflow_run_rule	applied a delete the ledger refuses: its run hasn.t ended
 workflow-history-drop-not-resent.json	history_drop_not_resent	--workflows	-	workflow_run_rule	(isn.t marked orphaned|history rows aren.t gone)
 workflow-runs-signal-admitted.json	signal_verdict_admits	--memory-gate --workflows	-	workflow_run_rule	applied a signal the ledger refuses: past its shard.s share
+workflow-runs-delete-keeps-index.json	runs_delete_keeps_index	--workflows	-	workflow_run_rule	a deleted run is still in its workflow.s list
+workflow-runs-child-unindexed.json	runs_child_unindexed	--workflows	-	workflow_run_rule	a run isn.t in its lists. index
+workflow-runs-step-incarnation.json	runs_step_incarnation_unchecked	--workflows	-	workflow_run_rule	applied a (step|complete) the ledger refuses: it names another incarnation
+actions-counts-unmoved.json	actions_counts_unmoved	--actions	-	action_rule	counts are not a recount of its runs

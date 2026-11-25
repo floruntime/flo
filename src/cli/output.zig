@@ -495,7 +495,7 @@ fn checkWireList(data: []const u8, columns: []const WireColumn) error{Truncated}
 // ── Shared helpers ──────────────────────────────────────────────────────
 
 /// Format an i64 millisecond timestamp as a relative time string.
-fn formatRelativeTimeBuf(ms: i64, buf: *[24]u8) []const u8 {
+pub fn formatRelativeTimeBuf(ms: i64, buf: *[24]u8) []const u8 {
     const now = @import("stdx").time.milliTimestamp();
     const diff = now - ms;
     if (diff < 0) return std.fmt.bufPrint(buf, "{d}ms", .{ms}) catch "?";

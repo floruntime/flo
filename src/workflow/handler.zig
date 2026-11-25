@@ -187,6 +187,11 @@ pub const WorkflowHandler = struct {
     /// An index couldn't keep an entry: the runs are walked again
     /// (`leadCaches`).
     rewatch: bool = false,
+    /// Index rows a run list passed over (a Flo bug): its run gone, or its
+    /// entry unlistable. Each kind is logged once, not every page.
+    missing_runs: u64 = 0,
+    missing_runs_logged: u32 = 0,
+    unlistable_said: bool = false,
     /// The cancel this leader proposed last for a run, by key, owned: its
     /// end is counted when that entry applies. Leader memory.
     ending: std.StringHashMapUnmanaged(Ending) = .empty,
@@ -284,6 +289,9 @@ pub const WorkflowHandler = struct {
     /// The longest run id a start may choose: its key is the namespace's id
     /// and the run id.
     pub const MAX_RUN_ID: usize = MAX_START_KEY - KEY_PREFIX;
+    comptime {
+        std.debug.assert(MAX_RUN_ID == runs_machine.MAX_RUN_ID);
+    }
 
     pub const RunStatus = runs_machine.RunStatus;
 
@@ -308,6 +316,9 @@ pub const WorkflowHandler = struct {
         status: RunStatus,
         input_owned: []const u8,
         created_at_ms: i64,
+        /// Its incarnation, as applied: a step names it, so one decided for
+        /// a run since deleted, its id started again, applies to nothing.
+        created_ns: u64,
         started_at_ms: ?i64,
         completed_at_ms: ?i64,
         idempotency_key_owned: ?[]const u8,
@@ -1469,8 +1480,8 @@ pub const WorkflowHandler = struct {
             return null;
         }
         const reason = if (req.value.len > 0) req.value else "cancelled by user";
-        const c: runs_machine.Complete = .{ .status = .cancelled, .output = null, .event = terminalEventType(.cancelled), .detail = reason, .workflow = run.workflow };
-        var vbuf: [MAX_CANCEL_REASON + MAX_WORKFLOW_NAME_LEN + 64]u8 = undefined;
+        const c: runs_machine.Complete = .{ .status = .cancelled, .output = null, .event = terminalEventType(.cancelled), .detail = reason, .workflow = run.workflow, .created_ns = run.created_ns };
+        var vbuf: [MAX_CANCEL_REASON + MAX_WORKFLOW_NAME_LEN + 72]u8 = undefined;
         const value = c.encode(&vbuf) orelse {
             shard.sendRefusal(conn, req.header.request_id, .internal_error, proto.notRun("internal error: a cancel that doesn't encode"));
             return null;
@@ -1702,42 +1713,37 @@ pub const WorkflowHandler = struct {
         created_at: i64,
     };
 
-    /// Collect the runs of namespace `ns` matching filters, as applied, on
-    /// this handler's own thread.
-    pub fn collectMatchingRuns(
-        self: *WorkflowHandler,
-        runs_list: *std.ArrayListUnmanaged(RunInfo),
-        ns: NamespaceId,
-        workflow_name: []const u8,
-        status_filter: ?[]const u8,
-        search_lower: ?[]const u8,
-    ) !void {
-        const id = ns.bytes();
-        var rit = self.defsRead().range(runs_machine.RunFam, &id);
-        while (rit.next() catch unreachable) |item| { // written by the machine alone
-            const run = self.shownRun(item.key, keyName(item.key)).?;
-            if (workflow_name.len > 0 and !std.mem.eql(u8, run.workflow_name_owned, workflow_name)) continue;
-            if (status_filter) |sf| {
-                if (!std.mem.eql(u8, run.status.toString(), sf)) continue;
-            }
-
-            // Free-text search: match against run_id, workflow, step, input, search_tags
-            if (search_lower) |sq| {
-                const matched = containsLower(run.run_id_owned, sq) or
-                    containsLower(run.workflow_name_owned, sq) or
-                    (if (run.current_step_name_owned) |step| containsLower(step, sq) else false) or
-                    containsLower(run.input_owned, sq) or
-                    (if (run.search_tags_owned) |tags| containsLower(tags, sq) else false);
-                if (!matched) continue;
-            }
-
-            try runs_list.append(self.allocator, .{
-                .run_id = run.run_id_owned,
-                .workflow = run.workflow_name_owned,
-                .status = run.status.toString(),
-                .created_at = run.started_at_ms orelse run.created_at_ms,
-            });
+    /// Run `run_key` (id `run_id`) as a list shows it, if it matches the
+    /// status and the lowercased search; null for one that doesn't, or that
+    /// isn't there. The search reads at most `SEARCH_SPAN` bytes of each
+    /// field, so a page's cost is bounded whatever a run holds.
+    pub fn listedRun(self: *WorkflowHandler, run_key: []const u8, run_id: []const u8, status_filter: []const u8, search_lower: []const u8) Listed {
+        const run = self.shownRun(run_key, run_id) orelse return .missing;
+        if (status_filter.len > 0 and !std.mem.eql(u8, run.status.toString(), status_filter)) return .filtered;
+        if (search_lower.len > 0) {
+            const matched = containsLower(span(run.run_id_owned), search_lower) or
+                containsLower(span(run.workflow_name_owned), search_lower) or
+                (if (run.current_step_name_owned) |step| containsLower(span(step), search_lower) else false) or
+                containsLower(span(run.input_owned), search_lower) or
+                (if (run.search_tags_owned) |tags| containsLower(span(tags), search_lower) else false);
+            if (!matched) return .filtered;
         }
+        return .{ .shown = .{
+            .run_id = run.run_id_owned,
+            .workflow = run.workflow_name_owned,
+            .status = run.status.toString(),
+            .created_at = run.started_at_ms orelse run.created_at_ms,
+        } };
+    }
+
+    /// A list's verdict on one indexed run: shown, filtered out, or not there.
+    pub const Listed = union(enum) { shown: RunInfo, filtered, missing };
+
+    /// The most of one field a list's search reads.
+    pub const SEARCH_SPAN: usize = 4096;
+
+    fn span(field: []const u8) []const u8 {
+        return field[0..@min(field.len, SEARCH_SPAN)];
     }
 
     const ListRunsQuery = struct {
@@ -3427,6 +3433,7 @@ pub const WorkflowHandler = struct {
         defer if (output) |o| self.allocator.free(o);
 
         const value: Step.Value = .{
+            .created_ns = run.created_ns,
             .rev = run.rev,
             .step = run.current_step_name_owned orelse "",
             .events = .{ .bytes = events.written(), .count = event_count },
@@ -3471,6 +3478,7 @@ pub const WorkflowHandler = struct {
         var events: wire_schema.Writer = .{ .buf = try a.alloc(u8, 512) };
         try runs_machine.Event.encode(&events, .{ .event = terminalEventType(.failed), .detail = "step record too large to log", .at_ms = now_ms });
         const value: runs_machine.Step.Value = .{
+            .created_ns = run.created_ns,
             .rev = run.rev,
             .step = run.current_step_name_owned orelse "",
             .events = .{ .bytes = events.written(), .count = 1 },
@@ -4956,6 +4964,7 @@ pub const WorkflowHandler = struct {
             .status = appliedStatus(rec),
             .input_owned = "",
             .created_at_ms = rec.created_at_ms,
+            .created_ns = rec.created_ns,
             .started_at_ms = rec.created_at_ms,
             .completed_at_ms = if (rec.completed_at_ms != 0) rec.completed_at_ms else null,
             .idempotency_key_owned = null,
@@ -6907,7 +6916,7 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     // Two unfinished here: it holds, though another namespace's run makes three.
     try testing.expectEqual(@as(usize, 0), runsOf(&handler, &shard));
 
-    const c: runs_machine.Complete = .{ .status = .cancelled, .output = null, .event = "workflow_cancelled", .detail = "stop", .workflow = "wf" };
+    const c: runs_machine.Complete = .{ .status = .cancelled, .output = null, .event = "workflow_cancelled", .detail = "stop", .workflow = "wf", .created_ns = handler.appliedRun(testKey(TEST_NS_A, "r1")).?.created_ns };
     var record_buf: [128]u8 = undefined;
     const record = c.encode(&record_buf).?;
     // Applied twice (a second cancel): one run finished.
@@ -7648,11 +7657,23 @@ test "workflow replay: a start that runs out of memory fails and creates nothing
     }
 }
 
-test "workflow replay: a start answers with its run id whole, at the longest key an entry carries" {
+/// A completion's incarnation, last in its value: a start at `ms`.
+fn incarnationAt(comptime ms: u64) [8]u8 {
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, ms * std.time.ns_per_ms, .little);
+    return b;
+}
+
+test "workflow replay: a start answers with its run id whole, at the longest a run may have; a longer one is refused" {
     var handler = WorkflowHandler.init(testing.allocator);
     defer handler.deinit();
     const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0, 0 };
-    var key: [persistence_mod.MAX_ENTRY_KEY]u8 = undefined;
+    var long: [persistence_mod.MAX_ENTRY_KEY]u8 = undefined;
+    _ = writeKey(&long, .default, &@as([long.len - KEY_PREFIX]u8, @splat('l')));
+    var refused: Result = .{};
+    try handler.replayStart(&long, &start, 1, &refused);
+    try testing.expectEqualStrings(runs_machine.RUN_ID_TOO_LONG, refused.refused().?.refusal.message);
+    var key: [KEY_PREFIX + runs_machine.MAX_RUN_ID]u8 = undefined;
     _ = writeKey(&key, .default, &@as([key.len - KEY_PREFIX]u8, @splat('r')));
     var out: Result = .{};
     try handler.replayStart(&key, &start, 1, &out);
@@ -7721,7 +7742,10 @@ test "workflow replay: a run starts and completes at its entries' stamps, not th
         try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, stamp_ns, .default, testKey(.default, "r1"), &start, &pbuf).?, &out);
         try testing.expectEqual(stamp_ms, shownOf(&handler, testKey(.default, "r1")).?.created_at_ms);
         // completed, no output, no event, workflow "wf"
-        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, .default, testKey(.default, "r1"), &[_]u8{ 3, 0, 0, 0, 0, 0, 2, 0, 'w', 'f' }, &pbuf).?, &out);
+        // Its incarnation, the start's stamp, last.
+        var complete = [_]u8{ 3, 0, 0, 0, 0, 0, 2, 0, 'w', 'f' } ++ @as([8]u8, @splat(0));
+        std.mem.writeInt(u64, complete[10..18], stamp_ns, .little);
+        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, .default, testKey(.default, "r1"), &complete, &pbuf).?, &out);
         const run = shownOf(&handler, testKey(.default, "r1")).?;
         try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
         try testing.expectEqual(@as(?i64, stamp_ms + 9), run.completed_at_ms);
@@ -7739,7 +7763,8 @@ test "workflow replay: a complete entry cut short leaves the run as it was, and 
     try handler.replayStart(testKey(.default, "r1"), &start, 1, &start_out);
 
     // completed, output "ok", last event "e"/"d", workflow "wf"
-    const whole = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++ [_]u8{ 1, 0, 'e', 1, 0, 'd' } ++ [_]u8{ 2, 0, 'w', 'f' };
+    // Its incarnation last: the start's stamp, 1 ms.
+    const whole = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++ [_]u8{ 1, 0, 'e', 1, 0, 'd' } ++ [_]u8{ 2, 0, 'w', 'f' } ++ incarnationAt(1);
 
     var events: std.ArrayListUnmanaged(WorkflowHandler.HistoryEvent) = .empty;
     defer events.deinit(allocator);
@@ -7774,8 +7799,8 @@ test "workflow replay: a cancel logged after a completion is refused and changes
     // next leader took while that completion hadn't applied there.
     const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0, 0 };
     const wf = [_]u8{ 2, 0, 'w', 'f' };
-    const completed = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ wf;
-    const cancelled = [_]u8{5} ++ [_]u8{0} ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ wf;
+    const completed = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ wf ++ incarnationAt(1);
+    const cancelled = [_]u8{5} ++ [_]u8{0} ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ wf ++ incarnationAt(1);
 
     // Two replicas apply the same log.
     for (0..2) |_| {
@@ -8018,6 +8043,7 @@ test "a step's logged counters that won't decode end the run failed, saying why,
     createTestRun(&handler, testKey(.default, "r"), "r", "test-wf");
     // A step whose counters are of a version this build doesn't read.
     const step: runs_machine.Step.Value = .{
+        .created_ns = handler.appliedRun(testKey(.default, "r")).?.created_ns,
         .rev = 0,
         .step = "",
         .events = .{ .bytes = "", .count = 0 },
@@ -8571,6 +8597,7 @@ fn createTestRunAt(handler: *WorkflowHandler, run_id: []const u8, wf_name: []con
         // A step that waits on a signal.
         .waiting => {
             const step: runs_machine.Step.Value = .{
+                .created_ns = handler.appliedRun(ns_key).?.created_ns,
                 .rev = 0,
                 .step = "",
                 .events = .{ .bytes = "", .count = 0 },
@@ -8595,7 +8622,7 @@ fn createTestRunAt(handler: *WorkflowHandler, run_id: []const u8, wf_name: []con
             try handler.applyDirect(.workflow_step, 0, ns_key, try runs_machine.Step.encodeInto(&sb, step), started_at, &out);
         },
         else => {
-            const c: runs_machine.Complete = .{ .status = status, .output = null, .event = "ended", .detail = "", .workflow = wf_name };
+            const c: runs_machine.Complete = .{ .status = status, .output = null, .event = "ended", .detail = "", .workflow = wf_name, .created_ns = handler.appliedRun(ns_key).?.created_ns };
             var cb: [256]u8 = undefined;
             try handler.replayComplete(ns_key, c.encode(&cb).?, started_at, &out);
         },
@@ -8663,6 +8690,126 @@ fn expectRunIds(want: []const []const u8, got: []const []const u8) !void {
     for (want, got) |w, g| try testing.expectEqualStrings(w, g);
 }
 
+/// Every run `ownPage` lists of `workflow` ("" for all) matching `search`,
+/// a page at a time at `limit` and `room`, each page after the last's
+/// stop, into `out` as owned ids (`ids_buf`): the list's whole walk.
+fn walkAll(handler: *WorkflowHandler, workflow: []const u8, search: []const u8, limit: u32, room: u32, ids_buf: [][16]u8, out: [][]const u8) !struct { ids: []const []const u8, pages: usize, empty_pages: usize } {
+    const buf = try testing.allocator.alloc(u8, system_ops.Runs.max_size);
+    defer testing.allocator.free(buf);
+    var n: usize = 0;
+    var pages: usize = 0;
+    var empty: usize = 0;
+    var after_buf: [16]u8 = undefined;
+    var after: ?list_runs.RunAt.Value = null;
+    while (pages < 100_000) : (pages += 1) {
+        const page = try list_runs.ownPage(handler, .default, workflow, .{ .limit = limit, .status = "", .search = search, .after = after }, room, buf);
+        var it = page.runs.iterator();
+        var got: usize = 0;
+        while (try it.next()) |run| : (got += 1) {
+            @memcpy(ids_buf[n][0..run.at.run_id.len], run.at.run_id);
+            out[n] = ids_buf[n][0..run.at.run_id.len];
+            n += 1;
+        }
+        if (got == 0) empty += 1;
+        if (!page.more) return .{ .ids = out[0..n], .pages = pages + 1, .empty_pages = empty };
+        const stop = page.stop.?;
+        @memcpy(after_buf[0..stop.run_id.len], stop.run_id);
+        after = .{ .created_at = stop.created_at, .run_id = after_buf[0..stop.run_id.len] };
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "list runs: a search matching one run past the walk bound answers a page of none with more, and the next page finds it" {
+    var handler = WorkflowHandler.init(testing.allocator);
+    defer handler.deinit();
+    // The one that matches is the oldest, behind more than a page reads.
+    try createTestRunAt(&handler, "needle", "wf", 1, .running);
+    var id: [16]u8 = undefined;
+    for (0..list_runs.WALK_MAX + 4) |i| try createTestRunAt(&handler, try std.fmt.bufPrint(&id, "w-{d}", .{i}), "wf", @intCast(i + 2), .running);
+    var ids_buf: [4][16]u8 = undefined;
+    var out: [4][]const u8 = undefined;
+    const got = try walkAll(&handler, "", "needle", 10, 1 << 20, &ids_buf, &out);
+    try expectRunIds(&.{"needle"}, got.ids);
+    try testing.expectEqual(@as(usize, 2), got.pages);
+    try testing.expectEqual(@as(usize, 1), got.empty_pages);
+}
+
+test "list runs: a named workflow's list holds its own runs, each once in the list's order, at every limit and room, not another's sharing its prefix" {
+    var handler = WorkflowHandler.init(testing.allocator);
+    defer handler.deinit();
+    // Started together, ids of other lengths; and "wfx", whose key's name
+    // part starts as "wf"'s does.
+    for ([_][]const u8{ "b", "ab", "zzz", "c" }) |r| try createTestRunAt(&handler, r, "wf", 7, .running);
+    try createTestRunAt(&handler, "q", "wf", 8, .running);
+    for ([_][]const u8{ "a", "bb" }) |r| try createTestRunAt(&handler, r, "wfx", 7, .running);
+    const want = [_][]const u8{ "q", "ab", "b", "c", "zzz" };
+    // One entry: [len]id[len]"wf"[len]"running"[i64].
+    for ([_]u32{ 1, 2, 3, 10 }) |limit| for ([_]u32{ 2 + 3 + 2 + 2 + 2 + 7 + 8, 1 << 20 }) |room| {
+        var ids_buf: [8][16]u8 = undefined;
+        var out: [8][]const u8 = undefined;
+        const got = try walkAll(&handler, "wf", "", limit, room, &ids_buf, &out);
+        try expectRunIds(&want, got.ids);
+    };
+}
+
+test "list runs: an index row whose run is gone is skipped, said once" {
+    var handler = WorkflowHandler.init(testing.allocator);
+    defer handler.deinit();
+    for ([_][]const u8{ "r1", "r2", "r3" }) |r| try createTestRunAt(&handler, r, "wf", 5, .running);
+    // r2's run row gone, its index rows left: a Flo bug a list survives.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ks = contract_view.KeySet.init(arena.allocator());
+    try ks.addIn(runs_machine.RunFam.ID, .default, "r2");
+    var view = contract_view.View.init(&handler.own_store, arena.allocator(), &ks);
+    var kb: [64]u8 = undefined;
+    try view.delete(runs_machine.RunFam, writeKey(&kb, .default, "r2"));
+    try view.commit();
+    var ids_buf: [4][16]u8 = undefined;
+    var out: [4][]const u8 = undefined;
+    const got = try walkAll(&handler, "", "", 10, 1 << 20, &ids_buf, &out);
+    try expectRunIds(&.{ "r1", "r3" }, got.ids);
+    // Each list meets it again; only the first logs it.
+    const again = try walkAll(&handler, "", "", 10, 1 << 20, &ids_buf, &out);
+    try expectRunIds(&.{ "r1", "r3" }, again.ids);
+    try testing.expectEqual(@as(u64, 2), handler.missing_runs);
+    try testing.expectEqual(@as(u32, 1), handler.missing_runs_logged);
+}
+
+test "list runs: runs started in one ms with ids of other lengths on two shards, walked through their index keys and merged, are each listed once in order" {
+    var one = WorkflowHandler.init(testing.allocator);
+    defer one.deinit();
+    var two = WorkflowHandler.init(testing.allocator);
+    defer two.deinit();
+    for ([_][]const u8{ "b", "ab" }) |r| try createTestRunAt(&one, r, "wf", 7, .running);
+    for ([_][]const u8{ "c", "zz" }) |r| try createTestRunAt(&two, r, "wg", 7, .running);
+    const bufs = [_][]u8{ try testing.allocator.alloc(u8, system_ops.Runs.max_size), try testing.allocator.alloc(u8, system_ops.Runs.max_size) };
+    defer for (bufs) |b| testing.allocator.free(b);
+    var seen: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (seen.items) |x| testing.allocator.free(x);
+        seen.deinit(testing.allocator);
+    }
+    var after_buf: [16]u8 = undefined;
+    var after: ?list_runs.RunAt.Value = null;
+    var rounds: usize = 0;
+    while (rounds < 10) : (rounds += 1) {
+        const q: list_runs.Query = .{ .limit = 2, .status = "", .search = "", .after = after };
+        const pages = [_]list_runs.PageResponse.Value{
+            try list_runs.ownPage(&one, .default, "", q, 1 << 20, bufs[0]),
+            try list_runs.ownPage(&two, .default, "", q, 1 << 20, bufs[1]),
+        };
+        var entries: [4][]const u8 = undefined;
+        const m = try list_runs.mergeRuns(&pages, 2, 1 << 20, &entries);
+        // Each entry leads with its id: [len:u16][id].
+        for (entries[0..m.taken]) |e| try seen.append(testing.allocator, try testing.allocator.dupe(u8, e[2..][0..std.mem.readInt(u16, e[0..2], .little)]));
+        const c = m.cursor orelse break;
+        @memcpy(after_buf[0..c.run_id.len], c.run_id);
+        after = .{ .created_at = c.created_at, .run_id = after_buf[0..c.run_id.len] };
+    }
+    try expectRunIds(&.{ "ab", "b", "c", "zz" }, seen.items);
+}
+
 test "list runs: a shard's page is newest first, by id among runs started together, and resumes after the run given" {
     var handler = WorkflowHandler.init(testing.allocator);
     defer handler.deinit();
@@ -8721,6 +8868,9 @@ test "list runs: a shard's page stops before its entries pass the room it was gi
     const page = try list_runs.ownPage(&handler, .default, "", .{ .limit = 10, .status = "", .search = "", .after = null }, one + 1, buf);
     try expectRunIds(&.{"r-2"}, try pageRunIds(page, &ids));
     try testing.expect(page.more);
+    // Where it stopped, read after the page is built: the run it showed.
+    try testing.expectEqualStrings("r-2", page.stop.?.run_id);
+    try testing.expectEqual(@as(i64, 20), page.stop.?.created_at);
 }
 
 test "workflow keys: two namespaces keep their own workflows and runs, whatever their names hold" {
@@ -8757,14 +8907,16 @@ test "workflow keys: two namespaces keep their own workflows and runs, whatever 
     try testing.expectEqual(@as(usize, 4), handler.runCount());
 
     for ([_]NamespaceId{ TEST_NS_A, TEST_NS_B }) |ns| {
-        var runs: std.ArrayListUnmanaged(WorkflowHandler.RunInfo) = .empty;
-        defer runs.deinit(allocator);
-        try handler.collectMatchingRuns(&runs, ns, "", null, null);
-        try testing.expectEqual(@as(usize, 2), runs.items.len);
+        const pbuf2 = try allocator.alloc(u8, system_ops.Runs.max_size);
+        defer allocator.free(pbuf2);
+        const page = try list_runs.ownPage(&handler, ns, "", .{ .limit = 10, .status = "", .search = "", .after = null }, 1 << 20, pbuf2);
+        var ids: [8][]const u8 = undefined;
+        const listed_ids = try pageRunIds(page, &ids);
+        try testing.expectEqual(@as(usize, 2), listed_ids.len);
         // Each run listed is one this namespace started.
-        for (runs.items) |listed| {
+        for (listed_ids) |listed| {
             var own = false;
-            for (cases) |c| own = own or (c.ns == ns and std.mem.eql(u8, c.name, listed.run_id));
+            for (cases) |c| own = own or (c.ns == ns and std.mem.eql(u8, c.name, listed));
             try testing.expect(own);
         }
         // And each lists only its own definitions.
@@ -9328,6 +9480,7 @@ fn stepTestRun(handler: *WorkflowHandler, key: []const u8, wf: []const u8, rev: 
     var ew: wire_schema.Writer = .{ .buf = eb };
     runs_machine.Event.encode(&ew, .{ .event = "big", .detail = detail, .at_ms = 0 }) catch unreachable;
     const value: Step.Value = .{
+        .created_ns = handler.appliedRun(key).?.created_ns,
         .rev = rev,
         .step = "s",
         .events = .{ .bytes = ew.written(), .count = 1 },

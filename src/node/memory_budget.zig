@@ -47,8 +47,11 @@ pub fn ringBytesPerShard(hot_buffer_capacity: u64) u64 {
 /// overhead, with the chunk it may go in at once and that chunk's outbox
 /// rows (the row, and on a first send the lane's meta row and its
 /// per-namespace count). Pinned by an actions test with every field at its
-/// largest.
-pub const CALL_RECORDS_BYTES: u64 = 2 * pool.RESIDENT_RECORD + 1024 + CALL_HISTORY_BYTES;
+/// largest. Its place in its action's list (a key alone) and, on the
+/// action's first invoke, its counts row are two records more.
+pub const CALL_RECORDS_BYTES: u64 = 2 * pool.RESIDENT_RECORD + 1024 + CALL_HISTORY_BYTES + CALL_INDEX_BYTES;
+const CALL_INDEX_BYTES: u64 = 2 * pool.RESIDENT_RECORD + (@sizeOf(u32) + @sizeOf(action_machine.RunAtBuf)) +
+    (@sizeOf(u32) + ae.MAX_ACTION_NAME + action_machine.CountsRec.max_size);
 const CALL_HISTORY_BYTES: u64 = (he.Chunk.max_size - he.MAX_CHUNK_RECORDS) + hp.recordBound(action_machine.EV_INVOKED.len, 0, 0) +
     3 * pool.RESIDENT_RECORD + channels.OUT_KEY + channels.CHAN_KEY + channels.OUT_NS_KEY + 3 * 64;
 /// What its answer to the caller takes: the outbox row, and, on a first send

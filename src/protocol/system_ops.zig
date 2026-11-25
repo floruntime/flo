@@ -30,10 +30,9 @@ pub const Entry = Record(&.{
 const more_size = schema.Bool.max_size;
 pub const Entries = schema.BoundedList(Entry, MAX_PAGE, @intCast(ops.MAX_RESPONSE_BODY - more_size - @sizeOf(u32)));
 
-/// A run id's longest a list carries. A run's start entry keys it by id and
-/// holds one under 600 bytes, so no run has a longer one; this bound keeps a
-/// cursor of a start time and an id within its u16 length.
-pub const MAX_RUN_ID: u32 = @intCast(ops.MAX_KEY);
+/// A run id's longest: no run has a longer one (its start is refused), and
+/// a cursor names one to build an index key from it.
+pub const MAX_RUN_ID: u32 = 596;
 /// A run's status, as the list names it.
 pub const MAX_RUN_STATUS: u32 = 32;
 /// The longest search a run list takes.
@@ -54,7 +53,9 @@ pub const Run = Record(&.{
     .{ .name = "entry", .T = Bytes(MAX_RUN_ENTRY), .doc = "The run as the list's answer encodes it" },
 });
 
-pub const Runs = schema.BoundedList(Run, MAX_PAGE, @intCast(ops.MAX_RESPONSE_BODY - more_size - @sizeOf(u32)));
+/// A runs page's stop, beside its runs and more.
+const stop_size = schema.Optional(RunAt).max_size;
+pub const Runs = schema.BoundedList(Run, MAX_PAGE, @intCast(ops.MAX_RESPONSE_BODY - more_size - stop_size - @sizeOf(u32)));
 
 pub const table = [_]ops.Op{
     .{
@@ -93,6 +94,7 @@ pub const table = [_]ops.Op{
         .response = Record(&.{
             .{ .name = "runs", .T = Runs, .doc = "The page's runs, in the list's order" },
             .{ .name = "more", .T = schema.Bool, .doc = "Whether the shard holds more past the page" },
+            .{ .name = "stop", .T = schema.Optional(RunAt), .doc = "With more: the last run the shard read, sent or not; it holds none at or before it unsent" },
         }),
         .cli = .{ .expose = .none },
         .doc = "A shard's page of a workflow's runs, read from its own state.",

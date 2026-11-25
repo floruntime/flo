@@ -245,6 +245,9 @@ pub const Step = Record(&.{
     // The signals its waits took, in order: each the oldest of its type the
     // run holds, gone from `workflow.sig` in this apply.
     .{ .name = "takes", .T = schema.BoundedList(Take, MAX_SIGNALS, MAX_PERSIST_PAYLOAD) },
+    // The run's incarnation, its start's stamp: a step decided for one
+    // that was deleted, its id started again since, applies to nothing.
+    .{ .name = "created_ns", .T = Int(u64) },
 });
 
 pub const HistRec = hp.HistRec;
@@ -298,6 +301,57 @@ pub const IdemFam = view_mod.Family(64, "workflow.idem", .id, Stored(Idem));
 pub const PerDefFam = view_mod.Family(65, "workflow.per_def", .id, Stored(PerDef));
 pub const OutFam = view_mod.Family(66, "workflow.out", .id, Stored(Out));
 pub const SigFam = view_mod.Family(67, "workflow.sig", .id, Stored(Sig));
+/// Every run, as its workflow's list and the all-workflows list order them:
+/// newest first, then by id in byte order. Written with the run at its
+/// start and gone at its delete; the keys alone, no values. A list walks
+/// them from its cursor instead of reading and sorting every run.
+pub const RunAtFam = view_mod.Family(72, "workflow.run_at", .id, delivery.Empty);
+pub const RunAllFam = view_mod.Family(73, "workflow.run_all", .id, delivery.Empty);
+
+/// A start time as the index keys order it: the newest first.
+pub fn listedAt(created_ms: i64) u64 {
+    return std.math.maxInt(u64) - @as(u64, @intCast(@max(created_ms, 0)));
+}
+
+/// `ns ‖ len ‖ workflow ‖ ~created_ms ‖ run`: a run in its workflow's list.
+/// The id is last, with no length before it, so the key's order is the
+/// list's.
+pub fn runAtKey(a: std.mem.Allocator, ns: NamespaceId, workflow: []const u8, created_ms: i64, run: []const u8) error{OutOfMemory}![]u8 {
+    const k = try underName(a, ns, workflow, 8 + run.len);
+    const at = KEY_PREFIX + 2 + workflow.len;
+    std.mem.writeInt(u64, k[at..][0..8], listedAt(created_ms), .big);
+    @memcpy(k[at + 8 ..], run);
+    return k;
+}
+
+/// `ns ‖ len ‖ workflow`: every run of one workflow in its list.
+pub fn runAtPrefix(a: std.mem.Allocator, ns: NamespaceId, workflow: []const u8) error{OutOfMemory}![]u8 {
+    return underName(a, ns, workflow, 0);
+}
+
+/// `ns ‖ ~created_ms ‖ run`: a run in the all-workflows list.
+pub fn runAllKey(a: std.mem.Allocator, ns: NamespaceId, created_ms: i64, run: []const u8) error{OutOfMemory}![]u8 {
+    const k = try a.alloc(u8, KEY_PREFIX + 8 + run.len);
+    @memcpy(k[0..KEY_PREFIX], &ns.bytes());
+    std.mem.writeInt(u64, k[KEY_PREFIX..][0..8], listedAt(created_ms), .big);
+    @memcpy(k[KEY_PREFIX + 8 ..], run);
+    return k;
+}
+
+/// A start entry's stamp in ms, as its run's `created_at_ms` holds it and
+/// a delete derives it from `created_ns`.
+fn msOfNs(ns: u64) i64 {
+    return @intCast(ns / std.time.ns_per_ms);
+}
+
+/// A run's longest id: its start's key is the namespace's id and the id,
+/// at most 600 bytes.
+pub const MAX_RUN_ID: usize = 596;
+
+comptime {
+    // The longest index key: a namespace, the longest owner and run id.
+    std.debug.assert(KEY_PREFIX + 2 + he.MAX_OWNER + 8 + MAX_RUN_ID == 866);
+}
 
 /// `ns ‖ len ‖ run ‖ seq`, a signal's key.
 pub fn sigKey(a: std.mem.Allocator, ns: NamespaceId, run: []const u8, seq: u64) error{OutOfMemory}![]u8 {
@@ -499,6 +553,7 @@ fn carriesServerKeys(event: []const u8) bool {
     return std.mem.eql(u8, event, "schedule_started") or std.mem.eql(u8, event, "trigger_started");
 }
 
+pub const RUN_ID_TOO_LONG = "bad request: a run id is at most 596 bytes";
 pub const NAME_TOO_LONG = "a workflow name is longer than its runs' history may name";
 
 pub const SERVER_KEY_REFUSED = "reserved idempotency key: a leading '_' is the server's";
@@ -515,6 +570,8 @@ pub const Complete = struct {
     event: []const u8,
     detail: []const u8,
     workflow: []const u8,
+    /// The run's incarnation, as the cancel read it.
+    created_ns: u64,
 
     pub fn parse(value: []const u8) ?Complete {
         var c: Cursor = .{ .bytes = value };
@@ -526,8 +583,9 @@ pub const Complete = struct {
         const event = c.take(c.int(u16) orelse return null) orelse return null;
         const detail = c.take(c.int(u16) orelse return null) orelse return null;
         const workflow = c.take(c.int(u16) orelse return null) orelse return null;
+        const created_ns = c.int(u64) orelse return null;
         if (c.off != value.len) return null;
-        return .{ .status = status, .output = output, .event = event, .detail = detail, .workflow = workflow };
+        return .{ .status = status, .output = output, .event = event, .detail = detail, .workflow = workflow, .created_ns = created_ns };
     }
 
     /// Its encoding into `buf`, or null when it doesn't fit.
@@ -543,11 +601,12 @@ pub const Complete = struct {
             w.writeInt(u16, std.math.cast(u16, part.len) orelse return null, .little) catch return null;
             w.writeAll(part) catch return null;
         }
+        w.writeInt(u64, c.created_ns, .little) catch return null;
         return w.buffered();
     }
 
     pub fn size(c: Complete) usize {
-        return 2 + (if (c.output) |o| 4 + o.len else 0) + 6 + c.event.len + c.detail.len + c.workflow.len;
+        return 2 + (if (c.output) |o| 4 + o.len else 0) + 6 + c.event.len + c.detail.len + c.workflow.len + 8;
     }
 };
 
@@ -667,6 +726,9 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             try out.addIn(defs_machine.DefFam.ID, n.ns, s.workflow);
             try out.addIn(PerDefFam.ID, n.ns, s.workflow);
             if (s.idem) |k| try out.addIn(IdemFam.ID, n.ns, (try idemKey(arena, n.ns, s.workflow, k))[KEY_PREFIX..]);
+            const ms = msOfNs(e.header.timestamp_ns);
+            try out.addIn(RunAtFam.ID, n.ns, (try runAtKey(arena, n.ns, s.workflow, ms, n.run))[KEY_PREFIX..]);
+            try out.addIn(RunAllFam.ID, n.ns, (try runAllKey(arena, n.ns, ms, n.run))[KEY_PREFIX..]);
         },
         .workflow_step => {
             const cmd = command(e).?;
@@ -708,6 +770,9 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             out.addRangeIn(SigFam.ID, n.ns, range) catch return error.OutOfMemory;
             const d = Delete.parse(cmd.value) orelse return;
             if (d.idem.len > 0) try out.addIn(IdemFam.ID, n.ns, (try idemKey(arena, n.ns, d.workflow, d.idem))[KEY_PREFIX..]);
+            const ms = msOfNs(d.created_ns);
+            try out.addIn(RunAtFam.ID, n.ns, (try runAtKey(arena, n.ns, d.workflow, ms, n.run))[KEY_PREFIX..]);
+            try out.addIn(RunAllFam.ID, n.ns, (try runAllKey(arena, n.ns, ms, n.run))[KEY_PREFIX..]);
         },
         else => {},
     }
@@ -750,6 +815,8 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
     // Its history names its workflow as its owner: one longer can't be
     // created, and its start is refused rather than its end halting.
     if (s.workflow.len > he.MAX_OWNER) return out.refuse(.bad_request, .unclassified, NAME_TOO_LONG);
+    // Its index rows bound its id: the handler's bound, held here too.
+    if (n.run.len > MAX_RUN_ID) return out.refuse(.bad_request, .unclassified, RUN_ID_TOO_LONG);
     // Only a trigger's start says where it read, and every one does.
     if ((s.trigger != null) != std.mem.eql(u8, s.event, "trigger_started")) return error.Halt;
     // A server's key on a start the server didn't make: refused.
@@ -872,6 +939,15 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
     }
     try view.put(RunFam, cmd.key, .{ .v = run });
     if (comptime plant.active != .runs_idem_unwritten) if (idem_key) |k| try view.put(IdemFam, k, .{ .v = .{ .run = n.run } });
+    // Its places in the lists, staged with it: a start the verdict refuses
+    // below rolls them back too.
+    if (comptime plant.active != .runs_child_unindexed) {
+        try view.put(RunAtFam, try runAtKey(arena, n.ns, s.workflow, stamp_ms, n.run), .{});
+        try view.put(RunAllFam, try runAllKey(arena, n.ns, stamp_ms, n.run), .{});
+    } else if (!s.isChild()) {
+        try view.put(RunAtFam, try runAtKey(arena, n.ns, s.workflow, stamp_ms, n.run), .{});
+        try view.put(RunAllFam, try runAllKey(arena, n.ns, stamp_ms, n.run), .{});
+    }
 
     var per = if (try view.get(PerDefFam, def_key)) |p| p.v else PER_DEF_NONE;
     if (!s.status.isTerminal()) per.active +|= 1;
@@ -1091,6 +1167,7 @@ fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64
     // deleted since. A ready leader decides only from what it applied, so
     // its own come before the delete; the simulator's leader lags.
     if (!std.mem.eql(u8, run.workflow, st.workflow)) return out.refuse(.not_found, .not_found, "run not found");
+    if (comptime plant.active != .runs_step_incarnation_unchecked) if (run.created_ns != st.created_ns) return out.refuse(.not_found, .not_found, "run not found");
     const ends: ?RunStatus = if (st.ends == 0) null else blk: {
         const status = std.enums.fromInt(RunStatus, st.ends) orelse return error.Halt;
         if (!status.isTerminal()) return error.Halt;
@@ -1167,6 +1244,8 @@ fn applyComplete(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms:
     var run = ((try view.get(RunFam, cmd.key)) orelse return out.refuse(.not_found, .not_found, "run not found")).v;
     // Another workflow's: for an earlier incarnation, as a step's may be.
     if (!std.mem.eql(u8, run.workflow, c.workflow)) return out.refuse(.not_found, .not_found, "run not found");
+    // Another incarnation's: the id deleted and started again since.
+    if (run.created_ns != c.created_ns) return out.refuse(.not_found, .not_found, "run not found");
     // The first completion in the log ends the run; a cancel and a
     // completion in flight together leave it as the first left it. A second
     // with the same outcome (two cancels) succeeds, changing nothing.
@@ -1203,6 +1282,8 @@ fn applyDelete(view: *View, n: Named, cmd: entry_mod.CommandPayload, out: *Resul
     try view.deleteRange(OutFam, range, null);
     try view.deleteRange(SigFam, range, null);
     try view.delete(RunFam, cmd.key);
+    if (comptime plant.active != .runs_delete_keeps_index) try view.delete(RunAtFam, try runAtKey(arena, n.ns, run.workflow, run.created_at_ms, n.run));
+    try view.delete(RunAllFam, try runAllKey(arena, n.ns, run.created_at_ms, n.run));
     try hp.sendDrop(view, ownerOf(n, &run), run.completed_at_ms);
 }
 
@@ -1376,6 +1457,8 @@ pub const machine: machine_mod.Machine = .{
         machine_mod.info(PerDefFam),
         machine_mod.info(OutFam),
         machine_mod.info(SigFam),
+        machine_mod.info(RunAtFam),
+        machine_mod.info(RunAllFam),
     },
     .keys = keys,
     .apply = apply,
@@ -1423,12 +1506,22 @@ const Fixture = struct {
     }
 
     fn start(f: *Fixture, run_id: []const u8, wf: []const u8, event: []const u8, idem: []const u8, stamp_ms: u64) !Result {
-        var kb: [64]u8 = undefined;
+        var kb: [KEY_PREFIX + MAX_RUN_ID + 8]u8 = undefined;
         var vb: [512]u8 = undefined;
         return f.command(.workflow_start, view_mod.idKey(&kb, .default, run_id) catch unreachable, startValue(&vb, wf, event, idem), stamp_ms);
     }
 
+    /// A completion of run `run_id`, naming its incarnation as applied.
     fn complete(f: *Fixture, run_id: []const u8, value: []const u8, stamp_ms: u64) !Result {
+        var kb: [64]u8 = undefined;
+        var vb: [MAX_PERSIST_PAYLOAD]u8 = undefined;
+        var c = Complete.parse(value).?;
+        if (f.get(run_id)) |r| c.created_ns = r.created_ns;
+        return f.command(.workflow_complete, view_mod.idKey(&kb, .default, run_id) catch unreachable, c.encode(&vb).?, stamp_ms);
+    }
+
+    /// A completion as given, its incarnation unpatched.
+    fn completeAs(f: *Fixture, run_id: []const u8, value: []const u8, stamp_ms: u64) !Result {
         var kb: [64]u8 = undefined;
         return f.command(.workflow_complete, view_mod.idKey(&kb, .default, run_id) catch unreachable, value, stamp_ms);
     }
@@ -1445,6 +1538,7 @@ const Fixture = struct {
         var tw: schema.Writer = .{ .buf = &takes_buf };
         for (spec.takes) |t| try Take.encode(&tw, .{ .type = t });
         const value: Step.Value = .{
+            .created_ns = spec.created_ns orelse if (f.get(run_id)) |r| r.created_ns else 0,
             .rev = spec.rev,
             .step = spec.at,
             .events = .{ .bytes = ew.written(), .count = spec.events },
@@ -1559,6 +1653,8 @@ const Fixture = struct {
 
 const StepSpec = struct {
     rev: u64,
+    /// The run's incarnation as applied, unless given.
+    created_ns: ?u64 = null,
     at: []const u8 = "s",
     events: u32 = 1,
     wait: Wait = .none,
@@ -1580,7 +1676,7 @@ fn startValue(buf: []u8, wf: []const u8, event: []const u8, idem: []const u8) []
 
 /// A cancel's completion of a run of `wf`.
 fn completeValue(buf: []u8, status: RunStatus, wf: []const u8) []const u8 {
-    const c: Complete = .{ .status = status, .output = null, .event = "workflow_cancelled", .detail = "stop", .workflow = wf };
+    const c: Complete = .{ .status = status, .output = null, .event = "workflow_cancelled", .detail = "stop", .workflow = wf, .created_ns = 0 };
     return c.encode(buf).?;
 }
 
@@ -1757,6 +1853,112 @@ test "workflow runs machine: a delete of an ended run removes it and its key, an
     try testing.expectEqual(@as(u32, 2), f.active("wf").?.active);
 }
 
+test "workflow runs machine: a step or cancel decided for a deleted incarnation, its id started again under the same workflow, is refused" {
+    var f = Fixture.init();
+    defer f.deinit();
+    const Status = @import("../protocol/proto.zig").StatusCode;
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    const old = f.get("r1").?.created_ns;
+    var vb: [512]u8 = undefined;
+    _ = try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 5);
+    try testing.expect((try f.deleteOf("r1")).refused() == null);
+    try testing.expect((try f.start("r1", "wf", "workflow_started", "", 8)).refused() == null);
+    try testing.expect(f.get("r1").?.created_ns != old);
+    // Rev 0 and the workflow match the new run: only the incarnation tells.
+    try testing.expectEqual(Status.not_found, (try f.step("r1", .{ .rev = 0, .created_ns = old })).refused().?.status);
+    var c = Complete.parse(completeValue(&vb, .cancelled, "wf")).?;
+    c.created_ns = old;
+    var cb: [512]u8 = undefined;
+    try testing.expectEqual(Status.not_found, (try f.completeAs("r1", c.encode(&cb).?, 9)).refused().?.status);
+    const now = f.get("r1").?;
+    try testing.expectEqual(@as(u64, 0), now.rev);
+    try testing.expectEqual(@as(u8, @backingInt(RunStatus.running)), now.status);
+    // Its own incarnation's step applies.
+    try testing.expect((try f.step("r1", .{ .rev = 0 })).refused() == null);
+}
+
+/// Whether run `id`'s start at `ms` put it in both lists' index, under `wf`.
+fn indexed(f: *Fixture, wf: []const u8, ms: i64, id: []const u8) !bool {
+    const rv: ReadView = .{ .store = &f.store };
+    const a = f.scratch.allocator();
+    const at = (try rv.get(RunAtFam, try runAtKey(a, .default, wf, ms, id))) != null;
+    const all = (try rv.get(RunAllFam, try runAllKey(a, .default, ms, id))) != null;
+    try testing.expectEqual(at, all);
+    return at;
+}
+
+test "workflow runs machine: every kind of start indexes its run, and none that creates nothing does" {
+    const pool = @import("../budget/pool.zig");
+    const settings = @import("../settings/machine.zig");
+    var f = Fixture.init();
+    defer f.deinit();
+    try f.create("wf");
+    // A schedule's, a trigger's, and one that starts ended.
+    _ = try f.start("s1", "wf", "schedule_started", "_schedule:16:wf:4000", 5);
+    try testing.expect(try indexed(&f, "wf", 5, "s1"));
+    try testing.expect((try triggerStart(&f, "t1", "_trigger:16:5:ev@10:2", .{ .ns = 16, .made = 5, .stream = "ev", .ts = 10, .seq = 2 })).refused() == null);
+    try testing.expect(try indexed(&f, "wf", 1, "t1"));
+    var kb: [64]u8 = undefined;
+    var vb: [512]u8 = undefined;
+    const ended = (Start{ .workflow = "wf", .version = "1", .status = .completed, .event = "workflow_started", .idem = null, .input = "" }).encode(&vb).?;
+    try testing.expect((try f.command(.workflow_start, view_mod.idKey(&kb, .default, "e1") catch unreachable, ended, 6)).refused() == null);
+    try testing.expect(try indexed(&f, "wf", 6, "e1"));
+    // A child's, from its parent's record.
+    var csb: [ae.ChildStart.max_size]u8 = undefined;
+    _ = try f.answer(.child_start, try ae.ChildStart.encodeInto(&csb, .{ .ns = NamespaceId.default.int(), .parent_slot = 3, .parent_run = "p0", .parent_workflow = "pwf", .workflow = "wf", .version = "", .run = "c1", .input = "{}" }));
+    try testing.expect((try f.start("c1", "wf", "child_started", "", 7)).refused() == null);
+    try testing.expect(try indexed(&f, "wf", 7, "c1"));
+    // A child with no parent record creates nothing, and indexes nothing.
+    _ = try f.start("c2", "wf", "child_started", "", 8);
+    try testing.expect(f.get("c2") == null);
+    try testing.expect(!try indexed(&f, "wf", 8, "c2"));
+    // Past the share, the verdict rolls back the start, its index rows too.
+    try settings.bindForTest(&f.store, pool.useOf(&f.store));
+    const held = try f.start("h1", "wf", "workflow_started", "", 9);
+    try testing.expect(held.refused() != null);
+    try testing.expect(!try indexed(&f, "wf", 9, "h1"));
+    try testing.expectEqual(@as(usize, 4), f.store.families[RunAtFam.ID].count);
+}
+
+test "workflow runs machine: the lists' index keys are the bytes the list's order needs" {
+    const a = testing.allocator;
+    const at = try runAtKey(a, .default, "wf", 1, "r1");
+    defer a.free(at);
+    const all = try runAllKey(a, .default, 1, "r1");
+    defer a.free(all);
+    // ns ‖ len ‖ "wf" ‖ ~1 ‖ "r1", and ns ‖ ~1 ‖ "r1": no length before the id.
+    const ns = NamespaceId.default.bytes();
+    const not1 = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe };
+    try testing.expectEqualSlices(u8, &(ns ++ [_]u8{ 0, 2, 'w', 'f' } ++ not1 ++ [_]u8{ 'r', '1' }), at);
+    try testing.expectEqualSlices(u8, &(ns ++ not1 ++ [_]u8{ 'r', '1' }), all);
+}
+
+test "workflow runs machine: a run's start puts it in both lists' index, its delete takes it out, and a start that creates nothing indexes nothing" {
+    var f = Fixture.init();
+    defer f.deinit();
+    const rv: ReadView = .{ .store = &f.store };
+    const a = f.scratch.allocator();
+    _ = try f.start("r1", "wf", "workflow_started", "k1", 40);
+    const r1 = f.get("r1").?;
+    // The key's start time is the run's, derived from its incarnation alike.
+    try testing.expectEqual(r1.created_at_ms, msOfNs(r1.created_ns));
+    try testing.expect((try rv.get(RunAtFam, try runAtKey(a, .default, "wf", r1.created_at_ms, "r1"))) != null);
+    try testing.expect((try rv.get(RunAllFam, try runAllKey(a, .default, r1.created_at_ms, "r1"))) != null);
+    // An idempotency hit, a taken id and an id past a run's create nothing.
+    _ = try f.start("r2", "wf", "workflow_started", "k1", 41);
+    _ = try f.start("r1", "wf", "workflow_started", "", 42);
+    const long: [MAX_RUN_ID + 1]u8 = @splat('x');
+    const refused = try f.start(&long, "wf", "workflow_started", "", 43);
+    try testing.expectEqualStrings(RUN_ID_TOO_LONG, refused.refused().?.refusal.message);
+    try testing.expectEqual(@as(usize, 1), f.store.families[RunAtFam.ID].count);
+    try testing.expectEqual(@as(usize, 1), f.store.families[RunAllFam.ID].count);
+    var vb: [512]u8 = undefined;
+    _ = try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 50);
+    try testing.expect((try f.deleteOf("r1")).refused() == null);
+    try testing.expectEqual(@as(usize, 0), f.store.families[RunAtFam.ID].count);
+    try testing.expectEqual(@as(usize, 0), f.store.families[RunAllFam.ID].count);
+}
+
 test "workflow runs machine: a schedule's slot fires once, its run deleted or not; an older slot after a newer one is refused" {
     var f = Fixture.init();
     defer f.deinit();
@@ -1782,13 +1984,13 @@ test "workflow runs machine: a run's largest output, an entry's whole payload, g
     // Some events pending, then the largest completion an entry holds.
     try testing.expect((try f.step("r1", .{ .rev = 0, .events = 40 })).refused() == null);
     const room = MAX_PERSIST_PAYLOAD - entry_mod.COMMAND_PREFIX_SIZE - 4 - 2;
-    const fixed = (Complete{ .status = .completed, .output = "", .event = "workflow_completed", .detail = "", .workflow = "wf" }).size();
+    const fixed = (Complete{ .status = .completed, .output = "", .event = "workflow_completed", .detail = "", .workflow = "wf", .created_ns = 0 }).size();
     const ob = try testing.allocator.alloc(u8, room - fixed);
     defer testing.allocator.free(ob);
     @memset(ob, 'o');
     const vb = try testing.allocator.alloc(u8, room);
     defer testing.allocator.free(vb);
-    const value = (Complete{ .status = .completed, .output = ob, .event = "workflow_completed", .detail = "", .workflow = "wf" }).encode(vb).?;
+    const value = (Complete{ .status = .completed, .output = ob, .event = "workflow_completed", .detail = "", .workflow = "wf", .created_ns = 0 }).encode(vb).?;
     try testing.expect((try f.complete("r1", value, 9)).refused() == null);
     const run = f.get("r1").?;
     try testing.expect(run.output_truncated);
@@ -1808,7 +2010,7 @@ test "workflow runs machine: an ended run keeps a summary: a preview of its outp
     var ob: [3000]u8 = undefined;
     @memset(&ob, 'o');
     var vb: [4096]u8 = undefined;
-    const value = (Complete{ .status = .completed, .output = &ob, .event = "workflow_completed", .detail = "", .workflow = "wf" }).encode(&vb).?;
+    const value = (Complete{ .status = .completed, .output = &ob, .event = "workflow_completed", .detail = "", .workflow = "wf", .created_ns = 0 }).encode(&vb).?;
     try testing.expect((try f.complete("r1", value, 9)).refused() == null);
     const run = f.get("r1").?;
     try testing.expectEqual(@as(usize, OUTPUT_PREVIEW), run.output.len);

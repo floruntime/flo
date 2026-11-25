@@ -200,6 +200,15 @@ pub const ActionsHandler = struct {
     /// action.status copies a run's output and error here: the answer is
     /// encoded after the store may have moved.
     status_buf: ?[]u8 = null,
+    /// `action.list_runs`'s page, reused: its answer is encoded from it.
+    list_buf: ?[]u8 = null,
+    /// Set once a run list met a run its page's schema can't hold (a Flo
+    /// bug): logged once, not every page.
+    unlistable_said: bool = false,
+    /// Set once a run list met an index row with no run (a Flo bug).
+    missing_run_said: bool = false,
+    /// Runs a run list passed over, for either reason.
+    unlisted_runs: u64 = 0,
     /// action.info copies the action's owner here: the answer is encoded
     /// after the handler returns, so its own stack is gone.
     info_owner_buf: [action_ops.MAX_OWNER]u8 = undefined,
@@ -253,6 +262,7 @@ pub const ActionsHandler = struct {
         for (self.reruns.items) |r| self.allocator.free(r.bytes);
         self.reruns.deinit(self.allocator);
         if (self.status_buf) |b| self.allocator.free(b);
+        if (self.list_buf) |b| self.allocator.free(b);
     }
 
     fn freeKeys(allocator: Allocator, map: anytype) void {
@@ -271,7 +281,7 @@ pub const ActionsHandler = struct {
         dispatcher.registerWithRoute(.action_info, table_run.handler("action.info", ActionsHandler, runInfo), preRouteByAction);
         dispatcher.registerPagedWalk(.action_list, dispatchAction, localScanActions);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
-        dispatcher.registerWithRoute(.action_list_runs, dispatchAction, preRouteByAction);
+        dispatcher.registerWithRoute(.action_list_runs, table_run.handler("action.list_runs", ActionsHandler, runListRuns), preRouteByAction);
         // An await runs where its worker is registered: its labels, whether
         // it drains, the actions it runs. The runs it takes live on their
         // actions' shards, which it asks.
@@ -319,7 +329,6 @@ pub const ActionsHandler = struct {
             .action_register => handleRegister(shard, req),
             .action_invoke => handleInvoke(shard, req),
             .action_list => handleList(shard, req),
-            .action_list_runs => handleListRuns(shard, req),
             .action_delete => handleDelete(shard, req),
             else => CommandResult{ .err = .{ .code = .invalid_request, .message = "unknown action opcode" } },
         };
@@ -477,58 +486,96 @@ pub const ActionsHandler = struct {
         return .{ .items = name_buf[0..count], .next_cursor = null };
     }
 
-    /// One shard's runs of an action (or every action, for an empty key):
-    ///   [count:u32] ([run_id_len:u16][run_id][action_name_len:u16][action_name]
-    ///                [status:u8][created_at:i64][has_started:u8][started_at?:i64]
-    ///                [has_completed:u8][completed_at?:i64])*
-    fn handleListRuns(shard: *Shard, req: Request) CommandResult {
-        // An action's runs are on its name's shard; with no name this would
-        // list only the shard it landed on.
-        if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "action name is required" } };
-        const ns = req.ns_id;
-        const limit: u32 = if (req.value.len >= 4) std.mem.readInt(u32, req.value[0..4], .little) else 100;
-        var w: std.Io.Writer.Allocating = .init(shard.allocator);
-        defer w.deinit();
-        writeRuns(shard, ns, req.key, limit, &w.writer) catch
-            return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
-        const data = w.toOwnedSlice() catch return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
-        return .{ .action_list_result = .{ .data = data, .cursor = null } };
+    const ListRunsResponse = table_run.op("action.list_runs").response;
+    const RunCursor = action_ops.RunCursor;
+
+    /// The most index rows one page reads.
+    pub const WALK_MAX: u32 = 4096;
+
+    /// `action.list_runs`: an action's runs, newest first, from the cursor,
+    /// by its index (`machine.RunAt`): at most `limit`, reading at most
+    /// `WALK_MAX` rows. With more, the cursor is the last run shown.
+    fn runListRuns(shard: *Shard, _: *Connection, req: Request, limit: u32, after: ?RunCursor.Value) Error!table_run.Outcome(ListRunsResponse) {
+        const self = shard.actions_handler;
+        // An action's runs are on its name's shard: a list with no name
+        // would see only the shard it landed on.
+        if (req.key.len == 0) return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .malformed, .ran = .no, .message = "bad request: action name is required" } } };
+        // A cursor builds an index key: held to what a run's own key can be
+        // here, not only by the schema's bound.
+        if (after) |c| if (c.created_at_ms < 0 or c.run.len == 0 or c.run.len > ae.MAX_RUN_ID)
+            return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .out_of_range, .ran = .no, .message = "bad request: a cursor no run can be at" } } };
+        if (req.key.len > ae.MAX_ACTION_NAME) return error.NotFound;
+        const buf = self.list_buf orelse blk: {
+            const b = try self.allocator.alloc(u8, action_ops.ListedRuns.max_size);
+            self.list_buf = b;
+            break :blk b;
+        };
+        var pb: machine.RunAtBuf = undefined;
+        var kb: [@sizeOf(u32) + @sizeOf(machine.RunAtBuf)]u8 = undefined;
+        const prefix = storeKey(&kb, req.ns_id, machine.runAtPrefix(&pb, req.key)) orelse return error.NotFound;
+        var ab: machine.RunAtBuf = undefined;
+        var akb: [@sizeOf(u32) + @sizeOf(machine.RunAtBuf)]u8 = undefined;
+        const from: ?[]const u8 = if (after) |c| storeKey(&akb, req.ns_id, machine.runAtKey(&ab, req.key, c.created_at_ms, c.run)) orelse return error.NotFound else null;
+        var it = if (from) |k| readOf(shard).rangeAfter(machine.RunAt, prefix, k) else readOf(shard).range(machine.RunAt, prefix);
+        var b = action_ops.ListedRuns.Builder.init(buf);
+        var shown: u32 = 0;
+        var read: u32 = 0;
+        var last: ?RunCursor.Value = null;
+        var rb: [KEY_BUF]u8 = undefined;
+        while (it.next() catch unreachable) |item| { // written by the machine alone
+            if (read == WALK_MAX) return .{ .answer = .{ .runs = b.value(), .cursor = last } };
+            const tail = item.key[prefix.len..];
+            const at: RunCursor.Value = .{ .created_at_ms = @intCast(std.math.maxInt(u64) - std.mem.readInt(u64, tail[0..8], .big)), .run = tail[8..] };
+            const run = getRunAt(shard, &rb, req.ns_id, at.run) orelse {
+                // A Flo bug a list survives: logged once, counted.
+                self.unlisted_runs += 1;
+                if (!self.missing_run_said) {
+                    self.missing_run_said = true;
+                    if (@import("builtin").is_test)
+                        log.warn("action run list: run {s} is indexed but not there; skipped", .{at.run})
+                    else
+                        log.err("action run list: run {s} is indexed but not there; skipped", .{at.run});
+                }
+                read += 1;
+                last = at;
+                continue;
+            };
+            const listed: action_ops.ListedRun.Value = .{
+                .run = at.run,
+                .status = @fromBackingInt(@backingInt(statusOf(run))),
+                .created_at_ms = nsToMs(run.created_ns),
+                .started_at_ms = if (run.started_ns != 0) nsToMs(run.started_ns) else null,
+                .completed_at_ms = if (run.completed_ns != 0) nsToMs(run.completed_ns) else null,
+            };
+            if (shown == limit) return .{ .answer = .{ .runs = b.value(), .cursor = last } };
+            // Sized for a page's most: past it, the page ends here.
+            const added = b.add(listed) catch |err| {
+                // A Flo bug: skipped like a missing run, so one bad run
+                // never fails every page.
+                self.unlisted_runs += 1;
+                if (!self.unlistable_said) {
+                    self.unlistable_said = true;
+                    if (@import("builtin").is_test)
+                        log.warn("action run list: run {s} can't be listed ({s}); skipped", .{ at.run, @errorName(err) })
+                    else
+                        log.err("action run list: run {s} can't be listed ({s}); skipped", .{ at.run, @errorName(err) });
+                }
+                read += 1;
+                last = at;
+                continue;
+            };
+            if (!added) return .{ .answer = .{ .runs = b.value(), .cursor = last } };
+            shown += 1;
+            read += 1;
+            last = at;
+        }
+        return .{ .answer = .{ .runs = b.value(), .cursor = null } };
     }
 
-    fn writeRuns(shard: *Shard, ns: NamespaceId, action: []const u8, limit: u32, w: *std.Io.Writer) !void {
-        var pb: [KEY_BUF]u8 = undefined;
-        const p = storeKey(&pb, ns, "") orelse return error.WriteFailed;
-        var count: u32 = 0;
-        var it = readOf(shard).range(machine.Runs, p);
-        while (try it.next()) |item| {
-            if (count >= limit) break;
-            if (action.len > 0 and !std.mem.eql(u8, item.value.v.action, action)) continue;
-            count += 1;
-        }
-        try w.writeInt(u32, count, .little);
-        var emitted: u32 = 0;
-        it = readOf(shard).range(machine.Runs, p);
-        while (try it.next()) |item| {
-            if (emitted >= count) break;
-            const run = item.value.v;
-            if (action.len > 0 and !std.mem.eql(u8, run.action, action)) continue;
-            emitted += 1;
-            const id = item.key[@sizeOf(u32)..];
-            try w.writeInt(u16, @intCast(id.len), .little);
-            try w.writeAll(id);
-            try w.writeInt(u16, @intCast(run.action.len), .little);
-            try w.writeAll(run.action);
-            try w.writeByte(@backingInt(statusOf(run)));
-            try w.writeInt(i64, nsToMs(run.created_ns), .little);
-            try writeOptionalMs(w, run.started_ns);
-            try writeOptionalMs(w, run.completed_ns);
-        }
-    }
-
-    fn writeOptionalMs(w: *std.Io.Writer, at_ns: u64) !void {
-        if (at_ns == 0) return w.writeByte(0);
-        try w.writeByte(1);
-        try w.writeInt(i64, nsToMs(at_ns), .little);
+    fn getRunAt(shard: *Shard, b: *[KEY_BUF]u8, ns: NamespaceId, id: []const u8) ?Run {
+        const k = storeKey(b, ns, id) orelse return null;
+        const r = readOf(shard).get(machine.Runs, k) catch return null;
+        return if (r) |x| x.v else null;
     }
 
     /// A run's status as the wire says it.
@@ -590,10 +637,9 @@ pub const ActionsHandler = struct {
 
     // ── Info ────────────────────────────────────────────────────────────
 
-    /// An action's definition and its runs. Ready runs are its ready keys,
-    /// up to READY_COUNTED. The other counts and the latency read every run
-    /// in the namespace, so they are none past RUNS_SCANNED: runs are kept,
-    /// and a namespace's grow without bound.
+    /// An action's definition, its runs by status from its counts row, one
+    /// read however many it has, and how long its newest completed runs
+    /// took, from a walk of at most RUNS_SCANNED of its index rows.
     fn runInfo(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(InfoResponse) {
         const ns = req.ns_id;
         const def = getDef(shard, ns, req.key) orelse
@@ -602,40 +648,25 @@ pub const ActionsHandler = struct {
         const owner = owner_buf[0..@min(def.owner.len, owner_buf.len)];
         @memcpy(owner, def.owner[0..owner.len]);
 
-        var ready: u64 = 0;
-        var ready_capped = false;
-        var pb: [KEY_BUF]u8 = undefined;
-        var rb: [machine.MAX_KEY_LEN]u8 = undefined;
-        if (storeKey(&pb, ns, machine.readyPrefix(&rb, req.key))) |prefix| {
-            var it = readOf(shard).range(machine.Ready, prefix);
-            while (it.next() catch null) |_| {
-                if (ready == action_ops.READY_COUNTED) {
-                    ready_capped = true;
-                    break;
-                }
-                ready += 1;
-            }
-        }
-
+        // Kept as its runs move, so exact whatever their number.
+        const c = machine.countsOf(readOf(shard), ns, req.key);
         const durations = try shard.allocator.alloc(u64, action_ops.RUNS_SCANNED);
         defer shard.allocator.free(durations);
-        const counts = countRuns(shard, ns, req.key, durations);
-        const lat = if (counts.sampled) null else latencyOf(durations[0..counts.measured]);
-        const counted = !counts.sampled;
+        const sample = sampleLatencies(shard, ns, req.key, durations);
+        const lat = latencyOf(durations[0..sample.measured]);
         return .{ .answer = .{
             .owner = owner,
             .version = def.version,
             .timeout_ms = def.lease_ms,
             .max_attempts = def.max_attempts,
             .created_at_ms = nsToMs(def.created_ns),
-            .ready = ready,
-            .ready_capped = ready_capped,
-            .too_many_runs = counts.sampled,
-            .running = if (counted) counts.running else null,
-            .completed = if (counted) counts.completed else null,
-            .failed = if (counted) counts.failed else null,
-            .timed_out = if (counted) counts.timed_out else null,
-            .latency_count = if (counted) counts.measured else null,
+            .pending = c.ready,
+            .running = c.leased,
+            .completed = c.completed,
+            .failed = c.failed,
+            .timed_out = c.timed_out,
+            .latency_sampled = sample.more,
+            .latency_count = sample.measured,
             .latency_avg_ms = if (lat) |l| l.avg_ms else null,
             .latency_p50_ms = if (lat) |l| l.p50_ms else null,
             .latency_p95_ms = if (lat) |l| l.p95_ms else null,
@@ -643,48 +674,31 @@ pub const ActionsHandler = struct {
         } };
     }
 
-    const RunCounts = struct {
-        scanned: u32 = 0,
-        sampled: bool = false,
-        running: u64 = 0,
-        completed: u64 = 0,
-        failed: u64 = 0,
-        timed_out: u64 = 0,
-        measured: usize = 0,
-    };
+    const Sample = struct { measured: u32 = 0, more: bool = false };
 
-    /// `action`'s runs by status among the first `durations.len` of the
-    /// namespace's, and the completed ones' durations in ms.
-    fn countRuns(shard: *Shard, ns: NamespaceId, action: []const u8, durations: []u64) RunCounts {
-        var c: RunCounts = .{};
-        var pb: [KEY_BUF]u8 = undefined;
-        const p = storeKey(&pb, ns, "") orelse return c;
-        var it = readOf(shard).range(machine.Runs, p);
-        while (it.next() catch null) |item| {
-            if (c.scanned == durations.len) {
-                c.sampled = true;
+    /// The durations of the newest `durations.len` runs of `action` that a
+    /// worker completed, by its list's index: one bounded walk per ask.
+    /// `more` when older runs weren't read.
+    fn sampleLatencies(shard: *Shard, ns: NamespaceId, action: []const u8, durations: []u64) Sample {
+        var out: Sample = .{};
+        var pb: machine.RunAtBuf = undefined;
+        var kb: [@sizeOf(u32) + @sizeOf(machine.RunAtBuf)]u8 = undefined;
+        const prefix = storeKey(&kb, ns, machine.runAtPrefix(&pb, action)) orelse return out;
+        var it = readOf(shard).range(machine.RunAt, prefix);
+        var read: usize = 0;
+        var rb: [KEY_BUF]u8 = undefined;
+        while (it.next() catch null) |item| : (read += 1) {
+            if (read == durations.len) {
+                out.more = true;
                 break;
             }
-            c.scanned += 1;
-            const run = item.value.v;
-            if (!std.mem.eql(u8, run.action, action)) continue;
-            switch (run.status) {
-                .ready => {},
-                .leased => c.running += 1,
-                .failed => c.failed += 1,
-                .timed_out => c.timed_out += 1,
-                .completed => {
-                    c.completed += 1;
-                    // A run completed without a worker taking it has no
-                    // duration to measure.
-                    if (run.started_ns != 0 and run.completed_ns >= run.started_ns) {
-                        durations[c.measured] = (run.completed_ns - run.started_ns) / std.time.ns_per_ms;
-                        c.measured += 1;
-                    }
-                },
-            }
+            const run = getRunAt(shard, &rb, ns, item.key[prefix.len + 8 ..]) orelse continue;
+            // A run completed without a worker taking it has no duration.
+            if (run.status != .completed or run.started_ns == 0 or run.completed_ns < run.started_ns) continue;
+            durations[out.measured] = (run.completed_ns - run.started_ns) / std.time.ns_per_ms;
+            out.measured += 1;
         }
-        return c;
+        return out;
     }
 
     const Latency = struct { avg_ms: u64, p50_ms: u64, p95_ms: u64, max_ms: u64 };
@@ -2038,14 +2052,4 @@ test "an action entry naming no namespace is refused before it is proposed" {
     const shard: *Shard = undefined;
     try std.testing.expectError(error.NamespaceUnknown, propose(shard, .action_register, ae.Register.Value{ .ns = 0, .name = "a", .owner = "", .lease_ms = 1000, .max_attempts = 1 }));
     try std.testing.expectError(error.NamespaceUnknown, propose(shard, .action_delete, ae.Delete.Value{ .ns = 0, .name = "a" }));
-}
-
-test "listing action runs with no action name is refused, not answered from one shard" {
-    // An action's runs are on its name's shard: a keyless list would see
-    // only the shard it landed on. Refused before the shard is read.
-    const shard: *Shard = undefined;
-    const req: Request = .{ .header = proto.RequestHeader.init(.action_list_runs, 1), .namespace = "", .key = "", .value = "" };
-    const r = ActionsHandler.handleListRuns(shard, req);
-    try std.testing.expectEqual(@as(@TypeOf(r.err.code), .invalid_request), r.err.code);
-    try std.testing.expectEqualStrings("action name is required", r.err.message);
 }

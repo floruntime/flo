@@ -153,6 +153,77 @@ const M = delivery.Model(.{
 
 pub const Defs = view_mod.Family(20, "action.def", .id, Stored(Def));
 pub const Runs = view_mod.Family(21, "action.run", .id, Stored(Run));
+/// Every run, as its action's list orders it: newest first, then by id in
+/// byte order. Written at its invoke and gone at its delete; keys alone.
+pub const RunAt = view_mod.Family(74, "action.run_at", .id, delivery.Empty);
+
+/// The key after the namespace of run `run`'s place in its action's list:
+/// `len ‖ action ‖ ~created_ms ‖ run`, the id last with no length before
+/// it, so the key's order is the list's.
+pub fn runAtKey(buf: *RunAtBuf, action: []const u8, created_ms: i64, run: []const u8) []const u8 {
+    // Its callers hold both to their bounds; past them it would overrun.
+    std.debug.assert(action.len <= ae.MAX_ACTION_NAME and run.len <= ae.MAX_RUN_ID);
+    std.mem.writeInt(u16, buf[0..2], @intCast(action.len), .big);
+    @memcpy(buf[2..][0..action.len], action);
+    std.mem.writeInt(u64, buf[2 + action.len ..][0..8], std.math.maxInt(u64) - @as(u64, @intCast(@max(created_ms, 0))), .big);
+    @memcpy(buf[2 + action.len + 8 ..][0..run.len], run);
+    return buf[0 .. 2 + action.len + 8 + run.len];
+}
+
+/// `len ‖ action`: every run of one action in its list.
+pub fn runAtPrefix(buf: *RunAtBuf, action: []const u8) []const u8 {
+    std.debug.assert(action.len <= ae.MAX_ACTION_NAME);
+    std.mem.writeInt(u16, buf[0..2], @intCast(action.len), .big);
+    @memcpy(buf[2..][0..action.len], action);
+    return buf[0 .. 2 + action.len];
+}
+
+pub const RunAtBuf = [2 + ae.MAX_ACTION_NAME + 8 + ae.MAX_RUN_ID]u8;
+
+/// An action's runs by where they are, kept as they move, so its info
+/// reads one row whatever its runs. Keyed by the action, as its definition.
+pub const CountsRec = Record(&.{
+    .{ .name = "ready", .T = Int(u64) },
+    .{ .name = "leased", .T = Int(u64) },
+    .{ .name = "completed", .T = Int(u64) },
+    .{ .name = "failed", .T = Int(u64) },
+    .{ .name = "timed_out", .T = Int(u64) },
+});
+pub const Counts = view_mod.Family(75, "action.counts", .id, Stored(CountsRec));
+
+const ZERO_COUNTS: CountsRec.Value = .{ .ready = 0, .leased = 0, .completed = 0, .failed = 0, .timed_out = 0 };
+
+/// Action `action`'s runs, by where they are; all zero for one with none.
+pub fn countsOf(read: view_mod.ReadView, ns: NamespaceId, action: []const u8) CountsRec.Value {
+    var b: [@sizeOf(u32) + ae.MAX_ACTION_NAME]u8 = undefined;
+    const k = view_mod.idKey(&b, ns, action) catch return ZERO_COUNTS;
+    const got = read.get(Counts, k) catch return ZERO_COUNTS;
+    return if (got) |c| c.v else ZERO_COUNTS;
+}
+
+fn countField(c: *CountsRec.Value, s: Status) *u64 {
+    return switch (s) {
+        .ready => &c.ready,
+        .leased => &c.leased,
+        .completed => &c.completed,
+        .failed => &c.failed,
+        .timed_out => &c.timed_out,
+    };
+}
+
+/// One of action `action`'s runs moved from `from` to `to`, null for none
+/// (an invoke, a delete). A count never wraps: one that would is a Flo
+/// bug, which the simulator's recount catches. A row all zero after a
+/// delete goes.
+fn moveCount(view: *View, ns: NamespaceId, action: []const u8, from: ?Status, to: ?Status) ApplyError!void {
+    if (comptime plant.active == .actions_counts_unmoved) return;
+    const k = try idKey(view, ns, action);
+    var c = if (try view.get(Counts, k)) |got| got.v else ZERO_COUNTS;
+    if (from) |f| countField(&c, f).* -|= 1;
+    if (to) |t| countField(&c, t).* +|= 1;
+    if (to == null and std.meta.eql(c, ZERO_COUNTS)) return view.delete(Counts, k);
+    try view.put(Counts, k, .{ .v = c });
+}
 pub const Ready = M.Ready;
 pub const Deadlines = M.Deadlines;
 pub const Requests = M.Requests;
@@ -198,6 +269,9 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             try out.addIn(Defs.ID, ns, p.action);
             try out.addIn(Runs.ID, ns, p.run);
             try out.addIn(Ready.ID, ns, readyKey(&b, p.action, {}, stamp, p.run));
+            var ab: RunAtBuf = undefined;
+            try out.addIn(RunAt.ID, ns, runAtKey(&ab, p.action, msOf(stamp), p.run));
+            try out.addIn(Counts.ID, ns, p.action);
         },
         .action_deliver => {
             const p = ae.Deliver.decodeAll(e.payload, &diag) catch return;
@@ -207,11 +281,13 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             try out.addIn(Ready.ID, ns, readyKey(&b, p.action, {}, p.due_ns, p.run));
             try out.add(Deadlines.ID, "", deadlineKey(&b, after(stamp, p.lease_ms), ns, p.run));
             if (p.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, p.holder, k));
+            try out.addIn(Counts.ID, ns, p.action);
         },
         .action_settle => {
             const p = ae.Settle.decodeAll(e.payload, &diag) catch return;
             const ns: NamespaceId = .of(p.ns);
             try out.addIn(Runs.ID, ns, p.run);
+            try out.addIn(Counts.ID, ns, p.action);
             try out.add(Deadlines.ID, "", deadlineKey(&b, p.expiry_ns, ns, p.run));
             if (p.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, p.holder, k));
         },
@@ -219,6 +295,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             const p = ae.Release.decodeAll(e.payload, &diag) catch return;
             const ns: NamespaceId = .of(p.ns);
             try out.addIn(Runs.ID, ns, p.run);
+            try out.addIn(Counts.ID, ns, p.action);
             try out.addIn(Ready.ID, ns, readyKey(&b, p.action, {}, after(stamp, p.delay_ms), p.run));
             try out.add(Deadlines.ID, "", deadlineKey(&b, p.expiry_ns, ns, p.run));
             if (p.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, p.holder, k));
@@ -239,11 +316,15 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
                 try out.add(Deadlines.ID, "", deadlineKey(&b, item.expiry_ns, ns, item.run));
                 try out.addIn(Ready.ID, ns, readyKey(&b, item.action, {}, stamp, item.run));
                 if (item.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, item.holder, k));
+                try out.addIn(Counts.ID, ns, item.action);
             }
         },
         .action_run_delete => {
             const p = ae.RunDelete.decodeAll(e.payload, &diag) catch return;
             try out.addIn(Runs.ID, .of(p.ns), p.run);
+            var ab: RunAtBuf = undefined;
+            try out.addIn(RunAt.ID, .of(p.ns), runAtKey(&ab, p.action, msOf(p.created_ns), p.run));
+            try out.addIn(Counts.ID, .of(p.ns), p.action);
         },
         // A hand-back reads and writes nothing here.
         .action_abandon => {},
@@ -354,6 +435,11 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             try view.put(Runs, rk, .{ .v = new });
             var b: KeyBuf = undefined;
             try view.put(Ready, try idKey(view, .of(p.ns), readyKey(&b, p.action, {}, stamp, p.run)), .{});
+            // Its place in its action's list, staged with it: a call held
+            // below rolls it back too.
+            var ab: RunAtBuf = undefined;
+            try view.put(RunAt, try idKey(view, .of(p.ns), runAtKey(&ab, p.action, msOf(stamp), p.run)), .{});
+            try moveCount(view, .of(p.ns), p.action, null, .ready);
             if (call) if (gate.overSince(view, mark)) |o| {
                 try view.rollback(mark);
                 var wb: [128]u8 = undefined;
@@ -374,6 +460,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             if (run.v.status != .ready or run.v.due_ns != p.due_ns or p.due_ns > stamp)
                 return out.refuse(.conflict, .unclassified, NOT_READY);
             try M.deliver(view, .of(p.ns), p.run, &run.v, p.holder, p.request_key, .{ .term = e.header.term, .index = e.header.index }, p.lease_ms, stamp);
+            try moveCount(view, .of(p.ns), p.action, .ready, .leased);
             if (run.v.deliveries <= recordedDeliveries(run.v.max_attempts))
                 try record(view, .of(p.ns), p.run, &run.v, attemptEvent(EV_DELIVERED, p.holder, msOf(stamp)), .flush_on_size)
             else
@@ -433,6 +520,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 run.v.abandons +|= 1;
                 preview(&run.v.@"error", &run.v.error_truncated, p.@"error");
                 try M.readyAgain(view, .of(p.ns), p.run, &run.v, after(stamp, p.delay_ms));
+                try moveCount(view, .of(p.ns), p.action, .leased, .ready);
             } else {
                 run.v.ended = .released;
                 run.v.failures +|= 1;
@@ -444,7 +532,10 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 else
                     try record(view, .of(p.ns), p.run, &run.v, attemptEvent(EV_RELEASED, p.@"error", at_ms), .flush_on_size);
                 preview(&run.v.@"error", &run.v.error_truncated, p.@"error");
-                if (ends) try endRun(view, .of(p.ns), p.run, &run.v, .failed, stamp, "") else try M.readyAgain(view, .of(p.ns), p.run, &run.v, after(stamp, p.delay_ms));
+                if (ends) try endRun(view, .of(p.ns), p.run, &run.v, .failed, stamp, "") else {
+                    try M.readyAgain(view, .of(p.ns), p.run, &run.v, after(stamp, p.delay_ms));
+                    try moveCount(view, .of(p.ns), p.action, .leased, .ready);
+                }
             }
             try view.put(Runs, rk, run);
         },
@@ -502,7 +593,10 @@ fn expireOne(view: *View, item: ae.ExpireItem.Value, stamp: u64) ApplyError!bool
     const ends = run.v.failures >= run.v.max_attempts;
     try record(view, .of(item.ns), item.run, &run.v, .{ .event = EV_EXPIRED, .detail = LEASE_EXPIRED, .at_ms = msOf(stamp) }, if (ends) .hold else .flush_on_size);
     preview(&run.v.@"error", &run.v.error_truncated, LEASE_EXPIRED);
-    if (ends) try endRun(view, .of(item.ns), item.run, &run.v, .timed_out, stamp, "") else try M.readyAgain(view, .of(item.ns), item.run, &run.v, stamp);
+    if (ends) try endRun(view, .of(item.ns), item.run, &run.v, .timed_out, stamp, "") else {
+        try M.readyAgain(view, .of(item.ns), item.run, &run.v, stamp);
+        try moveCount(view, .of(item.ns), run.v.action, .leased, .ready);
+    }
     try view.put(Runs, rk, run);
     return true;
 }
@@ -670,6 +764,7 @@ fn endRun(view: *View, ns: NamespaceId, id: []const u8, run: *Run.Value, status:
     var db: [ENDED_DETAIL_MAX]u8 = undefined;
     const detail = std.fmt.bufPrint(&db, ENDED_FMT, .{ run.abandons, run.deliveries_unrecorded }) catch unreachable;
     try record(view, ns, id, run, .{ .event = EV_ENDED, .detail = detail, .at_ms = msOf(stamp) }, .hold);
+    try moveCount(view, ns, run.action, run.status, status);
     run.status = status;
     run.completed_ns = stamp;
     try tellCaller(view, ns, id, run.*, result);
@@ -687,7 +782,8 @@ fn inScope(view: *View, rk: []const u8, action: []const u8) ApplyError!?Stored(R
 }
 
 pub const OTHER_RESULT = "stale report: the run was completed with another result";
-pub const RUN_LIVE = "bad request: the run hasn't ended; cancel it first";
+/// An action run has no cancel: it ends by its worker or its attempts.
+pub const RUN_LIVE = "bad request: the run hasn't ended; delete it once it ends";
 
 /// An ended run deleted: its row goes, and its history is dropped on the
 /// history lane, after its last chunk. Its id is then free for a new run.
@@ -703,6 +799,9 @@ fn applyRunDelete(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     if (run.v.created_ns != p.created_ns) return out.refuse(.not_found, .not_found, NO_RUN);
     if (run.v.completed_ns == 0) return out.refuse(.bad_request, .run_live, RUN_LIVE);
     try view.delete(Runs, rk);
+    var ab: RunAtBuf = undefined;
+    try view.delete(RunAt, try idKey(view, ns, runAtKey(&ab, run.v.action, msOf(run.v.created_ns), p.run)));
+    try moveCount(view, ns, run.v.action, run.v.status, null);
     if (comptime plant.active == .actions_delete_keeps_history) return;
     try hp.sendDrop(view, ownerOf(ns, p.run, &run.v), msOf(run.v.completed_ns));
 }
@@ -717,7 +816,7 @@ const idKey = M.inNs;
 pub const machine: machine_mod.Machine = .{
     .name = "actions",
     .entry_types = &.{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_run_delete, .action_abandon_send, .action_abandon },
-    .families = &([_]machine_mod.FamilyInfo{ machine_mod.info(Defs), machine_mod.info(Runs) } ++ M.FAMILIES),
+    .families = &([_]machine_mod.FamilyInfo{ machine_mod.info(Defs), machine_mod.info(Runs), machine_mod.info(RunAt), machine_mod.info(Counts) } ++ M.FAMILIES),
     .keys = keys,
     .apply = apply,
     .skipped = skipped,
@@ -1478,6 +1577,50 @@ fn histDrops(t: *TestActions, a: std.mem.Allocator) ![]he.Drop.Value {
         try got.append(a, try he.Drop.decodeAll(try a.dupe(u8, item.value.v.payload), &diag));
     }
     return got.items;
+}
+
+test "actions machine: an action's counts move with its runs, once each, and its row goes when the last is deleted" {
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 2);
+    const rv: view_mod.ReadView = .{ .store = &t.store };
+    try invoke(&t, "r1", 10 * ms);
+    try invoke(&t, "r2", 10 * ms);
+    try testing.expectEqual(@as(u64, 2), countsOf(rv, .default, "send").ready);
+    _ = try deliver(&t, "r1", 10 * ms, 20 * ms);
+    try testing.expectEqual(@as(u64, 1), countsOf(rv, .default, "send").leased);
+    // A deliver refused moves nothing.
+    _ = try deliver(&t, "r1", 10 * ms, 21 * ms);
+    try testing.expectEqual(@as(u64, 1), countsOf(rv, .default, "send").ready);
+    // A release with attempts left: leased, then ready again.
+    try testing.expect((try t.apply(.action_release, releaseOf(&t, "r1", false), 30 * ms)).refused() == null);
+    try testing.expectEqual(@as(u64, 2), countsOf(rv, .default, "send").ready);
+    try testing.expectEqual(@as(u64, 0), countsOf(rv, .default, "send").leased);
+    _ = try deliver(&t, "r1", t.run(.default, "r1").?.due_ns, 40 * ms);
+    var settle = settleOf(&t, "r1");
+    try testing.expect((try t.apply(.action_settle, settle, 50 * ms)).refused() == null);
+    // Its resend moves nothing.
+    settle = settleOf(&t, "r1");
+    _ = try t.apply(.action_settle, settle, 51 * ms);
+    var c = countsOf(rv, .default, "send");
+    try testing.expectEqual(@as(u64, 1), c.completed);
+    try testing.expectEqual(@as(u64, 1), c.ready);
+    try testing.expectEqual(@as(u64, 0), c.leased);
+    // An expire that requeues, then one that ends it.
+    _ = try deliver(&t, "r2", 10 * ms, 60 * ms);
+    try t.duty(60 * ms + LEASE);
+    try testing.expectEqual(@as(u64, 1), countsOf(rv, .default, "send").ready);
+    _ = try deliver(&t, "r2", t.run(.default, "r2").?.due_ns, 60 * ms + LEASE + 1);
+    try t.duty(60 * ms + 2 * LEASE + 2);
+    c = countsOf(rv, .default, "send");
+    try testing.expectEqual(@as(u64, 1), c.timed_out);
+    try testing.expectEqual(@as(u64, 0), c.ready + c.leased);
+    // Deletes take each end's count back; the row goes with the last.
+    for ([_][]const u8{ "r1", "r2" }) |id| {
+        const r = t.run(.default, id).?;
+        try testing.expect((try t.apply(.action_run_delete, ae.RunDelete.Value{ .ns = DEFAULT, .action = "send", .run = id, .created_ns = r.created_ns }, 90 * ms)).refused() == null);
+    }
+    try testing.expectEqual(@as(usize, 0), t.count(Counts));
 }
 
 test "actions machine: a delete of an ended run removes it and drops its history; a live run, another incarnation or a resend is refused" {

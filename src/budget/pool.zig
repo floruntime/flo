@@ -83,6 +83,11 @@ pub const CHARGED = [_]u16{
     // workflow: idem, per_def, out, sig
     64, 65,
     66, 67,
+    // workflow: run_at, run_all; action: run_at. The lists' indexes
+    72, 73,
+    74,
+    // action.counts: an action's runs by where they are
+    75,
 };
 
 /// The families the pool is not charged for: the node's own state, and a

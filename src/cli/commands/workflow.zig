@@ -29,6 +29,7 @@ const wf_parser = @import("../../workflow/parser.zig");
 const wf_validator = @import("../../workflow/validator.zig");
 const gen = @import("../gen.zig");
 const workflow_ops = @import("../../protocol/workflow_ops.zig");
+const system_ops = @import("../../protocol/system_ops.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -111,6 +112,7 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("status", 's', "", "Filter by status (running, completed, failed, cancelled)")
                 .stringFlag("search", 'q', "", "Search runs by keyword")
                 .uintFlag("limit", 'l', 100, "Maximum runs to show")
+                .uintFlag("page", 0, 0, "Most runs to ask for a page, at most 1024 (0: the most a page holds)")
                 .action(wrapHandler(runListRuns)),
         )
         .subcommand(
@@ -510,6 +512,9 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
     }
 
     const limit = ctx.getUint("limit") orelse 100;
+    if (limit == 0) return outcome.usage(ctx, "--limit is at least 1", .{});
+    const page_size = ctx.getUint("page") orelse 0;
+    if (page_size > system_ops.MAX_PAGE) return outcome.usage(ctx, "--page is at most {d}", .{system_ops.MAX_PAGE});
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -526,22 +531,26 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
     var cursor_buf: [64 * 1024 + 8]u8 = undefined;
     var cursor: ?[]const u8 = null;
     while (count < limit) {
-        var result = client_mod.workflow.listRuns(&client, namespace, name, @intCast(limit - count), status_val, cursor, search_val) catch |err| return outcome.requestFailed(ctx, err);
+        var result = client_mod.workflow.listRuns(&client, namespace, name, @intCast(if (page_size == 0) limit - count else @min(limit - count, page_size)), status_val, cursor, search_val) catch |err| return outcome.requestFailed(ctx, err);
         defer result.deinit();
         try outcome.check(ctx, result);
         // No matching runs still answers with a count of 0.
         const page = result.asRawData() orelse return outcome.malformed(ctx, "list-runs response (empty)");
         const split = splitRunsPage(page) orelse return outcome.malformed(ctx, "list-runs response");
-        rows.appendSlice(ctx.allocator, split.rows) catch return outcome.malformed(ctx, "list-runs response (out of memory)");
+        if (output.isVerbose(ctx)) ctx.printErr("[verbose] page: {d} runs, {s}\n", .{ split.count, if (split.cursor != null) "more" else "the last" });
+        rows.appendSlice(ctx.allocator, split.rows) catch return error.OutOfMemory;
         count += split.count;
         const next = split.cursor orelse break;
-        if (next.len > cursor_buf.len) return outcome.malformed(ctx, "list-runs cursor");
+        if (next.len > cursor_buf.len or next.len <= 8) return outcome.malformed(ctx, "list-runs cursor");
+        // Pages run newest first: a cursor that doesn't move on would ask
+        // for the same page forever.
+        if (cursor) |prev| if (!cursorMovedOn(prev, next)) return outcome.malformed(ctx, "list-runs answer (its cursor didn't move on)");
         @memcpy(cursor_buf[0..next.len], next);
         cursor = cursor_buf[0..next.len];
     }
     var data: std.ArrayListUnmanaged(u8) = .empty;
     defer data.deinit(ctx.allocator);
-    data.ensureTotalCapacity(ctx.allocator, 4 + rows.items.len + 3) catch return outcome.malformed(ctx, "list-runs response (out of memory)");
+    data.ensureTotalCapacity(ctx.allocator, 4 + rows.items.len + 3) catch return error.OutOfMemory;
     var count_le: [4]u8 = undefined;
     std.mem.writeInt(u32, &count_le, count, .little);
     data.appendSliceAssumeCapacity(&count_le);
@@ -565,6 +574,15 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
 /// A list-runs page: its rows' bytes, their count, and the cursor when
 /// more follow. Rows are `[run_id][workflow][status]` (u16-prefixed each)
 /// then `[created_at:i64]`.
+/// Whether cursor `next` (`[created_at:i64][run_id]`) comes after `prev`
+/// in a run list's order: older, or as old with a greater id.
+fn cursorMovedOn(prev: []const u8, next: []const u8) bool {
+    const p = std.mem.readInt(i64, prev[0..8], .little);
+    const n = std.mem.readInt(i64, next[0..8], .little);
+    if (n != p) return n < p;
+    return std.mem.order(u8, next[8..], prev[8..]) == .gt;
+}
+
 fn splitRunsPage(page: []const u8) ?struct { count: u32, rows: []const u8, cursor: ?[]const u8 } {
     if (page.len < 4) return null;
     const count = std.mem.readInt(u32, page[0..4], .little);

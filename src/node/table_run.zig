@@ -262,6 +262,8 @@ pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []con
         "Shard: a shard's page of a list stops before its entries pass the room it was given",
         "Shard: a list page holds what one answer does, its shards sharing the room, and the next page starts where it stopped",
     } },
+    .{ .op = "action.list_runs", .field = "limit", .tests = &.{"actions: an action's runs list newest first by cursor, to the last page; a cursor no run can be at is refused"} },
+    .{ .op = "action.list_runs", .field = "after", .tests = &.{"actions: an action's runs list newest first by cursor, to the last page; a cursor no run can be at is refused"} },
     .{ .op = "system.runs_page", .field = "status", .tests = &.{"list runs: a shard's page holds only runs with the status asked"} },
     .{ .op = "system.runs_page", .field = "search", .tests = &.{"list runs: a shard's page holds only runs the search matches"} },
     .{ .op = "system.runs_page", .field = "after", .tests = &.{"list runs: a shard's page is newest first, by id among runs started together, and resumes after the run given"} },

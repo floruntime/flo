@@ -140,6 +140,14 @@ pub const Plant = enum {
     history_drop_not_resent,
     /// An action run's delete sends no history drop.
     actions_delete_keeps_history,
+    /// An action's counts don't move as its runs do.
+    actions_counts_unmoved,
+    /// A step applies to its run whatever incarnation it was decided for.
+    runs_step_incarnation_unchecked,
+    /// A run's delete leaves its place in its workflow's list.
+    runs_delete_keeps_index,
+    /// A child's start puts no place in the lists.
+    runs_child_unindexed,
 };
 
 pub const active: Plant = std.meta.stringToEnum(Plant, @import("build_options").vopr_plant) orelse
