@@ -1244,7 +1244,6 @@ test "e2e/processing: ts source to ts sink - derived metrics pipeline" {
         \\sources.[0].ts.lateness_ms: 0
         \\sinks.[0].ts.measurement: derived_temp
         \\sinks.[0].ts.value_field: value
-        \\sinks.[0].ts.tags.sensor: sensor
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ts-to-ts.yaml");
