@@ -1541,3 +1541,124 @@ test "e2e/action/status: a completed run's named outcome is shown" {
     const table = try ctx.execCapture(&.{ "action", "status", t.run });
     try testing.expect(std.mem.indexOf(u8, table, "outcome: approved") != null);
 }
+
+/// The shard `name` routes to in namespace `id` on `shards` shards, as the
+/// server's router places an action or a stream by its name.
+fn shardOfName(shards: u16, id: @import("src").node.router.NamespaceId, name: []const u8) u16 {
+    const router = @import("src").node.router;
+    return switch (router.Router.init(shards, 0).route(router.routeNsKey(id, name))) {
+        .local => 0,
+        .shard => |s| s.shard_id,
+    };
+}
+
+test "e2e/action/routing: on 12 shards, in a namespace of its own, runs of actions off shard 0 go through every op keyed by the run" {
+    const shards = 12;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards } });
+    defer ctx.deinit();
+    const ns = "ar-ns";
+    try ctx.exec(&.{ "namespace", "create", ns });
+    // The first namespace created takes the first allocated id, so its
+    // actions' shards follow from it, as the server routes them.
+    const first: @import("src").node.router.NamespaceId = .of(16);
+
+    // Actions whose runs live off shard 0, each on a shard of its own.
+    var names: [4][16]u8 = undefined;
+    var lens: [4]usize = undefined;
+    var used: [shards]bool = @splat(false);
+    var found: usize = 0;
+    var i: usize = 0;
+    while (found < names.len) : (i += 1) {
+        if (i == 256) return error.TooFewShards;
+        var b: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&b, "ar-act-{d}", .{i});
+        const s = shardOfName(shards, first, name);
+        if (s == 0 or used[s]) continue;
+        used[s] = true;
+        @memcpy(names[found][0..name.len], name);
+        lens[found] = name.len;
+        found += 1;
+    }
+
+    for (&names, lens) |*nb, len| {
+        const action = nb[0..len];
+        var wb: [24]u8 = undefined;
+        const worker = try std.fmt.bufPrint(&wb, "{s}-w", .{action});
+        try ctx.exec(&.{ "action", "register", action, "--max-attempts", "2", "-n", ns });
+        try ctx.exec(&.{ "worker", "register", worker, action, "-n", ns });
+
+        var run_buf: [64]u8 = undefined;
+        const run = blk: {
+            const out = try ctx.execCapture(&.{ "action", "invoke", action, "{\"n\":1}", "-n", ns });
+            const r = extractRunId(out) orelse {
+                std.debug.print("\nno run id in '{s}'\n", .{out});
+                return error.TestFailed;
+            };
+            @memcpy(run_buf[0..r.len], r);
+            break :blk run_buf[0..r.len];
+        };
+
+        // Delivered, touched and failed: pending again, with the error.
+        var first_task = try ctx.cli.run(&.{ "worker", "await", action, "--worker-id", worker, "--block", "5000", "-n", ns });
+        defer first_task.deinit();
+        try testing.expect(first_task.stdoutContains(run));
+        const task1 = taskIdOf(first_task.stdout) orelse return error.TestFailed;
+        var touched = try ctx.cli.run(&.{ "worker", "touch", task1, "--worker-id", worker, "-n", ns });
+        defer touched.deinit();
+        try stdx.testing.assertContains(touched, "Expires at: ");
+        var failed = try ctx.cli.run(&.{ "worker", "fail", task1, "--worker-id", worker, "--error", "first try", "-n", ns });
+        defer failed.deinit();
+        try testing.expectEqualStrings("OK\n", failed.stdout);
+        {
+            var s = try ctx.cli.run(&.{ "action", "status", run, "-n", ns });
+            defer s.deinit();
+            try stdx.testing.assertContains(s, "status: pending");
+            try stdx.testing.assertContains(s, "error: first try");
+        }
+        // A live run isn't deleted.
+        var live = try ctx.cli.run(&.{ "action", "run-delete", run, "-n", ns });
+        defer live.deinit();
+        try stdx.testing.assertContains(live, "the run hasn't ended; delete it once it ends");
+
+        // Delivered again and completed.
+        var second_task = try ctx.cli.run(&.{ "worker", "await", action, "--worker-id", worker, "--block", "5000", "-n", ns });
+        defer second_task.deinit();
+        const task2 = taskIdOf(second_task.stdout) orelse return error.TestFailed;
+        try testing.expect(!std.mem.eql(u8, task1, task2));
+        var completed = try ctx.cli.run(&.{ "worker", "complete", task2, "--worker-id", worker, "--result", "done", "-n", ns });
+        defer completed.deinit();
+        try testing.expectEqualStrings("OK\n", completed.stdout);
+        {
+            var s = try ctx.cli.run(&.{ "action", "status", run, "-n", ns });
+            defer s.deinit();
+            try stdx.testing.assertContains(s, "status: completed");
+            try stdx.testing.assertContains(s, "attempt: 2");
+            try stdx.testing.assertContains(s, "output: done");
+        }
+        {
+            var h = try ctx.cli.run(&.{ "action", "history", run, "-n", ns });
+            defer h.deinit();
+            for ([_][]const u8{ "action_invoked\t{\"n\":1}", "action_released\tfirst try", "action_settled\tdone", "action_ended\t", "has_more: false" }) |line|
+                try stdx.testing.assertContains(h, line);
+        }
+        // Not in another namespace.
+        {
+            var other = try ctx.cli.run(&.{ "action", "status", run });
+            defer other.deinit();
+            try stdx.testing.assertContains(other, "Run not found");
+        }
+
+        // Deleted once ended, its history with it.
+        var deleted = try ctx.cli.run(&.{ "action", "run-delete", run, "-n", ns });
+        defer deleted.deinit();
+        try testing.expectEqualStrings("OK\n", deleted.stdout);
+        {
+            var s = try ctx.cli.run(&.{ "action", "status", run, "-n", ns });
+            defer s.deinit();
+            try stdx.testing.assertContains(s, "Run not found");
+            var h = try ctx.cli.run(&.{ "action", "history", run, "-n", ns });
+            defer h.deinit();
+            try stdx.testing.assertContains(h, "no such run");
+        }
+    }
+}
