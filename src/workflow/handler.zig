@@ -284,6 +284,9 @@ pub const WorkflowHandler = struct {
     /// The longest run id a start may choose: its key is the namespace's id
     /// and the run id.
     pub const MAX_RUN_ID: usize = MAX_START_KEY - KEY_PREFIX;
+    comptime {
+        std.debug.assert(MAX_RUN_ID == runs_machine.MAX_RUN_ID);
+    }
 
     pub const RunStatus = runs_machine.RunStatus;
 
@@ -1702,42 +1705,34 @@ pub const WorkflowHandler = struct {
         created_at: i64,
     };
 
-    /// Collect the runs of namespace `ns` matching filters, as applied, on
-    /// this handler's own thread.
-    pub fn collectMatchingRuns(
-        self: *WorkflowHandler,
-        runs_list: *std.ArrayListUnmanaged(RunInfo),
-        ns: NamespaceId,
-        workflow_name: []const u8,
-        status_filter: ?[]const u8,
-        search_lower: ?[]const u8,
-    ) !void {
-        const id = ns.bytes();
-        var rit = self.defsRead().range(runs_machine.RunFam, &id);
-        while (rit.next() catch unreachable) |item| { // written by the machine alone
-            const run = self.shownRun(item.key, keyName(item.key)).?;
-            if (workflow_name.len > 0 and !std.mem.eql(u8, run.workflow_name_owned, workflow_name)) continue;
-            if (status_filter) |sf| {
-                if (!std.mem.eql(u8, run.status.toString(), sf)) continue;
-            }
-
-            // Free-text search: match against run_id, workflow, step, input, search_tags
-            if (search_lower) |sq| {
-                const matched = containsLower(run.run_id_owned, sq) or
-                    containsLower(run.workflow_name_owned, sq) or
-                    (if (run.current_step_name_owned) |step| containsLower(step, sq) else false) or
-                    containsLower(run.input_owned, sq) or
-                    (if (run.search_tags_owned) |tags| containsLower(tags, sq) else false);
-                if (!matched) continue;
-            }
-
-            try runs_list.append(self.allocator, .{
-                .run_id = run.run_id_owned,
-                .workflow = run.workflow_name_owned,
-                .status = run.status.toString(),
-                .created_at = run.started_at_ms orelse run.created_at_ms,
-            });
+    /// Run `run_key` (id `run_id`) as a list shows it, if it matches the
+    /// status and the lowercased search; null for one that doesn't, or that
+    /// isn't there. The search reads at most `SEARCH_SPAN` bytes of each
+    /// field, so a page's cost is bounded whatever a run holds.
+    pub fn listedRun(self: *WorkflowHandler, run_key: []const u8, run_id: []const u8, status_filter: []const u8, search_lower: []const u8) ?RunInfo {
+        const run = self.shownRun(run_key, run_id) orelse return null;
+        if (status_filter.len > 0 and !std.mem.eql(u8, run.status.toString(), status_filter)) return null;
+        if (search_lower.len > 0) {
+            const matched = containsLower(span(run.run_id_owned), search_lower) or
+                containsLower(span(run.workflow_name_owned), search_lower) or
+                (if (run.current_step_name_owned) |step| containsLower(span(step), search_lower) else false) or
+                containsLower(span(run.input_owned), search_lower) or
+                (if (run.search_tags_owned) |tags| containsLower(span(tags), search_lower) else false);
+            if (!matched) return null;
         }
+        return .{
+            .run_id = run.run_id_owned,
+            .workflow = run.workflow_name_owned,
+            .status = run.status.toString(),
+            .created_at = run.started_at_ms orelse run.created_at_ms,
+        };
+    }
+
+    /// The most of one field a list's search reads.
+    pub const SEARCH_SPAN: usize = 4096;
+
+    fn span(field: []const u8) []const u8 {
+        return field[0..@min(field.len, SEARCH_SPAN)];
     }
 
     const ListRunsQuery = struct {
@@ -8757,14 +8752,16 @@ test "workflow keys: two namespaces keep their own workflows and runs, whatever 
     try testing.expectEqual(@as(usize, 4), handler.runCount());
 
     for ([_]NamespaceId{ TEST_NS_A, TEST_NS_B }) |ns| {
-        var runs: std.ArrayListUnmanaged(WorkflowHandler.RunInfo) = .empty;
-        defer runs.deinit(allocator);
-        try handler.collectMatchingRuns(&runs, ns, "", null, null);
-        try testing.expectEqual(@as(usize, 2), runs.items.len);
+        const pbuf2 = try allocator.alloc(u8, system_ops.Runs.max_size);
+        defer allocator.free(pbuf2);
+        const page = try list_runs.ownPage(&handler, ns, "", .{ .limit = 10, .status = "", .search = "", .after = null }, 1 << 20, pbuf2);
+        var ids: [8][]const u8 = undefined;
+        const listed_ids = try pageRunIds(page, &ids);
+        try testing.expectEqual(@as(usize, 2), listed_ids.len);
         // Each run listed is one this namespace started.
-        for (runs.items) |listed| {
+        for (listed_ids) |listed| {
             var own = false;
-            for (cases) |c| own = own or (c.ns == ns and std.mem.eql(u8, c.name, listed.run_id));
+            for (cases) |c| own = own or (c.ns == ns and std.mem.eql(u8, c.name, listed));
             try testing.expect(own);
         }
         // And each lists only its own definitions.

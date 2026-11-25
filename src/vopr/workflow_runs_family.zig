@@ -344,8 +344,8 @@ pub const WorkflowRuns = struct {
     const GONE = 32;
     const GoneL = struct { wf: usize, run: usize, idem: ?usize, created_ns: u64, completed_ms: i64, orphaned: bool };
 
-    pub const FAMILIES = [_]u16{ rm.RunFam.ID, hm.Workflows.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID, calls_mod.Calls.ID, rm.SigFam.ID };
-    pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "history.wf", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents", "step.calls", "workflow.sig" };
+    pub const FAMILIES = [_]u16{ rm.RunFam.ID, hm.Workflows.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID, calls_mod.Calls.ID, rm.SigFam.ID, rm.RunAtFam.ID, rm.RunAllFam.ID };
+    pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "history.wf", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents", "step.calls", "workflow.sig", "workflow.run_at", "workflow.run_all" };
 
     pub const Kind = enum { start, step, complete, child_start, child_refuse, reply, done, retry, clear, signal, delete };
 
@@ -1112,6 +1112,11 @@ pub const WorkflowRuns = struct {
                 if (hm.orphanRow(rv, a, .workflow, NS, owner, RUNS[gn.run], gn.created_ns) == null) return "a deleted run whose drop was lost past its retries isn't marked orphaned";
                 if (hm.endedRow(rv, a, .workflow, NS, owner, RUNS[gn.run], gn.created_ns, at) == null) return "an orphaned run's history rows are gone";
             } else if (try hm.holdsAny(rv, a, .workflow, NS, owner, RUNS[gn.run], gn.created_ns, at)) return "a deleted run's history rows aren't gone";
+            const ms: i64 = @intCast(gn.created_ns / std.time.ns_per_ms);
+            if (l.runs[gn.run] == null or l.runs[gn.run].?.created_ns / std.time.ns_per_ms != gn.created_ns / std.time.ns_per_ms or l.runs[gn.run].?.wf != gn.wf) {
+                if ((rv.get(rm.RunAtFam, try rm.runAtKey(a, NS, owner, ms, RUNS[gn.run])) catch return "an index row could not be read") != null)
+                    return "a deleted run is still in its workflow's list";
+            }
         }
 
         // Against the ledger, run by run.
@@ -1126,6 +1131,13 @@ pub const WorkflowRuns = struct {
             if (l.runs[r] != null) want_runs += 1;
         }
         if (stored != want_runs) return "the runs are not the ledger's";
+        // One place in each list per run, and none besides.
+        for ([_]u16{ rm.RunAtFam.ID, rm.RunAllFam.ID }) |fam| {
+            var rows = store.range(fam, "");
+            var n: usize = 0;
+            while (rows.next()) |_| n += 1;
+            if (n != want_runs) return "the lists' index rows are not one per run";
+        }
         return null;
     }
 
@@ -1196,6 +1208,9 @@ pub const WorkflowRuns = struct {
             return null;
         };
         const g = got orelse return "a run the ledger holds is gone";
+        if ((rv.get(rm.RunAtFam, try rm.runAtKey(a, NS, NAMES[run.wf], run.created_ms, name)) catch return "an index row could not be read") == null or
+            (rv.get(rm.RunAllFam, try rm.runAllKey(a, NS, run.created_ms, name)) catch return "an index row could not be read") == null)
+            return "a run isn't in its lists' index";
         if (!std.mem.eql(u8, g.workflow, NAMES[run.wf])) return "a run's workflow is not its start's";
         if (g.status != @backingInt(run.status)) return "a run's status is not the ledger's";
         if (run.woken_rev != null and g.rev != run.rev) return "a woken run's rev is not the ledger's";

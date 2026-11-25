@@ -153,6 +153,29 @@ const M = delivery.Model(.{
 
 pub const Defs = view_mod.Family(20, "action.def", .id, Stored(Def));
 pub const Runs = view_mod.Family(21, "action.run", .id, Stored(Run));
+/// Every run, as its action's list orders it: newest first, then by id in
+/// byte order. Written at its invoke and gone at its delete; keys alone.
+pub const RunAt = view_mod.Family(74, "action.run_at", .id, delivery.Empty);
+
+/// The key after the namespace of run `run`'s place in its action's list:
+/// `len ‖ action ‖ ~created_ms ‖ run`, the id last with no length before
+/// it, so the key's order is the list's.
+pub fn runAtKey(buf: *RunAtBuf, action: []const u8, created_ms: i64, run: []const u8) []const u8 {
+    std.mem.writeInt(u16, buf[0..2], @intCast(action.len), .big);
+    @memcpy(buf[2..][0..action.len], action);
+    std.mem.writeInt(u64, buf[2 + action.len ..][0..8], std.math.maxInt(u64) - @as(u64, @intCast(@max(created_ms, 0))), .big);
+    @memcpy(buf[2 + action.len + 8 ..][0..run.len], run);
+    return buf[0 .. 2 + action.len + 8 + run.len];
+}
+
+/// `len ‖ action`: every run of one action in its list.
+pub fn runAtPrefix(buf: *RunAtBuf, action: []const u8) []const u8 {
+    std.mem.writeInt(u16, buf[0..2], @intCast(action.len), .big);
+    @memcpy(buf[2..][0..action.len], action);
+    return buf[0 .. 2 + action.len];
+}
+
+pub const RunAtBuf = [2 + ae.MAX_ACTION_NAME + 8 + ae.MAX_RUN_ID]u8;
 pub const Ready = M.Ready;
 pub const Deadlines = M.Deadlines;
 pub const Requests = M.Requests;
@@ -198,6 +221,8 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             try out.addIn(Defs.ID, ns, p.action);
             try out.addIn(Runs.ID, ns, p.run);
             try out.addIn(Ready.ID, ns, readyKey(&b, p.action, {}, stamp, p.run));
+            var ab: RunAtBuf = undefined;
+            try out.addIn(RunAt.ID, ns, runAtKey(&ab, p.action, msOf(stamp), p.run));
         },
         .action_deliver => {
             const p = ae.Deliver.decodeAll(e.payload, &diag) catch return;
@@ -244,6 +269,8 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         .action_run_delete => {
             const p = ae.RunDelete.decodeAll(e.payload, &diag) catch return;
             try out.addIn(Runs.ID, .of(p.ns), p.run);
+            var ab: RunAtBuf = undefined;
+            try out.addIn(RunAt.ID, .of(p.ns), runAtKey(&ab, p.action, msOf(p.created_ns), p.run));
         },
         // A hand-back reads and writes nothing here.
         .action_abandon => {},
@@ -354,6 +381,10 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             try view.put(Runs, rk, .{ .v = new });
             var b: KeyBuf = undefined;
             try view.put(Ready, try idKey(view, .of(p.ns), readyKey(&b, p.action, {}, stamp, p.run)), .{});
+            // Its place in its action's list, staged with it: a call held
+            // below rolls it back too.
+            var ab: RunAtBuf = undefined;
+            try view.put(RunAt, try idKey(view, .of(p.ns), runAtKey(&ab, p.action, msOf(stamp), p.run)), .{});
             if (call) if (gate.overSince(view, mark)) |o| {
                 try view.rollback(mark);
                 var wb: [128]u8 = undefined;
@@ -703,6 +734,8 @@ fn applyRunDelete(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     if (run.v.created_ns != p.created_ns) return out.refuse(.not_found, .not_found, NO_RUN);
     if (run.v.completed_ns == 0) return out.refuse(.bad_request, .run_live, RUN_LIVE);
     try view.delete(Runs, rk);
+    var ab: RunAtBuf = undefined;
+    try view.delete(RunAt, try idKey(view, ns, runAtKey(&ab, run.v.action, msOf(run.v.created_ns), p.run)));
     if (comptime plant.active == .actions_delete_keeps_history) return;
     try hp.sendDrop(view, ownerOf(ns, p.run, &run.v), msOf(run.v.completed_ns));
 }
@@ -717,7 +750,7 @@ const idKey = M.inNs;
 pub const machine: machine_mod.Machine = .{
     .name = "actions",
     .entry_types = &.{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_run_delete, .action_abandon_send, .action_abandon },
-    .families = &([_]machine_mod.FamilyInfo{ machine_mod.info(Defs), machine_mod.info(Runs) } ++ M.FAMILIES),
+    .families = &([_]machine_mod.FamilyInfo{ machine_mod.info(Defs), machine_mod.info(Runs), machine_mod.info(RunAt) } ++ M.FAMILIES),
     .keys = keys,
     .apply = apply,
     .skipped = skipped,

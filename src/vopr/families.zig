@@ -719,8 +719,8 @@ pub const Actions = struct {
     /// which sends its history to itself.
     landed: history_lane.Landed = .{},
 
-    pub const FAMILIES = [_]u16{ action_machine.Defs.ID, action_machine.Runs.ID, action_machine.Ready.ID, action_machine.Deadlines.ID, action_machine.Requests.ID, hm.Actions.ID };
-    pub const NAMES = [_][]const u8{ "action.def", "action.run", "action.ready", "action.deadline", "action.request", "history.act" };
+    pub const FAMILIES = [_]u16{ action_machine.Defs.ID, action_machine.Runs.ID, action_machine.Ready.ID, action_machine.Deadlines.ID, action_machine.Requests.ID, hm.Actions.ID, action_machine.RunAt.ID };
+    pub const NAMES = [_][]const u8{ "action.def", "action.run", "action.ready", "action.deadline", "action.request", "history.act", "action.run_at" };
     const PLACE: view_mod.Place = .{ .group = 0, .count = 1 };
 
     pub const Kind = enum { register, delete, invoke, deliver, settle, release, extend, expire, run_delete };
@@ -1059,6 +1059,14 @@ pub const Actions = struct {
         return null;
     }
 
+    /// Whether run `id` (`v`) has its place in its action's list.
+    fn listed(self: *Actions, ns: NamespaceId, id: []const u8, v: action_machine.Run.Value) bool {
+        var ab: action_machine.RunAtBuf = undefined;
+        var kb: [@sizeOf(u32) + @sizeOf(action_machine.RunAtBuf)]u8 = undefined;
+        const k = view_mod.idKey(&kb, ns, action_machine.runAtKey(&ab, v.action, @intCast(v.created_ns / std.time.ns_per_ms), id)) catch return false;
+        return (self.read().get(action_machine.RunAt, k) catch null) != null;
+    }
+
     /// An applied delete: of an ended run, its own incarnation, now gone,
     /// with its history once the drop landed, or marked orphaned when the
     /// drop was lost past its retries.
@@ -1069,6 +1077,7 @@ pub const Actions = struct {
         if (pre.completed_ns == 0) return "a delete of a live run applied";
         if (pre.created_ns != p.created_ns or !std.mem.eql(u8, pre.action, p.action)) return "a delete of another incarnation applied";
         if (self.run(t.ns, t.id) != null) return "an applied delete left its run";
+        if (self.listed(t.ns, t.id, pre)) return "a deleted run is still in its action's list";
         var arena = std.heap.ArenaAllocator.init(self.store.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1184,6 +1193,7 @@ pub const Actions = struct {
 
     /// What every run must be, whatever entry left it so.
     fn ruleOfRun(self: *Actions, ns: NamespaceId, id: []const u8, v: action_machine.Run.Value) ?[]const u8 {
+        if (!self.listed(ns, id, v)) return "a run isn't in its action's list";
         if (v.failures >= v.max_attempts and v.status != .failed and v.status != .timed_out) return "a run that spent its attempts didn't end";
         if (historyRule(self, ns, id, v)) |why| return why;
         var b: [512]u8 = undefined;

@@ -298,6 +298,57 @@ pub const IdemFam = view_mod.Family(64, "workflow.idem", .id, Stored(Idem));
 pub const PerDefFam = view_mod.Family(65, "workflow.per_def", .id, Stored(PerDef));
 pub const OutFam = view_mod.Family(66, "workflow.out", .id, Stored(Out));
 pub const SigFam = view_mod.Family(67, "workflow.sig", .id, Stored(Sig));
+/// Every run, as its workflow's list and the all-workflows list order them:
+/// newest first, then by id in byte order. Written with the run at its
+/// start and gone at its delete; the keys alone, no values. A list walks
+/// them from its cursor instead of reading and sorting every run.
+pub const RunAtFam = view_mod.Family(72, "workflow.run_at", .id, delivery.Empty);
+pub const RunAllFam = view_mod.Family(73, "workflow.run_all", .id, delivery.Empty);
+
+/// A start time as the index keys order it: the newest first.
+pub fn listedAt(created_ms: i64) u64 {
+    return std.math.maxInt(u64) - @as(u64, @intCast(@max(created_ms, 0)));
+}
+
+/// `ns ‖ len ‖ workflow ‖ ~created_ms ‖ run`: a run in its workflow's list.
+/// The id is last, with no length before it, so the key's order is the
+/// list's.
+pub fn runAtKey(a: std.mem.Allocator, ns: NamespaceId, workflow: []const u8, created_ms: i64, run: []const u8) error{OutOfMemory}![]u8 {
+    const k = try underName(a, ns, workflow, 8 + run.len);
+    const at = KEY_PREFIX + 2 + workflow.len;
+    std.mem.writeInt(u64, k[at..][0..8], listedAt(created_ms), .big);
+    @memcpy(k[at + 8 ..], run);
+    return k;
+}
+
+/// `ns ‖ len ‖ workflow`: every run of one workflow in its list.
+pub fn runAtPrefix(a: std.mem.Allocator, ns: NamespaceId, workflow: []const u8) error{OutOfMemory}![]u8 {
+    return underName(a, ns, workflow, 0);
+}
+
+/// `ns ‖ ~created_ms ‖ run`: a run in the all-workflows list.
+pub fn runAllKey(a: std.mem.Allocator, ns: NamespaceId, created_ms: i64, run: []const u8) error{OutOfMemory}![]u8 {
+    const k = try a.alloc(u8, KEY_PREFIX + 8 + run.len);
+    @memcpy(k[0..KEY_PREFIX], &ns.bytes());
+    std.mem.writeInt(u64, k[KEY_PREFIX..][0..8], listedAt(created_ms), .big);
+    @memcpy(k[KEY_PREFIX + 8 ..], run);
+    return k;
+}
+
+/// A start entry's stamp in ms, as its run's `created_at_ms` holds it and
+/// a delete derives it from `created_ns`.
+fn msOfNs(ns: u64) i64 {
+    return @intCast(ns / std.time.ns_per_ms);
+}
+
+/// A run's longest id: its start's key is the namespace's id and the id,
+/// at most 600 bytes.
+pub const MAX_RUN_ID: usize = 596;
+
+comptime {
+    // The longest index key: a namespace, the longest owner and run id.
+    std.debug.assert(KEY_PREFIX + 2 + he.MAX_OWNER + 8 + MAX_RUN_ID == 866);
+}
 
 /// `ns ‖ len ‖ run ‖ seq`, a signal's key.
 pub fn sigKey(a: std.mem.Allocator, ns: NamespaceId, run: []const u8, seq: u64) error{OutOfMemory}![]u8 {
@@ -499,6 +550,7 @@ fn carriesServerKeys(event: []const u8) bool {
     return std.mem.eql(u8, event, "schedule_started") or std.mem.eql(u8, event, "trigger_started");
 }
 
+pub const RUN_ID_TOO_LONG = "bad request: a run id is at most 596 bytes";
 pub const NAME_TOO_LONG = "a workflow name is longer than its runs' history may name";
 
 pub const SERVER_KEY_REFUSED = "reserved idempotency key: a leading '_' is the server's";
@@ -667,6 +719,9 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             try out.addIn(defs_machine.DefFam.ID, n.ns, s.workflow);
             try out.addIn(PerDefFam.ID, n.ns, s.workflow);
             if (s.idem) |k| try out.addIn(IdemFam.ID, n.ns, (try idemKey(arena, n.ns, s.workflow, k))[KEY_PREFIX..]);
+            const ms = msOfNs(e.header.timestamp_ns);
+            try out.addIn(RunAtFam.ID, n.ns, (try runAtKey(arena, n.ns, s.workflow, ms, n.run))[KEY_PREFIX..]);
+            try out.addIn(RunAllFam.ID, n.ns, (try runAllKey(arena, n.ns, ms, n.run))[KEY_PREFIX..]);
         },
         .workflow_step => {
             const cmd = command(e).?;
@@ -708,6 +763,9 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             out.addRangeIn(SigFam.ID, n.ns, range) catch return error.OutOfMemory;
             const d = Delete.parse(cmd.value) orelse return;
             if (d.idem.len > 0) try out.addIn(IdemFam.ID, n.ns, (try idemKey(arena, n.ns, d.workflow, d.idem))[KEY_PREFIX..]);
+            const ms = msOfNs(d.created_ns);
+            try out.addIn(RunAtFam.ID, n.ns, (try runAtKey(arena, n.ns, d.workflow, ms, n.run))[KEY_PREFIX..]);
+            try out.addIn(RunAllFam.ID, n.ns, (try runAllKey(arena, n.ns, ms, n.run))[KEY_PREFIX..]);
         },
         else => {},
     }
@@ -750,6 +808,8 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
     // Its history names its workflow as its owner: one longer can't be
     // created, and its start is refused rather than its end halting.
     if (s.workflow.len > he.MAX_OWNER) return out.refuse(.bad_request, .unclassified, NAME_TOO_LONG);
+    // Its index rows bound its id: the handler's bound, held here too.
+    if (n.run.len > MAX_RUN_ID) return out.refuse(.bad_request, .unclassified, RUN_ID_TOO_LONG);
     // Only a trigger's start says where it read, and every one does.
     if ((s.trigger != null) != std.mem.eql(u8, s.event, "trigger_started")) return error.Halt;
     // A server's key on a start the server didn't make: refused.
@@ -872,6 +932,10 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
     }
     try view.put(RunFam, cmd.key, .{ .v = run });
     if (comptime plant.active != .runs_idem_unwritten) if (idem_key) |k| try view.put(IdemFam, k, .{ .v = .{ .run = n.run } });
+    // Its places in the lists, staged with it: a start the verdict refuses
+    // below rolls them back too.
+    try view.put(RunAtFam, try runAtKey(arena, n.ns, s.workflow, stamp_ms, n.run), .{});
+    try view.put(RunAllFam, try runAllKey(arena, n.ns, stamp_ms, n.run), .{});
 
     var per = if (try view.get(PerDefFam, def_key)) |p| p.v else PER_DEF_NONE;
     if (!s.status.isTerminal()) per.active +|= 1;
@@ -1203,6 +1267,8 @@ fn applyDelete(view: *View, n: Named, cmd: entry_mod.CommandPayload, out: *Resul
     try view.deleteRange(OutFam, range, null);
     try view.deleteRange(SigFam, range, null);
     try view.delete(RunFam, cmd.key);
+    try view.delete(RunAtFam, try runAtKey(arena, n.ns, run.workflow, run.created_at_ms, n.run));
+    try view.delete(RunAllFam, try runAllKey(arena, n.ns, run.created_at_ms, n.run));
     try hp.sendDrop(view, ownerOf(n, &run), run.completed_at_ms);
 }
 
@@ -1376,6 +1442,8 @@ pub const machine: machine_mod.Machine = .{
         machine_mod.info(PerDefFam),
         machine_mod.info(OutFam),
         machine_mod.info(SigFam),
+        machine_mod.info(RunAtFam),
+        machine_mod.info(RunAllFam),
     },
     .keys = keys,
     .apply = apply,
@@ -1423,7 +1491,7 @@ const Fixture = struct {
     }
 
     fn start(f: *Fixture, run_id: []const u8, wf: []const u8, event: []const u8, idem: []const u8, stamp_ms: u64) !Result {
-        var kb: [64]u8 = undefined;
+        var kb: [KEY_PREFIX + MAX_RUN_ID + 8]u8 = undefined;
         var vb: [512]u8 = undefined;
         return f.command(.workflow_start, view_mod.idKey(&kb, .default, run_id) catch unreachable, startValue(&vb, wf, event, idem), stamp_ms);
     }
@@ -1755,6 +1823,32 @@ test "workflow runs machine: a delete of an ended run removes it and its key, an
     try testing.expect(f.get("r1").?.created_ns != r1.created_ns);
     // The count of its workflow's live runs moved only at its end.
     try testing.expectEqual(@as(u32, 2), f.active("wf").?.active);
+}
+
+test "workflow runs machine: a run's start puts it in both lists' index, its delete takes it out, and a start that creates nothing indexes nothing" {
+    var f = Fixture.init();
+    defer f.deinit();
+    const rv: ReadView = .{ .store = &f.store };
+    const a = f.scratch.allocator();
+    _ = try f.start("r1", "wf", "workflow_started", "k1", 40);
+    const r1 = f.get("r1").?;
+    // The key's start time is the run's, derived from its incarnation alike.
+    try testing.expectEqual(r1.created_at_ms, msOfNs(r1.created_ns));
+    try testing.expect((try rv.get(RunAtFam, try runAtKey(a, .default, "wf", r1.created_at_ms, "r1"))) != null);
+    try testing.expect((try rv.get(RunAllFam, try runAllKey(a, .default, r1.created_at_ms, "r1"))) != null);
+    // An idempotency hit, a taken id and an id past a run's create nothing.
+    _ = try f.start("r2", "wf", "workflow_started", "k1", 41);
+    _ = try f.start("r1", "wf", "workflow_started", "", 42);
+    const long: [MAX_RUN_ID + 1]u8 = @splat('x');
+    const refused = try f.start(&long, "wf", "workflow_started", "", 43);
+    try testing.expectEqualStrings(RUN_ID_TOO_LONG, refused.refused().?.refusal.message);
+    try testing.expectEqual(@as(usize, 1), f.store.families[RunAtFam.ID].count);
+    try testing.expectEqual(@as(usize, 1), f.store.families[RunAllFam.ID].count);
+    var vb: [512]u8 = undefined;
+    _ = try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 50);
+    try testing.expect((try f.deleteOf("r1")).refused() == null);
+    try testing.expectEqual(@as(usize, 0), f.store.families[RunAtFam.ID].count);
+    try testing.expectEqual(@as(usize, 0), f.store.families[RunAllFam.ID].count);
 }
 
 test "workflow runs machine: a schedule's slot fires once, its run deleted or not; an older slot after a newer one is refused" {
