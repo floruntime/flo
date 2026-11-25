@@ -941,8 +941,13 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
     if (comptime plant.active != .runs_idem_unwritten) if (idem_key) |k| try view.put(IdemFam, k, .{ .v = .{ .run = n.run } });
     // Its places in the lists, staged with it: a start the verdict refuses
     // below rolls them back too.
-    try view.put(RunAtFam, try runAtKey(arena, n.ns, s.workflow, stamp_ms, n.run), .{});
-    try view.put(RunAllFam, try runAllKey(arena, n.ns, stamp_ms, n.run), .{});
+    if (comptime plant.active != .runs_child_unindexed) {
+        try view.put(RunAtFam, try runAtKey(arena, n.ns, s.workflow, stamp_ms, n.run), .{});
+        try view.put(RunAllFam, try runAllKey(arena, n.ns, stamp_ms, n.run), .{});
+    } else if (!s.isChild()) {
+        try view.put(RunAtFam, try runAtKey(arena, n.ns, s.workflow, stamp_ms, n.run), .{});
+        try view.put(RunAllFam, try runAllKey(arena, n.ns, stamp_ms, n.run), .{});
+    }
 
     var per = if (try view.get(PerDefFam, def_key)) |p| p.v else PER_DEF_NONE;
     if (!s.status.isTerminal()) per.active +|= 1;
@@ -1277,7 +1282,7 @@ fn applyDelete(view: *View, n: Named, cmd: entry_mod.CommandPayload, out: *Resul
     try view.deleteRange(OutFam, range, null);
     try view.deleteRange(SigFam, range, null);
     try view.delete(RunFam, cmd.key);
-    try view.delete(RunAtFam, try runAtKey(arena, n.ns, run.workflow, run.created_at_ms, n.run));
+    if (comptime plant.active != .runs_delete_keeps_index) try view.delete(RunAtFam, try runAtKey(arena, n.ns, run.workflow, run.created_at_ms, n.run));
     try view.delete(RunAllFam, try runAllKey(arena, n.ns, run.created_at_ms, n.run));
     try hp.sendDrop(view, ownerOf(n, &run), run.completed_at_ms);
 }

@@ -307,6 +307,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bench-actions", .source = "bench/bench_actions.zig" },
         .{ .name = "bench-action-loop", .source = "bench/bench_action_loop.zig" },
         .{ .name = "bench-workflow-idle", .source = "bench/bench_workflow_idle.zig" },
+        .{ .name = "bench-list-runs", .source = "bench/bench_list_runs.zig" },
         .{ .name = "bench-workflow-child", .source = "bench/bench_workflow_child.zig" },
         .{ .name = "bench-segment-walk", .source = "bench/bench_segment_walk.zig" },
         .{ .name = "bench-segment-read", .source = "bench/bench_segment_read.zig" },

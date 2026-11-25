@@ -108,14 +108,14 @@ pub fn ownPage(handler: *WorkflowHandler, ns: NamespaceId, workflow: []const u8,
     if (workflow.len > 0) {
         const prefix = try runs_machine.runAtPrefix(a, ns, workflow);
         const after: ?[]const u8 = if (q.after) |c| try runs_machine.runAtKey(a, ns, workflow, c.created_at, c.run_id) else null;
-        return walk(runs_machine.RunAtFam, handler, rv, a, ns, prefix, after, q, room, buf);
+        return walk(runs_machine.RunAtFam, handler, rv, ns, prefix, after, q, room, buf);
     }
     const prefix = try a.dupe(u8, &ns.bytes());
     const after: ?[]const u8 = if (q.after) |c| try runs_machine.runAllKey(a, ns, c.created_at, c.run_id) else null;
-    return walk(runs_machine.RunAllFam, handler, rv, a, ns, prefix, after, q, room, buf);
+    return walk(runs_machine.RunAllFam, handler, rv, ns, prefix, after, q, room, buf);
 }
 
-fn walk(comptime F: type, handler: *WorkflowHandler, rv: view_mod.ReadView, a: std.mem.Allocator, ns: NamespaceId, prefix: []const u8, after: ?[]const u8, q: Query, room: u32, buf: []u8) error{OutOfMemory}!PageResponse.Value {
+fn walk(comptime F: type, handler: *WorkflowHandler, rv: view_mod.ReadView, ns: NamespaceId, prefix: []const u8, after: ?[]const u8, q: Query, room: u32, buf: []u8) error{OutOfMemory}!PageResponse.Value {
     var it = if (after) |k| rv.rangeAfter(F, prefix, k) else rv.range(F, prefix);
     var b = Runs.Builder.init(buf);
     var used: usize = 0;
@@ -128,7 +128,9 @@ fn walk(comptime F: type, handler: *WorkflowHandler, rv: view_mod.ReadView, a: s
         // `prefix ‖ ~created_ms ‖ run`.
         const tail = item.key[prefix.len..];
         const created_at: i64 = @intCast(std.math.maxInt(u64) - std.mem.readInt(u64, tail[0..8], .big));
-        const at: RunAt.Value = .{ .created_at = created_at, .run_id = try a.dupe(u8, tail[8..]) };
+        // The id is the key's own: the store holds it while the page is
+        // answered, as the walk and its answer run in one call.
+        const at: RunAt.Value = .{ .created_at = created_at, .run_id = tail[8..] };
         const run_key = view_mod.idKey(&kb, ns, at.run_id) catch unreachable; // bounded at start
         const run = handler.listedRun(run_key, at.run_id, q.status, q.search) orelse {
             if (handler.appliedRun(run_key) == null) missingRun(at);

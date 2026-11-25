@@ -400,7 +400,7 @@ test "e2e/list: an action list with a prefix lists only the actions it names, on
 /// One page of every workflow's runs that `search` matches:
 /// `[limit:u32][status_len:u16 = 0][cursor_len:u16][cursor][search_len:u16][search]`.
 fn runsPage(fd: std.c.fd_t, limit: u32, cursor: []const u8, search: []const u8, out: []u8) ![]const u8 {
-    var value: [4 + 2 + 2 + 512 + 2 + 64]u8 = undefined;
+    var value: [4 + 2 + 2 + 8 + 596 + 2 + 64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&value);
     try w.writeInt(u32, limit, .little);
     try w.writeInt(u16, 0, .little);
@@ -473,4 +473,95 @@ test "e2e/list: every workflow's runs page through every shard, newest first, ea
 
     // The CLI follows the cursor until it has the runs asked for.
     try expectEachListedOnce(ctx, &.{ "workflow", "list-runs", "--search", "lr-run-", "--limit", "30", "-o", "json" }, "lr-run-", runs);
+}
+
+/// A run id of `RUN_ID_LEN` bytes: `lp-NNN-`, `needle-` for every 200th,
+/// then padding, so a page's entries pass a shard's share of the room.
+fn longRunId(buf: *[RUN_ID_LEN]u8, i: usize) []const u8 {
+    const head = std.fmt.bufPrint(buf, "lp-{d:0>3}-{s}", .{ i, if (i % 200 == 0) "needle-" else "" }) catch unreachable;
+    @memset(buf[head.len..], 'x');
+    return buf;
+}
+const RUN_ID_LEN = 300;
+const MANY_RUNS = 1000;
+const MANY_WORKFLOWS = 10;
+
+/// The runs of every page of every workflow's runs `search` matches, at
+/// `limit` a page, each counted in `seen` by its number; every page in the
+/// list's order, newest first, then by id.
+fn pageAll(fd: std.c.fd_t, limit: u32, search: []const u8, seen: []usize, out: []u8) !usize {
+    var cursor_buf: [8 + 596]u8 = undefined;
+    var cursor: []const u8 = "";
+    var prev_at: i64 = std.math.maxInt(i64);
+    var prev_id_buf: [RUN_ID_LEN]u8 = undefined;
+    var prev_id: []const u8 = "";
+    var pages: usize = 0;
+    while (pages < 2 * MANY_RUNS) : (pages += 1) {
+        const d = try runsPage(fd, limit, cursor, search, out);
+        const count = std.mem.readInt(u32, d[0..4], .little);
+        try testing.expect(count <= limit);
+        var pos: usize = 4;
+        for (0..count) |_| {
+            const run_id = nameU16(d, &pos);
+            _ = nameU16(d, &pos);
+            _ = nameU16(d, &pos);
+            const created_at = std.mem.readInt(i64, d[pos..][0..8], .little);
+            pos += 8;
+            // The list's order across every shard: older, or as old with a
+            // greater id.
+            try testing.expect(created_at < prev_at or (created_at == prev_at and std.mem.order(u8, run_id, prev_id) == .gt));
+            prev_at = created_at;
+            @memcpy(prev_id_buf[0..run_id.len], run_id);
+            prev_id = prev_id_buf[0..run_id.len];
+            const i = try std.fmt.parseInt(usize, run_id[3..6], 10);
+            seen[i] += 1;
+        }
+        const has_more = d[pos] != 0;
+        const clen = std.mem.readInt(u16, d[pos + 1 ..][0..2], .little);
+        try testing.expectEqual(has_more, clen > 0);
+        if (!has_more) return pages + 1;
+        @memcpy(cursor_buf[0..clen], d[pos + 3 ..][0..clen]);
+        cursor = cursor_buf[0..clen];
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "e2e/list: a thousand long-named runs page through every shard by room, each once, and a search matching five finds each once" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = WIDE_SHARDS } });
+    defer ctx.deinit();
+    for (0..MANY_WORKFLOWS) |w| {
+        var def_buf: [256]u8 = undefined;
+        const def = try std.fmt.bufPrint(&def_buf,
+            \\kind: Workflow
+            \\name: lp-wf-{d}
+            \\version: 1.0.0
+            \\start.wait_for_signal.type: never
+            \\start.transitions.success: flo.Completed
+        , .{w});
+        var file_buf: [32]u8 = undefined;
+        const path = try stdx.testing.writeDottedToTempYaml(testing.allocator, def, try std.fmt.bufPrint(&file_buf, "lp-wf-{d}.yaml", .{w}));
+        defer stdx.testing.cleanupTempFile(testing.allocator, path);
+        try ctx.exec(&.{ "workflow", "create", "-f", path });
+    }
+    for (0..MANY_RUNS) |i| {
+        var wf: [16]u8 = undefined;
+        var rid: [RUN_ID_LEN]u8 = undefined;
+        try ctx.exec(&.{ "workflow", "start", try std.fmt.bufPrint(&wf, "lp-wf-{d}", .{i % MANY_WORKFLOWS}), "{}", "--run-id", longRunId(&rid, i) });
+    }
+    const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
+    defer _ = std.c.close(fd);
+    const out = try testing.allocator.alloc(u8, 512 * 1024);
+    defer testing.allocator.free(out);
+
+    // As many as a page may hold: each shard's share of the answer's room
+    // stops it first, so pages end where a shard's stop bounds them.
+    var seen = @as([MANY_RUNS]usize, @splat(0));
+    const pages = try pageAll(fd, 1024, "lp-", &seen, out);
+    for (seen) |s| try testing.expectEqual(@as(usize, 1), s);
+    try testing.expect(pages > 1);
+
+    // A search matching five of them, two at a time.
+    var found = @as([MANY_RUNS]usize, @splat(0));
+    _ = try pageAll(fd, 2, "needle", &found, out);
+    for (found, 0..) |s, i| try testing.expectEqual(@as(usize, if (i % 200 == 0) 1 else 0), s);
 }

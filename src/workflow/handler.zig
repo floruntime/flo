@@ -8724,6 +8724,9 @@ test "list runs: a shard's page stops before its entries pass the room it was gi
     const page = try list_runs.ownPage(&handler, .default, "", .{ .limit = 10, .status = "", .search = "", .after = null }, one + 1, buf);
     try expectRunIds(&.{"r-2"}, try pageRunIds(page, &ids));
     try testing.expect(page.more);
+    // Where it stopped, read after the page is built: the run it showed.
+    try testing.expectEqualStrings("r-2", page.stop.?.run_id);
+    try testing.expectEqual(@as(i64, 20), page.stop.?.created_at);
 }
 
 test "workflow keys: two namespaces keep their own workflows and runs, whatever their names hold" {
