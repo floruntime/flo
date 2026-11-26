@@ -30,6 +30,7 @@ const Store = @import("../contract/store.zig").Store;
 const ReadView = @import("../contract/view.zig").ReadView;
 const gather_mod = @import("../node/gather.zig");
 const settings_machine = @import("../settings/machine.zig");
+const hq = @import("../budget/history_quota.zig");
 const hm = @import("../stream/history_machine.zig");
 
 const Dispatcher = dispatcher_mod.Dispatcher;
@@ -965,6 +966,8 @@ pub const NamespaceHandler = struct {
             .usage_bytes = u.bytes,
             .orphans = u.orphans,
             .orphan_bytes = u.orphan_bytes,
+            .reserved_workflow_bytes = hq.reservedOf(hq.WorkflowReserved, rv, ns),
+            .reserved_action_bytes = hq.reservedOf(hq.ActionReserved, rv, ns),
         };
     }
 

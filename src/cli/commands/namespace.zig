@@ -274,7 +274,7 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
                 if (!first) out.append(ctx.allocator, ',') catch return error.OutOfMemory;
                 out.print(ctx.allocator, "{{\"shard\":{d},\"bound\":{},\"part_bytes\":", .{ s.shard, s.bound }) catch return error.OutOfMemory;
                 (if (s.part_bytes) |p| out.print(ctx.allocator, "{d}", .{p}) else out.appendSlice(ctx.allocator, "null")) catch return error.OutOfMemory;
-                out.print(ctx.allocator, ",\"usage_bytes\":{d},\"orphans\":{d},\"orphan_bytes\":{d}}}", .{ s.usage_bytes, s.orphans, s.orphan_bytes }) catch return error.OutOfMemory;
+                out.print(ctx.allocator, ",\"usage_bytes\":{d},\"orphans\":{d},\"orphan_bytes\":{d},\"reserved_workflow_bytes\":{d},\"reserved_action_bytes\":{d}}}", .{ s.usage_bytes, s.orphans, s.orphan_bytes, s.reserved_workflow_bytes, s.reserved_action_bytes }) catch return error.OutOfMemory;
             }
             ctx.print("{{\"name\":{f},\"created_at_ms\":{d},\"history_quota\":", .{ output.jsonString(name), info.created_at_ms });
             if (info.history_quota) |q| ctx.print("{d}", .{q}) else ctx.print("null", .{});
@@ -288,14 +288,15 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
             if (info.history_quota) |q| ctx.print("History quota: {s} over every shard ({s})\n", .{ bytesText(&qb, q), if (info.history_quota_own) "its own" else "the default" }) else ctx.print("History quota: none ({s})\n", .{if (info.history_quota_own) "its own" else "the default"});
             var table = output.Table.init(ctx.allocator);
             defer table.deinit();
-            for ([_][]const u8{ "SHARD", "PART", "USAGE", "ORPHANS" }) |h| table.addColumn(h, .left) catch return error.OutOfMemory;
+            for ([_][]const u8{ "SHARD", "PART", "USAGE", "RESERVED", "ORPHANS" }) |h| table.addColumn(h, .left) catch return error.OutOfMemory;
             var it = info.shards.iterator();
             while (it.next() catch return outcome.malformed(ctx, "namespace.info answer")) |s| {
-                var b: [4][24]u8 = undefined;
+                var b: [5][24]u8 = undefined;
                 table.addRow(&.{
                     std.fmt.bufPrint(&b[0], "{d}", .{s.shard}) catch unreachable,
                     if (!s.bound) "not bound" else if (s.part_bytes) |p| bytesText(&b[1], p) else "none",
                     bytesText(&b[2], s.usage_bytes),
+                    bytesText(&b[4], s.reserved_workflow_bytes +| s.reserved_action_bytes),
                     std.fmt.bufPrint(&b[3], "{d}", .{s.orphans}) catch unreachable,
                 }) catch return error.OutOfMemory;
             }
