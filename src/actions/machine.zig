@@ -675,7 +675,7 @@ pub const TRUNCATED = "truncated";
 /// `action_ended`'s detail: the hand-backs and the deliveries its history
 /// didn't record. The longest, both at u32's largest, is `ENDED_DETAIL_MAX`.
 pub const ENDED_FMT = "{{\"abandons\":{d},\"deliveries_unrecorded\":{d}}}";
-const ENDED_DETAIL_MAX = std.fmt.count(ENDED_FMT, .{ std.math.maxInt(u32), std.math.maxInt(u32) });
+pub const ENDED_DETAIL_MAX = std.fmt.count(ENDED_FMT, .{ std.math.maxInt(u32), std.math.maxInt(u32) });
 
 /// A run's deliveries its history records: its history is then bounded by
 /// its attempts, whatever is handed back.

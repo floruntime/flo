@@ -115,7 +115,7 @@ test "e2e/membership: a fourth node stays a replica until promoted; removal is r
     var via: usize = 0;
     while (via == leader_before or via == replica) via += 1;
 
-    // The replica itself refuses a cluster admin command up front, naming the
+    // The replica itself refuses an admin command up front, naming the
     // leader, rather than forwarding it where the leader won't answer — so it
     // is never a silent not_found.
     {
@@ -123,7 +123,7 @@ test "e2e/membership: a fourth node stays a replica until promoted; removal is r
         var refused = try cluster.clis[replica].?.run(&.{ "cluster", "promote", fourth_s, "--config", cfg });
         defer refused.deinit();
         try stdx.testing.assertFailed(refused);
-        try testing.expect(refused.contains("cluster admin command must go to a voter"));
+        try testing.expect(refused.contains("an admin command must go to a voter"));
     }
 
     try cluster.execAdminOn(via, &.{ "cluster", "promote", fourth_s });

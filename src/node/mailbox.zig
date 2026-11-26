@@ -42,6 +42,9 @@ pub const Flag = enum(u5) {
     /// A stream payload read from disk is back: reads held on it are made
     /// again.
     stream_disk_read,
+    /// Shard 0 published a namespace's quota: the shard's walk binds it.
+    /// It only wakes the shard, which reads the table's epoch.
+    quota_published,
 
     pub fn bit(self: Flag) u32 {
         return @as(u32, 1) << @backingInt(self);
