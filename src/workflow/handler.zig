@@ -726,6 +726,20 @@ pub const WorkflowHandler = struct {
             std.fmt.bufPrint(&buf, "{s}{d}:{s}", .{ &w.ns.bytes(), w.workflow.len, w.workflow }) catch return
         else
             "";
+        if (of == null) {
+            var hit = self.plan_health.iterator();
+            while (hit.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(self.allocator);
+            }
+            self.plan_health.clearRetainingCapacity();
+            var cit = self.plan_cursors.keyIterator();
+            while (cit.next()) |k| self.allocator.free(k.*);
+            self.plan_cursors.clearRetainingCapacity();
+            return;
+        }
+        // One workflow's: a removal moves no other entry (`removeByPtr`
+        // leaves a tombstone), so one walk finds them all.
         var hit = self.plan_health.iterator();
         while (hit.next()) |entry| {
             if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
@@ -733,7 +747,6 @@ pub const WorkflowHandler = struct {
             entry.value_ptr.deinit(self.allocator);
             self.plan_health.removeByPtr(entry.key_ptr);
             self.allocator.free(key);
-            hit = self.plan_health.iterator();
         }
         var cit = self.plan_cursors.keyIterator();
         while (cit.next()) |k| {
@@ -741,7 +754,6 @@ pub const WorkflowHandler = struct {
             const key = k.*;
             self.plan_cursors.removeByPtr(k);
             self.allocator.free(key);
-            cit = self.plan_cursors.keyIterator();
         }
     }
 
@@ -790,18 +802,19 @@ pub const WorkflowHandler = struct {
                     got.value_ptr.* = 1;
                 }
             },
-            .result, .probe => {
-                const health = self.healthAt(e.key) orelse continue;
-                switch (e.what) {
-                    .result => |r| {
-                        health.recordApiAttempt(r.success, 0, e.at_ms);
-                        if (r.breaker) |cfg| health.updateBreakerState(cfg, r.success, e.at_ms);
-                    },
-                    .probe => health.markProbe(e.at_ms),
-                    .pass => unreachable,
-                }
-            },
+            .result, .probe => applyEffect(self.healthAt(e.key) orelse continue, e),
         };
+    }
+
+    fn applyEffect(health: *plan_types.ExecutorHealth, e: PlanEffect) void {
+        switch (e.what) {
+            .result => |r| {
+                health.recordApiAttempt(r.success, 0, e.at_ms);
+                if (r.breaker) |cfg| health.updateBreakerState(cfg, r.success, e.at_ms);
+            },
+            .probe => health.markProbe(e.at_ms),
+            .pass => {},
+        }
     }
 
     /// A fresh pass's executor order, by the plan's selection: definition
@@ -2377,19 +2390,19 @@ pub const WorkflowHandler = struct {
             const natural_idx = exec_order[run.plan_executor_idx];
             const executor = plan.executors[natural_idx];
 
-            // Its breaker, under any selection, before attempting it.
-            // Half-open lets one call through, the probe, until its result.
-            if (executor.breaker) |breaker_cfg| {
-                if (self.healthOf(ns, run.workflow_name_owned, plan_name, executor.name)) |health| switch (health.admits(breaker_cfg, now_ms)) {
-                    .yes => {},
-                    .probe => self.stagePlanEffect(run, ns, plan_name, executor.name, .probe, now_ms),
-                    .no => {
-                        self.addHistoryEvent(run, "plan_breaker_skip", executor.name, now_ms);
-                        run.plan_executor_idx += 1;
-                        run.plan_executor_retry_count = 0;
-                        continue;
-                    },
-                };
+            // Its breaker, under any selection, before attempting it, as
+            // this decision's own results so far leave it: a retry isn't
+            // made past the breaker its last failure opened. Half-open lets
+            // one call through, the probe, until its result.
+            const admit: plan_types.ExecutorHealth.Admit = if (executor.breaker) |breaker_cfg|
+                self.admitsNow(run, ns, plan_name, executor.name, breaker_cfg, now_ms)
+            else
+                .yes;
+            if (admit == .no) {
+                self.addHistoryEvent(run, "plan_breaker_skip", executor.name, now_ms);
+                run.plan_executor_idx += 1;
+                run.plan_executor_retry_count = 0;
+                continue;
             }
 
             // Track natural index for async resume health recording
@@ -2408,8 +2421,12 @@ pub const WorkflowHandler = struct {
 
             // With another executor to try, a missing action doesn't hold the
             // step up; the last that can run waits, as a step with no plan does.
-            const can_wait = !self.anotherExecutorCanRun(plan, exec_order[run.plan_executor_idx + 1 ..], ns, run.workflow_name_owned, plan_name, now_ms);
+            const can_wait = !self.anotherExecutorCanRun(run, plan, exec_order[run.plan_executor_idx + 1 ..], ns, plan_name, now_ms);
             const outcome = self.invokeAction(shard, run, resolved_action, step_input, step_label, ns, can_wait, now_ms);
+
+            // The probe is the call made: one held for room is no call.
+            if (admit == .probe and !(outcome == null and run.waiting_for_room))
+                self.stagePlanEffect(run, ns, plan_name, executor.name, .probe, now_ms);
 
             // Parked for async action — will resume via resumeFromAction
             if (outcome == null) return null;
@@ -2449,12 +2466,11 @@ pub const WorkflowHandler = struct {
 
     /// Whether one of `order`'s executors could run: its breaker, if it has
     /// one, isn't holding it back.
-    fn anotherExecutorCanRun(self: *WorkflowHandler, plan: definition.InlinePlan, order: []const u8, ns: NamespaceId, workflow: []const u8, plan_name: []const u8, now_ms: i64) bool {
+    fn anotherExecutorCanRun(self: *WorkflowHandler, run: *const RunRecord, plan: definition.InlinePlan, order: []const u8, ns: NamespaceId, plan_name: []const u8, now_ms: i64) bool {
         for (order) |i| {
             const executor = plan.executors[i];
             const cfg = executor.breaker orelse return true;
-            const health = self.healthOf(ns, workflow, plan_name, executor.name) orelse return true;
-            if (health.admits(cfg, now_ms) != .no) return true;
+            if (self.admitsNow(run, ns, plan_name, executor.name, cfg, now_ms) != .no) return true;
         }
         return false;
     }
@@ -4356,6 +4372,17 @@ pub const WorkflowHandler = struct {
         const key = healthKey(self.allocator, ns, workflow, plan_name, executor_name) catch return null;
         defer self.allocator.free(key);
         return self.plan_health.getPtr(key);
+    }
+
+    /// What an executor's breaker admits now: its logged health, with what
+    /// `run`'s decision has staged for it so far. Out of memory, the
+    /// logged health alone.
+    fn admitsNow(self: *WorkflowHandler, run: *const RunRecord, ns: NamespaceId, plan_name: []const u8, executor_name: []const u8, cfg: plan_types.CircuitBreakerConfig, now_ms: i64) plan_types.ExecutorHealth.Admit {
+        const key = healthKey(self.allocator, ns, run.workflow_name_owned, plan_name, executor_name) catch return .yes;
+        defer self.allocator.free(key);
+        var health: plan_types.ExecutorHealth = if (self.plan_health.get(key)) |h| h else .initWithName(&.{});
+        for (run.plan_effects.items) |e| if (std.mem.eql(u8, e.key, key)) applyEffect(&health, e);
+        return health.admits(cfg, now_ms);
     }
 
     /// An executor's call ended: counted, and its breaker moved, once the
@@ -7909,6 +7936,77 @@ test "plan selection: half-open lets one probe through; the others skip it until
     try testing.expectEqual(plan_types.CircuitBreakerState.closed, f.health(0).?.breaker_state);
     var buf: [64]u8 = undefined;
     try testing.expectEqualStrings("e0", runSelectionPass(&f.handler, &f.shard, "closed", "success", &buf));
+}
+
+test "plan selection: a probe held for room is no probe: the breaker stays open until a call goes out" {
+    var f: SelectionFixture = undefined;
+    try f.init("static-order", 2, .{});
+    defer f.deinit();
+    // A call left in the outbox, before e0's breaker opens.
+    var fb: [KEY_PREFIX + 8]u8 = undefined;
+    const fill = writeKey(&fb, .default, "fill");
+    createTestRun(&f.handler, fill, "fill", "sel-wf");
+    f.handler.advanceWorkflow(&f.shard, fill);
+    settleTest(&f.shard);
+    try testing.expect(f.handler.inspect(fill).?.pending_action_run_id_owned != null);
+    const h = testHealth(&f.handler, &f.shard, "sel-wf", "p", "e0");
+    h.breaker_state = .open;
+    h.breaker_opened_at_ms = @import("stdx").time.milliTimestamp() - 3_600_001;
+    // e0's turn to probe, and no room: the step waits, and e0 is not marked.
+    f.shard.outbox_caps = .{ .other = .{ .shard = 1 << 30, .channel = 1 } };
+    var kb: [KEY_PREFIX + 8]u8 = undefined;
+    const key = writeKey(&kb, .default, "held");
+    createTestRun(&f.handler, key, "held", "sel-wf");
+    f.handler.advanceWorkflow(&f.shard, key);
+    settleTest(&f.shard);
+    try testing.expect(f.handler.inspect(key).?.waiting_for_room);
+    try testing.expectEqual(plan_types.CircuitBreakerState.open, f.health(0).?.breaker_state);
+    // Room again: its next try is the probe.
+    f.shard.outbox_caps = .{};
+    f.handler.advanceWorkflow(&f.shard, key);
+    settleTest(&f.shard);
+    const run = f.handler.inspect(key).?;
+    try testing.expect(run.pending_action_run_id_owned != null);
+    try testing.expectEqualStrings("e0", run.history.items[run.history.items.len - 1].detail_owned);
+    try testing.expectEqual(plan_types.CircuitBreakerState.half_open, f.health(0).?.breaker_state);
+}
+
+test "plan selection: a retry isn't made past the breaker its own failure opened" {
+    var f: SelectionFixture = undefined;
+    try f.init("static-order", 2, .{});
+    defer f.deinit();
+    var buf: [64]u8 = undefined;
+    _ = runSelectionPass(&f.handler, &f.shard, "r", "failure", &buf);
+    var starts: usize = 0;
+    var skips: usize = 0;
+    for (f.handler.inspect(testKey(.default, "r")).?.history.items) |evt| {
+        if (!std.mem.eql(u8, evt.detail_owned, "e0")) continue;
+        if (std.mem.eql(u8, evt.event_type_owned, "plan_executor_start")) starts += 1;
+        if (std.mem.eql(u8, evt.event_type_owned, "plan_breaker_skip")) skips += 1;
+    }
+    // e0 has one retry, but its first failure opened its breaker.
+    try testing.expectEqual(@as(usize, 1), starts);
+    try testing.expectEqual(@as(usize, 1), skips);
+}
+
+test "plan selection: random's shuffle is the plan's own: two plans at the same pass don't share it" {
+    var f: SelectionFixture = undefined;
+    try f.init("random", 2, .{});
+    defer f.deinit();
+    var execs: [8]definition.ExecutorConfig = undefined;
+    for (&execs) |*e| e.* = .{ .name = "x", .action_name = "@actions/x", .retry = null, .breaker = null };
+    var orders: [2][8]u8 = undefined;
+    for ([_][]const u8{ "p", "q" }, &orders) |name, *order| {
+        var run: WorkflowHandler.RunRecord = undefined;
+        run.workflow_name_owned = "sel-wf";
+        run.plan_effects = .empty;
+        defer {
+            for (run.plan_effects.items) |e| testing.allocator.free(e.key);
+            run.plan_effects.deinit(testing.allocator);
+        }
+        f.handler.orderPass(&f.shard, &run, .{ .name = name, .selection = .random, .executors = &execs }, .default, order);
+    }
+    try testing.expect(!std.mem.eql(u8, &orders[0], &orders[1]));
 }
 
 test "plan selection: a redefinition and a new term forget the leader's plan memory" {
