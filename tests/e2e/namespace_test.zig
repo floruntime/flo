@@ -510,6 +510,13 @@ test "e2e/namespace: quotas set, rounded up per shard, and their binds come back
     defer ctx.deinit();
     try ctx.exec(&.{ "namespace", "create", "hq-a" });
     try ctx.exec(&.{ "namespace", "create", "hq-b" });
+    try ctx.exec(&.{ "namespace", "create", "hq-d" });
+    // A figure, then back to the default: the default's part, under an
+    // index past the figure's, so a restart can't bring the figure back.
+    try ctx.exec(&.{ "namespace", "alter", "hq-d", "--history-quota", "30GiB", "--config", ctx.server.config_file });
+    try expectBound(ctx, "hq-d", shards, (30 << 30) / shards);
+    try ctx.exec(&.{ "namespace", "alter", "hq-d", "--history-quota", "default", "--config", ctx.server.config_file });
+    try expectBound(ctx, "hq-d", shards, (10 << 30) / shards);
     // A quota that doesn't divide by the shards: each part rounds up.
     const odd: u64 = (20 << 30) + 1;
     var qb: [32]u8 = undefined;
@@ -521,6 +528,13 @@ test "e2e/namespace: quotas set, rounded up per shard, and their binds come back
     try ctx.restartServer();
     // Replayed: the settings and every shard's bind, with no transient
     // default part on the way.
+    {
+        const info = try quotaInfo(ctx, "hq-d");
+        defer info.deinit();
+        try testing.expectEqual(@as(?u64, 10 << 30), info.value.history_quota);
+        try testing.expect(!info.value.history_quota_own);
+        for (info.value.shards) |s| try testing.expectEqual(@as(?u64, (10 << 30) / shards), s.part_bytes);
+    }
     {
         const info = try quotaInfo(ctx, "hq-a");
         defer info.deinit();
