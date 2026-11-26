@@ -120,6 +120,9 @@ pub const ProcessingHandler = struct {
     sink_drops: u64 = 0,
     /// See `sinkRead`.
     sink_read: ?*SinkRead = null,
+    /// What an operator chain's arena allocates from, when set: a test
+    /// gives it an allocator that fails. Null is the shard's.
+    chain_backing: ?Allocator = null,
     chain_errors: u64 = 0,
     chain_warn_ms: i64 = 0,
     /// The job whose pipeline is ticking, so a drop or chain error names it.
@@ -2005,7 +2008,7 @@ pub const ProcessingHandler = struct {
         var taken: u32 = 0;
         // One point at a time: its JSON and what its chain allocates are
         // freed once its outputs are written.
-        var arena = std.heap.ArenaAllocator.init(shard.allocator);
+        var arena = std.heap.ArenaAllocator.init(self.chain_backing orelse shard.allocator);
         defer arena.deinit();
         for (points) |pt| {
             defer _ = arena.reset(.retain_capacity);
@@ -2079,7 +2082,7 @@ pub const ProcessingHandler = struct {
         var taken: u32 = 0;
         // One payload's chain at a time: what it allocates is freed once its
         // outputs are written.
-        var arena = std.heap.ArenaAllocator.init(shard.allocator);
+        var arena = std.heap.ArenaAllocator.init(self.chain_backing orelse shard.allocator);
         defer arena.deinit();
         var all = true;
         for (payloads, ids) |payload, id| {

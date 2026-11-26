@@ -14798,6 +14798,66 @@ test "Shard: a TS sink drops a record lacking a tag's field, counted and shown o
     try std.testing.expectEqual(@as(u64, 4), job.records_processed);
 }
 
+test "Shard: an operator chain out of memory ends the batch before its record: nothing written, skipped or passed, and the next tick takes it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    var tbuf: [16]u8 = undefined;
+    var target_buf: [24]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "{s}-out", .{try keyOn(a, .default, 0, &tbuf)});
+    for ([_][]const u8{ "{\"v\":1}", "{\"v\":2}", "{\"v\":3}" }) |r| _ = try a.stream_handler.appendPayloadToStream(source, "default", r);
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: short
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\operators:
+        \\  - name: m
+        \\    type: map
+        \\    v: "$.v"
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: {s} }}
+    , .{ source, target });
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    const pipe = pit.next().?;
+    const h = a.processing_handler;
+
+    // Every allocation of the chain's arena fails.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    h.chain_backing = failing.allocator();
+    tickNow(a, pipe);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 0), pipe.records_in);
+    try std.testing.expectEqual(@as(u64, 0), pipe.stream_cursor_ts);
+    try std.testing.expectEqual(@as(u64, 0), h.sink_drops);
+    try std.testing.expectEqual(@as(u64, 0), h.chain_errors);
+    try std.testing.expectEqual(@as(u64, 0), h.firstJob().?.drops);
+    try std.testing.expectEqual(@as(usize, 0), streamRecords(a, target, "default"));
+
+    // Memory back: the same records, every one, once.
+    h.chain_backing = null;
+    pipe.last_batch_ms = 0;
+    tickNow(a, pipe);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+    try std.testing.expectEqual(@as(usize, 3), streamRecords(a, target, "default"));
+    try std.testing.expectEqual(@as(u64, 0), h.firstJob().?.drops);
+}
+
 test "Shard: a job's processed count takes each record once, across batches not logged, logged, and refused" {
     var two: TwoShards = undefined;
     try two.init();
