@@ -72,5 +72,4 @@ workflow-history-drop-unread.json	history_drop_unread	--workflows	-	workflow_run
 workflow-quota-end-keeps-reserve.json	quota_end_keeps_reserve	--workflows	-	workflow_run_rule	reserve (is not the sum|row)
 actions-quota-end-keeps-reserve.json	quota_action_end_keeps_reserve	--actions	-	action_rule	reserve (is not the sum|row)
 workflow-quota-start-admits.json	quota_start_admits	--workflows	-	workflow_run_rule	applied a start the ledger refuses: past its namespace.s quota
-workflow-quota-signal-admits.json	quota_signal_admits	--workflows	-	workflow_run_rule	applied a signal the ledger refuses: at its namespace.s quota
 actions-quota-invoke-admits.json	quota_invoke_admits	--actions	-	action_rule	an invoke was admitted past its namespace.s quota

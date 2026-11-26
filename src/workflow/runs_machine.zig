@@ -1130,7 +1130,7 @@ fn applySignal(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i
     // a held run can still end. Any other signal adds history no reserve
     // counts, so it is held to the usage arm. Before memory, so a signal
     // over both answers the quota.
-    if (!wakes and comptime plant.active != .quota_signal_admits) if (try hq.verdict(hq.WorkflowReserved, view, n.ns, 0, .usage)) |o| return hq.refuse(out, view, n.ns, o);
+    if (!wakes) if (try hq.verdict(hq.WorkflowReserved, view, n.ns, 0, .usage)) |o| return hq.refuse(out, view, n.ns, o);
     // Held past its shard's share once all of it is staged: nothing lands,
     // and its client sends it again once memory frees. One that wakes its
     // run is taken within the slack.

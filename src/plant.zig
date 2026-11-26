@@ -158,8 +158,6 @@ pub const Plant = enum {
     quota_action_end_keeps_reserve,
     /// A workflow start is admitted past its namespace's quota.
     quota_start_admits,
-    /// A signal that doesn't wake its run is admitted past the quota's usage.
-    quota_signal_admits,
     /// An action invoke, direct or a call's, is admitted past the quota.
     quota_invoke_admits,
 };
