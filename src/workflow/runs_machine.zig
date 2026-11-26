@@ -2843,7 +2843,7 @@ test "workflow runs machine: at its namespace's quota a signal is refused unless
     try testing.expectEqual(Wait.none, f.get("r1").?.wait);
 }
 
-test "workflow runs machine: a start's verdict counts the action runs' reserve; a signal that doesn't wake is held to the usage arm alone" {
+test "workflow runs machine: at its namespace's quota a start's verdict counts the action runs' reserve, and a signal that doesn't wake is held to the usage arm alone" {
     var f = Fixture.init();
     defer f.deinit();
     const each = reserveOf("wf", "r1");

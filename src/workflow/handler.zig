@@ -10978,3 +10978,50 @@ test "workflow quota: a step at its namespace's quota is held without a copy, as
     try testing.expectEqual(@as(usize, 0), handler.holdCount(quota));
     try testing.expect(!handler.quota_eased.any());
 }
+
+test "workflow schedule: held at its namespace's quota, a disable clears the hold and its count, and a cleared hold says the next episode again" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    const store = &shard.defaultPartition().store;
+    try testing.expectEqual(.created, shard.namespace_handler.applyCreate("a"));
+    var out: Result = .{};
+    const now = @import("stdx").time.milliTimestamp();
+    try handler.replayCreate(testKey(TEST_NS_A, "wf"),
+        \\kind: Workflow
+        \\name: wf
+        \\version: 1.0.0
+        \\schedule:
+        \\  interval: 1000
+        \\start:
+        \\  wait_for_signal:
+        \\    type: never
+        \\  transitions:
+        \\    success: flo.Completed
+    , now - 10_000, 0, &out);
+    const sched = handler.schedules.getPtr(testKey(TEST_NS_A, "wf")).?;
+    try hq.setForTest(store, TEST_NS_A, 1 << 30, 1 << 30);
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(@as(?u64, 1 << 30), sched.quota_hold.share);
+    try testing.expect(sched.quota_hold.said);
+    try testing.expectEqual(@as(u64, 1), handler.quota_held);
+    // Disabled: nothing of the hold is left, counted or said.
+    try handler.replayEnabled(testKey(TEST_NS_A, "wf"), &.{0}, now, &out);
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(@as(?u64, null), sched.quota_hold.share);
+    try testing.expect(!sched.quota_hold.said);
+    try testing.expectEqual(@as(u64, 0), handler.quota_held);
+    // Enabled again, still at the quota: a new episode, said again.
+    const said = handler.holds_said;
+    try handler.replayEnabled(testKey(TEST_NS_A, "wf"), &.{1}, now - 5_000, &out);
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(@as(?u64, 1 << 30), sched.quota_hold.share);
+    try testing.expectEqual(said + 1, handler.holds_said);
+}

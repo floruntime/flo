@@ -35125,6 +35125,48 @@ test "Shard: a halted leader holds no trigger at its memory share: the halt hold
     try std.testing.expectEqual(@as(?u64, null), t.trigger().hold.share);
 }
 
+test "Shard: a halted leader holds no trigger at its namespace's quota either: the halt holds it, whichever hold was up" {
+    const hq = @import("../budget/history_quota.zig");
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    const a = &t.two.shards[0];
+    const store = &a.defaultPartition().store;
+    try hq.setForTest(store, .default, 1 << 30, 1 << 30);
+    t.ask();
+    a.workflow_handler.tickSchedules(a);
+    try std.testing.expectEqual(@as(u64, 1), a.workflow_handler.quota_held);
+    try std.testing.expectEqual(@as(u64, 0), a.workflow_handler.memory_held);
+    a.halted = .{ .index = 1, .term = a.raft_node.current_term, .crc = 0 };
+    defer a.halted = null;
+    // Only the quota's hold is up: dropped all the same.
+    a.runProducers();
+    try std.testing.expectEqual(@as(u64, 0), a.workflow_handler.quota_held);
+    try std.testing.expectEqual(@as(?u64, null), t.trigger().quota_hold.share);
+}
+
+test "Shard: a trigger held at its namespace's quota is cleared, uncounted and unsaid, once its workflow is disabled" {
+    const hq = @import("../budget/history_quota.zig");
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    const a = &t.two.shards[0];
+    try hq.setForTest(&a.defaultPartition().store, .default, 1 << 30, 1 << 30);
+    t.ask();
+    a.workflow_handler.tickSchedules(a);
+    try std.testing.expectEqual(@as(u64, 1), a.workflow_handler.quota_held);
+    try std.testing.expect(t.trigger().quota_hold.said);
+    var out: persistence_mod.Result = .{};
+    try a.workflow_handler.replayEnabled(t.key, &.{0}, @import("stdx").time.milliTimestamp(), &out);
+    // Asked at its next poll.
+    a.workflow_handler.triggers_dirty = true;
+    a.workflow_handler.tickStreamTriggers(a);
+    a.workflow_handler.tickSchedules(a);
+    try std.testing.expectEqual(@as(u64, 0), a.workflow_handler.quota_held);
+    try std.testing.expectEqual(@as(?u64, null), t.trigger().quota_hold.share);
+    try std.testing.expect(!t.trigger().quota_hold.said);
+}
+
 test "Shard: a trigger's first start in a new term follows the place logged, so it lands without a resync" {
     var t: TriggerPair = .{};
     try t.init();
