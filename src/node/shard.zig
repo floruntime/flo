@@ -4426,7 +4426,7 @@ pub const Shard = struct {
     /// A replica serves reads but can't carry a write or a cluster admin change
     /// to the leader (the leader's replica guard refuses a non-voter's forward),
     /// so it points the caller straight at the leader: a write to the leader's
-    /// client port, a cluster admin command to a voter's admin socket. The two
+    /// client port, an admin command to a voter's admin socket. The two
     /// share the stem; only the tail and the destination port differ.
     fn redirectToLeader(self: *Shard, conn: *Connection, req: proto.Request, kind: RedirectKind) void {
         const leader = self.raft_node.leader_id;
@@ -15030,7 +15030,9 @@ test "Shard: an idle pipeline wakes its shard at its own poll interval, no soone
     try std.testing.expectEqual(@as(u32, 100), a.idleTimeoutMs(t));
     // An empty source: the loop never stays up for it, so nothing is
     // counted as an un-slept tick, and its sleep ends at the deadline.
+    // (A new leader's first quota walk keeps the loop up too: count it done.)
     a.more_work = false;
+    a.quota_clean = .{ .epoch = a.namespace_handler.table.quotaEpoch(), .term = a.raft_node.current_term };
     for (0..10) |k| {
         const now = t + @as(i64, @intCast(k));
         a.notePipelinesNext(true);
@@ -29928,7 +29930,7 @@ test "Shard: a replica refuses a repair from its admin socket up front, naming t
     // refuses it up front, naming the leader, rather than holding a forward
     // the leader won't answer.
     const answer = (try t.repairSkip(.admin, 5, false, &buf)) orelse return error.TestExpectedRefusal;
-    try expectAnswer(answer, .unavailable, "cluster admin command must go to a voter");
+    try expectAnswer(answer, .unavailable, "an admin command must go to a voter");
     try std.testing.expect(std.mem.indexOf(u8, answer.data, "node 1") != null); // names the leader
     try std.testing.expectEqual(held, t.shard.forward_count); // not forwarded
     try std.testing.expect(!t.conn.response_deferred); // answered here, not held
