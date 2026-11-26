@@ -1447,7 +1447,7 @@ test "e2e/processing: ts source to ts sink - the sink writes what the operators 
     }
 }
 
-test "e2e/processing: a record an operator can't read is a counted skip in status; a point whose tags repeat a key still goes through" {
+test "e2e/processing: a record an operator can't read is a counted skip in status; a point whose tags repeat a key can't be written" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
     const ns = "proc_skip";
@@ -1479,29 +1479,15 @@ test "e2e/processing: a record an operator can't read is a counted skip in statu
         stdx.time.sleep(100 * std.time.ns_per_ms);
     }
 
-    // A point whose tags give a key twice: its record keeps the first, and
-    // the operators read it, so it is written.
-    try ctx.exec(&.{ "ts", "write", "raw", "--tags", "a=1,a=2", "--value", "7", "--timestamp", "1795600000000", "-n", ns });
-    var ts_buf: [64]u8 = undefined;
-    const ts_id = try submitJob(ctx, ns,
-        \\kind: Processing
-        \\name: dup-tags
-        \\namespace: proc_skip
-        \\sources.[0].ts.measurement: raw
-        \\sources.[0].ts.poll_interval_ms: 100
-        \\sources.[0].ts.lateness_ms: 0
-        \\sinks.[0].ts.measurement: copied
-        \\sinks.[0].ts.value_field: v
-        \\operators.[0].type: map
-        \\operators.[0].name: m
-        \\operators.[0].value: "$.value"
-    , "dup-tags.yaml", &ts_buf);
-    var r = try tsReadUntil(ctx, ns, "copied", "v", null, "7.000000", 8000);
-    defer r.deinit();
-    try stdx.testing.assertContains(r, "{\"timestamp_ms\": 1795600000000, \"time_ns\": 1795600000000000000, \"value\": 7.000000}");
-    var s = try ctx.cli.run(&.{ "processing", "status", ts_id, "-n", ns });
-    defer s.deinit();
-    try testing.expect(!s.stdoutContains("skipped"));
+    // A point whose tags give a key twice can't be written at all, so no
+    // job ever reads one (the record's own guard, first key kept, is the
+    // unit tests', which build the stored tag string directly).
+    var dup = try ctx.cli.run(&.{ "ts", "write", "raw", "--tags", "a=1,a=2", "--value", "7", "--timestamp", "1795600000000", "-n", ns });
+    defer dup.deinit();
+    try stdx.testing.assertContains(dup, "tag key \"a\" is given twice; a series has each key once");
+    var none = try ctx.cli.run(&.{ "ts", "list", "-n", ns });
+    defer none.deinit();
+    try testing.expect(!none.stdoutContains("raw"));
 }
 
 test "e2e/processing: ts source - a stream sink's record carries the point's field and tags" {
