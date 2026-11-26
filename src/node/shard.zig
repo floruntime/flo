@@ -2409,14 +2409,6 @@ pub const Shard = struct {
         // An internal op from a client runs where an unknown op would: here.
         if (run_mod.internalFromClient(op, auth.origin)) return self.dispatchLocal(conn, req, auth);
 
-        // A workflow run id the client chose names no shard: ask each which
-        // holds the run (`RunFind`), and for a start that chooses one,
-        // whether another workflow's run has it already.
-        if (self.runIdUnplaced(req)) {
-            if (self.refusedRead(conn, req)) return;
-            return self.findRun(conn, req, auth, req.key, null);
-        }
-
         // A write routes by its namespace's id, so on a node of several
         // shards one into a namespace the node doesn't have yet waits for
         // shard 0 to create and publish it, then comes back here. Paid once
@@ -2480,6 +2472,16 @@ pub const Shard = struct {
             const home = self.router.hashToShard(hash);
             if (home != self.id) return self.forwardToShard(home, conn, req, auth);
         };
+
+        // A workflow run id the client chose names no shard: ask each which
+        // holds the run (`RunFind`), by the namespace's id, so only past the
+        // wait above: before it, a namespace never created would answer as
+        // a run not found, and one not yet published here would ask every
+        // shard under no id.
+        if (self.runIdUnplaced(req)) {
+            if (self.refusedRead(conn, req)) return;
+            return self.findRun(conn, req, auth, req.key, null);
+        }
 
         // A start that chooses its run id is decided on its workflow's
         // shard, found by the namespace's id: only past the wait above.
@@ -13123,6 +13125,29 @@ test "Shard: 64 pipelined writes into a new namespace, their share spent when sh
     var answers: [Connection.MAX_FORWARDS_IN_FLIGHT]proto.Response = undefined;
     try ParkTest.responses(b, c.conn, c.pair[1], &out, &answers);
     for (answers) |r| try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
+}
+
+test "Shard: a write by a chosen run id in a namespace this shard's table hasn't published asks shard 0 first, never every shard under no id" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const ca = try TestClient.open(a);
+    defer _ = std.c.close(ca.pair[1]);
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    // Created on shard 0, not yet published, as just after a restart: shard
+    // 1's table has no id for it.
+    a.runRequest(ca.conn, try ParkTest.request(.namespace_create, 1, "", "xs", "", ""), .client);
+    try std.testing.expect(b.namespace_handler.table.lookup("xs") == null);
+    b.runRequest(c.conn, try ParkTest.request(.workflow_cancel, 2, "xs", "late-run", "", ""), .client);
+    var asks: usize = 0;
+    for (b.gathers.entries) |e| if (e.active) {
+        try std.testing.expect(e.context.op == &Shard.EdgeAsk.op);
+        asks += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), asks);
 }
 
 test "Shard: a read held while shard 0 says whether its namespace is published, whose share is spent when it answers, waits for room and is answered, unrefused" {
