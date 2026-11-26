@@ -124,6 +124,32 @@ test "e2e/ts: write stores the exact value and timestamp" {
     try testing.expectEqualStrings("1708700400123 1234.567800\n1708700400456 -0.250000\n", r.stdout);
 }
 
+test "e2e/ts: write refuses tags that repeat a key, lack one or aren't UTF-8, naming the key" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    for ([_]struct { tags: []const u8, why: []const u8 }{
+        .{ .tags = "a=1,a=2", .why = "tag key \"a\" is given twice; a series has each key once" },
+        .{ .tags = "host=web,=x", .why = "tag \"=x\" has no key" },
+        .{ .tags = "\xff=1", .why = "tags must be UTF-8" },
+        .{ .tags = "host=caf\xc3", .why = "tags must be UTF-8" },
+    }) |c| {
+        var r = try ctx.cli.run(&.{ "ts", "write", "bad_tags", "--tags", c.tags, "--value", "7" });
+        defer r.deinit();
+        if (!r.contains(c.why)) {
+            std.debug.print("\n{s}: '{s}' '{s}'\n", .{ c.tags, r.stdout, r.stderr });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // None was written; a good one is.
+    var none = try ctx.cli.run(&.{ "ts", "list" });
+    defer none.deinit();
+    try testing.expect(!none.stdoutContains("bad_tags"));
+    var ok = try ctx.cli.run(&.{ "ts", "write", "bad_tags", "--tags", "a=1,b=2", "--value", "7" });
+    defer ok.deinit();
+    try stdx.testing.assertContains(ok, "OK");
+}
+
 test "e2e/ts: write refuses a value that is not a finite number" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();

@@ -281,6 +281,9 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             const w = writeOf(e, &canon_buf) orelse return error.Halt;
             if (std.mem.indexOfScalar(u8, w.cmd.key, 0) != null or std.mem.indexOfScalar(u8, w.rec.field_name, 0) != null)
                 return out.refuse(.bad_request, .unclassified, NUL_IN_NAME);
+            // As its proposer refuses it: every stored series keeps a tag
+            // set a filter can name, each key once.
+            if (tsp.tagSetProblem(w.rec.tags)) |p| return out.refuse(.bad_request, .unclassified, p.fixed());
             const ts = w.rec.timestamp_ns;
             if (ts > std.math.maxInt(i64)) return out.refuse(.bad_request, .unclassified, TIME_TOO_LATE);
             const sk = try seriesKey(a, w.cmd.namespace_id, w.cmd.key, w.rec.field_name, w.tag_hash);
@@ -597,6 +600,30 @@ test "time series: a name holding NUL is refused, and changes nothing" {
         var o = Result.start(e);
         try machine_mod.applyEntry(&machine, &s, &scratch, e, &o);
         if (i == 0) try testing.expect(o.refused() == null) else try testing.expectEqualStrings(NUL_IN_NAME, o.refused().?.refusal.message);
+    }
+    try testing.expectEqual(@as(usize, 1), s.family(Points.ID).count);
+    try testing.expectEqual(@as(usize, 1), s.family(Series.ID).count);
+}
+
+test "time series: a write whose tags repeat a key, lack one or aren't UTF-8 is refused where it applies, and changes nothing" {
+    var log: TestLog = .{};
+    defer log.deinit();
+    const bad = [_]struct { tags: []const u8, why: []const u8 }{
+        .{ .tags = "a=1,a=2", .why = tsp.TAG_REPEATED },
+        .{ .tags = "host=a,=x", .why = tsp.TAG_EMPTY_KEY },
+        .{ .tags = "\xff=1", .why = tsp.TAG_NOT_UTF8 },
+        .{ .tags = "h=\xfe", .why = tsp.TAG_NOT_UTF8 },
+    };
+    for (bad) |b| try log.write(.of(7), "cpu", "v", 1, 1000, b.tags);
+    try log.write(.of(7), "cpu", "v", 2, 2000, "a=1,b=2");
+    var s = store_mod.Store.init(testing.allocator);
+    defer s.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    for (log.entries.items, 0..) |*e, i| {
+        var out = Result.start(e);
+        try machine_mod.applyEntry(&machine, &s, &scratch, e, &out);
+        if (i < bad.len) try testing.expectEqualStrings(bad[i].why, out.refused().?.refusal.message) else try testing.expect(out.refused() == null);
     }
     try testing.expectEqual(@as(usize, 1), s.family(Points.ID).count);
     try testing.expectEqual(@as(usize, 1), s.family(Series.ID).count);

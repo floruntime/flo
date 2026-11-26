@@ -180,6 +180,95 @@ pub fn canonicalTagString(tags: []const u8, buf: []u8) []const u8 {
     return buf[0..pos];
 }
 
+/// What's wrong with a write's tag set, if anything: more than
+/// `MAX_TAG_STRING` bytes or `MAX_TAGS` pairs (past them
+/// `canonicalTagString` would cut it unseen), a byte that isn't UTF-8, a
+/// pair with no key, or a key given twice. A write is refused for any of
+/// them, so every stored series has a tag set a filter can name, one key
+/// once.
+pub const TagProblem = union(enum) {
+    too_long,
+    too_many,
+    not_utf8,
+    /// The pair with no key.
+    empty_key: []const u8,
+    /// The key given twice.
+    repeated: []const u8,
+
+    /// The refusal, naming the pair or key where it has one.
+    pub fn text(p: TagProblem, buf: []u8) []const u8 {
+        return switch (p) {
+            .empty_key => |pair| std.fmt.bufPrint(buf, "bad request: tag \"{s}\" has no key", .{pair[0..@min(pair.len, 64)]}) catch TAG_EMPTY_KEY,
+            .repeated => |key| std.fmt.bufPrint(buf, "bad request: tag key \"{s}\" is given twice; a series has each key once", .{key[0..@min(key.len, 64)]}) catch TAG_REPEATED,
+            else => p.fixed(),
+        };
+    }
+
+    /// The refusal without the pair or key, for where no buffer outlives it.
+    pub fn fixed(p: TagProblem) []const u8 {
+        return switch (p) {
+            .too_long => TAG_TOO_LONG,
+            .too_many => TAG_TOO_MANY,
+            .not_utf8 => TAG_NOT_UTF8,
+            .empty_key => TAG_EMPTY_KEY,
+            .repeated => TAG_REPEATED,
+        };
+    }
+};
+
+pub const TAG_TOO_LONG = std.fmt.comptimePrint("bad request: tags are at most {d} bytes", .{MAX_TAG_STRING});
+pub const TAG_TOO_MANY = std.fmt.comptimePrint("bad request: a point has at most {d} tags", .{MAX_TAGS});
+pub const TAG_NOT_UTF8 = "bad request: tags must be UTF-8";
+pub const TAG_EMPTY_KEY = "bad request: a tag has no key";
+pub const TAG_REPEATED = "bad request: a tag key is given twice; a series has each key once";
+
+/// The first problem with `tags`, split and trimmed as
+/// `canonicalTagString` reads it; null when it has none.
+pub fn tagSetProblem(tags: []const u8) ?TagProblem {
+    if (tags.len > MAX_TAG_STRING) return .too_long;
+    if (!std.unicode.utf8ValidateSlice(tags)) return .not_utf8;
+    var keys: [MAX_TAGS][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, tags, ',');
+    while (it.next()) |raw| {
+        const part = std.mem.trim(u8, raw, " \t");
+        if (part.len == 0) continue;
+        if (n == MAX_TAGS) return .too_many;
+        const key = part[0 .. std.mem.indexOfScalar(u8, part, '=') orelse part.len];
+        if (key.len == 0) return .{ .empty_key = part };
+        for (keys[0..n]) |k| if (std.mem.eql(u8, k, key)) return .{ .repeated = key };
+        keys[n] = key;
+        n += 1;
+    }
+    return null;
+}
+
+test "tagSetProblem: a repeated or empty key, bytes that aren't UTF-8, and a set past the limits" {
+    try std.testing.expectEqual(@as(?TagProblem, null), tagSetProblem(""));
+    try std.testing.expectEqual(@as(?TagProblem, null), tagSetProblem("host=a, env=prod,,flag"));
+    try std.testing.expectEqualStrings("a", tagSetProblem("a=1,b=2,a=3").?.repeated);
+    try std.testing.expectEqualStrings("a", tagSetProblem(" a=1 ,a").?.repeated);
+    try std.testing.expectEqualStrings("=x", tagSetProblem("host=a,=x").?.empty_key);
+    try std.testing.expectEqual(TagProblem.not_utf8, tagSetProblem("\xff=1").?);
+    try std.testing.expectEqual(TagProblem.not_utf8, tagSetProblem("h=caf\xc3").?);
+    try std.testing.expectEqual(@as(?TagProblem, null), tagSetProblem("h=caf\xc3\xa9"));
+    try std.testing.expectEqual(TagProblem.too_long, tagSetProblem("k=" ++ comptime @import("stdx").repeat("v", MAX_TAG_STRING - 1)).?);
+    var many: [MAX_TAGS + 1][4]u8 = undefined;
+    var buf: [256]u8 = undefined;
+    var pos: usize = 0;
+    for (&many, 0..) |*m, i| {
+        m.* = .{ 'k', @intCast('A' + i), '=', '1' };
+        @memcpy(buf[pos..][0..4], m);
+        pos += 4;
+        buf[pos] = ',';
+        pos += 1;
+    }
+    try std.testing.expectEqual(TagProblem.too_many, tagSetProblem(buf[0..pos]).?);
+    try std.testing.expectEqual(@as(?TagProblem, null), tagSetProblem(buf[0 .. pos - 6]));
+    var tb: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("bad request: tag key \"a\" is given twice; a series has each key once", tagSetProblem("a=1,a=2").?.text(&tb));
+}
+
 /// Canonical tag-set hash — `canonicalTagString` then Wyhash. Returns 0 for an
 /// empty tag set (the untagged series).
 pub fn canonicalTagHash(tags: []const u8) u64 {
