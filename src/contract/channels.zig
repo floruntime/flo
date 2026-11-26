@@ -178,6 +178,18 @@ pub fn nsUntakenOf(read: ReadView, own: u16, ns: ns_table.Id) u64 {
     return if (v) |x| x.v.bytes - x.v.delivered else 0;
 }
 
+/// A test's store with `ns`'s history-lane row to group `own` at `bytes`,
+/// `delivered` of them taken, as sends and inbounds would leave it.
+pub fn setHistoryForTest(store: *store_mod.Store, own: u16, ns: ns_table.Id, bytes: u64, delivered: u64) !void {
+    var kb: [OUT_NS_KEY]u8 = undefined;
+    const k = outNsKey(&kb, own, .history, ns);
+    var vb: [NsBytes.max_size]u8 = undefined;
+    const v = try NsBytes.encodeInto(&vb, .{ .bytes = bytes, .delivered = delivered });
+    if (store.find(OutNsFam.ID, k)) |node| {
+        store.replace(OutNsFam.ID, node, try store.allocator.dupe(u8, v));
+    } else store.link(OutNsFam.ID, try store.allocRecord(k), try store.allocator.dupe(u8, v));
+}
+
 /// A history message of `ns`, `len` bytes, taken by its inbound: landed,
 /// refused or skipped, its bytes no longer in flight.
 fn takeHistory(view: *View, own: u16, ns: ns_table.Id, len: u64) ApplyError!void {

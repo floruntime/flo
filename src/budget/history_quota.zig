@@ -261,6 +261,40 @@ test "history quota: a leader's check sums both machines' reserves and its own a
     try testing.expect(atUsage(read, .default));
 }
 
+test "history quota: a namespace's in-flight history is its usage and its own untaken lane bytes; another namespace's, landed, untaken or staged, moves nothing of it" {
+    const Store = @import("../contract/store.zig").Store;
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    store.place = .{ .group = 0, .count = 1 };
+    const read: ReadView = .{ .store = &store };
+    const a: NamespaceId = .of(7);
+    const b: NamespaceId = .of(8);
+    try setForTest(&store, a, 1000, 600);
+    // Its own: 300 sent, 100 of them taken (landed, in its usage already).
+    try channels.setHistoryForTest(&store, 0, a, 300, 100);
+    try testing.expectEqual(@as(u64, 800), inFlight(read, a));
+    try testing.expect(!atUsage(read, a));
+    // Another namespace's: far past the part, landed and untaken.
+    try setForTest(&store, b, 1000, 5000);
+    try channels.setHistoryForTest(&store, 0, b, 9000, 10);
+    try testing.expectEqual(@as(u64, 800), inFlight(read, a));
+    try testing.expect(!atUsage(read, a));
+    try testing.expect(preCheck(read, a, 200) == null);
+    // Staged in an apply: only its own sends count.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var keys = KeySet.init(arena.allocator());
+    var view = View.init(&store, arena.allocator(), &keys);
+    view.place = store.place;
+    try view.sends.append(arena.allocator(), .{ .origin = .user(b), .slot = 0, .entry_type = 0, .flags = entry_mod.Flags.HISTORY, .payload = &@as([500]u8, @splat('x')) });
+    try testing.expectEqual(@as(u64, 800), inFlightIn(&view, a));
+    try view.sends.append(arena.allocator(), .{ .origin = .user(a), .slot = 0, .entry_type = 0, .flags = entry_mod.Flags.HISTORY, .payload = &@as([200]u8, @splat('x')) });
+    try testing.expectEqual(@as(u64, 1000), inFlightIn(&view, a));
+    // A send that isn't history is none of it.
+    try view.sends.append(arena.allocator(), .{ .origin = .user(a), .slot = 0, .entry_type = 0, .flags = 0, .payload = &@as([200]u8, @splat('x')) });
+    try testing.expectEqual(@as(u64, 1000), inFlightIn(&view, a));
+}
+
 test "history quota: the refusal names the namespace's own figures in under 128 bytes, and a run past its part says so" {
     var buf: [128]u8 = undefined;
     const most = std.math.maxInt(u64);
