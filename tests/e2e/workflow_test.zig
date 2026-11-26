@@ -324,9 +324,9 @@ test "e2e/workflow: signal not found workflow" {
     var result = try ctx.cli.run(&.{ "workflow", "signal", "fake-run-id-12345", "--type", "approve" });
     defer result.deinit();
 
-    // Should fail with not found
+    // Should fail with not found, as every op by a run's id answers it
     try stdx.testing.assertFailed(result);
-    try stdx.testing.assertContains(result, "Not found");
+    try stdx.testing.assertContains(result, "not found: no such run [not_found/not_found]");
 }
 
 // =============================================================================
@@ -862,6 +862,91 @@ test "e2e/workflow: run-delete refuses a live run, deletes an ended one, and its
     defer fresh.deinit();
     try stdx.testing.assertSucceeded(fresh);
     try stdx.testing.assertContains(fresh, "waiting");
+}
+
+/// The table's `workflow.run_delete`.
+fn runDeleteOp() @import("src").protocol.ops.Op {
+    for (@import("src").protocol.workflow_ops.table) |o| if (std.mem.eql(u8, o.name, "workflow.run_delete")) return o;
+    unreachable;
+}
+
+test "e2e/workflow: on 12 shards, in a namespace of its own, a run by an id the client chose is deleted once ended and refused while live, on its workflow's shard and off shard 0" {
+    const shards = 12;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards } });
+    defer ctx.deinit();
+    const ns = "rd-ns";
+    try ctx.exec(&.{ "namespace", "create", ns });
+    // The first namespace created takes the first allocated id: its
+    // workflows' shards follow from it, as the server routes them.
+    const src = @import("src");
+    const router = src.node.router.Router.init(shards, 0);
+    const first = src.namespace_table.FIRST_ALLOCATED;
+    const shardOf = struct {
+        fn f(r: src.node.router.Router, id: src.node.router.NamespaceId, name: []const u8) u16 {
+            return switch (r.route(src.node.router.routeNsKey(id, name))) {
+                .local => 0,
+                .shard => |sh| sh.shard_id,
+            };
+        }
+    }.f;
+    // Workflows on several shards, shard 0 among them only if one lands there.
+    var off_zero: usize = 0;
+    var names: [6][16]u8 = undefined;
+    var name_lens: [6]usize = undefined;
+    for (0..names.len) |i| {
+        const name = try std.fmt.bufPrint(&names[i], "rd-wf-{d}", .{i});
+        name_lens[i] = name.len;
+        if (shardOf(router, first, name) != 0) off_zero += 1;
+    }
+    try testing.expect(off_zero >= 3);
+    for (0..names.len) |i| {
+        const wf = names[i][0..name_lens[i]];
+        var def_buf: [512]u8 = undefined;
+        const def = try std.fmt.bufPrint(&def_buf,
+            \\kind: Workflow
+            \\name: {s}
+            \\version: 1.0.0
+            \\start.wait_for_signal.type: proceed
+            \\start.wait_for_signal.timeout_ms: 300000
+            \\start.transitions.success: flo.Completed
+            \\start.transitions.timeout: flo.Failed
+        , .{wf});
+        var file_buf: [32]u8 = undefined;
+        const path = try writeDottedToTempYaml(testing.allocator, def, try std.fmt.bufPrint(&file_buf, "{s}.yaml", .{wf}));
+        defer cleanupTempFile(testing.allocator, path);
+        try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", ns });
+        var rid_buf: [16]u8 = undefined;
+        const rid = try std.fmt.bufPrint(&rid_buf, "rd-{d}", .{i});
+        try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", rid, "-n", ns });
+
+        var live = try ctx.cli.run(&.{ "workflow", "run-delete", rid, "-n", ns });
+        defer live.deinit();
+        try stdx.testing.assertContains(live, "the run hasn't ended; cancel it first");
+        try ctx.exec(&.{ "workflow", "cancel", rid, "-n", ns });
+        var deleted = try ctx.cli.run(&.{ "workflow", "run-delete", rid, "-n", ns });
+        defer deleted.deinit();
+        try stdx.testing.assertSucceeded(deleted);
+        try testing.expectEqualStrings("OK", std.mem.trim(u8, deleted.stdout, &std.ascii.whitespace));
+        // Gone, every op by its id answers as for any run no shard holds:
+        // the same status, reason and text, as an SDK reads them.
+        var conn = src.cli_client.Client.init(testing.allocator, ctx.endpoint);
+        defer conn.deinit();
+        try conn.connect();
+        const wc = src.cli_client.workflow;
+        var answers = [_]src.cli_client.Response{
+            try wc.status(&conn, ns, rid),
+            try wc.historyPage(&conn, ns, rid, 10, null, false),
+            try wc.signal(&conn, ns, rid, "proceed", null),
+            try wc.cancel(&conn, ns, rid, null),
+            try conn.call(comptime runDeleteOp(), ns, rid, .{}),
+        };
+        for (&answers) |*r| {
+            defer r.deinit();
+            try testing.expectEqual(src.protocol.proto.StatusCode.not_found, r.status);
+            try testing.expectEqual(src.protocol.proto.Reason.not_found, r.reason());
+            try testing.expectEqualStrings("not found: no such run", r.errorMessage());
+        }
+    }
 }
 
 test "e2e/workflow: a cancel reason past 1024 bytes is refused and the run keeps going" {

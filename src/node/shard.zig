@@ -2506,19 +2506,35 @@ pub const Shard = struct {
 
     // ─── A run by an id the client chose ─────────────────────────────────
 
+    /// The ops keyed by a workflow run's id, which a client may choose at
+    /// its start: one it chose carries no slot, so each is found by asking
+    /// every shard (`runIdUnplaced`).
+    pub const WORKFLOW_RUN_OPS = [_]proto.OpCode{ .workflow_status, .workflow_history, .workflow_signal, .workflow_cancel, .workflow_run_delete };
+    /// The ops routed by a run's or job's id that only the server mints (an
+    /// action run's, a call's run, a processing job's), so its slot is
+    /// always the id's own. Every op routed by an id is in one of the two
+    /// lists, which a test holds the dispatcher and the op table to.
+    pub const GENERATED_ID_OPS = [_]proto.OpCode{ .action_status, .action_history, .action_run_delete, .action_complete, .action_fail, .action_touch, .processing_stop, .processing_cancel, .processing_status, .processing_remove };
+
+    comptime {
+        // Every table op routed by a run id is in one of the two lists: a
+        // new one left out would route a chosen id to group 0.
+        @setEvalBranchQuota(100_000);
+        for (table.op_table) |o| if (o.route == .run_id) {
+            for (WORKFLOW_RUN_OPS ++ GENERATED_ID_OPS) |op| {
+                if (@backingInt(op) == o.code) break;
+            } else @compileError("table op " ++ o.name ++ " routes by a run id: list it in WORKFLOW_RUN_OPS or GENERATED_ID_OPS");
+        };
+    }
+
     /// Whether `req` names a workflow run by an id the client chose at its
     /// start. A generated id carries its workflow's slot, so its op routes
     /// straight there; a chosen one carries none, and the run is on the
     /// shard of its workflow's name, which the op doesn't name.
     fn runIdUnplaced(self: *const Shard, req: proto.Request) bool {
-        const by_run_id = switch (req.header.op_code) {
-            @backingInt(proto.OpCode.workflow_status),
-            @backingInt(proto.OpCode.workflow_history),
-            @backingInt(proto.OpCode.workflow_signal),
-            @backingInt(proto.OpCode.workflow_cancel),
-            => true,
-            else => false,
-        };
+        const by_run_id = for (WORKFLOW_RUN_OPS) |op| {
+            if (req.header.op_code == @backingInt(op)) break true;
+        } else false;
         // Only the server mints ids of the generated form (a start refuses a
         // chosen one), so this splits them exactly; a chosen id can decode as
         // a slot (`order-123`), and that slot names no run's shard.
@@ -2587,7 +2603,9 @@ pub const Shard = struct {
                 owner = @intCast(i);
             }
             const req = try proto.Request.parse(self.bytes);
-            const to = owner orelse return shard.sendErrorResponse(conn, request_id, .not_found, "");
+            // No shard holds it: the op runs here, where it finds no run and
+            // answers as it does for one by any id.
+            const to = owner orelse shard.id;
             // Held for room, it goes on to the shard found for it.
             const prev = shard.reentry;
             shard.reentry = Reentry.of(conn, req.header.request_id, shard.merging_since_ms orelse nowMs(), self.auth.origin, .forward);
@@ -29935,6 +29953,39 @@ test "Shard: a run id the client chose is told apart from a generated one exactl
     // Not a run-id op, or no id.
     try std.testing.expect(!a.runIdUnplaced(.{ .header = proto.RequestHeader.init(.kv_get, 1), .namespace = "", .key = "alpha", .value = "" }));
     try std.testing.expect(!a.runIdUnplaced(.{ .header = proto.RequestHeader.init(.workflow_cancel, 1), .namespace = "", .key = "", .value = "" }));
+}
+
+test "Shard: every op routed by a run's id is either a workflow run's, found by asking every shard when its id was chosen, or one only the server mints" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const by_id_ops = Shard.WORKFLOW_RUN_OPS ++ Shard.GENERATED_ID_OPS;
+    // Each op the dispatcher routes by an id is listed once; each listed op
+    // is routed by its id.
+    for (a.dispatcher.pre_route, 0..) |f, code| {
+        const by_id = if (f) |g| g == run_id_mod.preRouteByRunId else false;
+        var n: usize = 0;
+        for (by_id_ops) |op| if (@backingInt(op) == code) {
+            n += 1;
+        };
+        if (by_id != (n == 1)) {
+            std.debug.print("op 0x{x}: routed by an id {}, listed {d} times\n", .{ code, by_id, n });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // A workflow run's op by a chosen id asks every shard; by a generated
+    // id, or for any other op, it goes by the id.
+    var buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const generated = a.run_id_gen.next(.workflow, 3, a.raft_node.current_term, &buf);
+    for (Shard.WORKFLOW_RUN_OPS) |op| {
+        try std.testing.expect(a.runIdUnplaced(.{ .header = proto.RequestHeader.init(op, 1), .namespace = "", .key = "rd-1", .value = "" }));
+        try std.testing.expect(!a.runIdUnplaced(.{ .header = proto.RequestHeader.init(op, 1), .namespace = "", .key = generated, .value = "" }));
+    }
+    // No workflow op is among those only the server mints ids for: a
+    // workflow run's id may be the client's.
+    for (Shard.GENERATED_ID_OPS) |op| try std.testing.expect(!std.mem.startsWith(u8, @tagName(op), "workflow_"));
+    for (Shard.GENERATED_ID_OPS) |op| try std.testing.expect(!a.runIdUnplaced(.{ .header = proto.RequestHeader.init(op, 1), .namespace = "", .key = "rd-1", .value = "" }));
 }
 
 test "Shard: a start's chosen run id is read from its value, and a start with none, or the server's form, chooses none" {
