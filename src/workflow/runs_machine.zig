@@ -2877,6 +2877,13 @@ test "workflow runs machine: a child's start at its namespace's quota is answere
     try testing.expectEqual(ae.Answer.over_quota, told.answer);
     try testing.expect(std.mem.startsWith(u8, told.why.?, "limit: ns 1 history "));
     try testing.expectEqual(@as(u64, 0), hq.reservedOf(hq.WorkflowReserved, .{ .store = &f.store }, .default));
+    // Counted once, after its parent's record was found.
+    try testing.expectEqual(@as(u64, 1), f.store.quota_refusals);
+    // A child start with no parent's record waiting, at the quota all the
+    // same, starts nothing and tells no one: nothing to count.
+    try testing.expect((try f.start("kid2", "kid", "child_started", "", 3)).refused() == null);
+    try testing.expect(f.get("kid2") == null);
+    try testing.expectEqual(@as(u64, 1), f.store.quota_refusals);
 }
 
 test "workflow runs machine: past its shard's share a client's, a schedule's and a trigger's start are refused, writing nothing" {

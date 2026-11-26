@@ -2240,6 +2240,15 @@ test "actions machine: a call past its namespace's share of the history lane is 
     try testing.expectEqualStrings("b7", held.run);
     try testing.expect(std.mem.indexOf(u8, held.why.?, "history lane") != null);
     try testing.expect(t.run(busy, "b7") == null);
+    // Past the lane and at its quota too: it waits on the quota, which a
+    // call that can't wait still does, rather than failing on the lane.
+    try hq.setForTest(&t.store, busy, 1 << 30, 1 << 30);
+    try testing.expect((try applyCall(&t, Call.of(busy, "b8", &input), 10 * ms)).refused() == null);
+    const both = try lastReply(&t, a);
+    try testing.expectEqual(ae.Answer.over_quota, both.answer);
+    try testing.expect(std.mem.startsWith(u8, both.why.?, "limit: ns 7 history "));
+    try testing.expect(t.run(busy, "b8") == null);
+    try hq.setForTest(&t.store, busy, settings.NO_QUOTA, 0);
     // The namespace holding none of the lane is not held by it.
     try testing.expect((try applyCall(&t, Call.of(quiet, "q1", &input), 10 * ms)).refused() == null);
     try testing.expectEqual(ae.Answer.started, (try lastReply(&t, a)).answer);

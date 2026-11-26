@@ -10100,9 +10100,40 @@ test "step executor: a call that can't wait, held at its callee's namespace's qu
         if (std.mem.eql(u8, evt.event_type_owned, "call_held_over_quota")) held += 1;
     }
     try testing.expectEqual(@as(usize, 1), held);
+    // Asked again and refused, past where memory's backoff stops at a
+    // minute: both sites that wait on it wait the quota's, longer.
+    var cur = run;
+    var at = c;
+    var tries: usize = 0;
+    while (at.attempts < 6) : (tries += 1) {
+        try testing.expect(tries < 16);
+        handler.retryCall(&shard, cur, cur.pending_action_run_id_owned.?, at, @import("stdx").time.milliTimestamp());
+        _ = handler.commitRun(&shard, testKey(.default, "run-q"));
+        settleTest(&shard);
+        cur = handler.takeRun(&shard, testKey(.default, "run-q")).?;
+        at = WorkflowHandler.callOf(&shard, cur, cur.pending_action_run_id_owned.?).?;
+        try testing.expectEqual(calls_mod.State.over_quota, at.state);
+    }
+    const wait_ms = WorkflowHandler.heldRetryMs(at.state, at.attempts);
+    try testing.expect(wait_ms > WorkflowHandler.CALL_RETRY_MAX_MS);
+    const last_ms: i64 = @intCast(at.last_ns / std.time.ns_per_ms);
+    // Past memory's longest wait and short of the quota's: neither site asks.
+    const between = last_ms + @as(i64, @intCast(WorkflowHandler.CALL_RETRY_MAX_MS)) + 1_000;
+    cur.call_retry_at_ms = 0;
+    const before_log = shard.raft_node.log.lastIndex();
+    try testing.expect(!handler.callSettled(&shard, cur, cur.pending_action_run_id_owned.?, between));
+    try testing.expectEqual(before_log, shard.raft_node.log.lastIndex());
+    _ = handler.commitRun(&shard, testKey(.default, "run-q"));
+    switch (handler.callWork(&shard, testKey(.default, "run-q"), between)) {
+        .later => |due| try testing.expect(due >= last_ms + @as(i64, @intCast(wait_ms)) - 1),
+        else => return error.TestUnexpectedResult,
+    }
+    settleTest(&shard);
+    const run2 = handler.takeRun(&shard, testKey(.default, "run-q")).?;
     // Room again: asked again, it starts.
     try hq.setForTest(&shard.defaultPartition().store, .default, 1 << 30, 0);
-    handler.retryCall(&shard, run, rid, c, @import("stdx").time.milliTimestamp());
+    const rid2 = run2.pending_action_run_id_owned.?;
+    handler.retryCall(&shard, run2, rid2, WorkflowHandler.callOf(&shard, run2, rid2).?, @import("stdx").time.milliTimestamp());
     _ = handler.commitRun(&shard, testKey(.default, "run-q"));
     settleTest(&shard);
     const again = handler.takeRun(&shard, testKey(.default, "run-q")).?;
