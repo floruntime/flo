@@ -7392,6 +7392,8 @@ pub const Shard = struct {
         // Last, after everything this tick applied: what the pipelines do
         // next decides how long the next tick may sleep. Only a leader's,
         // not halted, run; every tick, so it clears the tick it's done.
+        // `leads` is as it stood before this tick's applies: one that just
+        // stepped down is cleared by the next tick.
         self.notePipelinesNext(leads);
         return events.len;
     }
@@ -14599,6 +14601,14 @@ test "Shard: operators that can't be rebuilt for a new term make the pipeline wa
     // Its retry is the next poll's, not the loop's: no deadline, so a
     // failing rebuild at a short poll interval can't wake it each ms.
     {
+        const nw = a.processing_handler.nextWork(a, pipe.last_poll_ms + 1);
+        try std.testing.expect(!nw.due);
+        try std.testing.expectEqual(@as(?i64, null), nw.deadline_ms);
+    }
+    // With records waiting too: still the next poll's, never every tick.
+    pipe.more = true;
+    for (0..5) |_| {
+        _ = a.processing_handler.tickPipelines(a);
         const nw = a.processing_handler.nextWork(a, pipe.last_poll_ms + 1);
         try std.testing.expect(!nw.due);
         try std.testing.expectEqual(@as(?i64, null), nw.deadline_ms);

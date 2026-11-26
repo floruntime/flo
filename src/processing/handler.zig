@@ -1776,7 +1776,9 @@ pub const ProcessingHandler = struct {
         const due = now_ms - pipe.last_poll_ms >= @as(i64, @intCast(pipe.src_poll_ms));
         // A waiting one looks again each tick, so its wait ends as soon
         // as it can.
-        if (!due and !pipe.more and (pipe.wait == .none or pipe.wait == .operators)) return .not_due;
+        // Operators not rebuilt are tried again at the next poll, records
+        // waiting or not: never every tick.
+        if (!due and (pipe.wait == .operators or (!pipe.more and pipe.wait == .none))) return .not_due;
         // Its batch in the log: nothing more until it applies.
         if (pipe.batch_term == raft.current_term and pipe.batch_index > raft.last_applied) return .skip;
         // A page asked of the shard owning its source: nothing until it
