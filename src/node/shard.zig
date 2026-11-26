@@ -12792,6 +12792,15 @@ test "Shard: a gather refused for room frees its state and this shard's part, an
     f.client.conn.forwards_in_flight = 0;
 }
 
+/// A name, `prefix` and a number, that namespace `ns` puts on shard `want`.
+fn nameOn(shard: *Shard, ns: ns_table.Id, want: u16, prefix: []const u8, buf: []u8) ![]const u8 {
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const k = try std.fmt.bufPrint(buf, "{s}{d}", .{ prefix, i });
+        if (shard.router.hashToShard(node_router.routeNsKey(ns, k)) == want) return k;
+    }
+}
+
 /// A key that namespace `ns` puts on shard `want` of `shard`'s node.
 fn keyOn(shard: *Shard, ns: ns_table.Id, want: u16, buf: []u8) ![]const u8 {
     var i: usize = 0;
@@ -12818,6 +12827,22 @@ fn entryAt(shard: *Shard, t: entry_mod.EntryType, from: u64) ?u64 {
 }
 
 /// The records stream `name` in namespace `ns` holds on `s`.
+/// The last payload of stream `name`, copied into `buf`, or null.
+fn lastStreamPayload(s: *Shard, name: []const u8, ns: []const u8, buf: []u8) ?[]const u8 {
+    var got: ?[]const u8 = null;
+    var after: @import("../projection/stream.zig").StreamID = .{ .timestamp_ms = 0, .sequence = 0 };
+    while (true) {
+        const r = s.stream_handler.readPayloadsForStream(name, ns, after, 1000);
+        defer r.deinit(s.stream_handler.allocator);
+        if (r.payloads.len == 0) return got;
+        const p = r.payloads[r.payloads.len - 1];
+        if (p.len > buf.len) return null;
+        @memcpy(buf[0..p.len], p);
+        got = buf[0..p.len];
+        after = r.last_id;
+    }
+}
+
 fn streamRecords(s: *Shard, name: []const u8, ns: []const u8) usize {
     var n: usize = 0;
     var after: @import("../projection/stream.zig").StreamID = .{ .timestamp_ms = 0, .sequence = 0 };
@@ -14865,6 +14890,130 @@ test "Shard: a TS sink drops a record lacking a tag's field, counted and shown o
     try std.testing.expectEqual(pipe.stream_cursor_seq, at.b);
     try std.testing.expectEqual(pipe.stream_cursor_ts, at.a);
     try std.testing.expectEqual(@as(u64, 4), job.records_processed);
+}
+
+test "Shard: an operator chain out of memory ends the batch before its record: nothing written, skipped or passed, and the next tick takes it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    var target_buf: [24]u8 = undefined;
+    const target = try nameOn(a, .default, 0, "tout", &target_buf);
+    for ([_][]const u8{ "{\"v\":1}", "{\"v\":2}", "{\"v\":3}" }) |r| _ = try a.stream_handler.appendPayloadToStream(source, "default", r);
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: short
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\operators:
+        \\  - name: m
+        \\    type: map
+        \\    v: "$.v"
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: {s} }}
+    , .{ source, target });
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    const pipe = pit.next().?;
+    const h = a.processing_handler;
+
+    // Every allocation of the chain's arena fails.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    h.chain_backing = failing.allocator();
+    tickNow(a, pipe);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 0), pipe.records_in);
+    try std.testing.expectEqual(@as(u64, 0), pipe.stream_cursor_ts);
+    try std.testing.expectEqual(@as(u64, 0), h.sink_drops);
+    try std.testing.expectEqual(@as(u64, 0), h.chain_errors);
+    try std.testing.expectEqual(@as(u64, 0), h.firstJob().?.drops);
+    try std.testing.expectEqual(@as(usize, 0), streamRecords(a, target, "default"));
+    // The stall shows on the job: not a silent RUNNING.
+    {
+        const job = h.firstJob().?;
+        var nb: [512]u8 = undefined;
+        try std.testing.expect(std.mem.indexOf(u8, h.liveNote(&job, &nb).?, "1 batch stopped short of memory, each record tried again") != null);
+    }
+
+    // Memory back: the same records, every one, once.
+    h.chain_backing = null;
+    pipe.last_batch_ms = 0;
+    tickNow(a, pipe);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+    try std.testing.expectEqual(@as(usize, 3), streamRecords(a, target, "default"));
+    try std.testing.expectEqual(@as(u64, 0), h.firstJob().?.drops);
+}
+
+test "Shard: a running sum out of memory is run again and counts each record once" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    var target_buf: [24]u8 = undefined;
+    const target = try nameOn(a, .default, 0, "tsum", &target_buf);
+    for ([_][]const u8{ "{\"v\":1}", "{\"v\":2}", "{\"v\":3}" }) |r| _ = try a.stream_handler.appendPayloadToStream(source, "default", r);
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: summed
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\operators:
+        \\  - name: s
+        \\    type: aggregate
+        \\    function: sum
+        \\    field: "$.v"
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: {s} }}
+    , .{ source, target });
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    const pipe = pit.next().?;
+    const h = a.processing_handler;
+    // Fails at every allocation number in turn, then runs clean: whatever
+    // failed, the totals are 1, 3 and 6, each record counted once.
+    var fail_at: usize = 0;
+    while (fail_at < 40) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_at });
+        h.chain_backing = failing.allocator();
+        pipe.last_batch_ms = 0;
+        tickNow(a, pipe);
+        two.settle();
+        h.chain_backing = null;
+        if (pipe.records_in == 3) break;
+    }
+    pipe.last_batch_ms = 0;
+    tickNow(a, pipe);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+    try std.testing.expect(h.memory_stalls > 0);
+    try std.testing.expectEqual(@as(usize, 3), streamRecords(a, target, "default"));
+    var lb: [128]u8 = undefined;
+    const last = lastStreamPayload(a, target, "default", &lb) orelse return error.NoRecord;
+    try std.testing.expect(std.mem.indexOf(u8, last, "\"value\":6,\"count\":3") != null);
 }
 
 test "Shard: a job's processed count takes each record once, across batches not logged, logged, and refused" {

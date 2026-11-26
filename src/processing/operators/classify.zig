@@ -94,7 +94,7 @@ pub const ClassifyOperator = struct {
         var any_matched = false;
         log.debug("classify '{s}': processing record value[{d}]={s}", .{ self.name, rec.value.len, if (rec.value.len > 200) rec.value[0..200] else rec.value });
         for (self.rules) |*rule| {
-            const matched = rule.condition.evaluate(rec);
+            const matched = (try rule.condition.judge(rec, ctx.allocator)) == .pass;
             log.debug("classify '{s}': rule bit={d} cond='{s}' matched={}", .{ self.name, rule.tag_bit, rule.condition.condition, matched });
             if (matched) {
                 tagged_rec.addTag(rule.tag_bit);

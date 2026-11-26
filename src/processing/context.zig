@@ -60,6 +60,19 @@ pub const OperatorContext = struct {
     current_processing_time_ms: i64,
     /// Operator name (for logging/debugging)
     operator_name: []const u8,
+    /// Why the record in hand was skipped, set by `skip`.
+    skipped: ?[]const u8 = null,
+    /// An operator kept state from the record in hand (an aggregate's
+    /// total): running the record again would count it twice.
+    changed_state: bool = false,
+
+    /// An operator that can't read its record skips it with a reason: the
+    /// chain's caller counts it where the job's status shows it, so a
+    /// record is never lost unseen.
+    pub fn skip(self: *OperatorContext, why: []const u8) error{RecordSkipped} {
+        self.skipped = why;
+        return error.RecordSkipped;
+    }
 
     /// Convenience: emit a record downstream
     pub fn emit(self: *OperatorContext, rec: ProcessingRecord) !void {
