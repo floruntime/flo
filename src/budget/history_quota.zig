@@ -130,6 +130,14 @@ pub fn preCheck(read: ReadView, ns: NamespaceId, own: u64) ?Over {
     return null;
 }
 
+/// Whether `ns`'s usage has reached its part, as committed: a non-waking
+/// signal's arm, for a model to predict.
+pub fn atUsage(read: ReadView, ns: NamespaceId) bool {
+    const part = (settings.boundQuota(read, ns) orelse return false).part_bytes;
+    if (part == settings.NO_QUOTA) return false;
+    return hm.usageOf(read, ns).bytes >= part;
+}
+
 /// The refusal for an admission `o` holds back, under 128 bytes, from the
 /// namespace's own id and figures alone. A run whose own reserve is past
 /// the part is told so: deleting runs can't admit it, and a smaller run or

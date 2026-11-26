@@ -346,6 +346,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         },
     );
     if (scenario.memory_share > 0) std.debug.print("[vopr] memory gate: {d} writes judged, {d} refused for memory, {d} store copies\n", .{ vopr.memory_gate.judged, vopr.memory_gate.refused, vopr.memory_gate.copies });
+    if (scenario.quota_percent > 0) std.debug.print("[vopr] quota: alters={d} binds={d} refusals={d} (most on one replica)\n", .{ sim.quota_alters, sim.quota_binds, sim.quotaRefusals() });
     if (sim.leader_not_ready_refused > 0) std.debug.print("[vopr] client writes refused for a leader still applying earlier terms: {d}\n", .{sim.leader_not_ready_refused});
     if (scenario.action_percent > 0) printActionCounts(s.actions);
     if (scenario.queue_percent > 0) printQueueCounts(s.queues);

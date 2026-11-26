@@ -58,6 +58,7 @@ const schema = @import("../protocol/schema.zig");
 const ae = @import("../protocol/action_entries.zig");
 const router = @import("../node/router.zig");
 const rm = @import("../workflow/runs_machine.zig");
+const hq = @import("../budget/history_quota.zig");
 const calls_mod = @import("../actions/calls_machine.zig");
 const hm = @import("../stream/history_machine.zig");
 const he = @import("../protocol/history_entries.zig");
@@ -712,6 +713,18 @@ pub const WorkflowRuns = struct {
                             }
                             if (ev != TRIGGER) return refuse(.start, "its workflow is disabled");
                         }
+                        // Past its namespace's quota, judged before memory:
+                        // nothing of it lands, and a child's parent is
+                        // answered over_quota. One that starts ended
+                        // reserves nothing of its own.
+                        const own = if (s.status.isTerminal()) 0 else rm.reserveOf(s.workflow, RUNS[r]);
+                        if (hq.preCheck(.{ .store = store }, NS, own) != null) {
+                            if (ev != CHILD) return refuse(.start, "past its namespace's quota");
+                            const f = l.parents[r].?;
+                            want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[f.slot], .run = RUNS[r], .answer = .over_quota };
+                            l.parents[r] = null;
+                            return want;
+                        }
                         // Past the share the shard committed to, what it
                         // writes but its sends: nothing of it lands, and a
                         // child's parent is answered over_budget.
@@ -773,6 +786,9 @@ pub const WorkflowRuns = struct {
                         // writes but its sends: refused, unless it wakes its
                         // run and the slack holds it.
                         const wakes = run.wait.wait == .signal and std.mem.eql(u8, run.wait.on, SIG_TYPES[ty]);
+                        // At its namespace's quota's usage, one that doesn't
+                        // wake its run is refused, before memory.
+                        if (!wakes and hq.atUsage(.{ .store = store }, NS)) return refuse(.signal, "at its namespace's quota");
                         if (settings.boundShare(.{ .store = store })) |b| {
                             const add = memory_gate.wouldAddData(&rm.machine, store, e) orelse return null;
                             const use = pool.useOf(store);

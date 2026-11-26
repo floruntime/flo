@@ -48,6 +48,9 @@ const kv_reap_workload = @import("kv_reap_workload.zig");
 const group_family = @import("group_family.zig");
 const group_workload = @import("group_workload.zig");
 const namespace_entries = @import("../protocol/namespace_entries.zig");
+const settings_entries = @import("../protocol/settings_entries.zig");
+const schema = @import("../protocol/schema.zig");
+const quota_walk_mod = @import("../settings/quota_walk.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
 const limits = @import("../protocol/limits.zig");
 const NamespaceHandler = @import("../namespace/handler.zig").NamespaceHandler;
@@ -477,6 +480,9 @@ const SimNode = struct {
     groups_term_since_ns: u64 = 0,
     /// Shard 0's namespace handler, on this replica's own table.
     ns: families.Namespaces,
+    /// Its leader's walk of that table for the quota parts to bind, as a
+    /// shard's leader walks its own. Leader memory: none after a restart.
+    quota_walk: quota_walk_mod.Walk = .{},
     /// It applies nothing before this tick (`apply_lag_permille`).
     apply_paused_until: u64 = 0,
     families_index: u64 = 0,
@@ -1154,6 +1160,9 @@ pub const Simulator = struct {
     /// refusal production answers. Modelled so the sim never commits a write
     /// production would have refused.
     leader_not_ready_refused: u64 = 0,
+    /// Quota alters and binds proposed (`submitQuotaOp`).
+    quota_alters: u64 = 0,
+    quota_binds: u64 = 0,
     /// Frames from a node outside the receiver's membership, dropped.
     stranger_frames: u64 = 0,
     /// Join, removal and forward frames, which nothing here sends.
@@ -1533,6 +1542,7 @@ pub const Simulator = struct {
         node.wf_runs.reset();
         node.groups.reset();
         node.ns.reset();
+        node.quota_walk = .{};
         if (self.scenario.memory_share > 0) bindShare(node, self.scenario.memory_share);
         if (self.extension) |x| x.reset(x.ctx, node.id);
         node.apply_paused_until = 0;
@@ -2122,6 +2132,7 @@ pub const Simulator = struct {
         if (self.scenario.processing_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.processing_percent) return self.submitJobOp(target);
         if (self.scenario.workflow_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.workflow_percent) return self.submitWorkflowDefOp(target);
         if (self.scenario.kv_reap_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.kv_reap_percent) return self.submitKvReapOp(target);
+        if (self.scenario.quota_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.quota_percent) return self.submitQuotaOp(target);
         const op = try self.workload.nextOp();
         if (op.entry_type == .namespace_create) return self.submitCreate(target, op.id, op.payload);
         // Production refuses a client write on a leader still applying earlier
@@ -2173,6 +2184,51 @@ pub const Simulator = struct {
         const res = target.raft.propose(made.entry_type, 0, made.payload) catch return;
         self.workload.recordProposal(id, target.id, res.term, res.index);
         try self.pending_ops.append(self.allocator, id);
+    }
+
+    /// The default namespace's quota set as an alter on shard 0 sets it, to
+    /// figures near a few runs' reserves, none or the default; or this
+    /// leader's binds of the parts its walk finds due, as a shard's leader
+    /// proposes them (`quota_walk`). One group stands for every shard: the
+    /// part is the whole quota.
+    fn submitQuotaOp(self: *Simulator, target: *SimNode) !void {
+        if (!target.raft.leaderReady()) {
+            self.leader_not_ready_refused += 1;
+            return;
+        }
+        const r = self.action_prng.random();
+        const payload: []const u8, const etype: entry_mod.EntryType = if (r.boolean()) blk: {
+            const floor = @import("../budget/history_reserve.zig").PART_FLOOR;
+            const figures = [_]u64{ floor, floor + floor / 2, 2 * floor, 4 * floor, 1 << 22 };
+            const k = r.uintLessThan(u8, 10);
+            const mode: @import("../protocol/namespace_ops.zig").QuotaMode = if (k == 0) .none else if (k == 1) .default else .bytes;
+            const bytes: u64 = if (mode == .bytes) figures[r.uintLessThan(usize, figures.len)] else 0;
+            const out = namespace_entries.Alter.encodeInto(self.action_buf, .{ .name = "default", .mode = mode, .bytes = bytes }) catch return;
+            break :blk .{ out, .namespace_alter };
+        } else blk: {
+            const Item = settings_entries.QuotaItem;
+            var items: [settings_entries.MAX_QUOTA_BINDS]Item.Value = undefined;
+            const n = target.quota_walk.due(target.ns.handler.table, .{ .store = &target.actions.store }, target.raft.current_term, 1, &items);
+            if (n == 0) return;
+            var ib: [settings_entries.MAX_QUOTA_BINDS * Item.max_size]u8 = undefined;
+            var w: schema.Writer = .{ .buf = &ib };
+            for (items[0..n]) |it| Item.encode(&w, it) catch return;
+            const out = settings_machine.SetQuotaBind.encodeInto(self.action_buf, .{ .items = .{ .bytes = w.written(), .count = @intCast(n) } }) catch return;
+            break :blk .{ out, .settings_quota_bind };
+        };
+        const id = try self.workload.nextActionOp(etype, payload);
+        const res = target.raft.propose(etype, 0, payload) catch return;
+        if (etype == .namespace_alter) self.quota_alters += 1 else self.quota_binds += 1;
+        self.workload.recordProposal(id, target.id, res.term, res.index);
+        try self.pending_ops.append(self.allocator, id);
+    }
+
+    /// The most admissions any one replica refused at the quota in its
+    /// life: a run's evidence that the arms were met.
+    pub fn quotaRefusals(self: *const Simulator) u64 {
+        var most: u64 = 0;
+        for (self.nodes) |*node| most = @max(most, node.actions.store.quota_refusals + node.wf_defs.store.quota_refusals);
+        return most;
     }
 
     /// A queue entry, made from the leader's own applied queue state as its
@@ -2721,6 +2777,13 @@ pub const Simulator = struct {
                 .detail = "the group machine failed a workload entry it should apply",
             },
         });
+        // The quota's own entries: an alter on shard 0, published to the
+        // table, and a bind on every store a shard's machines share.
+        if (is_op and e.header.entry_type == @backingInt(entry_mod.EntryType.namespace_alter)) node.ns.applyAlter(e) catch self.checker.fail(.{ .invariant = .applied_integrity, .node = node.id, .index = idx, .tick = self.now, .detail = "the namespaces machine failed a quota alter" });
+        if (is_op and e.header.entry_type == @backingInt(entry_mod.EntryType.settings_quota_bind)) {
+            families.applyQuotaBind(&node.actions.store, &node.actions.scratch, e) catch self.checker.fail(.{ .invariant = .applied_integrity, .node = node.id, .index = idx, .tick = self.now, .detail = "the settings machine failed a quota bind" });
+            families.applyQuotaBind(&node.wf_defs.store, &node.wf_defs.scratch, e) catch self.checker.fail(.{ .invariant = .applied_integrity, .node = node.id, .index = idx, .tick = self.now, .detail = "the settings machine failed a quota bind" });
+        }
         if (is_op and families.Namespaces.owns(e.header.entry_type)) if (node.ns.apply(e, self.options.family_mutant)) |effect| {
             if (node.ns.rule()) |why| self.checker.fail(.{ .invariant = .ns_rule, .node = node.id, .index = idx, .tick = self.now, .detail = why });
             const first_entry = !(self.ns_seen.getOrPut(self.allocator, .{ idx, std.hash.Wyhash.hash(HASH_SEED, e.payload) }) catch @panic("sim OOM")).found_existing;
