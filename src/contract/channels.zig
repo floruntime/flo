@@ -183,9 +183,17 @@ pub fn nsUntakenOf(read: ReadView, own: u16, ns: ns_table.Id) u64 {
 fn takeHistory(view: *View, own: u16, ns: ns_table.Id, len: u64) ApplyError!void {
     var nk: [OUT_NS_KEY]u8 = undefined;
     const ns_key = outNsKey(&nk, own, .history, ns);
+    // Sent and not trimmed, so its row is there, as the trim holds it to.
     const held = (try view.getOwn(OutNsFam, ns_key)) orelse return error.Halt;
-    if (held.v.delivered + len > held.v.bytes) return error.Halt;
-    try view.putOwn(OutNsFam, ns_key, .{ .v = .{ .bytes = held.v.bytes, .delivered = held.v.delivered + len } });
+    // Taken past what was sent is an accounting slip, not a broken log:
+    // capped and counted with the history usage's drift, never a halt,
+    // which every replica would hit again on replay.
+    var delivered = held.v.delivered + len;
+    if (delivered > held.v.bytes) {
+        view.history_usage_drift += 1;
+        delivered = held.v.bytes;
+    }
+    try view.putOwn(OutNsFam, ns_key, .{ .v = .{ .bytes = held.v.bytes, .delivered = delivered } });
 }
 
 /// Parked keys live under a namespace of their own, so an unpark can declare
@@ -1094,14 +1102,18 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 const ns_key = outNsKey(&nk, p.to, lane, .of(out.v.origin_ns));
                 const held = (try view.get(OutNsFam, ns_key)) orelse return error.Halt;
                 if (held.v.bytes < out.v.payload.len) return error.Halt;
-                // A history message is trimmed only once its inbound took it.
+                // A history message is trimmed only once its inbound took
+                // it. One that wasn't, or taken bytes left with none sent, is
+                // an accounting slip: counted as the history usage's drift,
+                // never a halt (`takeHistory`).
                 const taken: u64 = if (lane == .history) out.v.payload.len else 0;
-                if (held.v.delivered < taken) return error.Halt;
-                const left: NsBytes.Value = .{ .bytes = held.v.bytes - out.v.payload.len, .delivered = held.v.delivered - taken };
-                if (left.bytes == 0) {
-                    if (left.delivered != 0) return error.Halt;
-                    try view.delete(OutNsFam, ns_key);
-                } else try view.put(OutNsFam, ns_key, .{ .v = left });
+                if (held.v.delivered < taken) view.history_usage_drift += 1;
+                var left: NsBytes.Value = .{ .bytes = held.v.bytes - out.v.payload.len, .delivered = held.v.delivered -| taken };
+                if (left.delivered > left.bytes) {
+                    view.history_usage_drift += 1;
+                    left.delivered = left.bytes;
+                }
+                if (left.bytes == 0) try view.delete(OutNsFam, ns_key) else try view.put(OutNsFam, ns_key, .{ .v = left });
                 try view.delete(OutFam, key);
             }
             meta.acked = p.through;
