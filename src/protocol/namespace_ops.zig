@@ -100,7 +100,7 @@ pub const table = [_]ops.Op{
             .{ .name = "created_at_ms", .T = Int(i64), .doc = "When it was created, in ms since the epoch; 0 for default" },
             .{ .name = "history_quota", .T = Optional(Int(u64)), .doc = "Its run-history quota over every shard, bytes; none when off" },
             .{ .name = "history_quota_own", .T = schema.Bool, .doc = "Whether it set its own quota, not the default" },
-            .{ .name = "shards", .T = ShardQuotas, .doc = "Each shard's part, usage and reserves" },
+            .{ .name = "shards", .T = ShardQuotas, .doc = "Each shard's part and usage" },
         }),
         .cli = .{ .expose = .hand, .key = name_key, .examples = &.{"flo namespace info myapp"} },
         .doc = "A namespace's record and its run-history quota on every shard; not_found if there is none.",
@@ -118,7 +118,7 @@ pub const table = [_]ops.Op{
             .{ .name = "history_quota_bytes", .T = Optional(Quota), .doc = "The quota over every shard, bytes: present when the mode is bytes, and only then" },
         }),
         .response = Record(&.{}),
-        .cli = .{ .expose = .hand, .key = name_key, .examples = &.{ "flo namespace alter myapp --history-quota 20GiB", "flo namespace alter myapp --history-quota none" } },
+        .cli = .{ .expose = .hand, .key = name_key, .examples = &.{ "flo namespace alter myapp --history-quota 20GiB", "flo namespace alter myapp --history-quota none", "flo namespace alter myapp --history-quota default" } },
         .doc = "Set a namespace's run-history quota, on the node's admin socket only. Its one setting: a second setting must add a way to leave it unchanged.",
     },
     .{
