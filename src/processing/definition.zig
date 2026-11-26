@@ -282,9 +282,12 @@ pub const SinkSpec = struct {
     /// Field extractors: pairs of (field_name, json_key) for extracting numeric fields.
     /// Stored as flat pairs: [field_name_1, json_key_1, field_name_2, json_key_2, ...]
     ts_field_keys: []const []const u8 = &.{},
-    /// Shorthand: field name for treating entire value as a single numeric field.
-    /// If non-empty, ts_field_keys are ignored. Defaults to "value" for TS sinks.
+    /// With no `fields`: under a stream source, the record field read and
+    /// written as "value"; under a TS source, the field each point is
+    /// written under. "value" when not given.
     ts_value_field: []const u8 = "",
+    /// Whether `value_field` was given, which `fields` would leave unread.
+    ts_value_field_set: bool = false,
 };
 
 // =============================================================================

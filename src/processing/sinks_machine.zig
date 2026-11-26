@@ -394,6 +394,19 @@ test "sinks: a batch moves its pipeline's cursor and sends its writes once; one 
     try testing.expectEqual(@as(u64, 3), t.sent());
 }
 
+test "processing: a logged submit the parser now refuses applies as a failed job, saying why" {
+    var t = T.init();
+    defer t.deinit();
+    var cb: [512]u8 = undefined;
+    var vb: [256]u8 = undefined;
+    // `value_field` beside `fields`, which it would leave unread.
+    const yaml = "kind: Processing\nsources: [{stream: {name: in}}]\nsinks: [{ts: {measurement: m, value_field: v, fields: {load: l}}}]\n";
+    try t.command(.processing_submit, "job", encodeSubmit(&vb, .running, 0, "default", yaml).?, &cb);
+    const job = jobOf(t.read(), .of(21), "job").?;
+    try testing.expectEqual(@backingInt(JobStatus.failed), job.status);
+    try testing.expect(std.mem.startsWith(u8, job.failure, "TS sink 'default-sink-0' can't give both \"value_field\" and \"fields\""));
+}
+
 test "processing: removing a job drops it and its pipelines' cursors, and no other job's" {
     var t = T.init();
     defer t.deinit();

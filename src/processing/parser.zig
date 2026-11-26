@@ -290,6 +290,13 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
         if (snk.kind == .ts and !mem.eql(u8, snk.ts_value_field, "value"))
             return d.fail(ParseError.InvalidFormat, "split the job to name a value field: TS sink '{s}' sets \"value_field\", which for stream source '{s}' names the record field read, and for TS source '{s}' the field written", .{ snk.name, stream_src.?.name, ts_src.?.name });
     };
+    // With `fields`, each point is written under its own field's name from
+    // the record field it maps: `value_field` would go unread. Checked after
+    // the rules above, so a job to split is told so first.
+    for (def.sinks.items) |snk| {
+        if (snk.kind == .ts and snk.ts_value_field_set and snk.ts_field_keys.len > 0)
+            return d.fail(ParseError.InvalidFormat, "TS sink '{s}' can't give both \"value_field\" and \"fields\": each of \"fields\" names the point it writes and the record field it reads", .{snk.name});
+    }
 
     return def;
 }
@@ -779,12 +786,12 @@ fn parseOneSink(allocator: Allocator, d: D, item: JsonValue, index: usize, defau
         snk.ts_measurement = try dupe(allocator, measurement);
         snk.namespace = try dupe(allocator, try optString(d, obj, "namespace") orelse default_namespace);
         const value_field = try optString(d, obj, "value_field");
+        // No record field is named "", and no point is written under it.
+        if (value_field) |v| if (v.len == 0) return d.fail(ParseError.InvalidFormat, "\"value_field\" can't be empty", .{});
         snk.ts_value_field = try dupe(allocator, value_field orelse "value");
+        snk.ts_value_field_set = value_field != null;
         snk.ts_tag_keys = try parseStringPairs(allocator, d, obj, "tags");
         snk.ts_field_keys = try parseStringPairs(allocator, d, obj, "fields");
-        // With `fields`, each point is written under its own field's name
-        // from the record field it maps: `value_field` would go unread.
-        if (value_field != null and snk.ts_field_keys.len > 0) return d.fail(ParseError.InvalidFormat, "\"value_field\" and \"fields\" can't both be given: each of \"fields\" names the point it writes and the record field it reads", .{});
         // A point's tags are a TS read's: past its count no read finds them.
         if (snk.ts_tag_keys.len / 2 > ts_mod.MAX_TAGS) return d.fail(ParseError.InvalidFormat, "\"tags\" takes at most {d} tags, not {d}", .{ ts_mod.MAX_TAGS, snk.ts_tag_keys.len / 2 });
         // The record fields the sink reads, each named in `"name":` form
@@ -2559,6 +2566,16 @@ test "parser: a TS sink's value_field, which means one thing per source kind, is
         try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, &diag));
         try std.testing.expectEqualStrings("split the job to name a value field: TS sink 'out' sets \"value_field\", which for stream source 'events' names the record field read, and for TS source 'points' the field written at the top level", diag.message());
     }
+    // The TS sink second, beside another: refused all the same. With
+    // `fields` too, the split is said first.
+    for ([_][]const u8{ "value_field: usage", "value_field: usage, fields: { load: l }" }) |opts| {
+        const text = try std.fmt.allocPrint(allocator, "kind: Processing\nsources:\n{s}{s}sinks:\n  - stream: {{ name: copy }}\n  - name: second\n    ts: {{ measurement: m, {s} }}\n", .{ stream_src, ts_src, opts });
+        defer allocator.free(text);
+        var diag: Diagnostic = .{};
+        try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, &diag));
+        try std.testing.expect(mem.startsWith(u8, diag.message(), "split the job to "));
+        try std.testing.expect(mem.indexOf(u8, diag.message(), "TS sink 'second'") != null);
+    }
     // One kind of source: each meaning stands. Named "value", the two agree.
     for ([_][]const u8{
         "  - ts: { measurement: cpu }\nsinks:\n  - ts: { measurement: cpu_copy, value_field: usage }\n",
@@ -2583,9 +2600,24 @@ test "parser: a TS sink's value_field beside fields, which would leave it unread
         \\  - ts: { measurement: m, value_field: v, fields: { load: l } }
         \\
     , &diag));
-    try std.testing.expectEqualStrings("\"value_field\" and \"fields\" can't both be given: each of \"fields\" names the point it writes and the record field it reads at sinks[0].ts", diag.message());
-    // Either alone is taken.
-    for ([_][]const u8{ "value_field: v", "fields: { load: l }" }) |one| {
+    try std.testing.expectEqualStrings("TS sink 'default-sink-0' can't give both \"value_field\" and \"fields\": each of \"fields\" names the point it writes and the record field it reads at the top level", diag.message());
+    // Beside another sink, second: refused all the same.
+    try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator,
+        \\kind: Processing
+        \\sources:
+        \\  - stream: { name: ev }
+        \\sinks:
+        \\  - stream: { name: copy }
+        \\  - name: pts
+        \\    ts: { measurement: m, value_field: v, fields: { load: l } }
+        \\
+    , &diag));
+    try std.testing.expect(mem.startsWith(u8, diag.message(), "TS sink 'pts' can't give both"));
+    // An empty value field names nothing.
+    try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, "kind: Processing\nsources:\n  - stream: { name: ev }\nsinks:\n  - ts: { measurement: m, value_field: \"\" }\n", &diag));
+    try std.testing.expectEqualStrings("\"value_field\" can't be empty at sinks[0].ts", diag.message());
+    // Either alone is taken, as is an empty map of fields.
+    for ([_][]const u8{ "value_field: v", "fields: { load: l }", "value_field: v, fields: {}" }) |one| {
         const text = try std.fmt.allocPrint(allocator, "kind: Processing\nsources:\n  - stream: {{ name: ev }}\nsinks:\n  - ts: {{ measurement: m, {s} }}\n", .{one});
         defer allocator.free(text);
         var def = try parseJobDefinition(allocator, text, null);
