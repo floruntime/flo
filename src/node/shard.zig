@@ -7414,6 +7414,7 @@ pub const Shard = struct {
         if (others) return 0;
         if (self.producers_due) {
             self.processing_unslept_ticks += 1;
+            if (self.metrics_registry) |m| _ = m.processing.unslept_ticks_total.fetchAdd(1, .monotonic);
             return 0;
         }
         return self.idleTimeoutMs(now_ms);
@@ -14697,10 +14698,16 @@ test "Shard: an idle pipeline wakes its shard at its own poll interval, no soone
         try std.testing.expectEqual(@as(u32, @intCast(10 - k)), a.loopTimeoutMs(false, now));
     }
     try std.testing.expectEqual(@as(u64, 0), a.processing_unslept_ticks);
-    // Due: the next tick doesn't sleep, and that is counted.
+    // Due: the next tick doesn't sleep, and that is counted, on the shard
+    // and in the metric a server exports.
+    var metrics = MetricsRegistry.init(std.testing.allocator);
+    defer metrics.deinit();
+    a.setMetricsRegistry(&metrics);
+    defer a.metrics_registry = null;
     a.producers_due = true;
     try std.testing.expectEqual(@as(u32, 0), a.loopTimeoutMs(false, t + 10));
     try std.testing.expectEqual(@as(u64, 1), a.processing_unslept_ticks);
+    try std.testing.expectEqual(@as(u64, 1), metrics.processing.unslept_ticks_total.load(.monotonic));
     a.producers_due = false;
 
     // A second job, every 50 ms, polled later: the earlier deadline wins.
