@@ -13133,27 +13133,64 @@ test "Shard: 64 pipelined writes into a new namespace, their share spent when sh
     for (answers) |r| try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
 }
 
-test "Shard: a write by a chosen run id in a namespace this shard's table hasn't published asks shard 0 first, never every shard under no id" {
+test "Shard: a write by a chosen run id in a namespace this shard's table hasn't published asks shard 0 first, then finds the run under the namespace's id" {
     var two: TwoShards = undefined;
     try two.init();
     defer two.deinit();
     const a = &two.shards[0];
     const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    // A workflow whose shard is 0 by the namespace's id, and 1 by none.
+    const id = nextNamespaceId(a);
+    var wbuf: [16]u8 = undefined;
+    var i: usize = 0;
+    const w = while (true) : (i += 1) {
+        const n = try std.fmt.bufPrint(&wbuf, "wf{d}", .{i});
+        const by_id = a.router.hashToShard(node_router.routeNsKey(id, n));
+        const by_none = a.router.hashToShard(node_router.routeNsKey(.invalid, n));
+        if (by_id == 0 and by_none == 1) break n;
+    };
+    var dbuf: [256]u8 = undefined;
+    const def = try std.fmt.bufPrint(&dbuf,
+        \\{{"kind":"Workflow","name":"{s}","version":"1.0.0",
+        \\"start":{{"wait_for_signal":{{"type":"go"}},"transitions":{{"success":"flo.Completed"}}}}}}
+    , .{w});
+    // Created on shard 0 with its namespace, a run started by a chosen id:
+    // applied, not yet published, as just after a restart.
     const ca = try TestClient.open(a);
     defer _ = std.c.close(ca.pair[1]);
+    a.runRequest(ca.conn, try ParkTest.request(.workflow_create, 1, "late", w, def, ""), .client);
+    _ = a.applyCommitted();
+    var out: [512]u8 = undefined;
+    _ = try nextAnswer(ca, a, &out);
+    const both = [_]u8{ 0, 0, 1, 1, 0, 'z', 1, 2, 0, 'r', '1' };
+    a.runRequest(ca.conn, try ParkTest.request(.workflow_start, 2, "late", w, &both, ""), .client);
+    for (0..8) |_| for (&two.shards) |*s| {
+        _ = s.drainInbox();
+        _ = s.applyCommitted();
+    };
+    _ = try nextAnswer(ca, a, &out);
+    try std.testing.expect(a.workflow_handler.holdsRun(id, "r1"));
+    try std.testing.expect(b.namespace_handler.table.lookup("late") == null);
+
+    // Shard 1 gets a cancel by the chosen id: it asks shard 0 first, and
+    // starts no search of every shard under no id.
     const c = try TestClient.open(b);
     defer _ = std.c.close(c.pair[1]);
-    // Created on shard 0, not yet published, as just after a restart: shard
-    // 1's table has no id for it.
-    a.runRequest(ca.conn, try ParkTest.request(.namespace_create, 1, "", "xs", "", ""), .client);
-    try std.testing.expect(b.namespace_handler.table.lookup("xs") == null);
-    b.runRequest(c.conn, try ParkTest.request(.workflow_cancel, 2, "xs", "late-run", "", ""), .client);
+    b.runRequest(c.conn, try ParkTest.request(.workflow_cancel, 9, "late", "r1", "", ""), .client);
     var asks: usize = 0;
     for (b.gathers.entries) |e| if (e.active) {
         try std.testing.expect(e.context.op == &Shard.EdgeAsk.op);
         asks += 1;
     };
     try std.testing.expectEqual(@as(usize, 1), asks);
+    // Once shard 0 answers with the namespace published, the search runs
+    // under its id, finds the run on shard 0, and the cancel applies.
+    two.settle();
+    const got = try nextAnswer(c, b, &out);
+    try std.testing.expectEqual(@as(u64, 9), got.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), got.header.status);
+    try std.testing.expect(b.namespace_handler.table.lookup("late") != null);
 }
 
 test "Shard: a read held while shard 0 says whether its namespace is published, whose share is spent when it answers, waits for room and is answered, unrefused" {
