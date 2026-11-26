@@ -282,6 +282,10 @@ pub const ProcessingHandler = struct {
         read_seq: u64 = 0,
         read_term: u64 = 0,
         read_sent_ms: i64 = 0,
+        /// When a batch last stopped short of memory (wall-clock ms; 0:
+        /// never). For a while after, the pipeline waits: its retry is the
+        /// shard's own wake, not its poll interval's.
+        stalled_ms: i64 = 0,
         next_read_seq: u64 = 0,
         /// Per-tick processing time (ns) over productive ticks: last/max/sum/count.
         tick_ns_last: u64 = 0,
@@ -1751,6 +1755,71 @@ pub const ProcessingHandler = struct {
     /// records' sink writes with the cursor they move it to, one batch at a
     /// time. Returns whether one was held for a halted sink shard.
     /// Called from Shard.tick() on each reactor iteration.
+    /// Whether a leader's pipeline is looked at this tick: `.ready` reads,
+    /// or looks again at its wait; `.not_due` waits for its next poll; a
+    /// held job, or a batch of this term not yet applied, is `.skip`.
+    /// tickPipelines and nextWork both decide by it, so the loop's wake
+    /// can't drift from what a tick does.
+    pub const Gate = enum { skip, not_due, ready };
+
+    /// How long a pipeline waits after a batch stopped short of memory.
+    const MEMORY_STALL_MS: i64 = 100;
+
+    fn gateOf(run: *const JobRun, pipe: *const PipelineState, raft: *const raft_node_mod.RaftNode, now_ms: i64) Gate {
+        if (run.held or run.failure_owned.len > 0) return .skip;
+        // Short of memory a moment ago: a wait, retried on the shard's own
+        // wake, so a short poll interval doesn't retry it every ms.
+        if (pipe.stalled_ms != 0 and now_ms - pipe.stalled_ms < MEMORY_STALL_MS) return .skip;
+        // A poll reads up to `batch_size` records, a page at a time:
+        // while a page fills its batch, the next is read as soon as
+        // that batch applies, not at the next poll.
+        const due = now_ms - pipe.last_poll_ms >= @as(i64, @intCast(pipe.src_poll_ms));
+        // A waiting one looks again each tick, so its wait ends as soon
+        // as it can.
+        if (!due and !pipe.more and (pipe.wait == .none or pipe.wait == .operators)) return .not_due;
+        // Its batch in the log: nothing more until it applies.
+        if (pipe.batch_term == raft.current_term and pipe.batch_index > raft.last_applied) return .skip;
+        // A page asked of the shard owning its source: nothing until it
+        // comes, and its coming wakes the shard (or it's asked again once
+        // its deadline passes).
+        if (pipe.read_seq != 0 and now_ms - pipe.read_sent_ms < READ_DEADLINE_MS) return .skip;
+        return .ready;
+    }
+
+    /// What this leader's pipelines will do: `due`, one reads at the next
+    /// tick, so the loop must not sleep first; else `deadline_ms`, when the
+    /// earliest one not yet due becomes due (wall-clock ms, as `last_poll_ms`).
+    /// A pipeline that would only find its wait again (outbox, share,
+    /// pressure, log, a halted sink shard, an unknown namespace, operators
+    /// not rebuilt) counts in neither: the loop's own idle wake looks again,
+    /// as before, so a wait at a short poll interval can't wake it each ms.
+    pub const Next = struct { due: bool = false, deadline_ms: ?i64 = null };
+
+    pub fn nextWork(self: *const ProcessingHandler, shard: *Shard, now_ms: i64) Next {
+        var next: Next = .{};
+        const raft = shard.raft_node;
+        var it = self.pipelines.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const pipe = entry.value_ptr;
+            const base = if (std.mem.indexOfScalar(u8, key, 0)) |nul| key[0..nul] else key;
+            const run = self.runs.getPtr(base) orelse continue;
+            switch (gateOf(run, pipe, raft, now_ms)) {
+                .skip => {},
+                .not_due => {
+                    if (pipe.wait != .none) continue;
+                    if (self.waitOf(shard, run.ns_id, pipe) != .none) continue;
+                    const at = pipe.last_poll_ms + @as(i64, @intCast(pipe.src_poll_ms));
+                    next.deadline_ms = if (next.deadline_ms) |d| @min(d, at) else at;
+                },
+                .ready => if (self.waitOf(shard, run.ns_id, pipe) == .none) {
+                    next.due = true;
+                },
+            }
+        }
+        return next;
+    }
+
     pub fn tickPipelines(self: *ProcessingHandler, shard: *Shard) bool {
         var held = false;
         const now_ms = @import("stdx").time.milliTimestamp();
@@ -1788,16 +1857,11 @@ pub const ProcessingHandler = struct {
                 else => {},
             };
 
-            // A poll reads up to `batch_size` records, a page at a time:
-            // while a page fills its batch, the next is read as soon as
-            // that batch applies, not at the next poll.
             const poll_ms: i64 = @intCast(pipe.src_poll_ms);
-            const due = now_ms - pipe.last_poll_ms >= poll_ms;
-            // A waiting one looks again each tick, so its wait ends as soon
-            // as it can.
-            if (!due and !pipe.more and (pipe.wait == .none or pipe.wait == .operators)) continue;
-            // Its batch in the log: nothing more until it applies.
-            if (pipe.batch_term == raft.current_term and pipe.batch_index > raft.last_applied) continue;
+            switch (gateOf(run, pipe, raft, now_ms)) {
+                .skip, .not_due => continue,
+                .ready => {},
+            }
             // Operator state is a leader term's: a new term reads again
             // from the logged cursor, so its operators start empty.
             if (pipe.ops_term != raft.current_term) {
@@ -2032,7 +2096,7 @@ pub const ProcessingHandler = struct {
             var ab: [48]u8 = undefined;
             const at = std.fmt.bufPrint(&ab, "point {d}/{d}", .{ pt.timestamp_ns, pt.ual }) catch "a point";
             const json = tsPointJson(arena.allocator(), pipe.src_measurement, pipe.src_field, pt.value, ts_ms, pt.tags) catch {
-                self.noteMemoryStall(at);
+                self.noteMemoryStall(pipe, at);
                 break;
             };
             batch.beginRecord();
@@ -2044,7 +2108,7 @@ pub const ProcessingHandler = struct {
                 // Short of memory the batch stops here, the record still
                 // ahead of the cursor: not a record to skip.
                 error.OutOfMemory => {
-                    self.noteMemoryStall(at);
+                    self.noteMemoryStall(pipe, at);
                     break;
                 },
                 // An aggregate had counted it: run again it would count twice.
@@ -2122,7 +2186,7 @@ pub const ProcessingHandler = struct {
                 // Short of memory the batch stops here, the record still
                 // ahead of the cursor: not a record to skip.
                 error.OutOfMemory => {
-                    self.noteMemoryStall(at);
+                    self.noteMemoryStall(pipe, at);
                     all = false;
                     break;
                 },
@@ -2181,7 +2245,9 @@ pub const ProcessingHandler = struct {
     /// read once this batch applies.
     fn notePage(_: *ProcessingHandler, pipe: *PipelineState, batch: *const Batch, taken: u32, got: usize) void {
         pipe.poll_left -|= taken;
-        pipe.more = pipe.poll_left > 0 and (batch.full or (got > 0 and got >= pipe.page_limit));
+        // More waits only after a page that took something: one cut before
+        // its first record (short of memory) tries again at the next poll.
+        pipe.more = taken > 0 and pipe.poll_left > 0 and (batch.full or (got > 0 and got >= pipe.page_limit));
     }
 
     /// Most a read of another shard's source waits for its page before it
@@ -2737,8 +2803,9 @@ pub const ProcessingHandler = struct {
     /// A batch stopped short of memory before the record at `at`: that
     /// record and the rest are read again at the next tick. Counted on the
     /// job, shown in its status, and logged at most once every 30 s.
-    fn noteMemoryStall(self: *ProcessingHandler, at: []const u8) void {
+    fn noteMemoryStall(self: *ProcessingHandler, pipe: *PipelineState, at: []const u8) void {
         self.memory_stalls += 1;
+        pipe.stalled_ms = @import("stdx").time.milliTimestamp();
         const job = self.runs.getPtr(self.ticking_job) orelse return;
         self.reported = true;
         job.memory_stalls += 1;
