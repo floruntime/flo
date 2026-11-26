@@ -69,3 +69,5 @@ workflow-runs-step-incarnation.json	runs_step_incarnation_unchecked	--workflows	
 actions-counts-unmoved.json	actions_counts_unmoved	--actions	-	action_rule	counts are not a recount of its runs
 workflow-history-fold-total-dropped.json	history_fold_total_dropped	--workflows	-	workflow_run_rule	history usage is not the sum of its rows. totals
 workflow-history-drop-unread.json	history_drop_unread	--workflows	-	workflow_run_rule	a namespace with no history rows has a usage row
+workflow-quota-end-keeps-reserve.json	quota_end_keeps_reserve	--workflows	-	workflow_run_rule	reserve (is not the sum|row)
+actions-quota-end-keeps-reserve.json	quota_action_end_keeps_reserve	--actions	-	action_rule	reserve (is not the sum|row)
