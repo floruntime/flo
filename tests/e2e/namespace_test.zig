@@ -412,7 +412,7 @@ test "e2e/namespace: a read the leader answers in a namespace never created is r
 const QuotaInfo = struct {
     history_quota: ?u64,
     history_quota_own: bool,
-    shards: []const struct { shard: u16, bound: bool, part_bytes: ?u64, usage_bytes: u64, reserved_workflow_bytes: u64 = 0, reserved_action_bytes: u64 = 0 },
+    shards: []const struct { shard: u16, bound: bool, part_bytes: ?u64, usage_bytes: u64, reserved_workflow_bytes: u64 = 0, reserved_action_bytes: u64 = 0, in_flight_bytes: u64 = 0, held_runs: ?u32 = null },
 };
 
 fn quotaInfo(ctx: *stdx.testing.TestContext, name: []const u8) !std.json.Parsed(QuotaInfo) {
@@ -825,4 +825,111 @@ test "e2e/namespace: on 12 shards, in a namespace of its own, a call and a child
         stdx.time.sleep(100 * std.time.ns_per_ms);
     }
     try testing.expect(started);
+}
+
+/// Each shard's held runs and in-flight history in `ns`'s info.
+fn heldOn(ctx: *stdx.testing.TestContext, ns: []const u8, shard: u16) !struct { held: ?u32, in_flight: u64, usage: u64 } {
+    const info = try quotaInfo(ctx, ns);
+    defer info.deinit();
+    for (info.value.shards) |s| if (s.shard == shard) return .{ .held = s.held_runs, .in_flight = s.in_flight_bytes, .usage = s.usage_bytes };
+    return error.NoSuchShard;
+}
+
+test "e2e/namespace: on 12 shards, in a namespace of its own, a run's steps are held once its shard's history reaches the part, info shows it held there alone, and it goes on once the quota is lifted" {
+    const shards = 12;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards } });
+    defer ctx.deinit();
+    const ns = "qh-ns";
+    try ctx.exec(&.{ "namespace", "create", ns });
+    var nb: [16]u8 = undefined;
+    const wf = try nameOff(&nb, "qh-wf-", &.{});
+    const at = shardIn(wf);
+    var def_buf: [512]u8 = undefined;
+    const def = try std.fmt.bufPrint(&def_buf,
+        \\kind: Workflow
+        \\name: {s}
+        \\version: 1.0.0
+        \\start.wait_for_signal.type: proceed
+        \\start.wait_for_signal.timeout_ms: 300000
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.timeout: flo.Failed
+    , .{wf});
+    const path = try stdx.testing.writeDottedToTempYaml(testing.allocator, def, "qh-wf.yaml");
+    defer stdx.testing.cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", ns });
+    // Under the default quota: ninety starts whose inputs, kept in their
+    // history, take the workflow's shard past the floor's part.
+    const big = try testing.allocator.alloc(u8, 3_000);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    big[0] = '"';
+    big[big.len - 1] = '"';
+    for (0..90) |k| {
+        var rb: [16]u8 = undefined;
+        try ctx.exec(&.{ "workflow", "start", wf, big, "--run-id", try std.fmt.bufPrint(&rb, "qh-fill-{d}", .{k}), "-n", ns });
+    }
+    try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", "qh-held", "-n", ns });
+    var waiting = false;
+    for (0..100) |_| {
+        var w = try ctx.cli.run(&.{ "workflow", "status", "qh-held", "-n", ns });
+        defer w.deinit();
+        if (std.mem.indexOf(u8, w.stdout, "waiting") != null) {
+            waiting = true;
+            break;
+        }
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expect(waiting);
+    const floor: u64 = 214_905;
+    var used: u64 = 0;
+    for (0..100) |_| {
+        used = (try heldOn(ctx, ns, at)).usage;
+        if (used >= 90 * 3_000) break;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expect(used >= 90 * 3_000);
+    var qb: [32]u8 = undefined;
+    try ctx.exec(&.{ "namespace", "alter", ns, "--history-quota", try std.fmt.bufPrint(&qb, "{d}", .{floor * shards}), "--config", ctx.server.config_file });
+    try expectBound(ctx, ns, shards, floor);
+    const before = try heldOn(ctx, ns, at);
+    try testing.expect(before.in_flight >= floor);
+    // The signal it waits on is let in: its step, to its end, is held.
+    try ctx.exec(&.{ "workflow", "signal", "qh-held", "--type", "proceed", "-n", ns });
+    var held = false;
+    for (0..100) |_| {
+        if ((try heldOn(ctx, ns, at)).held == 1) {
+            held = true;
+            break;
+        }
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expect(held);
+    // Held on its own shard alone, read from the server: every other shard
+    // holds none.
+    {
+        const info = try quotaInfo(ctx, ns);
+        defer info.deinit();
+        try testing.expectEqual(@as(usize, shards), info.value.shards.len);
+        for (info.value.shards) |s| try testing.expectEqual(@as(?u32, if (s.shard == at) 1 else 0), s.held_runs);
+    }
+    stdx.time.sleep(500 * std.time.ns_per_ms);
+    var st = try ctx.cli.run(&.{ "workflow", "status", "qh-held", "-n", ns });
+    defer st.deinit();
+    try testing.expect(std.mem.indexOf(u8, st.stdout, "completed") == null);
+    // Lifted: the bind eases the namespace, its hold is asked, and the run
+    // takes its step to its end.
+    try ctx.exec(&.{ "namespace", "alter", ns, "--history-quota", "none", "--config", ctx.server.config_file });
+    try expectBound(ctx, ns, shards, null);
+    var done = false;
+    for (0..100) |_| {
+        var s2 = try ctx.cli.run(&.{ "workflow", "status", "qh-held", "-n", ns });
+        defer s2.deinit();
+        if (std.mem.indexOf(u8, s2.stdout, "completed") != null) {
+            done = true;
+            break;
+        }
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expect(done);
+    try testing.expectEqual(@as(?u32, 0), (try heldOn(ctx, ns, at)).held);
 }
