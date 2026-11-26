@@ -73,13 +73,34 @@ pub const Counts = Record(&.{
     .{ .name = "live", .T = Int(u32) },
 });
 
-/// A namespace's settings, set by an alter: its run-history quota in bytes
-/// over every shard (`NO_QUOTA` for none), and the log index that set it,
-/// which shard 0 publishes with it.
+/// A namespace's settings, set by an alter: how its run-history quota is
+/// set (the default, none, or `bytes` over every shard), and the log index
+/// that set it, which shard 0 publishes with it. An alter back to the
+/// default keeps a row, so the index a namespace's quota is published
+/// under only rises: a shard's stale-bind check holds across it, and across
+/// a restart.
+pub const QuotaMode = @import("../protocol/namespace_ops.zig").QuotaMode;
 pub const Settings = Record(&.{
-    .{ .name = "history_quota", .T = Int(u64) },
+    .{ .name = "mode", .T = schema.Enum(QuotaMode) },
+    .{ .name = "bytes", .T = Int(u64) },
     .{ .name = "set_index", .T = Int(u64) },
 });
+
+/// The quota a namespace's setting gives, over every shard: the default for
+/// none set or one set back to it, `NO_QUOTA` for none.
+pub fn quotaOf(s: ?Settings.Value) u64 {
+    const set = s orelse return DEFAULT_HISTORY_QUOTA;
+    return switch (set.mode) {
+        .default => DEFAULT_HISTORY_QUOTA,
+        .none => NO_QUOTA,
+        .bytes => set.bytes,
+    };
+}
+
+/// Whether a namespace's setting is its own, not the default.
+pub fn quotaOwn(s: ?Settings.Value) bool {
+    return if (s) |set| set.mode != .default else false;
+}
 
 pub const NameFam = view_mod.Family(4, "namespace.name", .shard, Stored(Meta));
 pub const CountsFam = view_mod.Family(5, "namespace.meta", .shard, Stored(Counts));
@@ -136,12 +157,14 @@ pub fn settings(read: ReadView, name: []const u8) ?Settings.Value {
     return if (got) |s| s.v else null;
 }
 
-/// Why a quota of `bytes` can't be set, held to `floor` bytes: null if it
-/// can. None (`NO_QUOTA`) always can.
-pub fn quotaRefusal(bytes: u64, floor: u64) ?[]const u8 {
-    if (bytes == NO_QUOTA) return null;
-    if (bytes == 0) return "bad request: a history quota of 0 would refuse every run; set none to turn it off";
-    if (bytes < floor) return "bad request: a history quota is at least one run's reserve on every shard";
+/// Why a quota set as `mode` with `bytes` can't be, held to `floor` bytes:
+/// null if it can. Bytes come with the bytes mode and only with it.
+pub fn quotaRefusal(mode: QuotaMode, bytes: ?u64, floor: u64) ?[]const u8 {
+    if (mode != .bytes) return if (bytes == null) null else "bad request: a history quota's bytes come with its bytes mode only";
+    const b = bytes orelse return "bad request: a history quota set in bytes needs its bytes";
+    if (b == 0) return "bad request: a history quota of 0 would refuse every run; set none to turn it off";
+    if (b == NO_QUOTA) return "bad request: a history quota is at most 2^64 - 2 bytes; set none to turn it off";
+    if (b < floor) return "bad request: a history quota is at least one run's reserve on every shard";
     return null;
 }
 
@@ -226,8 +249,8 @@ fn applyAlter(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     var kb: [1 + MAX_NAME_LEN]u8 = undefined;
     const k = nameKey(&kb, a.name);
     if (!isDefault(a.name) and try view.get(NameFam, k) == null) return out.refuse(.no_namespace, .not_found, "namespace not found");
-    if (quotaRefusal(a.history_quota, PART_FLOOR)) |why| return out.refuse(.bad_request, .out_of_range, why);
-    try view.put(SettingsFam, k, .{ .v = .{ .history_quota = a.history_quota, .set_index = e.header.index } });
+    if (quotaRefusal(a.mode, if (a.mode == .bytes) a.bytes else if (a.bytes == 0) null else a.bytes, PART_FLOOR)) |why| return out.refuse(.bad_request, .out_of_range, why);
+    try view.put(SettingsFam, k, .{ .v = .{ .mode = a.mode, .bytes = if (a.mode == .bytes) a.bytes else 0, .set_index = e.header.index } });
 }
 
 pub const machine: machine_mod.Machine = .{
@@ -324,31 +347,37 @@ test "namespaces machine: the room is the live count, and a full registry halts 
     try testing.expectError(error.Halt, f.create(MAX_LIVE, "one-more", counts(f.read()).next_id));
 }
 
-fn alter(f: *Fixture, index: u64, name: []const u8, quota: u64) !Result {
+fn alter(f: *Fixture, index: u64, name: []const u8, mode: QuotaMode, bytes: u64) !Result {
     var buf: [namespace_entries.Alter.max_size]u8 = undefined;
-    const bytes = namespace_entries.Alter.encodeInto(&buf, .{ .name = name, .history_quota = quota }) catch unreachable;
-    const e = entry_mod.buildEntry(.namespace_alter, 0, 1, index, index * 1000, bytes);
+    const encoded = namespace_entries.Alter.encodeInto(&buf, .{ .name = name, .mode = mode, .bytes = bytes }) catch unreachable;
+    const e = entry_mod.buildEntry(.namespace_alter, 0, 1, index, index * 1000, encoded);
     var out = Result.start(&e);
     try machine_mod.applyEntry(&machine, &f.store, &f.scratch, &e, &out);
     return out;
 }
 
-test "namespaces machine: an alter sets a namespace's quota with its index, default's too; one of none keeps a row; a namespace not there, a quota of 0 or below the floor is refused and sets nothing" {
+test "namespaces machine: an alter sets a namespace's quota with its index, default's too; none and back to the default keep a row; a namespace not there, a quota of 0, below the floor, or bytes with another mode is refused and sets nothing" {
     var f = Fixture.init(0);
     defer f.deinit();
     try f.create(1, "orders", ns_table.FIRST_ALLOCATED.int());
-    try testing.expect((try alter(&f, 2, "orders", 20 << 30)).refused() == null);
-    try testing.expectEqual(Settings.Value{ .history_quota = 20 << 30, .set_index = 2 }, settings(f.read(), "orders").?);
-    try testing.expect((try alter(&f, 3, "default", NO_QUOTA)).refused() == null);
-    try testing.expectEqual(Settings.Value{ .history_quota = NO_QUOTA, .set_index = 3 }, settings(f.read(), "default").?);
-    for ([_]struct { []const u8, u64 }{ .{ "never", 20 << 30 }, .{ "orders", 0 }, .{ "orders", PART_FLOOR - 1 } }) |c| {
-        const out = try alter(&f, 4, c[0], c[1]);
+    try testing.expect((try alter(&f, 2, "orders", .bytes, 20 << 30)).refused() == null);
+    try testing.expectEqual(Settings.Value{ .mode = .bytes, .bytes = 20 << 30, .set_index = 2 }, settings(f.read(), "orders").?);
+    try testing.expectEqual(@as(u64, 20 << 30), quotaOf(settings(f.read(), "orders")));
+    try testing.expect((try alter(&f, 3, "default", .none, 0)).refused() == null);
+    try testing.expectEqual(NO_QUOTA, quotaOf(settings(f.read(), "default")));
+    // Back to the default: its own no longer, its index risen.
+    try testing.expect((try alter(&f, 4, "orders", .default, 0)).refused() == null);
+    try testing.expectEqual(Settings.Value{ .mode = .default, .bytes = 0, .set_index = 4 }, settings(f.read(), "orders").?);
+    try testing.expectEqual(DEFAULT_HISTORY_QUOTA, quotaOf(settings(f.read(), "orders")));
+    try testing.expect(!quotaOwn(settings(f.read(), "orders")));
+    for ([_]struct { []const u8, QuotaMode, u64 }{ .{ "never", .bytes, 20 << 30 }, .{ "orders", .bytes, 0 }, .{ "orders", .bytes, PART_FLOOR - 1 }, .{ "orders", .none, 20 << 30 }, .{ "orders", .bytes, NO_QUOTA } }) |c| {
+        const out = try alter(&f, 5, c[0], c[1], c[2]);
         try testing.expect(out.refused() != null);
     }
-    try testing.expectEqual(@as(u64, 2), settings(f.read(), "orders").?.set_index);
+    try testing.expectEqual(@as(u64, 4), settings(f.read(), "orders").?.set_index);
     try testing.expect(settings(f.read(), "never") == null);
     // Only shard 0 logs alters.
     var other = Fixture.init(1);
     defer other.deinit();
-    try testing.expectError(error.Halt, alter(&other, 1, "default", NO_QUOTA));
+    try testing.expectError(error.Halt, alter(&other, 1, "default", .none, 0));
 }

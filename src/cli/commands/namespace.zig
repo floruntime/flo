@@ -93,7 +93,7 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
                     "flo namespace alter myapp --history-quota none",
                 })
                 .arg("name", "Name of the namespace")
-                .stringFlag("history-quota", 0, "", "Bytes over every shard (a number, or with KiB, MiB, GiB or TiB), or none to turn it off")
+                .stringFlag("history-quota", 0, "", "Bytes over every shard (a number, or with KiB, MiB, GiB or TiB), none to turn it off, or default for the server's")
                 .action(wrapHandler(runAlter)),
         )
         .build();
@@ -186,30 +186,33 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     }
 }
 
-/// A quota as the flag gives it: bytes, a number with a binary unit, or
-/// none (null). Errors for anything else, or 0.
-pub fn parseQuota(text: []const u8) error{Invalid}!?u64 {
-    if (std.mem.eql(u8, text, "none")) return null;
+/// A quota as the flag gives it: `default`, `none`, or bytes, a number with
+/// an optional binary unit, above 0 and at most the wire's most. Errors for
+/// anything else.
+pub fn parseQuota(text: []const u8) error{Invalid}!struct { mode: namespace_ops.QuotaMode, bytes: ?u64 } {
+    if (std.mem.eql(u8, text, "none")) return .{ .mode = .none, .bytes = null };
+    if (std.mem.eql(u8, text, "default")) return .{ .mode = .default, .bytes = null };
     const units = [_]struct { []const u8, u64 }{ .{ "TiB", 1 << 40 }, .{ "GiB", 1 << 30 }, .{ "MiB", 1 << 20 }, .{ "KiB", 1 << 10 }, .{ "B", 1 } };
-    for (units) |u| if (std.mem.endsWith(u8, text, u[0])) {
-        const n = std.fmt.parseInt(u64, text[0 .. text.len - u[0].len], 10) catch return error.Invalid;
-        const bytes = std.math.mul(u64, n, u[1]) catch return error.Invalid;
-        return if (bytes == 0) error.Invalid else bytes;
-    };
-    const bytes = std.fmt.parseInt(u64, text, 10) catch return error.Invalid;
-    return if (bytes == 0) error.Invalid else bytes;
+    const bytes = for (units) |u| {
+        if (std.mem.endsWith(u8, text, u[0])) {
+            const n = std.fmt.parseInt(u64, text[0 .. text.len - u[0].len], 10) catch return error.Invalid;
+            break std.math.mul(u64, n, u[1]) catch return error.Invalid;
+        }
+    } else std.fmt.parseInt(u64, text, 10) catch return error.Invalid;
+    if (bytes == 0 or bytes > std.math.maxInt(u64) - 1) return error.Invalid;
+    return .{ .mode = .bytes, .bytes = bytes };
 }
 
 fn runAlter(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?;
     const text = ctx.getString("history-quota") orelse "";
-    if (text.len == 0) return outcome.usage(ctx, "give --history-quota <bytes|none>", .{});
-    const quota = parseQuota(text) catch return outcome.usage(ctx, "--history-quota is a number of bytes above 0 (optionally with KiB, MiB, GiB or TiB), or none", .{});
+    if (text.len == 0) return outcome.usage(ctx, "give --history-quota <bytes|none|default>", .{});
+    const quota = parseQuota(text) catch return outcome.usage(ctx, "--history-quota is a number of bytes above 0 and below 2^64 - 1 (optionally with KiB, MiB, GiB or TiB), none, or default", .{});
     const endpoint = cli_config.getEndpoint(ctx);
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-    var result = client_mod.namespace.alter(&client, name, quota) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.namespace.alter(&client, name, quota.mode, quota.bytes) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
     try outcome.check(ctx, result);
     ctx.print("OK\n", .{});
@@ -241,7 +244,7 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
                 if (!first) out.append(ctx.allocator, ',') catch return error.OutOfMemory;
                 out.print(ctx.allocator, "{{\"shard\":{d},\"bound\":{},\"part_bytes\":", .{ s.shard, s.bound }) catch return error.OutOfMemory;
                 (if (s.part_bytes) |p| out.print(ctx.allocator, "{d}", .{p}) else out.appendSlice(ctx.allocator, "null")) catch return error.OutOfMemory;
-                out.print(ctx.allocator, ",\"usage_bytes\":{d},\"reserved_workflow_bytes\":{d},\"reserved_action_bytes\":{d},\"orphans\":{d},\"orphan_bytes\":{d},\"held_runs\":{d}}}", .{ s.usage_bytes, s.reserved_workflow_bytes, s.reserved_action_bytes, s.orphans, s.orphan_bytes, s.held_runs }) catch return error.OutOfMemory;
+                out.print(ctx.allocator, ",\"usage_bytes\":{d},\"orphans\":{d},\"orphan_bytes\":{d}}}", .{ s.usage_bytes, s.orphans, s.orphan_bytes }) catch return error.OutOfMemory;
             }
             ctx.print("{{\"name\":{f},\"created_at_ms\":{d},\"history_quota\":", .{ output.jsonString(name), info.created_at_ms });
             if (info.history_quota) |q| ctx.print("{d}", .{q}) else ctx.print("null", .{});

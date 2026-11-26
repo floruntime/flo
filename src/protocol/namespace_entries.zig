@@ -17,11 +17,12 @@ pub const Create = Record(&.{
     .{ .name = "id", .T = Id },
 });
 
-/// A namespace's run-history quota set, in bytes over every shard;
-/// `NO_QUOTA` for none. The built-in "default" namespace may be named.
+/// A namespace's run-history quota set: the default, none, or `bytes` over
+/// every shard. The built-in "default" namespace may be named.
 pub const Alter = Record(&.{
     .{ .name = "name", .T = namespace_ops.Name },
-    .{ .name = "history_quota", .T = schema.Int(u64) },
+    .{ .name = "mode", .T = schema.Enum(namespace_ops.QuotaMode) },
+    .{ .name = "bytes", .T = schema.Int(u64) },
 });
 
 /// A quota of none, as the log and the store hold it; the wire says none

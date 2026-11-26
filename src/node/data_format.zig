@@ -266,7 +266,7 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // A namespace's run-history quota set by an alter and bound per shard
     // (namespace.settings, settings.quota); a completion's detail held at
     // apply to a cancel reason's bound.
-    .{ .format = 73, .segment_version = 44, .entries = 0x59128684bb98d69e },
+    .{ .format = 73, .segment_version = 44, .entries = 0x8aa1807f14af4929 },
 };
 
 comptime {

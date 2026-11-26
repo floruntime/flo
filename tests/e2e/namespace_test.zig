@@ -461,6 +461,17 @@ test "e2e/namespace: a namespace's run-history quota is bound on every shard, it
         try testing.expectEqual(@as(?u64, null), info.value.history_quota);
         try testing.expect(info.value.history_quota_own);
     }
+    // Back to the default: its part is the default's again, and its own no
+    // longer.
+    try ctx.exec(&.{ "namespace", "alter", "hq", "--history-quota", "default" });
+    try expectBound(ctx, "hq", shards, (10 << 30) / shards);
+    {
+        const info = try quotaInfo(ctx, "hq");
+        defer info.deinit();
+        try testing.expect(!info.value.history_quota_own);
+    }
+    try ctx.exec(&.{ "namespace", "alter", "hq", "--history-quota", "none" });
+    try expectBound(ctx, "hq", shards, null);
     // The built-in default namespace takes one too.
     try expectBound(ctx, "default", shards, (10 << 30) / shards);
     // Below one run's reserve on every shard, refused by the server by
@@ -472,6 +483,9 @@ test "e2e/namespace: a namespace's run-history quota is bound on every shard, it
     var zero = try ctx.cli.run(&.{ "namespace", "alter", "hq", "--history-quota", "0" });
     defer zero.deinit();
     try stdx.testing.assertContains(zero, "--history-quota is a number of bytes above 0");
+    var huge = try ctx.cli.run(&.{ "namespace", "alter", "hq", "--history-quota", "18446744073709551615" });
+    defer huge.deinit();
+    try stdx.testing.assertContains(huge, "--history-quota is a number of bytes above 0");
     var missing = try ctx.cli.run(&.{ "namespace", "alter", "never-made", "--history-quota", "20GiB" });
     defer missing.deinit();
     try stdx.testing.assertContains(missing, "not found");
