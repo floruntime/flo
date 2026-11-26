@@ -943,3 +943,88 @@ test "e2e/namespace: on 12 shards, in a namespace of its own, a run's steps are 
     try testing.expect(done);
     try testing.expectEqual(@as(?u32, 0), (try heldOn(ctx, ns, at)).held);
 }
+
+/// The first `prefix`-N on shard `at`.
+fn nameOn(buf: []u8, prefix: []const u8, at: u16) ![]const u8 {
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const name = try std.fmt.bufPrint(buf, "{s}{d}", .{ prefix, i });
+        if (shardIn(name) == at) return name;
+    }
+}
+
+/// How many runs of `wf` in `ns` the server lists.
+fn runsOf(ctx: *stdx.testing.TestContext, ns: []const u8, wf: []const u8) !usize {
+    var r = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", wf, "--limit", "1000", "-n", ns, "-o", "json" });
+    defer r.deinit();
+    var n: usize = 0;
+    var it = std.mem.splitSequence(u8, r.stdout, "\"run_id\"");
+    _ = it.next();
+    while (it.next()) |_| n += 1;
+    return n;
+}
+
+test "e2e/namespace: on 12 shards, in a namespace of its own, a schedule and a trigger at their shard's part start nothing, and start again once the quota is lifted" {
+    const shards = 12;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards } });
+    defer ctx.deinit();
+    const ns = "qs-ns";
+    try ctx.exec(&.{ "namespace", "create", ns });
+    var fb: [16]u8 = undefined;
+    const filler = try nameOff(&fb, "qs-fill-", &.{});
+    const at = shardIn(filler);
+    var sb: [16]u8 = undefined;
+    const sched = try nameOn(&sb, "qs-sched-", at);
+    var tb: [16]u8 = undefined;
+    const trig = try nameOn(&tb, "qs-trig-", at);
+    var y: [3][512]u8 = undefined;
+    const defs = [_][]const u8{
+        try std.fmt.bufPrint(&y[0], "kind: Workflow\nname: {s}\nversion: 1.0.0\nstart:\n  wait_for_signal:\n    type: never\n  transitions:\n    success: flo.Completed\n", .{filler}),
+        try std.fmt.bufPrint(&y[1], "kind: Workflow\nname: {s}\nversion: 1.0.0\nschedule:\n  interval: 200\nstart:\n  wait_for_signal:\n    type: never\n  transitions:\n    success: flo.Completed\n", .{sched}),
+        try std.fmt.bufPrint(&y[2], "kind: Workflow\nname: {s}\nversion: 1.0.0\ntrigger:\n  stream: qs-events\nstart:\n  wait_for_signal:\n    type: never\n  transitions:\n    success: flo.Completed\n", .{trig}),
+    };
+    // The filler first, then its history past the floor's part on its shard.
+    {
+        var pb: [32]u8 = undefined;
+        const path = try stdx.testing.writeTempYaml(testing.allocator, defs[0], try std.fmt.bufPrint(&pb, "qs-def-0.yaml", .{}));
+        defer stdx.testing.cleanupTempFile(testing.allocator, path);
+        try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", ns });
+    }
+    const big = try testing.allocator.alloc(u8, 3_000);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    big[0] = '"';
+    big[big.len - 1] = '"';
+    for (0..90) |k| {
+        var rb: [16]u8 = undefined;
+        try ctx.exec(&.{ "workflow", "start", filler, big, "--run-id", try std.fmt.bufPrint(&rb, "qs-f-{d}", .{k}), "-n", ns });
+    }
+    const floor: u64 = 214_905;
+    var qb: [32]u8 = undefined;
+    try ctx.exec(&.{ "namespace", "alter", ns, "--history-quota", try std.fmt.bufPrint(&qb, "{d}", .{floor * shards}), "--config", ctx.server.config_file });
+    try expectBound(ctx, ns, shards, floor);
+    try testing.expect((try heldOn(ctx, ns, at)).in_flight >= floor);
+    for (defs[1..], 1..) |d, i| {
+        var pb: [32]u8 = undefined;
+        const path = try stdx.testing.writeTempYaml(testing.allocator, d, try std.fmt.bufPrint(&pb, "qs-def-{d}.yaml", .{i}));
+        defer stdx.testing.cleanupTempFile(testing.allocator, path);
+        try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", ns });
+    }
+    for (0..3) |_| try ctx.exec(&.{ "stream", "append", "qs-events", "{}", "-n", ns });
+    // A second and more of slots and the trigger's events: nothing starts.
+    stdx.time.sleep(1500 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 0), try runsOf(ctx, ns, sched));
+    try testing.expectEqual(@as(usize, 0), try runsOf(ctx, ns, trig));
+    // Lifted: each starts on its own wait, a missed slot once, late.
+    try ctx.exec(&.{ "namespace", "alter", ns, "--history-quota", "none", "--config", ctx.server.config_file });
+    try expectBound(ctx, ns, shards, null);
+    var both = false;
+    for (0..300) |_| {
+        if (try runsOf(ctx, ns, sched) > 0 and try runsOf(ctx, ns, trig) > 0) {
+            both = true;
+            break;
+        }
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expect(both);
+}
