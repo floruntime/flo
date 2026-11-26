@@ -109,11 +109,7 @@ pub const PollConfig = struct {
 
 // Re-export plan types for inline plans
 pub const SelectionStrategy = plan_types.SelectionStrategy;
-pub const ErrorClassification = plan_types.ErrorClassification;
 pub const ExecutorConfig = plan_types.ExecutorConfig;
-pub const HealthConfig = plan_types.HealthConfig;
-pub const CacheConfig = plan_types.CacheConfig;
-pub const FallbackConfig = plan_types.FallbackConfig;
 
 // =============================================================================
 // Idempotency Mode
@@ -640,44 +636,24 @@ pub const StreamTriggerDef = struct {
 ///   payment:              # <- name comes from here
 ///     selection: health-weighted
 ///     executors:
-///       - action: "@actions/stripe-charge"
-///         priority: 1
+///       - name: stripe
+///         run: "@actions/stripe-charge"
 /// ```
 pub const InlinePlan = struct {
     /// Plan name (from the YAML map key)
     name: []const u8,
     /// Selection strategy for executors
     selection: SelectionStrategy,
-    /// Error classification rules
-    error_classification: ?ErrorClassification,
-    /// Executor configurations (at least one required)
+    /// Executor configurations (at least one required), tried in this order
     executors: []const ExecutorConfig,
-    /// Health tracking configuration
-    health_config: ?HealthConfig,
-    /// Cache configuration
-    cache_config: ?CacheConfig,
-    /// Fallback configuration
-    fallback_config: ?FallbackConfig,
 
     pub fn deinit(self: *InlinePlan, allocator: Allocator) void {
         allocator.free(self.name);
-        if (self.error_classification) |*ec| {
-            var mec = ec.*;
-            mec.deinit(allocator);
-        }
         for (self.executors) |exec| {
             var e = exec;
             e.deinit(allocator);
         }
         if (self.executors.len > 0) allocator.free(@constCast(self.executors));
-        if (self.cache_config) |*cc| {
-            var mcc = cc.*;
-            mcc.deinit(allocator);
-        }
-        if (self.fallback_config) |*fc| {
-            var mfc = fc.*;
-            mfc.deinit(allocator);
-        }
     }
 
     pub fn clone(self: InlinePlan, allocator: Allocator) !InlinePlan {
@@ -687,29 +663,10 @@ pub const InlinePlan = struct {
             executors[i] = try exec.clone(allocator);
         }
 
-        var error_classification: ?ErrorClassification = null;
-        if (self.error_classification) |ec| {
-            error_classification = try ec.clone(allocator);
-        }
-
-        var cache_config: ?CacheConfig = null;
-        if (self.cache_config) |cc| {
-            cache_config = try cc.clone(allocator);
-        }
-
-        var fallback_config: ?FallbackConfig = null;
-        if (self.fallback_config) |fc| {
-            fallback_config = try fc.clone(allocator);
-        }
-
         return .{
             .name = try allocator.dupe(u8, self.name),
             .selection = self.selection,
-            .error_classification = error_classification,
             .executors = executors,
-            .health_config = self.health_config,
-            .cache_config = cache_config,
-            .fallback_config = fallback_config,
         };
     }
 };

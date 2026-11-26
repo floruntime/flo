@@ -84,9 +84,6 @@ pub const ErrorCode = enum {
     // Configuration errors (E4xx)
     invalid_retry_config,
     invalid_breaker_config,
-    invalid_rate_limit_config,
-    invalid_cache_config,
-    invalid_health_config,
 
     // Semantic errors (E5xx)
     conflicting_transitions,
@@ -118,9 +115,6 @@ pub const ErrorCode = enum {
 
             .invalid_retry_config => "E401",
             .invalid_breaker_config => "E402",
-            .invalid_rate_limit_config => "E403",
-            .invalid_cache_config => "E404",
-            .invalid_health_config => "E405",
 
             .conflicting_transitions => "E501",
             .empty_transitions => "E502",
@@ -722,39 +716,6 @@ pub fn validateInlinePlan(result: *ValidationResult, plan: *const InlinePlan) !v
             try result.addError(.invalid_action_reference, msg, exec.name);
         }
     }
-
-    // Validate health config if present
-    if (plan.health_config) |health| {
-        if (health.decay <= 0.0 or health.decay > 1.0) {
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "Plan '{s}' health decay must be in range (0, 1]", .{plan.name}) catch "Invalid health config";
-            try result.addError(.invalid_health_config, msg, plan.name);
-        }
-        if (health.min_samples == 0) {
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "Plan '{s}' health min_samples of 0 may cause unstable routing", .{plan.name}) catch "Invalid health config";
-            try result.addWarning(.invalid_health_config, msg, plan.name);
-        }
-        if (health.window_ms <= 0) {
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "Plan '{s}' health window_ms must be positive", .{plan.name}) catch "Invalid health config";
-            try result.addError(.invalid_health_config, msg, plan.name);
-        }
-    }
-
-    // Validate cache config if present
-    if (plan.cache_config) |cache| {
-        if (cache.ttl_ms <= 0) {
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "Plan '{s}' cache ttl_ms must be positive", .{plan.name}) catch "Invalid cache config";
-            try result.addError(.invalid_cache_config, msg, plan.name);
-        }
-        if (cache.key_template.len == 0) {
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "Plan '{s}' cache key cannot be empty", .{plan.name}) catch "Invalid cache config";
-            try result.addError(.invalid_cache_config, msg, plan.name);
-        }
-    }
 }
 
 /// Validate a single executor configuration
@@ -766,11 +727,6 @@ fn validateExecutorConfig(result: *ValidationResult, exec: ExecutorConfig, plan_
             const msg = std.fmt.bufPrint(&buf, "Executor '{s}' (plan '{s}') has invalid retry max_attempts (must be > 0)", .{ exec.name, plan_name }) catch "Invalid retry config";
             try result.addError(.invalid_retry_config, msg, exec.name);
         }
-        if (retry.initial_delay_ms > retry.max_delay_ms) {
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "Executor '{s}' (plan '{s}') has initial_delay_ms > max_delay_ms", .{ exec.name, plan_name }) catch "Invalid retry config";
-            try result.addError(.invalid_retry_config, msg, exec.name);
-        }
     }
 
     // Validate circuit breaker config
@@ -779,23 +735,6 @@ fn validateExecutorConfig(result: *ValidationResult, exec: ExecutorConfig, plan_
             var buf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "Executor '{s}' (plan '{s}') has invalid breaker failure_threshold (must be > 0)", .{ exec.name, plan_name }) catch "Invalid breaker config";
             try result.addError(.invalid_breaker_config, msg, exec.name);
-        }
-        if (breaker.half_open_max_calls == 0) {
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "Executor '{s}' (plan '{s}') has invalid breaker half_open_max_calls (must be > 0)", .{ exec.name, plan_name }) catch "Invalid breaker config";
-            try result.addError(.invalid_breaker_config, msg, exec.name);
-        }
-    }
-
-    // Validate rate limit config
-    if (exec.rate_limit) |rate_limit| {
-        if (rate_limit.max_per_second == null and
-            rate_limit.max_per_minute == null and
-            rate_limit.max_per_hour == null)
-        {
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "Executor '{s}' (plan '{s}') has rate_limit with no limits set", .{ exec.name, plan_name }) catch "Invalid rate limit config";
-            try result.addWarning(.invalid_rate_limit_config, msg, exec.name);
         }
     }
 }

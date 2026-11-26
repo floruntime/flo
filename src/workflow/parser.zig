@@ -45,15 +45,7 @@ pub const RetryPolicy = plan_types.RetryPolicy;
 pub const BackoffType = plan_types.BackoffType;
 pub const ExecutorConfig = plan_types.ExecutorConfig;
 pub const CircuitBreakerConfig = plan_types.CircuitBreakerConfig;
-pub const TrackingConfig = plan_types.TrackingConfig;
-pub const TrackingMode = plan_types.TrackingMode;
-pub const RateLimitConfig = plan_types.RateLimitConfig;
-pub const CacheConfig = plan_types.CacheConfig;
-pub const FallbackConfig = plan_types.FallbackConfig;
-pub const FallbackCondition = plan_types.FallbackCondition;
-pub const HealthConfig = plan_types.HealthConfig;
 pub const SelectionStrategy = plan_types.SelectionStrategy;
-pub const ErrorClassification = plan_types.ErrorClassification;
 
 // =============================================================================
 // Parse Errors
@@ -70,8 +62,6 @@ pub const ParseError = error{
     InvalidSelectionStrategy,
     InvalidBackoffType,
     InvalidSearchAttrType,
-    InvalidFallbackCondition,
-    InvalidTrackingMode,
     DuplicateStepName,
     DuplicateExecutorName,
     DuplicatePlanName,
@@ -380,18 +370,12 @@ fn parseInlinePlans(allocator: Allocator, root: JsonValue, d: D) ParseError![]In
 }
 
 fn parseInlinePlan(allocator: Allocator, name: []const u8, obj: JsonValue, d: D) ParseError!InlinePlan {
-    try checkKeys(d, obj, &.{ "selection", "errors", "executors", "health", "cache", "fallback" });
+    try checkKeys(d, obj, &.{ "selection", "executors" });
 
     const selection = try oneOf(SelectionStrategy, d, "selection", try optString(d, obj, "selection") orelse "static-order", &.{
         .{ "static-order", .static_order }, .{ "round-robin", .round_robin },
         .{ "random", .random },             .{ "health-weighted", .health_weighted },
     }, ParseError.InvalidSelectionStrategy);
-
-    const error_classification = try parseErrorClassification(allocator, obj, d);
-    errdefer if (error_classification) |*ec| {
-        var mec = ec.*;
-        mec.deinit(allocator);
-    };
 
     const executors = try parseExecutors(allocator, obj, d);
     errdefer {
@@ -403,28 +387,10 @@ fn parseInlinePlan(allocator: Allocator, name: []const u8, obj: JsonValue, d: D)
     }
     if (executors.len == 0) return d.fail(ParseError.EmptyExecutors, "\"executors\" must name at least one executor", .{});
 
-    const health_config = try parseHealthConfig(obj, d);
-
-    const cache_config = try parseCacheConfig(allocator, obj, d);
-    errdefer if (cache_config) |*cc| {
-        var mcc = cc.*;
-        mcc.deinit(allocator);
-    };
-
-    const fallback_config = try parseFallbackConfig(allocator, obj, d);
-    errdefer if (fallback_config) |*fc| {
-        var mfc = fc.*;
-        mfc.deinit(allocator);
-    };
-
     return InlinePlan{
         .name = try dupe(allocator, name),
         .selection = selection,
-        .error_classification = error_classification,
         .executors = executors,
-        .health_config = health_config,
-        .cache_config = cache_config,
-        .fallback_config = fallback_config,
     };
 }
 
@@ -681,14 +647,14 @@ fn parseBackoff(d: D, obj: JsonValue) ParseError!BackoffType {
 }
 
 fn parseRetryPolicy(obj: JsonValue, d: D) ParseError!RetryPolicy {
-    try checkKeys(d, obj, &.{ "max_attempts", "initial_delay_ms", "max_delay_ms", "within_ms", "backoff" });
-    return .{
-        .max_attempts = try optIntAs(u32, d, obj, "max_attempts") orelse 3,
-        .backoff = try parseBackoff(d, obj),
-        .initial_delay_ms = try optIntAs(u32, d, obj, "initial_delay_ms") orelse 1000,
-        .max_delay_ms = try optIntAs(u32, d, obj, "max_delay_ms") orelse 30000,
-        .within_ms = try optIntAs(u64, d, obj, "within_ms"),
-    };
+    // Refused by name rather than as unknown keys: they read as settings a
+    // retry honours, and nothing waits between attempts.
+    inline for (.{ "backoff", "initial_delay_ms", "max_delay_ms", "within_ms" }) |key| {
+        if (obj.object.get(key) != null)
+            return d.fail(ParseError.UnknownKey, "\"retry\" takes no \"{s}\": a retry runs at once after a failure, and delays between retries aren't supported yet (a step's \"poll\" keeps its delays)", .{key});
+    }
+    try checkKeys(d, obj, &.{"max_attempts"});
+    return .{ .max_attempts = try optIntAs(u32, d, obj, "max_attempts") orelse 3 };
 }
 
 fn parsePollConfig(obj: JsonValue, d: D) ParseError!definition.PollConfig {
@@ -729,31 +695,6 @@ fn freeStringList(allocator: Allocator, list: *std.ArrayList([]const u8)) void {
     list.deinit(allocator);
 }
 
-fn parseErrorClassification(allocator: Allocator, root: JsonValue, d: D) ParseError!?ErrorClassification {
-    const classify_obj = try optObject(d, root, "errors") orelse return null;
-    const mark = d.push("errors");
-    defer d.pop(mark);
-    try checkKeys(d, classify_obj, &.{ "retryable", "fatal" });
-
-    var retryable: std.ArrayList([]const u8) = .empty;
-    errdefer freeStringList(allocator, &retryable);
-    var fatal: std.ArrayList([]const u8) = .empty;
-    errdefer freeStringList(allocator, &fatal);
-
-    try parseStringList(allocator, d, classify_obj, "retryable", &retryable);
-    try parseStringList(allocator, d, classify_obj, "fatal", &fatal);
-
-    const retryable_s = retryable.toOwnedSlice(allocator) catch return ParseError.OutOfMemory;
-    errdefer {
-        for (retryable_s) |s| allocator.free(s);
-        allocator.free(retryable_s);
-    }
-    return ErrorClassification{
-        .retryable = retryable_s,
-        .fatal = fatal.toOwnedSlice(allocator) catch return ParseError.OutOfMemory,
-    };
-}
-
 fn parseExecutors(allocator: Allocator, root: JsonValue, d: D) ParseError![]ExecutorConfig {
     const arr = try optArray(d, root, "executors") orelse return missing(d, "executors");
     const list_mark = d.push("executors");
@@ -779,10 +720,9 @@ fn parseExecutors(allocator: Allocator, root: JsonValue, d: D) ParseError![]Exec
 }
 
 fn parseExecutorConfig(allocator: Allocator, obj: JsonValue, d: D) ParseError!ExecutorConfig {
-    try checkKeys(d, obj, &.{ "name", "run", "priority", "retry", "breaker", "tracking", "rate_limit" });
+    try checkKeys(d, obj, &.{ "name", "run", "retry", "breaker" });
     const name = try reqString(d, obj, "name");
     const action = try reqString(d, obj, "run");
-    const priority = try optIntAs(i32, d, obj, "priority") orelse 100;
 
     const retry: ?RetryPolicy = if (try optObject(d, obj, "retry")) |r| blk: {
         const mark = d.push("retry");
@@ -794,111 +734,26 @@ fn parseExecutorConfig(allocator: Allocator, obj: JsonValue, d: D) ParseError!Ex
         defer d.pop(mark);
         break :blk try parseCircuitBreakerConfig(b, d);
     } else null;
-    const tracking: ?TrackingConfig = if (try optObject(d, obj, "tracking")) |t| blk: {
-        const mark = d.push("tracking");
-        defer d.pop(mark);
-        break :blk try parseTrackingConfig(t, d);
-    } else null;
-    const rate_limit: ?RateLimitConfig = if (try optObject(d, obj, "rate_limit")) |r| blk: {
-        const mark = d.push("rate_limit");
-        defer d.pop(mark);
-        break :blk try parseRateLimitConfig(r, d);
-    } else null;
 
     const name_d = try dupe(allocator, name);
     errdefer allocator.free(name_d);
     return ExecutorConfig{
         .name = name_d,
         .action_name = try dupe(allocator, action),
-        .priority = priority,
         .retry = retry,
         .breaker = breaker,
-        .tracking = tracking,
-        .rate_limit = rate_limit,
     };
 }
 
 fn parseCircuitBreakerConfig(obj: JsonValue, d: D) ParseError!CircuitBreakerConfig {
-    try checkKeys(d, obj, &.{ "failure_threshold", "cooldown_ms", "half_open_max_calls" });
+    try checkKeys(d, obj, &.{ "failure_threshold", "cooldown_ms" });
+    // Its defaults are the config's own, so a breaker written with none and
+    // one written with the defaults are the same breaker.
+    const defaults: CircuitBreakerConfig = .{};
     return .{
         // Compared with a signed count of failures, so it stays in i32 range.
-        .failure_threshold = try optIntAs(u31, d, obj, "failure_threshold") orelse 5,
-        .cooldown_ms = try optAtLeast(d, obj, "cooldown_ms", 1) orelse 60000,
-        .half_open_max_calls = try optIntAs(u32, d, obj, "half_open_max_calls") orelse 2,
-    };
-}
-
-fn parseTrackingConfig(obj: JsonValue, d: D) ParseError!TrackingConfig {
-    try checkKeys(d, obj, &.{ "mode", "timeout_ms" });
-    return .{
-        .mode = try oneOf(TrackingMode, d, "mode", try optString(d, obj, "mode") orelse "sync", &.{
-            .{ "sync", .sync }, .{ "async", .async_mode },
-        }, ParseError.InvalidTrackingMode),
-        .timeout_ms = try optAtLeast(d, obj, "timeout_ms", 1),
-    };
-}
-
-fn parseRateLimitConfig(obj: JsonValue, d: D) ParseError!RateLimitConfig {
-    try checkKeys(d, obj, &.{ "max_per_second", "max_per_minute", "max_per_hour" });
-    return .{
-        .max_per_second = try optIntAs(u32, d, obj, "max_per_second"),
-        .max_per_minute = try optIntAs(u32, d, obj, "max_per_minute"),
-        .max_per_hour = try optIntAs(u32, d, obj, "max_per_hour"),
-    };
-}
-
-fn parseHealthConfig(root: JsonValue, d: D) ParseError!?HealthConfig {
-    const health_obj = try optObject(d, root, "health") orelse return null;
-    const mark = d.push("health");
-    defer d.pop(mark);
-    try checkKeys(d, health_obj, &.{ "window_ms", "decay", "min_samples" });
-
-    const window_ms: i64 = try optIntAs(u32, d, health_obj, "window_ms") orelse 300000;
-    if (window_ms == 0) return d.fail(ParseError.InvalidFieldType, "\"window_ms\" must be at least 1", .{});
-
-    return .{
-        .window_ms = window_ms,
-        .decay = try optFloat(d, health_obj, "decay") orelse 0.9,
-        .min_samples = try optIntAs(u32, d, health_obj, "min_samples") orelse 50,
-    };
-}
-
-fn parseCacheConfig(allocator: Allocator, root: JsonValue, d: D) ParseError!?CacheConfig {
-    const cache_obj = try optObject(d, root, "cache") orelse return null;
-    const mark = d.push("cache");
-    defer d.pop(mark);
-    try checkKeys(d, cache_obj, &.{ "ttl_ms", "key", "invalidate_on" });
-
-    const ttl_ms = try optAtLeast(d, cache_obj, "ttl_ms", 1) orelse 300000;
-    const key_template = try reqString(d, cache_obj, "key");
-
-    var invalidate_on: std.ArrayList([]const u8) = .empty;
-    errdefer freeStringList(allocator, &invalidate_on);
-    try parseStringList(allocator, d, cache_obj, "invalidate_on", &invalidate_on);
-
-    const key_d = try dupe(allocator, key_template);
-    errdefer allocator.free(key_d);
-    return CacheConfig{
-        .ttl_ms = ttl_ms,
-        .key_template = key_d,
-        .invalidate_on = invalidate_on.toOwnedSlice(allocator) catch return ParseError.OutOfMemory,
-    };
-}
-
-fn parseFallbackConfig(allocator: Allocator, root: JsonValue, d: D) ParseError!?FallbackConfig {
-    const fallback_obj = try optObject(d, root, "fallback") orelse return null;
-    const mark = d.push("fallback");
-    defer d.pop(mark);
-    try checkKeys(d, fallback_obj, &.{ "value", "condition" });
-
-    const value = try reqString(d, fallback_obj, "value");
-    const condition = try oneOf(FallbackCondition, d, "condition", try optString(d, fallback_obj, "condition") orelse "exhausted", &.{
-        .{ "exhausted", .exhausted }, .{ "any_error", .any_error },
-    }, ParseError.InvalidFallbackCondition);
-
-    return FallbackConfig{
-        .value = try dupe(allocator, value),
-        .condition = condition,
+        .failure_threshold = try optIntAs(u31, d, obj, "failure_threshold") orelse defaults.failure_threshold,
+        .cooldown_ms = try optAtLeast(d, obj, "cooldown_ms", 1) orelse defaults.cooldown_ms,
     };
 }
 
@@ -961,7 +816,6 @@ test "parseWorkflow: exponential_jitter backoff parses to jitter" {
         \\  "version": "1.0.0",
         \\  "start": {
         \\    "run": "@actions/x",
-        \\    "retry": { "max_attempts": 3, "backoff": "exponential_jitter", "initial_delay_ms": 10 },
         \\    "poll":  { "max_attempts": 3, "backoff": "exponential_jitter", "base_delay_ms": 10 },
         \\    "transitions": { "success": "flo.Completed", "failure": "flo.Failed" }
         \\  }
@@ -971,7 +825,6 @@ test "parseWorkflow: exponential_jitter backoff parses to jitter" {
     var def = try parseWorkflow(allocator, json, null);
     defer def.deinit(allocator);
 
-    try testing.expectEqual(BackoffType.exponential_jitter, def.start.run.retry.?.backoff);
     try testing.expectEqual(BackoffType.exponential_jitter, def.start.run.poll.?.backoff);
 }
 
@@ -1050,7 +903,6 @@ test "parseWorkflow: YAML with inline plans" {
         \\    executors:
         \\      - name: stripe
         \\        run: "@actions/charge-stripe"
-        \\        priority: 100
         \\
         \\start:
         \\  run: "@plan/payment"
@@ -1173,7 +1025,6 @@ test "parseWorkflow: a count or delay that doesn't fit its field is refused" {
     const allocator = testing.allocator;
     for ([_][]const u8{
         "\"retry\": { \"max_attempts\": -1 }",
-        "\"retry\": { \"initial_delay_ms\": 5000000000 }",
         "\"poll\": { \"max_attempts\": 5000000000 }",
         "\"poll\": { \"base_delay_ms\": -1 }",
     }) |field| {
@@ -1271,27 +1122,62 @@ test "parseWorkflow: a value of the wrong kind is refused, not defaulted" {
     try expectRefused(wrap("", "\"search_attributes\": [ \"a\" ],"), ParseError.InvalidFieldType, "a search attribute must be a map, not a string at search_attributes[0]");
 }
 
+test "parseWorkflow: a retry delay is refused by name, on a step and on an executor" {
+    const msg = "a retry runs at once after a failure, and delays between retries aren't supported yet (a step's \"poll\" keeps its delays)";
+    try expectRefused(wrap("\"retry\": { \"max_attempts\": 2, \"backoff\": \"constant\" },", ""), ParseError.UnknownKey, "\"retry\" takes no \"backoff\": " ++ msg ++ " at start.retry");
+    try expectRefused(wrap("\"retry\": { \"initial_delay_ms\": 10 },", ""), ParseError.UnknownKey, "\"retry\" takes no \"initial_delay_ms\": " ++ msg ++ " at start.retry");
+    try expectRefused(wrap("\"retry\": { \"max_delay_ms\": 10 },", ""), ParseError.UnknownKey, "\"retry\" takes no \"max_delay_ms\": " ++ msg ++ " at start.retry");
+    try expectRefused(wrap("\"retry\": { \"within_ms\": 10 },", ""), ParseError.UnknownKey, "\"retry\" takes no \"within_ms\": " ++ msg ++ " at start.retry");
+    try expectRefused(wrap("",
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "retry": { "max_attempts": 2, "initial_delay_ms": 10 } } ] } },
+    ), ParseError.UnknownKey, "\"retry\" takes no \"initial_delay_ms\": " ++ msg ++ " at plans.p.executors[0].retry");
+}
+
 test "parseWorkflow: an unknown enum value is refused, not defaulted" {
-    try expectRefused(wrap("\"retry\": { \"backoff\": \"exp-jitter-200ms\" },", ""), ParseError.InvalidBackoffType, "\"backoff\" must be one of constant|linear|exponential|exponential_jitter, not \"exp-jitter-200ms\" at start.retry");
+    try expectRefused(wrap("\"poll\": { \"backoff\": \"exp-jitter-200ms\" },", ""), ParseError.InvalidBackoffType, "\"backoff\" must be one of constant|linear|exponential|exponential_jitter, not \"exp-jitter-200ms\" at start.poll");
     try expectRefused(wrap("", "\"terminals\": { \"T\": { \"status\": \"done\" } },"), ParseError.InvalidFieldType, "\"status\" must be one of completed|failed|cancelled|timed_out, not \"done\" at terminals.T");
     try expectRefused(wrap("",
         \\"plans": { "p": { "selection": "round_robin", "executors": [ { "name": "e", "run": "@actions/e" } ] } },
     ), ParseError.InvalidSelectionStrategy, "\"selection\" must be one of static-order|round-robin|random|health-weighted, not \"round_robin\" at plans.p");
+}
+
+test "parseWorkflow: a plan option nothing enforces is refused by name" {
+    // Each was once parsed and never read: refused, so a plan doesn't seem
+    // to do what it can't.
     try expectRefused(wrap("",
-        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "tracking": { "mode": "later" } } ] } },
-    ), ParseError.InvalidTrackingMode, "\"mode\" must be one of sync|async, not \"later\" at plans.p.executors[0].tracking");
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "priority": 1 } ] } },
+    ), ParseError.UnknownKey, "unknown key \"priority\" at plans.p.executors[0]");
     try expectRefused(wrap("",
-        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e" } ], "fallback": { "value": "{}", "condition": "any" } } },
-    ), ParseError.InvalidFallbackCondition, "\"condition\" must be one of exhausted|any_error, not \"any\" at plans.p.fallback");
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "tracking": { "mode": "async" } } ] } },
+    ), ParseError.UnknownKey, "unknown key \"tracking\" at plans.p.executors[0]");
     try expectRefused(wrap("",
-        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e" } ], "health": { "window": "5m" } } },
-    ), ParseError.UnknownKey, "unknown key \"window\" at plans.p.health");
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "rate_limit": { "max_per_second": 5 } } ] } },
+    ), ParseError.UnknownKey, "unknown key \"rate_limit\" at plans.p.executors[0]");
+    try expectRefused(wrap("",
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "breaker": { "half_open_max_calls": 2 } } ] } },
+    ), ParseError.UnknownKey, "unknown key \"half_open_max_calls\" at plans.p.executors[0].breaker");
+    for ([_][]const u8{ "errors", "health", "cache", "fallback" }) |key| {
+        var jb: [256]u8 = undefined;
+        var mb: [128]u8 = undefined;
+        try expectRefused(try std.fmt.bufPrint(&jb,
+            \\{{ "kind": "Workflow", "name": "w", "version": "1", "start": {{ "run": "@plan/p", "transitions": {{}} }},
+            \\  "plans": {{ "p": {{ "executors": [ {{ "name": "e", "run": "@actions/e" }} ], "{s}": {{}} }} }} }}
+        , .{key}), ParseError.UnknownKey, try std.fmt.bufPrint(&mb, "unknown key \"{s}\" at plans.p", .{key}));
+    }
+}
+
+test "parseWorkflow: a breaker written with no settings is one written with the defaults" {
+    const allocator = std.testing.allocator;
+    var def = try parseWorkflow(allocator,
+        \\{ "kind": "Workflow", "name": "w", "version": "1", "start": { "run": "@plan/p", "transitions": {} },
+        \\  "plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "breaker": {} } ] } } }
+    , null);
+    defer def.deinit(allocator);
+    const defaults: CircuitBreakerConfig = .{};
+    try std.testing.expectEqual(defaults, def.plans[0].executors[0].breaker.?);
 }
 
 test "parseWorkflow: a required key that was silently optional is required" {
-    try expectRefused(wrap("",
-        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e" } ], "cache": { "ttl_ms": 5 } } },
-    ), ParseError.MissingRequiredField, "missing required key \"key\" at plans.p.cache");
     try expectRefused(wrap("", "\"search_attributes\": [ { \"name\": \"a\" } ],"), ParseError.MissingRequiredField, "missing required key \"from\" at search_attributes[0]");
     try expectRefused(
         \\{ "kind": "Workflow", "name": "w", "version": "1", "start": { "transitions": {} } }
@@ -1332,24 +1218,12 @@ test "parseWorkflow: snake_case keys parse" {
         \\plans:
         \\  pay:
         \\    selection: round-robin
-        \\    errors:
-        \\      retryable: [timeout]
         \\    executors:
         \\      - name: a
         \\        run: "@actions/a"
-        \\        rate_limit:
-        \\          max_per_second: 5
         \\        breaker:
         \\          failure_threshold: 3
         \\          cooldown_ms: 100
-        \\          half_open_max_calls: 1
-        \\    health:
-        \\      window_ms: 60000
-        \\      min_samples: 10
-        \\    cache:
-        \\      ttl_ms: 1000
-        \\      key: "k"
-        \\      invalidate_on: [x]
         \\start:
         \\  run: "@plan/pay"
         \\  input_mapping: '{"a": "$.input.a"}'
@@ -1376,11 +1250,7 @@ test "parseWorkflow: snake_case keys parse" {
     try std.testing.expectEqualStrings("{\"a\": \"$.input.a\"}", def.start.run.input_mapping.?);
     try std.testing.expectEqual(@as(u32, 2), def.start.run.poll.?.max_attempts);
     try std.testing.expectEqual(@as(?i64, 1000), def.steps[0].step.wait_for_signal.timeout_ms);
-    try std.testing.expectEqual(@as(?u32, 5), def.plans[0].executors[0].rate_limit.?.max_per_second);
-    try std.testing.expectEqual(@as(u32, 10), def.plans[0].health_config.?.min_samples);
-    try std.testing.expectEqual(@as(i64, 60000), def.plans[0].health_config.?.window_ms);
-    try std.testing.expectEqualStrings("k", def.plans[0].cache_config.?.key_template);
-    try std.testing.expectEqual(@as(usize, 1), def.plans[0].error_classification.?.retryable.len);
+    try std.testing.expectEqual(@as(i64, 100), def.plans[0].executors[0].breaker.?.cooldown_ms);
 }
 
 test "parseWorkflow: a negative or zero duration is refused" {
@@ -1388,7 +1258,7 @@ test "parseWorkflow: a negative or zero duration is refused" {
     try expectRefused(wrap("", "\"steps\": { \"b\": { \"wait_for_signal\": { \"type\": \"go\", \"timeout_ms\": 0 } } },"), ParseError.InvalidFieldType, "\"timeout_ms\" must be at least 1, not 0 at steps.b.wait_for_signal");
     try expectRefused(wrap("", "\"schedule\": { \"interval\": -5 },"), ParseError.InvalidFieldType, "\"interval\" must be at least 1, not -5 at schedule");
     try expectRefused(wrap("",
-        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "breaker": { "cooldown_ms": -1 }, "tracking": { "timeout_ms": 0 } } ] } },
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "breaker": { "cooldown_ms": -1 } } ] } },
     ), ParseError.InvalidFieldType, "\"cooldown_ms\" must be at least 1, not -1 at plans.p.executors[0].breaker");
 }
 
