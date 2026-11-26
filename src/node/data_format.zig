@@ -274,7 +274,7 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // A namespace's run-history quota enforced at admission: each live run's
     // reserve (workflow.reserved, action.reserved), the over_quota answer
     // and call state, and a run's progress noting a call held at the quota.
-    .{ .format = 75, .segment_version = 45, .entries = 0x95d116535e184953 },
+    .{ .format = 75, .segment_version = 45, .entries = 0x056c0002022ce186 },
 };
 
 comptime {

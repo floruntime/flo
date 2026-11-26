@@ -191,6 +191,14 @@ pub fn setForTest(store: *@import("../contract/store.zig").Store, ns: NamespaceI
     try putRaw(store, hm.UsageFam.ID, k, try hm.Usage.encodeInto(&ub, .{ .bytes = use, .orphans = 0, .orphan_bytes = 0 }));
 }
 
+/// A test's store with `ns`'s reserve in `F` set to `bytes`, as its machine
+/// would leave it.
+pub fn setReservedForTest(comptime F: type, store: *@import("../contract/store.zig").Store, ns: NamespaceId, bytes: u64) !void {
+    var kb: [4]u8 = undefined;
+    var rb: [Reserved.max_size]u8 = undefined;
+    try putRaw(store, F.ID, key(&kb, ns), try Reserved.encodeInto(&rb, .{ .bytes = bytes }));
+}
+
 fn putRaw(store: *@import("../contract/store.zig").Store, fam: u16, k: []const u8, bytes: []const u8) !void {
     if (store.find(fam, k)) |node| {
         store.replace(fam, node, try store.allocator.dupe(u8, bytes));
@@ -198,6 +206,25 @@ fn putRaw(store: *@import("../contract/store.zig").Store, fam: u16, k: []const u
 }
 
 const testing = std.testing;
+
+test "history quota: a leader's check sums both machines' reserves and its own against the part" {
+    var store = @import("../contract/store.zig").Store.init(testing.allocator);
+    defer store.deinit();
+    const read: ReadView = .{ .store = &store };
+    try setForTest(&store, .default, 1000, 100);
+    try testing.expect(preCheck(read, .default, 900) == null);
+    // Each machine's reserve alone takes it over.
+    try setReservedForTest(ActionReserved, &store, .default, 1);
+    try testing.expectEqual(@as(u64, 1001), preCheck(read, .default, 900).?.use + preCheck(read, .default, 900).?.reserved);
+    try setReservedForTest(ActionReserved, &store, .default, 0);
+    try setReservedForTest(WorkflowReserved, &store, .default, 1);
+    try testing.expect(preCheck(read, .default, 900) != null);
+    // The usage at the part, with nothing reserved.
+    try setReservedForTest(WorkflowReserved, &store, .default, 0);
+    try setForTest(&store, .default, 1000, 1000);
+    try testing.expect(preCheck(read, .default, 0) != null);
+    try testing.expect(atUsage(read, .default));
+}
 
 test "history quota: the refusal names the namespace's own figures in under 128 bytes, and a run past its part says so" {
     var buf: [128]u8 = undefined;

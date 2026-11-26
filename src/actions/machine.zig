@@ -396,12 +396,11 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             // A call's start comes as a message, which no edge holds: past
             // its namespace's share of this shard's history lane, it is told
             // so, and asks again later, so one tenant's calls don't fill the
-            // lane every tenant's invokes wait on.
-            if (call) if (historyHeld(view, .of(p.ns))) |h| {
-                var wb: [128]u8 = undefined;
-                const why = std.fmt.bufPrint(&wb, "history lane: namespace holds {d} of a {d} cap", .{ h.held, h.cap }) catch "history lane: past its share";
-                return replyWhy(view, p, .over_budget, why);
-            };
+            // lane every tenant's invokes wait on. Read before its own sends
+            // are staged, and answered after the quota's arm, so a call over
+            // both waits on the quota (which never fails it) rather than
+            // failing a step that can't wait.
+            const lane = if (call) historyHeld(view, .of(p.ns)) else null;
             // A call's start is held to the shard's share here, not at the
             // top-level gate, which never sees a channel's messages: past
             // it, the call is told so and asks again later.
@@ -465,6 +464,12 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 var wb: [128]u8 = undefined;
                 return replyWhy(view, p, .over_quota, hq.why(&wb, .of(p.ns), if (view.store.place) |pl| pl.group else 0, o));
             };
+            if (lane) |h| {
+                try view.rollback(mark);
+                var wb: [128]u8 = undefined;
+                const why = std.fmt.bufPrint(&wb, "history lane: namespace holds {d} of a {d} cap", .{ h.held, h.cap }) catch "history lane: past its share";
+                return replyWhy(view, p, .over_budget, why);
+            }
             if (call) if (gate.overSince(view, mark)) |o| {
                 try view.rollback(mark);
                 var wb: [128]u8 = undefined;
@@ -2090,6 +2095,28 @@ fn applyCalls(t: *TestActions, bodies: []const ae.Invoke.Value, stamp: u64) !Res
     out.reset(&e);
     try machine_mod.applyEntry(&channels.Channels(&.{machine}).machine, &t.store, &t.scratch, &e, &out);
     return out;
+}
+
+test "actions machine: a call over both its namespace's quota and the shard's memory share waits on the quota; an invoke's verdict counts the workflow runs' reserve" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 3);
+    try hq.setForTest(&t.store, .default, 1 << 30, 1 << 30);
+    try settings.bindForTest(&t.store, 1);
+    const call: ae.Invoke.Value = .{ .ns = DEFAULT, .action = "send", .run = "c0", .input = "", .labels = null, .source = .workflow, .caller_run = "wr", .caller_workflow = "wf" };
+    try testing.expect((try applyCall(&t, call, 10 * ms)).refused() == null);
+    try testing.expectEqual(ae.Answer.over_quota, (try lastReply(&t, arena.allocator())).answer);
+    // Room for one run, the workflow runs reserving most of it: refused.
+    try settings.bindForTest(&t.store, std.math.maxInt(u64));
+    const each = history_reserve.action(4, 2, 3, 0, 0, 0, false);
+    try hq.setForTest(&t.store, .default, each + 100, 0);
+    try hq.setReservedForTest(hq.WorkflowReserved, &t.store, .default, 200);
+    const direct: ae.Invoke.Value = .{ .ns = DEFAULT, .action = "send", .run = "d0", .input = "", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null };
+    try testing.expectEqual(Reason.history_quota, (try t.apply(.action_invoke, direct, 20 * ms)).refused().?.refusal.reason);
+    try hq.setReservedForTest(hq.WorkflowReserved, &t.store, .default, 0);
+    try testing.expect((try t.apply(.action_invoke, direct, 21 * ms)).refused() == null);
 }
 
 test "actions machine: at its namespace's quota a direct invoke is refused history_quota and a call's answered over_quota, raising nothing; calls in one inbound are judged one after another" {

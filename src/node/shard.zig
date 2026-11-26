@@ -7430,7 +7430,7 @@ pub const Shard = struct {
         if (leads or holds) self.runProducers() else {
             self.duties.clear();
             self.processing_handler.stopLeading(self);
-            if (self.workflow_handler.memory_held > 0) self.workflow_handler.dropHolds(self);
+            if (self.workflow_handler.memory_held > 0 or self.workflow_handler.quota_held > 0) self.workflow_handler.dropHolds(self);
         }
 
         // Shard 0's leader keeps the memory-budget settings rows current. It
@@ -7565,7 +7565,7 @@ pub const Shard = struct {
         // scheduled ones (interval → start runs), once the caches are built.
         const built = self.workflow_handler.caches_built;
         // Halted, nothing is held at the share: the halt holds it.
-        if (self.halted != null and self.workflow_handler.memory_held > 0) self.workflow_handler.dropHolds(self);
+        if (self.halted != null and (self.workflow_handler.memory_held > 0 or self.workflow_handler.quota_held > 0)) self.workflow_handler.dropHolds(self);
         if (!self.heldIfHalted(.stream_triggers, self.workflow_handler.stream_triggers.count() > 0)) {
             if (built) self.workflow_handler.tickStreamTriggers(self);
             self.duties.note(.stream_triggers, null, now);

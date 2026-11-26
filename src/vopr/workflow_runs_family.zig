@@ -529,7 +529,7 @@ pub const WorkflowRuns = struct {
                 const r = indexOf(&RUNS, p.run) orelse return null;
                 const f = l.parents[r] orelse return want;
                 if (f.started) return want;
-                want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[f.slot], .run = RUNS[r], .answer = p.answer };
+                want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[f.slot], .run = RUNS[r], .answer = p.answer, .why = p.why };
                 l.parents[r] = null;
             },
             .reply, .done, .retry, .clear => return self.predictCall(e, kind),
@@ -1390,7 +1390,7 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
     }
     if (roll < 17) {
         const answers = [_]ae.Answer{ .no_action, .conflict };
-        const p = ae.ChildRefuse.encodeInto(buf, .{ .ns = NS.int(), .run = RUNS[pending.or_(r, 70, any)], .answer = answers[r.uintLessThan(usize, answers.len)] }) catch return null;
+        const p = ae.ChildRefuse.encodeInto(buf, .{ .ns = NS.int(), .run = RUNS[pending.or_(r, 70, any)], .answer = answers[r.uintLessThan(usize, answers.len)], .why = null }) catch return null;
         return .{ .entry_type = .child_refuse, .payload = p };
     }
     // A step of a run the leader holds, at its rev, or now and then a rev

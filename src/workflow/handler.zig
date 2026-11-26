@@ -579,6 +579,9 @@ pub const WorkflowHandler = struct {
             /// often a shard hovering at the bound holds it, and across a
             /// new term.
             said_until_ms: i64 = std.math.minInt(i64),
+            /// The quota's hold lasts until an operator acts: said once an
+            /// episode, from its first hold until it clears or a run starts.
+            said: bool = false,
 
             const SAY_EVERY_MS: i64 = 60_000;
 
@@ -596,6 +599,11 @@ pub const WorkflowHandler = struct {
             /// Held at `share`; true when it is to be said.
             fn held(h: *Self, share: u64, now_ms: i64) bool {
                 h.share = share;
+                if (bound == .quota) {
+                    if (h.said) return false;
+                    h.said = true;
+                    return true;
+                }
                 if (now_ms < h.said_until_ms) return false;
                 h.said_until_ms = now_ms +| SAY_EVERY_MS;
                 return true;
@@ -617,6 +625,7 @@ pub const WorkflowHandler = struct {
             /// Not at the bound now; a wait still stands until a run starts.
             fn clear(h: *Self) void {
                 h.share = null;
+                h.said = false;
             }
         };
     }
@@ -2638,7 +2647,7 @@ pub const WorkflowHandler = struct {
                 if (run.call_retry_index > shard.raft_node.last_applied) return false;
                 const now_ns: u64 = @intCast(@max(now_ms, 0) *| std.time.ns_per_ms);
                 if (now_ns >= waitedOutNs(c, shard.actions_handler.missing_action_wait_ms)) return true;
-                const wait_ms = callRetryMs(c.attempts);
+                const wait_ms = heldRetryMs(c.state, c.attempts);
                 if (now_ns < c.last_ns +| wait_ms * std.time.ns_per_ms or now_ms < run.call_retry_at_ms) return false;
                 self.retryCall(shard, run, action_rid, c, now_ms);
                 return false;
@@ -2656,7 +2665,7 @@ pub const WorkflowHandler = struct {
                 }
                 if (run.call_retry_index > shard.raft_node.last_applied) return false;
                 const now_ns: u64 = @intCast(@max(now_ms, 0) *| std.time.ns_per_ms);
-                const wait_ms = callRetryMs(c.attempts);
+                const wait_ms = heldRetryMs(c.state, c.attempts);
                 if (now_ns < c.last_ns +| wait_ms * std.time.ns_per_ms or now_ms < run.call_retry_at_ms) return false;
                 self.retryCall(shard, run, action_rid, c, now_ms);
                 return false;
@@ -2672,7 +2681,7 @@ pub const WorkflowHandler = struct {
                 }
                 if (run.call_retry_index > shard.raft_node.last_applied) return false;
                 const now_ns: u64 = @intCast(@max(now_ms, 0) *| std.time.ns_per_ms);
-                const wait_ms = quotaRetryMs(c.attempts);
+                const wait_ms = heldRetryMs(c.state, c.attempts);
                 if (now_ns < c.last_ns +| wait_ms * std.time.ns_per_ms or now_ms < run.call_retry_at_ms) return false;
                 self.retryCall(shard, run, action_rid, c, now_ms);
                 return false;
@@ -2690,6 +2699,13 @@ pub const WorkflowHandler = struct {
     }
 
     pub const QUOTA_RETRY_MAX_MS: u64 = 600_000;
+
+    /// How long a call in `state` waits before asking again: a quota hold
+    /// on its own backoff, a missing action or a memory hold on the call's.
+    /// Both sites that wait on a held call read it here.
+    pub fn heldRetryMs(state: calls_mod.State, attempts: u32) u64 {
+        return if (state == .over_quota) quotaRetryMs(attempts) else callRetryMs(attempts);
+    }
 
     /// Asks again for a call whose action wasn't registered, or whose
     /// action's shard was at its memory share. Not proposed (a busy log, a
@@ -2797,12 +2813,16 @@ pub const WorkflowHandler = struct {
         // At its shard's memory share, or its namespace's quota here, the
         // start would be refused at apply: the parent is told now, and asks
         // again. The quota first, as at apply.
-        const answer: ?ae.Answer = if (taken) .conflict else if (!held) .no_action else if (hq.preCheck(self.defsRead(), ns, runs_machine.reserveOf(p.workflow, run_id)) != null) .over_quota else if (gate.atShare(&shard.defaultPartition().store) != null) .over_budget else null;
+        const quota = if (taken or !held) null else hq.preCheck(self.defsRead(), ns, runs_machine.reserveOf(p.workflow, run_id));
+        const answer: ?ae.Answer = if (taken) .conflict else if (!held) .no_action else if (quota != null) .over_quota else if (gate.atShare(&shard.defaultPartition().store) != null) .over_budget else null;
         if (answer) |a| {
             // A refusal is told to the parent: not past its outbox's room.
             if (shard.sendWait(shard.router.slotToShard(p.parent_slot), .main, ns) != null) return error.Overloaded;
+            // The quota's figures, as an apply's refusal gives them.
+            var wb: [128]u8 = undefined;
+            const why: ?[]const u8 = if (quota) |o| hq.why(&wb, ns, shard.id, o) else null;
             var buf: [ae.ChildRefuse.max_size]u8 = undefined;
-            const payload = try ae.ChildRefuse.encodeInto(&buf, .{ .ns = ns.int(), .run = run_id, .answer = a });
+            const payload = try ae.ChildRefuse.encodeInto(&buf, .{ .ns = ns.int(), .run = run_id, .answer = a, .why = why });
             return shard.raft_node.propose(.child_refuse, entry_mod.Flags.NONE, payload);
         }
         return self.proposeStart(shard, ns, run_id, p.workflow, if (p.version.len > 0) p.version else "latest", p.input, null, "child_started", null);
@@ -3074,7 +3094,7 @@ pub const WorkflowHandler = struct {
                 const now_ns: u64 = @intCast(@max(now_ms, 0) *| std.time.ns_per_ms);
                 const waited_out_ns = waitedOutNs(c, wait_ms);
                 if (now_ns >= waited_out_ns) return .step;
-                const next_ns = c.last_ns +| callRetryMs(c.attempts) * std.time.ns_per_ms;
+                const next_ns = c.last_ns +| heldRetryMs(c.state, c.attempts) * std.time.ns_per_ms;
                 if (now_ns >= next_ns and now_ms >= p.call_retry_at_ms) return .step;
                 const due_ms = @max(ceilMs(next_ns), p.call_retry_at_ms);
                 return .{ .later = @min(due_ms, ceilMs(waited_out_ns)) };
@@ -3085,7 +3105,7 @@ pub const WorkflowHandler = struct {
                 if (!p.call_over_budget_noted) return .step;
                 if (p.call_retry_index > shard.raft_node.last_applied) return .none;
                 const now_ns: u64 = @intCast(@max(now_ms, 0) *| std.time.ns_per_ms);
-                const next_ns = c.last_ns +| callRetryMs(c.attempts) * std.time.ns_per_ms;
+                const next_ns = c.last_ns +| heldRetryMs(c.state, c.attempts) * std.time.ns_per_ms;
                 if (now_ns >= next_ns and now_ms >= p.call_retry_at_ms) return .step;
                 return .{ .later = @max(ceilMs(next_ns), p.call_retry_at_ms) };
             },
@@ -3095,7 +3115,7 @@ pub const WorkflowHandler = struct {
                 if (!p.call_over_quota_noted) return .step;
                 if (p.call_retry_index > shard.raft_node.last_applied) return .none;
                 const now_ns: u64 = @intCast(@max(now_ms, 0) *| std.time.ns_per_ms);
-                const next_ns = c.last_ns +| quotaRetryMs(c.attempts) * std.time.ns_per_ms;
+                const next_ns = c.last_ns +| heldRetryMs(c.state, c.attempts) * std.time.ns_per_ms;
                 if (now_ns >= next_ns and now_ms >= p.call_retry_at_ms) return .step;
                 return .{ .later = @max(ceilMs(next_ns), p.call_retry_at_ms) };
             },
@@ -4030,6 +4050,7 @@ pub const WorkflowHandler = struct {
             // Skip disabled workflows
             if (self.isDisabled(entry.key_ptr.*)) {
                 schedule.hold.clear();
+                schedule.quota_hold.clear();
                 continue;
             }
 
@@ -4169,6 +4190,7 @@ pub const WorkflowHandler = struct {
             // Skip disabled workflows
             if (self.isDisabled(entry.key_ptr.*)) {
                 trigger.hold.clear();
+                trigger.quota_hold.clear();
                 continue;
             }
 
@@ -9971,6 +9993,12 @@ test "step executor: a call that can't wait, held at its callee's namespace's qu
     _ = handler.commitRun(&shard, testKey(.default, "run-q"));
 }
 
+test "a held call waits on its own hold's backoff: the quota's up to 10 minutes, memory's and a missing action's up to one" {
+    try testing.expectEqual(@as(u64, 600_000), WorkflowHandler.heldRetryMs(.over_quota, 8));
+    try testing.expectEqual(WorkflowHandler.CALL_RETRY_MAX_MS, WorkflowHandler.heldRetryMs(.over_budget, 8));
+    try testing.expectEqual(WorkflowHandler.CALL_RETRY_MAX_MS, WorkflowHandler.heldRetryMs(.no_action, 8));
+}
+
 test "a call held at its callee's quota asks again at 5 s, doubling, at most 10 minutes" {
     try testing.expectEqual(@as(u64, 5_000), WorkflowHandler.quotaRetryMs(0));
     try testing.expectEqual(@as(u64, 5_000), WorkflowHandler.quotaRetryMs(1));
@@ -10394,6 +10422,12 @@ test "workflow schedule: at its namespace's quota a slot isn't proposed; refused
     try testing.expectEqual(@as(?u64, 1 << 30), sched.quota_hold.share);
     try testing.expectEqual(@as(u64, 1), handler.quota_held);
     try testing.expectEqual(@as(u64, 0), handler.memory_held);
+    // Said once for the episode, however long it lasts.
+    const said = handler.holds_said;
+    sched.quota_hold.said_until_ms = 0;
+    handler.tickSchedules(&shard);
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(said, handler.holds_said);
     // Another namespace's usage holds nothing of this one.
     try hq.setForTest(store, TEST_NS_A, 1 << 30, 0);
     try hq.setForTest(store, .default, 1 << 30, 1 << 30);
@@ -10709,14 +10743,19 @@ test "a child at its namespace's quota is answered over_quota by its leader, not
     @memcpy(kid_id, run.pending_action_run_id_owned.?);
     const store = &shard.defaultPartition().store;
     try testing.expect(children_mod.parentOf(.{ .store = store }, .default, kid_id) != null);
-    // The child's reserve won't fit: the leader answers the call itself.
+    // The child's reserve won't fit, nor is there memory: the leader
+    // answers the call itself, for the quota, with its figures.
     try hq.setForTest(store, .default, runs_machine.reserveOf("kid-wf", kid_id) - 1, 0);
+    try @import("../settings/machine.zig").bindForTest(store, 1);
+    const refusals = store.quota_refusals;
     startTestChildren(&handler, &shard);
+    try testing.expectEqual(refusals + 1, store.quota_refusals);
     try testing.expect(children_mod.parentOf(.{ .store = store }, .default, kid_id) == null);
     var rk: [KEY_PREFIX + ae.MAX_RUN_ID]u8 = undefined;
     try testing.expect(handler.appliedRun(writeKey(&rk, .default, kid_id)) == null);
     const c = WorkflowHandler.callOf(&shard, handler.inspect(testKey(.default, "par")).?, kid_id).?;
     try testing.expectEqual(calls_mod.State.over_quota, c.state);
+    try testing.expect(std.mem.startsWith(u8, c.outcome, "limit: ns 1 run reserve "));
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.inspect(testKey(.default, "par")).?.status);
 }
 

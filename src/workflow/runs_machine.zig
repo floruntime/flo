@@ -1019,10 +1019,11 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
     if (comptime plant.active != .quota_start_admits) if (try hq.verdict(hq.WorkflowReserved, view, n.ns, own, .usage_and_reserve)) |o| {
         if (!s.isChild()) return hq.refuse(out, view, n.ns, o);
         try view.rollback(mark);
-        view.store.quota_refusals += 1;
         var wb: [128]u8 = undefined;
         const k = parent_key orelse return hq.refuse(out, view, n.ns, o);
         const p = (try view.get(Parents, k)) orelse return hq.refuse(out, view, n.ns, o);
+        // Answered, not refused: counted here, once.
+        view.store.quota_refusals += 1;
         try reply(view, n.ns, n.run, p.v.parent_slot, .over_quota, hq.why(&wb, n.ns, if (view.store.place) |pl| pl.group else 0, o));
         try view.delete(Parents, k);
         out.putInt(u8, 0);
@@ -1454,7 +1455,9 @@ fn applyParent(view: *View, e: *const Entry, n: Named) ApplyError!void {
             // Refused by an earlier leader already, or started meanwhile.
             const f = found orelse return;
             if (f.v.state != .pending) return;
-            try reply(view, n.ns, n.run, f.v.parent_slot, p.answer, null);
+            // A leader's refusal for the quota is one, as at apply.
+            if (p.answer == .over_quota) view.store.quota_refusals += 1;
+            try reply(view, n.ns, n.run, f.v.parent_slot, p.answer, p.why);
             try view.delete(Parents, k);
         },
         else => return error.Halt,
@@ -2247,7 +2250,7 @@ test "workflow runs machine: what arrives late for a deleted run is refused or c
     try testing.expect(parentOf(.{ .store = &f.store }, .default, "c1") == null);
     try testing.expect((try f.deleteOf("c1")).refused() == null);
     var crb: [ae.ChildRefuse.max_size]u8 = undefined;
-    _ = try f.answer(.child_refuse, try ae.ChildRefuse.encodeInto(&crb, .{ .ns = NamespaceId.default.int(), .run = "c1", .answer = .conflict }));
+    _ = try f.answer(.child_refuse, try ae.ChildRefuse.encodeInto(&crb, .{ .ns = NamespaceId.default.int(), .run = "c1", .answer = .conflict, .why = null }));
     try testing.expect(f.get("c1") == null);
     try testing.expect(parentOf(.{ .store = &f.store }, .default, "c1") == null);
 }
@@ -2838,6 +2841,23 @@ test "workflow runs machine: at its namespace's quota a signal is refused unless
     // The one it waits on wakes it: admitted.
     try testing.expect((try f.command(.workflow_signal, key, try Signal.encodeInto(&sb, .{ .type = "go", .payload = "" }), 6)).refused() == null);
     try testing.expectEqual(Wait.none, f.get("r1").?.wait);
+}
+
+test "workflow runs machine: a start's verdict counts the action runs' reserve; a signal that doesn't wake is held to the usage arm alone" {
+    var f = Fixture.init();
+    defer f.deinit();
+    const each = reserveOf("wf", "r1");
+    // Room for one run, but the namespace's action runs reserve most of it.
+    try hq.setForTest(&f.store, .default, each + 100, 0);
+    try hq.setReservedForTest(hq.ActionReserved, &f.store, .default, 200);
+    try testing.expectEqual(proto.Reason.history_quota, (try f.start("r1", "wf", "workflow_started", "", 1)).refused().?.refusal.reason);
+    try hq.setReservedForTest(hq.ActionReserved, &f.store, .default, 0);
+    try testing.expect((try f.start("r1", "wf", "workflow_started", "", 2)).refused() == null);
+    // The reserves past the part, the usage under it: a signal still lands.
+    try hq.setReservedForTest(hq.ActionReserved, &f.store, .default, 1 << 30);
+    var kb: [64]u8 = undefined;
+    var sb: [128]u8 = undefined;
+    try testing.expect((try f.command(.workflow_signal, view_mod.idKey(&kb, .default, "r1") catch unreachable, try Signal.encodeInto(&sb, .{ .type = "other", .payload = "" }), 3)).refused() == null);
 }
 
 test "workflow runs machine: a child's start at its namespace's quota is answered over_quota, its parent's record gone and nothing reserved" {
