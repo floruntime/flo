@@ -276,6 +276,27 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
             }
         }
     }
+    // `value_field` names the record field a stream source's records are
+    // read from, written as "value", and the field a TS source's points are
+    // written under: in a job with both, one sink would write each under
+    // another name.
+    const ts_src = for (def.sources.items) |src| {
+        if (src.kind == .ts) break src;
+    } else null;
+    const stream_src = for (def.sources.items) |src| {
+        if (src.kind == .stream) break src;
+    } else null;
+    if (ts_src != null and stream_src != null) for (def.sinks.items) |snk| {
+        if (snk.kind == .ts and !mem.eql(u8, snk.ts_value_field, "value"))
+            return d.fail(ParseError.InvalidFormat, "split the job to name a value field: TS sink '{s}' sets \"value_field\", which for stream source '{s}' names the record field read, and for TS source '{s}' the field written", .{ snk.name, stream_src.?.name, ts_src.?.name });
+    };
+    // With `fields`, each point is written under its own field's name from
+    // the record field it maps: `value_field` would go unread. Checked after
+    // the rules above, so a job to split is told so first.
+    for (def.sinks.items) |snk| {
+        if (snk.kind == .ts and snk.ts_value_field_set and snk.ts_field_keys.len > 0)
+            return d.fail(ParseError.InvalidFormat, "TS sink '{s}' can't give both \"value_field\" and \"fields\": each of \"fields\" names the point it writes and the record field it reads", .{snk.name});
+    }
 
     return def;
 }
@@ -764,7 +785,11 @@ fn parseOneSink(allocator: Allocator, d: D, item: JsonValue, index: usize, defau
         snk.target = try dupe(allocator, measurement);
         snk.ts_measurement = try dupe(allocator, measurement);
         snk.namespace = try dupe(allocator, try optString(d, obj, "namespace") orelse default_namespace);
-        snk.ts_value_field = try dupe(allocator, try optString(d, obj, "value_field") orelse "value");
+        const value_field = try optString(d, obj, "value_field");
+        // No record field is named "", and no point is written under it.
+        if (value_field) |v| if (v.len == 0) return d.fail(ParseError.InvalidFormat, "\"value_field\" can't be empty", .{});
+        snk.ts_value_field = try dupe(allocator, value_field orelse "value");
+        snk.ts_value_field_set = value_field != null;
         snk.ts_tag_keys = try parseStringPairs(allocator, d, obj, "tags");
         snk.ts_field_keys = try parseStringPairs(allocator, d, obj, "fields");
         // A point's tags are a TS read's: past its count no read finds them.
@@ -2523,6 +2548,83 @@ test "parser: a TS sink's field can't read a record field named empty" {
     try std.testing.expect(mem.indexOf(u8, diag.message(), "a field's record field can't be empty") != null);
 }
 
+test "parser: a TS sink's value_field, which means one thing per source kind, is refused in a job with both" {
+    const allocator = std.testing.allocator;
+    const stream_src = "  - name: events\n    stream: { name: ev }\n";
+    const ts_src = "  - name: points\n    ts: { measurement: cpu }\n";
+    for ([_][2][]const u8{ .{ stream_src, ts_src }, .{ ts_src, stream_src } }) |order| {
+        const text = try std.fmt.allocPrint(allocator,
+            \\kind: Processing
+            \\sources:
+            \\{s}{s}sinks:
+            \\  - name: out
+            \\    ts: {{ measurement: cpu_copy, value_field: usage }}
+            \\
+        , .{ order[0], order[1] });
+        defer allocator.free(text);
+        var diag: Diagnostic = .{};
+        try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, &diag));
+        try std.testing.expectEqualStrings("split the job to name a value field: TS sink 'out' sets \"value_field\", which for stream source 'events' names the record field read, and for TS source 'points' the field written at the top level", diag.message());
+    }
+    // The TS sink second, beside another: refused all the same. With
+    // `fields` too, the split is said first.
+    for ([_][]const u8{ "value_field: usage", "value_field: usage, fields: { load: l }" }) |opts| {
+        const text = try std.fmt.allocPrint(allocator, "kind: Processing\nsources:\n{s}{s}sinks:\n  - stream: {{ name: copy }}\n  - name: second\n    ts: {{ measurement: m, {s} }}\n", .{ stream_src, ts_src, opts });
+        defer allocator.free(text);
+        var diag: Diagnostic = .{};
+        try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, &diag));
+        try std.testing.expect(mem.startsWith(u8, diag.message(), "split the job to "));
+        try std.testing.expect(mem.indexOf(u8, diag.message(), "TS sink 'second'") != null);
+    }
+    // One kind of source: each meaning stands. Named "value", the two agree.
+    for ([_][]const u8{
+        "  - ts: { measurement: cpu }\nsinks:\n  - ts: { measurement: cpu_copy, value_field: usage }\n",
+        "  - stream: { name: ev }\nsinks:\n  - ts: { measurement: cpu_copy, value_field: usage }\n",
+        "  - stream: { name: ev }\n  - ts: { measurement: cpu }\nsinks:\n  - ts: { measurement: cpu_copy, value_field: value }\n",
+    }) |body| {
+        const text = try std.fmt.allocPrint(allocator, "kind: Processing\nsources:\n{s}", .{body});
+        defer allocator.free(text);
+        var def = try parseJobDefinition(allocator, text, null);
+        def.deinit(allocator);
+    }
+}
+
+test "parser: a TS sink's value_field beside fields, which would leave it unread, is refused" {
+    const allocator = std.testing.allocator;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator,
+        \\kind: Processing
+        \\sources:
+        \\  - stream: { name: ev }
+        \\sinks:
+        \\  - ts: { measurement: m, value_field: v, fields: { load: l } }
+        \\
+    , &diag));
+    try std.testing.expectEqualStrings("TS sink 'default-sink-0' can't give both \"value_field\" and \"fields\": each of \"fields\" names the point it writes and the record field it reads at the top level", diag.message());
+    // Beside another sink, second: refused all the same.
+    try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator,
+        \\kind: Processing
+        \\sources:
+        \\  - stream: { name: ev }
+        \\sinks:
+        \\  - stream: { name: copy }
+        \\  - name: pts
+        \\    ts: { measurement: m, value_field: v, fields: { load: l } }
+        \\
+    , &diag));
+    try std.testing.expect(mem.startsWith(u8, diag.message(), "TS sink 'pts' can't give both"));
+    // An empty value field names nothing.
+    try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, "kind: Processing\nsources:\n  - stream: { name: ev }\nsinks:\n  - ts: { measurement: m, value_field: \"\" }\n", &diag));
+    try std.testing.expectEqualStrings("\"value_field\" can't be empty at sinks[0].ts", diag.message());
+    // Either alone is taken, as is an empty map of fields.
+    for ([_][]const u8{ "value_field: v", "fields: { load: l }", "value_field: v, fields: {}" }) |one| {
+        const text = try std.fmt.allocPrint(allocator, "kind: Processing\nsources:\n  - stream: {{ name: ev }}\nsinks:\n  - ts: {{ measurement: m, {s} }}\n", .{one});
+        defer allocator.free(text);
+        var def = try parseJobDefinition(allocator, text, null);
+        def.deinit(allocator);
+    }
+}
+
 test "parser: a TS sink in a job with a TS source can't map tags or fields, which its points would leave unread" {
     const allocator = std.testing.allocator;
     const Case = struct { map: []const u8, says: []const u8 };
@@ -2566,11 +2668,12 @@ test "parser: a TS sink in a job with a TS source can't map tags or fields, whic
         try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(allocator, text, &diag));
         try std.testing.expect(mem.indexOf(u8, diag.message(), "TS sink 'out' maps tags, but TS source 'points'") != null);
 
+        // No map, and the value field's name left alone: taken.
         const plain = try std.fmt.allocPrint(allocator,
             \\kind: Processing
             \\sources:
             \\{s}{s}sinks:
-            \\  - ts: {{ measurement: cpu_copy, value_field: usage }}
+            \\  - ts: {{ measurement: cpu_copy }}
             \\
         , .{ order[0], order[1] });
         defer allocator.free(plain);
