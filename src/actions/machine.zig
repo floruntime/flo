@@ -451,6 +451,19 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             var ab: RunAtBuf = undefined;
             try view.put(RunAt, try idKey(view, .of(p.ns), runAtKey(&ab, p.action, msOf(stamp), p.run)), .{});
             try moveCount(view, .of(p.ns), p.action, null, .ready);
+            // Past its namespace's run-history quota on this shard, judged
+            // with its own reserve staged above and every earlier invoke of
+            // this inbound: a direct invoke refused, a call's told
+            // over_quota and asking again later. Before memory on both
+            // paths: a call's memory arm follows, a direct invoke's is the
+            // top-level gate after this apply.
+            if (comptime plant.active != .quota_invoke_admits) if (try hq.verdict(hq.ActionReserved, view, .of(p.ns), reserveOf(p.run, new), .usage_and_reserve)) |o| {
+                if (!call) return hq.refuse(out, view, .of(p.ns), o);
+                try view.rollback(mark);
+                view.store.quota_refusals += 1;
+                var wb: [128]u8 = undefined;
+                return replyWhy(view, p, .over_quota, hq.why(&wb, .of(p.ns), if (view.store.place) |pl| pl.group else 0, o));
+            };
             if (call) if (gate.overSince(view, mark)) |o| {
                 try view.rollback(mark);
                 var wb: [128]u8 = undefined;
@@ -2031,6 +2044,90 @@ test "actions machine: an attempt's worker and retried error are recorded as pre
 
 /// `body`, an invoke, applied as a call's start: a message on the main lane
 /// from the calling namespace.
+/// Calls' starts, all in one inbound, in order.
+fn applyCalls(t: *TestActions, bodies: []const ae.Invoke.Value, stamp: u64) !Result {
+    const ce = @import("../protocol/channel_entries.zig");
+    const a = t.scratch.child_allocator;
+    var mw: std.Io.Writer.Allocating = .init(a);
+    defer mw.deinit();
+    for (bodies) |body| {
+        const payload = try a.alloc(u8, try ae.Invoke.encodedSize(body));
+        defer a.free(payload);
+        _ = try ae.Invoke.encodeInto(payload, body);
+        const mb = try a.alloc(u8, payload.len + 64);
+        defer a.free(mb);
+        var w: schema.Writer = .{ .buf = mb };
+        try ce.Message.encode(&w, .{ .slot = @intCast(router.nsKeySlot(.of(body.ns), body.action)), .entry_type = @backingInt(EntryType.action_invoke), .layout_epoch = 0, .flags = 0, .origin_kind = @backingInt(view_mod.Origin.Kind.user), .origin_ns = body.ns, .payload = payload });
+        try mw.writer.writeAll(w.written());
+    }
+    const rv: view_mod.ReadView = .{ .store = &t.store };
+    const seq = (if (channels.inOf(rv, 0, .main)) |i| i.applied else 0) + 1;
+    const ib = try a.alloc(u8, mw.written().len + 64);
+    defer a.free(ib);
+    const inbound = try ce.Inbound.encodeInto(ib, .{ .from = 0, .lane = @backingInt(channels.Lane.main), .first_seq = seq, .messages = .{ .bytes = mw.written(), .count = @intCast(bodies.len) } });
+    t.index += 1;
+    const e = entry_mod.buildEntry(.channel_inbound, entry_mod.Flags.NONE, t.term, t.index, stamp, inbound);
+    var out: Result = .{};
+    out.reset(&e);
+    try machine_mod.applyEntry(&channels.Channels(&.{machine}).machine, &t.store, &t.scratch, &e, &out);
+    return out;
+}
+
+test "actions machine: at its namespace's quota a direct invoke is refused history_quota and a call's answered over_quota, raising nothing; calls in one inbound are judged one after another" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    const read: view_mod.ReadView = .{ .store = &t.store };
+    try register(&t, 3);
+    const each = history_reserve.action(4, 2, 3, 0, 0, 0, false);
+    // Room for three runs' reserves exactly.
+    try hq.setForTest(&t.store, .default, 3 * each, 0);
+    const Call = struct {
+        fn of(run_id: []const u8) ae.Invoke.Value {
+            return .{ .ns = DEFAULT, .action = "send", .run = run_id, .input = "", .labels = null, .source = .workflow, .caller_run = "wr", .caller_workflow = "wf" };
+        }
+    };
+    const batch = [_]ae.Invoke.Value{ Call.of("c0"), Call.of("c1"), Call.of("c2"), Call.of("c3"), Call.of("c4") };
+    try testing.expect((try applyCalls(&t, &batch, 10 * ms)).refused() == null);
+    var started: usize = 0;
+    var held: usize = 0;
+    var pb: [channels.CHAN_KEY]u8 = undefined;
+    var it = read.range(channels.OutFam, channels.outPrefix(&pb, 0, .main));
+    while (try it.next()) |item| {
+        if (item.value.v.entry_type != @backingInt(EntryType.call_reply)) continue;
+        var diag: schema.Diagnostic = .{};
+        const r = try ae.Reply.decodeAll(try a.dupe(u8, item.value.v.payload), &diag);
+        switch (r.answer) {
+            .started => started += 1,
+            .over_quota => {
+                held += 1;
+                try testing.expect(std.mem.startsWith(u8, r.why.?, "limit: ns 1 history 0+"));
+                try testing.expect(t.run(.default, r.run) == null);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), started);
+    try testing.expectEqual(@as(usize, 2), held);
+    try testing.expectEqual(3 * each, hq.reservedOf(hq.ActionReserved, read, .default));
+    // A direct invoke past it: refused whole, nothing written.
+    const before = t.sums();
+    var direct = Call.of("d0");
+    direct.source = .direct;
+    direct.caller_run = null;
+    direct.caller_workflow = null;
+    const rf = (try t.apply(.action_invoke, direct, 20 * ms)).refused().?;
+    try testing.expectEqual(Reason.history_quota, rf.refusal.reason);
+    try testing.expectEqual(before, t.sums());
+    try testing.expectEqual(3 * each, hq.reservedOf(hq.ActionReserved, read, .default));
+    // A run whose own reserve is over the part is told so.
+    try hq.setForTest(&t.store, .default, each - 1, 0);
+    const own = (try t.apply(.action_invoke, direct, 21 * ms)).refused().?;
+    try testing.expect(std.mem.startsWith(u8, own.refusal.message, "limit: ns 1 run reserve "));
+}
+
 fn applyCall(t: *TestActions, body: ae.Invoke.Value, stamp: u64) !Result {
     const ce = @import("../protocol/channel_entries.zig");
     const a = t.scratch.child_allocator;

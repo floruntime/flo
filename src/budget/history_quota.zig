@@ -138,6 +138,23 @@ pub fn why(buf: []u8, ns: NamespaceId, shard: u16, o: Over) []const u8 {
     return std.fmt.bufPrint(buf, "limit: ns {d} history {d}+{d} of {d} on shard {d}", .{ ns.int(), o.use, o.reserved, o.part, shard }) catch "limit: run history quota";
 }
 
+/// A test's store with `ns`'s part bound to `part` and its usage set to
+/// `use`, as a bind and the history machine would leave them.
+pub fn setForTest(store: *@import("../contract/store.zig").Store, ns: NamespaceId, part: u64, use: u64) !void {
+    var kb: [4]u8 = undefined;
+    const k = key(&kb, ns);
+    var qb: [settings.QuotaPart.max_size]u8 = undefined;
+    try putRaw(store, settings.QuotaFam.ID, k, try settings.QuotaPart.encodeInto(&qb, .{ .part_bytes = part, .published_index = 1 }));
+    var ub: [hm.Usage.max_size]u8 = undefined;
+    try putRaw(store, hm.UsageFam.ID, k, try hm.Usage.encodeInto(&ub, .{ .bytes = use, .orphans = 0, .orphan_bytes = 0 }));
+}
+
+fn putRaw(store: *@import("../contract/store.zig").Store, fam: u16, k: []const u8, bytes: []const u8) !void {
+    if (store.find(fam, k)) |node| {
+        store.replace(fam, node, try store.allocator.dupe(u8, bytes));
+    } else store.link(fam, try store.allocRecord(k), try store.allocator.dupe(u8, bytes));
+}
+
 const testing = std.testing;
 
 test "history quota: the refusal names the namespace's own figures in under 128 bytes, and a run past its part says so" {

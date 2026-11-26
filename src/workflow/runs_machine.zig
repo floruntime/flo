@@ -40,6 +40,7 @@ const ae = @import("../protocol/action_entries.zig");
 const he = @import("../protocol/history_entries.zig");
 const hp = @import("../stream/history_producer.zig");
 const limits = @import("../protocol/limits.zig");
+const proto = @import("../protocol/proto.zig");
 const view_mod = @import("../contract/view.zig");
 const machine_mod = @import("../contract/machine.zig");
 const delivery = @import("../contract/delivery.zig");
@@ -758,6 +759,8 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         },
         .workflow_signal => {
             try out.addIn(RunFam.ID, n.ns, n.run);
+            // Read by its quota verdict.
+            try hq.addKeys(hq.WorkflowReserved, out, n.ns);
             const range = (try runRange(arena, n.ns, n.run))[KEY_PREFIX..];
             out.addRangeIn(SigFam.ID, n.ns, range) catch return error.OutOfMemory;
         },
@@ -989,6 +992,25 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
         };
     };
 
+    // Past its namespace's run-history quota on this shard: the usage at the
+    // part, or the usage and every live run's reserve, this one's staged
+    // above, over it. Refused as memory is, a child's parent told
+    // over_quota. Judged before memory, so a start over both answers the
+    // quota. A run that starts ended reserves nothing, but adds its one
+    // chunk: judged with nothing of its own.
+    const own = if (s.status.isTerminal()) 0 else reserveOf(run.workflow, n.run);
+    if (comptime plant.active != .quota_start_admits) if (try hq.verdict(hq.WorkflowReserved, view, n.ns, own, .usage_and_reserve)) |o| {
+        if (!s.isChild()) return hq.refuse(out, view, n.ns, o);
+        try view.rollback(mark);
+        view.store.quota_refusals += 1;
+        var wb: [128]u8 = undefined;
+        const k = parent_key orelse return hq.refuse(out, view, n.ns, o);
+        const p = (try view.get(Parents, k)) orelse return hq.refuse(out, view, n.ns, o);
+        try reply(view, n.ns, n.run, p.v.parent_slot, .over_quota, hq.why(&wb, n.ns, if (view.store.place) |pl| pl.group else 0, o));
+        try view.delete(Parents, k);
+        out.putInt(u8, 0);
+        return;
+    };
     // Held past its shard's share: nothing of it is written. A child's
     // parent is told instead, its record gone, and asks again; dropping the
     // entry would drop that answer too.
@@ -1086,6 +1108,12 @@ fn applySignal(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i
         if (comptime plant.active != .runs_signal_wake_keeps_rev) run.rev += 1;
     }
     try view.put(RunFam, cmd.key, .{ .v = run });
+    // At its namespace's run-history quota on this shard: refused, unless it
+    // wakes its run, which the run's reserve counts (one waking signal), so
+    // a held run can still end. Any other signal adds history no reserve
+    // counts, so it is held to the usage arm. Before memory, so a signal
+    // over both answers the quota.
+    if (!wakes and comptime plant.active != .quota_signal_admits) if (try hq.verdict(hq.WorkflowReserved, view, n.ns, 0, .usage)) |o| return hq.refuse(out, view, n.ns, o);
     // Held past its shard's share once all of it is staged: nothing lands,
     // and its client sends it again once memory frees. One that wakes its
     // run is taken within the slack.
@@ -1223,7 +1251,8 @@ fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64
         if (try view.get(calls_mod.Calls, k)) |call| {
             switch (call.v.state) {
                 .done, .refused, .no_action, .over_budget => {},
-                .sent, .started => if (comptime plant.active != .runs_settle_before_call_ends) return out.refuse(.conflict, .unclassified, "conflict: the run's call hasn't ended"),
+                // Held at its callee's quota, it never settles: it waits.
+                .sent, .started, .over_quota => if (comptime plant.active != .runs_settle_before_call_ends) return out.refuse(.conflict, .unclassified, "conflict: the run's call hasn't ended"),
             }
             if (comptime plant.active != .runs_settled_call_kept) try view.delete(calls_mod.Calls, k);
         }
@@ -2206,28 +2235,39 @@ test "workflow runs machine: what arrives late for a deleted run is refused or c
     try testing.expect(parentOf(.{ .store = &f.store }, .default, "c1") == null);
 }
 
-test "workflow runs machine: a repair skip leaves a call held over its callee's memory share as it is" {
-    var f = Fixture.init();
-    defer f.deinit();
-    _ = try f.start("r1", "wf", "workflow_started", "", 1);
-    var cb: [ae.Call.max_size]u8 = undefined;
-    const call = try ae.Call.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .kind = .action, .caller_run = "r1", .caller_workflow = "wf", .step = "s", .target = "act", .version = "", .run = "a1", .input = "{}", .can_wait = true });
-    _ = try f.step("r1", .{ .rev = 0, .wait = .call, .wait_on = "a1", .call = call });
-    const slot = calls_mod.callerSlot(.default, "wf");
-    var rb: [ae.Reply.max_size]u8 = undefined;
-    const held = try ae.Reply.encodeInto(&rb, .{ .ns = NamespaceId.default.int(), .slot = slot, .run = "a1", .answer = .over_budget, .why = "would pass its share" });
-    _ = try f.answer(.call_reply, held);
-    try testing.expectEqual(calls_mod.State.over_budget, calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1").?.state);
-    // A skip of a later answer to it: the hold stands, to be retried.
-    f.index += 1;
-    const e = entry_mod.buildEntry(.call_reply, entry_mod.Flags.NONE, 1, f.index, 0, held);
-    _ = f.scratch.reset(.retain_capacity);
-    var ks = view_mod.KeySet.init(f.scratch.allocator());
-    try machine.keys(&e, &ks);
-    var view = view_mod.View.init(&f.store, f.scratch.allocator(), &ks);
-    try machine.skipped.?(&view, &e, "repaired");
-    try view.commit();
-    try testing.expectEqual(calls_mod.State.over_budget, calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1").?.state);
+test "workflow runs machine: a repair skip leaves a call held over its callee's memory share or quota as it is; a held call is asked again, and a quota-held one never settles a step" {
+    inline for (.{ .{ ae.Answer.over_budget, calls_mod.State.over_budget }, .{ ae.Answer.over_quota, calls_mod.State.over_quota } }) |c| {
+        var f = Fixture.init();
+        defer f.deinit();
+        _ = try f.start("r1", "wf", "workflow_started", "", 1);
+        var cb: [ae.Call.max_size]u8 = undefined;
+        const call = try ae.Call.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .kind = .action, .caller_run = "r1", .caller_workflow = "wf", .step = "s", .target = "act", .version = "", .run = "a1", .input = "{}", .can_wait = false });
+        _ = try f.step("r1", .{ .rev = 0, .wait = .call, .wait_on = "a1", .call = call });
+        const slot = calls_mod.callerSlot(.default, "wf");
+        var rb: [ae.Reply.max_size]u8 = undefined;
+        const held = try ae.Reply.encodeInto(&rb, .{ .ns = NamespaceId.default.int(), .slot = slot, .run = "a1", .answer = c[0], .why = "held" });
+        _ = try f.answer(.call_reply, held);
+        try testing.expectEqual(c[1], calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1").?.state);
+        // A skip of a later answer to it: the hold stands, to be retried.
+        f.index += 1;
+        const e = entry_mod.buildEntry(.call_reply, entry_mod.Flags.NONE, 1, f.index, 0, held);
+        _ = f.scratch.reset(.retain_capacity);
+        var ks = view_mod.KeySet.init(f.scratch.allocator());
+        try machine.keys(&e, &ks);
+        var view = view_mod.View.init(&f.store, f.scratch.allocator(), &ks);
+        try machine.skipped.?(&view, &e, "repaired");
+        try view.commit();
+        try testing.expectEqual(c[1], calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1").?.state);
+        // A step can't take a quota-held call's end: it has none.
+        if (c[1] == .over_quota) {
+            const settle = try f.step("r1", .{ .rev = f.get("r1").?.rev, .settles = "a1" });
+            try testing.expectEqualStrings("conflict: the run's call hasn't ended", settle.refused().?.refusal.message);
+        }
+        // Asked again: sent, its start sent with it.
+        var crb: [ae.CallRetry.max_size]u8 = undefined;
+        _ = try f.answer(.step_call_retry, try ae.CallRetry.encodeInto(&crb, .{ .ns = NamespaceId.default.int(), .slot = slot, .run = "a1" }));
+        try testing.expectEqual(calls_mod.State.sent, calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1").?.state);
+    }
 }
 
 test "workflow runs machine: a step whose counters are past their bound is refused, writing nothing" {
@@ -2729,6 +2769,77 @@ fn lastReply(f: *Fixture) ?ae.Reply.Value {
         told = ae.Reply.decodeAll(item.value.v.payload, &diag) catch null;
     }
     return told;
+}
+
+test "workflow runs machine: at its namespace's quota a start is refused history_quota, raising nothing; the usage arm, the reserve arm, none, and the quota answered before memory" {
+    const settings = @import("../settings/machine.zig");
+    var f = Fixture.init();
+    defer f.deinit();
+    const read: ReadView = .{ .store = &f.store };
+    const each = reserveOf("wf", "r1");
+    // A part room for two runs' reserves and a little usage.
+    try hq.setForTest(&f.store, .default, 2 * each + 100, 100);
+    try testing.expect((try f.start("r1", "wf", "workflow_started", "", 1)).refused() == null);
+    try testing.expect((try f.start("r2", "wf", "workflow_started", "", 2)).refused() == null);
+    // A third would take the reserves past the part.
+    const third = try f.start("r3", "wf", "workflow_started", "", 3);
+    const rf = third.refused().?;
+    try testing.expectEqual(proto.StatusCode.limit, rf.status);
+    try testing.expectEqual(proto.Reason.history_quota, rf.refusal.reason);
+    try testing.expect(std.mem.startsWith(u8, rf.refusal.message, "limit: ns 1 history 100+"));
+    try testing.expect(f.get("r3") == null);
+    try testing.expectEqual(2 * each, hq.reservedOf(hq.WorkflowReserved, read, .default));
+    try testing.expectEqual(@as(u64, 1), f.store.quota_refusals);
+    // The usage at the part refuses even a run that starts ended.
+    try hq.setForTest(&f.store, .default, 1 << 40, 1 << 40);
+    var sb: [512]u8 = undefined;
+    var kb: [64]u8 = undefined;
+    const ended = (Start{ .workflow = "wf", .version = "1", .status = .completed, .event = "workflow_started", .idem = null, .trigger = null, .input = "" }).encode(&sb).?;
+    try testing.expectEqual(proto.Reason.history_quota, (try f.command(.workflow_start, view_mod.idKey(&kb, .default, "r4") catch unreachable, ended, 4)).refused().?.refusal.reason);
+    // Over both the quota and the shard's memory share: the quota answers.
+    try settings.bindForTest(&f.store, 1);
+    try testing.expectEqual(proto.Reason.history_quota, (try f.start("r5", "wf", "workflow_started", "", 5)).refused().?.refusal.reason);
+    try settings.bindForTest(&f.store, std.math.maxInt(u64));
+    // None admits whatever the usage.
+    try hq.setForTest(&f.store, .default, settings.NO_QUOTA, std.math.maxInt(u64));
+    try testing.expect((try f.start("r6", "wf", "workflow_started", "", 6)).refused() == null);
+    try testing.expectEqual(@as(u64, 0), f.store.quota_reserve_drift);
+}
+
+test "workflow runs machine: at its namespace's quota a signal is refused unless it wakes its run, which a held run needs to end" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    try testing.expect((try f.step("r1", .{ .rev = 0, .wait = .signal, .wait_on = "go" })).refused() == null);
+    try hq.setForTest(&f.store, .default, 1 << 20, 1 << 20);
+    var kb: [64]u8 = undefined;
+    const key = view_mod.idKey(&kb, .default, "r1") catch unreachable;
+    var sb: [128]u8 = undefined;
+    const other = try f.command(.workflow_signal, key, try Signal.encodeInto(&sb, .{ .type = "other", .payload = "" }), 5);
+    try testing.expectEqual(proto.Reason.history_quota, other.refused().?.refusal.reason);
+    try testing.expectEqual(@as(u64, 0), f.get("r1").?.sig_next);
+    // The one it waits on wakes it: admitted.
+    try testing.expect((try f.command(.workflow_signal, key, try Signal.encodeInto(&sb, .{ .type = "go", .payload = "" }), 6)).refused() == null);
+    try testing.expectEqual(Wait.none, f.get("r1").?.wait);
+}
+
+test "workflow runs machine: a child's start at its namespace's quota is answered over_quota, its parent's record gone and nothing reserved" {
+    var f = Fixture.init();
+    defer f.deinit();
+    var cb: [ae.ChildStart.max_size]u8 = undefined;
+    const cs = try ae.ChildStart.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .parent_slot = 7, .parent_run = "par", .parent_workflow = "pwf", .workflow = "kid", .version = "", .run = "kid1", .input = "{}" });
+    f.index += 1;
+    var e = entry_mod.buildEntry(.child_start, entry_mod.Flags.NONE, 1, f.index, 0, cs);
+    try testing.expect((try Fixture.run(&machine, &f, &e)).refused() == null);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "kid1") != null);
+    try hq.setForTest(&f.store, .default, 1 << 20, 1 << 20);
+    try testing.expect((try f.start("kid1", "kid", "child_started", "", 2)).refused() == null);
+    try testing.expect(f.get("kid1") == null);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "kid1") == null);
+    const told = lastReply(&f).?;
+    try testing.expectEqual(ae.Answer.over_quota, told.answer);
+    try testing.expect(std.mem.startsWith(u8, told.why.?, "limit: ns 1 history "));
+    try testing.expectEqual(@as(u64, 0), hq.reservedOf(hq.WorkflowReserved, .{ .store = &f.store }, .default));
 }
 
 test "workflow runs machine: past its shard's share a client's, a schedule's and a trigger's start are refused, writing nothing" {

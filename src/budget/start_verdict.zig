@@ -6,7 +6,8 @@
 //!
 //! Its arms read only the committed store and what is staged, so every
 //! replica, replay included, reaches the same verdict. Memory is the only
-//! arm here; a run-history quota is checked before it.
+//! arm here; its callers judge the namespace's run-history quota first
+//! (`history_quota.verdict`), so an entry over both answers the quota.
 
 const std = @import("std");
 const view_mod = @import("../contract/view.zig");
@@ -58,7 +59,7 @@ pub fn signalVerdict(view: *view_mod.View, ns: NamespaceId, wakes: bool) ?Verdic
 /// Null when what is staged in `view` may commit for a run of namespace
 /// `ns`; otherwise the bound it would pass.
 pub fn startVerdict(view: *view_mod.View, ns: NamespaceId) ?Verdict {
-    // The quota arm, per namespace, goes first.
+    // The shard's memory is one share for every namespace.
     _ = ns;
     if (gate.over(view)) |o| return .{ .bound = .memory_budget, .over = o };
     return null;

@@ -584,7 +584,7 @@ pub const WorkflowRuns = struct {
                             if (st.caller_slot != slotOf(NAMES[run.wf])) return null;
                             const c = indexOf(&CALLEES, st.settles) orelse return null;
                             if (l.calls[so][c]) |call| switch (call.state) {
-                                .sent, .started => return refuse(.step, "it takes its run's call's end before the call has one"),
+                                .sent, .started, .over_quota => return refuse(.step, "it takes its run's call's end before the call has one"),
                                 .done, .refused, .no_action, .over_budget => {},
                             };
                             settled = c;
@@ -885,9 +885,10 @@ pub const WorkflowRuns = struct {
                     .started => .started,
                     .no_action => .no_action,
                     .over_budget => .over_budget,
+                    .over_quota => .over_quota,
                     else => .refused,
                 };
-                if (c.state == .over_budget) want.classes.insert(.call_held);
+                if (c.state == .over_budget or c.state == .over_quota) want.classes.insert(.call_held);
                 if (p.why) |w| c.outcome = static(&WHYS, w) orelse return null;
             },
             .done => {
@@ -900,8 +901,8 @@ pub const WorkflowRuns = struct {
                 c.result = if (p.result.len == 0) "" else static(&RESULTS, p.result) orelse return null;
             },
             .retry => {
-                if (c.state != .no_action and c.state != .over_budget) return want;
-                if (c.state == .over_budget) want.classes.insert(.held_call_retried);
+                if (c.state != .no_action and c.state != .over_budget and c.state != .over_quota) return want;
+                if (c.state == .over_budget or c.state == .over_quota) want.classes.insert(.held_call_retried);
                 c.state = .sent;
                 c.attempts += 1;
                 want.sends[0] = startOf(c.*, at.at.?.c);
@@ -1499,7 +1500,7 @@ fn callAnswer(r: std.Random, buf: []u8, l: *const WorkflowRuns.Ledger) ?Made {
     for (l.calls, 0..) |row, so| for (row, 0..) |x, c| if (x) |call| {
         calls[n] = .{ .so = so, .c = c };
         n += 1;
-        if (call.state == .no_action or call.state == .over_budget) {
+        if (call.state == .no_action or call.state == .over_budget or call.state == .over_quota) {
             no_action[na] = .{ .so = so, .c = c };
             na += 1;
         }
@@ -1512,7 +1513,7 @@ fn callAnswer(r: std.Random, buf: []u8, l: *const WorkflowRuns.Ledger) ?Made {
     const slot = slotOf(NAMES[at.so]);
     const run = CALLEES[at.c];
     if (k < 35) {
-        const answers = [_]ae.Answer{ .started, .started, .started, .no_action, .no_action, .over_budget, .conflict, .refused, .skipped };
+        const answers = [_]ae.Answer{ .started, .started, .started, .no_action, .no_action, .over_budget, .over_quota, .conflict, .refused, .skipped };
         // A moved answer is refused: nothing sends one until slots move.
         const answer: ae.Answer = if (r.uintLessThan(u8, 100) < 3) .moved else answers[r.uintLessThan(usize, answers.len)];
         const why: ?[]const u8 = if (r.uintLessThan(u8, 100) < 30) WHYS[0] else null;

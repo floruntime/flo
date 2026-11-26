@@ -378,6 +378,7 @@ pub const WorkflowHandler = struct {
         /// Its step's call is held by its action's shard's memory share:
         /// said once in its history, however long the hold.
         call_over_budget_noted: bool = false,
+        call_over_quota_noted: bool = false,
         /// When this leader may next ask again for that call, and the index
         /// of the last time it did: until that applies, the step waits on
         /// it, so it can't give up as the start goes out again.
@@ -2639,8 +2640,35 @@ pub const WorkflowHandler = struct {
                 self.retryCall(shard, run, action_rid, c, now_ms);
                 return false;
             },
+            .over_quota => {
+                // It always waits, a step that can't wait too: room comes
+                // as the callee's namespace deletes runs or raises its
+                // quota, and failing would lose the step for a limit. Said
+                // once, however long the hold.
+                if (!run.call_over_quota_noted) {
+                    run.call_over_quota_noted = true;
+                    self.addHistoryEvent(run, "call_held_over_quota", c.outcome, now_ms);
+                }
+                if (run.call_retry_index > shard.raft_node.last_applied) return false;
+                const now_ns: u64 = @intCast(@max(now_ms, 0) *| std.time.ns_per_ms);
+                const wait_ms = quotaRetryMs(c.attempts);
+                if (now_ns < c.last_ns +| wait_ms * std.time.ns_per_ms or now_ms < run.call_retry_at_ms) return false;
+                self.retryCall(shard, run, action_rid, c, now_ms);
+                return false;
+            },
         }
     }
+
+    /// How long a call held at its callee's quota waits before asking again,
+    /// after `attempts`: 5 s, doubling, at most 10 minutes. Room comes only
+    /// as runs are deleted or the quota raised, so it asks less often than a
+    /// memory hold does.
+    pub fn quotaRetryMs(attempts: u32) u64 {
+        const doublings: u6 = @intCast(@min(@max(attempts, 1) - 1, 16));
+        return @min(CALL_RETRY_FIRST_MS << doublings, QUOTA_RETRY_MAX_MS);
+    }
+
+    pub const QUOTA_RETRY_MAX_MS: u64 = 600_000;
 
     /// Asks again for a call whose action wasn't registered, or whose
     /// action's shard was at its memory share. Not proposed (a busy log, a
@@ -2654,8 +2682,8 @@ pub const WorkflowHandler = struct {
         const payload = ae.CallRetry.encodeInto(&buf, .{ .ns = ns.int(), .slot = calls_mod.callerSlot(ns, run.workflow_name_owned), .run = action_rid }) catch return;
         run.call_retry_index = (proposeCharged(shard, ns, .step_call_retry, payload) catch return).index;
         if (shard.metrics_registry) |m| m.workflow.recordActionCallRetry();
-        // A hold over memory was said once, when it started.
-        if (c.state == .over_budget) return;
+        // A hold over memory or the quota was said once, when it started.
+        if (c.state == .over_budget or c.state == .over_quota) return;
         var nb: [ae.MAX_ACTION_NAME + 96]u8 = undefined;
         const next_s = callRetryMs(c.attempts +| 1) / 1000;
         self.addHistoryEvent(run, "action_call_retry", std.fmt.bufPrint(&nb, "waiting for action {s} to be registered, retry in {d} s", .{ c.target, next_s }) catch c.target, now_ms);
@@ -3039,6 +3067,16 @@ pub const WorkflowHandler = struct {
                 if (now_ns >= next_ns and now_ms >= p.call_retry_at_ms) return .step;
                 return .{ .later = @max(ceilMs(next_ns), p.call_retry_at_ms) };
             },
+            .over_quota => {
+                // Always waits, `can_wait` or not (`callSettled`).
+                const p = progress_mod.Progress.decode(rec.progress) catch return .step;
+                if (!p.call_over_quota_noted) return .step;
+                if (p.call_retry_index > shard.raft_node.last_applied) return .none;
+                const now_ns: u64 = @intCast(@max(now_ms, 0) *| std.time.ns_per_ms);
+                const next_ns = c.last_ns +| quotaRetryMs(c.attempts) * std.time.ns_per_ms;
+                if (now_ns >= next_ns and now_ms >= p.call_retry_at_ms) return .step;
+                return .{ .later = @max(ceilMs(next_ns), p.call_retry_at_ms) };
+            },
         }
     }
 
@@ -3104,8 +3142,9 @@ pub const WorkflowHandler = struct {
             .no_action => .no_action,
             // Settled only when its step can't wait: refused, saying why.
             .refused, .over_budget => .refused,
-            // Not settled: `callSettled` resumes only a settled one.
-            .sent, .started => return,
+            // Not settled: `callSettled` resumes only a settled one. A call
+            // held at its callee's quota never settles.
+            .sent, .started, .over_quota => return,
         } else .lost;
 
         // A child that failed, was cancelled or timed out takes the step's
@@ -3173,6 +3212,7 @@ pub const WorkflowHandler = struct {
         run.took_call_end = true;
         run.call_unregistered_noted = false;
         run.call_over_budget_noted = false;
+        run.call_over_quota_noted = false;
         run.call_retry_at_ms = 0;
         run.call_retry_index = 0;
 
@@ -5161,6 +5201,7 @@ pub const WorkflowHandler = struct {
         run.waiting_for_room = p.waiting_for_room;
         run.call_unregistered_noted = p.call_unregistered_noted;
         run.call_over_budget_noted = p.call_over_budget_noted;
+        run.call_over_quota_noted = p.call_over_quota_noted;
         run.call_retry_at_ms = p.call_retry_at_ms;
         run.call_retry_index = p.call_retry_index;
         run.plan_executor_idx = p.plan_executor_idx;
@@ -5186,6 +5227,7 @@ pub const WorkflowHandler = struct {
             .waiting_for_room = run.waiting_for_room,
             .call_unregistered_noted = run.call_unregistered_noted,
             .call_over_budget_noted = run.call_over_budget_noted,
+            .call_over_quota_noted = run.call_over_quota_noted,
             .call_retry_at_ms = run.call_retry_at_ms,
             .call_retry_index = run.call_retry_index,
             .plan_executor_idx = run.plan_executor_idx,
@@ -9799,6 +9841,59 @@ test "step executor: a call that can't wait, held over its action's shard's memo
         if (std.mem.eql(u8, evt.event_type_owned, "action_refused") and std.mem.indexOf(u8, evt.detail_owned, "would pass its share") != null) refused = true;
     }
     try testing.expect(refused);
+}
+
+test "step executor: a call that can't wait, held at its callee's namespace's quota, waits anyway, says so once, and starts once there is room" {
+    const hq = @import("../budget/history_quota.zig");
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    registerTestAction(&shard, "stripe");
+    registerTestAction(&shard, "paypal");
+    // Each executor's call can't wait: held for memory it would fail.
+    createTestDef(&handler, testKey(.default, "plan-wf"), "plan-wf", test_plan_exhaust_workflow_json);
+    createTestRun(&handler, testKey(.default, "run-q"), "run-q", "plan-wf");
+    // The namespace's usage is at its part: nothing it calls may start.
+    try hq.setForTest(&shard.defaultPartition().store, .default, 1 << 30, 1 << 30);
+    handler.advanceWorkflow(&shard, testKey(.default, "run-q"));
+    settleTest(&shard);
+    handler.checkPendingActions(&shard);
+    settleTest(&shard);
+    const run = handler.takeRun(&shard, testKey(.default, "run-q")).?;
+    const rid = run.pending_action_run_id_owned.?;
+    const c = WorkflowHandler.callOf(&shard, run, rid).?;
+    try testing.expectEqual(calls_mod.State.over_quota, c.state);
+    try testing.expect(std.mem.startsWith(u8, c.outcome, "limit: ns 1 history "));
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    var held: usize = 0;
+    for (handler.inspect(testKey(.default, "run-q")).?.history.items) |evt| {
+        try testing.expect(!std.mem.eql(u8, evt.event_type_owned, "action_refused"));
+        if (std.mem.eql(u8, evt.event_type_owned, "call_held_over_quota")) held += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), held);
+    // Room again: asked again, it starts.
+    try hq.setForTest(&shard.defaultPartition().store, .default, 1 << 30, 0);
+    handler.retryCall(&shard, run, rid, c, @import("stdx").time.milliTimestamp());
+    _ = handler.commitRun(&shard, testKey(.default, "run-q"));
+    settleTest(&shard);
+    const again = handler.takeRun(&shard, testKey(.default, "run-q")).?;
+    try testing.expectEqual(calls_mod.State.started, WorkflowHandler.callOf(&shard, again, again.pending_action_run_id_owned.?).?.state);
+    _ = handler.commitRun(&shard, testKey(.default, "run-q"));
+}
+
+test "a call held at its callee's quota asks again at 5 s, doubling, at most 10 minutes" {
+    try testing.expectEqual(@as(u64, 5_000), WorkflowHandler.quotaRetryMs(0));
+    try testing.expectEqual(@as(u64, 5_000), WorkflowHandler.quotaRetryMs(1));
+    try testing.expectEqual(@as(u64, 10_000), WorkflowHandler.quotaRetryMs(2));
+    try testing.expectEqual(@as(u64, 600_000), WorkflowHandler.quotaRetryMs(8));
+    try testing.expectEqual(@as(u64, 600_000), WorkflowHandler.quotaRetryMs(std.math.maxInt(u32)));
 }
 
 test "step executor: a call first unregistered, then over its action's shard's share, then unregistered again, says each hold once" {

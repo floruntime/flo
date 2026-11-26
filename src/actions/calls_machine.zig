@@ -59,6 +59,10 @@ pub const State = enum(u8) {
     /// Its action's shard was at its memory share when the start arrived:
     /// no run yet, and its start is sent again once memory may have freed.
     over_budget = 6,
+    /// Its callee's namespace was at its run-history quota on its shard: no
+    /// run yet, and its start is sent again later. It always waits, so a
+    /// step never fails for it.
+    over_quota = 7,
 };
 
 /// A step's call of an action's run or a child workflow's, kept under the
@@ -279,8 +283,12 @@ pub fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     switch (typeOf(e).?) {
         .step_call_retry => {
             var c = (found orelse return).v;
-            // Answered since the retry was proposed, or proposed twice.
-            if (c.state != .no_action and c.state != .over_budget) return;
+            // Answered since the retry was proposed, or proposed twice. Every
+            // state is named, so one added later must say whether it retries.
+            switch (c.state) {
+                .no_action, .over_budget, .over_quota => {},
+                .sent, .started, .done, .refused => return,
+            }
             c.attempts +|= 1;
             c.last_ns = stamp;
             if (unstartable(c)) |why| {
@@ -306,6 +314,7 @@ pub fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 .started => .started,
                 .no_action => .no_action,
                 .over_budget => .over_budget,
+                .over_quota => .over_quota,
                 .conflict, .skipped, .refused => .refused,
                 .moved => unreachable,
             };
@@ -345,7 +354,9 @@ pub fn skipped(view: *View, e: *const Entry, why: []const u8) ApplyError!void {
     var kb: KeyBuf = undefined;
     const k = callKey(&kb, n.ns, n.slot, n.run) orelse return;
     var c = ((try view.get(Calls, k)) orelse return).v;
-    if (c.state == .done or c.state == .refused or c.state == .no_action or c.state == .over_budget) return;
+    // An over-quota call waits for room, whatever a repair skipped: it asks
+    // again, and is never failed for it.
+    if (c.state == .done or c.state == .refused or c.state == .no_action or c.state == .over_budget or c.state == .over_quota) return;
     c.state = .refused;
     c.outcome = why;
     c.last_ns = e.header.timestamp_ns;

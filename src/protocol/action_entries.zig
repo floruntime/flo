@@ -276,6 +276,10 @@ pub const Answer = enum(u8) {
     /// The action's shard is at its memory share: no run was started, and
     /// the call may ask again once memory frees. The reply's `why` says so.
     over_budget = 7,
+    /// The callee's namespace is at its run-history quota on its shard: no
+    /// run was started, and the call asks again later, however long that
+    /// takes. The reply's `why` gives the figures.
+    over_quota = 8,
 };
 
 /// The action's shard's answer to a call's start, sent back to the
