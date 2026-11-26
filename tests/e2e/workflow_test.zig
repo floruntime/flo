@@ -79,8 +79,8 @@ test "e2e/workflow: create workflow with inline plan" {
         .idempotency("required");
     _ = builder.plans()
         .plan("payment", "health-weighted")
-        .executor("stripe", "@actions/charge-stripe", 100)
-        .executor("paypal", "@actions/charge-paypal", 80)
+        .executor("stripe", "@actions/charge-stripe")
+        .executor("paypal", "@actions/charge-paypal")
         .done()
         .done();
     _ = builder.start("@plan/payment")
@@ -110,7 +110,7 @@ test "e2e/workflow: create workflow with circuit breaker" {
     _ = builder.workflow("cb-test", "1.0.0");
     _ = builder.plans()
         .plan("resilient-api", "round-robin")
-        .executorWithBreaker("primary", "@actions/call-api", 100, 5, 30000) // 5 failures, 30s cooldown
+        .executorWithBreaker("primary", "@actions/call-api", 5, 30000) // 5 failures, 30s cooldown
         .done()
         .done();
     _ = builder.start("@plan/resilient-api")
@@ -138,7 +138,7 @@ test "e2e/workflow: create workflow with retry config" {
     _ = builder.workflow("retry-test", "1.0.0");
     _ = builder.plans()
         .plan("retryable", "round-robin")
-        .executorWithRetry("api", "@actions/flaky-api", 100, 3, "exponential") // 3 attempts, exponential
+        .executorWithRetry("api", "@actions/flaky-api", 3) // 3 attempts
         .done()
         .done();
     _ = builder.start("@plan/retryable")
@@ -654,8 +654,8 @@ test "e2e/workflow: workflow with inline plan" {
     _ = builder.workflow("payment-flow", "1.0.0");
     _ = builder.plans()
         .plan("payment", "health-weighted")
-        .executor("stripe", "@actions/charge-stripe", 100)
-        .executor("paypal", "@actions/charge-paypal", 80)
+        .executor("stripe", "@actions/charge-stripe")
+        .executor("paypal", "@actions/charge-paypal")
         .done()
         .done();
 
@@ -3765,8 +3765,8 @@ fn createPlanWorkflow(ctx: *stdx.testing.TestContext, name: []const u8, first: [
     defer testing.allocator.free(second_target);
     _ = builder.plans()
         .plan("p", "static-order")
-        .executor("first", first_target, 100)
-        .executor("second", second_target, 100)
+        .executor("first", first_target)
+        .executor("second", second_target)
         .done()
         .done();
     _ = builder.start("@plan/p").onSuccess("flo.Completed").onFailure("flo.Failed");
