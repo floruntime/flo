@@ -70,6 +70,21 @@ pub const Row = schema.Record(&.{
     .{ .name = "completed_ms", .T = Int(u64) },
     .{ .name = "retries", .T = Int(u8) },
     .{ .name = "mode", .T = Int(u8) },
+    // The log bytes this row keeps referenced: a chunk's whole message, a
+    // fold's own and every row it folded, an ended run's last row's; an
+    // orphan mark's, every row its run holds, kept current as later chunks
+    // and folds land. Markers and final rows hold none. A namespace's usage
+    // is the sum over its rows.
+    .{ .name = "total", .T = Int(u64) },
+});
+
+/// A namespace's history on this shard, as its rows count it: the bytes
+/// its live and ended rows reference (orphaned runs' rows among them), and
+/// its orphaned runs with their bytes.
+pub const Usage = schema.Record(&.{
+    .{ .name = "bytes", .T = Int(u64) },
+    .{ .name = "orphans", .T = Int(u32) },
+    .{ .name = "orphan_bytes", .T = Int(u64) },
 });
 
 /// How an ended run's row points at its history.
@@ -82,6 +97,8 @@ pub const Mode = enum(u8) {
 
 pub const Workflows = view_mod.Family(70, "history.wf", .id, delivery.Stored(Row));
 pub const Actions = view_mod.Family(71, "history.act", .id, delivery.Stored(Row));
+/// One row per namespace, keyed by the namespace alone: both families'.
+pub const UsageFam = view_mod.Family(76, "history.usage", .id, delivery.Stored(Usage));
 
 /// How many times a run's last fold may be lost before it ends with its
 /// live rows as they are.
@@ -216,6 +233,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
     eb[0] = @backingInt(Tag.ended);
     eb[1..9].* = ownerHash(h.owner);
     out.addRangeIn(fam, h.ns, &eb) catch unreachable;
+    try out.addIn(UsageFam.ID, h.ns, "");
 }
 
 fn familyId(f: he.Family) u16 {
@@ -276,7 +294,41 @@ fn applyIn(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Message
 }
 
 fn row(owner: []const u8) Row.Value {
-    return .{ .owner = owner, .ual_index = 0, .part = 0, .first_seq = 0, .last_seq = 0, .byte_len = 0, .kind = 0, .completed_ms = 0, .retries = 0, .mode = 0 };
+    return .{ .owner = owner, .ual_index = 0, .part = 0, .first_seq = 0, .last_seq = 0, .byte_len = 0, .kind = 0, .completed_ms = 0, .retries = 0, .mode = 0, .total = 0 };
+}
+
+/// How a namespace's usage moves in one apply.
+const Move = struct {
+    add: u64 = 0,
+    sub: u64 = 0,
+    orphans_add: u32 = 0,
+    orphans_sub: u32 = 0,
+    orphan_bytes_add: u64 = 0,
+    orphan_bytes_sub: u64 = 0,
+};
+
+fn moveUsage(view: *View, ns: NamespaceId, m: Move) ApplyError!void {
+    const k = try inNs(view.arena, ns, "");
+    var u: Usage.Value = if (try view.get(UsageFam, k)) |got| got.v else .{ .bytes = 0, .orphans = 0, .orphan_bytes = 0 };
+    // A subtract past 0 is drift a VOPR rule finds: counted, never a halt,
+    // which every replica would hit again on replay.
+    const drift = &view.history_usage_drift;
+    u.bytes = subOrDrift(u64, drift, u.bytes +| m.add, m.sub);
+    u.orphans = subOrDrift(u32, drift, u.orphans +| m.orphans_add, m.orphans_sub);
+    u.orphan_bytes = subOrDrift(u64, drift, u.orphan_bytes +| m.orphan_bytes_add, m.orphan_bytes_sub);
+    if (u.bytes == 0 and u.orphans == 0 and u.orphan_bytes == 0) {
+        if (try view.get(UsageFam, k) != null) try view.delete(UsageFam, k);
+        return;
+    }
+    try view.put(UsageFam, k, .{ .v = u });
+}
+
+fn subOrDrift(comptime T: type, drift: *u64, have: T, take: T) T {
+    if (take > have) {
+        drift.* += 1;
+        return 0;
+    }
+    return have - take;
 }
 
 /// A chunk's row, or a lost one for its events: the run's next live row,
@@ -284,6 +336,8 @@ fn row(owner: []const u8) Row.Value {
 fn land(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Message, h: Head, kind: he.Kind, byte_len: u32) ApplyError!void {
     const a = view.arena;
     var r = row(h.owner);
+    // A lost chunk's row references nothing a read can return.
+    r.total = if (kind == .lost) 0 else e.payload.len;
     r.ual_index = e.header.index;
     r.part = msg.ordinal + 1;
     r.first_seq = h.first_seq;
@@ -291,6 +345,8 @@ fn land(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Message, h
     r.byte_len = byte_len;
     r.kind = @backingInt(kind);
     try view.put(F, try inNs(a, h.ns, try liveKey(a, h.owner, h.run, h.created_ns, r.ual_index, r.part)), .{ .v = r });
+    try moveUsage(view, h.ns, .{ .add = r.total });
+    try orphanGrows(F, view, h, r.total);
     if (h.final) {
         var f = row(h.owner);
         f.completed_ms = h.completed_ms;
@@ -309,11 +365,13 @@ fn fold(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Message, h
     try view.delete(F, marker);
     var first: u64 = std.math.maxInt(u64);
     var last: u64 = 0;
+    var folded: u64 = 0;
     var it = locators.iterator();
     while (it.next() catch return error.Halt) |l| {
         const k = try inNs(a, h.ns, try liveKey(a, h.owner, h.run, h.created_ns, l.ual_index, l.part));
         // Each row it lists is one the marker kept from folding twice.
-        if (try view.get(F, k) == null) return error.Halt;
+        const got = (try view.get(F, k)) orelse return error.Halt;
+        folded +|= got.v.total;
         try view.delete(F, k);
         if (l.kind != @backingInt(he.Kind.lost) or l.last_seq != 0) {
             first = @min(first, l.first_seq);
@@ -327,7 +385,11 @@ fn fold(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Message, h
     r.last_seq = last;
     r.byte_len = @intCast(e.payload.len);
     r.kind = @backingInt(he.Kind.index);
+    // The rows it folded move into it; only its own message is new.
+    r.total = (if (comptime plant.active == .history_fold_total_dropped) 0 else folded) +| e.payload.len;
     try view.put(F, try inNs(a, h.ns, try liveKey(a, h.owner, h.run, h.created_ns, r.ual_index, r.part)), .{ .v = r });
+    try moveUsage(view, h.ns, .{ .add = e.payload.len });
+    try orphanGrows(F, view, h, e.payload.len);
     try settle(F, view, msg, h);
 }
 
@@ -381,22 +443,68 @@ fn end(comptime F: type, view: *View, h: Head, completed_ms: u64, last: Row.Valu
     r.owner = h.owner;
     r.completed_ms = completed_ms;
     r.mode = @backingInt(Mode.one);
-    try view.put(F, try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, completed_ms)), .{ .v = r });
+    const ek = try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, completed_ms));
+    try releaseEnded(F, view, h.ns, ek);
+    try view.put(F, ek, .{ .v = r });
     try view.delete(F, try inNs(a, h.ns, try liveKey(a, h.owner, h.run, h.created_ns, last.ual_index, last.part)));
     try view.delete(F, try inNs(a, h.ns, try runKey(a, .final, h.owner, h.run, h.created_ns)));
 }
 
-/// Every row of a run's incarnation, gone. Its bytes stay in the log.
+/// Every row of a run's incarnation, gone, and the bytes they referenced
+/// off its namespace's usage. Its bytes stay in the log.
 fn drop(comptime F: type, view: *View, h: Head) ApplyError!void {
     const a = view.arena;
+    var m: Move = .{};
     var doomed: std.ArrayListUnmanaged([]const u8) = .empty;
     var it = try view.range(F, try inNs(a, h.ns, try runKey(a, .live, h.owner, h.run, h.created_ns)));
-    while (try it.next()) |item| try doomed.append(a, item.key);
+    while (try it.next()) |item| {
+        try doomed.append(a, item.key);
+        m.sub +|= item.value.v.total;
+    }
     for (doomed.items) |k| try view.delete(F, k);
     try view.delete(F, try inNs(a, h.ns, try runKey(a, .marker, h.owner, h.run, h.created_ns)));
     try view.delete(F, try inNs(a, h.ns, try runKey(a, .final, h.owner, h.run, h.created_ns)));
-    try view.delete(F, try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, h.completed_ms)));
-    try view.delete(F, try inNs(a, h.ns, try runKey(a, .orphan, h.owner, h.run, h.created_ns)));
+    const ended = try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, h.completed_ms));
+    if (try view.get(F, ended)) |got| m.sub +|= got.v.total;
+    try view.delete(F, ended);
+    const orphan = try inNs(a, h.ns, try runKey(a, .orphan, h.owner, h.run, h.created_ns));
+    if (try view.get(F, orphan)) |got| {
+        m.orphans_sub = 1;
+        m.orphan_bytes_sub = got.v.total;
+    }
+    try view.delete(F, orphan);
+    if (comptime plant.active == .history_drop_unread) return;
+    try moveUsage(view, h.ns, m);
+}
+
+/// A run marked orphaned whose rows reference `bytes` more (a chunk or fold
+/// that landed after its mark): its mark and its namespace's orphaned bytes
+/// grow with them.
+fn orphanGrows(comptime F: type, view: *View, h: Head, bytes: u64) ApplyError!void {
+    if (bytes == 0) return;
+    const k = try inNs(view.arena, h.ns, try runKey(view.arena, .orphan, h.owner, h.run, h.created_ns));
+    var o = (try view.get(F, k)) orelse return;
+    o.v.total +|= bytes;
+    try view.put(F, k, o);
+    try moveUsage(view, h.ns, .{ .orphan_bytes_add = bytes });
+}
+
+/// What an ended row put at `key` replaces: one already there (a second
+/// final chunk, which no producer sends) has its total taken off usage, so
+/// a replace never counts twice.
+fn releaseEnded(comptime F: type, view: *View, ns: NamespaceId, key: []const u8) ApplyError!void {
+    if (try view.get(F, key)) |old| try moveUsage(view, ns, .{ .sub = old.v.total });
+}
+
+/// The bytes `h`'s run's rows still reference: its live rows and its ended
+/// row, if any.
+fn runTotal(comptime F: type, view: *View, h: Head) ApplyError!u64 {
+    const a = view.arena;
+    var total: u64 = 0;
+    var it = try view.range(F, try inNs(a, h.ns, try runKey(a, .live, h.owner, h.run, h.created_ns)));
+    while (try it.next()) |item| total +|= item.value.v.total;
+    if (try view.get(F, try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, h.completed_ms)))) |got| total +|= got.v.total;
+    return total;
 }
 
 /// `h`'s drop, sent again to this group on the history lane, its resend
@@ -443,17 +551,25 @@ fn skippedIn(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Messa
             var r = row(h.owner);
             r.completed_ms = f.completed_ms;
             r.mode = @backingInt(Mode.live);
-            try view.put(F, try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, f.completed_ms)), .{ .v = r });
+            const ek = try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, f.completed_ms));
+            try releaseEnded(F, view, h.ns, ek);
+            try view.put(F, ek, .{ .v = r });
             try view.delete(F, final_key);
         },
         .history_drop => {
             if (comptime plant.active == .history_drop_not_resent) return;
             if (h.first_seq < MAX_DROP_RETRIES - 1) return sendDrop(view, msg, h, h.first_seq + 1);
-            // Past its retries: its rows stay, marked, until a later drop.
+            // Past its retries: its rows stay, marked, until a later drop,
+            // and are counted as orphaned. A mark already there (a later
+            // drop lost too) counts nothing again.
+            const orphan = try inNs(a, h.ns, try runKey(a, .orphan, h.owner, h.run, h.created_ns));
+            if (try view.get(F, orphan) != null) return;
             var o = row(h.owner);
             o.completed_ms = h.completed_ms;
             o.retries = MAX_DROP_RETRIES;
-            try view.put(F, try inNs(a, h.ns, try runKey(a, .orphan, h.owner, h.run, h.created_ns)), .{ .v = o });
+            o.total = try runTotal(F, view, h);
+            try view.put(F, orphan, .{ .v = o });
+            try moveUsage(view, h.ns, .{ .orphans_add = 1, .orphan_bytes_add = o.total });
         },
         else => {},
     }
@@ -462,7 +578,7 @@ fn skippedIn(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Messa
 pub const machine: machine_mod.Machine = .{
     .name = "history",
     .entry_types = &.{ .history_chunk, .history_index, .history_drop },
-    .families = &.{ machine_mod.info(Workflows), machine_mod.info(Actions) },
+    .families = &.{ machine_mod.info(Workflows), machine_mod.info(Actions), machine_mod.info(UsageFam) },
     .keys = keys,
     .apply = apply,
     .malformed = malformed,
@@ -599,6 +715,57 @@ pub fn ruleOf(comptime F: type, read: ReadView, a: std.mem.Allocator) error{OutO
             if ((rows.next() catch return "a history row could not be read") != null) return "a run with its ended row has live, marker or final rows besides";
         }
     }
+    return null;
+}
+
+/// A namespace's usage row on this shard, or zeros for none.
+pub fn usageOf(read: ReadView, ns: NamespaceId) Usage.Value {
+    var kb: [4]u8 = undefined;
+    const k = view_mod.idKey(&kb, ns, "") catch unreachable;
+    const got = read.get(UsageFam, k) catch null;
+    return if (got) |g| g.v else .{ .bytes = 0, .orphans = 0, .orphan_bytes = 0 };
+}
+
+/// Why the usage rows aren't what the history rows sum to, or null: each
+/// namespace's bytes are its live and ended rows' totals over both
+/// families, and its orphans its orphan marks and their totals.
+pub fn usageRule(read: ReadView, a: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
+    var sums: std.AutoHashMapUnmanaged(u32, Usage.Value) = .empty;
+    inline for (.{ Workflows, Actions }) |F| {
+        var it = read.range(F, "");
+        while (it.next() catch return "a history row could not be read") |item| {
+            const k = item.key;
+            if (k.len < 5) return "a history row's key is not one";
+            const ns = std.mem.readInt(u32, k[0..4], .big);
+            const e = try sums.getOrPut(a, ns);
+            if (!e.found_existing) e.value_ptr.* = .{ .bytes = 0, .orphans = 0, .orphan_bytes = 0 };
+            switch (k[4]) {
+                @backingInt(Tag.live), @backingInt(Tag.ended) => e.value_ptr.bytes +|= item.value.v.total,
+                @backingInt(Tag.orphan) => {
+                    e.value_ptr.orphans += 1;
+                    e.value_ptr.orphan_bytes +|= item.value.v.total;
+                },
+                else => {},
+            }
+        }
+    }
+    var seen: usize = 0;
+    var it = read.range(UsageFam, "");
+    while (it.next() catch return "a usage row could not be read") |item| {
+        if (item.key.len != 4) return "a usage row's key is not a namespace";
+        const want = sums.get(std.mem.readInt(u32, item.key[0..4], .big)) orelse return "a namespace with no history rows has a usage row";
+        seen += 1;
+        const got = item.value.v;
+        if (got.bytes != want.bytes) return "a namespace's history usage is not the sum of its rows' totals";
+        if (got.orphans != want.orphans or got.orphan_bytes != want.orphan_bytes) return "a namespace's orphaned history is not its orphan marks'";
+    }
+    // A namespace whose rows sum to nothing keeps no row.
+    var vit = sums.valueIterator();
+    var nonzero: usize = 0;
+    while (vit.next()) |v| {
+        if (v.bytes != 0 or v.orphans != 0 or v.orphan_bytes != 0) nonzero += 1;
+    }
+    if (nonzero != seen) return "a namespace's history rows count bytes its usage row doesn't";
     return null;
 }
 
@@ -988,6 +1155,168 @@ test "history: a skipped drop whose count is past any it could reach marks its r
     try t.sendOwn(r, .history_drop, p);
     try t.pump();
     try testing.expectEqual(@as(usize, 1), t.countTag(r, .orphan));
+}
+
+/// The usage rule over `t`'s rows, as VOPR checks it.
+fn expectUsageRule(t: *H) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    if (try usageRule(t.read(), arena.allocator())) |why| {
+        std.debug.print("usage rule: {s}\n", .{why});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "history usage: a chunk counts its whole message; folds, ends and drops keep each namespace's usage its rows' sum, and a drop takes it to none" {
+    for ([_]usize{ 1, 2, 16, 37 }) |chunks| for ([_]he.Family{ .action, .workflow }) |family| for ([_]bool{ false, true }) |ends| {
+        var t = H.init();
+        defer t.deinit();
+        const r: H.Run = .{ .family = family };
+        const elsewhere: H.Run = .{ .family = family, .ns = .of(17), .owner = "other" };
+        for (0..chunks) |i| {
+            try t.chunk(r, i + 1, i + 1, ends and i + 1 == chunks, 900);
+            try t.chunk(elsewhere, i + 1, i + 1, false, 0);
+            if (i == 0) {
+                // One chunk landed: its message's bytes, header and all.
+                try t.pumpAtMost(1);
+                var buf: [he.Chunk.max_size]u8 = undefined;
+                const one = try he.Chunk.encodeInto(&buf, .{ .ns = r.ns.int(), .family = @backingInt(r.family), .owner = r.owner, .run = r.run, .created_ns = r.created_ns, .first_seq = 1, .last_seq = 1, .final = ends and chunks == 1, .completed_ms = 900, .records = "events" });
+                try testing.expectEqual(@as(u64, one.len), usageOf(t.read(), r.ns).bytes);
+            }
+        }
+        try t.pump();
+        try expectUsageRule(&t);
+        const before = usageOf(t.read(), elsewhere.ns);
+        try testing.expect(usageOf(t.read(), r.ns).bytes > 0);
+        try t.dropOf(r, if (ends) 900 else 0);
+        try t.pump();
+        try expectUsageRule(&t);
+        // Its namespace keeps no row; the other's is as it was.
+        const nb = r.ns.bytes();
+        try testing.expect((try t.read().get(UsageFam, &nb)) == null);
+        try testing.expectEqual(before.bytes, usageOf(t.read(), elsewhere.ns).bytes);
+    };
+}
+
+test "history usage: a lost chunk counts nothing, and a run ended at its live rows keeps their bytes" {
+    var t = H.init();
+    defer t.deinit();
+    const r: H.Run = .{};
+    try t.chunk(r, 1, 1, false, 0);
+    try t.chunk(r, 2, 2, true, 700);
+    // Seq 2 lost; then its fold (3) and both resends (4, 5).
+    t.skip = &.{ 2, 3, 4, 5 };
+    try t.pump();
+    var rows: [4]Row.Value = undefined;
+    const got = t.live(r, &rows);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqual(@as(u64, 0), got[1].total);
+    try testing.expectEqual(@as(u8, @backingInt(Mode.live)), t.ended(r, 700).?.mode);
+    try testing.expectEqual(@as(u64, 0), t.ended(r, 700).?.total);
+    try testing.expectEqual(got[0].total, usageOf(t.read(), r.ns).bytes);
+    try expectUsageRule(&t);
+    t.skip = &.{};
+    try t.dropOf(r, 700);
+    try t.pump();
+    try testing.expectEqual(@as(u64, 0), usageOf(t.read(), r.ns).bytes);
+    try expectUsageRule(&t);
+}
+
+test "history usage: an orphaned run is counted once with its rows' bytes, however often its drop is lost, and a later drop takes both" {
+    var t = H.init();
+    defer t.deinit();
+    const r: H.Run = .{};
+    try t.chunk(r, 1, 1, false, 0);
+    try t.chunk(r, 2, 2, true, 50);
+    try t.pump();
+    const bytes = usageOf(t.read(), r.ns).bytes;
+    // Seqs 4..6: the drop and its two resends; then 7..9 a second drop's.
+    t.skip = &.{ 4, 5, 6, 7, 8, 9 };
+    for (0..2) |_| {
+        try t.dropOf(r, 50);
+        try t.pump();
+        const u = usageOf(t.read(), r.ns);
+        try testing.expectEqual(@as(u32, 1), u.orphans);
+        try testing.expectEqual(bytes, u.orphan_bytes);
+        try testing.expectEqual(bytes, u.bytes);
+        try expectUsageRule(&t);
+    }
+    t.skip = &.{};
+    try t.dropOf(r, 50);
+    try t.pump();
+    const u = usageOf(t.read(), r.ns);
+    try testing.expectEqual(@as(u64, 0), u.bytes);
+    try testing.expectEqual(@as(u32, 0), u.orphans);
+    try testing.expectEqual(@as(u64, 0), u.orphan_bytes);
+    try expectUsageRule(&t);
+}
+
+test "history usage: an orphaned run's mark grows with the chunks and folds that land after it" {
+    var t = H.init();
+    defer t.deinit();
+    const r: H.Run = .{};
+    for (0..7) |i| try t.chunk(r, i + 1, i + 1, false, 0);
+    try t.pump();
+    // Its drop and both resends lost (seqs 8..10): orphaned at 7 rows.
+    t.skip = &.{ 8, 9, 10 };
+    try t.dropOf(r, 0);
+    try t.pump();
+    t.skip = &.{};
+    try testing.expectEqual(@as(usize, 1), t.countTag(r, .orphan));
+    // Nine more land after the mark, and the fold at 16 with them.
+    for (0..9) |i| try t.chunk(r, 8 + i, 8 + i, false, 0);
+    try t.pump();
+    const u = usageOf(t.read(), r.ns);
+    try testing.expectEqual(u.bytes, u.orphan_bytes);
+    try expectUsageRule(&t);
+}
+
+test "history usage: an ended row put over one already there (a second final chunk) takes the first's bytes off, so none count twice" {
+    var t = H.init();
+    defer t.deinit();
+    const r: H.Run = .{};
+    try t.chunk(r, 1, 1, true, 50);
+    try t.pump();
+    try t.chunk(r, 2, 2, true, 50);
+    try t.pump();
+    try expectUsageRule(&t);
+    try testing.expectEqual(@as(u64, 0), t.store.history_usage_drift);
+}
+
+test "history usage: however many runs land and go in one namespace, it keeps one usage row, its size unchanged" {
+    var t = H.init();
+    defer t.deinit();
+    var size: ?u64 = null;
+    var rb: [16]u8 = undefined;
+    for (0..400) |i| {
+        const r: H.Run = .{ .run = try std.fmt.bufPrint(&rb, "r{d}", .{i}) };
+        // 20 chunks a run, its last final: folds and an end each.
+        for (0..20) |c| try t.chunk(r, c + 1, c + 1, c == 19, 50);
+        try t.pump();
+        // Every other run deleted, so the row rises and falls.
+        if (i % 2 == 1) {
+            try t.dropOf(r, 50);
+            try t.pump();
+        }
+        const f = t.store.family(UsageFam.ID);
+        try testing.expectEqual(@as(usize, 1), f.count);
+        if (size) |sz| try testing.expectEqual(sz, f.encoded_bytes) else size = f.encoded_bytes;
+    }
+    try expectUsageRule(&t);
+}
+
+test "history usage: a subtract past what a namespace holds is counted as drift and saturates, never halts" {
+    var t = H.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ks = KeySet.init(arena.allocator());
+    try ks.addIn(UsageFam.ID, .default, "");
+    var view = View.init(&t.store, arena.allocator(), &ks);
+    try moveUsage(&view, .default, .{ .add = 5, .sub = 9, .orphans_sub = 1 });
+    try view.commit();
+    try testing.expectEqual(@as(u64, 2), t.store.history_usage_drift);
+    try testing.expectEqual(@as(u64, 0), usageOf(t.read(), .default).bytes);
 }
 
 test "history: a run's reads see only its own incarnation's rows, and an ended run's one row" {
