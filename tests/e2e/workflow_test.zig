@@ -3594,7 +3594,7 @@ test "e2e/workflow: on 4 shards, a run started with an id the client chose is fo
     // An id no run has is not found.
     var none = try ctx.cli.run(&.{ "workflow", "status", "no-such-run" });
     defer none.deinit();
-    try testing.expect(std.mem.indexOf(u8, none.stderr, "Workflow run not found") != null);
+    try testing.expect(std.mem.indexOf(u8, none.stderr, "not found: no such run [not_found/not_found]") != null);
 
     // A chosen id another workflow's run has is refused at start, wherever
     // that run is: the id stays the first run's.
@@ -4555,4 +4555,107 @@ test "e2e/workflow/cluster: a node that missed a schedule and a timer run while 
     const after = try cluster.pollUntilContains(first, &.{ "workflow", "status", "back-tw" }, "Status:   timed_out", 250, 400);
     testing.allocator.free(after);
     try testing.expectEqual(first, try clusterLeader(&cluster, null));
+}
+
+test "e2e/workflow: on 1 shard and on 12, every op by a run's id in a namespace never created says so, by a chosen id or a generated one" {
+    for ([_]u8{ 1, 12 }) |shards| try neverCreatedAnswers(shards);
+}
+
+fn neverCreatedAnswers(shards: u8) !void {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards } });
+    defer ctx.deinit();
+    const ids = [_][]const u8{ "never-run-1", "wfr-1a2b3c4d5e6f00-3-1c" };
+    // One the client chose, and one of the server's form, which routes by
+    // its slot bits.
+    const run_id = @import("src").node.run_id;
+    try testing.expect(!run_id.looksGenerated(.workflow, ids[0]) and run_id.looksGenerated(.workflow, ids[1]));
+    for (ids) |rid| {
+        for ([_][]const []const u8{
+            &.{ "workflow", "status", rid, "-n", "never-made" },
+            &.{ "workflow", "history", rid, "-n", "never-made" },
+            &.{ "workflow", "cancel", rid, "-n", "never-made" },
+            &.{ "workflow", "signal", rid, "--type", "go", "-n", "never-made" },
+            &.{ "workflow", "run-delete", rid, "-n", "never-made" },
+        }) |args| {
+            var r = try ctx.cli.run(args);
+            defer r.deinit();
+            if (!r.contains("namespace not found [no_namespace/not_found]")) std.debug.print("{d} shards, {s} {s}: {s}{s}\n", .{ shards, args[1], rid, r.stdout, r.stderr });
+            try testing.expect(r.contains("namespace not found [no_namespace/not_found]"));
+        }
+    }
+}
+
+test "e2e/workflow: on 12 shards, in a namespace of its own, a run by a generated id is signalled and deleted on its workflow's shard, and the dashboard signals and cancels a run by a chosen one" {
+    const shards = 12;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards, .dashboard_enabled = true } });
+    defer ctx.deinit();
+    const ns = "rk-ns";
+    try ctx.exec(&.{ "namespace", "create", ns });
+    const src = @import("src");
+    const router = src.node.router.Router.init(shards, 0);
+    const first = src.namespace_table.FIRST_ALLOCATED;
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    var off_zero: usize = 0;
+    for (0..4) |i| {
+        var wf_buf: [16]u8 = undefined;
+        const wf = try std.fmt.bufPrint(&wf_buf, "rk-wf-{d}", .{i});
+        if (switch (router.route(src.node.router.routeNsKey(first, wf))) {
+            .local => false,
+            .shard => |sh| sh.shard_id != 0,
+        }) off_zero += 1;
+        var def_buf: [512]u8 = undefined;
+        const def = try std.fmt.bufPrint(&def_buf,
+            \\kind: Workflow
+            \\name: {s}
+            \\version: 1.0.0
+            \\start.wait_for_signal.type: go
+            \\start.wait_for_signal.timeout_ms: 300000
+            \\start.transitions.success: flo.Completed
+            \\start.transitions.timeout: flo.Failed
+        , .{wf});
+        var file_buf: [32]u8 = undefined;
+        const path = try writeDottedToTempYaml(testing.allocator, def, try std.fmt.bufPrint(&file_buf, "{s}.yaml", .{wf}));
+        defer cleanupTempFile(testing.allocator, path);
+        try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", ns });
+
+        // A generated id: signalled to its end, then deleted.
+        var started = try ctx.cli.run(&.{ "workflow", "start", wf, "{}", "-o", "json", "-n", ns });
+        defer started.deinit();
+        const parsed = try std.json.parseFromSlice(struct { run_id: []const u8 }, testing.allocator, started.stdout, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const rid = parsed.value.run_id;
+        var sig = try ctx.cli.run(&.{ "workflow", "signal", rid, "--type", "go", "-n", ns });
+        defer sig.deinit();
+        try stdx.testing.assertContains(sig, "Signal 'go' sent to workflow");
+        var tries: usize = 0;
+        while (tries < 50) : (tries += 1) {
+            var st = try ctx.cli.run(&.{ "workflow", "status", rid, "-n", ns });
+            defer st.deinit();
+            if (st.contains("completed")) break;
+            stdx.time.sleep(100 * std.time.ns_per_ms);
+        }
+        var del = try ctx.cli.run(&.{ "workflow", "run-delete", rid, "-n", ns });
+        defer del.deinit();
+        try testing.expectEqualStrings("OK", std.mem.trim(u8, del.stdout, &std.ascii.whitespace));
+
+        // A chosen id, through the dashboard: a signal reaches it, then a
+        // second run of it is cancelled.
+        var cid_buf: [16]u8 = undefined;
+        const cid = try std.fmt.bufPrint(&cid_buf, "rk-{d}", .{i});
+        try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", cid, "-n", ns });
+        var url_buf: [128]u8 = undefined;
+        var sresp = try http.post(try std.fmt.bufPrint(&url_buf, "/api/v1/workflow/runs/{s}/signal?signal=go&namespace={s}", .{ cid, ns }), "");
+        defer sresp.deinit();
+        try testing.expectEqual(@as(u16, 200), sresp.status);
+        try testing.expect(std.mem.indexOf(u8, sresp.body, "\"ok\":true") != null);
+        var cid2_buf: [16]u8 = undefined;
+        const cid2 = try std.fmt.bufPrint(&cid2_buf, "rk-c-{d}", .{i});
+        try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", cid2, "-n", ns });
+        var cresp = try http.delete(try std.fmt.bufPrint(&url_buf, "/api/v1/workflow/runs/{s}?namespace={s}", .{ cid2, ns }));
+        defer cresp.deinit();
+        try testing.expectEqual(@as(u16, 200), cresp.status);
+        try testing.expect(std.mem.indexOf(u8, cresp.body, "\"cancelled\"") != null);
+    }
+    try testing.expect(off_zero >= 2);
 }
