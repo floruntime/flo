@@ -1299,6 +1299,176 @@ test "e2e/processing: ts source to ts sink - derived metrics pipeline" {
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_ts2ts" });
 }
 
+/// `ts read <m> --field <f> [--tags <t>] -o json` until its output holds
+/// `want`, or `timeout_ms` passes: the last output, owned by the caller.
+fn tsReadUntil(ctx: *stdx.testing.TestContext, ns: []const u8, measurement: []const u8, field: []const u8, tags: ?[]const u8, want: []const u8, timeout_ms: u64) !stdx.testing.CommandResult {
+    const deadline = stdx.time.monotonicMs() + timeout_ms;
+    while (true) {
+        var r = if (tags) |t|
+            try ctx.cli.run(&.{ "ts", "read", measurement, "-n", ns, "--from", "0", "--field", field, "--tags", t, "--limit", "100", "-o", "json" })
+        else
+            try ctx.cli.run(&.{ "ts", "read", measurement, "-n", ns, "--from", "0", "--field", field, "--limit", "100", "-o", "json" });
+        if (r.stdoutContains(want) or stdx.time.monotonicMs() >= deadline) return r;
+        r.deinit();
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+}
+
+/// Submits the dotted job `def` as `file`, in `ns`: its id, in `buf`.
+fn submitJob(ctx: *stdx.testing.TestContext, ns: []const u8, def: []const u8, file: []const u8, buf: []u8) ![]const u8 {
+    const path = try writeDottedToTempYaml(testing.allocator, def, file);
+    defer cleanupTempFile(testing.allocator, path);
+    const out = try ctx.execCapture(&.{ "processing", "submit", path, "-n", ns });
+    const id = extractJobId(out) orelse {
+        std.debug.print("\nno job id in '{s}'\n", .{out});
+        return error.NoJobId;
+    };
+    @memcpy(buf[0..id.len], id);
+    return buf[0..id.len];
+}
+
+test "e2e/processing: ts source to ts sink - the sink writes what the operators made of each point, at its time and tags" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const ns = "proc_tsops";
+    try ctx.exec(&.{ "ns", "create", ns });
+    try ctx.exec(&.{ "ts", "write", "raw", "--tags", "sensor=A1", "--value", "2", "--timestamp", "1795600000000", "-n", ns });
+    try ctx.exec(&.{ "ts", "write", "raw", "--tags", "sensor=A1", "--value", "3", "--timestamp", "1795600001000", "-n", ns });
+    try ctx.exec(&.{ "ts", "write", "raw", "--tags", "sensor=A2", "--value", "5", "--timestamp", "1795600002000", "-n", ns });
+    const source =
+        \\sources.[0].ts.measurement: raw
+        \\sources.[0].ts.poll_interval_ms: 100
+        \\sources.[0].ts.lateness_ms: 0
+        \\
+    ;
+    var ids: [3][64]u8 = undefined;
+
+    // A running sum: each point's total so far, at that point's time and tags.
+    _ = try submitJob(ctx, ns, "kind: Processing\nname: run-sum\nnamespace: " ++ ns ++ "\n" ++ source ++
+        \\sinks.[0].ts.measurement: summed
+        \\sinks.[0].ts.value_field: total
+        \\sinks.[1].stream.name: summed-out
+        \\operators.[0].type: aggregate
+        \\operators.[0].name: s
+        \\operators.[0].function: sum
+        \\operators.[0].field: "$.value"
+    , "tsops-sum.yaml", &ids[0]);
+    {
+        var r = try tsReadUntil(ctx, ns, "summed", "total", null, "\"value\": 10.000000", 8000);
+        defer r.deinit();
+        for ([_][]const u8{
+            "{\"timestamp_ms\": 1795600000000, \"time_ns\": 1795600000000000000, \"value\": 2.000000}",
+            "{\"timestamp_ms\": 1795600001000, \"time_ns\": 1795600001000000000, \"value\": 5.000000}",
+            "{\"timestamp_ms\": 1795600002000, \"time_ns\": 1795600002000000000, \"value\": 10.000000}",
+        }) |pt| try stdx.testing.assertContains(r, pt);
+        var a2 = try tsReadUntil(ctx, ns, "summed", "total", "sensor=A2", "10.000000", 2000);
+        defer a2.deinit();
+        try stdx.testing.assertContains(a2, "{\"timestamp_ms\": 1795600002000, \"time_ns\": 1795600002000000000, \"value\": 10.000000}");
+        try testing.expect(!a2.stdoutContains("5.000000"));
+    }
+
+    // A count window of 2: one total, at the time of the point that closed it.
+    _ = try submitJob(ctx, ns, "kind: Processing\nname: win-sum\nnamespace: " ++ ns ++ "\n" ++ source ++
+        \\sinks.[0].ts.measurement: windowed
+        \\sinks.[0].ts.value_field: v
+        \\operators.[0].type: aggregate
+        \\operators.[0].name: s
+        \\operators.[0].function: sum
+        \\operators.[0].field: "$.value"
+        \\operators.[0].window: count
+        \\operators.[0].window_size: 2
+    , "tsops-win.yaml", &ids[1]);
+    {
+        var r = try tsReadUntil(ctx, ns, "windowed", "v", null, "5.000000", 8000);
+        defer r.deinit();
+        try stdx.testing.assertContains(r, "{\"points\": [\n  {\"timestamp_ms\": 1795600001000, \"time_ns\": 1795600001000000000, \"value\": 5.000000}\n], ");
+    }
+
+    // A map that echoes altered tags, field, time and measurement: only its
+    // `value` is read, so the points are the source's, as they were.
+    const echo_id = try submitJob(ctx, ns, "kind: Processing\nname: echo\nnamespace: " ++ ns ++ "\n" ++ source ++
+        \\sinks.[0].ts.measurement: echoed
+        \\sinks.[0].ts.value_field: v
+        \\operators.[0].type: map
+        \\operators.[0].name: m
+        \\operators.[0].value: "$.value"
+        \\operators.[0].tags: "sensor=EVIL"
+        \\operators.[0].field: "other"
+        \\operators.[0].timestamp_ms: "1"
+        \\operators.[0].measurement: "elsewhere"
+    , "tsops-echo.yaml", &ids[2]);
+    {
+        var r = try tsReadUntil(ctx, ns, "echoed", "v", null, "\"value\": 5.000000", 8000);
+        defer r.deinit();
+        try stdx.testing.assertContains(r, "{\"timestamp_ms\": 1795600000000, \"time_ns\": 1795600000000000000, \"value\": 2.000000}");
+        try stdx.testing.assertContains(r, "{\"timestamp_ms\": 1795600002000, \"time_ns\": 1795600002000000000, \"value\": 5.000000}");
+        var a1 = try tsReadUntil(ctx, ns, "echoed", "v", "sensor=A1", "3.000000", 2000);
+        defer a1.deinit();
+        try stdx.testing.assertContains(a1, "\"value\": 3.000000");
+        var evil = try ctx.cli.run(&.{ "ts", "read", "echoed", "-n", ns, "--from", "0", "--field", "v", "--tags", "sensor=EVIL", "-o", "json" });
+        defer evil.deinit();
+        try stdx.testing.assertContains(evil, "has no series of field 'v' with tags sensor=EVIL");
+        var other = try ctx.cli.run(&.{ "ts", "read", "echoed", "-n", ns, "--from", "0", "--field", "other", "-o", "json" });
+        defer other.deinit();
+        try stdx.testing.assertContains(other, "has no series of field 'other'");
+        var list = try ctx.cli.run(&.{ "ts", "list", "-n", ns });
+        defer list.deinit();
+        try testing.expect(!list.stdoutContains("elsewhere"));
+        var s = try ctx.cli.run(&.{ "processing", "status", echo_id, "-n", ns });
+        defer s.deinit();
+        try testing.expect(!s.stdoutContains("dropped"));
+    }
+
+    // A map without `value`, and one whose `value` is a string: every record
+    // a counted drop, shown in the job's status, nothing written.
+    const Bad = struct { name: []const u8, sink: []const u8, map: []const u8 };
+    inline for (.{
+        Bad{ .name = "no-value", .sink = "nv", .map = "operators.[0].reading: \"$.value\"" },
+        Bad{ .name = "str-value", .sink = "sv", .map = "operators.[0].value: \"high\"" },
+    }) |bad| {
+        var bad_id: [64]u8 = undefined;
+        const id = try submitJob(ctx, ns, "kind: Processing\nname: " ++ bad.name ++ "\nnamespace: " ++ ns ++ "\n" ++ source ++
+            "sinks.[0].ts.measurement: " ++ bad.sink ++ "\nsinks.[0].ts.value_field: v\noperators.[0].type: map\noperators.[0].name: m\n" ++ bad.map, "tsops-" ++ bad.name ++ ".yaml", &bad_id);
+        const want = "3 records dropped by a sink, the last by ts sink '" ++ bad.sink ++ "': the operators' record has no finite number `value`";
+        const deadline = stdx.time.monotonicMs() + 8000;
+        while (true) {
+            var s = try ctx.cli.run(&.{ "processing", "status", id, "-n", ns });
+            defer s.deinit();
+            if (s.stdoutContains(want)) break;
+            if (stdx.time.monotonicMs() >= deadline) {
+                std.debug.print("\nstatus: {s}\n", .{s.stdout});
+                return error.NoDrops;
+            }
+            stdx.time.sleep(100 * std.time.ns_per_ms);
+        }
+        var r = try ctx.cli.run(&.{ "ts", "read", bad.sink, "-n", ns, "--from", "0", "--field", "v", "-o", "json" });
+        defer r.deinit();
+        try stdx.testing.assertContains(r, "has no series of field 'v'");
+    }
+}
+
+test "e2e/processing: ts source - a stream sink's record carries the point's field and tags" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const ns = "proc_tsrec";
+    try ctx.exec(&.{ "ns", "create", ns });
+    try ctx.exec(&.{ "ts", "write", "raw", "--tags", "sensor=A1,room=lab", "--value", "2", "--timestamp", "1795600000000", "-n", ns });
+    var id_buf: [64]u8 = undefined;
+    _ = try submitJob(ctx, ns,
+        \\kind: Processing
+        \\name: plain
+        \\namespace: proc_tsrec
+        \\sources.[0].ts.measurement: raw
+        \\sources.[0].ts.poll_interval_ms: 100
+        \\sources.[0].ts.lateness_ms: 0
+        \\sinks.[0].stream.name: plain-out
+    , "tsrec-plain.yaml", &id_buf);
+    try testing.expect(try readStreamBlocking(ctx, "plain-out", ns, "raw", "8000"));
+    var r = try ctx.cli.run(&.{ "stream", "read", "plain-out", "-n", ns, "--start", "0-0", "--limit", "10" });
+    defer r.deinit();
+    try stdx.testing.assertContains(r, "{\"measurement\":\"raw\",\"field\":\"value\",\"value\":2,\"timestamp_ms\":1795600000000,\"tags\":{\"room\":\"lab\",\"sensor\":\"A1\"}}");
+}
+
 test "e2e/processing: ts source - job status shows RUNNING" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();

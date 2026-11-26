@@ -62,6 +62,7 @@ const Flags = entry_mod.Flags;
 const native_registry = @import("operators/native_registry.zig");
 const kv_lookup_mod = @import("operators/kv_lookup.zig");
 const sink_payload = @import("sink_payload.zig");
+const persistence = @import("../storage/persistence.zig");
 const sinks_machine = @import("sinks_machine.zig");
 const pe = @import("../protocol/processing_entries.zig");
 const ce = @import("../protocol/channel_entries.zig");
@@ -300,6 +301,11 @@ pub const ProcessingHandler = struct {
         /// window, 0 while it hasn't: a read of another shard's field sends
         /// it, and that shard releases the window only if its own count is
         /// still the same.
+        pub fn hasTsSink(self: *const PipelineState) bool {
+            for (self.sinks) |snk| if (snk.kind == .ts) return true;
+            return false;
+        }
+
         pub fn idleAt(self: *const PipelineState, now_ms: u64) u64 {
             if (self.lateness_ms == 0 or !self.seen_known) return 0;
             const writes = self.seen_writes orelse return 0;
@@ -1484,12 +1490,54 @@ pub const ProcessingHandler = struct {
         return entry.value;
     }
 
-    /// `{"measurement":<name>,"value":<v>,"timestamp_ms":<ms>}`, the name
-    /// escaped as a JSON string and a non-finite value as null, in an
-    /// allocation sized to it.
-    fn tsPointJson(allocator: Allocator, measurement: []const u8, value: f64, ts_ms: i64) ![]u8 {
-        const v: ?f64 = if (std.math.isFinite(value)) value else null;
-        return std.json.Stringify.valueAlloc(allocator, .{ .measurement = measurement, .value = v, .timestamp_ms = ts_ms }, .{});
+    /// `{"measurement":<name>,"field":<name>,"value":<v>,"timestamp_ms":<ms>,
+    /// "tags":{<key>:<value>,...}}`: a point as its operators and its
+    /// stream and queue sinks see it. Names and tags are JSON strings
+    /// escaped so a sink's field read gives back their exact bytes; a
+    /// non-finite value is null. `tags` is the point's canonical tag string,
+    /// each pair split at its first `=` (a pair without one is a key whose
+    /// value is empty).
+    fn tsPointJson(allocator: Allocator, measurement: []const u8, field: []const u8, value: f64, ts_ms: i64, tags: []const u8) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        var jw: std.json.Stringify = .{ .writer = &out.writer };
+        writeTsPoint(&jw, measurement, field, value, ts_ms, tags) catch return error.OutOfMemory;
+        return out.toOwnedSlice();
+    }
+
+    fn writeTsPoint(jw: *std.json.Stringify, measurement: []const u8, field: []const u8, value: f64, ts_ms: i64, tags: []const u8) std.json.Stringify.Error!void {
+        try jw.beginObject();
+        try jw.objectField("measurement");
+        try jw.write(measurement);
+        try jw.objectField("field");
+        try jw.write(field);
+        try jw.objectField("value");
+        if (std.math.isFinite(value)) try jw.write(value) else try jw.write(null);
+        try jw.objectField("timestamp_ms");
+        try jw.write(ts_ms);
+        try jw.objectField("tags");
+        try jw.beginObject();
+        var it = std.mem.splitScalar(u8, tags, ',');
+        while (it.next()) |pair| {
+            if (pair.len == 0) continue;
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+            try jw.objectField(pair[0..eq]);
+            try jw.write(if (eq < pair.len) pair[eq + 1 ..] else "");
+        }
+        try jw.endObject();
+        try jw.endObject();
+    }
+
+    /// The longest record `tsPointJson` makes: every byte of the
+    /// measurement, field and tags escaped as `\u00XX`, plus the keys and
+    /// numbers. A stored point's field and tags together fit the TS write's
+    /// value buffer.
+    pub const MAX_TS_POINT_JSON: usize = 6 * (persistence.MAX_ENTRY_KEY + ts_mod.MAX_TAG_STRING + 512) + 256;
+    comptime {
+        // A point's record always fits a queue message and a stream sink's
+        // payload, so a sink never refuses one for its size.
+        std.debug.assert(MAX_TS_POINT_JSON <= @import("../protocol/queue_entries.zig").MAX_MESSAGE);
+        std.debug.assert(MAX_TS_POINT_JSON <= sink_payload.MAX_PAYLOAD);
     }
 
     /// A PipelineState with source/sink config (no operators). Out of
@@ -1948,7 +1996,7 @@ pub const ProcessingHandler = struct {
             // Format TS point as JSON record. Short of memory, the batch
             // stops here, the point still ahead of the cursor.
             const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
-            const json = tsPointJson(arena.allocator(), pipe.src_measurement, pt.value, ts_ms) catch break;
+            const json = tsPointJson(arena.allocator(), pipe.src_measurement, pipe.src_field, pt.value, ts_ms, pt.tags) catch break;
             batch.beginRecord();
             // Apply operator chain (or pass through directly). A record
             // the chain failed on is counted and skipped: passing it through
@@ -1958,7 +2006,11 @@ pub const ProcessingHandler = struct {
                 break :blk @as(?[]const ProcessingRecord, &.{});
             };
             if (output_records) |records| {
-                for (records) |rec| self.writeSinkRecord(batch, pipe, shard, arena.allocator(), rec.value, pt.value, pt.timestamp_ns, pt.tags, rec.tags);
+                // A TS sink writes what the operators made of the point: its
+                // record's `value`. Tags and time stay the point's, whatever
+                // the record says.
+                const ts_sink = pipe.hasTsSink();
+                for (records) |rec| self.writeSinkRecord(batch, pipe, shard, arena.allocator(), rec.value, if (ts_sink) outputValue(rec.value) else null, pt.timestamp_ns, pt.tags, rec.tags);
             } else {
                 self.writeSinkRecord(batch, pipe, shard, arena.allocator(), json, pt.value, pt.timestamp_ns, pt.tags, 0);
             }
@@ -2582,18 +2634,34 @@ pub const ProcessingHandler = struct {
     /// Write a processed record to all matching sinks (TS source variant).
     /// Tag filtering: sinks with required_tags=0 (firehose) get all records;
     /// sinks with required_tags set only get records where record_tags matches.
-    fn writeSinkRecord(self: *ProcessingHandler, batch: *Batch, pipe: *PipelineState, shard: *Shard, scratch: Allocator, payload: []const u8, field_value: f64, timestamp_ns: u64, src_tags: []const u8, record_tags: u32) void {
+    /// `field_value` is what a TS sink writes; null drops the record for
+    /// TS sinks, counted, while the others still take it.
+    fn writeSinkRecord(self: *ProcessingHandler, batch: *Batch, pipe: *PipelineState, shard: *Shard, scratch: Allocator, payload: []const u8, field_value: ?f64, timestamp_ns: u64, src_tags: []const u8, record_tags: u32) void {
         pipe.records_out += 1; // operator chain emitted a record into the sink stage
         for (pipe.sinks) |snk| {
             if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
             const ns = self.namespaceIdOf(snk.namespace);
             switch (snk.kind) {
                 .stream => self.addWrite(batch, shard, snk, sink_payload.stream(self.msg_buf, scratch, ns, snk.target, payload)),
-                .ts => self.sendTsPoint(batch, shard, snk, snk.value_field, field_value, timestamp_ns, src_tags),
+                .ts => if (field_value) |v|
+                    self.sendTsPoint(batch, shard, snk, snk.value_field, v, timestamp_ns, src_tags)
+                else
+                    self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the operators' record has no finite number `value`"),
                 .kv => self.writeKvSink(batch, snk, shard, "", payload),
                 .queue => self.addWrite(batch, shard, snk, sink_payload.queue(self.msg_buf, shard.queue_handler.caps, ns, snk.target, snk.queue_priority, payload)),
             }
         }
+    }
+
+    /// The top-level `value` of an operator's output record, when it is a
+    /// finite number; null otherwise. A number is never escaped, so the
+    /// reader needs room only for its own state.
+    fn outputValue(record: []const u8) ?f64 {
+        var buf: [record_fields.STATE + 64]u8 = undefined;
+        var out: [1]?record_fields.Field = .{null};
+        record_fields.read(record, &.{"value"}, &out, &buf) catch return null;
+        const v = (out[0] orelse return null).float() orelse return null;
+        return if (std.math.isFinite(v)) v else null;
     }
 
     /// Write a processed record to all matching sinks (stream source variant).
@@ -3092,7 +3160,7 @@ test "ProcessingHandler: a submit with an unknown status halts, storing nothing"
 }
 
 test "ProcessingHandler: a TS source record is JSON for any measurement name" {
-    const json = try ProcessingHandler.tsPointJson(std.testing.allocator, "cp\"u\\", 1.5, 7);
+    const json = try ProcessingHandler.tsPointJson(std.testing.allocator, "cp\"u\\", "value", 1.5, 7, "");
     defer std.testing.allocator.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
@@ -3101,10 +3169,55 @@ test "ProcessingHandler: a TS source record is JSON for any measurement name" {
     try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("timestamp_ms").?.integer);
 }
 
+test "ProcessingHandler: a TS source record carries the point's field and tags, each read back exact" {
+    const tags = "a=x\"y,b=p\\q,c=\x01z\x7f,d,e=k=v,f=caf\xc3\xa9";
+    const json = try ProcessingHandler.tsPointJson(std.testing.allocator, "m\"\\\n", "f\\\"", 2.5, 9, tags);
+    defer std.testing.allocator.free(json);
+    // The record's own reader, as a sink reads a field.
+    var buf: [record_fields.STATE + 256]u8 = undefined;
+    var out: [5]?record_fields.Field = undefined;
+    try record_fields.read(json, &.{ "measurement", "field", "value", "timestamp_ms", "tags" }, &out, &buf);
+    try std.testing.expectEqualStrings("m\"\\\n", out[0].?.string);
+    try std.testing.expectEqualStrings("f\\\"", out[1].?.string);
+    try std.testing.expectEqual(@as(?f64, 2.5), out[2].?.float());
+    try std.testing.expectEqual(@as(?f64, 9), out[3].?.float());
+    try std.testing.expect(out[4].? == .other);
+    // The tags object, read the same way.
+    const start = std.mem.indexOf(u8, json, "\"tags\":").? + "\"tags\":".len;
+    const obj = json[start .. json.len - 1];
+    var tout: [6]?record_fields.Field = undefined;
+    try record_fields.read(obj, &.{ "a", "b", "c", "d", "e", "f" }, &tout, &buf);
+    try std.testing.expectEqualStrings("x\"y", tout[0].?.string);
+    try std.testing.expectEqualStrings("p\\q", tout[1].?.string);
+    try std.testing.expectEqualStrings("\x01z\x7f", tout[2].?.string);
+    try std.testing.expectEqualStrings("", tout[3].?.string);
+    try std.testing.expectEqualStrings("k=v", tout[4].?.string);
+    try std.testing.expectEqualStrings("caf\xc3\xa9", tout[5].?.string);
+}
+
+test "ProcessingHandler: a TS source record at its longest stays within MAX_TS_POINT_JSON" {
+    // Every byte a control character, escaped six bytes wide.
+    const ctl = "\x01";
+    const measurement = comptime @import("stdx").repeat(ctl, persistence.MAX_ENTRY_KEY);
+    const field = comptime @import("stdx").repeat(ctl, 512);
+    const pair = "\x01=" ++ comptime @import("stdx").repeat(ctl, 30) ++ ",";
+    const tags = comptime @import("stdx").repeat(pair, ts_mod.MAX_TAG_STRING / pair.len);
+    const json = try ProcessingHandler.tsPointJson(std.testing.allocator, measurement, field, -std.math.floatMax(f64), std.math.minInt(i64), tags);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(json.len <= ProcessingHandler.MAX_TS_POINT_JSON);
+}
+
+test "ProcessingHandler: an operator's record gives a TS sink its value only as a finite top-level number" {
+    try std.testing.expectEqual(@as(?f64, 2.5), ProcessingHandler.outputValue("{\"value\":2.5}"));
+    try std.testing.expectEqual(@as(?f64, -3), ProcessingHandler.outputValue("{\"count\":1,\"value\":-3}"));
+    for ([_][]const u8{ "{\"value\":\"2.5\"}", "{}", "{\"value\":null}", "{\"value\":1e400}", "{\"v\":{\"value\":1}}", "[1]", "2.5", "{\"value\":" }) |rec|
+        try std.testing.expectEqual(@as(?f64, null), ProcessingHandler.outputValue(rec));
+}
+
 test "ProcessingHandler: a TS source record holds a measurement name of any length" {
     // Past the 512-byte buffer a point was built in, whose points were skipped.
     const name = comptime @import("stdx").repeat("\"", 600);
-    const json = try ProcessingHandler.tsPointJson(std.testing.allocator, name, 1.5, 7);
+    const json = try ProcessingHandler.tsPointJson(std.testing.allocator, name, "value", 1.5, 7, "");
     defer std.testing.allocator.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
@@ -3142,9 +3255,9 @@ test "ProcessingHandler: a KV sink record with no key, or one too long, is count
 
 test "ProcessingHandler: a TS source record writes a non-finite value as null" {
     for ([_]f64{ std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64) }) |v| {
-        const json = try ProcessingHandler.tsPointJson(std.testing.allocator, "m", v, 7);
+        const json = try ProcessingHandler.tsPointJson(std.testing.allocator, "m", "value", v, 7, "");
         defer std.testing.allocator.free(json);
-        try std.testing.expectEqualStrings("{\"measurement\":\"m\",\"value\":null,\"timestamp_ms\":7}", json);
+        try std.testing.expectEqualStrings("{\"measurement\":\"m\",\"field\":\"value\",\"value\":null,\"timestamp_ms\":7,\"tags\":{}}", json);
     }
 }
 
