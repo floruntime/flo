@@ -152,6 +152,10 @@ pub const Plant = enum {
     history_fold_total_dropped,
     /// A history drop takes its run's rows off nothing: usage keeps them.
     history_drop_unread,
+    /// A workflow run's end keeps its run-history reserve.
+    quota_end_keeps_reserve,
+    /// An action run's end keeps its run-history reserve.
+    quota_action_end_keeps_reserve,
 };
 
 pub const active: Plant = std.meta.stringToEnum(Plant, @import("build_options").vopr_plant) orelse

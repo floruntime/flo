@@ -6054,6 +6054,8 @@ pub const Shard = struct {
             sm.pool_share_bytes.store(if (bound) |b| b.share_bytes else 0, .monotonic);
             sm.memory_refusals.store(self.defaultPartition().store.memory_refusals, .monotonic);
             sm.history_usage_drift.store(self.defaultPartition().store.history_usage_drift, .monotonic);
+            sm.quota_reserve_drift.store(self.defaultPartition().store.quota_reserve_drift, .monotonic);
+            sm.quota_refusals.store(self.defaultPartition().store.quota_refusals, .monotonic);
             sm.runs_unlisted[0].store(self.workflow_handler.missing_runs, .monotonic);
             sm.runs_unlisted[1].store(self.actions_handler.unlisted_runs, .monotonic);
             for (&sm.ts_late, self.defaultPartition().store.ts_late_points) |*m, n| m.store(n, .monotonic);

@@ -42,6 +42,8 @@ const ae = @import("../protocol/action_entries.zig");
 const action_ops = @import("../protocol/action_ops.zig");
 const limits = @import("../protocol/limits.zig");
 const view_mod = @import("../contract/view.zig");
+const hq = @import("../budget/history_quota.zig");
+const history_reserve = @import("../budget/history_reserve.zig");
 const gate = @import("../budget/gate.zig");
 const machine_mod = @import("../contract/machine.zig");
 const delivery = @import("../contract/delivery.zig");
@@ -272,6 +274,8 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             var ab: RunAtBuf = undefined;
             try out.addIn(RunAt.ID, ns, runAtKey(&ab, p.action, msOf(stamp), p.run));
             try out.addIn(Counts.ID, ns, p.action);
+            // Its reserve, raised, and read by its verdict.
+            try hq.addKeys(hq.ActionReserved, out, ns);
         },
         .action_deliver => {
             const p = ae.Deliver.decodeAll(e.payload, &diag) catch return;
@@ -282,6 +286,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             try out.add(Deadlines.ID, "", deadlineKey(&b, after(stamp, p.lease_ms), ns, p.run));
             if (p.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, p.holder, k));
             try out.addIn(Counts.ID, ns, p.action);
+            try hq.addKeys(hq.ActionReserved, out, ns);
         },
         .action_settle => {
             const p = ae.Settle.decodeAll(e.payload, &diag) catch return;
@@ -290,6 +295,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             try out.addIn(Counts.ID, ns, p.action);
             try out.add(Deadlines.ID, "", deadlineKey(&b, p.expiry_ns, ns, p.run));
             if (p.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, p.holder, k));
+            try hq.addKeys(hq.ActionReserved, out, ns);
         },
         .action_release => {
             const p = ae.Release.decodeAll(e.payload, &diag) catch return;
@@ -299,6 +305,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             try out.addIn(Ready.ID, ns, readyKey(&b, p.action, {}, after(stamp, p.delay_ms), p.run));
             try out.add(Deadlines.ID, "", deadlineKey(&b, p.expiry_ns, ns, p.run));
             if (p.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, p.holder, k));
+            try hq.addKeys(hq.ActionReserved, out, ns);
         },
         .action_extend => {
             const p = ae.Extend.decodeAll(e.payload, &diag) catch return;
@@ -317,6 +324,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
                 try out.addIn(Ready.ID, ns, readyKey(&b, item.action, {}, stamp, item.run));
                 if (item.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, item.holder, k));
                 try out.addIn(Counts.ID, ns, item.action);
+                try hq.addKeys(hq.ActionReserved, out, ns);
             }
         },
         .action_run_delete => {
@@ -433,6 +441,9 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             };
             try record(view, .of(p.ns), p.run, &new, .{ .event = EV_INVOKED, .detail = p.input, .at_ms = msOf(stamp) }, .flush_on_size);
             try view.put(Runs, rk, .{ .v = new });
+            // What its history may still add, staged with it: a refused
+            // invoke raises nothing.
+            try hq.raise(hq.ActionReserved, view, .of(p.ns), reserveOf(p.run, new));
             var b: KeyBuf = undefined;
             try view.put(Ready, try idKey(view, .of(p.ns), readyKey(&b, p.action, {}, stamp, p.run)), .{});
             // Its place in its action's list, staged with it: a call held
@@ -459,12 +470,14 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             // and due by the log's clock.
             if (run.v.status != .ready or run.v.due_ns != p.due_ns or p.due_ns > stamp)
                 return out.refuse(.conflict, .unclassified, NOT_READY);
+            const before = reserveOf(p.run, run.v);
             try M.deliver(view, .of(p.ns), p.run, &run.v, p.holder, p.request_key, .{ .term = e.header.term, .index = e.header.index }, p.lease_ms, stamp);
             try moveCount(view, .of(p.ns), p.action, .ready, .leased);
             if (run.v.deliveries <= recordedDeliveries(run.v.max_attempts))
                 try record(view, .of(p.ns), p.run, &run.v, attemptEvent(EV_DELIVERED, p.holder, msOf(stamp)), .flush_on_size)
             else
                 run.v.deliveries_unrecorded +|= 1;
+            try moveReserve(view, .of(p.ns), before, reserveOf(p.run, run.v));
             try view.put(Runs, rk, run);
             out.putInt(u32, run.v.deliveries);
         },
@@ -489,6 +502,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 }
                 return stale(out, run.v, p.holder, p.deliveries, p.token);
             }
+            const before = reserveOf(p.run, run.v);
             try M.endLease(view, .of(p.ns), p.run, run.v, p.holder, p.request_key, p.expiry_ns);
             try record(view, .of(p.ns), p.run, &run.v, .{ .event = EV_SETTLED, .detail = p.result, .extra = p.outcome, .at_ms = msOf(stamp) }, .hold);
             run.v.ended = .settled;
@@ -497,6 +511,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             run.v.result_hash = fnv1a64(p.result);
             preview(&run.v.@"error", &run.v.error_truncated, "");
             try endRun(view, .of(p.ns), p.run, &run.v, .completed, stamp, p.result);
+            try moveReserve(view, .of(p.ns), before, reserveOf(p.run, run.v));
             try view.put(Runs, rk, run);
         },
         .action_release => {
@@ -508,6 +523,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 if (sameDelivery(run.v, p.holder, p.deliveries, p.token) and run.v.ended == ended) return;
                 return stale(out, run.v, p.holder, p.deliveries, p.token);
             }
+            const before = reserveOf(p.run, run.v);
             try M.endLease(view, .of(p.ns), p.run, run.v, p.holder, p.request_key, p.expiry_ns);
             const at_ms = msOf(stamp);
             if (p.abandoned) {
@@ -537,6 +553,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                     try moveCount(view, .of(p.ns), p.action, .leased, .ready);
                 }
             }
+            try moveReserve(view, .of(p.ns), before, reserveOf(p.run, run.v));
             try view.put(Runs, rk, run);
         },
         .action_extend => {
@@ -587,6 +604,7 @@ fn expireOne(view: *View, item: ae.ExpireItem.Value, stamp: u64) ApplyError!bool
     const found = try view.get(Runs, rk);
     if (!try M.expireKey(view, .of(item.ns), item.run, item.action, item.expiry_ns, if (found) |r| r.v else null, stamp)) return false;
     var run = found.?;
+    const before = reserveOf(item.run, run.v);
     try M.dropRequest(view, .of(item.ns), item.holder, item.request_key, item.run);
     run.v.ended = .expired;
     run.v.failures +|= 1;
@@ -597,8 +615,29 @@ fn expireOne(view: *View, item: ae.ExpireItem.Value, stamp: u64) ApplyError!bool
         try M.readyAgain(view, .of(item.ns), item.run, &run.v, stamp);
         try moveCount(view, .of(item.ns), run.v.action, .leased, .ready);
     }
+    try moveReserve(view, .of(item.ns), before, reserveOf(item.run, run.v));
     try view.put(Runs, rk, run);
     return true;
+}
+
+/// What action run `id` may still add to its history, from its own names,
+/// attempts and counters: computed from the run in each apply, never from
+/// the message, so a resend that moves no counter moves nothing. 0 once it
+/// has ended.
+pub fn reserveOf(id: []const u8, run: Run.Value) u64 {
+    const ended = switch (run.status) {
+        .ready, .leased => false,
+        .completed, .failed, .timed_out => true,
+    };
+    return history_reserve.action(run.action.len, id.len, run.max_attempts, run.deliveries, run.abandons, run.failures, ended);
+}
+
+/// Move `ns`'s action reserve from a run's `before` to `now`. It only
+/// falls; a rise would be a Flo bug the VOPR's rule finds.
+fn moveReserve(view: *View, ns: NamespaceId, before: u64, now: u64) ApplyError!void {
+    if (comptime plant.active == .quota_action_end_keeps_reserve) if (now == 0) return;
+    if (now > before) return hq.raise(hq.ActionReserved, view, ns, now - before);
+    try hq.lower(hq.ActionReserved, view, ns, before - now);
 }
 
 /// The history lane's bytes a call's start in `ns` would wait on, as the
@@ -816,7 +855,7 @@ const idKey = M.inNs;
 pub const machine: machine_mod.Machine = .{
     .name = "actions",
     .entry_types = &.{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_run_delete, .action_abandon_send, .action_abandon },
-    .families = &([_]machine_mod.FamilyInfo{ machine_mod.info(Defs), machine_mod.info(Runs), machine_mod.info(RunAt), machine_mod.info(Counts) } ++ M.FAMILIES),
+    .families = &([_]machine_mod.FamilyInfo{ machine_mod.info(Defs), machine_mod.info(Runs), machine_mod.info(RunAt), machine_mod.info(Counts), machine_mod.info(hq.ActionReserved) } ++ M.FAMILIES),
     .keys = keys,
     .apply = apply,
     .skipped = skipped,
@@ -1038,6 +1077,51 @@ test "actions machine: a run is delivered once, settled by its holder, and a res
     const before = t.sums();
     try testing.expect((try t.apply(.action_settle, settle, 31 * ms)).refused() == null);
     try testing.expectEqual(before, t.sums());
+}
+
+test "actions machine: a run reserves its quota share at invoke; each delivery, failure and hand-back moves it by what its counters left; its end releases it all, and a resend moves nothing" {
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    const read: view_mod.ReadView = .{ .store = &t.store };
+    try register(&t, 3);
+    try invoke(&t, "r1", 10 * ms);
+    const fresh = t.run(.default, "r1").?;
+    try testing.expectEqual(history_reserve.action(4, 2, 3, 0, 0, 0, false), reserveOf("r1", fresh));
+    try testing.expectEqual(reserveOf("r1", fresh), hq.reservedOf(hq.ActionReserved, read, .default));
+    // Each counter that moves takes what it can no longer add.
+    try testing.expect((try deliver(&t, "r1", 10 * ms, 20 * ms)).refused() == null);
+    try testing.expectEqual(reserveOf("r1", t.run(.default, "r1").?), hq.reservedOf(hq.ActionReserved, read, .default));
+    try testing.expect(hq.reservedOf(hq.ActionReserved, read, .default) < reserveOf("r1", fresh));
+    try testing.expect((try t.apply(.action_release, releaseOf(&t, "r1", false), 30 * ms)).refused() == null);
+    try testing.expectEqual(reserveOf("r1", t.run(.default, "r1").?), hq.reservedOf(hq.ActionReserved, read, .default));
+    try testing.expect((try deliver(&t, "r1", t.run(.default, "r1").?.due_ns, 40 * ms)).refused() == null);
+    try testing.expect((try t.apply(.action_release, releaseOf(&t, "r1", true), 50 * ms)).refused() == null);
+    try testing.expectEqual(reserveOf("r1", t.run(.default, "r1").?), hq.reservedOf(hq.ActionReserved, read, .default));
+    // A second run's reserve adds to the first's.
+    try invoke(&t, "r2", 60 * ms);
+    try testing.expectEqual(reserveOf("r1", t.run(.default, "r1").?) + reserveOf("r2", t.run(.default, "r2").?), hq.reservedOf(hq.ActionReserved, read, .default));
+    // r1's settle ends it: its reserve goes, and a resend moves nothing.
+    try testing.expect((try deliver(&t, "r1", t.run(.default, "r1").?.due_ns, 70 * ms)).refused() == null);
+    const settle = settleOf(&t, "r1");
+    try testing.expect((try t.apply(.action_settle, settle, 80 * ms)).refused() == null);
+    try testing.expectEqual(@as(u64, 0), reserveOf("r1", t.run(.default, "r1").?));
+    try testing.expectEqual(reserveOf("r2", t.run(.default, "r2").?), hq.reservedOf(hq.ActionReserved, read, .default));
+    try testing.expect((try t.apply(.action_settle, settle, 81 * ms)).refused() == null);
+    try testing.expectEqual(reserveOf("r2", t.run(.default, "r2").?), hq.reservedOf(hq.ActionReserved, read, .default));
+    // r2 expires to its end: 3 attempts, each delivered and its lease run out.
+    var ibuf: [ae.ExpireItem.max_size]u8 = undefined;
+    var at: u64 = 90 * ms;
+    for (0..3) |_| {
+        try testing.expect((try deliver(&t, "r2", t.run(.default, "r2").?.due_ns, at)).refused() == null);
+        const expiry = t.run(.default, "r2").?.expiry_ns;
+        _ = try t.apply(.action_expire, try expiring(&ibuf, keyOf("r2", expiry)), expiry + 1);
+        at = expiry + 2;
+    }
+    try testing.expectEqual(Status.timed_out, t.run(.default, "r2").?.status);
+    try testing.expectEqual(@as(u64, 0), hq.reservedOf(hq.ActionReserved, read, .default));
+    var kb: [4]u8 = undefined;
+    try testing.expect((try read.get(hq.ActionReserved, view_mod.idKey(&kb, .default, "") catch unreachable)) == null);
+    try testing.expectEqual(@as(u64, 0), t.store.quota_reserve_drift);
 }
 
 test "actions machine: a refused entry changes nothing: a stale token, an early deliver, another scope, an expire before its deadline" {

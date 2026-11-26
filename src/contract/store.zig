@@ -152,6 +152,11 @@ pub const Store = struct {
     /// History usage subtracts that would have gone below zero (a Flo bug):
     /// saturated, never a halt, so replay can't hit it again.
     history_usage_drift: u64 = 0,
+    /// Run-history reserve lowers that would have gone below zero (a Flo
+    /// bug), saturated as the usage's are.
+    quota_reserve_drift: u64 = 0,
+    /// Admissions refused at a namespace's run-history quota.
+    quota_refusals: u64 = 0,
     /// Time-series points this node applied late, past each lateness edge
     /// (`ts/machine.zig`), added as each entry commits. A count of applies,
     /// not state: no snapshot carries it, it starts again from zero with

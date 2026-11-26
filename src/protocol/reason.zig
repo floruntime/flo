@@ -104,6 +104,13 @@ pub const Reason = enum(u16) {
     skipped_by_repair = 38,
     /// A delete of a run that hasn't ended: cancel it, then delete it.
     run_live = 39,
+    /// The namespace's run history on this shard has reached its part of
+    /// the quota, or the history its live runs may still add would pass it:
+    /// delete ended runs and their history, or raise the quota. The message
+    /// names the namespace's id, the shard and the figures. A run whose own
+    /// reserve is past the part is told so: only a smaller run (fewer
+    /// attempts) or a larger quota admits it.
+    history_quota = 40,
 };
 
 /// Whether a refused request took effect.

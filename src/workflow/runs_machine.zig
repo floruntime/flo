@@ -49,6 +49,8 @@ const defs_machine = @import("defs_machine.zig");
 const calls_mod = @import("../actions/calls_machine.zig");
 const gate = @import("../budget/gate.zig");
 const start_verdict = @import("../budget/start_verdict.zig");
+const hq = @import("../budget/history_quota.zig");
+const history_reserve = @import("../budget/history_reserve.zig");
 const parser = @import("parser.zig");
 const jsonpath = @import("jsonpath.zig");
 const NamespaceId = @import("../namespace/table.zig").Id;
@@ -726,6 +728,8 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         .workflow_start => {
             const cmd = command(e).?;
             try out.addIn(RunFam.ID, n.ns, n.run);
+            // Its reserve, raised, and read by its verdict.
+            try hq.addKeys(hq.WorkflowReserved, out, n.ns);
             const s = Start.parse(cmd.value) orelse return;
             try out.addIn(defs_machine.DefFam.ID, n.ns, s.workflow);
             try out.addIn(PerDefFam.ID, n.ns, s.workflow);
@@ -737,6 +741,8 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         .workflow_step => {
             const cmd = command(e).?;
             try out.addIn(RunFam.ID, n.ns, n.run);
+            // A step that ends its run releases its reserve.
+            try hq.addKeys(hq.WorkflowReserved, out, n.ns);
             const range = (try runRange(arena, n.ns, n.run))[KEY_PREFIX..];
             out.addRangeIn(OutFam.ID, n.ns, range) catch return error.OutOfMemory;
             // A wait on a signal: whether the run holds one of its type.
@@ -758,6 +764,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         .workflow_complete => {
             const cmd = command(e).?;
             try out.addIn(RunFam.ID, n.ns, n.run);
+            try hq.addKeys(hq.WorkflowReserved, out, n.ns);
             const range = (try runRange(arena, n.ns, n.run))[KEY_PREFIX..];
             // Not the invalid namespace, checked above.
             out.addRangeIn(OutFam.ID, n.ns, range) catch return error.OutOfMemory;
@@ -806,6 +813,13 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         .workflow_run_delete => return applyDelete(view, n, command(e).?, out),
         else => return error.Halt,
     }
+}
+
+/// What a live run of workflow `workflow`, id `run`, reserves of its
+/// namespace's quota: from its names alone, which its record keeps for
+/// life, so its end releases what its start raised.
+pub fn reserveOf(workflow: []const u8, run: []const u8) u64 {
+    return history_reserve.workflow(workflow.len, run.len);
 }
 
 fn statusOf(r: Run.Value) RunStatus {
@@ -942,6 +956,10 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
         try summarize(view, n, &run, null, false, stamp_ms);
     }
     try view.put(RunFam, cmd.key, .{ .v = run });
+    // A live run reserves what its history may still add, staged with it,
+    // so a refused start raises nothing. One that starts ended reserves
+    // nothing, and has nothing to release.
+    if (!s.status.isTerminal()) try hq.raise(hq.WorkflowReserved, view, n.ns, reserveOf(run.workflow, n.run));
     if (comptime plant.active != .runs_idem_unwritten) if (idem_key) |k| try view.put(IdemFam, k, .{ .v = .{ .run = n.run } });
     // Its places in the lists, staged with it: a start the verdict refuses
     // below rolls them back too.
@@ -1298,6 +1316,8 @@ fn applyDelete(view: *View, n: Named, cmd: entry_mod.CommandPayload, out: *Resul
 /// workflow's, and a child's parent hears how, its record gone.
 fn endRun(view: *View, n: Named, run_key: []const u8, run: *Run.Value, status: RunStatus, output: ?[]const u8, stamp_ms: i64) ApplyError!void {
     const arena = view.arena;
+    // What it reserved at its start: the same names, so the same figure.
+    if (comptime plant.active != .quota_end_keeps_reserve) try hq.lower(hq.WorkflowReserved, view, n.ns, reserveOf(run.workflow, n.run));
     run.status = @backingInt(status);
     run.completed_at_ms = stamp_ms;
     run.wait = .none;
@@ -1466,6 +1486,7 @@ pub const machine: machine_mod.Machine = .{
         machine_mod.info(SigFam),
         machine_mod.info(RunAtFam),
         machine_mod.info(RunAllFam),
+        machine_mod.info(hq.WorkflowReserved),
     },
     .keys = keys,
     .apply = apply,
@@ -1685,6 +1706,39 @@ fn startValue(buf: []u8, wf: []const u8, event: []const u8, idem: []const u8) []
 fn completeValue(buf: []u8, status: RunStatus, wf: []const u8) []const u8 {
     const c: Complete = .{ .status = status, .output = null, .event = "workflow_cancelled", .detail = "stop", .workflow = wf, .created_ns = 0 };
     return c.encode(buf).?;
+}
+
+test "runs machine: a live run reserves its quota share at its start, released whole at its end; a refused start or one that starts ended reserves nothing" {
+    var f = Fixture.init();
+    defer f.deinit();
+    const read: view_mod.ReadView = .{ .store = &f.store };
+    const each = reserveOf("wf", "r1");
+    try testing.expectEqual(history_reserve.workflow(2, 2), each);
+    _ = try f.start("r1", "wf", "workflow_started", "", 1000);
+    try testing.expectEqual(each, hq.reservedOf(hq.WorkflowReserved, read, .default));
+    _ = try f.start("r2", "wf", "workflow_started", "", 1001);
+    try testing.expectEqual(2 * each, hq.reservedOf(hq.WorkflowReserved, read, .default));
+    // A second start of r1 is refused: it raises nothing.
+    try testing.expect((try f.start("r1", "wf", "workflow_started", "", 1002)).refused() != null);
+    try testing.expectEqual(2 * each, hq.reservedOf(hq.WorkflowReserved, read, .default));
+    var vb: [256]u8 = undefined;
+    try testing.expect((try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 1003)).refused() == null);
+    try testing.expectEqual(each, hq.reservedOf(hq.WorkflowReserved, read, .default));
+    // A second completion of the ended run lowers nothing again.
+    _ = try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 1004);
+    try testing.expectEqual(each, hq.reservedOf(hq.WorkflowReserved, read, .default));
+    // A step that ends its run releases it too; the row then goes.
+    try testing.expect((try f.step("r2", .{ .rev = f.get("r2").?.rev, .ends = .completed })).refused() == null);
+    try testing.expectEqual(@as(u64, 0), hq.reservedOf(hq.WorkflowReserved, read, .default));
+    var kb: [4]u8 = undefined;
+    try testing.expect((try read.get(hq.WorkflowReserved, view_mod.idKey(&kb, .default, "") catch unreachable)) == null);
+    // A run that starts ended reserves nothing.
+    var sb: [512]u8 = undefined;
+    var kb2: [64]u8 = undefined;
+    const ended = (Start{ .workflow = "wf", .version = "1", .status = .completed, .event = "workflow_started", .idem = null, .trigger = null, .input = "" }).encode(&sb).?;
+    try testing.expect((try f.command(.workflow_start, view_mod.idKey(&kb2, .default, "r3") catch unreachable, ended, 1005)).refused() == null);
+    try testing.expectEqual(@as(u64, 0), hq.reservedOf(hq.WorkflowReserved, read, .default));
+    try testing.expectEqual(@as(u64, 0), f.store.quota_reserve_drift);
 }
 
 test "workflow runs machine: a completion whose detail is past a cancel reason's bound is refused at apply and ends nothing; one at the bound ends its run" {
