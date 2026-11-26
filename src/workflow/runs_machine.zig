@@ -822,6 +822,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
 /// namespace's quota: from its names alone, which its record keeps for
 /// life, so its end releases what its start raised.
 pub fn reserveOf(workflow: []const u8, run: []const u8) u64 {
+    if (comptime plant.active == .quota_reserve_omits_step) return history_reserve.workflow(workflow.len, run.len) / 8;
     return history_reserve.workflow(workflow.len, run.len);
 }
 

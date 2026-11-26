@@ -42,6 +42,7 @@ const persistence = @import("../storage/persistence.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const node_router = @import("../node/router.zig");
 const store_mod = @import("store.zig");
+const plant = @import("../plant.zig");
 const ns_table = @import("../namespace/table.zig");
 
 const Entry = entry_mod.Entry;
@@ -809,7 +810,7 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 // is taken, so a resend is a duplicate.
                 if (skip) |*sk| if (sk.skips(seq)) {
                     try skipMessage(view, e, m, p.from, lane, seq, ordinal, sk);
-                    if (lane == .history) try takeHistory(view, place.group, .of(m.origin_ns), m.payload.len);
+                    if (lane == .history and comptime plant.active != .history_skip_untaken) try takeHistory(view, place.group, .of(m.origin_ns), m.payload.len);
                     applied = seq;
                     continue;
                 };

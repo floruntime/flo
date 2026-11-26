@@ -160,6 +160,12 @@ pub const Plant = enum {
     quota_start_admits,
     /// An action invoke, direct or a call's, is admitted past the quota.
     quota_invoke_admits,
+    /// A history message a repair skipped leaves its bytes untaken: its
+    /// namespace's in-flight history counts it until the trim.
+    history_skip_untaken,
+    /// A workflow run reserves an eighth of what its history may still add
+    /// past the part: its step in flight and its end go uncounted.
+    quota_reserve_omits_step,
 };
 
 pub const active: Plant = std.meta.stringToEnum(Plant, @import("build_options").vopr_plant) orelse
