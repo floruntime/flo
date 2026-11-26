@@ -42,6 +42,8 @@ pub const ShardQuota = Record(&.{
     .{ .name = "usage_bytes", .T = Int(u64), .doc = "The run history its rows reference here, bytes" },
     .{ .name = "orphans", .T = Int(u32), .doc = "Deleted runs whose history couldn't be dropped, still counted in usage" },
     .{ .name = "orphan_bytes", .T = Int(u64), .doc = "Their bytes" },
+    .{ .name = "reserved_workflow_bytes", .T = Int(u64), .doc = "What its live workflow runs may still add to their history here, bytes: a start is refused when usage and every reserve would pass the part" },
+    .{ .name = "reserved_action_bytes", .T = Int(u64), .doc = "The same for its live action runs" },
 });
 pub const ShardQuotas = schema.List(ShardQuota, MAX_SHARDS);
 

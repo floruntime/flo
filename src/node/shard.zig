@@ -170,6 +170,7 @@ const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
 const memory_budget = @import("memory_budget.zig");
 const pool = @import("../budget/pool.zig");
 const host_memory = @import("host_memory.zig");
+const quota_walk = @import("../settings/quota_walk.zig");
 const settings_machine = @import("../settings/machine.zig");
 const contract_view = @import("../contract/view.zig");
 
@@ -939,15 +940,7 @@ pub const Shard = struct {
     /// The quota bind this leader proposed and hasn't seen apply, and where
     /// its walk of the namespace table goes on from.
     quota_bind_pending: ?BudgetPropose = null,
-    quota_cursor: u32 = 0,
-    /// The table's quota epoch and this shard's term when the walk now
-    /// under way began, and whether it has found anything to bind; and the
-    /// epoch and term of the last whole walk that found nothing, which
-    /// lets the walk stop until either moves.
-    quota_walk: struct { epoch: u64 = 0, term: u64 = 0, found: bool = true } = .{},
-    quota_clean: ?struct { epoch: u64, term: u64 } = null,
-    /// Ids the walk has looked at, since start: for its tests.
-    quota_looked: u64 = 0,
+    quota: quota_walk.Walk = .{},
     /// The last bind's propose was refused (writes stopped, the log's
     /// outstanding cap): the walk goes on a stretch per idle sleep, not
     /// keeping the loop up, until a propose is taken or a walk is clean.
@@ -6054,6 +6047,8 @@ pub const Shard = struct {
             sm.pool_share_bytes.store(if (bound) |b| b.share_bytes else 0, .monotonic);
             sm.memory_refusals.store(self.defaultPartition().store.memory_refusals, .monotonic);
             sm.history_usage_drift.store(self.defaultPartition().store.history_usage_drift, .monotonic);
+            sm.quota_reserve_drift.store(self.defaultPartition().store.quota_reserve_drift, .monotonic);
+            sm.quota_refusals.store(self.defaultPartition().store.quota_refusals, .monotonic);
             sm.runs_unlisted[0].store(self.workflow_handler.missing_runs, .monotonic);
             sm.runs_unlisted[1].store(self.actions_handler.unlisted_runs, .monotonic);
             for (&sm.ts_late, self.defaultPartition().store.ts_late_points) |*m, n| m.store(n, .monotonic);
@@ -7031,15 +7026,8 @@ pub const Shard = struct {
         self.bind_pending = proposeOrNull(raft, .settings_budget_bind, bytes);
     }
 
-    /// A namespace's quota over every shard, as each of `shards` holds it:
-    /// split evenly, rounded up; none stays none.
-    pub fn quotaPart(quota: u64, shards: u32) u64 {
-        if (quota == settings_machine.NO_QUOTA) return quota;
-        return std.math.divCeil(u64, quota, @max(shards, 1)) catch unreachable;
-    }
-
-    /// The namespaces the table walk looks at in one tick.
-    const QUOTA_SCAN_PER_TICK: u32 = 1024;
+    pub const quotaPart = quota_walk.part;
+    const QUOTA_SCAN_PER_TICK = quota_walk.PER_CALL;
 
     /// Bind this shard's part of each namespace's run-history quota, as
     /// shard 0 published it: logged here, so every replica holds the same
@@ -7069,44 +7057,12 @@ pub const Shard = struct {
     }
 
     /// The namespaces whose bound part is due, into `out`, walking on from
-    /// the cursor: how many.
+    /// the cursor: how many. A walk found clean clears a refused propose.
     fn quotaBindsDue(self: *Shard, out: []settings_entries.QuotaItem.Value) usize {
-        const names = self.namespace_handler.table;
-        const epoch = names.quotaEpoch();
-        const term = self.raft_node.current_term;
-        // A whole walk at this epoch and term found every part bound: none
-        // is due until a quota is published or another term binds.
-        if (self.quota_clean) |c| {
-            if (c.epoch == epoch and c.term == term) return 0;
-            self.quota_clean = null;
-        }
         const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
-        const shards = self.router.shard_count;
-        var n: usize = 0;
-        var looked: u32 = 0;
-        while (n < out.len and looked < QUOTA_SCAN_PER_TICK) : (looked += 1) {
-            if (self.quota_cursor == 0) {
-                // A walk ends: clean if it found nothing at one epoch and term.
-                if (!self.quota_walk.found and self.quota_walk.epoch == epoch and self.quota_walk.term == term) {
-                    self.quota_clean = .{ .epoch = epoch, .term = term };
-                    self.quota_propose_refused = false;
-                    self.quota_walk = .{ .epoch = epoch, .term = term, .found = true };
-                    return n;
-                }
-                self.quota_walk = .{ .epoch = epoch, .term = term, .found = false };
-            }
-            const id: ns_table.Id = .of(self.quota_cursor);
-            self.quota_cursor = (self.quota_cursor + 1) % ns_table.CAPACITY;
-            self.quota_looked += 1;
-            const q = names.quotaOf(id) orelse continue;
-            const part = quotaPart(q.quota, shards);
-            if (settings_machine.boundQuota(read, id)) |b| {
-                if (b.part_bytes == part or q.index < b.published_index) continue;
-            }
-            out[n] = .{ .ns = id.int(), .part_bytes = part, .published_index = q.index };
-            n += 1;
-            self.quota_walk.found = true;
-        }
+        const before = self.quota.clean;
+        const n = self.quota.due(self.namespace_handler.table, read, self.raft_node.current_term, self.router.shard_count, out);
+        if (self.quota.clean != null and !std.meta.eql(before, self.quota.clean)) self.quota_propose_refused = false;
         return n;
     }
 
@@ -7121,8 +7077,7 @@ pub const Shard = struct {
         if (self.quota_bind_pending) |p| {
             if (p.term == raft.current_term and p.index > raft.last_applied) return false;
         }
-        const c = self.quota_clean orelse return true;
-        return c.epoch != self.namespace_handler.table.quotaEpoch() or c.term != raft.current_term;
+        return !self.quota.isClean(self.namespace_handler.table.quotaEpoch(), raft.current_term);
     }
 
     /// Wake every other shard that sleeps: shard 0 published a quota, which
@@ -7475,7 +7430,7 @@ pub const Shard = struct {
         if (leads or holds) self.runProducers() else {
             self.duties.clear();
             self.processing_handler.stopLeading(self);
-            if (self.workflow_handler.memory_held > 0) self.workflow_handler.dropHolds(self);
+            if (self.workflow_handler.memory_held > 0 or self.workflow_handler.quota_held > 0) self.workflow_handler.dropHolds(self);
         }
 
         // Shard 0's leader keeps the memory-budget settings rows current. It
@@ -7610,7 +7565,7 @@ pub const Shard = struct {
         // scheduled ones (interval → start runs), once the caches are built.
         const built = self.workflow_handler.caches_built;
         // Halted, nothing is held at the share: the halt holds it.
-        if (self.halted != null and self.workflow_handler.memory_held > 0) self.workflow_handler.dropHolds(self);
+        if (self.halted != null and (self.workflow_handler.memory_held > 0 or self.workflow_handler.quota_held > 0)) self.workflow_handler.dropHolds(self);
         if (!self.heldIfHalted(.stream_triggers, self.workflow_handler.stream_triggers.count() > 0)) {
             if (built) self.workflow_handler.tickStreamTriggers(self);
             self.duties.note(.stream_triggers, null, now);
@@ -11194,9 +11149,9 @@ test "quota binds: once a whole walk at one epoch and term finds every part boun
     }
     // Two whole walks: one that bound, one that found nothing. Clean now.
     for (0..walks) |_| try std.testing.expectEqual(@as(usize, 0), shard.quotaBindsDue(&items));
-    const looked = shard.quota_looked;
+    const looked = shard.quota.looked;
     for (0..walks) |_| try std.testing.expectEqual(@as(usize, 0), shard.quotaBindsDue(&items));
-    try std.testing.expectEqual(looked, shard.quota_looked);
+    try std.testing.expectEqual(looked, shard.quota.looked);
     // A quota published moves the epoch: the walk runs again, and binds it.
     names.publishQuota(ns_table.DEFAULT, 4 << 30, 6);
     var found: usize = 0;
@@ -11205,14 +11160,14 @@ test "quota binds: once a whole walk at one epoch and term finds every part boun
         if (found > 0) break;
     }
     try std.testing.expectEqual(@as(usize, 1), found);
-    try std.testing.expect(shard.quota_looked > looked);
+    try std.testing.expect(shard.quota.looked > looked);
     // So does a new term, with nothing published.
     _ = try applySettings(&shard, at, .settings_quota_bind, try quotaBind(&buf, &.{.{ .ns = ns_table.DEFAULT.int(), .part_bytes = 4 << 30, .published_index = 6 }}));
     for (0..2 * walks) |_| try std.testing.expectEqual(@as(usize, 0), shard.quotaBindsDue(&items));
-    const clean = shard.quota_looked;
+    const clean = shard.quota.looked;
     shard.raft_node.current_term += 1;
     _ = shard.quotaBindsDue(&items);
-    try std.testing.expect(shard.quota_looked > clean);
+    try std.testing.expect(shard.quota.looked > clean);
 }
 
 test "quota binds: the loop doesn't sleep while a walk is under way, a published quota is bound in back-to-back ticks, and an idle shard sleeps again" {
@@ -11240,7 +11195,7 @@ test "quota binds: the loop doesn't sleep while a walk is under way, a published
         }
         try std.testing.expectEqual(step[0], settings_machine.boundQuota(read, ns_table.DEFAULT).?.part_bytes);
         // Clean: the walk keeps nothing awake, and the loop may sleep.
-        try std.testing.expect(shard.quota_clean != null);
+        try std.testing.expect(shard.quota.clean != null);
         shard.more_work = false;
         shard.apply_behind = false;
         try std.testing.expect(shard.loopTimeoutMs(false, now) > 0);
@@ -11295,7 +11250,7 @@ test "quota binds: a bind whose propose is refused lets the loop sleep, and bind
     }
     try std.testing.expectEqual(@as(u64, 8 << 30), settings_machine.boundQuota(read, ns_table.DEFAULT).?.part_bytes);
     // Clean: it sleeps again.
-    try std.testing.expect(shard.quota_clean != null);
+    try std.testing.expect(shard.quota.clean != null);
 }
 
 test "quota binds: a bind refused at the log's outstanding cap, apply held, lets the loop sleep, and binds once apply catches up" {
@@ -11363,8 +11318,8 @@ test "quota binds: a quota set A, then B, then A again binds each in turn, and a
     }
     // 64 namespaces published at once: one tick's walk fills one batch.
     for (0..settings_entries.MAX_QUOTA_BINDS) |i| names.publishQuota(.of(@intCast(16 + i)), 2 << 30, 9);
-    shard.quota_cursor = 0;
-    shard.quota_clean = null;
+    shard.quota.cursor = 0;
+    shard.quota.clean = null;
     const n = shard.quotaBindsDue(&items);
     try std.testing.expectEqual(@as(usize, settings_entries.MAX_QUOTA_BINDS), n);
     try std.testing.expect((try applySettings(&shard, at, .settings_quota_bind, try quotaBind(&buf, items[0..n]))).refused() == null);
@@ -15125,7 +15080,7 @@ test "Shard: an idle pipeline wakes its shard at its own poll interval, no soone
     // counted as an un-slept tick, and its sleep ends at the deadline.
     // (A new leader's first quota walk keeps the loop up too: count it done.)
     a.more_work = false;
-    a.quota_clean = .{ .epoch = a.namespace_handler.table.quotaEpoch(), .term = a.raft_node.current_term };
+    a.quota.clean = .{ .epoch = a.namespace_handler.table.quotaEpoch(), .term = a.raft_node.current_term };
     for (0..10) |k| {
         const now = t + @as(i64, @intCast(k));
         a.notePipelinesNext(true);

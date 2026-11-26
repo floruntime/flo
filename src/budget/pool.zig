@@ -93,6 +93,9 @@ pub const CHARGED = [_]u16{
     // namespace.settings: a namespace's quota; settings.quota: its part here
     77,
     78,
+    // workflow.reserved, action.reserved: a namespace's live runs' reserves here
+    79,
+    80,
 };
 
 /// The families the pool is not charged for: the node's own state, and a

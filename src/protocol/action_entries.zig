@@ -276,6 +276,10 @@ pub const Answer = enum(u8) {
     /// The action's shard is at its memory share: no run was started, and
     /// the call may ask again once memory frees. The reply's `why` says so.
     over_budget = 7,
+    /// The callee's namespace is at its run-history quota on its shard: no
+    /// run was started, and the call asks again later, however long that
+    /// takes. The reply's `why` gives the figures.
+    over_quota = 8,
 };
 
 /// The action's shard's answer to a call's start, sent back to the
@@ -316,6 +320,8 @@ pub const ChildRefuse = Record(&.{
     .{ .name = "ns", .T = NamespaceId },
     .{ .name = "run", .T = RunId },
     .{ .name = "answer", .T = schema.Enum(Answer) },
+    // Why, for its parent's call: the quota's figures when `over_quota`.
+    .{ .name = "why", .T = Optional(Bytes(MAX_SKIP_WHY)) },
 });
 
 /// A called run ended: sent to the caller's slot from the entry that

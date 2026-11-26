@@ -4,8 +4,9 @@
 //! state is left in one node's memory. The machine stores the bytes and
 //! never reads them.
 //!
-//! `[version:u8 = 2][retry_count:u32][poll_attempt:u32]
+//! `[version:u8 = 3][retry_count:u32][poll_attempt:u32]
 //!  [waiting_for_room:u8][call_unregistered_noted:u8][call_over_budget_noted:u8]
+//!  [call_over_quota_noted:u8]
 //!  [call_retry_at_ms:i64][call_retry_index:u64]
 //!  [plan_executor_idx:u8][plan_executor_natural_idx:u8]
 //!  [plan_executor_retry_count:u32][plan_order_len:u8][plan_order:u8 * len]`,
@@ -14,7 +15,7 @@
 const std = @import("std");
 const plan_types = @import("plan_types.zig");
 
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 
 pub const Progress = struct {
     /// Retries taken of the current step.
@@ -28,6 +29,9 @@ pub const Progress = struct {
     /// The step's call is held by its action's shard's memory share, and
     /// said so.
     call_over_budget_noted: bool = false,
+    /// The step's call is held by its callee's namespace's run-history
+    /// quota, and said so.
+    call_over_quota_noted: bool = false,
     /// When the step's call may next be asked again, and the index of the
     /// last time it was.
     call_retry_at_ms: i64 = 0,
@@ -41,7 +45,7 @@ pub const Progress = struct {
     plan_order: [plan_types.MAX_PLAN_EXECUTORS]u8 = @splat(0),
     plan_order_len: u8 = 0,
 
-    pub const max_size = 1 + 4 + 4 + 1 + 1 + 1 + 8 + 8 + 1 + 1 + 4 + 1 + plan_types.MAX_PLAN_EXECUTORS;
+    pub const max_size = 1 + 4 + 4 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 1 + 4 + 1 + plan_types.MAX_PLAN_EXECUTORS;
 
     pub fn encode(p: *const Progress, buf: *[max_size]u8) []const u8 {
         var w: std.Io.Writer = .fixed(buf);
@@ -51,6 +55,7 @@ pub const Progress = struct {
         w.writeByte(@intFromBool(p.waiting_for_room)) catch unreachable;
         w.writeByte(@intFromBool(p.call_unregistered_noted)) catch unreachable;
         w.writeByte(@intFromBool(p.call_over_budget_noted)) catch unreachable;
+        w.writeByte(@intFromBool(p.call_over_quota_noted)) catch unreachable;
         w.writeInt(i64, p.call_retry_at_ms, .little) catch unreachable;
         w.writeInt(u64, p.call_retry_index, .little) catch unreachable;
         w.writeByte(p.plan_executor_idx) catch unreachable;
@@ -76,6 +81,7 @@ pub const Progress = struct {
         p.waiting_for_room = (r.takeByte() catch return error.Malformed) != 0;
         p.call_unregistered_noted = (r.takeByte() catch return error.Malformed) != 0;
         p.call_over_budget_noted = (r.takeByte() catch return error.Malformed) != 0;
+        p.call_over_quota_noted = (r.takeByte() catch return error.Malformed) != 0;
         p.call_retry_at_ms = r.takeInt(i64, .little) catch return error.Malformed;
         p.call_retry_index = r.takeInt(u64, .little) catch return error.Malformed;
         p.plan_executor_idx = r.takeByte() catch return error.Malformed;
@@ -111,6 +117,7 @@ test "progress: every counter a step decides on round-trips through its logged b
         .waiting_for_room = true,
         .call_unregistered_noted = true,
         .call_over_budget_noted = true,
+        .call_over_quota_noted = true,
         .call_retry_at_ms = -5,
         .call_retry_index = 1 << 40,
         .plan_executor_idx = 2,

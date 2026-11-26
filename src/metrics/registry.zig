@@ -201,6 +201,9 @@ pub const WorkflowMetrics = struct {
     /// their shard at its memory share, or waiting after a start refused
     /// there. As of the leader's last pass.
     duties_memory_held: Atomic(u64) = Atomic(u64).init(0),
+    /// Schedules and triggers holding their starts at their namespace's
+    /// run-history quota, or waiting after a start refused there.
+    duties_quota_held: Atomic(u64) = Atomic(u64).init(0),
 
     pub fn init() WorkflowMetrics {
         return .{};
@@ -279,6 +282,7 @@ pub const WorkflowMetrics = struct {
         active_schedules: u64,
         action_expires_held: u64,
         duties_memory_held: u64,
+        duties_quota_held: u64,
     };
 
     pub fn snapshot(self: *const WorkflowMetrics) Snapshot {
@@ -297,6 +301,7 @@ pub const WorkflowMetrics = struct {
             .active_schedules = self.active_schedules.load(.monotonic),
             .action_expires_held = self.action_expires_held.load(.monotonic),
             .duties_memory_held = self.duties_memory_held.load(.monotonic),
+            .duties_quota_held = self.duties_quota_held.load(.monotonic),
         };
     }
 };
@@ -812,6 +817,11 @@ pub const ShardMetrics = struct {
     memory_refusals: Atomic(u64) = Atomic(u64).init(0),
     /// History usage subtracts past zero (a Flo bug), since start.
     history_usage_drift: Atomic(u64) = Atomic(u64).init(0),
+    /// Run-history reserve lowers past zero (a Flo bug), since start.
+    quota_reserve_drift: Atomic(u64) = Atomic(u64).init(0),
+    /// Starts, invokes and signals refused here at a namespace's run-history
+    /// quota, since start.
+    quota_refusals: Atomic(u64) = Atomic(u64).init(0),
     /// Runs a run list passed over, its index row there but the run gone
     /// or its entry unlistable (a Flo bug): workflow runs, action runs.
     runs_unlisted: [2]Atomic(u64) = @splat(Atomic(u64).init(0)),
@@ -1078,6 +1088,8 @@ pub const ShardMetrics = struct {
         pool_share_bytes: u64,
         memory_refusals: u64,
         history_usage_drift: u64,
+        quota_reserve_drift: u64,
+        quota_refusals: u64,
         runs_unlisted: [2]u64,
         ts_late: [TS_LATE_EDGES.len]u64,
         channel_sender_bugs: [SENDER_BUGS]u64,
@@ -1153,6 +1165,8 @@ pub const ShardMetrics = struct {
             .pool_share_bytes = self.pool_share_bytes.load(.monotonic),
             .memory_refusals = self.memory_refusals.load(.monotonic),
             .history_usage_drift = self.history_usage_drift.load(.monotonic),
+            .quota_reserve_drift = self.quota_reserve_drift.load(.monotonic),
+            .quota_refusals = self.quota_refusals.load(.monotonic),
             .runs_unlisted = .{ self.runs_unlisted[0].load(.monotonic), self.runs_unlisted[1].load(.monotonic) },
             .ts_late = blk: {
                 var v: [TS_LATE_EDGES.len]u64 = undefined;
@@ -1895,6 +1909,9 @@ fn writeWorkflowMetrics(writer: anytype, snapshot: WorkflowMetrics.Snapshot) !vo
     try writer.print("# HELP flo_workflow_duties_memory_held Schedules and triggers holding their starts at their last attempt: their shard at its memory share, or waiting after a start refused there\n", .{});
     try writer.print("# TYPE flo_workflow_duties_memory_held gauge\n", .{});
     try writer.print("flo_workflow_duties_memory_held {d}\n", .{snapshot.duties_memory_held});
+    try writer.print("# HELP flo_workflow_duties_quota_held Schedules and triggers holding their starts at their last attempt: their namespace at its run-history quota on the shard, or waiting after a start refused there\n", .{});
+    try writer.print("# TYPE flo_workflow_duties_quota_held gauge\n", .{});
+    try writer.print("flo_workflow_duties_quota_held {d}\n", .{snapshot.duties_quota_held});
 }
 
 /// Write processing metrics in Prometheus format
@@ -2057,6 +2074,8 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     if (snap.pool_share_bytes > 0) try writer.print("flo_shard_pool_share_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.pool_share_bytes });
     try writer.print("flo_shard_memory_refusals_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.memory_refusals });
     try writer.print("flo_shard_history_usage_drift_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.history_usage_drift });
+    try writer.print("flo_shard_quota_reserve_drift_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.quota_reserve_drift });
+    try writer.print("flo_shard_quota_refusals_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.quota_refusals });
     for ([_][]const u8{ "workflow", "action" }, snap.runs_unlisted) |family, n| try writer.print("flo_shard_runs_unlisted_total{{shard_id=\"{d}\",family=\"{s}\"}} {d}\n", .{ snap.shard_id, family, n });
     for (TS_LATE_EDGES, snap.ts_late) |edge, n| try writer.print("flo_ts_late_points_total{{shard_id=\"{d}\",behind=\"{s}\"}} {d}\n", .{ snap.shard_id, edge, n });
     for (std.enums.values(SenderBug), snap.channel_sender_bugs) |bug, n| try writer.print("flo_shard_channel_sender_bugs_total{{shard_id=\"{d}\",reason=\"{s}\"}} {d}\n", .{ snap.shard_id, @tagName(bug), n });

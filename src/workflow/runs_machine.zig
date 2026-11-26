@@ -40,6 +40,7 @@ const ae = @import("../protocol/action_entries.zig");
 const he = @import("../protocol/history_entries.zig");
 const hp = @import("../stream/history_producer.zig");
 const limits = @import("../protocol/limits.zig");
+const proto = @import("../protocol/proto.zig");
 const view_mod = @import("../contract/view.zig");
 const machine_mod = @import("../contract/machine.zig");
 const delivery = @import("../contract/delivery.zig");
@@ -49,6 +50,8 @@ const defs_machine = @import("defs_machine.zig");
 const calls_mod = @import("../actions/calls_machine.zig");
 const gate = @import("../budget/gate.zig");
 const start_verdict = @import("../budget/start_verdict.zig");
+const hq = @import("../budget/history_quota.zig");
+const history_reserve = @import("../budget/history_reserve.zig");
 const parser = @import("parser.zig");
 const jsonpath = @import("jsonpath.zig");
 const NamespaceId = @import("../namespace/table.zig").Id;
@@ -726,6 +729,8 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         .workflow_start => {
             const cmd = command(e).?;
             try out.addIn(RunFam.ID, n.ns, n.run);
+            // Its reserve, raised, and read by its verdict.
+            try hq.addKeys(hq.WorkflowReserved, out, n.ns);
             const s = Start.parse(cmd.value) orelse return;
             try out.addIn(defs_machine.DefFam.ID, n.ns, s.workflow);
             try out.addIn(PerDefFam.ID, n.ns, s.workflow);
@@ -737,6 +742,8 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         .workflow_step => {
             const cmd = command(e).?;
             try out.addIn(RunFam.ID, n.ns, n.run);
+            // A step that ends its run releases its reserve.
+            try hq.addKeys(hq.WorkflowReserved, out, n.ns);
             const range = (try runRange(arena, n.ns, n.run))[KEY_PREFIX..];
             out.addRangeIn(OutFam.ID, n.ns, range) catch return error.OutOfMemory;
             // A wait on a signal: whether the run holds one of its type.
@@ -752,12 +759,15 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         },
         .workflow_signal => {
             try out.addIn(RunFam.ID, n.ns, n.run);
+            // Read by its quota verdict.
+            try hq.addKeys(hq.WorkflowReserved, out, n.ns);
             const range = (try runRange(arena, n.ns, n.run))[KEY_PREFIX..];
             out.addRangeIn(SigFam.ID, n.ns, range) catch return error.OutOfMemory;
         },
         .workflow_complete => {
             const cmd = command(e).?;
             try out.addIn(RunFam.ID, n.ns, n.run);
+            try hq.addKeys(hq.WorkflowReserved, out, n.ns);
             const range = (try runRange(arena, n.ns, n.run))[KEY_PREFIX..];
             // Not the invalid namespace, checked above.
             out.addRangeIn(OutFam.ID, n.ns, range) catch return error.OutOfMemory;
@@ -806,6 +816,30 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         .workflow_run_delete => return applyDelete(view, n, command(e).?, out),
         else => return error.Halt,
     }
+}
+
+/// What a live run of workflow `workflow`, id `run`, reserves of its
+/// namespace's quota: from its names alone, which its record keeps for
+/// life, so its end releases what its start raised.
+pub fn reserveOf(workflow: []const u8, run: []const u8) u64 {
+    return history_reserve.workflow(workflow.len, run.len);
+}
+
+/// Why `workflow.reserved` isn't its namespaces' live runs' reserves, or
+/// a lower went past 0; null if neither. A VOPR rule; walks every run.
+pub fn reserveRule(store: *const @import("../contract/store.zig").Store, a: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
+    if (store.quota_reserve_drift != 0) return "a run-history reserve lower went past zero";
+    const read: ReadView = .{ .store = @constCast(store) };
+    var sums: std.AutoHashMapUnmanaged(u32, u64) = .empty;
+    var it = read.range(RunFam, "");
+    while (it.next() catch return "a run could not be read") |item| {
+        if (statusOf(item.value.v).isTerminal()) continue;
+        if (item.key.len <= KEY_PREFIX) return "a run's key names no run";
+        const e = try sums.getOrPut(a, std.mem.readInt(u32, item.key[0..4], .big));
+        if (!e.found_existing) e.value_ptr.* = 0;
+        e.value_ptr.* +|= reserveOf(item.value.v.workflow, item.key[KEY_PREFIX..]);
+    }
+    return hq.ruleAgainst(hq.WorkflowReserved, read, &sums);
 }
 
 fn statusOf(r: Run.Value) RunStatus {
@@ -942,6 +976,10 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
         try summarize(view, n, &run, null, false, stamp_ms);
     }
     try view.put(RunFam, cmd.key, .{ .v = run });
+    // A live run reserves what its history may still add, staged with it,
+    // so a refused start raises nothing. One that starts ended reserves
+    // nothing, and has nothing to release.
+    if (!s.status.isTerminal()) try hq.raise(hq.WorkflowReserved, view, n.ns, reserveOf(run.workflow, n.run));
     if (comptime plant.active != .runs_idem_unwritten) if (idem_key) |k| try view.put(IdemFam, k, .{ .v = .{ .run = n.run } });
     // Its places in the lists, staged with it: a start the verdict refuses
     // below rolls them back too.
@@ -971,6 +1009,26 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
         };
     };
 
+    // Past its namespace's run-history quota on this shard: the usage at the
+    // part, or the usage and every live run's reserve, this one's staged
+    // above, over it. Refused as memory is, a child's parent told
+    // over_quota. Judged before memory, so a start over both answers the
+    // quota. A run that starts ended reserves nothing, but adds its one
+    // chunk: judged with nothing of its own.
+    const own = if (s.status.isTerminal()) 0 else reserveOf(run.workflow, n.run);
+    if (comptime plant.active != .quota_start_admits) if (try hq.verdict(hq.WorkflowReserved, view, n.ns, own, .usage_and_reserve)) |o| {
+        if (!s.isChild()) return hq.refuse(out, view, n.ns, o);
+        try view.rollback(mark);
+        var wb: [128]u8 = undefined;
+        const k = parent_key orelse return hq.refuse(out, view, n.ns, o);
+        const p = (try view.get(Parents, k)) orelse return hq.refuse(out, view, n.ns, o);
+        // Answered, not refused: counted here, once.
+        view.store.quota_refusals += 1;
+        try reply(view, n.ns, n.run, p.v.parent_slot, .over_quota, hq.why(&wb, n.ns, if (view.store.place) |pl| pl.group else 0, o));
+        try view.delete(Parents, k);
+        out.putInt(u8, 0);
+        return;
+    };
     // Held past its shard's share: nothing of it is written. A child's
     // parent is told instead, its record gone, and asks again; dropping the
     // entry would drop that answer too.
@@ -1068,6 +1126,12 @@ fn applySignal(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i
         if (comptime plant.active != .runs_signal_wake_keeps_rev) run.rev += 1;
     }
     try view.put(RunFam, cmd.key, .{ .v = run });
+    // At its namespace's run-history quota on this shard: refused, unless it
+    // wakes its run, which the run's reserve counts (one waking signal), so
+    // a held run can still end. Any other signal adds history no reserve
+    // counts, so it is held to the usage arm. Before memory, so a signal
+    // over both answers the quota.
+    if (!wakes) if (try hq.verdict(hq.WorkflowReserved, view, n.ns, 0, .usage)) |o| return hq.refuse(out, view, n.ns, o);
     // Held past its shard's share once all of it is staged: nothing lands,
     // and its client sends it again once memory frees. One that wakes its
     // run is taken within the slack.
@@ -1205,7 +1269,8 @@ fn applyStep(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms: i64
         if (try view.get(calls_mod.Calls, k)) |call| {
             switch (call.v.state) {
                 .done, .refused, .no_action, .over_budget => {},
-                .sent, .started => if (comptime plant.active != .runs_settle_before_call_ends) return out.refuse(.conflict, .unclassified, "conflict: the run's call hasn't ended"),
+                // Held at its callee's quota, it never settles: it waits.
+                .sent, .started, .over_quota => if (comptime plant.active != .runs_settle_before_call_ends) return out.refuse(.conflict, .unclassified, "conflict: the run's call hasn't ended"),
             }
             if (comptime plant.active != .runs_settled_call_kept) try view.delete(calls_mod.Calls, k);
         }
@@ -1298,6 +1363,8 @@ fn applyDelete(view: *View, n: Named, cmd: entry_mod.CommandPayload, out: *Resul
 /// workflow's, and a child's parent hears how, its record gone.
 fn endRun(view: *View, n: Named, run_key: []const u8, run: *Run.Value, status: RunStatus, output: ?[]const u8, stamp_ms: i64) ApplyError!void {
     const arena = view.arena;
+    // What it reserved at its start: the same names, so the same figure.
+    if (comptime plant.active != .quota_end_keeps_reserve) try hq.lower(hq.WorkflowReserved, view, n.ns, reserveOf(run.workflow, n.run));
     run.status = @backingInt(status);
     run.completed_at_ms = stamp_ms;
     run.wait = .none;
@@ -1388,7 +1455,9 @@ fn applyParent(view: *View, e: *const Entry, n: Named) ApplyError!void {
             // Refused by an earlier leader already, or started meanwhile.
             const f = found orelse return;
             if (f.v.state != .pending) return;
-            try reply(view, n.ns, n.run, f.v.parent_slot, p.answer, null);
+            // A leader's refusal for the quota is one, as at apply.
+            if (p.answer == .over_quota) view.store.quota_refusals += 1;
+            try reply(view, n.ns, n.run, f.v.parent_slot, p.answer, p.why);
             try view.delete(Parents, k);
         },
         else => return error.Halt,
@@ -1466,6 +1535,7 @@ pub const machine: machine_mod.Machine = .{
         machine_mod.info(SigFam),
         machine_mod.info(RunAtFam),
         machine_mod.info(RunAllFam),
+        machine_mod.info(hq.WorkflowReserved),
     },
     .keys = keys,
     .apply = apply,
@@ -1685,6 +1755,39 @@ fn startValue(buf: []u8, wf: []const u8, event: []const u8, idem: []const u8) []
 fn completeValue(buf: []u8, status: RunStatus, wf: []const u8) []const u8 {
     const c: Complete = .{ .status = status, .output = null, .event = "workflow_cancelled", .detail = "stop", .workflow = wf, .created_ns = 0 };
     return c.encode(buf).?;
+}
+
+test "runs machine: a live run reserves its quota share at its start, released whole at its end; a refused start or one that starts ended reserves nothing" {
+    var f = Fixture.init();
+    defer f.deinit();
+    const read: view_mod.ReadView = .{ .store = &f.store };
+    const each = reserveOf("wf", "r1");
+    try testing.expectEqual(history_reserve.workflow(2, 2), each);
+    _ = try f.start("r1", "wf", "workflow_started", "", 1000);
+    try testing.expectEqual(each, hq.reservedOf(hq.WorkflowReserved, read, .default));
+    _ = try f.start("r2", "wf", "workflow_started", "", 1001);
+    try testing.expectEqual(2 * each, hq.reservedOf(hq.WorkflowReserved, read, .default));
+    // A second start of r1 is refused: it raises nothing.
+    try testing.expect((try f.start("r1", "wf", "workflow_started", "", 1002)).refused() != null);
+    try testing.expectEqual(2 * each, hq.reservedOf(hq.WorkflowReserved, read, .default));
+    var vb: [256]u8 = undefined;
+    try testing.expect((try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 1003)).refused() == null);
+    try testing.expectEqual(each, hq.reservedOf(hq.WorkflowReserved, read, .default));
+    // A second completion of the ended run lowers nothing again.
+    _ = try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 1004);
+    try testing.expectEqual(each, hq.reservedOf(hq.WorkflowReserved, read, .default));
+    // A step that ends its run releases it too; the row then goes.
+    try testing.expect((try f.step("r2", .{ .rev = f.get("r2").?.rev, .ends = .completed })).refused() == null);
+    try testing.expectEqual(@as(u64, 0), hq.reservedOf(hq.WorkflowReserved, read, .default));
+    var kb: [4]u8 = undefined;
+    try testing.expect((try read.get(hq.WorkflowReserved, view_mod.idKey(&kb, .default, "") catch unreachable)) == null);
+    // A run that starts ended reserves nothing.
+    var sb: [512]u8 = undefined;
+    var kb2: [64]u8 = undefined;
+    const ended = (Start{ .workflow = "wf", .version = "1", .status = .completed, .event = "workflow_started", .idem = null, .trigger = null, .input = "" }).encode(&sb).?;
+    try testing.expect((try f.command(.workflow_start, view_mod.idKey(&kb2, .default, "r3") catch unreachable, ended, 1005)).refused() == null);
+    try testing.expectEqual(@as(u64, 0), hq.reservedOf(hq.WorkflowReserved, read, .default));
+    try testing.expectEqual(@as(u64, 0), f.store.quota_reserve_drift);
 }
 
 test "workflow runs machine: a completion whose detail is past a cancel reason's bound is refused at apply and ends nothing; one at the bound ends its run" {
@@ -2147,33 +2250,44 @@ test "workflow runs machine: what arrives late for a deleted run is refused or c
     try testing.expect(parentOf(.{ .store = &f.store }, .default, "c1") == null);
     try testing.expect((try f.deleteOf("c1")).refused() == null);
     var crb: [ae.ChildRefuse.max_size]u8 = undefined;
-    _ = try f.answer(.child_refuse, try ae.ChildRefuse.encodeInto(&crb, .{ .ns = NamespaceId.default.int(), .run = "c1", .answer = .conflict }));
+    _ = try f.answer(.child_refuse, try ae.ChildRefuse.encodeInto(&crb, .{ .ns = NamespaceId.default.int(), .run = "c1", .answer = .conflict, .why = null }));
     try testing.expect(f.get("c1") == null);
     try testing.expect(parentOf(.{ .store = &f.store }, .default, "c1") == null);
 }
 
-test "workflow runs machine: a repair skip leaves a call held over its callee's memory share as it is" {
-    var f = Fixture.init();
-    defer f.deinit();
-    _ = try f.start("r1", "wf", "workflow_started", "", 1);
-    var cb: [ae.Call.max_size]u8 = undefined;
-    const call = try ae.Call.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .kind = .action, .caller_run = "r1", .caller_workflow = "wf", .step = "s", .target = "act", .version = "", .run = "a1", .input = "{}", .can_wait = true });
-    _ = try f.step("r1", .{ .rev = 0, .wait = .call, .wait_on = "a1", .call = call });
-    const slot = calls_mod.callerSlot(.default, "wf");
-    var rb: [ae.Reply.max_size]u8 = undefined;
-    const held = try ae.Reply.encodeInto(&rb, .{ .ns = NamespaceId.default.int(), .slot = slot, .run = "a1", .answer = .over_budget, .why = "would pass its share" });
-    _ = try f.answer(.call_reply, held);
-    try testing.expectEqual(calls_mod.State.over_budget, calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1").?.state);
-    // A skip of a later answer to it: the hold stands, to be retried.
-    f.index += 1;
-    const e = entry_mod.buildEntry(.call_reply, entry_mod.Flags.NONE, 1, f.index, 0, held);
-    _ = f.scratch.reset(.retain_capacity);
-    var ks = view_mod.KeySet.init(f.scratch.allocator());
-    try machine.keys(&e, &ks);
-    var view = view_mod.View.init(&f.store, f.scratch.allocator(), &ks);
-    try machine.skipped.?(&view, &e, "repaired");
-    try view.commit();
-    try testing.expectEqual(calls_mod.State.over_budget, calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1").?.state);
+test "workflow runs machine: a repair skip leaves a call held over its callee's memory share or quota as it is; a held call is asked again, and a quota-held one never settles a step" {
+    inline for (.{ .{ ae.Answer.over_budget, calls_mod.State.over_budget }, .{ ae.Answer.over_quota, calls_mod.State.over_quota } }) |c| {
+        var f = Fixture.init();
+        defer f.deinit();
+        _ = try f.start("r1", "wf", "workflow_started", "", 1);
+        var cb: [ae.Call.max_size]u8 = undefined;
+        const call = try ae.Call.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .kind = .action, .caller_run = "r1", .caller_workflow = "wf", .step = "s", .target = "act", .version = "", .run = "a1", .input = "{}", .can_wait = false });
+        _ = try f.step("r1", .{ .rev = 0, .wait = .call, .wait_on = "a1", .call = call });
+        const slot = calls_mod.callerSlot(.default, "wf");
+        var rb: [ae.Reply.max_size]u8 = undefined;
+        const held = try ae.Reply.encodeInto(&rb, .{ .ns = NamespaceId.default.int(), .slot = slot, .run = "a1", .answer = c[0], .why = "held" });
+        _ = try f.answer(.call_reply, held);
+        try testing.expectEqual(c[1], calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1").?.state);
+        // A skip of a later answer to it: the hold stands, to be retried.
+        f.index += 1;
+        const e = entry_mod.buildEntry(.call_reply, entry_mod.Flags.NONE, 1, f.index, 0, held);
+        _ = f.scratch.reset(.retain_capacity);
+        var ks = view_mod.KeySet.init(f.scratch.allocator());
+        try machine.keys(&e, &ks);
+        var view = view_mod.View.init(&f.store, f.scratch.allocator(), &ks);
+        try machine.skipped.?(&view, &e, "repaired");
+        try view.commit();
+        try testing.expectEqual(c[1], calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1").?.state);
+        // A step can't take a quota-held call's end: it has none.
+        if (c[1] == .over_quota) {
+            const settle = try f.step("r1", .{ .rev = f.get("r1").?.rev, .settles = "a1" });
+            try testing.expectEqualStrings("conflict: the run's call hasn't ended", settle.refused().?.refusal.message);
+        }
+        // Asked again: sent, its start sent with it.
+        var crb: [ae.CallRetry.max_size]u8 = undefined;
+        _ = try f.answer(.step_call_retry, try ae.CallRetry.encodeInto(&crb, .{ .ns = NamespaceId.default.int(), .slot = slot, .run = "a1" }));
+        try testing.expectEqual(calls_mod.State.sent, calls_mod.callOf(.{ .store = &f.store }, .default, slot, "a1").?.state);
+    }
 }
 
 test "workflow runs machine: a step whose counters are past their bound is refused, writing nothing" {
@@ -2675,6 +2789,94 @@ fn lastReply(f: *Fixture) ?ae.Reply.Value {
         told = ae.Reply.decodeAll(item.value.v.payload, &diag) catch null;
     }
     return told;
+}
+
+test "workflow runs machine: at its namespace's quota a start is refused history_quota, raising nothing; the usage arm, the reserve arm, none, and the quota answered before memory" {
+    const settings = @import("../settings/machine.zig");
+    var f = Fixture.init();
+    defer f.deinit();
+    const read: ReadView = .{ .store = &f.store };
+    const each = reserveOf("wf", "r1");
+    // A part room for two runs' reserves and a little usage.
+    try hq.setForTest(&f.store, .default, 2 * each + 100, 100);
+    try testing.expect((try f.start("r1", "wf", "workflow_started", "", 1)).refused() == null);
+    try testing.expect((try f.start("r2", "wf", "workflow_started", "", 2)).refused() == null);
+    // A third would take the reserves past the part.
+    const third = try f.start("r3", "wf", "workflow_started", "", 3);
+    const rf = third.refused().?;
+    try testing.expectEqual(proto.StatusCode.limit, rf.status);
+    try testing.expectEqual(proto.Reason.history_quota, rf.refusal.reason);
+    try testing.expect(std.mem.startsWith(u8, rf.refusal.message, "limit: ns 1 history 100+"));
+    try testing.expect(f.get("r3") == null);
+    try testing.expectEqual(2 * each, hq.reservedOf(hq.WorkflowReserved, read, .default));
+    try testing.expectEqual(@as(u64, 1), f.store.quota_refusals);
+    // The usage at the part refuses even a run that starts ended.
+    try hq.setForTest(&f.store, .default, 1 << 40, 1 << 40);
+    var sb: [512]u8 = undefined;
+    var kb: [64]u8 = undefined;
+    const ended = (Start{ .workflow = "wf", .version = "1", .status = .completed, .event = "workflow_started", .idem = null, .trigger = null, .input = "" }).encode(&sb).?;
+    try testing.expectEqual(proto.Reason.history_quota, (try f.command(.workflow_start, view_mod.idKey(&kb, .default, "r4") catch unreachable, ended, 4)).refused().?.refusal.reason);
+    // Over both the quota and the shard's memory share: the quota answers.
+    try settings.bindForTest(&f.store, 1);
+    try testing.expectEqual(proto.Reason.history_quota, (try f.start("r5", "wf", "workflow_started", "", 5)).refused().?.refusal.reason);
+    try settings.bindForTest(&f.store, std.math.maxInt(u64));
+    // None admits whatever the usage.
+    try hq.setForTest(&f.store, .default, settings.NO_QUOTA, std.math.maxInt(u64));
+    try testing.expect((try f.start("r6", "wf", "workflow_started", "", 6)).refused() == null);
+    try testing.expectEqual(@as(u64, 0), f.store.quota_reserve_drift);
+}
+
+test "workflow runs machine: at its namespace's quota a signal is refused unless it wakes its run, which a held run needs to end" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    try testing.expect((try f.step("r1", .{ .rev = 0, .wait = .signal, .wait_on = "go" })).refused() == null);
+    try hq.setForTest(&f.store, .default, 1 << 20, 1 << 20);
+    var kb: [64]u8 = undefined;
+    const key = view_mod.idKey(&kb, .default, "r1") catch unreachable;
+    var sb: [128]u8 = undefined;
+    const other = try f.command(.workflow_signal, key, try Signal.encodeInto(&sb, .{ .type = "other", .payload = "" }), 5);
+    try testing.expectEqual(proto.Reason.history_quota, other.refused().?.refusal.reason);
+    try testing.expectEqual(@as(u64, 0), f.get("r1").?.sig_next);
+    // The one it waits on wakes it: admitted.
+    try testing.expect((try f.command(.workflow_signal, key, try Signal.encodeInto(&sb, .{ .type = "go", .payload = "" }), 6)).refused() == null);
+    try testing.expectEqual(Wait.none, f.get("r1").?.wait);
+}
+
+test "workflow runs machine: a start's verdict counts the action runs' reserve; a signal that doesn't wake is held to the usage arm alone" {
+    var f = Fixture.init();
+    defer f.deinit();
+    const each = reserveOf("wf", "r1");
+    // Room for one run, but the namespace's action runs reserve most of it.
+    try hq.setForTest(&f.store, .default, each + 100, 0);
+    try hq.setReservedForTest(hq.ActionReserved, &f.store, .default, 200);
+    try testing.expectEqual(proto.Reason.history_quota, (try f.start("r1", "wf", "workflow_started", "", 1)).refused().?.refusal.reason);
+    try hq.setReservedForTest(hq.ActionReserved, &f.store, .default, 0);
+    try testing.expect((try f.start("r1", "wf", "workflow_started", "", 2)).refused() == null);
+    // The reserves past the part, the usage under it: a signal still lands.
+    try hq.setReservedForTest(hq.ActionReserved, &f.store, .default, 1 << 30);
+    var kb: [64]u8 = undefined;
+    var sb: [128]u8 = undefined;
+    try testing.expect((try f.command(.workflow_signal, view_mod.idKey(&kb, .default, "r1") catch unreachable, try Signal.encodeInto(&sb, .{ .type = "other", .payload = "" }), 3)).refused() == null);
+}
+
+test "workflow runs machine: a child's start at its namespace's quota is answered over_quota, its parent's record gone and nothing reserved" {
+    var f = Fixture.init();
+    defer f.deinit();
+    var cb: [ae.ChildStart.max_size]u8 = undefined;
+    const cs = try ae.ChildStart.encodeInto(&cb, .{ .ns = NamespaceId.default.int(), .parent_slot = 7, .parent_run = "par", .parent_workflow = "pwf", .workflow = "kid", .version = "", .run = "kid1", .input = "{}" });
+    f.index += 1;
+    var e = entry_mod.buildEntry(.child_start, entry_mod.Flags.NONE, 1, f.index, 0, cs);
+    try testing.expect((try Fixture.run(&machine, &f, &e)).refused() == null);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "kid1") != null);
+    try hq.setForTest(&f.store, .default, 1 << 20, 1 << 20);
+    try testing.expect((try f.start("kid1", "kid", "child_started", "", 2)).refused() == null);
+    try testing.expect(f.get("kid1") == null);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "kid1") == null);
+    const told = lastReply(&f).?;
+    try testing.expectEqual(ae.Answer.over_quota, told.answer);
+    try testing.expect(std.mem.startsWith(u8, told.why.?, "limit: ns 1 history "));
+    try testing.expectEqual(@as(u64, 0), hq.reservedOf(hq.WorkflowReserved, .{ .store = &f.store }, .default));
 }
 
 test "workflow runs machine: past its shard's share a client's, a schedule's and a trigger's start are refused, writing nothing" {

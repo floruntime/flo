@@ -412,7 +412,7 @@ test "e2e/namespace: a read the leader answers in a namespace never created is r
 const QuotaInfo = struct {
     history_quota: ?u64,
     history_quota_own: bool,
-    shards: []const struct { shard: u16, bound: bool, part_bytes: ?u64, usage_bytes: u64 },
+    shards: []const struct { shard: u16, bound: bool, part_bytes: ?u64, usage_bytes: u64, reserved_workflow_bytes: u64 = 0, reserved_action_bytes: u64 = 0 },
 };
 
 fn quotaInfo(ctx: *stdx.testing.TestContext, name: []const u8) !std.json.Parsed(QuotaInfo) {
@@ -602,4 +602,227 @@ test "e2e/namespace: on three nodes, an alter through any member's admin socket,
         }
         try testing.expect(seen);
     }
+}
+
+/// The reserves info shows on shard `shard` of namespace `name`.
+fn reservesOn(ctx: *stdx.testing.TestContext, name: []const u8, shard: u16) !struct { workflow: u64, action: u64 } {
+    const info = try quotaInfo(ctx, name);
+    defer info.deinit();
+    for (info.value.shards) |s| if (s.shard == shard) return .{ .workflow = s.reserved_workflow_bytes, .action = s.reserved_action_bytes };
+    return error.NoSuchShard;
+}
+
+test "e2e/namespace: on 12 shards, in a namespace of its own and off shard 0, a start or invoke past its shard's part is refused at the quota, info shows the reserves, and an end's release admits the next" {
+    const shards = 12;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards } });
+    defer ctx.deinit();
+    const ns = "qa-ns";
+    try ctx.exec(&.{ "namespace", "create", ns });
+    // The floor: each shard's part one longest run's reserve, room for one
+    // workflow run or two default action runs at these names.
+    const floor: u64 = 214_905;
+    var qb: [32]u8 = undefined;
+    try ctx.exec(&.{ "namespace", "alter", ns, "--history-quota", try std.fmt.bufPrint(&qb, "{d}", .{floor * shards}), "--config", ctx.server.config_file });
+    try expectBound(ctx, ns, shards, floor);
+
+    const src = @import("src");
+    const router = src.node.router.Router.init(shards, 0);
+    const id = src.namespace_table.FIRST_ALLOCATED;
+    const shardOf = struct {
+        fn f(r: src.node.router.Router, ns_id: src.node.router.NamespaceId, name: []const u8) u16 {
+            return switch (r.route(src.node.router.routeNsKey(ns_id, name))) {
+                .local => 0,
+                .shard => |sh| sh.shard_id,
+            };
+        }
+    }.f;
+    // Workflows on shards other than 0, each on a shard of its own.
+    var used: [shards]bool = @splat(false);
+    var picked: usize = 0;
+    var i: usize = 0;
+    while (picked < 3) : (i += 1) {
+        var nb: [16]u8 = undefined;
+        const wf = try std.fmt.bufPrint(&nb, "qa-wf-{d}", .{i});
+        const at = shardOf(router, id, wf);
+        if (at == 0 or used[at]) continue;
+        used[at] = true;
+        picked += 1;
+        var def_buf: [512]u8 = undefined;
+        const def = try std.fmt.bufPrint(&def_buf,
+            \\kind: Workflow
+            \\name: {s}
+            \\version: 1.0.0
+            \\start.wait_for_signal.type: proceed
+            \\start.wait_for_signal.timeout_ms: 300000
+            \\start.transitions.success: flo.Completed
+            \\start.transitions.timeout: flo.Failed
+        , .{wf});
+        var file_buf: [32]u8 = undefined;
+        const path = try stdx.testing.writeDottedToTempYaml(testing.allocator, def, try std.fmt.bufPrint(&file_buf, "{s}.yaml", .{wf}));
+        defer stdx.testing.cleanupTempFile(testing.allocator, path);
+        try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", ns });
+        var r1: [16]u8 = undefined;
+        var r2: [16]u8 = undefined;
+        const first = try std.fmt.bufPrint(&r1, "qa-{d}-a", .{i});
+        const second = try std.fmt.bufPrint(&r2, "qa-{d}-b", .{i});
+        try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", first, "-n", ns });
+        // Its reserve is on its workflow's shard, and nowhere else.
+        const held = try reservesOn(ctx, ns, at);
+        try testing.expect(held.workflow > 0 and held.workflow < floor);
+        try testing.expectEqual(@as(u64, 0), (try reservesOn(ctx, ns, 0)).workflow);
+        // A second would take the reserves past the part.
+        var refused = try ctx.cli.run(&.{ "workflow", "start", wf, "{}", "--run-id", second, "-n", ns });
+        defer refused.deinit();
+        if (!refused.contains("[limit/history_quota]")) std.debug.print("{s}{s}\n", .{ refused.stdout, refused.stderr });
+        try testing.expect(refused.contains("[limit/history_quota]"));
+        try testing.expect(refused.contains("limit: ns "));
+        var gone = try ctx.cli.run(&.{ "workflow", "status", second, "-n", ns });
+        defer gone.deinit();
+        try testing.expect(gone.contains("not found"));
+        // The first's end releases its reserve: the second starts.
+        try ctx.exec(&.{ "workflow", "cancel", first, "-n", ns });
+        try testing.expectEqual(@as(u64, 0), (try reservesOn(ctx, ns, at)).workflow);
+        try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", second, "-n", ns });
+        try testing.expectEqual(held.workflow, (try reservesOn(ctx, ns, at)).workflow);
+    }
+
+    // An action off shard 0: two default runs fit its part, a third doesn't.
+    var an: [16]u8 = undefined;
+    var j: usize = 0;
+    const act = while (true) : (j += 1) {
+        const name = try std.fmt.bufPrint(&an, "qa-act-{d}", .{j});
+        if (shardOf(router, id, name) != 0) break name;
+    };
+    const act_at = shardOf(router, id, act);
+    try ctx.exec(&.{ "action", "register", act, "-n", ns });
+    try ctx.exec(&.{ "action", "invoke", act, "{}", "-n", ns });
+    try ctx.exec(&.{ "action", "invoke", act, "{}", "-n", ns });
+    const two = (try reservesOn(ctx, ns, act_at)).action;
+    try testing.expect(two > floor / 2 and two <= floor);
+    var third = try ctx.cli.run(&.{ "action", "invoke", act, "{}", "-n", ns });
+    defer third.deinit();
+    if (!third.contains("[limit/history_quota]")) std.debug.print("{s}{s}\n", .{ third.stdout, third.stderr });
+    try testing.expect(third.contains("[limit/history_quota]"));
+    try testing.expectEqual(two, (try reservesOn(ctx, ns, act_at)).action);
+    // None turns it off: the third goes in.
+    try ctx.exec(&.{ "namespace", "alter", ns, "--history-quota", "none", "--config", ctx.server.config_file });
+    try expectBound(ctx, ns, shards, null);
+    var after = try ctx.cli.run(&.{ "action", "invoke", act, "{}", "-n", ns });
+    defer after.deinit();
+    try testing.expect(!after.contains("[limit/"));
+    try testing.expect((try reservesOn(ctx, ns, act_at)).action > two);
+}
+
+/// The 12-shard router's shard for `name` in the first namespace created.
+fn shardIn(name: []const u8) u16 {
+    const src = @import("src");
+    const router = src.node.router.Router.init(12, 0);
+    return switch (router.route(src.node.router.routeNsKey(src.namespace_table.FIRST_ALLOCATED, name))) {
+        .local => 0,
+        .shard => |sh| sh.shard_id,
+    };
+}
+
+/// The first `prefix`-N whose shard isn't 0 nor in `not`.
+fn nameOff(buf: []u8, prefix: []const u8, not: []const u16) ![]const u8 {
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const name = try std.fmt.bufPrint(buf, "{s}{d}", .{ prefix, i });
+        const at = shardIn(name);
+        if (at == 0) continue;
+        for (not) |n| {
+            if (n == at) break;
+        } else return name;
+    }
+}
+
+/// Polls `run`'s history in `ns` until it shows `what`.
+fn historyShows(ctx: *stdx.testing.TestContext, ns: []const u8, run: []const u8, what: []const u8) !bool {
+    for (0..300) |_| {
+        var h = try ctx.cli.run(&.{ "workflow", "history", run, "-n", ns });
+        defer h.deinit();
+        if (std.mem.indexOf(u8, h.stdout, what) != null) return true;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+test "e2e/namespace: on 12 shards, in a namespace of its own, a call and a child whose targets are on other shards wait over_quota, saying why, and go on once the quota is lifted" {
+    const shards = 12;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards } });
+    defer ctx.deinit();
+    const ns = "qc-ns";
+    try ctx.exec(&.{ "namespace", "create", ns });
+    const floor: u64 = 214_905;
+    var qb: [32]u8 = undefined;
+    try ctx.exec(&.{ "namespace", "alter", ns, "--history-quota", try std.fmt.bufPrint(&qb, "{d}", .{floor * shards}), "--config", ctx.server.config_file });
+    try expectBound(ctx, ns, shards, floor);
+
+    // An action, a child workflow, and the two parents that call them, each
+    // parent on a shard other than its target's, none on shard 0.
+    var ab: [16]u8 = undefined;
+    const act = try nameOff(&ab, "qc-act-", &.{});
+    var kb: [16]u8 = undefined;
+    const kid = try nameOff(&kb, "qc-kid-", &.{});
+    var cb: [16]u8 = undefined;
+    // Both targets' parts are filled below: the parents avoid both.
+    const caller = try nameOff(&cb, "qc-caller-", &.{ shardIn(act), shardIn(kid) });
+    var pb: [16]u8 = undefined;
+    const parent = try nameOff(&pb, "qc-par-", &.{ shardIn(act), shardIn(kid), shardIn(caller) });
+    try ctx.exec(&.{ "action", "register", act, "-n", ns });
+    var y: [4][512]u8 = undefined;
+    const defs = [_][]const u8{
+        try std.fmt.bufPrint(&y[0], "kind: Workflow\nname: {s}\nversion: 1.0.0\nstart:\n  wait_for_signal:\n    type: go\n    timeout_ms: 300000\n  transitions:\n    success: flo.Completed\n    timeout: flo.Completed\n", .{kid}),
+        try std.fmt.bufPrint(&y[1], "kind: Workflow\nname: {s}\nversion: 1.0.0\nstart:\n  wait_for_signal:\n    type: go\n  transitions:\n    success: call\nsteps:\n  call:\n    run: \"@actions/{s}\"\n    transitions:\n      success: flo.Completed\n      failure: flo.Failed\n", .{ caller, act }),
+        try std.fmt.bufPrint(&y[2], "kind: Workflow\nname: {s}\nversion: 1.0.0\nstart:\n  wait_for_signal:\n    type: go\n  transitions:\n    success: call\nsteps:\n  call:\n    run: \"@workflow/{s}\"\n    transitions:\n      success: flo.Completed\n      failure: flo.Failed\n", .{ parent, kid }),
+    };
+    for (defs, 0..) |d, i| {
+        var fb: [32]u8 = undefined;
+        const path = try stdx.testing.writeTempYaml(testing.allocator, d, try std.fmt.bufPrint(&fb, "qc-def-{d}.yaml", .{i}));
+        defer stdx.testing.cleanupTempFile(testing.allocator, path);
+        try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", ns });
+    }
+    // Fill the targets' parts: two action runs, one child run.
+    try ctx.exec(&.{ "action", "invoke", act, "{}", "-n", ns });
+    try ctx.exec(&.{ "action", "invoke", act, "{}", "-n", ns });
+    try ctx.exec(&.{ "workflow", "start", kid, "{}", "--run-id", "qc-kid-fill", "-n", ns });
+    const acts = (try reservesOn(ctx, ns, shardIn(act))).action;
+    const kids = (try reservesOn(ctx, ns, shardIn(kid))).workflow;
+    try ctx.exec(&.{ "workflow", "start", caller, "{}", "--run-id", "qc-call-1", "-n", ns });
+    try ctx.exec(&.{ "workflow", "start", parent, "{}", "--run-id", "qc-par-1", "-n", ns });
+    try ctx.exec(&.{ "workflow", "signal", "qc-call-1", "--type", "go", "-n", ns });
+    try ctx.exec(&.{ "workflow", "signal", "qc-par-1", "--type", "go", "-n", ns });
+    // Both wait, said once, with the target's figures.
+    for ([_][]const u8{ "qc-call-1", "qc-par-1" }) |run| {
+        if (!try historyShows(ctx, ns, run, "call_held_over_quota")) return error.NotHeld;
+        var h = try ctx.cli.run(&.{ "workflow", "history", run, "-n", ns });
+        defer h.deinit();
+        try testing.expect(std.mem.indexOf(u8, h.stdout, "limit: ns ") != null);
+        var st = try ctx.cli.run(&.{ "workflow", "status", run, "-n", ns });
+        defer st.deinit();
+        try testing.expect(!st.contains("failed"));
+    }
+    // Lifted: asked again on their backoff, the call starts its run and the
+    // child runs.
+    try ctx.exec(&.{ "namespace", "alter", ns, "--history-quota", "none", "--config", ctx.server.config_file });
+    try expectBound(ctx, ns, shards, null);
+    var started = false;
+    for (0..300) |_| {
+        if ((try reservesOn(ctx, ns, shardIn(act))).action > acts) {
+            started = true;
+            break;
+        }
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expect(started);
+    // The child's run, on its own shard.
+    started = false;
+    for (0..300) |_| {
+        if ((try reservesOn(ctx, ns, shardIn(kid))).workflow > kids) {
+            started = true;
+            break;
+        }
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expect(started);
 }

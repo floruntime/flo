@@ -719,8 +719,8 @@ pub const Actions = struct {
     /// which sends its history to itself.
     landed: history_lane.Landed = .{},
 
-    pub const FAMILIES = [_]u16{ action_machine.Defs.ID, action_machine.Runs.ID, action_machine.Ready.ID, action_machine.Deadlines.ID, action_machine.Requests.ID, hm.Actions.ID, action_machine.RunAt.ID, action_machine.Counts.ID, hm.UsageFam.ID };
-    pub const NAMES = [_][]const u8{ "action.def", "action.run", "action.ready", "action.deadline", "action.request", "history.act", "action.run_at", "action.counts", "history.usage" };
+    pub const FAMILIES = [_]u16{ action_machine.Defs.ID, action_machine.Runs.ID, action_machine.Ready.ID, action_machine.Deadlines.ID, action_machine.Requests.ID, hm.Actions.ID, action_machine.RunAt.ID, action_machine.Counts.ID, hm.UsageFam.ID, @import("../budget/history_quota.zig").ActionReserved.ID };
+    pub const NAMES = [_][]const u8{ "action.def", "action.run", "action.ready", "action.deadline", "action.request", "history.act", "action.run_at", "action.counts", "history.usage", "action.reserved" };
     const PLACE: view_mod.Place = .{ .group = 0, .count = 1 };
 
     pub const Kind = enum { register, delete, invoke, deliver, settle, release, extend, expire, run_delete };
@@ -867,6 +867,14 @@ pub const Actions = struct {
         };
         // Held across the apply, so copied out of the store.
         if (def_before) |*d| d.owner = try ba.dupe(u8, d.owner);
+        // Whether an invoke of a registered action is past its namespace's
+        // quota, as it stood: its own reserve on the committed usage and
+        // reserves, against the part bound.
+        const quota_over: bool = if (kind == .invoke) if (def_before) |d| blk: {
+            const p = ae.Invoke.decodeAll(e.payload, &diag) catch return error.Halt;
+            const own = @import("../budget/history_reserve.zig").action(p.action.len, p.run.len, d.max_attempts, 0, 0, 0, false);
+            break :blk @import("../budget/history_quota.zig").preCheck(self.read(), .of(p.ns), own) != null;
+        } else false else false;
 
         const applied = try self.rewritten(e, r);
         var out: persistence.Result = .{};
@@ -876,10 +884,15 @@ pub const Actions = struct {
         try machine_mod.applyEntry(&action_machine.machine, &self.store, &self.scratch, &applied, &out);
         if (out.refused() != null) {
             if (!std.mem.eql(u64, &before, &self.commits()) or all_before != self.allCommits()) return error.RefusalChangedState;
-            const memory = out.refused().?.refusal.reason == .memory_budget;
+            const reason = out.refused().?.refusal.reason;
+            if (reason == .history_quota) return .{ .kind = kind, .refused = true, .broke = if (quota_over) null else "an invoke was refused at its namespace's quota with room for its reserve" };
+            const memory = reason == .memory_budget;
+            // The quota is judged before memory: one over both answers it.
+            if (quota_over and memory) return .{ .kind = kind, .refused = true, .broke = "an invoke past its namespace's quota was refused for memory" };
             return .{ .kind = kind, .refused = true, .broke = if (memory) null else refusedWrongly(e, stamp, touched.items, def_before) };
         }
         var effect: Effect = .{ .kind = kind, .refused = false };
+        if (quota_over) effect.broke = "an invoke was admitted past its namespace's quota";
         // A settle's resend, or one a run already ended names, changes
         // nothing at all: no row, and no send.
         if (kind == .settle) if (touched.items[0].before) |pre| if (pre.completed_ns != 0 and all_before != self.allCommits()) {
@@ -1277,7 +1290,8 @@ pub const Actions = struct {
         defer arena.deinit();
         if (hm.ruleOf(hm.Actions, self.read(), arena.allocator()) catch return "the history rows could not be read") |why| return why;
         if (self.store.history_usage_drift != 0) return "a history usage subtract went past zero";
-        return hm.usageRule(self.read(), arena.allocator()) catch "the history rows could not be read";
+        if (hm.usageRule(self.read(), arena.allocator()) catch return "the history rows could not be read") |why| return why;
+        return action_machine.reserveRule(&self.store, arena.allocator()) catch "the runs could not be read";
     }
 
     /// Every request record names its run's live delivery. Walks the
@@ -1389,6 +1403,14 @@ pub const Actions = struct {
     }
 };
 
+/// A quota bind applied to a family's store, as the settings machine
+/// applies it on a shard: each family's store stands for the shard's one.
+pub fn applyQuotaBind(store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, e: *const entry_mod.Entry) persistence.ApplyError!void {
+    var out: persistence.Result = .{};
+    out.reset(e);
+    try machine_mod.applyEntry(&@import("../settings/machine.zig").machine, store, scratch, e, &out);
+}
+
 pub const Queues = @import("queue_family.zig").Queues;
 pub const Jobs = @import("processing_family.zig").Jobs;
 
@@ -1472,6 +1494,17 @@ pub const Namespaces = struct {
         return .{ .store = self.handler.store };
     }
 
+    /// Apply an alter as shard 0 does, then publish what the store holds to
+    /// this replica's table, as its settle would once on disk: the leader's
+    /// quota walk reads the table. A refused alter (a namespace not there)
+    /// changes nothing. An error is one a workload alter must never meet.
+    pub fn applyAlter(self: *Namespaces, e: *const entry_mod.Entry) persistence.ApplyError!void {
+        var out: persistence.Result = .{};
+        out.reset(e);
+        try self.handler.applyCommitted(e, &out);
+        try self.handler.publishAll();
+    }
+
     /// Rewrite `name`'s id, or the live count, in the store.
     fn rewrite(self: *Namespaces, name: ?[]const u8, id: u32, live: ?u32) persistence.ApplyError!void {
         const st = self.handler.store;
@@ -1519,6 +1552,13 @@ pub const Namespaces = struct {
             hasher.update(rec.key);
             const m = rec.value.v;
             hasher.update(std.mem.asBytes(&[3]u64{ m.id, m.created_at_ns, m.created_index }));
+        }
+        // Each namespace's quota setting, and the index that set it.
+        var qit = self.read().range(ns_machine.SettingsFam, ns_machine.NAME_PREFIX);
+        while (qit.next() catch unreachable) |rec| {
+            hasher.update(rec.key);
+            const q = rec.value.v;
+            hasher.update(std.mem.asBytes(&[3]u64{ @backingInt(q.mode), q.bytes, q.set_index }));
         }
         return hasher.final();
     }

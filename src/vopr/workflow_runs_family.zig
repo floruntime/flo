@@ -58,6 +58,7 @@ const schema = @import("../protocol/schema.zig");
 const ae = @import("../protocol/action_entries.zig");
 const router = @import("../node/router.zig");
 const rm = @import("../workflow/runs_machine.zig");
+const hq = @import("../budget/history_quota.zig");
 const calls_mod = @import("../actions/calls_machine.zig");
 const hm = @import("../stream/history_machine.zig");
 const he = @import("../protocol/history_entries.zig");
@@ -350,8 +351,8 @@ pub const WorkflowRuns = struct {
     const GONE = 32;
     pub const GoneL = struct { wf: usize, run: usize, idem: ?usize, created_ns: u64, completed_ms: i64, orphaned: bool };
 
-    pub const FAMILIES = [_]u16{ rm.RunFam.ID, hm.Workflows.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID, calls_mod.Calls.ID, rm.SigFam.ID, rm.RunAtFam.ID, rm.RunAllFam.ID, hm.UsageFam.ID };
-    pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "history.wf", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents", "step.calls", "workflow.sig", "workflow.run_at", "workflow.run_all", "history.usage" };
+    pub const FAMILIES = [_]u16{ rm.RunFam.ID, hm.Workflows.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID, calls_mod.Calls.ID, rm.SigFam.ID, rm.RunAtFam.ID, rm.RunAllFam.ID, hm.UsageFam.ID, @import("../budget/history_quota.zig").WorkflowReserved.ID };
+    pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "history.wf", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents", "step.calls", "workflow.sig", "workflow.run_at", "workflow.run_all", "history.usage", "workflow.reserved" };
 
     pub const Kind = enum { start, step, complete, child_start, child_refuse, reply, done, retry, clear, signal, delete };
 
@@ -528,7 +529,7 @@ pub const WorkflowRuns = struct {
                 const r = indexOf(&RUNS, p.run) orelse return null;
                 const f = l.parents[r] orelse return want;
                 if (f.started) return want;
-                want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[f.slot], .run = RUNS[r], .answer = p.answer };
+                want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[f.slot], .run = RUNS[r], .answer = p.answer, .why = p.why };
                 l.parents[r] = null;
             },
             .reply, .done, .retry, .clear => return self.predictCall(e, kind),
@@ -584,7 +585,7 @@ pub const WorkflowRuns = struct {
                             if (st.caller_slot != slotOf(NAMES[run.wf])) return null;
                             const c = indexOf(&CALLEES, st.settles) orelse return null;
                             if (l.calls[so][c]) |call| switch (call.state) {
-                                .sent, .started => return refuse(.step, "it takes its run's call's end before the call has one"),
+                                .sent, .started, .over_quota => return refuse(.step, "it takes its run's call's end before the call has one"),
                                 .done, .refused, .no_action, .over_budget => {},
                             };
                             settled = c;
@@ -712,6 +713,18 @@ pub const WorkflowRuns = struct {
                             }
                             if (ev != TRIGGER) return refuse(.start, "its workflow is disabled");
                         }
+                        // Past its namespace's quota, judged before memory:
+                        // nothing of it lands, and a child's parent is
+                        // answered over_quota. One that starts ended
+                        // reserves nothing of its own.
+                        const own = if (s.status.isTerminal()) 0 else rm.reserveOf(s.workflow, RUNS[r]);
+                        if (hq.preCheck(.{ .store = store }, NS, own) != null) {
+                            if (ev != CHILD) return refuse(.start, "past its namespace's quota");
+                            const f = l.parents[r].?;
+                            want.sends[0] = .{ .entry_type = .call_reply, .to = PARENT_SLOTS[f.slot], .run = RUNS[r], .answer = .over_quota };
+                            l.parents[r] = null;
+                            return want;
+                        }
                         // Past the share the shard committed to, what it
                         // writes but its sends: nothing of it lands, and a
                         // child's parent is answered over_budget.
@@ -773,6 +786,9 @@ pub const WorkflowRuns = struct {
                         // writes but its sends: refused, unless it wakes its
                         // run and the slack holds it.
                         const wakes = run.wait.wait == .signal and std.mem.eql(u8, run.wait.on, SIG_TYPES[ty]);
+                        // At its namespace's quota's usage, one that doesn't
+                        // wake its run is refused, before memory.
+                        if (!wakes and hq.atUsage(.{ .store = store }, NS)) return refuse(.signal, "at its namespace's quota");
                         if (settings.boundShare(.{ .store = store })) |b| {
                             const add = memory_gate.wouldAddData(&rm.machine, store, e) orelse return null;
                             const use = pool.useOf(store);
@@ -885,9 +901,10 @@ pub const WorkflowRuns = struct {
                     .started => .started,
                     .no_action => .no_action,
                     .over_budget => .over_budget,
+                    .over_quota => .over_quota,
                     else => .refused,
                 };
-                if (c.state == .over_budget) want.classes.insert(.call_held);
+                if (c.state == .over_budget or c.state == .over_quota) want.classes.insert(.call_held);
                 if (p.why) |w| c.outcome = static(&WHYS, w) orelse return null;
             },
             .done => {
@@ -900,8 +917,8 @@ pub const WorkflowRuns = struct {
                 c.result = if (p.result.len == 0) "" else static(&RESULTS, p.result) orelse return null;
             },
             .retry => {
-                if (c.state != .no_action and c.state != .over_budget) return want;
-                if (c.state == .over_budget) want.classes.insert(.held_call_retried);
+                if (c.state != .no_action and c.state != .over_budget and c.state != .over_quota) return want;
+                if (c.state == .over_budget or c.state == .over_quota) want.classes.insert(.held_call_retried);
                 c.state = .sent;
                 c.attempts += 1;
                 want.sends[0] = startOf(c.*, at.at.?.c);
@@ -1084,6 +1101,7 @@ pub const WorkflowRuns = struct {
         if (!sweep) return if (touched) |t| self.runRule(store, a, t, true) else null;
         if (store.history_usage_drift != 0) return "a history usage subtract went past zero";
         if (try hm.usageRule(rv, a)) |why| return why;
+        if (try rm.reserveRule(store, a)) |why| return why;
         // On the store alone: counts, idempotency keys naming their run, and
         // a run's wait agreeing with its status.
         var active: [NAMES.len]u32 = @splat(0);
@@ -1372,7 +1390,7 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
     }
     if (roll < 17) {
         const answers = [_]ae.Answer{ .no_action, .conflict };
-        const p = ae.ChildRefuse.encodeInto(buf, .{ .ns = NS.int(), .run = RUNS[pending.or_(r, 70, any)], .answer = answers[r.uintLessThan(usize, answers.len)] }) catch return null;
+        const p = ae.ChildRefuse.encodeInto(buf, .{ .ns = NS.int(), .run = RUNS[pending.or_(r, 70, any)], .answer = answers[r.uintLessThan(usize, answers.len)], .why = null }) catch return null;
         return .{ .entry_type = .child_refuse, .payload = p };
     }
     // A step of a run the leader holds, at its rev, or now and then a rev
@@ -1499,7 +1517,7 @@ fn callAnswer(r: std.Random, buf: []u8, l: *const WorkflowRuns.Ledger) ?Made {
     for (l.calls, 0..) |row, so| for (row, 0..) |x, c| if (x) |call| {
         calls[n] = .{ .so = so, .c = c };
         n += 1;
-        if (call.state == .no_action or call.state == .over_budget) {
+        if (call.state == .no_action or call.state == .over_budget or call.state == .over_quota) {
             no_action[na] = .{ .so = so, .c = c };
             na += 1;
         }
@@ -1512,7 +1530,7 @@ fn callAnswer(r: std.Random, buf: []u8, l: *const WorkflowRuns.Ledger) ?Made {
     const slot = slotOf(NAMES[at.so]);
     const run = CALLEES[at.c];
     if (k < 35) {
-        const answers = [_]ae.Answer{ .started, .started, .started, .no_action, .no_action, .over_budget, .conflict, .refused, .skipped };
+        const answers = [_]ae.Answer{ .started, .started, .started, .no_action, .no_action, .over_budget, .over_quota, .conflict, .refused, .skipped };
         // A moved answer is refused: nothing sends one until slots move.
         const answer: ae.Answer = if (r.uintLessThan(u8, 100) < 3) .moved else answers[r.uintLessThan(usize, answers.len)];
         const why: ?[]const u8 = if (r.uintLessThan(u8, 100) < 30) WHYS[0] else null;
