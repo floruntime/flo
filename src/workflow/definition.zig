@@ -29,10 +29,10 @@
 //!   payment:
 //!     selection: health-weighted
 //!     executors:
-//!       - action: "@actions/stripe-charge"
-//!         priority: 1
-//!       - action: "@actions/paypal-charge"
-//!         priority: 2
+//!       - name: stripe
+//!         run: "@actions/stripe-charge"
+//!       - name: paypal
+//!         run: "@actions/paypal-charge"
 //!
 //! start:
 //!   run: "@actions/validate-order"

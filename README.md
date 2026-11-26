@@ -376,11 +376,9 @@ plans:
     executors:
       - name: stripe
         run: "@actions/charge-stripe"
-        priority: 100
         breaker: { failure_threshold: 5, cooldown_ms: 60000 }
       - name: braintree
         run: "@actions/charge-braintree"
-        priority: 90
 
 start:
   run: "@actions/validate-order"
@@ -401,12 +399,11 @@ steps:
       success: flo.Completed
 
   manual_review:
-    run: flo.WaitForSignal
-    signal: manager_approval
-    timeout: 24h
+    wait_for_signal:
+      type: manager_approval
+      timeout_ms: 86400000
     transitions:
-      approved: charge
-      rejected: flo.Failed
+      success: charge
       timeout: flo.Failed
 ```
 

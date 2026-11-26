@@ -122,15 +122,6 @@ fn optAtLeast(d: D, obj: JsonValue, key: []const u8, min: i64) ParseError!?i64 {
     return v;
 }
 
-fn optFloat(d: D, obj: JsonValue, key: []const u8) ParseError!?f64 {
-    const v = obj.object.get(key) orelse return null;
-    return switch (v) {
-        .float => v.float,
-        .integer => @floatFromInt(v.integer),
-        else => wrongKind(d, key, "a number", v),
-    };
-}
-
 fn optBool(d: D, obj: JsonValue, key: []const u8) ParseError!?bool {
     const v = obj.object.get(key) orelse return null;
     return if (v == .bool) v.bool else wrongKind(d, key, "true or false", v);
@@ -342,7 +333,6 @@ fn parseSearchAttributes(allocator: Allocator, root: JsonValue, d: D) ParseError
 ///     executors:
 ///       - name: stripe
 ///         run: "@actions/stripe-charge"
-///         priority: 1
 fn parseInlinePlans(allocator: Allocator, root: JsonValue, d: D) ParseError![]InlinePlan {
     const plans_obj = try optObject(d, root, "plans") orelse return allocator.alloc(InlinePlan, 0) catch ParseError.OutOfMemory;
     const plans_mark = d.push("plans");
@@ -654,7 +644,12 @@ fn parseRetryPolicy(obj: JsonValue, d: D) ParseError!RetryPolicy {
             return d.fail(ParseError.UnknownKey, "\"retry\" takes no \"{s}\": a retry runs at once after a failure, and delays between retries aren't supported yet (a step's \"poll\" keeps its delays)", .{key});
     }
     try checkKeys(d, obj, &.{"max_attempts"});
-    return .{ .max_attempts = try optIntAs(u32, d, obj, "max_attempts") orelse 3 };
+    const retries = try optIntAs(u32, d, obj, "max_attempts") orelse 3;
+    // Retries run back to back, each a fresh action run, so the count is all
+    // that bounds them.
+    if (retries > plan_types.MAX_RETRIES)
+        return d.fail(ParseError.InvalidFieldType, "\"max_attempts\" is the retries after a failed run, at most {d}, not {d}: they run at once, with no delay", .{ plan_types.MAX_RETRIES, retries });
+    return .{ .max_attempts = retries };
 }
 
 fn parsePollConfig(obj: JsonValue, d: D) ParseError!definition.PollConfig {
@@ -671,29 +666,6 @@ fn parsePollConfig(obj: JsonValue, d: D) ParseError!definition.PollConfig {
 // =============================================================================
 // Plan Parsers
 // =============================================================================
-
-fn parseStringList(allocator: Allocator, d: D, obj: JsonValue, key: []const u8, list: *std.ArrayList([]const u8)) ParseError!void {
-    const arr = try optArray(d, obj, key) orelse return;
-    const mark = d.push(key);
-    defer d.pop(mark);
-    for (arr, 0..) |item, i| {
-        if (item != .string) {
-            const im = d.pushIndex(i);
-            defer d.pop(im);
-            return d.fail(ParseError.InvalidFieldType, "must be a string, not {s}", .{kindName(item)});
-        }
-        const s = try dupe(allocator, item.string);
-        list.append(allocator, s) catch {
-            allocator.free(s);
-            return ParseError.OutOfMemory;
-        };
-    }
-}
-
-fn freeStringList(allocator: Allocator, list: *std.ArrayList([]const u8)) void {
-    for (list.items) |s| allocator.free(s);
-    list.deinit(allocator);
-}
 
 fn parseExecutors(allocator: Allocator, root: JsonValue, d: D) ParseError![]ExecutorConfig {
     const arr = try optArray(d, root, "executors") orelse return missing(d, "executors");
@@ -1131,6 +1103,27 @@ test "parseWorkflow: a retry delay is refused by name, on a step and on an execu
     try expectRefused(wrap("",
         \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "retry": { "max_attempts": 2, "initial_delay_ms": 10 } } ] } },
     ), ParseError.UnknownKey, "\"retry\" takes no \"initial_delay_ms\": " ++ msg ++ " at plans.p.executors[0].retry");
+}
+
+test "parseWorkflow: a retry count past MAX_RETRIES is refused, on a step and on an executor" {
+    const msg = "\"max_attempts\" is the retries after a failed run, at most 100, not 101: they run at once, with no delay";
+    try expectRefused(wrap("\"retry\": { \"max_attempts\": 101 },", ""), ParseError.InvalidFieldType, msg ++ " at start.retry");
+    try expectRefused(wrap("",
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "retry": { "max_attempts": 101 } } ] } },
+    ), ParseError.InvalidFieldType, msg ++ " at plans.p.executors[0].retry");
+    var def = try parseWorkflow(std.testing.allocator, wrap("\"retry\": { \"max_attempts\": 100 },", ""), null);
+    def.deinit(std.testing.allocator);
+}
+
+test "parseWorkflow: a breaker given only a threshold cools down for the default 60 s" {
+    var def = try parseWorkflow(std.testing.allocator, wrap("",
+        \\"plans": { "p": { "selection": "health-weighted", "executors": [ { "name": "e", "run": "@actions/e", "breaker": { "failure_threshold": 3 } } ] } },
+    ), null);
+    defer def.deinit(std.testing.allocator);
+    const b = def.plans[0].executors[0].breaker.?;
+    try std.testing.expectEqual(@as(u32, 3), b.failure_threshold);
+    try std.testing.expectEqual(@as(i64, 60000), b.cooldown_ms);
+    try std.testing.expectEqual(@as(i64, 60000), (plan_types.CircuitBreakerConfig{}).cooldown_ms);
 }
 
 test "parseWorkflow: an unknown enum value is refused, not defaulted" {

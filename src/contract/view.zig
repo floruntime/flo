@@ -247,7 +247,7 @@ pub const Message = struct {
     slot: u16 = 0,
 };
 
-pub const Mark = struct { ops: usize, sends: usize, late: [8]u64 };
+pub const Mark = struct { ops: usize, sends: usize, late: [8]u64, drift: u64 };
 
 pub const View = struct {
     store: *Store,
@@ -265,6 +265,10 @@ pub const View = struct {
     /// (`Store.ts_late_points`): added to the store's count only at commit,
     /// so a refused entry or rolled-back message counts none.
     ts_late_points: [8]u64 = @splat(0),
+    /// History usage subtracts past zero this entry made
+    /// (`Store.history_usage_drift`), counted at commit as the late points
+    /// are.
+    history_usage_drift: u64 = 0,
     /// Where the range deletes are in `ops`, in order: an entry makes few.
     ranges: std.ArrayListUnmanaged(usize) = .empty,
     /// Fail on an undeclared key rather than count it (`Store.strict_keys`).
@@ -315,7 +319,7 @@ pub const View = struct {
 
     /// A point `rollback` returns the staged writes and sends to.
     pub fn mark(self: *const View) Mark {
-        return .{ .ops = self.ops.items.len, .sends = self.sends.items.len, .late = self.ts_late_points };
+        return .{ .ops = self.ops.items.len, .sends = self.sends.items.len, .late = self.ts_late_points, .drift = self.history_usage_drift };
     }
 
     /// Drops what was staged after `m`: a refused message inside a batch
@@ -325,6 +329,7 @@ pub const View = struct {
         self.ops.shrinkRetainingCapacity(m.ops);
         self.sends.shrinkRetainingCapacity(m.sends);
         self.ts_late_points = m.late;
+        self.history_usage_drift = m.drift;
         // A range delete staged after the mark goes with it: left in, it
         // would still hide keys from later reads and unlink them at commit.
         while (self.ranges.items.len > 0 and self.ranges.items[self.ranges.items.len - 1] >= m.ops) _ = self.ranges.pop();
@@ -557,6 +562,7 @@ pub const View = struct {
         }
         for (plan.items) |*s| self.apply(s, &moved);
         for (&self.store.ts_late_points, self.ts_late_points) |*n, d| n.* += d;
+        self.store.history_usage_drift += self.history_usage_drift;
     }
 
     /// At least what committing would add to the families in `fams`, each
@@ -564,7 +570,7 @@ pub const View = struct {
     /// staged writes alone: every put counted whole, nothing freed. O(ops),
     /// with no lookup.
     pub fn stagedBound(self: *const View, fams: *const store_mod.FamilySet, per_record: u64) u64 {
-        return self.stagedBoundSince(.{ .ops = 0, .sends = 0, .late = @splat(0) }, fams, per_record);
+        return self.stagedBoundSince(.{ .ops = 0, .sends = 0, .late = @splat(0), .drift = 0 }, fams, per_record);
     }
 
     /// `stagedBound`, of the writes staged since `mark` alone.

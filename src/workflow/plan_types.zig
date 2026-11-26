@@ -21,7 +21,7 @@ pub const RunStatus = types.RunStatus;
 
 /// Strategy for selecting executors in a plan
 pub const SelectionStrategy = enum(u8) {
-    /// Always try in definition order (by priority)
+    /// Always try in the order the executors are written
     static_order = 0,
     /// Rotate starting executor across requests
     round_robin = 1,
@@ -79,9 +79,9 @@ pub const CircuitBreakerState = enum(u8) {
 pub const CircuitBreakerConfig = struct {
     /// Number of consecutive failures before opening
     failure_threshold: u32 = 5,
-    /// How long to stay open before half-open (ms); half-open takes the next
-    /// call as its probe.
-    cooldown_ms: i64 = 30000,
+    /// How long to stay open before half-open (ms). Half-open lets every
+    /// call through until one's result closes the breaker or opens it again.
+    cooldown_ms: i64 = 60000,
 };
 
 // =============================================================================
@@ -118,9 +118,17 @@ pub const BackoffType = enum(u8) {
     }
 };
 
-/// Retry policy for executor attempts. A retry runs at once after a failure.
+/// Most retries a step or an executor may set. A retry runs at once after a
+/// failure, and each is a fresh action run with up to 1000 attempts of its
+/// own, so one step's worst case is 101 runs of 1000 attempts, ~100k
+/// deliveries, with nothing between them.
+pub const MAX_RETRIES: u32 = 100;
+
+/// Retry policy for a step or an executor. A retry runs at once after a
+/// failure.
 pub const RetryPolicy = struct {
-    /// Maximum number of attempts
+    /// Retries after the first run fails, so up to `max_attempts + 1` runs
+    /// (the name is the definition's key).
     max_attempts: u32 = 3,
 };
 
@@ -192,8 +200,7 @@ pub const IdempotencyMode = enum(u8) {
 // Executor Health (Runtime State)
 // =============================================================================
 
-/// Runtime health metrics for an executor
-/// Stored at: _wf:health:{namespace}:{plan}:{executor}
+/// Runtime health metrics for an executor, kept in the leader's memory
 pub const ExecutorHealth = struct {
     /// Executor name
     executor_name: []const u8,
@@ -349,7 +356,7 @@ pub const ExecutorHealth = struct {
                 return false;
             },
             .half_open => {
-                // Allow limited probe requests
+                // Every call until a result decides.
                 return true;
             },
         }

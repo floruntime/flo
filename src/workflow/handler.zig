@@ -1409,7 +1409,7 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(run_ns_key);
         // What apply refuses, answered at once where this node can tell.
         const applied = self.appliedRun(run_ns_key) orelse {
-            shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
+            shard.sendRefusal(conn, req.header.request_id, .not_found, NO_SUCH_RUN);
             return null;
         };
         if (appliedStatus(applied).isTerminal()) {
@@ -1467,7 +1467,7 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(run_ns_key);
 
         const run = self.appliedRun(run_ns_key) orelse {
-            shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
+            shard.sendRefusal(conn, req.header.request_id, .not_found, NO_SUCH_RUN);
             return null;
         };
         if (appliedStatus(run).isTerminal()) {
@@ -1505,12 +1505,16 @@ pub const WorkflowHandler = struct {
     /// `workflow.run_delete`: an ended run deleted, its history with it.
     /// Refused here for a live one, and at apply for one that isn't there
     /// by then or is another incarnation than the one read here.
+    /// What every op by a run's id answers for a run no shard holds:
+    /// status, history, signal, cancel and delete alike.
+    pub const NO_SUCH_RUN: proto.Refusal = .{ .reason = .not_found, .ran = .no, .message = "not found: no such run" };
+
     const RunDelete = struct {
         pub const Error = error{ NotFound, NotLeading, OutOfMemory };
 
         pub fn refusal(err: Error) table_run.Refused {
             return switch (err) {
-                error.NotFound => .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = "not found: no such run" } },
+                error.NotFound => .{ .status = .not_found, .refusal = NO_SUCH_RUN },
                 error.NotLeading => .{ .status = .unavailable, .refusal = .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: this node's leadership isn't settled yet — retry" } },
                 error.OutOfMemory => .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "internal error: out of memory" } },
             };
@@ -1575,7 +1579,7 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(run_ns_key);
 
         const run = self.shownRun(run_ns_key, keyName(run_ns_key)) orelse {
-            shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
+            shard.sendRefusal(conn, req.header.request_id, .not_found, NO_SUCH_RUN);
             return;
         };
 

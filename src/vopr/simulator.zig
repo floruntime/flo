@@ -30,6 +30,7 @@ const pool_mod = @import("../budget/pool.zig");
 const memory_gate = @import("memory_gate.zig");
 const settings_machine = @import("../settings/machine.zig");
 const store_mod = @import("../contract/store.zig");
+const hm = @import("../stream/history_machine.zig");
 const scenario_mod = @import("scenario.zig");
 const workload_mod = @import("workload.zig");
 const network_mod = @import("network.zig");
@@ -3079,7 +3080,27 @@ pub const Simulator = struct {
         }
         self.finalDurabilityCheck();
         self.finalSumsCheck();
+        self.finalUsageCheck();
         return self.summary();
+    }
+
+    /// Each node's run-history usage at the end of the run, as the families
+    /// check it every 16th index: what the last indexes moved is checked too.
+    fn finalUsageCheck(self: *Simulator) void {
+        for (self.nodes) |*node| {
+            if (!node.up) continue;
+            if (usageBroke(&node.actions.store)) |why| self.checker.fail(.{ .invariant = .action_rule, .node = node.id, .index = 0, .tick = self.now, .detail = why });
+            if (usageBroke(&node.wf_defs.store)) |why| self.checker.fail(.{ .invariant = .workflow_run_rule, .node = node.id, .index = 0, .tick = self.now, .detail = why });
+        }
+    }
+
+    /// Why `store`'s run-history usage isn't its rows' sum, or a subtract
+    /// went past zero; null if neither.
+    pub fn usageBroke(store: *store_mod.Store) ?[]const u8 {
+        if (store.history_usage_drift != 0) return "a history usage subtract went past zero";
+        var arena = std.heap.ArenaAllocator.init(store.allocator);
+        defer arena.deinit();
+        return hm.usageRule(.{ .store = store }, arena.allocator()) catch "the history rows could not be read";
     }
 
     /// Node `id` crashes or comes back as it did in another group on the
