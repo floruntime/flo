@@ -3100,7 +3100,10 @@ pub const Simulator = struct {
         if (store.history_usage_drift != 0) return "a history usage subtract went past zero";
         var arena = std.heap.ArenaAllocator.init(store.allocator);
         defer arena.deinit();
-        return hm.usageRule(.{ .store = store }, arena.allocator()) catch "the history rows could not be read";
+        if (hm.usageRule(.{ .store = store }, arena.allocator()) catch return "the history rows could not be read") |why| return why;
+        // Each store holds one machine's runs: the other's rule finds none.
+        if (@import("../workflow/runs_machine.zig").reserveRule(store, arena.allocator()) catch return "the runs could not be read") |why| return why;
+        return @import("../actions/machine.zig").reserveRule(store, arena.allocator()) catch "the runs could not be read";
     }
 
     /// Node `id` crashes or comes back as it did in another group on the

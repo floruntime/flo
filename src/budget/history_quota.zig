@@ -152,6 +152,26 @@ pub fn why(buf: []u8, ns: NamespaceId, shard: u16, o: Over) []const u8 {
     return std.fmt.bufPrint(buf, "limit: ns {d} history {d}+{d} of {d} on shard {d}", .{ ns.int(), o.use, o.reserved, o.part, shard }) catch "limit: run history quota";
 }
 
+/// Why `F`'s rows aren't `sums`, each namespace's live runs' reserves as
+/// their machine computes them, or null: a row per namespace with a
+/// reserve, holding exactly it, and none for a namespace with none. A
+/// VOPR rule; walks the family.
+pub fn ruleAgainst(comptime F: type, read: ReadView, sums: *const std.AutoHashMapUnmanaged(u32, u64)) ?[]const u8 {
+    var seen: usize = 0;
+    var it = read.range(F, "");
+    while (it.next() catch return "a reserve row could not be read") |item| {
+        if (item.key.len != 4) return "a reserve row's key is not a namespace";
+        const want = sums.get(std.mem.readInt(u32, item.key[0..4], .big)) orelse return "a namespace with no live runs has a reserve row";
+        if (item.value.v.bytes != want) return "a namespace's reserve is not the sum of its live runs' reserves";
+        seen += 1;
+    }
+    var nonzero: usize = 0;
+    var vit = sums.valueIterator();
+    while (vit.next()) |v| nonzero += @intFromBool(v.* != 0);
+    if (nonzero != seen) return "a namespace's live runs reserve bytes it has no reserve row for";
+    return null;
+}
+
 /// A test's store with `ns`'s part bound to `part` and its usage set to
 /// `use`, as a bind and the history machine would leave them.
 pub fn setForTest(store: *@import("../contract/store.zig").Store, ns: NamespaceId, part: u64, use: u64) !void {

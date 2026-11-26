@@ -43,6 +43,7 @@ const action_ops = @import("../protocol/action_ops.zig");
 const limits = @import("../protocol/limits.zig");
 const view_mod = @import("../contract/view.zig");
 const hq = @import("../budget/history_quota.zig");
+const store_mod_top = @import("../contract/store.zig");
 const history_reserve = @import("../budget/history_reserve.zig");
 const gate = @import("../budget/gate.zig");
 const machine_mod = @import("../contract/machine.zig");
@@ -643,6 +644,24 @@ pub fn reserveOf(id: []const u8, run: Run.Value) u64 {
         .completed, .failed, .timed_out => true,
     };
     return history_reserve.action(run.action.len, id.len, run.max_attempts, run.deliveries, run.abandons, run.failures, ended);
+}
+
+/// Why `action.reserved` isn't its namespaces' live runs' reserves, or a
+/// lower went past 0; null if neither. A VOPR rule; walks every run.
+pub fn reserveRule(store: *const store_mod_top.Store, a: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
+    if (store.quota_reserve_drift != 0) return "a run-history reserve lower went past zero";
+    const read: view_mod.ReadView = .{ .store = @constCast(store) };
+    var sums: std.AutoHashMapUnmanaged(u32, u64) = .empty;
+    var it = read.range(Runs, "");
+    while (it.next() catch return "a run could not be read") |item| {
+        if (item.key.len <= 4) return "a run's key names no run";
+        const r = reserveOf(item.key[4..], item.value.v);
+        if (r == 0) continue;
+        const e = try sums.getOrPut(a, std.mem.readInt(u32, item.key[0..4], .big));
+        if (!e.found_existing) e.value_ptr.* = 0;
+        e.value_ptr.* +|= r;
+    }
+    return hq.ruleAgainst(hq.ActionReserved, read, &sums);
 }
 
 /// Move `ns`'s action reserve from a run's `before` to `now`. It only

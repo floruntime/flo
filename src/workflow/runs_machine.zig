@@ -825,6 +825,23 @@ pub fn reserveOf(workflow: []const u8, run: []const u8) u64 {
     return history_reserve.workflow(workflow.len, run.len);
 }
 
+/// Why `workflow.reserved` isn't its namespaces' live runs' reserves, or
+/// a lower went past 0; null if neither. A VOPR rule; walks every run.
+pub fn reserveRule(store: *const @import("../contract/store.zig").Store, a: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
+    if (store.quota_reserve_drift != 0) return "a run-history reserve lower went past zero";
+    const read: ReadView = .{ .store = @constCast(store) };
+    var sums: std.AutoHashMapUnmanaged(u32, u64) = .empty;
+    var it = read.range(RunFam, "");
+    while (it.next() catch return "a run could not be read") |item| {
+        if (statusOf(item.value.v).isTerminal()) continue;
+        if (item.key.len <= KEY_PREFIX) return "a run's key names no run";
+        const e = try sums.getOrPut(a, std.mem.readInt(u32, item.key[0..4], .big));
+        if (!e.found_existing) e.value_ptr.* = 0;
+        e.value_ptr.* +|= reserveOf(item.value.v.workflow, item.key[KEY_PREFIX..]);
+    }
+    return hq.ruleAgainst(hq.WorkflowReserved, read, &sums);
+}
+
 fn statusOf(r: Run.Value) RunStatus {
     return std.enums.fromInt(RunStatus, r.status) orelse .failed;
 }
