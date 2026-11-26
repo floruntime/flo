@@ -271,10 +271,27 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     // its chunk came to: one that came to another is misrouted or forged,
     // and would key rows a move of that slot couldn't find.
     if (router.nsKeySlot(h.ns, h.owner) != msg.slot) return error.Halt;
-    return switch (h.family) {
+    const before = usageBytes(view, h.ns);
+    try switch (h.family) {
         .workflow => applyIn(Workflows, view, e, msg, h),
         .action => applyIn(Actions, view, e, msg, h),
     };
+    easedBy(view, h.ns, before, e.payload.len);
+}
+
+fn usageBytes(view: *View, ns: NamespaceId) u64 {
+    var kb: [4]u8 = undefined;
+    const k = view_mod.idKey(&kb, ns, "") catch unreachable;
+    return if (view.get(UsageFam, k) catch null) |u| u.v.bytes else 0;
+}
+
+/// A history message's bytes leave the lane as it's taken: one whose apply
+/// added less than them to its namespace's usage (a lost chunk, a fold left
+/// unread or skipped, a drop) lowered the namespace's in-flight history,
+/// which may ease its quota. A chunk or fold that lands adds exactly its
+/// bytes, so ordinary traffic eases nothing.
+fn easedBy(view: *View, ns: NamespaceId, before: u64, taken: u64) void {
+    if (usageBytes(view, ns) < before +| taken) view.quota_eased.add(ns.int());
 }
 
 fn applyIn(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Message, h: Head) ApplyError!void {
@@ -525,10 +542,12 @@ fn sendDrop(view: *View, msg: view_mod.Message, h: Head, retries: u64) ApplyErro
 fn skipped(view: *View, e: *const Entry, _: []const u8) ApplyError!void {
     const msg = view.message orelse return;
     const h = headOfEntry(e) orelse return;
-    return switch (h.family) {
+    const before = usageBytes(view, h.ns);
+    try switch (h.family) {
         .workflow => skippedIn(Workflows, view, e, msg, h),
         .action => skippedIn(Actions, view, e, msg, h),
     };
+    easedBy(view, h.ns, before, e.payload.len);
 }
 
 fn skippedIn(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Message, h: Head) ApplyError!void {

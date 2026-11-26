@@ -183,6 +183,11 @@ pub const WorkflowHandler = struct {
     /// its own list alone, so no pass scans the whole held set, and one
     /// namespace's flapping hold costs another's nothing.
     held_by: std.AutoHashMapUnmanaged(Hold, std.ArrayListUnmanaged([]const u8)) = .empty,
+    /// The namespaces whose quota may have eased since the last release
+    /// pass (`Store.Eased`): only their quota holds are asked, so a pass
+    /// with nothing eased asks none, and ordinary history traffic, which
+    /// eases nothing, wakes no hold. Leader memory (`clearHeld`).
+    quota_eased: @import("../contract/store.zig").Eased = .{},
     /// How many times in a row each run's timer step was refused at apply,
     /// keys owned: its recheck backs off, so a step refused the same way
     /// every time costs a log entry a minute, not a second. Cleared when an
@@ -2135,9 +2140,29 @@ pub const WorkflowHandler = struct {
     /// end resumes it, say), they join that decision.
     fn advanceWorkflow(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8) void {
         if (self.runs.getPtr(run_ns_key)) |run| return self.advanceCopy(shard, run_ns_key, run);
+        // At its namespace's quota: held without a copy, and out of
+        // `to_step` until its hold clears, so no pass looks at it again.
+        if (stepsHeld(shard, keyNamespace(run_ns_key))) return self.holdQuota(run_ns_key);
         const run = self.takeRun(shard, run_ns_key) orelse return;
         if (run.ending == null and !self.endingInFlight(shard, run_ns_key)) self.advanceCopy(shard, run_ns_key, run);
-        _ = self.commitRun(shard, run_ns_key);
+        switch (self.commitRun(shard, run_ns_key)) {
+            .held => |h| if (h.kind == .quota) self.holdQuota(run_ns_key),
+            else => {},
+        }
+    }
+
+    /// Whether `ns`'s runs' steps are held at its quota, as committed.
+    fn stepsHeld(shard: *Shard, ns: NamespaceId) bool {
+        return hq.atUsage(.{ .store = &shard.defaultPartition().store }, ns);
+    }
+
+    /// Run `run_key` held at its namespace's quota: out of `to_step` and
+    /// `call_dirty`, kept on its hold's list. Its release indexes it again
+    /// from its wait as applied (`reindexReleased`).
+    fn holdQuota(self: *WorkflowHandler, run_key: []const u8) void {
+        self.unindexToStep(run_key);
+        unindexKey(self, &self.call_dirty, run_key);
+        self.holdTimer(.{ .ns = keyNamespace(run_key), .kind = .quota }, run_key);
     }
 
     fn advanceCopy(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8, run: *RunRecord) void {
@@ -2972,6 +2997,10 @@ pub const WorkflowHandler = struct {
                 .none => {},
                 .later => |at| self.armCallTimer(ns_key, at),
                 .step => {
+                    if (stepsHeld(shard, keyNamespace(ns_key))) {
+                        self.holdQuota(ns_key);
+                        continue;
+                    }
                     const run = (self.tryTakeRun(shard, ns_key) catch {
                         // Out of the dirty set already: looked at again.
                         self.indexKey(&self.call_dirty, ns_key);
@@ -2982,7 +3011,13 @@ pub const WorkflowHandler = struct {
                         continue;
                     };
                     if (self.callSettled(shard, run, rid, now_ms)) self.resumeFromAction(shard, ns_key, now_ms);
-                    _ = self.commitRun(shard, ns_key);
+                    switch (self.commitRun(shard, ns_key)) {
+                        .held => |h| if (h.kind == .quota) {
+                            self.holdQuota(ns_key);
+                            continue;
+                        },
+                        else => {},
+                    }
                     // Not logged (the log was full): looked at again.
                     if (self.steppingAt(shard, ns_key) == null) self.indexKey(&self.call_dirty, ns_key);
                 },
@@ -3007,8 +3042,13 @@ pub const WorkflowHandler = struct {
                 self.armTimer(ns_key, now_ms +| ENDING_RECHECK_MS);
                 continue;
             }
-            // Held by its namespace's history share: kept without a copy.
-            // A child's end held for its parent is known only once decided.
+            // Held at its namespace's quota, or by its history share: kept
+            // without a copy. A child's end held for its parent is known
+            // only once decided.
+            if (stepsHeld(shard, keyNamespace(ns_key))) {
+                self.holdQuota(ns_key);
+                continue;
+            }
             if (shard.historyWait(keyNamespace(ns_key)) != null) {
                 self.holdTimer(.{ .ns = keyNamespace(ns_key) }, ns_key);
                 continue;
@@ -3543,6 +3583,7 @@ pub const WorkflowHandler = struct {
             switch (err) {
                 error.Unchanged => return .unchanged,
                 error.HeldForHistory => return .{ .held = .{ .ns = keyNamespace(run_key) } },
+                error.HeldForQuota => return .{ .held = .{ .ns = keyNamespace(run_key), .kind = .quota } },
                 error.HeldForParent => {
                     const ns = keyNamespace(run_key);
                     const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
@@ -3580,6 +3621,10 @@ pub const WorkflowHandler = struct {
         // while that outbox has no room. Each child is held for its own
         // parent, so one full parent holds no other run's end.
         if (run.ending != null and parentWait(shard, ns, run.run_id_owned)) return error.HeldForParent;
+        // At its namespace's run-history quota: held, ending or not; only a
+        // cancel, which is no step, goes past it. Its run's reserve counts
+        // the one step a race lets through.
+        if (stepsHeld(shard, ns)) return error.HeldForQuota;
         // Its events go on this shard's history lane: held, and decided
         // again, while that is past its cap and the namespace its share.
         if (shard.historyWait(ns) != null) return error.HeldForHistory;
@@ -4918,6 +4963,21 @@ pub const WorkflowHandler = struct {
         if (self.parked.contains(key)) self.indexKey(&self.call_dirty, key);
     }
 
+    /// A run its quota hold released, indexed again from its wait as
+    /// applied, as an entry of its own would: no wait to `to_step`, a call
+    /// to `call_dirty`, a timer or a due signal to `timers`. Gone or ended,
+    /// nothing.
+    fn reindexReleased(self: *WorkflowHandler, run_key: []const u8) void {
+        const run = runs_machine.runOf(self.defsRead(), run_key) orelse return;
+        if (appliedStatus(run).isTerminal()) return;
+        switch (run.wait) {
+            .none => self.indexToStep(run_key),
+            .call => self.indexKey(&self.call_dirty, run_key),
+            .timer => self.armTimer(run_key, run.wait_due_ms),
+            .signal => if (run.wait_due_ms > 0) self.armTimer(run_key, run.wait_due_ms),
+        }
+    }
+
     fn runApplied(self: *WorkflowHandler, t: entry_mod.EntryType, run_key: []const u8) void {
         self.unhold(run_key);
         if (self.refusals.fetchRemove(run_key)) |kv| self.allocator.free(kv.key);
@@ -5038,6 +5098,7 @@ pub const WorkflowHandler = struct {
         var lit = self.held_by.valueIterator();
         while (lit.next()) |l| l.deinit(self.allocator);
         self.held_by.clearRetainingCapacity();
+        self.quota_eased = .{};
         var rit = self.refusals.keyIterator();
         while (rit.next()) |k| self.allocator.free(k.*);
         self.refusals.clearRetainingCapacity();
@@ -5047,8 +5108,13 @@ pub const WorkflowHandler = struct {
         return switch (hold.kind) {
             .parent => shard.sendWait(hold.parent_shard.?, .main, hold.ns) != null,
             .lane => shard.historyWait(hold.ns) != null,
-            .quota => false,
+            .quota => hq.atUsage(.{ .store = &shard.defaultPartition().store }, hold.ns),
         };
+    }
+
+    /// What the entry just applied eased, for the next release pass.
+    pub fn noteEased(self: *WorkflowHandler, eased: @import("../contract/store.zig").Eased) void {
+        self.quota_eased.merge(eased);
     }
 
     /// Held timers whose hold has cleared, put back on `timers`, due at
@@ -5061,12 +5127,21 @@ pub const WorkflowHandler = struct {
     fn releaseHeld(self: *WorkflowHandler, shard: *Shard, now_ms: i64) void {
         var cleared: [32]Hold = undefined;
         var n: usize = 0;
+        var eased = self.quota_eased;
+        self.quota_eased = .{};
         var hit = self.held_by.keyIterator();
         while (hit.next()) |h| {
+            // A quota hold is asked only once its namespace eased: nothing
+            // else lowers what holds it.
+            if (h.kind == .quota and !eased.has(h.ns.int())) continue;
             if (holds(shard, h.*)) continue;
+            if (n == cleared.len) {
+                // Asked next pass: kept eased until it is.
+                if (h.kind == .quota) self.quota_eased.add(h.ns.int());
+                continue;
+            }
             cleared[n] = h.*;
             n += 1;
-            if (n == cleared.len) break;
         }
         var m: usize = 0;
         for (cleared[0..n]) |c| {
@@ -5074,13 +5149,23 @@ pub const WorkflowHandler = struct {
                 const list = self.held_by.getPtr(c) orelse break;
                 const k = list.items[list.items.len - 1];
                 self.unlist(self.held.get(k).?);
-                // Its key's ownership moves from the set to the heap.
                 const kv = self.held.fetchRemove(k).?;
+                // A quota hold took runs from every path: each goes back to
+                // what its wait as applied needs. A lane's took timers only.
+                if (c.kind == .quota) {
+                    self.reindexReleased(kv.key);
+                    self.allocator.free(kv.key);
+                    continue;
+                }
+                // Its key's ownership moves from the set to the heap.
                 self.timers.push(self.allocator, .{ .at_ms = now_ms, .ns_key = kv.key }) catch {
                     self.lostIndex(kv.key);
                     self.allocator.free(kv.key);
                 };
             }
+            // A cleared quota hold with runs left past this pass's room is
+            // asked again next pass.
+            if (c.kind == .quota and self.held_by.contains(c)) self.quota_eased.add(c.ns.int());
         }
     }
 
@@ -9996,8 +10081,9 @@ test "step executor: a call that can't wait, held at its callee's namespace's qu
     // Each executor's call can't wait: held for memory it would fail.
     createTestDef(&handler, testKey(.default, "plan-wf"), "plan-wf", test_plan_exhaust_workflow_json);
     createTestRun(&handler, testKey(.default, "run-q"), "run-q", "plan-wf");
-    // The namespace's usage is at its part: nothing it calls may start.
-    try hq.setForTest(&shard.defaultPartition().store, .default, 1 << 30, 1 << 30);
+    // The namespace's usage is a byte under its part: its own steps go on,
+    // but no call's reserve fits.
+    try hq.setForTest(&shard.defaultPartition().store, .default, 1 << 30, (1 << 30) - 1);
     handler.advanceWorkflow(&shard, testKey(.default, "run-q"));
     settleTest(&shard);
     handler.checkPendingActions(&shard);

@@ -6736,6 +6736,15 @@ pub const Shard = struct {
         // The leader's workflow caches follow what applied; a follower,
         // and a replay at boot, keep none (`WorkflowHandler.leadCaches`).
         if (self.raft_node.role == .leader) self.workflow_handler.entryApplied(entry, result, .{ .term = self.raft_node.current_term, .last_index = self.raft_node.log.lastIndex() });
+        // What the entry eased goes to the leader's quota holds; every
+        // replica clears it, so nothing outlives the apply.
+        {
+            const st = &self.defaultPartition().store;
+            if (st.quota_eased.any()) {
+                if (self.raft_node.role == .leader) self.workflow_handler.noteEased(st.quota_eased);
+                st.quota_eased = .{};
+            }
+        }
         self.wakeApplied(entry);
         // The leader's own action steps: the await a deliver answers,
         // workers woken for a run ready again (once a pass: each wake is a

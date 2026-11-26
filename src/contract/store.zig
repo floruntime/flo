@@ -136,6 +136,43 @@ pub const FamilyState = struct {
 const TailKey = struct { fam: u16, len: u8, bytes: [MAX_TAIL_PREFIX]u8 };
 pub const MAX_TAIL_PREFIX = 16;
 
+/// The namespaces an entry may have eased the run-history quota of: its
+/// apply lowered one's in-flight history or raised its bound part. Past
+/// `ids`' room, `all`. The leader's workflow handler asks those namespaces'
+/// quota holds again; every replica clears it after each entry, so nothing
+/// outlives the apply (`Shard.afterApply`).
+pub const Eased = struct {
+    ids: [8]u32 = undefined,
+    n: u8 = 0,
+    all: bool = false,
+
+    pub fn add(self: *Eased, id: u32) void {
+        if (self.all) return;
+        for (self.ids[0..self.n]) |x| if (x == id) return;
+        if (self.n == self.ids.len) {
+            self.all = true;
+            return;
+        }
+        self.ids[self.n] = id;
+        self.n += 1;
+    }
+
+    pub fn merge(self: *Eased, o: Eased) void {
+        if (o.all) self.all = true;
+        for (o.ids[0..o.n]) |x| self.add(x);
+    }
+
+    pub fn any(self: Eased) bool {
+        return self.all or self.n > 0;
+    }
+
+    pub fn has(self: Eased, id: u32) bool {
+        if (self.all) return true;
+        for (self.ids[0..self.n]) |x| if (x == id) return true;
+        return false;
+    }
+};
+
 pub const Store = struct {
     allocator: Allocator,
     families: [MAX_FAMILIES]FamilyState = @splat(.{}),
@@ -157,6 +194,8 @@ pub const Store = struct {
     quota_reserve_drift: u64 = 0,
     /// Admissions refused at a namespace's run-history quota.
     quota_refusals: u64 = 0,
+    /// What the last entry eased (`Eased`), cleared after each.
+    quota_eased: Eased = .{},
     /// Time-series points this node applied late, past each lateness edge
     /// (`ts/machine.zig`), added as each entry commits. A count of applies,
     /// not state: no snapshot carries it, it starts again from zero with
