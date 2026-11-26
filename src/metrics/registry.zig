@@ -369,6 +369,10 @@ pub const ProcessingMetrics = struct {
         _ = self.records_dropped_total.fetchAdd(1, .monotonic);
     }
 
+    pub fn recordDroppedN(self: *ProcessingMetrics, n: u64) void {
+        _ = self.records_dropped_total.fetchAdd(n, .monotonic);
+    }
+
     pub fn recordSinkBatch(self: *ProcessingMetrics) void {
         _ = self.sink_batches_total.fetchAdd(1, .monotonic);
     }

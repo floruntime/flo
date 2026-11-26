@@ -115,7 +115,7 @@ pub const JsonFlatMapOperator = struct {
             self.allocator,
             rec.value,
             .{},
-        ) catch return ctx.skip("flatmap: the record isn't JSON it can read");
+        ) catch |err| return if (err == error.OutOfMemory) err else ctx.skip("flatmap: the record isn't JSON it can read");
         defer parsed.deinit();
 
         // Navigate to the array field

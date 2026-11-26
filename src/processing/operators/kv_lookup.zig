@@ -255,11 +255,15 @@ pub const KvLookupOperator = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         // Build the lookup key from the template
-        const lookup_key = self.buildKey(rec.value) orelse {
+        const built = self.buildKey(rec.value, ctx.allocator) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            // One it can't read is a skip, counted, not a key that isn't
+            // there; an enrich passes it on as it is.
+            error.NotJson => return if (self.mode == .enrich) ctx.emit(rec) else ctx.skip("kv_lookup: the record isn't JSON its key template can read"),
+        };
+        const lookup_key = built orelse {
             // Could not resolve template — filter drops, enrich passes through
             if (self.mode == .enrich) return ctx.emit(rec);
-            // One it can't read is a skip, counted, not a key that isn't there.
-            if (!context_mod.readsAsJson(rec.value)) return ctx.skip("kv_lookup: the record isn't JSON its key template can read");
             return;
         };
 
@@ -306,9 +310,10 @@ pub const KvLookupOperator = struct {
     // Template resolution
     // =========================================================================
 
-    /// Build the lookup key by resolving the template against the record value.
-    /// Returns null if any JSONPath placeholder cannot be resolved.
-    fn buildKey(self: *Self, value: []const u8) ?[]const u8 {
+    /// Build the lookup key by resolving the template against the record value,
+    /// parsed once into `arena`. Null if any JSONPath placeholder cannot be
+    /// resolved; NotJson when the record can't be read at all.
+    fn buildKey(self: *Self, value: []const u8, arena: std.mem.Allocator) error{ OutOfMemory, NotJson }!?[]const u8 {
         if (self.parts.len == 0) return null;
 
         // Fast path: single literal part (no JSONPath resolution needed)
@@ -320,13 +325,8 @@ pub const KvLookupOperator = struct {
         }
 
         // Parse JSON once for all placeholder resolutions
-        const parsed = std.json.parseFromSlice(
-            std.json.Value,
-            std.heap.page_allocator,
-            value,
-            .{},
-        ) catch return null;
-        defer parsed.deinit();
+        const root = std.json.parseFromSliceLeaky(std.json.Value, arena, value, .{}) catch |err|
+            return if (err == error.OutOfMemory) error.OutOfMemory else error.NotJson;
 
         var pos: usize = 0;
         for (self.parts) |part| {
@@ -337,7 +337,7 @@ pub const KvLookupOperator = struct {
                     pos += lit.len;
                 },
                 .json_path => |segments| {
-                    const resolved = resolveJsonPath(parsed.value, segments) orelse return null;
+                    const resolved = resolveJsonPath(root, segments) orelse return null;
                     if (pos + resolved.len > self.key_buf.len) return null;
                     @memcpy(self.key_buf[pos..][0..resolved.len], resolved);
                     pos += resolved.len;
@@ -393,7 +393,9 @@ pub const KvLookupOperator = struct {
 
     /// Build the lookup key for a given record value (test helper).
     pub fn buildKeyForTest(self: *Self, value: []const u8) ?[]const u8 {
-        return self.buildKey(value);
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        return self.buildKey(value, arena.allocator()) catch null;
     }
 };
 
@@ -470,10 +472,13 @@ test "KvLookupOperator — filter mode: drops when no lookup fn" {
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
+    // An operator allocates in the chain's arena, as in a chain.
+    var ctx_arena = std.heap.ArenaAllocator.init(allocator);
+    defer ctx_arena.deinit();
     var ctx = @import("../context.zig").OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = ctx_arena.allocator(),
         .current_processing_time_ms = 1000,
         .operator_name = "test",
     };
@@ -495,10 +500,13 @@ test "KvLookupOperator — enrich mode: passes through when no lookup fn" {
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
+    // An operator allocates in the chain's arena, as in a chain.
+    var ctx_arena = std.heap.ArenaAllocator.init(allocator);
+    defer ctx_arena.deinit();
     var ctx = @import("../context.zig").OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = ctx_arena.allocator(),
         .current_processing_time_ms = 1000,
         .operator_name = "test",
     };
@@ -534,10 +542,13 @@ test "KvLookupOperator — filter mode with stub lookup fn" {
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
+    // An operator allocates in the chain's arena, as in a chain.
+    var ctx_arena = std.heap.ArenaAllocator.init(allocator);
+    defer ctx_arena.deinit();
     var ctx = @import("../context.zig").OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = ctx_arena.allocator(),
         .current_processing_time_ms = 1000,
         .operator_name = "test",
     };

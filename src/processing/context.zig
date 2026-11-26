@@ -16,14 +16,6 @@ const ProcessingRecord = record_mod.ProcessingRecord;
 // =============================================================================
 
 /// Simple metrics for a single operator instance
-/// Whether `value` reads as the JSON the operators parse: well formed, no
-/// key given twice in an object.
-pub fn readsAsJson(value: []const u8) bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, value, .{}) catch return false;
-    parsed.deinit();
-    return true;
-}
-
 pub const OperatorMetrics = struct {
     /// Records processed by this operator
     records_in: u64 = 0,

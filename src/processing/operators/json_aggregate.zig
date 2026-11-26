@@ -43,6 +43,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const path_segments = @import("path_segments.zig");
+const json_out = @import("json_out.zig");
 const Operator = @import("../operator.zig").Operator;
 const OperatorContext = @import("../context.zig").OperatorContext;
 const record_mod = @import("../record.zig");
@@ -196,7 +197,7 @@ pub const JsonAggregateOperator = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         // Extract numeric value (for non-count functions)
-        const numeric_val: ?f64 = if (self.function != .count) switch (self.readField(rec.value)) {
+        const numeric_val: ?f64 = if (self.function != .count) switch (try self.readField(rec.value)) {
             .number => |v| v,
             .not_json => return ctx.skip("aggregate: the record isn't JSON it can read"),
             .no_number => return ctx.skip("aggregate: the record's field isn't a number"),
@@ -281,7 +282,7 @@ pub const JsonAggregateOperator = struct {
         try jw.objectField("key");
         try jw.write(key);
         try jw.objectField("value");
-        if (std.math.isFinite(result)) try jw.print("{d}", .{result}) else try jw.write(null);
+        try json_out.writeNumber(jw, result);
         try jw.objectField("count");
         try jw.write(count);
         try jw.endObject();
@@ -291,7 +292,7 @@ pub const JsonAggregateOperator = struct {
 
     /// The record's field as a number. A whole number past what an i64
     /// holds parses as text, and is read as the number it is.
-    fn readField(self: *const Self, value: []const u8) Read {
+    fn readField(self: *const Self, value: []const u8) error{OutOfMemory}!Read {
         const segments = self.field_segments orelse return .no_number;
 
         const parsed = std.json.parseFromSlice(
@@ -299,7 +300,7 @@ pub const JsonAggregateOperator = struct {
             self.allocator,
             value,
             .{},
-        ) catch return .not_json;
+        ) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else .not_json;
         defer parsed.deinit();
 
         var current = parsed.value;

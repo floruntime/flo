@@ -29,6 +29,7 @@ const proto = @import("../protocol/proto.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const parser = @import("parser.zig");
 const record_fields = @import("record_fields.zig");
+const json_out = @import("operators/json_out.zig");
 const definition = @import("definition.zig");
 const SourceKind = definition.SourceKind;
 const SinkKind = definition.SinkKind;
@@ -1516,7 +1517,7 @@ pub const ProcessingHandler = struct {
         try jw.objectField("field");
         try jw.write(field);
         try jw.objectField("value");
-        try writeNumber(jw, value);
+        try json_out.writeNumber(jw, value);
         try jw.objectField("timestamp_ms");
         try jw.write(ts_ms);
         try jw.objectField("tags");
@@ -1541,23 +1542,12 @@ pub const ProcessingHandler = struct {
         try jw.endObject();
     }
 
-    /// A finite value in a form every operator reads as a number: plain
-    /// between 1e-6 and 2^53, where it is exact and short, and with an
-    /// exponent outside it (a long run of digits parses as text, and a
-    /// tiny value would print hundreds of zeros). Non-finite is null.
-    fn writeNumber(jw: *std.json.Stringify, value: f64) std.json.Stringify.Error!void {
-        if (!std.math.isFinite(value)) return jw.write(null);
-        const mag = @abs(value);
-        if (mag == 0 or (mag >= 1e-6 and mag < 9007199254740992.0)) return jw.write(value);
-        return jw.print("{e}", .{value});
-    }
-
     /// The longest record `tsPointJson` makes. A stored point's field and
     /// tags together fit the TS write's value buffer (less its 20-byte
     /// header); every byte of them and of the measurement escapes to at most
     /// six, which also covers a tag's `=` and `,` turning into quotes and
     /// separators. The rest is the keys, the value (at most ~24 bytes, as
-    /// writeNumber prints it) and the timestamp.
+    /// json_out.writeNumber prints it) and the timestamp.
     pub const MAX_TS_POINT_JSON: usize = 6 * (persistence_mod.MAX_ENTRY_KEY + ts_mod.MAX_TAG_STRING + 512) + 256;
     comptime {
         // A point's record always fits a queue message and a stream sink's
@@ -2528,23 +2518,24 @@ pub const ProcessingHandler = struct {
         }
     }
 
-    /// The operator chain over one input value: its output records, or
-    /// null with no operators. Everything the chain allocates, the records
-    /// and what they point at, is in `arena`, which the caller frees (or
-    /// resets) once it has written them; a record may also point into
-    /// `value`, which must live as long.
     /// The records an operator skipped because it couldn't read them: how
     /// many, and the last one's reason.
     pub const Skips = struct {
         n: u32 = 0,
         why: []const u8 = "",
 
-        /// Each skipped record counted as dropped, in the job's status.
+        /// The skipped records counted as dropped, in the job's status.
         fn note(self: Skips, handler: *ProcessingHandler, shard: *Shard, at: []const u8) void {
-            for (0..self.n) |_| handler.noteDrop(shard, at, self.why);
+            handler.noteSkips(shard, at, self.why, self.n);
         }
     };
 
+    /// The operator chain over one input value: its output records, or
+    /// null with no operators. Everything the chain allocates, the records
+    /// and what they point at, is in `arena`, which the caller frees (or
+    /// resets) once it has written them; a record may also point into
+    /// `value`, which must live as long. A record an operator skips is
+    /// counted in `skips`.
     fn applyOperatorChain(operators: []Operator, value: []const u8, event_time_ms: i64, arena: Allocator, skips: *Skips) !?[]const ProcessingRecord {
         if (operators.len == 0) return null;
         var collector = OutputCollector.init(arena);
@@ -2679,6 +2670,23 @@ pub const ProcessingHandler = struct {
         if (now - job.drop_warn_ms < 30_000) return;
         job.drop_warn_ms = now;
         log.err("job '{s}': {s} skipped: {s} ({d} skipped by this job so far)", .{ self.ticking_job, at, why, job.drops });
+    }
+
+    /// `n` records an operator couldn't read, skipped: counted as dropped,
+    /// the last named in the job's status, and logged at most once every
+    /// 30 s per job, as a warning: their doing, not the server's.
+    fn noteSkips(self: *ProcessingHandler, shard: *Shard, at: []const u8, why: []const u8, n: u32) void {
+        self.sink_drops += n;
+        if (shard.metrics_registry) |m| m.processing.recordDroppedN(n);
+        const job = self.runs.getPtr(self.ticking_job) orelse return;
+        self.reported = true;
+        job.drops += n;
+        const text = std.fmt.bufPrint(&job.last_drop, "{s}: {s}", .{ at, why }) catch null;
+        job.last_drop_len = if (text) |t| t.len else job.last_drop.len;
+        const now = @import("stdx").time.milliTimestamp();
+        if (now - job.drop_warn_ms < 30_000) return;
+        job.drop_warn_ms = now;
+        log.warn("job '{s}': {s} skipped: {s} ({d} skipped by this job so far)", .{ self.ticking_job, at, why, job.drops });
     }
 
     /// A record the operator chain failed on is skipped; said once per
@@ -3318,7 +3326,8 @@ test "ProcessingHandler: a TS source record keeps a repeated tag key's first pai
     const json = try ProcessingHandler.tsPointJson(std.testing.allocator, "m", "value", 7, 9, "a=1,a=2,b=\xff,\xfe=x");
     defer std.testing.allocator.free(json);
     // JSON every operator parses: no key twice, no byte that isn't UTF-8.
-    try std.testing.expect(@import("context.zig").readsAsJson(json));
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    parsed.deinit();
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tags\":{\"a\":\"1\",\"b\":[255]}") != null);
 }
 
@@ -3371,18 +3380,72 @@ test "ProcessingHandler: a point whose tags repeat a key or aren't UTF-8 goes th
     }
 }
 
+test "ProcessingHandler: a record an aggregate skips leaves its totals as they were, running and in a count window" {
+    const Entry = definition.OperatorSpec.ConfigEntry;
+    const run_cfg = [_]Entry{ .{ .key = "function", .value = "sum" }, .{ .key = "field", .value = "$.value" } };
+    const win_cfg = [_]Entry{ .{ .key = "function", .value = "sum" }, .{ .key = "field", .value = "$.value" }, .{ .key = "window", .value = "count" }, .{ .key = "window_size", .value = "2" } };
+    const kv_enrich = [_]Entry{ .{ .key = "lookup_key", .value = "acct:${$.id}" }, .{ .key = "mode", .value = "enrich" } };
+    const Case = struct { cfg: []const Entry, want: []const ?f64 };
+    for ([_]Case{
+        // 2, skip, skip, 3: the running total goes 2 then 5.
+        .{ .cfg = &run_cfg, .want = &.{ 2, null, null, 5 } },
+        // A window of 2 closes on the second good record, at 5.
+        .{ .cfg = &win_cfg, .want = &.{ null, null, null, 5 } },
+    }) |c| {
+        var chain = try TestChain.init(&.{.{ .type_name = "aggregate", .name = "a", .config = c.cfg }});
+        defer chain.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        for ([_][]const u8{ "{\"value\":2}", "not json", "{\"value\":\"x\"}", "{\"value\":3}" }, c.want) |input, want| {
+            var skips: ProcessingHandler.Skips = .{};
+            const records = (try ProcessingHandler.applyOperatorChain(chain.ops[0..chain.n], input, 0, arena.allocator(), &skips)).?;
+            if (want) |w| {
+                try std.testing.expectEqual(@as(usize, 1), records.len);
+                try std.testing.expectEqual(@as(?f64, w), ProcessingHandler.outputValue(records[0].value));
+            } else try std.testing.expectEqual(@as(usize, 0), records.len);
+        }
+    }
+    // An enriching kv_lookup passes an unreadable record on as it is.
+    var chain = try TestChain.init(&.{.{ .type_name = "kv_lookup", .name = "kv", .config = &kv_enrich }});
+    defer chain.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var skips: ProcessingHandler.Skips = .{};
+    const passed = (try ProcessingHandler.applyOperatorChain(chain.ops[0..chain.n], "not json", 0, arena.allocator(), &skips)).?;
+    try std.testing.expectEqual(@as(u32, 0), skips.n);
+    try std.testing.expectEqualStrings("not json", passed[0].value);
+}
+
+test "ProcessingHandler: an operator's output numbers print in a form operators read as numbers" {
+    const Entry = definition.OperatorSpec.ConfigEntry;
+    const map_cfg = [_]Entry{.{ .key = "value", .value = "$.value" }};
+    const agg_cfg = [_]Entry{ .{ .key = "function", .value = "sum" }, .{ .key = "field", .value = "$.value" } };
+    for ([_][]const Entry{ &map_cfg, &agg_cfg }, [_][]const u8{ "map", "aggregate" }) |cfg, kind| {
+        var chain = try TestChain.init(&.{.{ .type_name = kind, .name = "o", .config = cfg }});
+        defer chain.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var skips: ProcessingHandler.Skips = .{};
+        const out = (try ProcessingHandler.applyOperatorChain(chain.ops[0..chain.n], "{\"value\":1e300}", 0, arena.allocator(), &skips)).?;
+        try std.testing.expect(std.mem.indexOf(u8, out[0].value, "\"value\":1e300") != null);
+        try std.testing.expect(out[0].value.len < 64);
+    }
+}
+
 test "ProcessingHandler: an operator that can't read its record skips it with a reason, counted, and the chain goes on" {
     const Entry = definition.OperatorSpec.ConfigEntry;
     const map_cfg = [_]Entry{.{ .key = "value", .value = "$.value" }};
     const filter_cfg = [_]Entry{.{ .key = "condition", .value = "json:value>1" }};
     const agg_cfg = [_]Entry{ .{ .key = "function", .value = "sum" }, .{ .key = "field", .value = "$.value" } };
     const flat_cfg = [_]Entry{.{ .key = "array_field", .value = "$.items" }};
+    const kv_cfg = [_]Entry{.{ .key = "lookup_key", .value = "acct:${$.id}" }};
     const Case = struct { spec: definition.OperatorSpec, why: []const u8 };
     for ([_]Case{
         .{ .spec = .{ .type_name = "map", .name = "m", .config = &map_cfg }, .why = "map: the record isn't JSON it can read" },
         .{ .spec = .{ .type_name = "filter", .name = "f", .config = &filter_cfg }, .why = "filter: the record isn't JSON its json: condition can read" },
         .{ .spec = .{ .type_name = "aggregate", .name = "a", .config = &agg_cfg }, .why = "aggregate: the record isn't JSON it can read" },
         .{ .spec = .{ .type_name = "flatmap", .name = "fm", .config = &flat_cfg }, .why = "flatmap: the record isn't JSON it can read" },
+        .{ .spec = .{ .type_name = "kv_lookup", .name = "kv", .config = &kv_cfg }, .why = "kv_lookup: the record isn't JSON its key template can read" },
     }) |c| {
         for ([_][]const u8{ "{\"value\":2,\"value\":3}", "not json", "{\"value\":\xff}" }) |input| {
             var chain = try TestChain.init(&.{c.spec});

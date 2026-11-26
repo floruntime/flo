@@ -162,7 +162,7 @@ pub const JsonMapOperator = struct {
             self.allocator,
             rec.value,
             .{},
-        ) catch return ctx.skip("map: the record isn't JSON it can read");
+        ) catch |err| return if (err == error.OutOfMemory) err else ctx.skip("map: the record isn't JSON it can read");
         defer parsed.deinit();
 
         // Build output JSON object
