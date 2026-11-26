@@ -270,6 +270,15 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
 };
 
 comptime {
+    // The least quota part a namespace may set is an apply-time rule
+    // (`namespace/machine.zig`), derived from the history producer's and the
+    // machines' bounds: a change to any of them moves it, and a log applied
+    // under the old floor would apply differently. Pinned, so such a change
+    // fails here and takes a format row.
+    std.debug.assert(@import("../budget/history_reserve.zig").PART_FLOOR == 214_905);
+}
+
+comptime {
     for (formats[1..], formats[0 .. formats.len - 1]) |row, prev| {
         // A format may change what stored bytes mean without changing a
         // layout, so two formats can share a segment version.

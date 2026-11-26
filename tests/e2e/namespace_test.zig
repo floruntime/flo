@@ -42,7 +42,7 @@ test "e2e/namespace: create and list" {
     var builtin = try ctx.cli.run(&.{ "ns", "info", "default" });
     defer builtin.deinit();
     try testing.expectEqual(@as(u8, 0), builtin.exit_code);
-    try testing.expect(std.mem.startsWith(u8, builtin.stdout, "Namespace:  default\nCreated at: built in\nHistory quota: 10737418240 bytes over every shard (the default)\n"));
+    try testing.expect(std.mem.startsWith(u8, builtin.stdout, "Namespace:  default\nCreated at: built in\nHistory quota: 10.0 GiB over every shard (the default)\n"));
 }
 
 test "e2e/namespace: create multiple namespaces" {

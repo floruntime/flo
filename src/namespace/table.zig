@@ -78,6 +78,10 @@ pub const Table = struct {
     /// index, and a reader loads the index first.
     quotas: [CAPACITY]Atomic(u64) = @splat(.init(0)),
     quota_indexes: [CAPACITY]Atomic(u64) = @splat(.init(0)),
+    /// Moves on every quota published: a shard that found nothing to bind
+    /// over a whole walk of the table at one epoch has nothing to bind
+    /// until it moves.
+    quota_epoch: Atomic(u64) = .init(0),
 
     /// A table holding the reserved names, published before any entry.
     pub fn create(allocator: Allocator) !*Table {
@@ -129,6 +133,11 @@ pub const Table = struct {
         if (index <= self.quota_indexes[id.int()].load(.monotonic)) return;
         self.quotas[id.int()].store(quota, .release);
         self.quota_indexes[id.int()].store(index, .release);
+        _ = self.quota_epoch.fetchAdd(1, .release);
+    }
+
+    pub fn quotaEpoch(self: *const Table) u64 {
+        return self.quota_epoch.load(.acquire);
     }
 
     /// `id`'s quota as published, and the index that set it; null for none

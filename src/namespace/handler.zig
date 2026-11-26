@@ -716,7 +716,10 @@ pub const NamespaceHandler = struct {
                 const now = @import("stdx").time.milliTimestamp();
                 if (now - self.flush_warn_ms >= 30_000) {
                     self.flush_warn_ms = now;
-                    log.warn("namespace: {d} created namespaces are not on disk ({s}); they are not published until they are", .{ self.unpublished.items.len, @errorName(err) });
+                    if (self.unpublished.items.len > 0)
+                        log.warn("namespace: {d} created namespaces are not on disk ({s}); they are not published until they are", .{ self.unpublished.items.len, @errorName(err) })
+                    else
+                        log.warn("namespace: a quota set is not on disk ({s}); it is not published until it is", .{@errorName(err)});
                 }
                 break :publish;
             };
@@ -972,7 +975,14 @@ pub const NamespaceHandler = struct {
         table_run.answer(ShardQuota, shard, conn, req.header.request_id, localQuota(shard, id));
     }
 
-    const FLOOR_MESSAGE = std.fmt.comptimePrint("bad request: a history quota is at least {d} bytes on every shard, one run's reserve on each", .{ns_machine.PART_FLOOR});
+    /// A quota below one run's reserve on every shard, told as the total it
+    /// must reach. Valid until the thread's next call.
+    fn floorMessage(floor: u64, shards: usize) []const u8 {
+        const S = struct {
+            threadlocal var buf: [160]u8 = undefined;
+        };
+        return std.fmt.bufPrint(&S.buf, "bad request: a history quota is at least {d} bytes on {d} shards, one run's reserve ({d} bytes) on each", .{ floor, shards, ns_machine.PART_FLOOR }) catch "bad request: a history quota is at least one run's reserve on every shard";
+    }
 
     /// namespace.alter: a namespace's quota set on shard 0, answered once
     /// it applies. Below one shard's floor on this node, refused here.
@@ -986,13 +996,12 @@ pub const NamespaceHandler = struct {
         const floor = ns_machine.PART_FLOOR *| shard.shardCount();
         if (ns_machine.quotaRefusal(mode, bytes, floor)) |why| {
             const below = mode == .bytes and bytes != null and bytes.? != 0 and bytes.? < floor;
-            const msg = if (below) FLOOR_MESSAGE else why;
-            return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .out_of_range, .ran = .no, .message = msg } } };
+            return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .out_of_range, .ran = .no, .message = if (below) floorMessage(floor, shard.shardCount()) else why } } };
         }
         if (!shard.raft_node.leaderReady()) return .{ .refused = .{ .status = .unavailable, .refusal = .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: a new leader is catching up; the quota wasn't set — retry" } } };
         const P = namespace_entries.Alter;
         var buf: [P.max_size]u8 = undefined;
-        const payload = P.encodeInto(&buf, .{ .name = if (name.len == 0) "default" else name, .mode = mode, .bytes = bytes orelse 0 }) catch return error.Internal;
+        const payload = P.encodeInto(&buf, .{ .name = name, .mode = mode, .bytes = bytes orelse 0 }) catch return error.Internal;
         const proposed = shard.raft_node.propose(.namespace_alter, entry_mod.Flags.NONE, payload) catch |err| return proposeError(err);
         return .{ .park = .{ .proposed = proposed, .answer = answerAlter } };
     }

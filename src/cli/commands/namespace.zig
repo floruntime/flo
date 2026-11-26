@@ -186,6 +186,17 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     }
 }
 
+/// `n` bytes as a person reads them: whole bytes below a KiB, else to one
+/// place in the largest binary unit that keeps it at 1 or more.
+fn bytesText(buf: []u8, n: u64) []const u8 {
+    const units = [_]struct { []const u8, u64 }{ .{ "TiB", 1 << 40 }, .{ "GiB", 1 << 30 }, .{ "MiB", 1 << 20 }, .{ "KiB", 1 << 10 } };
+    for (units) |u| if (n >= u[1]) {
+        const tenths = (n / u[1]) * 10 + (n % u[1]) * 10 / u[1];
+        return std.fmt.bufPrint(buf, "{d}.{d} {s}", .{ tenths / 10, tenths % 10, u[0] }) catch "?";
+    };
+    return std.fmt.bufPrint(buf, "{d} B", .{n}) catch "?";
+}
+
 /// A quota as the flag gives it: `default`, `none`, or bytes, a number with
 /// an optional binary unit, above 0 and at most the wire's most. Errors for
 /// anything else.
@@ -254,7 +265,8 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
             ctx.print("Namespace:  {s}\n", .{name});
             // "default" was never created: it is there from the start.
             if (info.created_at_ms == 0) ctx.print("Created at: built in\n", .{}) else ctx.print("Created at: {d} (ms since the epoch)\n", .{info.created_at_ms});
-            if (info.history_quota) |q| ctx.print("History quota: {d} bytes over every shard ({s})\n", .{ q, if (info.history_quota_own) "its own" else "the default" }) else ctx.print("History quota: none ({s})\n", .{if (info.history_quota_own) "its own" else "the default"});
+            var qb: [32]u8 = undefined;
+            if (info.history_quota) |q| ctx.print("History quota: {s} over every shard ({s})\n", .{ bytesText(&qb, q), if (info.history_quota_own) "its own" else "the default" }) else ctx.print("History quota: none ({s})\n", .{if (info.history_quota_own) "its own" else "the default"});
             var table = output.Table.init(ctx.allocator);
             defer table.deinit();
             for ([_][]const u8{ "SHARD", "PART", "USAGE", "ORPHANS" }) |h| table.addColumn(h, .left) catch return error.OutOfMemory;
@@ -263,8 +275,8 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
                 var b: [4][24]u8 = undefined;
                 table.addRow(&.{
                     std.fmt.bufPrint(&b[0], "{d}", .{s.shard}) catch unreachable,
-                    if (!s.bound) "not bound" else if (s.part_bytes) |p| std.fmt.bufPrint(&b[1], "{d}", .{p}) catch unreachable else "none",
-                    std.fmt.bufPrint(&b[2], "{d}", .{s.usage_bytes}) catch unreachable,
+                    if (!s.bound) "not bound" else if (s.part_bytes) |p| bytesText(&b[1], p) else "none",
+                    bytesText(&b[2], s.usage_bytes),
                     std.fmt.bufPrint(&b[3], "{d}", .{s.orphans}) catch unreachable,
                 }) catch return error.OutOfMemory;
             }

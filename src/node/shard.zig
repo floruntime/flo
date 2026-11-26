@@ -940,6 +940,14 @@ pub const Shard = struct {
     /// its walk of the namespace table goes on from.
     quota_bind_pending: ?BudgetPropose = null,
     quota_cursor: u32 = 0,
+    /// The table's quota epoch and this shard's term when the walk now
+    /// under way began, and whether it has found anything to bind; and the
+    /// epoch and term of the last whole walk that found nothing, which
+    /// lets the walk stop until either moves.
+    quota_walk: struct { epoch: u64 = 0, term: u64 = 0, found: bool = true } = .{},
+    quota_clean: ?struct { epoch: u64, term: u64 } = null,
+    /// Ids the walk has looked at, since start: for its tests.
+    quota_looked: u64 = 0,
     /// A budget too small to share among the shards was logged once.
     bind_zero_warned: bool = false,
 
@@ -7059,13 +7067,31 @@ pub const Shard = struct {
     /// the cursor: how many.
     fn quotaBindsDue(self: *Shard, out: []settings_entries.QuotaItem.Value) usize {
         const names = self.namespace_handler.table;
+        const epoch = names.quotaEpoch();
+        const term = self.raft_node.current_term;
+        // A whole walk at this epoch and term found every part bound: none
+        // is due until a quota is published or another term binds.
+        if (self.quota_clean) |c| {
+            if (c.epoch == epoch and c.term == term) return 0;
+            self.quota_clean = null;
+        }
         const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
         const shards = self.router.shard_count;
         var n: usize = 0;
         var looked: u32 = 0;
         while (n < out.len and looked < QUOTA_SCAN_PER_TICK) : (looked += 1) {
+            if (self.quota_cursor == 0) {
+                // A walk ends: clean if it found nothing at one epoch and term.
+                if (!self.quota_walk.found and self.quota_walk.epoch == epoch and self.quota_walk.term == term) {
+                    self.quota_clean = .{ .epoch = epoch, .term = term };
+                    self.quota_walk = .{ .epoch = epoch, .term = term, .found = true };
+                    return n;
+                }
+                self.quota_walk = .{ .epoch = epoch, .term = term, .found = false };
+            }
             const id: ns_table.Id = .of(self.quota_cursor);
             self.quota_cursor = (self.quota_cursor + 1) % ns_table.CAPACITY;
+            self.quota_looked += 1;
             const q = names.quotaOf(id) orelse continue;
             const part = quotaPart(q.quota, shards);
             if (settings_machine.boundQuota(read, id)) |b| {
@@ -7073,6 +7099,7 @@ pub const Shard = struct {
             }
             out[n] = .{ .ns = id.int(), .part_bytes = part, .published_index = q.index };
             n += 1;
+            self.quota_walk.found = true;
         }
         return n;
     }
@@ -11106,6 +11133,50 @@ test "quota binds: a namespace with none published binds nothing, a part bound c
     // None splits to none.
     try std.testing.expectEqual(settings_machine.NO_QUOTA, Shard.quotaPart(settings_machine.NO_QUOTA, 8));
     try std.testing.expectEqual(@as(u64, 2), Shard.quotaPart(7, 4));
+}
+
+test "quota binds: once a whole walk at one epoch and term finds every part bound, the walk reads nothing until a quota is published or the term moves" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const names = shard.namespace_handler.table;
+    var items: [settings_entries.MAX_QUOTA_BINDS]settings_entries.QuotaItem.Value = undefined;
+    var buf: [settings_machine.SetQuotaBind.max_size]u8 = undefined;
+    names.publishQuota(ns_table.DEFAULT, 8 << 30, 5);
+    const walks = ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 2;
+    var at: u64 = 1;
+    for (0..walks) |_| {
+        const n = shard.quotaBindsDue(&items);
+        if (n > 0) {
+            _ = try applySettings(&shard, at, .settings_quota_bind, try quotaBind(&buf, items[0..n]));
+            at += 1;
+        }
+    }
+    // Two whole walks: one that bound, one that found nothing. Clean now.
+    for (0..walks) |_| try std.testing.expectEqual(@as(usize, 0), shard.quotaBindsDue(&items));
+    const looked = shard.quota_looked;
+    for (0..walks) |_| try std.testing.expectEqual(@as(usize, 0), shard.quotaBindsDue(&items));
+    try std.testing.expectEqual(looked, shard.quota_looked);
+    // A quota published moves the epoch: the walk runs again, and binds it.
+    names.publishQuota(ns_table.DEFAULT, 4 << 30, 6);
+    var found: usize = 0;
+    for (0..walks) |_| {
+        found = shard.quotaBindsDue(&items);
+        if (found > 0) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), found);
+    try std.testing.expect(shard.quota_looked > looked);
+    // So does a new term, with nothing published.
+    _ = try applySettings(&shard, at, .settings_quota_bind, try quotaBind(&buf, &.{.{ .ns = ns_table.DEFAULT.int(), .part_bytes = 4 << 30, .published_index = 6 }}));
+    for (0..2 * walks) |_| try std.testing.expectEqual(@as(usize, 0), shard.quotaBindsDue(&items));
+    const clean = shard.quota_looked;
+    shard.raft_node.current_term += 1;
+    _ = shard.quotaBindsDue(&items);
+    try std.testing.expect(shard.quota_looked > clean);
 }
 
 test "settings: a pool share over 1000 per-mille is refused at apply, writing no row" {
