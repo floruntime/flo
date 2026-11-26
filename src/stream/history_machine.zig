@@ -1283,6 +1283,28 @@ test "history usage: an ended row put over one already there (a second final chu
     try testing.expectEqual(@as(u64, 0), t.store.history_usage_drift);
 }
 
+test "history usage: however many runs land and go in one namespace, it keeps one usage row, its size unchanged" {
+    var t = H.init();
+    defer t.deinit();
+    var size: ?u64 = null;
+    var rb: [16]u8 = undefined;
+    for (0..400) |i| {
+        const r: H.Run = .{ .run = try std.fmt.bufPrint(&rb, "r{d}", .{i}) };
+        // 20 chunks a run, its last final: folds and an end each.
+        for (0..20) |c| try t.chunk(r, c + 1, c + 1, c == 19, 50);
+        try t.pump();
+        // Every other run deleted, so the row rises and falls.
+        if (i % 2 == 1) {
+            try t.dropOf(r, 50);
+            try t.pump();
+        }
+        const f = t.store.family(UsageFam.ID);
+        try testing.expectEqual(@as(usize, 1), f.count);
+        if (size) |sz| try testing.expectEqual(sz, f.encoded_bytes) else size = f.encoded_bytes;
+    }
+    try expectUsageRule(&t);
+}
+
 test "history usage: a subtract past what a namespace holds is counted as drift and saturates, never halts" {
     var t = H.init();
     defer t.deinit();
