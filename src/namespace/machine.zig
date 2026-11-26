@@ -17,6 +17,7 @@ const machine_mod = @import("../contract/machine.zig");
 const delivery = @import("../contract/delivery.zig");
 const persistence = @import("../storage/persistence.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
+const proto = @import("../protocol/proto.zig");
 const namespace_entries = @import("../protocol/namespace_entries.zig");
 const ns_table = @import("table.zig");
 
@@ -73,8 +74,53 @@ pub const Counts = Record(&.{
     .{ .name = "live", .T = Int(u32) },
 });
 
+/// A namespace's settings, set by an alter: how its run-history quota is
+/// set (the default, none, or `bytes` over every shard), and the log index
+/// that set it, which shard 0 publishes with it. An alter back to the
+/// default keeps a row, so the index a namespace's quota is published
+/// under only rises: a shard's stale-bind check holds across it, and across
+/// a restart.
+pub const QuotaMode = @import("../protocol/namespace_ops.zig").QuotaMode;
+pub const Settings = Record(&.{
+    .{ .name = "mode", .T = schema.Enum(QuotaMode) },
+    .{ .name = "bytes", .T = Int(u64) },
+    .{ .name = "set_index", .T = Int(u64) },
+});
+
+/// The quota a namespace's setting gives, over every shard: the default for
+/// none set or one set back to it, `NO_QUOTA` for none.
+pub fn quotaOf(s: ?Settings.Value) u64 {
+    const set = s orelse return DEFAULT_HISTORY_QUOTA;
+    return switch (set.mode) {
+        .default => DEFAULT_HISTORY_QUOTA,
+        .none => NO_QUOTA,
+        .bytes => set.bytes,
+    };
+}
+
+/// Whether a namespace's setting is its own, not the default.
+pub fn quotaOwn(s: ?Settings.Value) bool {
+    return if (s) |set| set.mode != .default else false;
+}
+
 pub const NameFam = view_mod.Family(4, "namespace.name", .shard, Stored(Meta));
 pub const CountsFam = view_mod.Family(5, "namespace.meta", .shard, Stored(Counts));
+/// Keyed by name, as `namespace.name` is: one only for a namespace an alter
+/// named. One with none takes `DEFAULT_HISTORY_QUOTA`.
+pub const SettingsFam = view_mod.Family(77, "namespace.settings", .shard, Stored(Settings));
+
+/// A namespace's run-history quota until an alter sets its own, over every
+/// shard. An input where it binds, not a logged value: changing it rebinds
+/// every namespace with no setting of its own.
+pub const DEFAULT_HISTORY_QUOTA: u64 = 10 << 30;
+
+pub const NO_QUOTA = namespace_entries.NO_QUOTA;
+
+/// The least a namespace's quota may be on one shard: one workflow run, or
+/// one default action run, at the longest names. Below it every start
+/// there would be refused for good. An alter is held to it per shard at
+/// the op, where the node's shard count is known, and to it alone here.
+pub const PART_FLOOR: u64 = @import("../budget/history_reserve.zig").PART_FLOOR;
 
 /// What `namespace.meta` holds before any create: "default", which has no
 /// entry, is live, and no id is taken.
@@ -104,6 +150,39 @@ pub fn counts(read: ReadView) Counts.Value {
 }
 
 /// `name`'s record, or null; "default", which has no record, is not here.
+/// `name`'s settings, or null for one no alter named.
+pub fn settings(read: ReadView, name: []const u8) ?Settings.Value {
+    if (name.len == 0 or name.len > MAX_NAME_LEN) return null;
+    var kb: [1 + MAX_NAME_LEN]u8 = undefined;
+    const got = read.get(SettingsFam, nameKey(&kb, name)) catch unreachable; // written by this machine alone
+    return if (got) |s| s.v else null;
+}
+
+/// Why a quota set as `mode` with `bytes` can't be, held to `floor` bytes:
+/// null if it can. Bytes come with the bytes mode and only with it.
+pub fn quotaRefusal(mode: QuotaMode, bytes: ?u64, floor: u64) ?QuotaRefusal {
+    if (mode != .bytes) return if (bytes == null) null else .malformed("bad request: a history quota's bytes come with its bytes mode only");
+    const b = bytes orelse return .malformed("bad request: a history quota set in bytes needs its bytes");
+    if (b == 0) return .outOfRange("bad request: a history quota of 0 would refuse every run; set none to turn it off");
+    if (b == NO_QUOTA) return .outOfRange("bad request: a history quota is at most 2^64 - 2 bytes; set none to turn it off");
+    if (b < floor) return .outOfRange("bad request: a history quota is at least one run's reserve on every shard");
+    return null;
+}
+
+/// Why a quota is refused: a mode and bytes that don't go together is a
+/// malformed request; a figure out of bounds is out of range.
+pub const QuotaRefusal = struct {
+    reason: proto.Reason,
+    message: []const u8,
+
+    fn malformed(m: []const u8) QuotaRefusal {
+        return .{ .reason = .malformed, .message = m };
+    }
+    fn outOfRange(m: []const u8) QuotaRefusal {
+        return .{ .reason = .out_of_range, .message = m };
+    }
+};
+
 pub fn meta(read: ReadView, name: []const u8) ?Meta.Value {
     if (name.len == 0 or name.len > MAX_NAME_LEN) return null;
     var kb: [1 + MAX_NAME_LEN]u8 = undefined;
@@ -133,6 +212,13 @@ fn typeOf(e: *const Entry) EntryType {
 }
 
 fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
+    if (typeOf(e) == .namespace_alter) {
+        var d: schema.Diagnostic = .{};
+        const a = namespace_entries.Alter.decodeAll(e.payload, &d) catch return;
+        try out.add(NameFam.ID, "", a.name);
+        try out.add(SettingsFam.ID, "", a.name);
+        return;
+    }
     if (typeOf(e) != .namespace_create) return;
     var diag: schema.Diagnostic = .{};
     const c = namespace_entries.Create.decodeAll(e.payload, &diag) catch return;
@@ -144,7 +230,8 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
 /// checks the name, the room and the id against everything applied and in
 /// flight), so one that is refused here breaks the log: the writes behind
 /// it carry an id that isn't theirs. It halts, on every replica alike.
-fn apply(view: *View, e: *const Entry, _: *Result) ApplyError!void {
+fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
+    if (typeOf(e) == .namespace_alter) return applyAlter(view, e, out);
     if (typeOf(e) != .namespace_create) return error.Halt;
     // Only shard 0 logs creates; one elsewhere was never proposed. Every
     // shard's store has a place; only a test's may have none, and is then
@@ -165,10 +252,28 @@ fn apply(view: *View, e: *const Entry, _: *Result) ApplyError!void {
     try view.put(CountsFam, counts_key, .{ .v = .{ .next_id = c.id + 1, .live = now.live + 1 } });
 }
 
+/// An alter of a namespace's settings, on shard 0: a well-formed entry is
+/// refused, not halted on, for a name with no namespace or a quota below
+/// one shard's floor, as its op refuses them before proposing; a quota per
+/// shard below the floor on this node is the op's to refuse, since apply
+/// reads no node config. One that doesn't decode (a mode no build writes)
+/// halts: the op's schema refuses it before anything is proposed.
+fn applyAlter(view: *View, e: *const Entry, out: *Result) ApplyError!void {
+    if (view.place) |p| if (p.group != 0) return error.Halt;
+    var diag: schema.Diagnostic = .{};
+    const a = namespace_entries.Alter.decodeAll(e.payload, &diag) catch return error.Halt;
+    if (nameRefusal(a.name) != null and !isDefault(a.name)) return out.refuse(.bad_request, .malformed, "bad request: invalid namespace name");
+    var kb: [1 + MAX_NAME_LEN]u8 = undefined;
+    const k = nameKey(&kb, a.name);
+    if (!isDefault(a.name) and try view.get(NameFam, k) == null) return out.refuse(.no_namespace, .not_found, "namespace not found");
+    if (quotaRefusal(a.mode, if (a.mode == .bytes) a.bytes else if (a.bytes == 0) null else a.bytes, PART_FLOOR)) |why| return out.refuse(.bad_request, why.reason, why.message);
+    try view.put(SettingsFam, k, .{ .v = .{ .mode = a.mode, .bytes = if (a.mode == .bytes) a.bytes else 0, .set_index = e.header.index } });
+}
+
 pub const machine: machine_mod.Machine = .{
     .name = "namespaces",
-    .entry_types = &.{.namespace_create},
-    .families = &.{ machine_mod.info(NameFam), machine_mod.info(CountsFam) },
+    .entry_types = &.{ .namespace_create, .namespace_alter },
+    .families = &.{ machine_mod.info(NameFam), machine_mod.info(CountsFam), machine_mod.info(SettingsFam) },
     .keys = keys,
     .apply = apply,
 };
@@ -257,4 +362,49 @@ test "namespaces machine: the room is the live count, and a full registry halts 
     try testing.expectEqual(MAX_LIVE, counts(f.read()).live);
     try testing.expectEqual(Verdict.full, verdict(counts(f.read()), false, "one-more", counts(f.read()).next_id));
     try testing.expectError(error.Halt, f.create(MAX_LIVE, "one-more", counts(f.read()).next_id));
+}
+
+fn alter(f: *Fixture, index: u64, name: []const u8, mode: QuotaMode, bytes: u64) !Result {
+    var buf: [namespace_entries.Alter.max_size]u8 = undefined;
+    const encoded = namespace_entries.Alter.encodeInto(&buf, .{ .name = name, .mode = mode, .bytes = bytes }) catch unreachable;
+    const e = entry_mod.buildEntry(.namespace_alter, 0, 1, index, index * 1000, encoded);
+    var out = Result.start(&e);
+    try machine_mod.applyEntry(&machine, &f.store, &f.scratch, &e, &out);
+    return out;
+}
+
+test "namespaces machine: an alter sets a namespace's quota with its index, default's too; none and back to the default keep a row; a namespace not there, a quota of 0, below the floor, or bytes with another mode is refused and sets nothing" {
+    var f = Fixture.init(0);
+    defer f.deinit();
+    try f.create(1, "orders", ns_table.FIRST_ALLOCATED.int());
+    try testing.expect((try alter(&f, 2, "orders", .bytes, 20 << 30)).refused() == null);
+    try testing.expectEqual(Settings.Value{ .mode = .bytes, .bytes = 20 << 30, .set_index = 2 }, settings(f.read(), "orders").?);
+    try testing.expectEqual(@as(u64, 20 << 30), quotaOf(settings(f.read(), "orders")));
+    try testing.expect((try alter(&f, 3, "default", .none, 0)).refused() == null);
+    try testing.expectEqual(NO_QUOTA, quotaOf(settings(f.read(), "default")));
+    // Back to the default: its own no longer, its index risen.
+    try testing.expect((try alter(&f, 4, "orders", .default, 0)).refused() == null);
+    try testing.expectEqual(Settings.Value{ .mode = .default, .bytes = 0, .set_index = 4 }, settings(f.read(), "orders").?);
+    try testing.expectEqual(DEFAULT_HISTORY_QUOTA, quotaOf(settings(f.read(), "orders")));
+    try testing.expect(!quotaOwn(settings(f.read(), "orders")));
+    // A mode and bytes that don't go together is malformed; a figure out
+    // of bounds is out of range.
+    for ([_]struct { []const u8, QuotaMode, u64, proto.Reason }{
+        .{ "never", .bytes, 20 << 30, .not_found },
+        .{ "orders", .bytes, 0, .out_of_range },
+        .{ "orders", .bytes, PART_FLOOR - 1, .out_of_range },
+        .{ "orders", .none, 20 << 30, .malformed },
+        .{ "orders", .default, 20 << 30, .malformed },
+        .{ "orders", .bytes, NO_QUOTA, .out_of_range },
+    }) |c| {
+        const out = try alter(&f, 5, c[0], c[1], c[2]);
+        try testing.expectEqual(c[3], out.refused().?.refusal.reason);
+    }
+    try testing.expectEqual(proto.Reason.malformed, quotaRefusal(.bytes, null, PART_FLOOR).?.reason);
+    try testing.expectEqual(@as(u64, 4), settings(f.read(), "orders").?.set_index);
+    try testing.expect(settings(f.read(), "never") == null);
+    // Only shard 0 logs alters.
+    var other = Fixture.init(1);
+    defer other.deinit();
+    try testing.expectError(error.Halt, alter(&other, 1, "default", .none, 0));
 }

@@ -107,7 +107,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         // Workflows: their contract machines (workflow/defs_machine.zig,
         // workflow/runs_machine.zig).
         .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step, .workflow_signal, .workflow_run_delete => .none,
-        .namespace_create => .none,
+        .namespace_create, .namespace_alter => .none,
         // Actions: their contract machine (actions/machine.zig).
         .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_run_delete => .none,
         // Calls: the runs machine (workflow/runs_machine.zig).
@@ -121,7 +121,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         // Its contract machine (processing/sinks_machine.zig).
         .processing_sink_batch => .none,
         // Cluster settings: their contract machine (settings/machine.zig).
-        .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean, .settings_budget_bind => .none,
+        .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean, .settings_budget_bind, .settings_quota_bind => .none,
         .channel_inbound, .channel_trim, .channel_probe, .channel_unpark => .none,
     };
 }

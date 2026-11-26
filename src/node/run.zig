@@ -252,6 +252,19 @@ test "run: an admin op runs only from the admin socket or as a request already a
     inline for (@typeInfo(Origin).@"enum".field_names) |name| try std.testing.expect(authorize(.anonymous, @field(Origin, name), data_req) == .ok);
 }
 
+test "run: a namespace's quota is set only from the admin socket or as a request already authorized at an edge" {
+    const alter: proto.Request = .{ .header = proto.RequestHeader.init(.namespace_alter, 1), .namespace = "", .key = "orders", .value = "" };
+    inline for (.{ Origin.admin, Origin.peer, Origin.held }) |o| try std.testing.expect(authorize(.anonymous, o, alter) == .ok);
+    inline for (.{ Origin.client, Origin.shard }) |o| {
+        const r = authorize(.anonymous, o, alter).refused;
+        try std.testing.expectEqual(proto.StatusCode.unauthorized, r.status);
+        try std.testing.expectEqual(proto.Reason.admin_only, r.refusal.reason);
+    }
+    // Its info stays open.
+    const info: proto.Request = .{ .header = proto.RequestHeader.init(.namespace_info, 2), .namespace = "", .key = "orders", .value = "" };
+    try std.testing.expect(authorize(.anonymous, .client, info) == .ok);
+}
+
 test "run: across the whole cluster page, only the reads are open to a client" {
     // The cluster ops (0x030–0x04F) are legacy opcodes outside the op table,
     // so `table.isAdmin` can't class them: each must be named in `adminOnly`

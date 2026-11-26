@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 72;
+pub const CURRENT: u32 = 73;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -263,7 +263,20 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // A time-series write whose tags repeat a key, lack one, aren't UTF-8,
     // or pass 32 pairs or 1024 bytes is refused where it applies.
     .{ .format = 72, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
+    // A namespace's run-history quota set by an alter and bound per shard
+    // (namespace.settings, settings.quota); a completion's detail held at
+    // apply to a cancel reason's bound.
+    .{ .format = 73, .segment_version = 44, .entries = 0x8aa1807f14af4929 },
 };
+
+comptime {
+    // The least quota part a namespace may set is an apply-time rule
+    // (`namespace/machine.zig`), derived from the history producer's and the
+    // machines' bounds: a change to any of them moves it, and a log applied
+    // under the old floor would apply differently. Pinned, so such a change
+    // fails here and takes a format row.
+    std.debug.assert(@import("../budget/history_reserve.zig").PART_FLOOR == 214_905);
+}
 
 comptime {
     for (formats[1..], formats[0 .. formats.len - 1]) |row, prev| {

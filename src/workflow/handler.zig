@@ -4564,7 +4564,7 @@ pub const WorkflowHandler = struct {
     const MARKER_EVENT = "history_trimmed";
 
     /// A cancel reason goes into the run's history and its completion record.
-    const MAX_CANCEL_REASON: usize = 1024;
+    const MAX_CANCEL_REASON: usize = runs_machine.MAX_COMPLETE_DETAIL;
 
     /// The most a workflow_complete value for `run_ns_key` may hold: a log
     /// entry less its command header and key.

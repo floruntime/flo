@@ -194,7 +194,7 @@ pub const MAX_PROGRESS: usize = 1024;
 pub const MAX_NAME = 1024;
 /// The most a step's event detail or output holds: an entry, less the
 /// rest of the step.
-const MAX_BODY = MAX_PERSIST_PAYLOAD - 4 * MAX_NAME;
+pub const MAX_BODY = MAX_PERSIST_PAYLOAD - 4 * MAX_NAME;
 
 pub const Event = Record(&.{
     .{ .name = "event", .T = Bytes(MAX_NAME) },
@@ -564,6 +564,10 @@ pub const SERVER_KEY_REFUSED = "reserved idempotency key: a leading '_' is the s
 ///   [event_len:u16][event][detail_len:u16][detail]
 ///   [wf_len:u16][workflow]
 /// The event is the run's last, stamped with the entry's time.
+/// The longest a completion's event detail is (a cancel's reason), held at
+/// apply as the edge holds it: it is history every run's reserve counts.
+pub const MAX_COMPLETE_DETAIL: usize = 1024;
+
 pub const Complete = struct {
     status: RunStatus,
     output: ?[]const u8,
@@ -1254,6 +1258,9 @@ fn applyComplete(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ms:
         return out.refuse(.bad_request, .unclassified, "run already finished");
     }
 
+    // Past what its run's reserve counts: the edge refuses such a reason,
+    // so only an entry no ready leader sends gets here.
+    if (c.detail.len > MAX_COMPLETE_DETAIL or c.event.len > MAX_NAME) return out.refuse(.bad_request, .malformed, "bad request: a completion's event or detail past its bound");
     try appendHist(view, n, &run, c.event, c.detail, stamp_ms);
     return endRun(view, n, cmd.key, &run, c.status, c.output, stamp_ms);
 }
@@ -1678,6 +1685,22 @@ fn startValue(buf: []u8, wf: []const u8, event: []const u8, idem: []const u8) []
 fn completeValue(buf: []u8, status: RunStatus, wf: []const u8) []const u8 {
     const c: Complete = .{ .status = status, .output = null, .event = "workflow_cancelled", .detail = "stop", .workflow = wf, .created_ns = 0 };
     return c.encode(buf).?;
+}
+
+test "workflow runs machine: a completion whose detail is past a cancel reason's bound is refused at apply and ends nothing; one at the bound ends its run" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "k1", 1000);
+    _ = try f.start("r2", "wf", "workflow_started", "k2", 1000);
+    const long: [MAX_COMPLETE_DETAIL + 1]u8 = @splat('d');
+    var vb: [2 * MAX_COMPLETE_DETAIL]u8 = undefined;
+    const past: Complete = .{ .status = .cancelled, .output = null, .event = "workflow_cancelled", .detail = &long, .workflow = "wf", .created_ns = 0 };
+    const refused = try f.complete("r1", past.encode(&vb).?, 50);
+    try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.bad_request, refused.refused().?.status);
+    try testing.expect(!statusOf(f.get("r1").?).isTerminal());
+    const at: Complete = .{ .status = .cancelled, .output = null, .event = "workflow_cancelled", .detail = long[0..MAX_COMPLETE_DETAIL], .workflow = "wf", .created_ns = 0 };
+    try testing.expect((try f.complete("r2", at.encode(&vb).?, 60)).refused() == null);
+    try testing.expect(statusOf(f.get("r2").?).isTerminal());
 }
 
 test "workflow runs machine: a start creates its run, first event, idempotency key and count; one with a used key or id creates nothing" {

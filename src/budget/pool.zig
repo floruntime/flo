@@ -90,6 +90,9 @@ pub const CHARGED = [_]u16{
     75,
     // history.usage: a namespace's history bytes on this shard
     76,
+    // namespace.settings: a namespace's quota; settings.quota: its part here
+    77,
+    78,
 };
 
 /// The families the pool is not charged for: the node's own state, and a

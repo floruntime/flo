@@ -150,6 +150,8 @@ pub const EntryType = enum(u8) {
     namespace_create = 0x60,
     // 0x61 and 0x62 were a namespace delete and settings, never written;
     // 0x63 was another shard's bind of a name to its id. Retired.
+    /// A namespace's settings changed on shard 0: its run-history quota.
+    namespace_alter = 0x64,
 
     // ── Actions ──
     action_register = 0x70,
@@ -188,6 +190,9 @@ pub const EntryType = enum(u8) {
     settings_node_del = 0x92,
     settings_budget_clean = 0x93,
     settings_budget_bind = 0x94,
+    /// The run-history quota parts a shard holds, bound by its own leader
+    /// from what shard 0 published.
+    settings_quota_bind = 0x95,
 
     // ── Channels (messages between groups) ──
     channel_inbound = 0xA0,
@@ -200,7 +205,7 @@ pub const EntryType = enum(u8) {
     pub fn hasKeyValue(self: EntryType) bool {
         return switch (self) {
             .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch, .kv_reap => false,
-            .namespace_create => false,
+            .namespace_create, .namespace_alter => false,
             .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_run_delete => false,
             .step_call_retry, .step_call_clear, .call_reply, .call_done, .action_abandon_send, .action_abandon => false,
             .child_start, .child_refuse => false,
@@ -216,7 +221,7 @@ pub const EntryType = enum(u8) {
             // A sink batch's payload is a schema (`protocol/processing_entries.zig`).
             .processing_sink_batch => false,
             // Cluster-settings entries touch no namespace projection; they are node-level state on shard 0.
-            .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean, .settings_budget_bind => false,
+            .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean, .settings_budget_bind, .settings_quota_bind => false,
             // A message's own target says what it touches, at its apply.
             .channel_inbound, .channel_trim, .channel_probe, .channel_unpark => false,
             .raft_config, .raft_noop, .raft_snapshot, .repair_skip => false,

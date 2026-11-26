@@ -68,13 +68,17 @@ pub const OpCode = enum(u16) {
     system_holds_run = 0x003,
     /// A shard asking another for its page of a workflow's runs.
     system_runs_page = 0x002,
+    /// A shard asking another for a namespace's quota part and usage there.
+    system_history_quota = 0x004,
 
     // ── Namespace (0x010 – 0x02F) ────────────────────────────────────────────
     namespace_create = 0x010,
     namespace_delete = 0x011,
     namespace_list = 0x012,
     namespace_info = 0x013,
-    // 0x014 and 0x015 were namespace settings, never supported; retired.
+    /// A namespace's settings set: its run-history quota. (0x014 was a
+    /// settings op no release supported; 0x015 stays retired.)
+    namespace_alter = 0x014,
     /// A shard asking shard 0 for a namespace's id, creating it if new.
     namespace_ensure = 0x016,
     namespace_published = 0x017,

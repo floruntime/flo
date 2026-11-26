@@ -78,19 +78,31 @@ test "e2e/decode: requests whose lengths or types don't fit are answered, and th
     try alive(ctx);
 }
 
-test "e2e/decode: the retired namespace settings codes and an internal op are unknown to a client, and the node keeps serving" {
+test "e2e/decode: a client's alter is refused for the admin socket, the retired code and the internal ops are unknown to it, and the node keeps serving" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     var out: [512]u8 = undefined;
-    // A block the old settings format would have applied, then namespace.ensure,
-    // which only another shard sends.
+    // namespace.alter (0x014) is served on the admin socket only: a client's
+    // is refused before anything is proposed, so the default's quota stays.
+    var ab: [64]u8 = undefined;
+    const alter = try @import("src").protocol.namespace_ops.op("namespace.alter").request.encodeInto(&ab, .{ .history_quota_mode = .none, .history_quota_bytes = null });
+    const refused = try rawCall(ctx, .namespace_alter, "", "default", alter, &out);
+    try testing.expectEqual(@backingInt(proto.StatusCode.unauthorized), refused.status);
+    try testing.expect(std.mem.startsWith(u8, refused.data, "unauthorized: this op is served only on the node's admin socket"));
+    var default_info = try ctx.cli.run(&.{ "ns", "info", "default" });
+    defer default_info.deinit();
+    try stdx.testing.assertContains(default_info, "History quota: 10.0 GiB over every shard (the default)");
+    // A block the old settings format would have applied (0x015, retired),
+    // then namespace.ensure, which only another shard sends, and the quota
+    // gather, which only shard 0 sends.
     for ([_]struct { code: u16, says: []const u8 }{
-        .{ .code = 0x014, .says = "unknown op 0x14" },
         .{ .code = 0x015, .says = "unknown op 0x15" },
         .{ .code = @backingInt(proto.OpCode.namespace_ensure), .says = "unknown op 0x16" },
+        .{ .code = @backingInt(proto.OpCode.system_history_quota), .says = "unknown op 0x4" },
     }) |c| {
         const r = try rawCall(ctx, @fromBackingInt(c.code), "fresh", "default", &.{ 1, 6, 60, 0, 0, 0 }, &out);
+        if (!std.mem.eql(u8, c.says, r.data)) std.debug.print("code 0x{x}: status {d} {s}\n", .{ c.code, r.status, r.data });
         try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
         try testing.expectEqualStrings(c.says, r.data);
     }

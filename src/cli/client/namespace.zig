@@ -21,6 +21,12 @@ pub fn list(client: *Client, cursor: []const u8) !Response {
     return client.call(namespace_ops.op("namespace.list"), "", "", .{ .limit = namespace_ops.MAX_LIST, .cursor = cursor });
 }
 
+/// Set `name`'s run-history quota: the default, none, or `bytes` over every
+/// shard (with the bytes mode only).
+pub fn alter(client: *Client, name: []const u8, mode: namespace_ops.QuotaMode, bytes: ?u64) !Response {
+    return client.call(namespace_ops.op("namespace.alter"), "", name, .{ .history_quota_mode = mode, .history_quota_bytes = bytes });
+}
+
 pub fn info(client: *Client, name: []const u8) !Response {
     return client.call(namespace_ops.op("namespace.info"), "", name, .{});
 }

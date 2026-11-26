@@ -71,6 +71,17 @@ pub const Table = struct {
     /// Shard 0's log index of the last change the table holds. Every entry
     /// at or below it is published.
     published_index: Atomic(u64) = .init(0),
+    /// Each id's run-history quota over every shard (none is
+    /// `maxInt(u64)`), and shard 0's log index that set it. An index of 0
+    /// is none published yet: shard 0 publishes a namespace's quota before
+    /// its name, and every name's at boot. The quota is stored before its
+    /// index, and a reader loads the index first.
+    quotas: [CAPACITY]Atomic(u64) = @splat(.init(0)),
+    quota_indexes: [CAPACITY]Atomic(u64) = @splat(.init(0)),
+    /// Moves on every quota published: a shard that found nothing to bind
+    /// over a whole walk of the table at one epoch has nothing to bind
+    /// until it moves.
+    quota_epoch: Atomic(u64) = .init(0),
 
     /// A table holding the reserved names, published before any entry.
     pub fn create(allocator: Allocator) !*Table {
@@ -112,6 +123,30 @@ pub const Table = struct {
             }
         }
         if (index > self.published_index.load(.monotonic)) self.published_index.store(index, .release);
+    }
+
+    /// Publish `id`'s quota `quota`, set at shard 0's log index `index`.
+    /// Shard 0's thread only; an index at or below the one published
+    /// changes nothing.
+    pub fn publishQuota(self: *Table, id: Id, quota: u64, index: u64) void {
+        std.debug.assert(id != INVALID and id.int() < CAPACITY and index > 0);
+        if (index <= self.quota_indexes[id.int()].load(.monotonic)) return;
+        self.quotas[id.int()].store(quota, .release);
+        self.quota_indexes[id.int()].store(index, .release);
+        _ = self.quota_epoch.fetchAdd(1, .release);
+    }
+
+    pub fn quotaEpoch(self: *const Table) u64 {
+        return self.quota_epoch.load(.acquire);
+    }
+
+    /// `id`'s quota as published, and the index that set it; null for none
+    /// published yet.
+    pub fn quotaOf(self: *const Table, id: Id) ?struct { quota: u64, index: u64 } {
+        if (id == INVALID or id.int() >= CAPACITY) return null;
+        const index = self.quota_indexes[id.int()].load(.acquire);
+        if (index == 0) return null;
+        return .{ .quota = self.quotas[id.int()].load(.acquire), .index = index };
     }
 
     /// The id published for `name`, or null.
