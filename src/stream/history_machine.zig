@@ -1218,14 +1218,26 @@ test "history usage: a chunk counts its whole message; folds, ends and drops kee
 }
 
 test "history usage: a lost chunk counts nothing, and a run ended at its live rows keeps their bytes" {
+    const hq = @import("../budget/history_quota.zig");
     var t = H.init();
     defer t.deinit();
     const r: H.Run = .{};
     try t.chunk(r, 1, 1, false, 0);
+    // A chunk that lands moves its bytes from the lane to usage: the
+    // namespace's in-flight history, what its quota holds steps at, stays
+    // where it was, and nothing is eased.
+    const in_flight = hq.inFlight(t.read(), r.ns);
+    try testing.expect(in_flight > 0);
+    try t.pump();
+    try testing.expectEqual(in_flight, hq.inFlight(t.read(), r.ns));
+    try testing.expect(!t.store.quota_eased.any());
     try t.chunk(r, 2, 2, true, 700);
     // Seq 2 lost; then its fold (3) and both resends (4, 5).
     t.skip = &.{ 2, 3, 4, 5 };
     try t.pump();
+    // Lost, its bytes left the lane for nothing: the namespace is eased.
+    try testing.expect(t.store.quota_eased.has(r.ns.int()));
+    try testing.expect(!t.store.quota_eased.has(r.ns.int() + 1));
     var rows: [4]Row.Value = undefined;
     const got = t.live(r, &rows);
     try testing.expectEqual(@as(usize, 2), got.len);

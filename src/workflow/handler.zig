@@ -10911,3 +10911,70 @@ test "a child its shard is at its memory share for is answered over_budget by it
     try testing.expectEqual(calls_mod.State.over_budget, c.state);
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.inspect(testKey(.default, "par")).?.status);
 }
+
+test "workflow quota: a step at its namespace's quota is held without a copy, asked again only once the namespace eases, and indexed again from its wait" {
+    const Eased = @import("../contract/store.zig").Eased;
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    const store = &shard.defaultPartition().store;
+    const key = testKey(.default, "run-h");
+    const quota: WorkflowHandler.Hold = .{ .ns = .default, .kind = .quota };
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    createTestRun(&handler, key, "run-h", "test-wf");
+
+    // At its part: no step proposed, no copy taken, out of `to_step`.
+    try hq.setForTest(store, .default, 1 << 30, 1 << 30);
+    const before = shard.raft_node.log.lastIndex();
+    handler.advanceWorkflow(&shard, key);
+    try testing.expectEqual(before, shard.raft_node.log.lastIndex());
+    try testing.expectEqual(@as(usize, 1), handler.holdCount(quota));
+    try testing.expect(!handler.to_step.contains(key));
+    try testing.expect(handler.runs.get(key) == null);
+    // Passes ask nothing of it: still held, nothing proposed.
+    handler.checkPendingActions(&shard);
+    handler.advanceStartedRuns(&shard);
+    try testing.expectEqual(@as(usize, 1), handler.holdCount(quota));
+    try testing.expectEqual(before, shard.raft_node.log.lastIndex());
+
+    // Under the part, but nothing eased it: no poll finds it.
+    try hq.setForTest(store, .default, 1 << 30, 0);
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(@as(usize, 1), handler.holdCount(quota));
+    // Another namespace eased: this one's hold isn't asked.
+    var other: Eased = .{};
+    other.add(TEST_NS_A.int());
+    handler.noteEased(other);
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(@as(usize, 1), handler.holdCount(quota));
+    // Its own eased: released, back in `to_step` (it waits on nothing).
+    var own: Eased = .{};
+    own.add(NamespaceId.default.int());
+    handler.noteEased(own);
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(@as(usize, 0), handler.holdCount(quota));
+    try testing.expect(handler.to_step.contains(key));
+    try testing.expect(!handler.quota_eased.any());
+
+    // Eased while still at the part: one ask, and it stays held.
+    try hq.setForTest(store, .default, 1 << 30, 1 << 30);
+    handler.advanceWorkflow(&shard, key);
+    try testing.expectEqual(@as(usize, 1), handler.holdCount(quota));
+    handler.noteEased(own);
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(@as(usize, 1), handler.holdCount(quota));
+    try testing.expect(!handler.quota_eased.any());
+    // A new term drops the held set and the eased marks: the next leader
+    // rebuilds from the store, so nothing stays held on a stale verdict.
+    handler.noteEased(own);
+    handler.clearCaches();
+    try testing.expectEqual(@as(usize, 0), handler.holdCount(quota));
+    try testing.expect(!handler.quota_eased.any());
+}
