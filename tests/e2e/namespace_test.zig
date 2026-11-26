@@ -790,6 +790,13 @@ test "e2e/namespace: on 12 shards, in a namespace of its own, a call and a child
     const kids = (try reservesOn(ctx, ns, shardIn(kid))).workflow;
     try ctx.exec(&.{ "workflow", "start", caller, "{}", "--run-id", "qc-call-1", "-n", ns });
     try ctx.exec(&.{ "workflow", "start", parent, "{}", "--run-id", "qc-par-1", "-n", ns });
+    // Each parent's run is on its own shard, read from the server: its
+    // reserve is there, and neither target's shard holds it.
+    try testing.expect(shardIn(caller) != shardIn(act) and shardIn(parent) != shardIn(kid));
+    try testing.expect((try reservesOn(ctx, ns, shardIn(caller))).workflow > 0);
+    try testing.expect((try reservesOn(ctx, ns, shardIn(parent))).workflow > 0);
+    try testing.expectEqual(@as(u64, 0), (try reservesOn(ctx, ns, shardIn(act))).workflow);
+    try testing.expectEqual(kids, (try reservesOn(ctx, ns, shardIn(kid))).workflow);
     try ctx.exec(&.{ "workflow", "signal", "qc-call-1", "--type", "go", "-n", ns });
     try ctx.exec(&.{ "workflow", "signal", "qc-par-1", "--type", "go", "-n", ns });
     // Both wait, said once, with the target's figures.
@@ -797,7 +804,10 @@ test "e2e/namespace: on 12 shards, in a namespace of its own, a call and a child
         if (!try historyShows(ctx, ns, run, "call_held_over_quota")) return error.NotHeld;
         var h = try ctx.cli.run(&.{ "workflow", "history", run, "-n", ns });
         defer h.deinit();
-        try testing.expect(std.mem.indexOf(u8, h.stdout, "limit: ns ") != null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, h.stdout, "call_held_over_quota"));
+        var wb: [48]u8 = undefined;
+        const want = try std.fmt.bufPrint(&wb, "limit: ns {d} history ", .{@import("src").namespace_table.FIRST_ALLOCATED.int()});
+        try testing.expect(std.mem.indexOf(u8, h.stdout, want) != null);
         var st = try ctx.cli.run(&.{ "workflow", "status", run, "-n", ns });
         defer st.deinit();
         try testing.expect(!st.contains("failed"));
