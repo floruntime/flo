@@ -181,6 +181,8 @@ pub const WorkflowRuns = struct {
     quota_cap: ?u64 = null,
     /// The runs that took their one step in flight past the part.
     held_stepped: [RUNS.len]bool = @splat(false),
+    /// How many times its runs reached the part.
+    quota_crossings: u64 = 0,
 
     /// What a run waits for, as its last step set it.
     const WaitL = struct {
@@ -1014,6 +1016,7 @@ pub const WorkflowRuns = struct {
         }
         const now = hq.inFlight(rv, NS);
         const cap = self.quota_cap orelse {
+            self.quota_crossings += 1;
             self.quota_cap = now +| hq.reservedOf(hq.WorkflowReserved, rv, NS) +| hq.reservedOf(hq.ActionReserved, rv, NS);
             return null;
         };

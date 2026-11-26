@@ -2208,7 +2208,18 @@ pub const Simulator = struct {
         } else blk: {
             const Item = settings_entries.QuotaItem;
             var items: [settings_entries.MAX_QUOTA_BINDS]Item.Value = undefined;
-            const n = target.quota_walk.due(target.ns.handler.table, .{ .store = &target.actions.store }, target.raft.current_term, 1, &items);
+            // Now and then a part either side of the workflow runs'
+            // in-flight history, below any quota an alter can set: a run's history
+            // here is far smaller than the floor, and this is how the step
+            // hold, the usage arm and their rules are met. The walk binds
+            // the published part again after it.
+            const wf_read: @import("../contract/view.zig").ReadView = .{ .store = &target.wf_defs.store };
+            const hq = @import("../budget/history_quota.zig");
+            const bound = settings_machine.boundQuota(wf_read, .default);
+            const n: usize = if (bound != null and r.uintLessThan(u8, 3) == 0) blk2: {
+                items[0] = .{ .ns = @import("../namespace/table.zig").Id.default.int(), .part_bytes = @max(1, if (r.boolean()) hq.inFlight(wf_read, .default) +| r.uintLessThan(u64, 16 * 1024) else hq.inFlight(wf_read, .default) -| r.uintLessThan(u64, 4 * 1024)), .published_index = bound.?.published_index };
+                break :blk2 1;
+            } else target.quota_walk.due(target.ns.handler.table, .{ .store = &target.actions.store }, target.raft.current_term, 1, &items);
             if (n == 0) return;
             var ib: [settings_entries.MAX_QUOTA_BINDS * Item.max_size]u8 = undefined;
             var w: schema.Writer = .{ .buf = &ib };
@@ -2228,6 +2239,14 @@ pub const Simulator = struct {
     pub fn quotaRefusals(self: *const Simulator) u64 {
         var most: u64 = 0;
         for (self.nodes) |*node| most = @max(most, node.actions.store.quota_refusals + node.wf_defs.store.quota_refusals);
+        return most;
+    }
+
+    /// The most times any one replica's workflow runs reached their part
+    /// and were held there: a run's evidence the step hold's rule was met.
+    pub fn quotaHeld(self: *const Simulator) u64 {
+        var most: u64 = 0;
+        for (self.nodes) |*node| most = @max(most, node.wf_runs.quota_crossings);
         return most;
     }
 

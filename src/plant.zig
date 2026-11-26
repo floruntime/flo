@@ -163,8 +163,8 @@ pub const Plant = enum {
     /// A history message a repair skipped leaves its bytes untaken: its
     /// namespace's in-flight history counts it until the trim.
     history_skip_untaken,
-    /// A workflow run reserves an eighth of what its history may still add
-    /// past the part: its step in flight and its end go uncounted.
+    /// A workflow run reserves nothing for what its history may still add
+    /// past the part: its step in flight, its wake and its end go uncounted.
     quota_reserve_omits_step,
 };
 
