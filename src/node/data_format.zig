@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 75;
+pub const CURRENT: u32 = 76;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -273,8 +273,14 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     .{ .format = 74, .segment_version = 44, .entries = 0x8aa1807f14af4929 },
     // A namespace's run-history quota enforced at admission: each live run's
     // reserve (workflow.reserved, action.reserved), the over_quota answer
-    // and call state, and a run's progress noting a call held at the quota.
+    // and call state, a child's refusal saying why (child_refuse's `why`),
+    // and a run's progress noting a call held at the quota.
     .{ .format = 75, .segment_version = 45, .entries = 0x056c0002022ce186 },
+    // The quota's admission arms read a namespace's in-flight history: its
+    // usage and its history-lane bytes no inbound has taken
+    // (channel.out_ns's `delivered`), so which entries an apply refuses
+    // moves.
+    .{ .format = 76, .segment_version = 45, .entries = 0x056c0002022ce186 },
 };
 
 comptime {

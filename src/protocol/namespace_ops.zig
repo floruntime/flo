@@ -44,6 +44,8 @@ pub const ShardQuota = Record(&.{
     .{ .name = "orphan_bytes", .T = Int(u64), .doc = "Their bytes" },
     .{ .name = "reserved_workflow_bytes", .T = Int(u64), .doc = "What its live workflow runs may still add to their history here, bytes: a start is refused when usage and every reserve would pass the part" },
     .{ .name = "reserved_action_bytes", .T = Int(u64), .doc = "The same for its live action runs" },
+    .{ .name = "in_flight_bytes", .T = Int(u64), .doc = "Its usage and the history on its way to it, bytes: the namespace's workflow steps here are held once this reaches the part" },
+    .{ .name = "held_runs", .T = Optional(Int(u32)), .doc = "Workflow runs whose steps its leader holds at the quota; none when the node answering doesn't lead the shard" },
 });
 pub const ShardQuotas = schema.List(ShardQuota, MAX_SHARDS);
 
