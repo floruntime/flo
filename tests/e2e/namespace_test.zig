@@ -451,9 +451,9 @@ test "e2e/namespace: a namespace's run-history quota is bound on every shard, it
         try testing.expectEqual(@as(?u64, 10 << 30), info.value.history_quota);
         try testing.expect(!info.value.history_quota_own);
     }
-    try ctx.exec(&.{ "namespace", "alter", "hq", "--history-quota", "20GiB" });
+    try ctx.exec(&.{ "namespace", "alter", "hq", "--history-quota", "20GiB", "--config", ctx.server.config_file });
     try expectBound(ctx, "hq", shards, (20 << 30) / shards);
-    try ctx.exec(&.{ "namespace", "alter", "hq", "--history-quota", "none" });
+    try ctx.exec(&.{ "namespace", "alter", "hq", "--history-quota", "none", "--config", ctx.server.config_file });
     try expectBound(ctx, "hq", shards, null);
     {
         const info = try quotaInfo(ctx, "hq");
@@ -463,32 +463,43 @@ test "e2e/namespace: a namespace's run-history quota is bound on every shard, it
     }
     // Back to the default: its part is the default's again, and its own no
     // longer.
-    try ctx.exec(&.{ "namespace", "alter", "hq", "--history-quota", "default" });
+    try ctx.exec(&.{ "namespace", "alter", "hq", "--history-quota", "default", "--config", ctx.server.config_file });
     try expectBound(ctx, "hq", shards, (10 << 30) / shards);
     {
         const info = try quotaInfo(ctx, "hq");
         defer info.deinit();
         try testing.expect(!info.value.history_quota_own);
     }
-    try ctx.exec(&.{ "namespace", "alter", "hq", "--history-quota", "none" });
+    try ctx.exec(&.{ "namespace", "alter", "hq", "--history-quota", "none", "--config", ctx.server.config_file });
     try expectBound(ctx, "hq", shards, null);
     // The built-in default namespace takes one too.
     try expectBound(ctx, "default", shards, (10 << 30) / shards);
     // Below one run's reserve on every shard, refused by the server by
     // name; 0 refused by the CLI before it asks.
-    var low = try ctx.cli.run(&.{ "namespace", "alter", "hq", "--history-quota", "1KiB" });
+    var low = try ctx.cli.run(&.{ "namespace", "alter", "hq", "--history-quota", "1KiB", "--config", ctx.server.config_file });
     defer low.deinit();
     try stdx.testing.assertContains(low, "a history quota is at least");
     try stdx.testing.assertContains(low, "[bad_request/out_of_range]");
-    var zero = try ctx.cli.run(&.{ "namespace", "alter", "hq", "--history-quota", "0" });
+    var zero = try ctx.cli.run(&.{ "namespace", "alter", "hq", "--history-quota", "0", "--config", ctx.server.config_file });
     defer zero.deinit();
     try stdx.testing.assertContains(zero, "--history-quota is a number of bytes above 0");
-    var huge = try ctx.cli.run(&.{ "namespace", "alter", "hq", "--history-quota", "18446744073709551615" });
+    var huge = try ctx.cli.run(&.{ "namespace", "alter", "hq", "--history-quota", "18446744073709551615", "--config", ctx.server.config_file });
     defer huge.deinit();
     try stdx.testing.assertContains(huge, "--history-quota is a number of bytes above 0");
-    var missing = try ctx.cli.run(&.{ "namespace", "alter", "never-made", "--history-quota", "20GiB" });
+    var missing = try ctx.cli.run(&.{ "namespace", "alter", "never-made", "--history-quota", "20GiB", "--config", ctx.server.config_file });
     defer missing.deinit();
     try stdx.testing.assertContains(missing, "not found");
+    // The client port refuses an alter: it administers the node.
+    {
+        const src = @import("src");
+        var conn = src.cli_client.Client.init(testing.allocator, ctx.endpoint);
+        defer conn.deinit();
+        try conn.connect();
+        var r = try src.cli_client.namespace.alter(&conn, "hq", .bytes, 40 << 30);
+        defer r.deinit();
+        try testing.expectEqual(src.protocol.proto.StatusCode.unauthorized, r.status);
+        try testing.expectEqual(src.protocol.proto.Reason.admin_only, r.reason());
+    }
     // A refused alter changed nothing.
     try expectBound(ctx, "hq", shards, null);
 }
@@ -502,8 +513,8 @@ test "e2e/namespace: quotas set, rounded up per shard, and their binds come back
     // A quota that doesn't divide by the shards: each part rounds up.
     const odd: u64 = (20 << 30) + 1;
     var qb: [32]u8 = undefined;
-    try ctx.exec(&.{ "namespace", "alter", "hq-a", "--history-quota", try std.fmt.bufPrint(&qb, "{d}", .{odd}) });
-    try ctx.exec(&.{ "namespace", "alter", "hq-b", "--history-quota", "none" });
+    try ctx.exec(&.{ "namespace", "alter", "hq-a", "--history-quota", try std.fmt.bufPrint(&qb, "{d}", .{odd}), "--config", ctx.server.config_file });
+    try ctx.exec(&.{ "namespace", "alter", "hq-b", "--history-quota", "none", "--config", ctx.server.config_file });
     const part = (odd + shards - 1) / shards;
     try expectBound(ctx, "hq-a", shards, part);
     try expectBound(ctx, "hq-b", shards, null);
@@ -524,5 +535,41 @@ test "e2e/namespace: quotas set, rounded up per shard, and their binds come back
             try testing.expect(s.bound);
             try testing.expectEqual(@as(?u64, null), s.part_bytes);
         }
+    }
+}
+
+test "e2e/namespace: on three nodes, an alter through any member's admin socket, the followers' too, is carried to the leader and bound" {
+    var cluster = try stdx.testing.ClusterContext.init(testing.allocator, .{ .node_count = 3 });
+    defer cluster.deinit();
+    try cluster.execOnWithRetry(0, &.{ "namespace", "create", "hq-c" }, 20, 250);
+    // Each member in turn sets its own figure, and each is bound before the
+    // next: at least two of them are followers.
+    for (0..3) |node| {
+        var qb: [16]u8 = undefined;
+        const q = try std.fmt.bufPrint(&qb, "{d}GiB", .{20 + node});
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            cluster.execAdminOn(node, &.{ "namespace", "alter", "hq-c", "--history-quota", q }) catch |err| {
+                if (tries >= 20) return err;
+                stdx.time.sleep(250 * std.time.ns_per_ms);
+                continue;
+            };
+            break;
+        }
+        const bytes: u64 = (20 + node) << 30;
+        var want_buf: [96]u8 = undefined;
+        const want = try std.fmt.bufPrint(&want_buf, "\"bound\":true,\"part_bytes\":{d}", .{bytes});
+        var seen = false;
+        var polls: usize = 0;
+        while (!seen and polls < 100) : (polls += 1) {
+            const out = cluster.execCaptureAnyOn(node, &.{ "namespace", "info", "hq-c", "-o", "json" }) catch {
+                stdx.time.sleep(100 * std.time.ns_per_ms);
+                continue;
+            };
+            defer testing.allocator.free(out);
+            seen = std.mem.indexOf(u8, out, want) != null;
+            if (!seen) stdx.time.sleep(100 * std.time.ns_per_ms);
+        }
+        try testing.expect(seen);
     }
 }

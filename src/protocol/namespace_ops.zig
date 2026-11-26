@@ -108,7 +108,9 @@ pub const table = [_]ops.Op{
     .{
         .name = "namespace.alter",
         .code = 0x014,
-        .class = .write,
+        // Administers the node: only its admin socket (or a peer carrying
+        // one) may set a quota, until clients authenticate.
+        .class = .admin,
         .scope = .server,
         .route = .shard0,
         .request = Record(&.{
@@ -117,7 +119,7 @@ pub const table = [_]ops.Op{
         }),
         .response = Record(&.{}),
         .cli = .{ .expose = .hand, .key = name_key, .examples = &.{ "flo namespace alter myapp --history-quota 20GiB", "flo namespace alter myapp --history-quota none" } },
-        .doc = "Set a namespace's run-history quota. Its one setting: a second setting must add a way to leave it unchanged. Not a privileged action yet: any client can change any namespace's quota.",
+        .doc = "Set a namespace's run-history quota, on the node's admin socket only. Its one setting: a second setting must add a way to leave it unchanged.",
     },
     .{
         .name = "namespace.ensure",

@@ -16,6 +16,8 @@ const output = @import("../output.zig");
 const cli_config = @import("../config.zig");
 const schema = @import("../../protocol/schema.zig");
 const namespace_ops = @import("../../protocol/namespace_ops.zig");
+const server_cmd = @import("server.zig");
+const stdx = @import("stdx");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -87,13 +89,15 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
         .subcommand(
             commander.newBuilder(allocator)
                 .name("alter")
-                .about("Set a namespace's run-history quota, over every shard. Not a privileged action yet: any client can change any namespace's quota")
+                .about("Set a namespace's run-history quota, over every shard. It administers the node: run it on a node, where it goes to the admin socket, then to the leader")
                 .examples(&.{
                     "flo namespace alter myapp --history-quota 20GiB",
                     "flo namespace alter myapp --history-quota none",
                 })
                 .arg("name", "Name of the namespace")
                 .stringFlag("history-quota", 0, "", "Bytes over every shard (a number, or with KiB, MiB, GiB or TiB), none to turn it off, or default for the server's")
+                .stringFlag("config", 'c', "", "The node's config, naming its data directory or [admin] socket")
+                .stringFlag("data-dir", 'd', "", "The node's data directory (overrides the config)")
                 .action(wrapHandler(runAlter)),
         )
         .build();
@@ -219,10 +223,22 @@ fn runAlter(ctx: *commander.Context) commander.Error!void {
     const text = ctx.getString("history-quota") orelse "";
     if (text.len == 0) return outcome.usage(ctx, "give --history-quota <bytes|none|default>", .{});
     const quota = parseQuota(text) catch return outcome.usage(ctx, "--history-quota is a number of bytes above 0 and below 2^64 - 1 (optionally with KiB, MiB, GiB or TiB), none, or default", .{});
-    const endpoint = cli_config.getEndpoint(ctx);
-    var client = Client.init(ctx.allocator, endpoint);
+    // It administers the node: the client port refuses it, so it goes over
+    // the node's admin socket, which carries it to shard 0's leader.
+    if (ctx.flagChanged("endpoint") or ctx.flagChanged("port"))
+        return outcome.usage(ctx, "-e/--endpoint and -p/--port name a server to talk to, but this command goes to a node's admin socket; name the node with --config/--data-dir and run it on a member", .{});
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try server_cmd.adminSocketPath(ctx, &path_buf);
+    if (path.len > stdx.net.UNIX_PATH_MAX)
+        return outcome.localRefusal(ctx, "the admin socket {s} is {d} bytes, past the {d} a Unix socket path may hold, so the node started without one. Set [admin] socket to a shorter path in its config and restart it", .{ path, path.len, stdx.net.UNIX_PATH_MAX });
+    var client = Client.init(ctx.allocator, path);
     defer client.deinit();
-    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
+    client.connectUnix(path) catch |err| return switch (err) {
+        error.ConnectionRefused => outcome.localRefusal(ctx, "no server listens on the admin socket {s}: is a node running on this data directory? One that started without its socket logged why", .{path}),
+        error.PermissionDenied => outcome.localRefusal(ctx, "permission denied on the admin socket {s}: run as the user the server runs as", .{path}),
+        error.NotOurs => outcome.localRefusal(ctx, "{s} isn't a socket you own, so it isn't your server's admin socket: run as the user the server runs as, or check [admin] socket", .{path}),
+        else => outcome.localRefusal(ctx, "cannot connect to the admin socket {s}: {s}", .{ path, @errorName(err) }),
+    };
     var result = client_mod.namespace.alter(&client, name, quota.mode, quota.bytes) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
     try outcome.check(ctx, result);
