@@ -62,7 +62,6 @@ const Flags = entry_mod.Flags;
 const native_registry = @import("operators/native_registry.zig");
 const kv_lookup_mod = @import("operators/kv_lookup.zig");
 const sink_payload = @import("sink_payload.zig");
-const persistence = @import("../storage/persistence.zig");
 const sinks_machine = @import("sinks_machine.zig");
 const pe = @import("../protocol/processing_entries.zig");
 const ce = @import("../protocol/channel_entries.zig");
@@ -292,6 +291,12 @@ pub const ProcessingHandler = struct {
             self.seen_at_ms = now_ms;
         }
 
+        /// Whether any of its sinks writes time series.
+        pub fn hasTsSink(self: *const PipelineState) bool {
+            for (self.sinks) |snk| if (snk.kind == .ts) return true;
+            return false;
+        }
+
         /// How far behind its field's newest point the next read stops:
         /// `lateness_ms`, so a point that arrives up to that late is still
         /// ahead of the cursor; 0 once the field has had no write for that
@@ -301,11 +306,6 @@ pub const ProcessingHandler = struct {
         /// window, 0 while it hasn't: a read of another shard's field sends
         /// it, and that shard releases the window only if its own count is
         /// still the same.
-        pub fn hasTsSink(self: *const PipelineState) bool {
-            for (self.sinks) |snk| if (snk.kind == .ts) return true;
-            return false;
-        }
-
         pub fn idleAt(self: *const PipelineState, now_ms: u64) u64 {
             if (self.lateness_ms == 0 or !self.seen_known) return 0;
             const writes = self.seen_writes orelse return 0;
@@ -1492,11 +1492,15 @@ pub const ProcessingHandler = struct {
 
     /// `{"measurement":<name>,"field":<name>,"value":<v>,"timestamp_ms":<ms>,
     /// "tags":{<key>:<value>,...}}`: a point as its operators and its
-    /// stream and queue sinks see it. Names and tags are JSON strings
-    /// escaped so a sink's field read gives back their exact bytes; a
-    /// non-finite value is null. `tags` is the point's canonical tag string,
-    /// each pair split at its first `=` (a pair without one is a key whose
-    /// value is empty).
+    /// stream and queue sinks see it, always JSON the operators read.
+    /// `tags` is the point's canonical tag string, each pair split at its
+    /// first `=` (a pair without one is a key whose value is empty). A key
+    /// given twice keeps its first pair in that sorted string, and a key
+    /// that isn't UTF-8 is left out: neither has a place in a JSON object.
+    /// The point keeps all its tags, which a TS sink writes. Names and tag
+    /// values are JSON strings a sink's field read gives back exactly; one
+    /// that isn't UTF-8 is written as an array of its byte values. A
+    /// non-finite value is null.
     fn tsPointJson(allocator: Allocator, measurement: []const u8, field: []const u8, value: f64, ts_ms: i64, tags: []const u8) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
@@ -1512,27 +1516,49 @@ pub const ProcessingHandler = struct {
         try jw.objectField("field");
         try jw.write(field);
         try jw.objectField("value");
-        if (std.math.isFinite(value)) try jw.write(value) else try jw.write(null);
+        try writeNumber(jw, value);
         try jw.objectField("timestamp_ms");
         try jw.write(ts_ms);
         try jw.objectField("tags");
         try jw.beginObject();
+        var keys: [ts_mod.MAX_TAGS][]const u8 = undefined;
+        var n: usize = 0;
         var it = std.mem.splitScalar(u8, tags, ',');
-        while (it.next()) |pair| {
+        pairs: while (it.next()) |pair| {
             if (pair.len == 0) continue;
             const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
-            try jw.objectField(pair[0..eq]);
+            const key = pair[0..eq];
+            if (!std.unicode.utf8ValidateSlice(key)) continue;
+            for (keys[0..n]) |k| if (std.mem.eql(u8, k, key)) continue :pairs;
+            // A canonical tag string holds at most MAX_TAGS pairs.
+            if (n == keys.len) break;
+            keys[n] = key;
+            n += 1;
+            try jw.objectField(key);
             try jw.write(if (eq < pair.len) pair[eq + 1 ..] else "");
         }
         try jw.endObject();
         try jw.endObject();
     }
 
-    /// The longest record `tsPointJson` makes: every byte of the
-    /// measurement, field and tags escaped as `\u00XX`, plus the keys and
-    /// numbers. A stored point's field and tags together fit the TS write's
-    /// value buffer.
-    pub const MAX_TS_POINT_JSON: usize = 6 * (persistence.MAX_ENTRY_KEY + ts_mod.MAX_TAG_STRING + 512) + 256;
+    /// A finite value in a form every operator reads as a number: plain
+    /// between 1e-6 and 2^53, where it is exact and short, and with an
+    /// exponent outside it (a long run of digits parses as text, and a
+    /// tiny value would print hundreds of zeros). Non-finite is null.
+    fn writeNumber(jw: *std.json.Stringify, value: f64) std.json.Stringify.Error!void {
+        if (!std.math.isFinite(value)) return jw.write(null);
+        const mag = @abs(value);
+        if (mag == 0 or (mag >= 1e-6 and mag < 9007199254740992.0)) return jw.write(value);
+        return jw.print("{e}", .{value});
+    }
+
+    /// The longest record `tsPointJson` makes. A stored point's field and
+    /// tags together fit the TS write's value buffer (less its 20-byte
+    /// header); every byte of them and of the measurement escapes to at most
+    /// six, which also covers a tag's `=` and `,` turning into quotes and
+    /// separators. The rest is the keys, the value (at most ~24 bytes, as
+    /// writeNumber prints it) and the timestamp.
+    pub const MAX_TS_POINT_JSON: usize = 6 * (persistence_mod.MAX_ENTRY_KEY + ts_mod.MAX_TAG_STRING + 512) + 256;
     comptime {
         // A point's record always fits a queue message and a stream sink's
         // payload, so a sink never refuses one for its size.
@@ -2001,10 +2027,15 @@ pub const ProcessingHandler = struct {
             // Apply operator chain (or pass through directly). A record
             // the chain failed on is counted and skipped: passing it through
             // raw would write what the operators were there to change.
-            const output_records = applyOperatorChain(pipe.operators, json, ts_ms, arena.allocator()) catch |err| blk: {
+            var skips: Skips = .{};
+            const output_records = applyOperatorChain(pipe.operators, json, ts_ms, arena.allocator(), &skips) catch |err| blk: {
                 self.noteChainError(shard, err);
                 break :blk @as(?[]const ProcessingRecord, &.{});
             };
+            if (skips.n > 0) {
+                var sb: [48]u8 = undefined;
+                skips.note(self, shard, std.fmt.bufPrint(&sb, "point {d}/{d}", .{ pt.timestamp_ns, pt.ual }) catch "a point");
+            }
             if (output_records) |records| {
                 // A TS sink writes what the operators made of the point: its
                 // record's `value`. Tags and time stay the point's, whatever
@@ -2059,10 +2090,15 @@ pub const ProcessingHandler = struct {
         for (payloads, ids) |payload, id| {
             defer _ = arena.reset(.retain_capacity);
             batch.beginRecord();
-            const output_records = applyOperatorChain(pipe.operators, payload, @import("stdx").time.milliTimestamp(), arena.allocator()) catch |err| blk: {
+            var skips: Skips = .{};
+            const output_records = applyOperatorChain(pipe.operators, payload, @import("stdx").time.milliTimestamp(), arena.allocator(), &skips) catch |err| blk: {
                 self.noteChainError(shard, err);
                 break :blk @as(?[]const ProcessingRecord, &.{});
             };
+            if (skips.n > 0) {
+                var sb: [48]u8 = undefined;
+                skips.note(self, shard, std.fmt.bufPrint(&sb, "record {d}-{d}", .{ id.timestamp_ms, id.sequence }) catch "a record");
+            }
             if (output_records) |records| {
                 for (records) |rec| self.writeSinkRecordFromStream(batch, pipe, shard, arena.allocator(), rec.key, rec.value, rec.tags);
             } else {
@@ -2497,7 +2533,19 @@ pub const ProcessingHandler = struct {
     /// and what they point at, is in `arena`, which the caller frees (or
     /// resets) once it has written them; a record may also point into
     /// `value`, which must live as long.
-    fn applyOperatorChain(operators: []Operator, value: []const u8, event_time_ms: i64, arena: Allocator) !?[]const ProcessingRecord {
+    /// The records an operator skipped because it couldn't read them: how
+    /// many, and the last one's reason.
+    pub const Skips = struct {
+        n: u32 = 0,
+        why: []const u8 = "",
+
+        /// Each skipped record counted as dropped, in the job's status.
+        fn note(self: Skips, handler: *ProcessingHandler, shard: *Shard, at: []const u8) void {
+            for (0..self.n) |_| handler.noteDrop(shard, at, self.why);
+        }
+    };
+
+    fn applyOperatorChain(operators: []Operator, value: []const u8, event_time_ms: i64, arena: Allocator, skips: *Skips) !?[]const ProcessingRecord {
         if (operators.len == 0) return null;
         var collector = OutputCollector.init(arena);
         var metrics = OperatorMetrics{};
@@ -2508,15 +2556,28 @@ pub const ProcessingHandler = struct {
             .current_processing_time_ms = @import("stdx").time.milliTimestamp(),
             .operator_name = "",
         };
-        try operators[0].processElement(ProcessingRecord.fromValue(value, event_time_ms), &ctx);
+        try runOperator(operators[0], ProcessingRecord.fromValue(value, event_time_ms), &ctx, skips);
         // Each operator takes the one before's output; a staged record and
         // what it points at stay in the arena, so one passed through, still
         // pointing at them, stays good.
         for (operators[1..]) |op| {
             const staged = try collector.records.toOwnedSlice(arena);
-            for (staged) |rec| try op.processElement(rec, &ctx);
+            for (staged) |rec| try runOperator(op, rec, &ctx, skips);
         }
         return collector.records.items;
+    }
+
+    /// One record through one operator: one it skips is counted in `skips`
+    /// and the chain goes on with the others.
+    fn runOperator(op: Operator, rec: ProcessingRecord, ctx: *OperatorContext, skips: *Skips) !void {
+        op.processElement(rec, ctx) catch |err| switch (err) {
+            error.RecordSkipped => {
+                skips.n += 1;
+                skips.why = ctx.skipped orelse "an operator skipped it";
+                ctx.skipped = null;
+            },
+            else => return err,
+        };
     }
 
     /// A pipeline that can't read, at a poll: counted, and logged once a
@@ -3031,7 +3092,8 @@ test "ProcessingHandler: init and deinit" {
 }
 
 test "ProcessingHandler: applyOperatorChain with no operators returns null" {
-    const result = try ProcessingHandler.applyOperatorChain(&.{}, "hello", 100, std.testing.allocator);
+    var skips: ProcessingHandler.Skips = .{};
+    const result = try ProcessingHandler.applyOperatorChain(&.{}, "hello", 100, std.testing.allocator, &skips);
     try std.testing.expect(result == null);
 }
 
@@ -3050,7 +3112,8 @@ test "ProcessingHandler: applyOperatorChain with passthrough operator" {
     var ops = [_]Operator{create_result.op};
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const result = try ProcessingHandler.applyOperatorChain(&ops, "test-value", 42, arena.allocator());
+    var skips: ProcessingHandler.Skips = .{};
+    const result = try ProcessingHandler.applyOperatorChain(&ops, "test-value", 42, arena.allocator(), &skips);
     try std.testing.expect(result != null);
     const records = result.?;
 
@@ -3079,7 +3142,8 @@ test "ProcessingHandler: applyOperatorChain with filter operator rejects" {
     var ops = [_]Operator{create_result.op};
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const result = try ProcessingHandler.applyOperatorChain(&ops, "some-data", 0, arena.allocator());
+    var skips: ProcessingHandler.Skips = .{};
+    const result = try ProcessingHandler.applyOperatorChain(&ops, "some-data", 0, arena.allocator(), &skips);
     try std.testing.expect(result != null);
     const records = result.?;
     // key_not_empty filter rejects records with empty key
@@ -3116,7 +3180,8 @@ test "ProcessingHandler: a flatmap, map, pass-through and aggregate chain frees 
     const input = "{\"items\":[{\"k\":\"a\",\"v\":1},{\"k\":\"b\",\"v\":2},{\"k\":\"a\",\"v\":3}]}";
     for (0..1000) |i| {
         defer _ = arena.reset(.retain_capacity);
-        const records = (try ProcessingHandler.applyOperatorChain(&ops, input, @intCast(i), arena.allocator())).?;
+        var skips: ProcessingHandler.Skips = .{};
+        const records = (try ProcessingHandler.applyOperatorChain(&ops, input, @intCast(i), arena.allocator(), &skips)).?;
         // One aggregate result per element, keyed by its element's key.
         try std.testing.expectEqual(@as(usize, 3), records.len);
         try std.testing.expectEqualStrings("a", records[2].key);
@@ -3196,15 +3261,154 @@ test "ProcessingHandler: a TS source record carries the point's field and tags, 
 }
 
 test "ProcessingHandler: a TS source record at its longest stays within MAX_TS_POINT_JSON" {
-    // Every byte a control character, escaped six bytes wide.
-    const ctl = "\x01";
-    const measurement = comptime @import("stdx").repeat(ctl, persistence.MAX_ENTRY_KEY);
-    const field = comptime @import("stdx").repeat(ctl, 512);
-    const pair = "\x01=" ++ comptime @import("stdx").repeat(ctl, 30) ++ ",";
-    const tags = comptime @import("stdx").repeat(pair, ts_mod.MAX_TAG_STRING / pair.len);
-    const json = try ProcessingHandler.tsPointJson(std.testing.allocator, measurement, field, -std.math.floatMax(f64), std.math.minInt(i64), tags);
+    // Every byte a control character, escaped six bytes wide, with the
+    // field and tags filling the TS write's buffer, and the value's longest
+    // and shortest-form texts.
+    const stdx_ = @import("stdx");
+    const measurement = comptime stdx_.repeat("\x01", persistence_mod.MAX_ENTRY_KEY);
+    const room = ts_mod.MAX_TAG_STRING + 512 - 20;
+    // 32 distinct keys, each pair `\x01<k>=\x01...`, joined by `,`.
+    var tags_buf: [room]u8 = undefined;
+    var t: usize = 0;
+    for (0..ts_mod.MAX_TAGS) |k| {
+        if (k > 0) {
+            tags_buf[t] = ',';
+            t += 1;
+        }
+        const per = (room - 4 - (ts_mod.MAX_TAGS - 1)) / ts_mod.MAX_TAGS;
+        tags_buf[t] = 0x01;
+        tags_buf[t + 1] = @intCast('A' + k);
+        tags_buf[t + 2] = '=';
+        @memset(tags_buf[t + 3 .. t + per], 0x01);
+        t += per;
+    }
+    const field_only = comptime stdx_.repeat("\x01", room);
+    const Case = struct { field: []const u8, tags: []const u8 };
+    for ([_]Case{ .{ .field = field_only, .tags = "" }, .{ .field = "\x01\x01\x01\x01", .tags = tags_buf[0..t] } }) |c| {
+        for ([_]f64{ -1.2345678901234567e-308, -std.math.floatMax(f64), -std.math.floatMin(f64) / 3, -9007199254740991.123 }) |v| {
+            const json = try ProcessingHandler.tsPointJson(std.testing.allocator, measurement, c.field, v, std.math.minInt(i64), c.tags);
+            defer std.testing.allocator.free(json);
+            try std.testing.expect(json.len <= ProcessingHandler.MAX_TS_POINT_JSON);
+        }
+    }
+}
+
+test "ProcessingHandler: a TS source record writes its value in a form every operator reads as a number" {
+    for ([_]struct { v: f64, text: []const u8 }{
+        .{ .v = 2, .text = "\"value\":2," },
+        .{ .v = 2.5, .text = "\"value\":2.5," },
+        .{ .v = 0, .text = "\"value\":0," },
+        .{ .v = 1e19, .text = "\"value\":1e19," },
+        .{ .v = -1.5e-7, .text = "\"value\":-1.5e-7," },
+    }) |c| {
+        const json = try ProcessingHandler.tsPointJson(std.testing.allocator, "m", "value", c.v, 7, "");
+        defer std.testing.allocator.free(json);
+        if (std.mem.indexOf(u8, json, c.text) == null) {
+            std.debug.print("\n{d}: {s}\n", .{ c.v, json });
+            return error.TestUnexpectedResult;
+        }
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+        defer parsed.deinit();
+        const got = parsed.value.object.get("value").?;
+        try std.testing.expect(got == .integer or got == .float);
+    }
+}
+
+test "ProcessingHandler: a TS source record keeps a repeated tag key's first pair and leaves out a key that isn't UTF-8" {
+    const json = try ProcessingHandler.tsPointJson(std.testing.allocator, "m", "value", 7, 9, "a=1,a=2,b=\xff,\xfe=x");
     defer std.testing.allocator.free(json);
-    try std.testing.expect(json.len <= ProcessingHandler.MAX_TS_POINT_JSON);
+    // JSON every operator parses: no key twice, no byte that isn't UTF-8.
+    try std.testing.expect(@import("context.zig").readsAsJson(json));
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tags\":{\"a\":\"1\",\"b\":[255]}") != null);
+}
+
+/// Operators made from `specs` on the testing allocator, freed by `deinit`.
+const TestChain = struct {
+    made: [4]native_registry.CreateResult = undefined,
+    ops: [4]Operator = undefined,
+    n: usize = 0,
+
+    fn init(specs: []const definition.OperatorSpec) !TestChain {
+        var c: TestChain = .{};
+        errdefer c.deinit();
+        for (specs) |*spec| {
+            c.made[c.n] = try native_registry.create(std.testing.allocator, spec, null);
+            c.ops[c.n] = c.made[c.n].op;
+            c.n += 1;
+        }
+        return c;
+    }
+
+    fn deinit(c: *TestChain) void {
+        for (c.made[0..c.n]) |*m| m.deinit(std.testing.allocator);
+    }
+};
+
+test "ProcessingHandler: a point whose tags repeat a key or aren't UTF-8 goes through map, filter and aggregate" {
+    const Entry = definition.OperatorSpec.ConfigEntry;
+    const map_cfg = [_]Entry{.{ .key = "value", .value = "$.value" }};
+    const filter_cfg = [_]Entry{.{ .key = "condition", .value = "json:value>1" }};
+    const agg_cfg = [_]Entry{ .{ .key = "function", .value = "sum" }, .{ .key = "field", .value = "$.value" } };
+    const chains = [_][]const definition.OperatorSpec{
+        &.{.{ .type_name = "map", .name = "m", .config = &map_cfg }},
+        &.{.{ .type_name = "filter", .name = "f", .config = &filter_cfg }},
+        &.{.{ .type_name = "aggregate", .name = "a", .config = &agg_cfg }},
+    };
+    for ([_][]const u8{ "a=1,a=2", "b=\xff", "\xfe=x,c=3" }) |tags| {
+        const json = try ProcessingHandler.tsPointJson(std.testing.allocator, "m", "value", 7, 9, tags);
+        defer std.testing.allocator.free(json);
+        for (chains) |specs| {
+            var chain = try TestChain.init(specs);
+            defer chain.deinit();
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            var skips: ProcessingHandler.Skips = .{};
+            const records = (try ProcessingHandler.applyOperatorChain(chain.ops[0..chain.n], json, 9, arena.allocator(), &skips)).?;
+            try std.testing.expectEqual(@as(u32, 0), skips.n);
+            try std.testing.expectEqual(@as(usize, 1), records.len);
+            try std.testing.expectEqual(@as(?f64, 7), ProcessingHandler.outputValue(records[0].value));
+        }
+    }
+}
+
+test "ProcessingHandler: an operator that can't read its record skips it with a reason, counted, and the chain goes on" {
+    const Entry = definition.OperatorSpec.ConfigEntry;
+    const map_cfg = [_]Entry{.{ .key = "value", .value = "$.value" }};
+    const filter_cfg = [_]Entry{.{ .key = "condition", .value = "json:value>1" }};
+    const agg_cfg = [_]Entry{ .{ .key = "function", .value = "sum" }, .{ .key = "field", .value = "$.value" } };
+    const flat_cfg = [_]Entry{.{ .key = "array_field", .value = "$.items" }};
+    const Case = struct { spec: definition.OperatorSpec, why: []const u8 };
+    for ([_]Case{
+        .{ .spec = .{ .type_name = "map", .name = "m", .config = &map_cfg }, .why = "map: the record isn't JSON it can read" },
+        .{ .spec = .{ .type_name = "filter", .name = "f", .config = &filter_cfg }, .why = "filter: the record isn't JSON its json: condition can read" },
+        .{ .spec = .{ .type_name = "aggregate", .name = "a", .config = &agg_cfg }, .why = "aggregate: the record isn't JSON it can read" },
+        .{ .spec = .{ .type_name = "flatmap", .name = "fm", .config = &flat_cfg }, .why = "flatmap: the record isn't JSON it can read" },
+    }) |c| {
+        for ([_][]const u8{ "{\"value\":2,\"value\":3}", "not json", "{\"value\":\xff}" }) |input| {
+            var chain = try TestChain.init(&.{c.spec});
+            defer chain.deinit();
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            var skips: ProcessingHandler.Skips = .{};
+            const records = (try ProcessingHandler.applyOperatorChain(chain.ops[0..chain.n], input, 0, arena.allocator(), &skips)).?;
+            try std.testing.expectEqual(@as(usize, 0), records.len);
+            try std.testing.expectEqual(@as(u32, 1), skips.n);
+            try std.testing.expectEqualStrings(c.why, skips.why);
+        }
+    }
+    // An aggregate's field that isn't a number is a skip too; a whole number
+    // past an i64 is read as the number it is.
+    var chain = try TestChain.init(&.{.{ .type_name = "aggregate", .name = "a", .config = &agg_cfg }});
+    defer chain.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var skips: ProcessingHandler.Skips = .{};
+    _ = try ProcessingHandler.applyOperatorChain(chain.ops[0..chain.n], "{\"value\":\"high\"}", 0, arena.allocator(), &skips);
+    try std.testing.expectEqualStrings("aggregate: the record's field isn't a number", skips.why);
+    skips = .{};
+    const big = (try ProcessingHandler.applyOperatorChain(chain.ops[0..chain.n], "{\"value\":10000000000000000000}", 0, arena.allocator(), &skips)).?;
+    try std.testing.expectEqual(@as(u32, 0), skips.n);
+    try std.testing.expectEqual(@as(?f64, 1e19), ProcessingHandler.outputValue(big[0].value));
 }
 
 test "ProcessingHandler: an operator's record gives a TS sink its value only as a finite top-level number" {

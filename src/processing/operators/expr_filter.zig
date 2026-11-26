@@ -67,7 +67,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Operator = @import("../operator.zig").Operator;
-const OperatorContext = @import("../context.zig").OperatorContext;
+const context_mod = @import("../context.zig");
+const OperatorContext = context_mod.OperatorContext;
 const record_mod = @import("../record.zig");
 const ProcessingRecord = record_mod.ProcessingRecord;
 
@@ -170,9 +171,11 @@ pub const ExprFilterOperator = struct {
 
     fn processElement(ptr: *anyopaque, rec: ProcessingRecord, ctx: *OperatorContext) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        if (self.evaluate(rec)) {
-            try ctx.emit(rec);
-        }
+        if (self.evaluate(rec)) return ctx.emit(rec);
+        // A json: condition is false on a record it can't read; that's a
+        // skip, counted, not a record that failed the test.
+        if (usesJson(&self.parsed) and !context_mod.readsAsJson(rec.value))
+            return ctx.skip("filter: the record isn't JSON its json: condition can read");
     }
 
     fn getName(ptr: *anyopaque) []const u8 {
@@ -185,6 +188,15 @@ pub const ExprFilterOperator = struct {
     // =========================================================================
     // Condition evaluation
     // =========================================================================
+
+    fn usesJson(cond: *const ParsedCondition) bool {
+        return switch (cond.*) {
+            .single => |c| c == .json_expr,
+            inline .or_expr, .and_expr => |compound| for (compound.items[0..compound.len]) |sub| {
+                if (sub == .json_expr) break true;
+            } else false,
+        };
+    }
 
     pub fn evaluate(self: *const Self, rec: ProcessingRecord) bool {
         return evaluateCondition(&self.parsed, rec);
@@ -368,6 +380,7 @@ pub const ExprFilterOperator = struct {
             .string => |s| evalStringOp(s, expr.op, expr.value),
             .integer => |n| evalNumericOp(@floatFromInt(n), expr.op, expr.value),
             .float => |f| evalNumericOp(f, expr.op, expr.value),
+            .number_string => |t| if (std.fmt.parseFloat(f64, t)) |f| evalNumericOp(f, expr.op, expr.value) else |_| false,
             .bool => |b| evalBoolOp(b, expr.op, expr.value),
             else => false,
         };

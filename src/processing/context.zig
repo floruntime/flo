@@ -16,6 +16,14 @@ const ProcessingRecord = record_mod.ProcessingRecord;
 // =============================================================================
 
 /// Simple metrics for a single operator instance
+/// Whether `value` reads as the JSON the operators parse: well formed, no
+/// key given twice in an object.
+pub fn readsAsJson(value: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, value, .{}) catch return false;
+    parsed.deinit();
+    return true;
+}
+
 pub const OperatorMetrics = struct {
     /// Records processed by this operator
     records_in: u64 = 0,
@@ -60,6 +68,16 @@ pub const OperatorContext = struct {
     current_processing_time_ms: i64,
     /// Operator name (for logging/debugging)
     operator_name: []const u8,
+    /// Why the record in hand was skipped, set by `skip`.
+    skipped: ?[]const u8 = null,
+
+    /// An operator that can't read its record skips it with a reason: the
+    /// chain's caller counts it where the job's status shows it, so a
+    /// record is never lost unseen.
+    pub fn skip(self: *OperatorContext, why: []const u8) error{RecordSkipped} {
+        self.skipped = why;
+        return error.RecordSkipped;
+    }
 
     /// Convenience: emit a record downstream
     pub fn emit(self: *OperatorContext, rec: ProcessingRecord) !void {

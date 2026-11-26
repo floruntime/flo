@@ -1447,6 +1447,63 @@ test "e2e/processing: ts source to ts sink - the sink writes what the operators 
     }
 }
 
+test "e2e/processing: a record an operator can't read is a counted skip in status; a point whose tags repeat a key still goes through" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const ns = "proc_skip";
+    try ctx.exec(&.{ "ns", "create", ns });
+
+    // A stream record that isn't JSON, through a map.
+    try ctx.exec(&.{ "stream", "append", "skip-in", "not json", "-n", ns });
+    var id_buf: [64]u8 = undefined;
+    const id = try submitJob(ctx, ns,
+        \\kind: Processing
+        \\name: skip-stream
+        \\namespace: proc_skip
+        \\sources.[0].stream.name: skip-in
+        \\sinks.[0].stream.name: skip-out
+        \\operators.[0].type: map
+        \\operators.[0].name: m
+        \\operators.[0].v: "$.v"
+    , "skip-stream.yaml", &id_buf);
+    const want = "1 record skipped, the last record ";
+    const deadline = stdx.time.monotonicMs() + 8000;
+    while (true) {
+        var s = try ctx.cli.run(&.{ "processing", "status", id, "-n", ns });
+        defer s.deinit();
+        if (s.stdoutContains(want) and s.stdoutContains(": map: the record isn't JSON it can read")) break;
+        if (stdx.time.monotonicMs() >= deadline) {
+            std.debug.print("\nstatus: {s}\n", .{s.stdout});
+            return error.NoSkip;
+        }
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+
+    // A point whose tags give a key twice: its record keeps the first, and
+    // the operators read it, so it is written.
+    try ctx.exec(&.{ "ts", "write", "raw", "--tags", "a=1,a=2", "--value", "7", "--timestamp", "1795600000000", "-n", ns });
+    var ts_buf: [64]u8 = undefined;
+    const ts_id = try submitJob(ctx, ns,
+        \\kind: Processing
+        \\name: dup-tags
+        \\namespace: proc_skip
+        \\sources.[0].ts.measurement: raw
+        \\sources.[0].ts.poll_interval_ms: 100
+        \\sources.[0].ts.lateness_ms: 0
+        \\sinks.[0].ts.measurement: copied
+        \\sinks.[0].ts.value_field: v
+        \\operators.[0].type: map
+        \\operators.[0].name: m
+        \\operators.[0].value: "$.value"
+    , "dup-tags.yaml", &ts_buf);
+    var r = try tsReadUntil(ctx, ns, "copied", "v", null, "7.000000", 8000);
+    defer r.deinit();
+    try stdx.testing.assertContains(r, "{\"timestamp_ms\": 1795600000000, \"time_ns\": 1795600000000000000, \"value\": 7.000000}");
+    var s = try ctx.cli.run(&.{ "processing", "status", ts_id, "-n", ns });
+    defer s.deinit();
+    try testing.expect(!s.stdoutContains("skipped"));
+}
+
 test "e2e/processing: ts source - a stream sink's record carries the point's field and tags" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();

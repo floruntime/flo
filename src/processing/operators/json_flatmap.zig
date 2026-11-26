@@ -115,7 +115,7 @@ pub const JsonFlatMapOperator = struct {
             self.allocator,
             rec.value,
             .{},
-        ) catch return; // Skip non-JSON
+        ) catch return ctx.skip("flatmap: the record isn't JSON it can read");
         defer parsed.deinit();
 
         // Navigate to the array field
@@ -426,7 +426,7 @@ test "JsonFlatMapOperator — invalid JSON skipped" {
     };
 
     const op = fm.operator();
-    try op.processElement(ProcessingRecord.init("k1", "not-json", 100), &ctx);
+    try std.testing.expectError(error.RecordSkipped, op.processElement(ProcessingRecord.init("k1", "not-json", 100), &ctx));
 
     try std.testing.expectEqual(@as(usize, 0), collector.count());
 

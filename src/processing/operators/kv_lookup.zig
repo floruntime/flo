@@ -50,7 +50,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Operator = @import("../operator.zig").Operator;
-const OperatorContext = @import("../context.zig").OperatorContext;
+const context_mod = @import("../context.zig");
+const OperatorContext = context_mod.OperatorContext;
 const record_mod = @import("../record.zig");
 const ProcessingRecord = record_mod.ProcessingRecord;
 
@@ -256,7 +257,9 @@ pub const KvLookupOperator = struct {
         // Build the lookup key from the template
         const lookup_key = self.buildKey(rec.value) orelse {
             // Could not resolve template — filter drops, enrich passes through
-            if (self.mode == .enrich) try ctx.emit(rec);
+            if (self.mode == .enrich) return ctx.emit(rec);
+            // One it can't read is a skip, counted, not a key that isn't there.
+            if (!context_mod.readsAsJson(rec.value)) return ctx.skip("kv_lookup: the record isn't JSON its key template can read");
             return;
         };
 

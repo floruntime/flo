@@ -196,10 +196,11 @@ pub const JsonAggregateOperator = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         // Extract numeric value (for non-count functions)
-        const numeric_val: ?f64 = if (self.function != .count)
-            self.extractNumericField(rec.value) orelse return // skip non-numeric records
-        else
-            null;
+        const numeric_val: ?f64 = if (self.function != .count) switch (self.readField(rec.value)) {
+            .number => |v| v,
+            .not_json => return ctx.skip("aggregate: the record isn't JSON it can read"),
+            .no_number => return ctx.skip("aggregate: the record's field isn't a number"),
+        } else null;
 
         // Get or create group for this key
         const group = try self.getOrCreateGroup(rec.key);
@@ -286,31 +287,36 @@ pub const JsonAggregateOperator = struct {
         try jw.endObject();
     }
 
-    fn extractNumericField(self: *const Self, value: []const u8) ?f64 {
-        const segments = self.field_segments orelse return null;
+    const Read = union(enum) { number: f64, not_json, no_number };
+
+    /// The record's field as a number. A whole number past what an i64
+    /// holds parses as text, and is read as the number it is.
+    fn readField(self: *const Self, value: []const u8) Read {
+        const segments = self.field_segments orelse return .no_number;
 
         const parsed = std.json.parseFromSlice(
             std.json.Value,
             self.allocator,
             value,
             .{},
-        ) catch return null;
+        ) catch return .not_json;
         defer parsed.deinit();
 
         var current = parsed.value;
         for (segments) |seg| {
             switch (current) {
                 .object => |obj| {
-                    current = obj.get(seg) orelse return null;
+                    current = obj.get(seg) orelse return .no_number;
                 },
-                else => return null,
+                else => return .no_number,
             }
         }
 
         return switch (current) {
-            .integer => |n| @as(f64, @floatFromInt(n)),
-            .float => |f| f,
-            else => null,
+            .integer => |n| .{ .number = @floatFromInt(n) },
+            .float => |f| .{ .number = f },
+            .number_string => |t| if (std.fmt.parseFloat(f64, t)) |f| (if (std.math.isFinite(f)) .{ .number = f } else .no_number) else |_| .no_number,
+            else => .no_number,
         };
     }
 
@@ -578,17 +584,19 @@ test "JsonAggregateOperator — skips non-numeric / missing field" {
 
     const op = agg.operator();
 
-    // Missing field — record skipped
-    try op.processElement(ProcessingRecord.init("k", "{\"other\":1}", 100), &ctx);
+    // Missing field — record skipped, with why
+    try std.testing.expectError(error.RecordSkipped, op.processElement(ProcessingRecord.init("k", "{\"other\":1}", 100), &ctx));
+    try std.testing.expectEqualStrings("aggregate: the record's field isn't a number", ctx.skipped.?);
     try std.testing.expectEqual(@as(usize, 0), collector.count());
     try std.testing.expectEqual(@as(usize, 0), agg.groupCount());
 
     // Invalid JSON — record skipped
-    try op.processElement(ProcessingRecord.init("k", "not-json", 200), &ctx);
+    try std.testing.expectError(error.RecordSkipped, op.processElement(ProcessingRecord.init("k", "not-json", 200), &ctx));
+    try std.testing.expectEqualStrings("aggregate: the record isn't JSON it can read", ctx.skipped.?);
     try std.testing.expectEqual(@as(usize, 0), collector.count());
 
     // Non-numeric field — record skipped
-    try op.processElement(ProcessingRecord.init("k", "{\"amount\":\"text\"}", 300), &ctx);
+    try std.testing.expectError(error.RecordSkipped, op.processElement(ProcessingRecord.init("k", "{\"amount\":\"text\"}", 300), &ctx));
     try std.testing.expectEqual(@as(usize, 0), collector.count());
 
     collector.clear();
@@ -648,7 +656,7 @@ test "JsonAggregateOperator — output is JSON for any key, and a value past f64
 
     // Past f64's range std.json keeps the number as text: skipped like a
     // non-numeric value.
-    try op.processElement(ProcessingRecord.init(key, "{\"amount\":1e400}", 100), &ctx);
+    try std.testing.expectError(error.RecordSkipped, op.processElement(ProcessingRecord.init(key, "{\"amount\":1e400}", 100), &ctx));
     try std.testing.expectEqual(@as(usize, 0), collector.count());
 
     // A sum that overflows is written as null.
