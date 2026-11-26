@@ -100,32 +100,64 @@ test "e2e/workflow: create workflow with inline plan" {
     try stdx.testing.assertContains(result, "order-process");
 }
 
-test "e2e/workflow: create workflow with circuit breaker" {
+test "e2e/workflow: a round-robin plan's breaker opens on its executor's failure, and a later pass skips it" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     var builder = YamlBuilder.init(testing.allocator);
     defer builder.deinit();
-
     _ = builder.workflow("cb-test", "1.0.0");
     _ = builder.plans()
         .plan("resilient-api", "round-robin")
-        .executorWithBreaker("primary", "@actions/call-api", 5, 30000) // 5 failures, 30s cooldown
+        .executorWithBreaker("primary", "@actions/call-api", 1, 3600000) // opens on its first failure
+        .executor("backup", "@actions/backup-api")
         .done()
         .done();
     _ = builder.start("@plan/resilient-api")
-        .onSuccess("flo.Completed");
-
+        .onSuccess("flo.Completed")
+        .onFailure("flo.Failed");
     const yaml = try builder.build();
     defer testing.allocator.free(yaml);
-
     const path = try writeTempYaml(testing.allocator, yaml, "cb-workflow.yaml");
     defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+    try ctx.exec(&.{ "action", "register", "call-api" });
+    try ctx.exec(&.{ "action", "register", "backup-api" });
+    try ctx.exec(&.{ "worker", "register", "cb-w", "call-api", "backup-api" });
 
-    var result = try ctx.cli.run(&.{ "workflow", "create", "-f", path });
-    defer result.deinit();
-
-    try stdx.testing.assertSucceeded(result);
+    const Step = struct {
+        fn take(c: *stdx.testing.TestContext, action: []const u8, outcome: enum { fail, complete }) !void {
+            var taken = try c.cli.run(&.{ "worker", "await", action, "--worker-id", "cb-w", "--block", "5000" });
+            defer taken.deinit();
+            const id = extractTaskId(std.mem.trim(u8, taken.stdout, &std.ascii.whitespace)) orelse {
+                std.debug.print("\nno {s} task: {s}\n", .{ action, taken.stdout });
+                return error.AssertionFailed;
+            };
+            switch (outcome) {
+                .fail => try c.exec(&.{ "worker", "fail", id, "--worker-id", "cb-w", "--error", "down", "--no-retry" }),
+                .complete => try c.exec(&.{ "worker", "complete", id, "--worker-id", "cb-w", "--result", "{}" }),
+            }
+        }
+    };
+    // Pass 1 starts at primary, which fails: its breaker opens, and backup
+    // completes the step.
+    try ctx.exec(&.{ "workflow", "start", "cb-test", "{}", "--run-id", "cb-1" });
+    try Step.take(ctx, "call-api", .fail);
+    try Step.take(ctx, "backup-api", .complete);
+    try expectRunCompletes(ctx, "cb-1", 5000);
+    // Pass 2 starts one further along, at backup.
+    try ctx.exec(&.{ "workflow", "start", "cb-test", "{}", "--run-id", "cb-2" });
+    try Step.take(ctx, "backup-api", .complete);
+    try expectRunCompletes(ctx, "cb-2", 5000);
+    // Pass 3's turn is primary's: its breaker is open, so it is skipped,
+    // and backup runs.
+    try ctx.exec(&.{ "workflow", "start", "cb-test", "{}", "--run-id", "cb-3" });
+    try Step.take(ctx, "backup-api", .complete);
+    try expectRunCompletes(ctx, "cb-3", 5000);
+    try awaitHistory(ctx, "cb-3", "plan_breaker_skip", 2000);
+    var none = try ctx.cli.run(&.{ "worker", "await", "call-api", "--worker-id", "cb-w", "--block", "0" });
+    defer none.deinit();
+    try testing.expect(extractTaskId(std.mem.trim(u8, none.stdout, &std.ascii.whitespace)) == null);
 }
 
 test "e2e/workflow: create workflow with retry config" {
