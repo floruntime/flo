@@ -24,6 +24,26 @@ const names_bytes = MAX_LIST * Name.max_size;
 
 const name_key: ops.KeyArg = .{ .name = "name", .doc = "The namespace's name" };
 
+/// A run-history quota in bytes over every shard; omitted for none.
+pub const Quota = schema.Range(u64, 1, std.math.maxInt(u64) - 1);
+
+/// The most shards a node has.
+pub const MAX_SHARDS: u32 = @import("../config/server.zig").MAX_SHARDS;
+
+/// One shard's part of a namespace's run-history quota and what it holds.
+pub const ShardQuota = Record(&.{
+    .{ .name = "shard", .T = Int(u16), .doc = "The shard" },
+    .{ .name = "bound", .T = schema.Bool, .doc = "Whether its leader has bound a part here yet; none is enforced until it has" },
+    .{ .name = "part_bytes", .T = Optional(Int(u64)), .doc = "Its part of the quota, bytes; none when the quota is off or not yet bound" },
+    .{ .name = "usage_bytes", .T = Int(u64), .doc = "The run history its rows reference here, bytes" },
+    .{ .name = "reserved_workflow_bytes", .T = Int(u64), .doc = "What its live workflow runs reserve here, bytes" },
+    .{ .name = "reserved_action_bytes", .T = Int(u64), .doc = "What its live action runs reserve here, bytes" },
+    .{ .name = "orphans", .T = Int(u32), .doc = "Deleted runs whose history couldn't be dropped, still counted in usage" },
+    .{ .name = "orphan_bytes", .T = Int(u64), .doc = "Their bytes" },
+    .{ .name = "held_runs", .T = Int(u32), .doc = "Workflow runs this shard's leader holds for the quota" },
+});
+pub const ShardQuotas = schema.List(ShardQuota, MAX_SHARDS);
+
 pub const table = [_]ops.Op{
     .{
         .name = "namespace.create",
@@ -76,10 +96,26 @@ pub const table = [_]ops.Op{
         .route = .shard0,
         .request = Record(&.{}),
         .response = Record(&.{
-            .{ .name = "created_at_ms", .T = Int(i64), .doc = "When it was created, in ms since the epoch" },
+            .{ .name = "created_at_ms", .T = Int(i64), .doc = "When it was created, in ms since the epoch; 0 for default" },
+            .{ .name = "history_quota", .T = Optional(Int(u64)), .doc = "Its run-history quota over every shard, bytes; none when off" },
+            .{ .name = "history_quota_own", .T = schema.Bool, .doc = "Whether it set its own quota, not the default" },
+            .{ .name = "shards", .T = ShardQuotas, .doc = "Each shard's part, usage and reserves" },
         }),
         .cli = .{ .expose = .hand, .key = name_key, .examples = &.{"flo namespace info myapp"} },
-        .doc = "A namespace's record; not_found if there is none.",
+        .doc = "A namespace's record and its run-history quota on every shard; not_found if there is none.",
+    },
+    .{
+        .name = "namespace.alter",
+        .code = 0x014,
+        .class = .write,
+        .scope = .server,
+        .route = .shard0,
+        .request = Record(&.{
+            .{ .name = "history_quota", .T = Optional(Quota), .doc = "Its run-history quota over every shard, bytes; omit to turn it off" },
+        }),
+        .response = Record(&.{}),
+        .cli = .{ .expose = .hand, .key = name_key, .examples = &.{ "flo namespace alter myapp --history-quota 20GiB", "flo namespace alter myapp --history-quota none" } },
+        .doc = "Set a namespace's run-history quota. Not a privileged action yet: any client can change any namespace's quota.",
     },
     .{
         .name = "namespace.ensure",

@@ -46,12 +46,33 @@ pub const BudgetBind = Record(&.{
     .{ .name = "budget_bytes", .T = Int(u64) },
 });
 
+/// One namespace's part of its run-history quota on the binding shard, as
+/// shard 0 published it at `published_index`; `NO_QUOTA` for none.
+pub const QuotaItem = Record(&.{
+    .{ .name = "ns", .T = Int(u32) },
+    .{ .name = "part_bytes", .T = Int(u64) },
+    .{ .name = "published_index", .T = Int(u64) },
+});
+
+/// A part of none, as the log holds it.
+pub const NO_QUOTA: u64 = std.math.maxInt(u64);
+
+/// The most namespaces one bind carries.
+pub const MAX_QUOTA_BINDS: u32 = 64;
+
+/// `settings_quota_bind`: run-history quota parts this shard holds, logged
+/// by its own leader from what shard 0 published.
+pub const QuotaBind = Record(&.{
+    .{ .name = "items", .T = schema.List(QuotaItem, MAX_QUOTA_BINDS) },
+});
+
 pub const table = [_]entries.Entry{
     .{ .name = "settings.pool_share", .type_code = 0x90, .payload = Share, .max_payload = Share.max_size, .doc = "The memory-budget pool share, per-mille of each node's RAM after its reserve." },
     .{ .name = "settings.node_mem", .type_code = 0x91, .payload = NodeMem, .max_payload = NodeMem.max_size, .doc = "A node's reported RAM and reserve for the memory budget." },
     .{ .name = "settings.node_del", .type_code = 0x92, .payload = DelNode, .max_payload = DelNode.max_size, .doc = "A node's memory row removed when it leaves the membership." },
     .{ .name = "settings.budget_clean", .type_code = 0x93, .payload = BudgetClean, .max_payload = BudgetClean.max_size, .doc = "The last non-provisional memory budget, so a restart mid-freeze recovers the held value." },
     .{ .name = "settings.budget_bind", .type_code = 0x94, .payload = BudgetBind, .max_payload = BudgetBind.max_size, .doc = "The memory share a shard holds, bound by its own leader from the node's clean budget." },
+    .{ .name = "settings.quota_bind", .type_code = 0x95, .payload = QuotaBind, .max_payload = QuotaBind.max_size, .doc = "The run-history quota parts a shard holds, bound by its own leader from what shard 0 published." },
 };
 
 /// The payload schema of entry type `code`.

@@ -19,6 +19,7 @@ const delivery = @import("../contract/delivery.zig");
 const persistence = @import("../storage/persistence.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const settings_entries = @import("../protocol/settings_entries.zig");
+const NamespaceId = @import("../namespace/table.zig").Id;
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -65,6 +66,17 @@ pub const BudgetFam = view_mod.Family(52, "settings.budget", .shard, Stored(Budg
 // Its own family: `BudgetFam` decodes every key there as a `BudgetClean`.
 pub const BindFam = view_mod.Family(68, "settings.bind", .shard, Stored(Bind));
 
+/// A namespace's part of its run-history quota on this shard, as its leader
+/// last bound it from shard 0's publish at `published_index`: none is
+/// `NO_QUOTA`, kept as a row so a stale bind can't bring an older quota
+/// back. Absent until the namespace's first bind: no quota then.
+pub const QuotaPart = Record(&.{
+    .{ .name = "part_bytes", .T = Int(u64) },
+    .{ .name = "published_index", .T = Int(u64) },
+});
+pub const QuotaFam = view_mod.Family(78, "settings.quota", .id, Stored(QuotaPart));
+pub const NO_QUOTA = settings_entries.NO_QUOTA;
+
 /// The single key the policy record lives under.
 pub const POLICY_KEY = "share";
 /// The single key the clean-budget record lives under.
@@ -81,6 +93,7 @@ pub const SetNodeMem = settings_entries.NodeMem;
 pub const DelNode = settings_entries.DelNode;
 pub const SetBudgetClean = settings_entries.BudgetClean;
 pub const SetBudgetBind = settings_entries.BudgetBind;
+pub const SetQuotaBind = settings_entries.QuotaBind;
 
 // ─── Keys ──────────────────────────────────────────────────────────────────
 
@@ -115,6 +128,15 @@ pub fn bindForTest(store: *@import("../contract/store.zig").Store, share: u64) !
     } else store.link(BindFam.ID, try store.allocRecord(k), try store.allocator.dupe(u8, bytes));
 }
 
+/// Namespace `ns`'s quota part bound on the store `read` reads, or null for
+/// none bound yet. A part of `NO_QUOTA` is a bound none.
+pub fn boundQuota(read: view_mod.ReadView, ns: NamespaceId) ?QuotaPart.Value {
+    var kb: [4]u8 = undefined;
+    const k = view_mod.idKey(&kb, ns, "") catch unreachable;
+    const rec = (read.get(QuotaFam, k) catch null) orelse return null;
+    return rec.v;
+}
+
 /// The share bound on the store `read` reads, or null when none is.
 pub fn boundShare(read: view_mod.ReadView) ?Bind.Value {
     var kb: [1 + BIND_KEY.len]u8 = undefined;
@@ -145,6 +167,12 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         },
         .settings_budget_clean => try out.add(BudgetFam.ID, "", BUDGET_KEY),
         .settings_budget_bind => try out.add(BindFam.ID, "", BIND_KEY),
+        .settings_quota_bind => {
+            var diag: schema.Diagnostic = .{};
+            const p = SetQuotaBind.decodeAll(e.payload, &diag) catch return;
+            var it = p.items.iterator();
+            while (it.next() catch return) |item| try out.addIn(QuotaFam.ID, .of(item.ns), "");
+        },
         else => {},
     }
 }
@@ -184,14 +212,29 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             var kb: [1 + BIND_KEY.len]u8 = undefined;
             try view.put(BindFam, bindKey(&kb), .{ .v = .{ .share_bytes = p.share_bytes, .budget_bytes = p.budget_bytes } });
         },
+        .settings_quota_bind => {
+            const p = SetQuotaBind.decodeAll(e.payload, &diag) catch return out.refuse(.bad_request, .malformed, BAD);
+            var it = p.items.iterator();
+            while (it.next() catch return out.refuse(.bad_request, .malformed, BAD)) |item| {
+                // A part of 0 would hold everything: never proposed, since
+                // shard 0 refuses a quota of 0. Skipped, as is a bind of an
+                // older publish than the one bound: one stale item mustn't
+                // refuse its batch.
+                if (item.part_bytes == 0) continue;
+                var kb: [4]u8 = undefined;
+                const k = view_mod.idKey(&kb, .of(item.ns), "") catch unreachable;
+                if (try view.get(QuotaFam, k)) |bound| if (item.published_index < bound.v.published_index) continue;
+                try view.put(QuotaFam, k, .{ .v = .{ .part_bytes = item.part_bytes, .published_index = item.published_index } });
+            }
+        },
         else => {},
     }
 }
 
 pub const machine: machine_mod.Machine = .{
     .name = "settings",
-    .entry_types = &.{ .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean, .settings_budget_bind },
-    .families = &.{ machine_mod.info(PolicyFam), machine_mod.info(NodeFam), machine_mod.info(BudgetFam), machine_mod.info(BindFam) },
+    .entry_types = &.{ .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean, .settings_budget_bind, .settings_quota_bind },
+    .families = &.{ machine_mod.info(PolicyFam), machine_mod.info(NodeFam), machine_mod.info(BudgetFam), machine_mod.info(BindFam), machine_mod.info(QuotaFam) },
     .keys = keys,
     .apply = apply,
 };

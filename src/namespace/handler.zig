@@ -28,6 +28,9 @@ const ns_machine = @import("machine.zig");
 const contract_machine = @import("../contract/machine.zig");
 const Store = @import("../contract/store.zig").Store;
 const ReadView = @import("../contract/view.zig").ReadView;
+const gather_mod = @import("../node/gather.zig");
+const settings_machine = @import("../settings/machine.zig");
+const hm = @import("../stream/history_machine.zig");
 
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
@@ -98,6 +101,9 @@ pub const NamespaceHandler = struct {
     /// Shard 0: creates applied and not yet on disk, published at the next
     /// flush.
     unpublished: std.ArrayListUnmanaged(Unpublished) = .empty,
+    /// Shard 0: an alter applied whose quota isn't on disk yet, so not
+    /// published: every setting is published again at the next flush.
+    quotas_unpublished: bool = false,
     /// Shard 0: the table may lack a create the store holds: one replayed
     /// at boot, which doesn't queue it (`publishAll` at boot clears this),
     /// or one applied that couldn't be queued for want of memory. The next
@@ -424,6 +430,10 @@ pub const NamespaceHandler = struct {
     /// flight here, and queued to publish once it is on disk (`settle`).
     /// Boot replay doesn't come here; it publishes the lot (`publishAll`).
     pub fn afterApply(self: *NamespaceHandler, e: *const entry_mod.Entry) void {
+        if (self.owner and e.header.entry_type == @backingInt(entry_mod.EntryType.namespace_alter)) {
+            self.quotas_unpublished = true;
+            return;
+        }
         if (!self.owner or e.header.entry_type != @backingInt(entry_mod.EntryType.namespace_create)) return;
         var diag: schema.Diagnostic = .{};
         const c = namespace_entries.Create.decodeAll(e.payload, &diag) catch unreachable; // it applied
@@ -442,6 +452,7 @@ pub const NamespaceHandler = struct {
     /// a shard with nothing on disk.
     fn publishUnpublished(self: *NamespaceHandler) void {
         for (self.unpublished.items) |u| {
+            self.publishQuotaOf(u.id, u.name, u.index);
             self.table.publish(u.id, u.name, u.index) catch {};
             self.allocator.free(u.name);
         }
@@ -461,16 +472,43 @@ pub const NamespaceHandler = struct {
         while (it.next() catch unreachable) |rec| { // written by the machine alone
             top = @max(top, rec.value.v.created_index);
             const id: ns_table.Id = .of(rec.value.v.id);
+            const name = rec.key[ns_machine.NAME_PREFIX.len..];
+            // Its quota before its name: a shard that sees the name finds
+            // the quota published with it.
+            self.publishQuotaOf(id, name, rec.value.v.created_index);
             if (self.table.nameOf(id) != null) continue;
-            try self.table.publish(id, rec.key[ns_machine.NAME_PREFIX.len..], 0);
+            try self.table.publish(id, name, 0);
         }
+        self.publishQuotaOf(ns_table.DEFAULT, "default", 0);
         self.table.notePublished(top);
+    }
+
+    /// Shard 0: publish `id`'s quota, its own as the store holds it, or the
+    /// default under the index that made the namespace (`created_index`,
+    /// at least 1, so the built-in default namespace's counts as published).
+    fn publishQuotaOf(self: *NamespaceHandler, id: ns_table.Id, name: []const u8, created_index: u64) void {
+        if (ns_machine.settings(self.read(), name)) |s|
+            self.table.publishQuota(id, s.history_quota, s.set_index)
+        else
+            self.table.publishQuota(id, ns_machine.DEFAULT_HISTORY_QUOTA, @max(created_index, 1));
+    }
+
+    /// Shard 0: publish every namespace's own quota the store holds, after
+    /// an alter's is on disk. One already published at its index is left.
+    fn publishQuotas(self: *NamespaceHandler) void {
+        var it = self.read().range(ns_machine.SettingsFam, ns_machine.NAME_PREFIX);
+        while (it.next() catch unreachable) |rec| { // written by the machine alone
+            const name = rec.key[ns_machine.NAME_PREFIX.len..];
+            const id = if (ns_machine.isDefault(name)) ns_table.DEFAULT else if (ns_machine.meta(self.read(), name)) |m| ns_table.Id.of(m.id) else continue;
+            self.table.publishQuota(id, rec.value.v.history_quota, rec.value.v.set_index);
+        }
     }
 
     // ── Ops ─────────────────────────────────────────────────────────────
     // Every namespace op routes to shard 0, the namespaces' one owner.
 
     const ListResponse = namespace_ops.op("namespace.list").response;
+    const ShardQuota = namespace_ops.ShardQuota;
     const InfoResponse = namespace_ops.op("namespace.info").response;
     const EnsureResponse = namespace_ops.op("namespace.ensure").response;
     const PublishedResponse = namespace_ops.op("namespace.published").response;
@@ -482,6 +520,7 @@ pub const NamespaceHandler = struct {
             .{ "namespace.delete", OpCode.namespace_delete, runDelete },
             .{ "namespace.list", OpCode.namespace_list, runList },
             .{ "namespace.info", OpCode.namespace_info, runInfo },
+            .{ "namespace.alter", OpCode.namespace_alter, runAlter },
             .{ "namespace.ensure", OpCode.namespace_ensure, runEnsure },
             .{ "namespace.published", OpCode.namespace_published, runPublished },
         }) |o| {
@@ -672,7 +711,7 @@ pub const NamespaceHandler = struct {
     pub fn settle(self: *NamespaceHandler, shard: *Shard) void {
         if (!self.owner) return;
 
-        if (self.unpublished.items.len > 0 or self.publish_from_store) publish: {
+        if (self.unpublished.items.len > 0 or self.publish_from_store or self.quotas_unpublished) publish: {
             shard.flushSegmentToDisk() catch |err| {
                 const now = @import("stdx").time.milliTimestamp();
                 if (now - self.flush_warn_ms >= 30_000) {
@@ -681,7 +720,12 @@ pub const NamespaceHandler = struct {
                 }
                 break :publish;
             };
+            if (self.quotas_unpublished) {
+                self.publishQuotas();
+                self.quotas_unpublished = false;
+            }
             for (self.unpublished.items, 0..) |u, i| {
+                self.publishQuotaOf(u.id, u.name, u.index);
                 // Published already from the store (`publishAll`).
                 if (self.table.nameOf(u.id) == null) self.table.publish(u.id, u.name, u.index) catch {
                     // What was published stays published: drop it, and
@@ -841,11 +885,123 @@ pub const NamespaceHandler = struct {
         return null;
     }
 
-    fn runInfo(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(InfoResponse) {
+    /// namespace.info: its record, its quota, and each shard's part and
+    /// usage, gathered from every shard; it fails rather than answer with
+    /// part of them.
+    fn runInfo(shard: *Shard, conn: *Connection, req: Request) Error!table_run.Outcome(InfoResponse) {
+        const self = shard.namespace_handler;
         const name = req.key;
-        if (nameRefusal(name)) |why| return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(why) } };
-        const meta = shard.namespace_handler.metaOf(name) orelse return error.NoNamespace;
-        return .{ .answer = .{ .created_at_ms = @intCast(meta.created_at_ns / std.time.ns_per_ms) } };
+        if (!ns_machine.isDefault(name)) if (nameRefusal(name)) |why| return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(why) } };
+        const meta = self.metaOf(name) orelse return error.NoNamespace;
+        const own = ns_machine.settings(self.read(), name);
+        const quota = if (own) |s| s.history_quota else ns_machine.DEFAULT_HISTORY_QUOTA;
+        const state = try shard.allocator.create(InfoGather);
+        state.* = .{ .created_at_ms = @intCast(meta.created_at_ns / std.time.ns_per_ms), .quota = if (quota == ns_machine.NO_QUOTA) null else quota, .own = own != null };
+        var state_owned = true;
+        defer if (state_owned) shard.allocator.destroy(state);
+        const n = shard.shardCount();
+        const parts = try shard.allocator.alloc(gather_mod.Part, n);
+        defer shard.allocator.free(parts);
+        var own_buf: [ShardQuota.max_size]u8 = undefined;
+        const own_body = try shard.allocator.dupe(u8, ShardQuota.encodeInto(&own_buf, localQuota(shard, meta.id)) catch unreachable);
+        var body_owned = true;
+        defer if (body_owned) shard.allocator.free(own_body);
+        for (parts, 0..) |*p, i| {
+            const s: u16 = @intCast(i);
+            p.* = if (s == shard.id) .{ .owner = s, .body = own_body } else .{ .owner = s, .body = "", .op = @backingInt(OpCode.system_history_quota), .key = name };
+        }
+        state_owned = false;
+        body_owned = false;
+        shard.startGather(conn, req, parts, &InfoGather.op, state) catch |err| return switch (err) {
+            error.GatherBusy => .{ .refused = .{ .status = .overloaded, .refusal = .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many requests across shards are under way; this request was not run — retry" } } },
+            error.OutOfMemory => error.OutOfMemory,
+        };
+        return .wait;
+    }
+
+    /// A namespace's info, held while every shard says its part.
+    const InfoGather = struct {
+        created_at_ms: i64,
+        quota: ?u64,
+        own: bool,
+
+        const op: gather_mod.Op = .{ .merge = merge, .deinit = free };
+
+        fn free(state: *anyopaque, allocator: Allocator) void {
+            const self: *InfoGather = @ptrCast(@alignCast(state));
+            allocator.destroy(self);
+        }
+
+        fn merge(shard: *Shard, conn: *Connection, request_id: u64, state: *anyopaque, bodies: []const []const u8) anyerror!void {
+            const self: *InfoGather = @ptrCast(@alignCast(state));
+            const buf = try shard.allocator.alloc(u8, namespace_ops.ShardQuotas.max_size);
+            defer shard.allocator.free(buf);
+            var w: schema.Writer = .{ .buf = buf };
+            for (bodies) |body| {
+                var diag: schema.Diagnostic = .{};
+                try ShardQuota.encode(&w, try ShardQuota.decodeAll(body, &diag));
+            }
+            table_run.answer(InfoResponse, shard, conn, request_id, .{ .created_at_ms = self.created_at_ms, .history_quota = self.quota, .history_quota_own = self.own, .shards = .{ .bytes = w.written(), .count = @intCast(bodies.len) } });
+        }
+    };
+
+    /// This shard's part of namespace `ns`'s quota, as its leader bound it,
+    /// and the run history the namespace holds here.
+    pub fn localQuota(shard: *Shard, ns: ns_table.Id) ShardQuota.Value {
+        const rv: ReadView = .{ .store = &shard.defaultPartition().store };
+        const bound = settings_machine.boundQuota(rv, ns);
+        const u = hm.usageOf(rv, ns);
+        return .{
+            .shard = shard.id,
+            .bound = bound != null,
+            .part_bytes = if (bound) |b| (if (b.part_bytes == settings_machine.NO_QUOTA) null else b.part_bytes) else null,
+            .usage_bytes = u.bytes,
+            .reserved_workflow_bytes = 0,
+            .reserved_action_bytes = 0,
+            .orphans = u.orphans,
+            .orphan_bytes = u.orphan_bytes,
+            .held_runs = 0,
+        };
+    }
+
+    /// `system.history_quota`, on the shard asked: its part of the
+    /// namespace the key names. One this node's table doesn't know yet is
+    /// refused, so the info fails and is asked again.
+    pub fn handleHistoryQuota(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const id = shard.namespace_handler.table.lookup(if (req.key.len == 0) "default" else req.key) orelse
+            return shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun("unavailable: this node hasn't published the namespace yet; the info was not run — retry"));
+        table_run.answer(ShardQuota, shard, conn, req.header.request_id, localQuota(shard, id));
+    }
+
+    const FLOOR_MESSAGE = std.fmt.comptimePrint("bad request: a history quota is at least {d} bytes on every shard, one run's reserve on each", .{ns_machine.PART_FLOOR});
+
+    /// namespace.alter: a namespace's quota set on shard 0, answered once
+    /// it applies. Below one shard's floor on this node, refused here.
+    fn runAlter(shard: *Shard, _: *Connection, req: Request, history_quota: ?u64) Error!table_run.Outcome(Empty) {
+        const self = shard.namespace_handler;
+        const name = req.key;
+        if (!ns_machine.isDefault(name)) {
+            if (nameRefusal(name)) |why| return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(why) } };
+            if (self.metaOf(name) == null) return error.NoNamespace;
+        }
+        const quota = history_quota orelse ns_machine.NO_QUOTA;
+        const floor = ns_machine.PART_FLOOR *| shard.shardCount();
+        if (ns_machine.quotaRefusal(quota, floor)) |why| {
+            const msg = if (quota != 0) FLOOR_MESSAGE else why;
+            return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .out_of_range, .ran = .no, .message = msg } } };
+        }
+        if (!shard.raft_node.leaderReady()) return .{ .refused = .{ .status = .unavailable, .refusal = .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: a new leader is catching up; the quota wasn't set — retry" } } };
+        const P = namespace_entries.Alter;
+        var buf: [P.max_size]u8 = undefined;
+        const bytes = P.encodeInto(&buf, .{ .name = if (name.len == 0) "default" else name, .history_quota = quota }) catch return error.Internal;
+        const proposed = shard.raft_node.propose(.namespace_alter, entry_mod.Flags.NONE, bytes) catch |err| return proposeError(err);
+        return .{ .park = .{ .proposed = proposed, .answer = answerAlter } };
+    }
+
+    fn answerAlter(shard: *Shard, conn: *Connection, request_id: u64, _: *const persistence_mod.Result) void {
+        table_run.answer(Empty, shard, conn, request_id, .{});
     }
 
     // ── UAL Persistence ─────────────────────────────────────────────────
@@ -900,16 +1056,26 @@ fn testEntry(comptime t: entry_mod.EntryType, index: u64, stamp_ns: u64, v: name
     return entry_mod.buildEntry(t, 0, 1, index, stamp_ns, bytes);
 }
 
-test "namespace handler: every namespace op is registered, routed to shard 0, and settings are gone" {
+test "namespace handler: every namespace op is registered and routed to shard 0, and 0x015 stays retired" {
     var dispatcher = Dispatcher.init();
     NamespaceHandler.register(&dispatcher);
     const req: Request = .{ .header = proto.RequestHeader.init(.namespace_list, 1), .namespace = "", .key = "", .value = "", .options = "" };
-    for ([_]OpCode{ .namespace_create, .namespace_delete, .namespace_list, .namespace_info, .namespace_ensure, .namespace_published }) |op| {
+    for ([_]OpCode{ .namespace_create, .namespace_delete, .namespace_list, .namespace_info, .namespace_alter, .namespace_ensure, .namespace_published }) |op| {
         try testing.expect(dispatcher.hasHandler(op));
         try testing.expectEqual(@as(?u16, 0), dispatcher.shard_route[@backingInt(op)].?(req));
     }
-    try testing.expectEqual(@as(u16, 6), dispatcher.handler_count);
-    for ([_]u16{ 0x014, 0x015 }) |retired| try testing.expect(std.enums.tagName(OpCode, @fromBackingInt(retired)) == null);
+    try testing.expectEqual(@as(u16, 7), dispatcher.handler_count);
+    try testing.expect(std.enums.tagName(OpCode, @fromBackingInt(0x015)) == null);
+}
+
+test "namespace handler: a namespace's quota is published before its name, the default under its create's index" {
+    var handler = try NamespaceHandler.init(testing.allocator);
+    defer handler.deinit();
+    try testing.expectEqual(NamespaceHandler.CreateOutcome.created, handler.applyCreate("orders"));
+    const id = handler.table.lookup("orders").?;
+    const q = handler.table.quotaOf(id).?;
+    try testing.expectEqual(ns_machine.DEFAULT_HISTORY_QUOTA, q.quota);
+    try testing.expect(q.index >= 1);
 }
 
 test "namespace handler: list pages in name order, holding default from the start" {

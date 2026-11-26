@@ -111,6 +111,7 @@ const TSProjection = @import("../projection/ts.zig").TSProjection;
 const TSHandler = @import("../ts/handler.zig").TSHandler;
 const handler_mod = @import("../namespace/handler.zig");
 const ns_table = @import("../namespace/table.zig");
+const settings_entries = @import("../protocol/settings_entries.zig");
 const edge_mod = @import("edge.zig");
 const reentry_mod = @import("reentry.zig");
 const NamespaceHandler = handler_mod.NamespaceHandler;
@@ -935,6 +936,10 @@ pub const Shard = struct {
     budget_propose_pending: ?BudgetPropose = null,
     /// This shard's share bind in flight, one at a time (`proposeBudgetBind`).
     bind_pending: ?BudgetPropose = null,
+    /// The quota bind this leader proposed and hasn't seen apply, and where
+    /// its walk of the namespace table goes on from.
+    quota_bind_pending: ?BudgetPropose = null,
+    quota_cursor: u32 = 0,
     /// A budget too small to share among the shards was logged once.
     bind_zero_warned: bool = false,
 
@@ -1378,6 +1383,7 @@ pub const Shard = struct {
         WorkflowHandler.register(&dispatcher);
         dispatcher.register(.system_walk_page, walk_mod.handlePage);
         dispatcher.register(.system_holds_run, handleHoldsRun);
+        dispatcher.register(.system_history_quota, @import("../namespace/handler.zig").NamespaceHandler.handleHistoryQuota);
         dispatcher.register(.system_runs_page, @import("../workflow/list_runs.zig").handlePage);
         ProcessingHandler.register(&dispatcher);
         dispatcher.register(.cluster_status, dispatchClusterStatus);
@@ -7013,6 +7019,64 @@ pub const Shard = struct {
         self.bind_pending = proposeOrNull(raft, .settings_budget_bind, bytes);
     }
 
+    /// A namespace's quota over every shard, as each of `shards` holds it:
+    /// split evenly, rounded up; none stays none.
+    pub fn quotaPart(quota: u64, shards: u32) u64 {
+        if (quota == settings_machine.NO_QUOTA) return quota;
+        return std.math.divCeil(u64, quota, @max(shards, 1)) catch unreachable;
+    }
+
+    /// The namespaces the table walk looks at in one tick.
+    const QUOTA_SCAN_PER_TICK: u32 = 1024;
+
+    /// Bind this shard's part of each namespace's run-history quota, as
+    /// shard 0 published it: logged here, so every replica holds the same
+    /// part. A namespace is bound when its part differs from the bound one
+    /// (an alter of one rebinds that one) and what was published is no
+    /// older than what is bound, so a node whose shard 0 lags never binds
+    /// an older quota again. None published (index 0) binds nothing. One
+    /// bind in flight at a time, of up to `MAX_QUOTA_BINDS` namespaces,
+    /// walking the table a stretch a tick.
+    fn proposeQuotaBinds(self: *Shard) void {
+        const raft = self.raft_node;
+        if (self.quota_bind_pending) |p| {
+            if (p.term == raft.current_term and p.index > raft.last_applied) return;
+            self.quota_bind_pending = null;
+        }
+        const Item = settings_entries.QuotaItem;
+        var buf: [settings_machine.SetQuotaBind.max_size]u8 = undefined;
+        var items: [settings_entries.MAX_QUOTA_BINDS]Item.Value = undefined;
+        const n = self.quotaBindsDue(&items);
+        if (n == 0) return;
+        var ib: [settings_entries.MAX_QUOTA_BINDS * Item.max_size]u8 = undefined;
+        var w: schema.Writer = .{ .buf = &ib };
+        for (items[0..n]) |it| Item.encode(&w, it) catch return;
+        const bytes = settings_machine.SetQuotaBind.encodeInto(&buf, .{ .items = .{ .bytes = w.written(), .count = @intCast(n) } }) catch return;
+        self.quota_bind_pending = proposeOrNull(raft, .settings_quota_bind, bytes);
+    }
+
+    /// The namespaces whose bound part is due, into `out`, walking on from
+    /// the cursor: how many.
+    fn quotaBindsDue(self: *Shard, out: []settings_entries.QuotaItem.Value) usize {
+        const names = self.namespace_handler.table;
+        const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
+        const shards = self.router.shard_count;
+        var n: usize = 0;
+        var looked: u32 = 0;
+        while (n < out.len and looked < QUOTA_SCAN_PER_TICK) : (looked += 1) {
+            const id: ns_table.Id = .of(self.quota_cursor);
+            self.quota_cursor = (self.quota_cursor + 1) % ns_table.CAPACITY;
+            const q = names.quotaOf(id) orelse continue;
+            const part = quotaPart(q.quota, shards);
+            if (settings_machine.boundQuota(read, id)) |b| {
+                if (b.part_bytes == part or q.index < b.published_index) continue;
+            }
+            out[n] = .{ .ns = id.int(), .part_bytes = part, .published_index = q.index };
+            n += 1;
+        }
+        return n;
+    }
+
     /// Propose a settings entry; return its term and index to mark it in
     /// flight, or null when the propose was refused (not the leader now, or the
     /// outstanding cap is full) so the next tick tries again.
@@ -7363,6 +7427,7 @@ pub const Shard = struct {
         if (self.id == 0 and leads and self.halted == null) self.proposeBudgetRows();
         // Every shard's leader logs the share it is held to.
         if (leads and self.halted == null) self.proposeBudgetBind();
+        if (leads and self.halted == null) self.proposeQuotaBinds();
 
         // Every shard-0 node, leader or not, tells its linked peers its own
         // memory so whichever node leads can write its row.
@@ -10959,6 +11024,88 @@ test "settings: a bind of a 0 share is refused at apply, binding nothing" {
     _ = shard.applyEntry(&e, &out);
     try std.testing.expect(out.refused() != null);
     try std.testing.expect(settings_machine.boundShare(.{ .store = &shard.defaultPartition().store }) == null);
+}
+
+/// A settings entry of `etype` applied on `shard`, `at` past its last
+/// applied index: each a later entry than the one before.
+fn applySettings(shard: *Shard, at: u64, etype: entry_mod.EntryType, bytes: []const u8) !persistence_mod.Result {
+    const r = shard.raft_node;
+    const e = entry_mod.buildEntry(etype, entry_mod.Flags.NONE, r.current_term, r.last_applied + at, 0, bytes);
+    var out = persistence_mod.Result.start(&e);
+    _ = shard.applyEntry(&e, &out);
+    return out;
+}
+
+fn quotaBind(buf: []u8, items: []const settings_entries.QuotaItem.Value) ![]const u8 {
+    var ib: [settings_entries.MAX_QUOTA_BINDS * settings_entries.QuotaItem.max_size]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &ib };
+    for (items) |it| try settings_entries.QuotaItem.encode(&w, it);
+    return settings_machine.SetQuotaBind.encodeInto(buf, .{ .items = .{ .bytes = w.written(), .count = @intCast(items.len) } });
+}
+
+test "settings: a quota bind puts each part, skipping one older than the bound and a part of 0, and keeps a row for none" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    const a: ns_table.Id = .of(16);
+    const b: ns_table.Id = .of(17);
+    const c: ns_table.Id = .of(18);
+    var buf: [settings_machine.SetQuotaBind.max_size]u8 = undefined;
+    try std.testing.expect((try applySettings(&shard, 1, .settings_quota_bind, try quotaBind(&buf, &.{.{ .ns = a.int(), .part_bytes = 100, .published_index = 5 }}))).refused() == null);
+    // One stale item, a 0, and a none: the batch applies, the stale and the
+    // 0 skipped.
+    const out = try applySettings(&shard, 2, .settings_quota_bind, try quotaBind(&buf, &.{
+        .{ .ns = a.int(), .part_bytes = 200, .published_index = 4 },
+        .{ .ns = b.int(), .part_bytes = 0, .published_index = 9 },
+        .{ .ns = c.int(), .part_bytes = settings_machine.NO_QUOTA, .published_index = 3 },
+    }));
+    try std.testing.expect(out.refused() == null);
+    try std.testing.expectEqual(settings_machine.QuotaPart.Value{ .part_bytes = 100, .published_index = 5 }, settings_machine.boundQuota(read, a).?);
+    try std.testing.expect(settings_machine.boundQuota(read, b) == null);
+    try std.testing.expectEqual(settings_machine.QuotaPart.Value{ .part_bytes = settings_machine.NO_QUOTA, .published_index = 3 }, settings_machine.boundQuota(read, c).?);
+    // A later publish rebinds; one as old as the bound one too.
+    _ = try applySettings(&shard, 3, .settings_quota_bind, try quotaBind(&buf, &.{.{ .ns = a.int(), .part_bytes = 300, .published_index = 5 }}));
+    try std.testing.expectEqual(@as(u64, 300), settings_machine.boundQuota(read, a).?.part_bytes);
+}
+
+test "quota binds: a namespace with none published binds nothing, a part bound changes only when it differs, and an older publish never binds again" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    const names = shard.namespace_handler.table;
+    var items: [settings_entries.MAX_QUOTA_BINDS]settings_entries.QuotaItem.Value = undefined;
+    // A shard that leads before shard 0 published any quota (as after a
+    // restart, before shard 0's `publishAll`) binds nothing: no default
+    // stands in for an unpublished quota.
+    for (0..ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 1) |_| try std.testing.expectEqual(@as(usize, 0), shard.quotaBindsDue(&items));
+    names.publishQuota(ns_table.DEFAULT, 8 << 30, 5);
+    var n: usize = 0;
+    for (0..ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 1) |_| n += shard.quotaBindsDue(items[n..]);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u64, 8 << 30), items[0].part_bytes);
+    var buf: [settings_machine.SetQuotaBind.max_size]u8 = undefined;
+    _ = try applySettings(&shard, 4, .settings_quota_bind, try quotaBind(&buf, items[0..1]));
+    // The same part published again later: nothing to bind.
+    names.publishQuota(ns_table.DEFAULT, 8 << 30, 6);
+    for (0..ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 1) |_| try std.testing.expectEqual(@as(usize, 0), shard.quotaBindsDue(&items));
+    // Bound from a later publish than this node's table holds (its shard 0
+    // lagging): its older value isn't bound back.
+    _ = try applySettings(&shard, 5, .settings_quota_bind, try quotaBind(&buf, &.{.{ .ns = ns_table.DEFAULT.int(), .part_bytes = 4 << 30, .published_index = 9 }}));
+    for (0..ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 1) |_| try std.testing.expectEqual(@as(usize, 0), shard.quotaBindsDue(&items));
+    try std.testing.expectEqual(@as(u64, 4 << 30), settings_machine.boundQuota(read, ns_table.DEFAULT).?.part_bytes);
+    // None splits to none.
+    try std.testing.expectEqual(settings_machine.NO_QUOTA, Shard.quotaPart(settings_machine.NO_QUOTA, 8));
+    try std.testing.expectEqual(@as(u64, 2), Shard.quotaPart(7, 4));
 }
 
 test "settings: a pool share over 1000 per-mille is refused at apply, writing no row" {

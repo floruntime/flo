@@ -75,7 +75,7 @@ pub fn classOf(t: EntryType) Class {
         // Shard 0 proposes a create and the write behind it, and the write
         // relies on the create: a refused create would orphan its id. The
         // table is capped instead.
-        .namespace_create => .never,
+        .namespace_create, .namespace_alter => .never,
         // Held by the runs machine too: past the share a signal is refused,
         // but one that wakes its run is taken within a slack.
         .workflow_signal => .own,
@@ -89,7 +89,7 @@ pub fn classOf(t: EntryType) Class {
         // free, or answer a call.
         .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done => .never,
         .processing_sink_batch => .never,
-        .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean, .settings_budget_bind => .never,
+        .settings_pool_share, .settings_node_mem, .settings_node_del, .settings_budget_clean, .settings_budget_bind, .settings_quota_bind => .never,
         // An inbound's messages are judged before they are proposed, or are
         // the node's own; an unpark moves bytes already charged.
         .channel_inbound, .channel_trim, .channel_probe, .channel_unpark => .never,

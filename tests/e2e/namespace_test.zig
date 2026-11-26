@@ -42,7 +42,7 @@ test "e2e/namespace: create and list" {
     var builtin = try ctx.cli.run(&.{ "ns", "info", "default" });
     defer builtin.deinit();
     try testing.expectEqual(@as(u8, 0), builtin.exit_code);
-    try testing.expectEqualStrings("Namespace:  default\nCreated at: built in\n", builtin.stdout);
+    try testing.expect(std.mem.startsWith(u8, builtin.stdout, "Namespace:  default\nCreated at: built in\nHistory quota: 10737418240 bytes over every shard (the default)\n"));
 }
 
 test "e2e/namespace: create multiple namespaces" {
@@ -406,4 +406,75 @@ test "e2e/namespace: a read the leader answers in a namespace never created is r
         if (!r.contains("[no_namespace/")) std.debug.print("{s}: {s}{s}\n", .{ args[0], r.stdout, r.stderr });
         try testing.expect(r.contains("[no_namespace/"));
     }
+}
+
+/// `flo namespace info <name> -o json`'s answer, parsed.
+const QuotaInfo = struct {
+    history_quota: ?u64,
+    history_quota_own: bool,
+    shards: []const struct { shard: u16, bound: bool, part_bytes: ?u64, usage_bytes: u64 },
+};
+
+fn quotaInfo(ctx: *stdx.testing.TestContext, name: []const u8) !std.json.Parsed(QuotaInfo) {
+    var r = try ctx.cli.run(&.{ "namespace", "info", name, "-o", "json" });
+    defer r.deinit();
+    return std.json.parseFromSlice(QuotaInfo, testing.allocator, r.stdout, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+}
+
+/// Polls `name`'s info until every shard has bound `part` (null for none).
+fn expectBound(ctx: *stdx.testing.TestContext, name: []const u8, shards: usize, part: ?u64) !void {
+    var tries: usize = 0;
+    while (tries < 100) : (tries += 1) {
+        const info = try quotaInfo(ctx, name);
+        defer info.deinit();
+        try testing.expectEqual(shards, info.value.shards.len);
+        var all = true;
+        for (info.value.shards) |s| {
+            if (!s.bound or !std.meta.eql(s.part_bytes, part)) all = false;
+        }
+        if (all) return;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    return error.NotBound;
+}
+
+test "e2e/namespace: a namespace's run-history quota is bound on every shard, its part shown by info; an alter rebinds it, none binds none, and a quota below the floor or of 0 is refused" {
+    const shards = 4;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards } });
+    defer ctx.deinit();
+    try ctx.exec(&.{ "namespace", "create", "hq" });
+    // The default, 10 GiB, split over the shards and rounded up.
+    try expectBound(ctx, "hq", shards, (10 << 30) / shards);
+    {
+        const info = try quotaInfo(ctx, "hq");
+        defer info.deinit();
+        try testing.expectEqual(@as(?u64, 10 << 30), info.value.history_quota);
+        try testing.expect(!info.value.history_quota_own);
+    }
+    try ctx.exec(&.{ "namespace", "alter", "hq", "--history-quota", "20GiB" });
+    try expectBound(ctx, "hq", shards, (20 << 30) / shards);
+    try ctx.exec(&.{ "namespace", "alter", "hq", "--history-quota", "none" });
+    try expectBound(ctx, "hq", shards, null);
+    {
+        const info = try quotaInfo(ctx, "hq");
+        defer info.deinit();
+        try testing.expectEqual(@as(?u64, null), info.value.history_quota);
+        try testing.expect(info.value.history_quota_own);
+    }
+    // The built-in default namespace takes one too.
+    try expectBound(ctx, "default", shards, (10 << 30) / shards);
+    // Below one run's reserve on every shard, refused by the server by
+    // name; 0 refused by the CLI before it asks.
+    var low = try ctx.cli.run(&.{ "namespace", "alter", "hq", "--history-quota", "1KiB" });
+    defer low.deinit();
+    try stdx.testing.assertContains(low, "a history quota is at least");
+    try stdx.testing.assertContains(low, "[bad_request/out_of_range]");
+    var zero = try ctx.cli.run(&.{ "namespace", "alter", "hq", "--history-quota", "0" });
+    defer zero.deinit();
+    try stdx.testing.assertContains(zero, "--history-quota is a number of bytes above 0");
+    var missing = try ctx.cli.run(&.{ "namespace", "alter", "never-made", "--history-quota", "20GiB" });
+    defer missing.deinit();
+    try stdx.testing.assertContains(missing, "not found");
+    // A refused alter changed nothing.
+    try expectBound(ctx, "hq", shards, null);
 }
