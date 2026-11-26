@@ -350,8 +350,8 @@ pub const WorkflowRuns = struct {
     const GONE = 32;
     pub const GoneL = struct { wf: usize, run: usize, idem: ?usize, created_ns: u64, completed_ms: i64, orphaned: bool };
 
-    pub const FAMILIES = [_]u16{ rm.RunFam.ID, hm.Workflows.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID, calls_mod.Calls.ID, rm.SigFam.ID, rm.RunAtFam.ID, rm.RunAllFam.ID };
-    pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "history.wf", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents", "step.calls", "workflow.sig", "workflow.run_at", "workflow.run_all" };
+    pub const FAMILIES = [_]u16{ rm.RunFam.ID, hm.Workflows.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID, calls_mod.Calls.ID, rm.SigFam.ID, rm.RunAtFam.ID, rm.RunAllFam.ID, hm.UsageFam.ID };
+    pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "history.wf", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents", "step.calls", "workflow.sig", "workflow.run_at", "workflow.run_all", "history.usage" };
 
     pub const Kind = enum { start, step, complete, child_start, child_refuse, reply, done, retry, clear, signal, delete };
 
@@ -1082,6 +1082,7 @@ pub const WorkflowRuns = struct {
         if (try self.callsRule(store, a)) |why| return why;
         if (try hm.ruleOf(hm.Workflows, rv, a)) |why| return why;
         if (!sweep) return if (touched) |t| self.runRule(store, a, t, true) else null;
+        if (store.history_usage_drift != 0) return "a history usage subtract went past zero";
         if (try hm.usageRule(rv, a)) |why| return why;
         // On the store alone: counts, idempotency keys naming their run, and
         // a run's wait agreeing with its status.

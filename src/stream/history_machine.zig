@@ -72,8 +72,9 @@ pub const Row = schema.Record(&.{
     .{ .name = "mode", .T = Int(u8) },
     // The log bytes this row keeps referenced: a chunk's whole message, a
     // fold's own and every row it folded, an ended run's last row's; an
-    // orphan mark's, every row its run still holds. Markers and final rows
-    // hold none. A namespace's usage is the sum over its rows.
+    // orphan mark's, every row its run holds, kept current as later chunks
+    // and folds land. Markers and final rows hold none. A namespace's usage
+    // is the sum over its rows.
     .{ .name = "total", .T = Int(u64) },
 });
 
@@ -311,7 +312,7 @@ fn moveUsage(view: *View, ns: NamespaceId, m: Move) ApplyError!void {
     var u: Usage.Value = if (try view.get(UsageFam, k)) |got| got.v else .{ .bytes = 0, .orphans = 0, .orphan_bytes = 0 };
     // A subtract past 0 is drift a VOPR rule finds: counted, never a halt,
     // which every replica would hit again on replay.
-    const drift = &view.store.history_usage_drift;
+    const drift = &view.history_usage_drift;
     u.bytes = subOrDrift(u64, drift, u.bytes +| m.add, m.sub);
     u.orphans = subOrDrift(u32, drift, u.orphans +| m.orphans_add, m.orphans_sub);
     u.orphan_bytes = subOrDrift(u64, drift, u.orphan_bytes +| m.orphan_bytes_add, m.orphan_bytes_sub);
@@ -345,6 +346,7 @@ fn land(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Message, h
     r.kind = @backingInt(kind);
     try view.put(F, try inNs(a, h.ns, try liveKey(a, h.owner, h.run, h.created_ns, r.ual_index, r.part)), .{ .v = r });
     try moveUsage(view, h.ns, .{ .add = r.total });
+    try orphanGrows(F, view, h, r.total);
     if (h.final) {
         var f = row(h.owner);
         f.completed_ms = h.completed_ms;
@@ -387,6 +389,7 @@ fn fold(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Message, h
     r.total = (if (comptime plant.active == .history_fold_total_dropped) 0 else folded) +| e.payload.len;
     try view.put(F, try inNs(a, h.ns, try liveKey(a, h.owner, h.run, h.created_ns, r.ual_index, r.part)), .{ .v = r });
     try moveUsage(view, h.ns, .{ .add = e.payload.len });
+    try orphanGrows(F, view, h, e.payload.len);
     try settle(F, view, msg, h);
 }
 
@@ -440,7 +443,9 @@ fn end(comptime F: type, view: *View, h: Head, completed_ms: u64, last: Row.Valu
     r.owner = h.owner;
     r.completed_ms = completed_ms;
     r.mode = @backingInt(Mode.one);
-    try view.put(F, try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, completed_ms)), .{ .v = r });
+    const ek = try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, completed_ms));
+    try releaseEnded(F, view, h.ns, ek);
+    try view.put(F, ek, .{ .v = r });
     try view.delete(F, try inNs(a, h.ns, try liveKey(a, h.owner, h.run, h.created_ns, last.ual_index, last.part)));
     try view.delete(F, try inNs(a, h.ns, try runKey(a, .final, h.owner, h.run, h.created_ns)));
 }
@@ -470,6 +475,25 @@ fn drop(comptime F: type, view: *View, h: Head) ApplyError!void {
     try view.delete(F, orphan);
     if (comptime plant.active == .history_drop_unread) return;
     try moveUsage(view, h.ns, m);
+}
+
+/// A run marked orphaned whose rows reference `bytes` more (a chunk or fold
+/// that landed after its mark): its mark and its namespace's orphaned bytes
+/// grow with them.
+fn orphanGrows(comptime F: type, view: *View, h: Head, bytes: u64) ApplyError!void {
+    if (bytes == 0) return;
+    const k = try inNs(view.arena, h.ns, try runKey(view.arena, .orphan, h.owner, h.run, h.created_ns));
+    var o = (try view.get(F, k)) orelse return;
+    o.v.total +|= bytes;
+    try view.put(F, k, o);
+    try moveUsage(view, h.ns, .{ .orphan_bytes_add = bytes });
+}
+
+/// What an ended row put at `key` replaces: one already there (a second
+/// final chunk, which no producer sends) has its total taken off usage, so
+/// a replace never counts twice.
+fn releaseEnded(comptime F: type, view: *View, ns: NamespaceId, key: []const u8) ApplyError!void {
+    if (try view.get(F, key)) |old| try moveUsage(view, ns, .{ .sub = old.v.total });
 }
 
 /// The bytes `h`'s run's rows still reference: its live rows and its ended
@@ -527,7 +551,9 @@ fn skippedIn(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Messa
             var r = row(h.owner);
             r.completed_ms = f.completed_ms;
             r.mode = @backingInt(Mode.live);
-            try view.put(F, try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, f.completed_ms)), .{ .v = r });
+            const ek = try inNs(a, h.ns, try endedKey(a, h.owner, h.run, h.created_ns, f.completed_ms));
+            try releaseEnded(F, view, h.ns, ek);
+            try view.put(F, ek, .{ .v = r });
             try view.delete(F, final_key);
         },
         .history_drop => {
@@ -1223,6 +1249,38 @@ test "history usage: an orphaned run is counted once with its rows' bytes, howev
     try testing.expectEqual(@as(u32, 0), u.orphans);
     try testing.expectEqual(@as(u64, 0), u.orphan_bytes);
     try expectUsageRule(&t);
+}
+
+test "history usage: an orphaned run's mark grows with the chunks and folds that land after it" {
+    var t = H.init();
+    defer t.deinit();
+    const r: H.Run = .{};
+    for (0..7) |i| try t.chunk(r, i + 1, i + 1, false, 0);
+    try t.pump();
+    // Its drop and both resends lost (seqs 8..10): orphaned at 7 rows.
+    t.skip = &.{ 8, 9, 10 };
+    try t.dropOf(r, 0);
+    try t.pump();
+    t.skip = &.{};
+    try testing.expectEqual(@as(usize, 1), t.countTag(r, .orphan));
+    // Nine more land after the mark, and the fold at 16 with them.
+    for (0..9) |i| try t.chunk(r, 8 + i, 8 + i, false, 0);
+    try t.pump();
+    const u = usageOf(t.read(), r.ns);
+    try testing.expectEqual(u.bytes, u.orphan_bytes);
+    try expectUsageRule(&t);
+}
+
+test "history usage: an ended row put over one already there (a second final chunk) takes the first's bytes off, so none count twice" {
+    var t = H.init();
+    defer t.deinit();
+    const r: H.Run = .{};
+    try t.chunk(r, 1, 1, true, 50);
+    try t.pump();
+    try t.chunk(r, 2, 2, true, 50);
+    try t.pump();
+    try expectUsageRule(&t);
+    try testing.expectEqual(@as(u64, 0), t.store.history_usage_drift);
 }
 
 test "history usage: a subtract past what a namespace holds is counted as drift and saturates, never halts" {

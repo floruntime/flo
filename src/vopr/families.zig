@@ -719,8 +719,8 @@ pub const Actions = struct {
     /// which sends its history to itself.
     landed: history_lane.Landed = .{},
 
-    pub const FAMILIES = [_]u16{ action_machine.Defs.ID, action_machine.Runs.ID, action_machine.Ready.ID, action_machine.Deadlines.ID, action_machine.Requests.ID, hm.Actions.ID, action_machine.RunAt.ID, action_machine.Counts.ID };
-    pub const NAMES = [_][]const u8{ "action.def", "action.run", "action.ready", "action.deadline", "action.request", "history.act", "action.run_at", "action.counts" };
+    pub const FAMILIES = [_]u16{ action_machine.Defs.ID, action_machine.Runs.ID, action_machine.Ready.ID, action_machine.Deadlines.ID, action_machine.Requests.ID, hm.Actions.ID, action_machine.RunAt.ID, action_machine.Counts.ID, hm.UsageFam.ID };
+    pub const NAMES = [_][]const u8{ "action.def", "action.run", "action.ready", "action.deadline", "action.request", "history.act", "action.run_at", "action.counts", "history.usage" };
     const PLACE: view_mod.Place = .{ .group = 0, .count = 1 };
 
     pub const Kind = enum { register, delete, invoke, deliver, settle, release, extend, expire, run_delete };
@@ -1276,6 +1276,7 @@ pub const Actions = struct {
         var arena = std.heap.ArenaAllocator.init(self.store.allocator);
         defer arena.deinit();
         if (hm.ruleOf(hm.Actions, self.read(), arena.allocator()) catch return "the history rows could not be read") |why| return why;
+        if (self.store.history_usage_drift != 0) return "a history usage subtract went past zero";
         return hm.usageRule(self.read(), arena.allocator()) catch "the history rows could not be read";
     }
 
