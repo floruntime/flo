@@ -11,8 +11,8 @@
 //!     .idempotency("required")
 //!     .plans()
 //!         .plan("payment", "health-weighted")
-//!         .executor("stripe", "@actions/charge-stripe", 100)
-//!         .executor("paypal", "@actions/charge-paypal", 90)
+//!         .executor("stripe", "@actions/charge-stripe")
+//!         .executor("paypal", "@actions/charge-paypal")
 //!         .done()
 //!     .done()
 //!     .start("@actions/validate")
@@ -198,12 +198,11 @@ pub const PlanBuilder = struct {
     }
 
     /// Add an executor to the plan
-    pub fn executor(self: *Self, name: []const u8, action: []const u8, priority: i32) *Self {
+    pub fn executor(self: *Self, name: []const u8, action: []const u8) *Self {
         const y = self.yaml();
         y.appendFmt("- name: {s}", .{name}) catch {};
         y.indent = 8;
         y.appendFmt("run: \"{s}\"", .{action}) catch {};
-        y.appendFmt("priority: {d}", .{priority}) catch {};
         y.indent = 6;
         return self;
     }
@@ -213,19 +212,15 @@ pub const PlanBuilder = struct {
         self: *Self,
         name: []const u8,
         action: []const u8,
-        priority: i32,
         max_retries: u32,
-        backoff: []const u8,
     ) *Self {
         const y = self.yaml();
         y.appendFmt("- name: {s}", .{name}) catch {};
         y.indent = 8;
         y.appendFmt("run: \"{s}\"", .{action}) catch {};
-        y.appendFmt("priority: {d}", .{priority}) catch {};
         y.appendLine("retry:") catch {};
         y.indent = 10;
         y.appendFmt("max_attempts: {d}", .{max_retries}) catch {};
-        y.appendFmt("backoff: {s}", .{backoff}) catch {};
         y.indent = 6;
         return self;
     }
@@ -235,7 +230,6 @@ pub const PlanBuilder = struct {
         self: *Self,
         name: []const u8,
         action: []const u8,
-        priority: i32,
         failure_threshold: u32,
         cooldown_ms: u64,
     ) *Self {
@@ -243,7 +237,6 @@ pub const PlanBuilder = struct {
         y.appendFmt("- name: {s}", .{name}) catch {};
         y.indent = 8;
         y.appendFmt("run: \"{s}\"", .{action}) catch {};
-        y.appendFmt("priority: {d}", .{priority}) catch {};
         y.appendLine("breaker:") catch {};
         y.indent = 10;
         y.appendFmt("failure_threshold: {d}", .{failure_threshold}) catch {};
@@ -708,8 +701,8 @@ test "YamlBuilder: workflow with plan" {
     _ = builder.workflow("test", "1.0.0");
     _ = builder.plans()
         .plan("my-plan", "health-weighted")
-        .executor("exec1", "@actions/action1", 100)
-        .executor("exec2", "@actions/action2", 50)
+        .executor("exec1", "@actions/action1")
+        .executor("exec2", "@actions/action2")
         .done()
         .done();
     _ = builder.start("@plan/my-plan")
@@ -723,7 +716,6 @@ test "YamlBuilder: workflow with plan" {
     try testing.expect(std.mem.indexOf(u8, yaml, "my-plan:") != null);
     try testing.expect(std.mem.indexOf(u8, yaml, "selection: health-weighted") != null);
     try testing.expect(std.mem.indexOf(u8, yaml, "run: \"@actions/action1\"") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "priority: 100") != null);
 }
 
 test "YamlBuilder: workflow with retry config" {
@@ -734,7 +726,7 @@ test "YamlBuilder: workflow with retry config" {
     _ = builder.workflow("retry-test", "1.0.0");
     _ = builder.plans()
         .plan("with-retry", "static-order")
-        .executorWithRetry("flaky", "@actions/flaky-service", 100, 3, "exponential")
+        .executorWithRetry("flaky", "@actions/flaky-service", 3)
         .done()
         .done();
 
@@ -743,7 +735,6 @@ test "YamlBuilder: workflow with retry config" {
 
     try testing.expect(std.mem.indexOf(u8, yaml, "retry:") != null);
     try testing.expect(std.mem.indexOf(u8, yaml, "max_attempts: 3") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "backoff: exponential") != null);
 }
 
 test "YamlBuilder: workflow with circuit breaker" {
@@ -754,7 +745,7 @@ test "YamlBuilder: workflow with circuit breaker" {
     _ = builder.workflow("breaker-test", "1.0.0");
     _ = builder.plans()
         .plan("resilient", "static-order")
-        .executorWithBreaker("primary", "@actions/primary", 100, 5, 60000)
+        .executorWithBreaker("primary", "@actions/primary", 5, 60000)
         .done()
         .done();
 

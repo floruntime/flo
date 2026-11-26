@@ -358,10 +358,6 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     var result = client_mod.workflow.status(&client, namespace, run_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isNotFound()) {
-        return outcome.notFound(ctx, "Workflow run not found: {s}", .{run_id});
-    }
-
     try outcome.check(ctx, result);
 
     const data = result.asRawData() orelse return outcome.malformed(ctx, "workflow run status (empty)");
@@ -459,7 +455,6 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
     while (count < limit) {
         var result = client_mod.workflow.historyPage(&client, namespace, run_id, limit - count, cursor, false) catch |err| return outcome.requestFailed(ctx, err);
         defer result.deinit();
-        if (result.isNotFound()) return outcome.notFound(ctx, "Workflow run not found: {s}", .{run_id});
         try outcome.check(ctx, result);
         const data = result.asRawData() orelse return outcome.malformed(ctx, "history response (empty)");
         var diag: schema.Diagnostic = .{};
@@ -626,10 +621,6 @@ fn runCancel(ctx: *commander.Context) commander.Error!void {
 
     var result = client_mod.workflow.cancel(&client, namespace, run_id, reason_val) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
-
-    if (result.isNotFound()) {
-        return outcome.notFound(ctx, "Workflow run not found: {s}", .{run_id});
-    }
 
     try outcome.check(ctx, result);
 

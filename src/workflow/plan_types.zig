@@ -1,25 +1,12 @@
 //! Workflow Plan Types
 //!
-//! Types for inline plans - composed actions with resilience features.
+//! Types for inline plans: one step tried through a list of executors.
 //! Plans are defined inline within Workflow YAML, not as separate entities.
 //!
-//! # Key Types
+//! - `ExecutorConfig`: one executor, its retries and its circuit breaker
+//! - `ExecutorHealth`: an executor's runtime health, leader memory
+//! - `SelectionStrategy`: how a plan picks among its executors
 //!
-//! - `ExecutorConfig`: Individual executor configuration
-//! - `ExecutorHealth`: Runtime health metrics (stored in KV)
-//! - `PlanFeatures`: Auto-detected features from config
-//! - `SelectionStrategy`: How to select among executors
-//!
-//! # Features
-//!
-//! Plans can have various features auto-detected from config:
-//! - Circuit breaker (from `breaker:` config)
-//! - Health-weighted routing (from `selection: health-weighted`)
-//! - Rate limiting (from `rate_limit:` config)
-//! - Caching (from `cache:` config)
-//! - Async tracking (from `tracking: { mode: async }`)
-//! - Fallback values (from `fallback:` config)
-
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
@@ -34,7 +21,7 @@ pub const RunStatus = types.RunStatus;
 
 /// Strategy for selecting executors in a plan
 pub const SelectionStrategy = enum(u8) {
-    /// Always try in definition order (by priority)
+    /// Always try in the order the executors are written
     static_order = 0,
     /// Rotate starting executor across requests
     round_robin = 1,
@@ -67,55 +54,6 @@ pub const SelectionStrategy = enum(u8) {
 };
 
 // =============================================================================
-// Plan Features (Auto-detected)
-// =============================================================================
-
-/// Features auto-detected from plan configuration
-/// Not stored - computed at parse time
-pub const PlanFeatures = struct {
-    /// true if any executor has breaker config
-    circuit_breaker: bool = false,
-    /// true if selection is health-weighted
-    health_tracking: bool = false,
-    /// true if any executor has async tracking
-    async_tracking: bool = false,
-    /// true if any executor has rate_limit config
-    rate_limiting: bool = false,
-    /// true if cache config exists
-    caching: bool = false,
-    /// true if fallback config exists
-    fallback_value: bool = false,
-
-    /// Compute features from inline plan configuration
-    pub fn fromInlinePlan(
-        selection: SelectionStrategy,
-        executors: []const ExecutorConfig,
-        cache_config: ?CacheConfig,
-        fallback_config: ?FallbackConfig,
-    ) PlanFeatures {
-        var features = PlanFeatures{};
-
-        // Check selection strategy
-        features.health_tracking = selection == .health_weighted;
-
-        // Check executors
-        for (executors) |exec| {
-            if (exec.breaker != null) features.circuit_breaker = true;
-            if (exec.rate_limit != null) features.rate_limiting = true;
-            if (exec.tracking) |t| {
-                if (t.mode == .async_mode) features.async_tracking = true;
-            }
-        }
-
-        // Check plan-level configs
-        features.caching = cache_config != null;
-        features.fallback_value = fallback_config != null;
-
-        return features;
-    }
-};
-
-// =============================================================================
 // Circuit Breaker
 // =============================================================================
 
@@ -141,204 +79,16 @@ pub const CircuitBreakerState = enum(u8) {
 pub const CircuitBreakerConfig = struct {
     /// Number of consecutive failures before opening
     failure_threshold: u32 = 5,
-    /// How long to stay open before half-open (ms)
-    cooldown_ms: i64 = 30000,
-    /// Number of probe requests allowed in half-open state
-    half_open_max_calls: u32 = 3,
-};
-
-// =============================================================================
-// Tracking Configuration
-// =============================================================================
-
-/// Tracking mode for outcome reporting
-pub const TrackingMode = enum(u8) {
-    /// Synchronous - outcome known immediately from API call
-    sync = 0,
-    /// Asynchronous - outcome reported later via webhook
-    async_mode = 1,
-
-    pub fn toString(self: TrackingMode) []const u8 {
-        return switch (self) {
-            .sync => "sync",
-            .async_mode => "async",
-        };
-    }
-
-    pub fn fromString(s: []const u8) ?TrackingMode {
-        const map = std.StaticStringMap(TrackingMode).initComptime(.{
-            .{ "sync", .sync },
-            .{ "async", .async_mode },
-        });
-        return map.get(s);
-    }
-};
-
-/// Tracking configuration for async outcomes
-pub const TrackingConfig = struct {
-    /// Tracking mode
-    mode: TrackingMode,
-    /// Timeout for async outcome (ms), null for sync
-    timeout_ms: ?i64,
-};
-
-// =============================================================================
-// Rate Limiting
-// =============================================================================
-
-/// Rate limit configuration
-pub const RateLimitConfig = struct {
-    /// Max requests per second (null = unlimited)
-    max_per_second: ?u32,
-    /// Max requests per minute (null = unlimited)
-    max_per_minute: ?u32,
-    /// Max requests per hour (null = unlimited)
-    max_per_hour: ?u32,
-};
-
-// =============================================================================
-// Caching
-// =============================================================================
-
-/// Cache configuration for result reuse
-pub const CacheConfig = struct {
-    /// Time-to-live for cached results (ms)
-    ttl_ms: i64,
-    /// Template for cache key (e.g., "user:{input.user_id}")
-    key_template: []const u8,
-    /// Event types that invalidate cache
-    invalidate_on: [][]const u8,
-
-    pub fn deinit(self: *CacheConfig, allocator: Allocator) void {
-        allocator.free(self.key_template);
-        for (self.invalidate_on) |event| {
-            allocator.free(event);
-        }
-        if (self.invalidate_on.len > 0) allocator.free(self.invalidate_on);
-    }
-
-    pub fn clone(self: CacheConfig, allocator: Allocator) !CacheConfig {
-        const invalidate_on = try allocator.alloc([]const u8, self.invalidate_on.len);
-        for (self.invalidate_on, 0..) |event, i| {
-            invalidate_on[i] = try allocator.dupe(u8, event);
-        }
-        return .{
-            .ttl_ms = self.ttl_ms,
-            .key_template = try allocator.dupe(u8, self.key_template),
-            .invalidate_on = invalidate_on,
-        };
-    }
-};
-
-// =============================================================================
-// Health Configuration
-// =============================================================================
-
-/// Health tracking configuration
-pub const HealthConfig = struct {
-    /// Rolling window for health calculation (ms)
-    window_ms: i64,
-    /// Exponential decay factor for old samples
-    decay: f64,
-    /// Minimum samples before health-weighted kicks in
-    min_samples: u32,
-};
-
-// =============================================================================
-// Fallback Configuration
-// =============================================================================
-
-/// Condition for using fallback value
-pub const FallbackCondition = enum(u8) {
-    /// Only when all executors exhausted
-    exhausted = 0,
-    /// On any error (including fatal)
-    any_error = 1,
-
-    pub fn toString(self: FallbackCondition) []const u8 {
-        return switch (self) {
-            .exhausted => "exhausted",
-            .any_error => "any_error",
-        };
-    }
-};
-
-/// Fallback configuration
-pub const FallbackConfig = struct {
-    /// Default value to return (JSON)
-    value: []const u8,
-    /// When to use fallback
-    condition: FallbackCondition,
-
-    pub fn deinit(self: *FallbackConfig, allocator: Allocator) void {
-        allocator.free(self.value);
-    }
-
-    pub fn clone(self: FallbackConfig, allocator: Allocator) !FallbackConfig {
-        return .{
-            .value = try allocator.dupe(u8, self.value),
-            .condition = self.condition,
-        };
-    }
-};
-
-// =============================================================================
-// Error Classification
-// =============================================================================
-
-/// Error classification for retry decisions
-pub const ErrorClassification = struct {
-    /// Errors that should trigger retry
-    retryable: [][]const u8,
-    /// Errors that should not retry (immediate failure)
-    fatal: [][]const u8,
-
-    pub fn deinit(self: *ErrorClassification, allocator: Allocator) void {
-        for (self.retryable) |err| allocator.free(err);
-        if (self.retryable.len > 0) allocator.free(self.retryable);
-        for (self.fatal) |err| allocator.free(err);
-        if (self.fatal.len > 0) allocator.free(self.fatal);
-    }
-
-    pub fn clone(self: ErrorClassification, allocator: Allocator) !ErrorClassification {
-        const retryable = try allocator.alloc([]const u8, self.retryable.len);
-        for (self.retryable, 0..) |err, i| {
-            retryable[i] = try allocator.dupe(u8, err);
-        }
-
-        const fatal = try allocator.alloc([]const u8, self.fatal.len);
-        for (self.fatal, 0..) |err, i| {
-            fatal[i] = try allocator.dupe(u8, err);
-        }
-
-        return .{
-            .retryable = retryable,
-            .fatal = fatal,
-        };
-    }
-
-    /// Check if an error code is retryable
-    pub fn isRetryable(self: ErrorClassification, error_code: []const u8) bool {
-        for (self.retryable) |code| {
-            if (mem.eql(u8, code, error_code)) return true;
-        }
-        return false;
-    }
-
-    /// Check if an error code is fatal
-    pub fn isFatal(self: ErrorClassification, error_code: []const u8) bool {
-        for (self.fatal) |code| {
-            if (mem.eql(u8, code, error_code)) return true;
-        }
-        return false;
-    }
+    /// How long to stay open before half-open (ms). Half-open lets every
+    /// call through until one's result closes the breaker or opens it again.
+    cooldown_ms: i64 = 60000,
 };
 
 // =============================================================================
 // Retry Policy
 // =============================================================================
 
-/// Backoff type for retry delays
+/// Backoff type for poll delays
 pub const BackoffType = enum(u8) {
     /// Fixed delay between retries
     constant = 0,
@@ -368,38 +118,18 @@ pub const BackoffType = enum(u8) {
     }
 };
 
-/// Retry policy for executor attempts
+/// Most retries a step or an executor may set. A retry runs at once after a
+/// failure, and each is a fresh action run with up to 1000 attempts of its
+/// own, so one step's worst case is 101 runs of 1000 attempts, ~100k
+/// deliveries, with nothing between them.
+pub const MAX_RETRIES: u32 = 100;
+
+/// Retry policy for a step or an executor. A retry runs at once after a
+/// failure.
 pub const RetryPolicy = struct {
-    /// Maximum number of attempts
+    /// Retries after the first run fails, so up to `max_attempts + 1` runs
+    /// (the name is the definition's key).
     max_attempts: u32 = 3,
-    /// Type of backoff
-    backoff: BackoffType = .exponential,
-    /// Initial delay (ms)
-    initial_delay_ms: u32 = 1000,
-    /// Maximum delay cap (ms)
-    max_delay_ms: u32 = 30000,
-    /// Total time budget for all retries (ms), null = unlimited
-    within_ms: ?u64 = null,
-    /// Calculate delay for a given attempt (0-indexed)
-    pub fn calculateDelay(self: RetryPolicy, attempt: u32) u32 {
-        const delay: u32 = switch (self.backoff) {
-            .constant => self.initial_delay_ms,
-            .linear => self.initial_delay_ms *| (attempt +| 1),
-            .exponential => blk: {
-                const multiplier = std.math.powi(u32, 2, attempt) catch std.math.maxInt(u32);
-                break :blk self.initial_delay_ms *| multiplier;
-            },
-            .exponential_jitter => blk: {
-                const base_multiplier = std.math.powi(u32, 2, attempt) catch std.math.maxInt(u32);
-                const base_delay = self.initial_delay_ms *| base_multiplier;
-                // Add up to 25% jitter
-                var rng = std.Random.DefaultPrng.init(@intCast(@import("stdx").time.milliTimestamp()));
-                const jitter = rng.random().intRangeAtMost(u32, 0, base_delay / 4);
-                break :blk base_delay +| jitter;
-            },
-        };
-        return @min(delay, self.max_delay_ms);
-    }
 };
 
 // =============================================================================
@@ -415,16 +145,10 @@ pub const ExecutorConfig = struct {
     name: []const u8,
     /// Action to invoke (e.g., "@actions/charge-stripe")
     action_name: []const u8,
-    /// Priority (higher = tried first)
-    priority: i32,
     /// Retry policy for this executor
     retry: ?RetryPolicy,
     /// Circuit breaker configuration
     breaker: ?CircuitBreakerConfig,
-    /// Tracking configuration (sync/async)
-    tracking: ?TrackingConfig,
-    /// Rate limiting configuration
-    rate_limit: ?RateLimitConfig,
 
     pub fn deinit(self: *ExecutorConfig, allocator: Allocator) void {
         allocator.free(self.name);
@@ -435,11 +159,8 @@ pub const ExecutorConfig = struct {
         return .{
             .name = try allocator.dupe(u8, self.name),
             .action_name = try allocator.dupe(u8, self.action_name),
-            .priority = self.priority,
             .retry = self.retry,
             .breaker = self.breaker,
-            .tracking = self.tracking,
-            .rate_limit = self.rate_limit,
         };
     }
 };
@@ -479,8 +200,7 @@ pub const IdempotencyMode = enum(u8) {
 // Executor Health (Runtime State)
 // =============================================================================
 
-/// Runtime health metrics for an executor
-/// Stored at: _wf:health:{namespace}:{plan}:{executor}
+/// Runtime health metrics for an executor, kept in the leader's memory
 pub const ExecutorHealth = struct {
     /// Executor name
     executor_name: []const u8,
@@ -502,11 +222,6 @@ pub const ExecutorHealth = struct {
     // Circuit breaker state
     breaker_state: CircuitBreakerState = .closed,
     breaker_opened_at_ms: i64 = 0,
-
-    // Rate limiting counters
-    requests_this_second: u32 = 0,
-    requests_this_minute: u32 = 0,
-    requests_this_hour: u32 = 0,
 
     // Latency percentiles (ms)
     latency_p50_ms: i64 = 0,
@@ -641,7 +356,7 @@ pub const ExecutorHealth = struct {
                 return false;
             },
             .half_open => {
-                // Allow limited probe requests
+                // Every call until a result decides.
                 return true;
             },
         }
@@ -690,31 +405,6 @@ test "SelectionStrategy: toString and fromString" {
     try testing.expectEqual(SelectionStrategy.health_weighted, SelectionStrategy.fromString("health-weighted").?);
 }
 
-test "RetryPolicy: calculateDelay" {
-    const testing = std.testing;
-
-    const policy = RetryPolicy{
-        .max_attempts = 3,
-        .backoff = .exponential,
-        .initial_delay_ms = 1000,
-        .max_delay_ms = 30000,
-    };
-
-    // Exponential: 1000 * 2^attempt
-    try testing.expectEqual(@as(u32, 1000), policy.calculateDelay(0)); // 1000 * 1
-    try testing.expectEqual(@as(u32, 2000), policy.calculateDelay(1)); // 1000 * 2
-    try testing.expectEqual(@as(u32, 4000), policy.calculateDelay(2)); // 1000 * 4
-
-    // Constant backoff
-    const constant_policy = RetryPolicy{
-        .backoff = .constant,
-        .initial_delay_ms = 500,
-        .max_delay_ms = 30000,
-    };
-    try testing.expectEqual(@as(u32, 500), constant_policy.calculateDelay(0));
-    try testing.expectEqual(@as(u32, 500), constant_policy.calculateDelay(5));
-}
-
 test "ExecutorHealth: circuit breaker state machine" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -727,7 +417,6 @@ test "ExecutorHealth: circuit breaker state machine" {
     const config = CircuitBreakerConfig{
         .failure_threshold = 3,
         .cooldown_ms = 60000,
-        .half_open_max_calls = 2,
     };
 
     var now_ms: i64 = 1000000;

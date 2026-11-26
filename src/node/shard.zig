@@ -2409,14 +2409,6 @@ pub const Shard = struct {
         // An internal op from a client runs where an unknown op would: here.
         if (run_mod.internalFromClient(op, auth.origin)) return self.dispatchLocal(conn, req, auth);
 
-        // A workflow run id the client chose names no shard: ask each which
-        // holds the run (`RunFind`), and for a start that chooses one,
-        // whether another workflow's run has it already.
-        if (self.runIdUnplaced(req)) {
-            if (self.refusedRead(conn, req)) return;
-            return self.findRun(conn, req, auth, req.key, null);
-        }
-
         // A write routes by its namespace's id, so on a node of several
         // shards one into a namespace the node doesn't have yet waits for
         // shard 0 to create and publish it, then comes back here. Paid once
@@ -2450,7 +2442,9 @@ pub const Shard = struct {
         // On a node of several shards, a write that creates nothing in a
         // namespace that doesn't exist is refused as having none through
         // shard 0, as shard 0's answer to another shard's ask refuses it
-        // there. A lone shard answers it as it always has.
+        // there. A lone shard answers other writes as it always has; one by
+        // a workflow run's id says the namespace isn't there on any node, as
+        // that op's reads do.
         const creates = op < proto.MAX_OPCODES and dispatcher_mod.opCreates(@fromBackingInt(@intCast(op)));
         if (req.key.len > 0 and namespaced(op)) {
             const name = if (req.namespace.len == 0) "default" else req.namespace;
@@ -2462,7 +2456,7 @@ pub const Shard = struct {
                     return self.route(conn, routed, auth);
                 }
                 if (self.id != 0) return self.askShard0(conn, req, name, auth.origin);
-                if (self.shardCount() > 1 and requestWrites(req) and !creates and !nh.creating(name)) return self.sendRefusal(conn, req.header.request_id, .no_namespace, NO_NAMESPACE);
+                if ((self.shardCount() > 1 or isWorkflowRunOp(op)) and requestWrites(req) and !creates and !nh.creating(name)) return self.sendRefusal(conn, req.header.request_id, .no_namespace, NO_NAMESPACE);
             }
             // Shard 0 routes by its own registry's id a namespace it applied
             // but hasn't published, and the owning shard, which resolves
@@ -2480,6 +2474,16 @@ pub const Shard = struct {
             const home = self.router.hashToShard(hash);
             if (home != self.id) return self.forwardToShard(home, conn, req, auth);
         };
+
+        // A workflow run id the client chose names no shard: ask each which
+        // holds the run (`RunFind`), by the namespace's id, so only past the
+        // wait above: before it, a namespace never created would answer as
+        // a run not found, and one not yet published here would ask every
+        // shard under no id.
+        if (self.runIdUnplaced(req)) {
+            if (self.refusedRead(conn, req)) return;
+            return self.findRun(conn, req, auth, req.key, null);
+        }
 
         // A start that chooses its run id is decided on its workflow's
         // shard, found by the namespace's id: only past the wait above.
@@ -2531,10 +2535,14 @@ pub const Shard = struct {
     /// start. A generated id carries its workflow's slot, so its op routes
     /// straight there; a chosen one carries none, and the run is on the
     /// shard of its workflow's name, which the op doesn't name.
-    fn runIdUnplaced(self: *const Shard, req: proto.Request) bool {
-        const by_run_id = for (WORKFLOW_RUN_OPS) |op| {
-            if (req.header.op_code == @backingInt(op)) break true;
+    fn isWorkflowRunOp(op: u16) bool {
+        return for (WORKFLOW_RUN_OPS) |o| {
+            if (op == @backingInt(o)) break true;
         } else false;
+    }
+
+    fn runIdUnplaced(self: *const Shard, req: proto.Request) bool {
+        const by_run_id = isWorkflowRunOp(req.header.op_code);
         // Only the server mints ids of the generated form (a start refuses a
         // chosen one), so this splits them exactly; a chosen id can decode as
         // a slot (`order-123`), and that slot names no run's shard.
@@ -6017,6 +6025,7 @@ pub const Shard = struct {
             const bound = settings_machine.boundShare(.{ .store = &self.defaultPartition().store });
             sm.pool_share_bytes.store(if (bound) |b| b.share_bytes else 0, .monotonic);
             sm.memory_refusals.store(self.defaultPartition().store.memory_refusals, .monotonic);
+            sm.history_usage_drift.store(self.defaultPartition().store.history_usage_drift, .monotonic);
             sm.runs_unlisted[0].store(self.workflow_handler.missing_runs, .monotonic);
             sm.runs_unlisted[1].store(self.actions_handler.unlisted_runs, .monotonic);
             for (&sm.ts_late, self.defaultPartition().store.ts_late_points) |*m, n| m.store(n, .monotonic);
@@ -13123,6 +13132,66 @@ test "Shard: 64 pipelined writes into a new namespace, their share spent when sh
     var answers: [Connection.MAX_FORWARDS_IN_FLIGHT]proto.Response = undefined;
     try ParkTest.responses(b, c.conn, c.pair[1], &out, &answers);
     for (answers) |r| try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
+}
+
+test "Shard: a write by a chosen run id in a namespace this shard's table hasn't published asks shard 0 first, then finds the run under the namespace's id" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    // A workflow whose shard is 0 by the namespace's id, and 1 by none.
+    const id = nextNamespaceId(a);
+    var wbuf: [16]u8 = undefined;
+    var i: usize = 0;
+    const w = while (true) : (i += 1) {
+        const n = try std.fmt.bufPrint(&wbuf, "wf{d}", .{i});
+        const by_id = a.router.hashToShard(node_router.routeNsKey(id, n));
+        const by_none = a.router.hashToShard(node_router.routeNsKey(.invalid, n));
+        if (by_id == 0 and by_none == 1) break n;
+    };
+    var dbuf: [256]u8 = undefined;
+    const def = try std.fmt.bufPrint(&dbuf,
+        \\{{"kind":"Workflow","name":"{s}","version":"1.0.0",
+        \\"start":{{"wait_for_signal":{{"type":"go"}},"transitions":{{"success":"flo.Completed"}}}}}}
+    , .{w});
+    // Created on shard 0 with its namespace, a run started by a chosen id:
+    // applied, not yet published, as just after a restart.
+    const ca = try TestClient.open(a);
+    defer _ = std.c.close(ca.pair[1]);
+    a.runRequest(ca.conn, try ParkTest.request(.workflow_create, 1, "late", w, def, ""), .client);
+    _ = a.applyCommitted();
+    var out: [512]u8 = undefined;
+    _ = try nextAnswer(ca, a, &out);
+    const both = [_]u8{ 0, 0, 1, 1, 0, 'z', 1, 2, 0, 'r', '1' };
+    a.runRequest(ca.conn, try ParkTest.request(.workflow_start, 2, "late", w, &both, ""), .client);
+    for (0..8) |_| for (&two.shards) |*s| {
+        _ = s.drainInbox();
+        _ = s.applyCommitted();
+    };
+    _ = try nextAnswer(ca, a, &out);
+    try std.testing.expect(a.workflow_handler.holdsRun(id, "r1"));
+    try std.testing.expect(b.namespace_handler.table.lookup("late") == null);
+
+    // Shard 1 gets a cancel by the chosen id: it asks shard 0 first, and
+    // starts no search of every shard under no id.
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    b.runRequest(c.conn, try ParkTest.request(.workflow_cancel, 9, "late", "r1", "", ""), .client);
+    var asks: usize = 0;
+    for (b.gathers.entries) |e| if (e.active) {
+        try std.testing.expect(e.context.op == &Shard.EdgeAsk.op);
+        asks += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), asks);
+    // Once shard 0 answers with the namespace published, the search runs
+    // under its id, finds the run on shard 0, and the cancel applies.
+    two.settle();
+    const got = try nextAnswer(c, b, &out);
+    try std.testing.expectEqual(@as(u64, 9), got.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), got.header.status);
+    try std.testing.expect(b.namespace_handler.table.lookup("late") != null);
 }
 
 test "Shard: a read held while shard 0 says whether its namespace is published, whose share is spent when it answers, waits for room and is answered, unrefused" {

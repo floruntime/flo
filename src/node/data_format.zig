@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 69;
+pub const CURRENT: u32 = 71;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -250,6 +250,16 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // A processing job's TS sink mapping tags or fields from a TS source is
     // refused where its submit applies, kept failed.
     .{ .format = 69, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
+    // Every history row counts the log bytes it references (`total`), and
+    // each namespace's sum is kept on its shard (history.usage).
+    .{ .format = 70, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
+    // A workflow definition naming a plan option nothing enforced
+    // (`priority`, `tracking`, `rate_limit`, `errors`, `health`, `cache`,
+    // `fallback`, `half_open_max_calls`), a retry delay (`backoff`,
+    // `initial_delay_ms`, `max_delay_ms`, `within_ms`) or more than 100
+    // retries no longer parses: its create is refused, and a log holding one
+    // from before would halt where it applies.
+    .{ .format = 71, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
 };
 
 comptime {

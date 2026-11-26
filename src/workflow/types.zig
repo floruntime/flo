@@ -940,8 +940,6 @@ pub const Signal = struct {
 pub const TimerType = enum(u8) {
     /// Signal timeout (workflow waiting for signal)
     signal_timeout = 0,
-    /// Retry backoff delay
-    retry_backoff = 1,
     /// Overall workflow timeout
     workflow_timeout = 2,
     /// Async tracking timeout (waiting for webhook)
@@ -952,7 +950,6 @@ pub const TimerType = enum(u8) {
     pub fn toString(self: TimerType) []const u8 {
         return switch (self) {
             .signal_timeout => "signal_timeout",
-            .retry_backoff => "retry_backoff",
             .workflow_timeout => "workflow_timeout",
             .async_tracking_timeout => "async_tracking_timeout",
             .poll_backoff => "poll_backoff",
