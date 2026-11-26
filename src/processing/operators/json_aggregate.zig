@@ -43,6 +43,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const path_segments = @import("path_segments.zig");
+const json_out = @import("json_out.zig");
 const Operator = @import("../operator.zig").Operator;
 const OperatorContext = @import("../context.zig").OperatorContext;
 const record_mod = @import("../record.zig");
@@ -196,37 +197,43 @@ pub const JsonAggregateOperator = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         // Extract numeric value (for non-count functions)
-        const numeric_val: ?f64 = if (self.function != .count)
-            self.extractNumericField(rec.value) orelse return // skip non-numeric records
-        else
-            null;
+        const numeric_val: ?f64 = if (self.function != .count) switch (try self.readField(rec.value)) {
+            .number => |v| v,
+            .not_json => return ctx.skip("aggregate: the record isn't JSON it can read"),
+            .no_number => return ctx.skip("aggregate: the record's field isn't a number"),
+        } else null;
 
         // Get or create group for this key
         const group = try self.getOrCreateGroup(rec.key);
 
-        // Update accumulator
+        // The record's total, built apart and kept only once what it emits
+        // is built: a record that runs out of memory there leaves the group
+        // as it was, so running it again counts it once.
+        var next = group.*;
         if (numeric_val) |val| {
-            group.addValue(val);
+            next.addValue(val);
         } else {
-            group.addCount();
+            next.addCount();
         }
 
         // Emit based on window mode
         switch (self.window) {
             .none => {
                 // Running aggregate — emit on every record
-                try self.emitResult(rec.key, group, rec.event_time_ms, ctx);
+                try self.emitResult(rec.key, &next, rec.event_time_ms, ctx);
+                group.* = next;
             },
             .tumbling_count => |threshold| {
-                if (group.count >= threshold) {
-                    try self.emitResult(rec.key, group, rec.event_time_ms, ctx);
+                if (next.count >= threshold) {
+                    try self.emitResult(rec.key, &next, rec.event_time_ms, ctx);
                     // A window that emitted leaves nothing to keep: the key's
                     // next record starts a fresh one, so only keys with a
                     // window open hold memory.
                     if (self.groups.fetchSwapRemove(rec.key)) |kv| self.allocator.free(kv.key);
-                }
+                } else group.* = next;
             },
         }
+        ctx.changed_state = true;
     }
 
     fn getName(ptr: *anyopaque) []const u8 {
@@ -280,37 +287,42 @@ pub const JsonAggregateOperator = struct {
         try jw.objectField("key");
         try jw.write(key);
         try jw.objectField("value");
-        if (std.math.isFinite(result)) try jw.print("{d}", .{result}) else try jw.write(null);
+        try json_out.writeNumber(jw, result);
         try jw.objectField("count");
         try jw.write(count);
         try jw.endObject();
     }
 
-    fn extractNumericField(self: *const Self, value: []const u8) ?f64 {
-        const segments = self.field_segments orelse return null;
+    const Read = union(enum) { number: f64, not_json, no_number };
+
+    /// The record's field as a number. A whole number past what an i64
+    /// holds parses as text, and is read as the number it is.
+    fn readField(self: *const Self, value: []const u8) error{OutOfMemory}!Read {
+        const segments = self.field_segments orelse return .no_number;
 
         const parsed = std.json.parseFromSlice(
             std.json.Value,
             self.allocator,
             value,
             .{},
-        ) catch return null;
+        ) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else .not_json;
         defer parsed.deinit();
 
         var current = parsed.value;
         for (segments) |seg| {
             switch (current) {
                 .object => |obj| {
-                    current = obj.get(seg) orelse return null;
+                    current = obj.get(seg) orelse return .no_number;
                 },
-                else => return null,
+                else => return .no_number,
             }
         }
 
         return switch (current) {
-            .integer => |n| @as(f64, @floatFromInt(n)),
-            .float => |f| f,
-            else => null,
+            .integer => |n| .{ .number = @floatFromInt(n) },
+            .float => |f| .{ .number = f },
+            .number_string => |t| if (std.fmt.parseFloat(f64, t)) |f| (if (std.math.isFinite(f)) .{ .number = f } else .no_number) else |_| .no_number,
+            else => .no_number,
         };
     }
 
@@ -578,17 +590,19 @@ test "JsonAggregateOperator — skips non-numeric / missing field" {
 
     const op = agg.operator();
 
-    // Missing field — record skipped
-    try op.processElement(ProcessingRecord.init("k", "{\"other\":1}", 100), &ctx);
+    // Missing field — record skipped, with why
+    try std.testing.expectError(error.RecordSkipped, op.processElement(ProcessingRecord.init("k", "{\"other\":1}", 100), &ctx));
+    try std.testing.expectEqualStrings("aggregate: the record's field isn't a number", ctx.skipped.?);
     try std.testing.expectEqual(@as(usize, 0), collector.count());
     try std.testing.expectEqual(@as(usize, 0), agg.groupCount());
 
     // Invalid JSON — record skipped
-    try op.processElement(ProcessingRecord.init("k", "not-json", 200), &ctx);
+    try std.testing.expectError(error.RecordSkipped, op.processElement(ProcessingRecord.init("k", "not-json", 200), &ctx));
+    try std.testing.expectEqualStrings("aggregate: the record isn't JSON it can read", ctx.skipped.?);
     try std.testing.expectEqual(@as(usize, 0), collector.count());
 
     // Non-numeric field — record skipped
-    try op.processElement(ProcessingRecord.init("k", "{\"amount\":\"text\"}", 300), &ctx);
+    try std.testing.expectError(error.RecordSkipped, op.processElement(ProcessingRecord.init("k", "{\"amount\":\"text\"}", 300), &ctx));
     try std.testing.expectEqual(@as(usize, 0), collector.count());
 
     collector.clear();
@@ -648,7 +662,7 @@ test "JsonAggregateOperator — output is JSON for any key, and a value past f64
 
     // Past f64's range std.json keeps the number as text: skipped like a
     // non-numeric value.
-    try op.processElement(ProcessingRecord.init(key, "{\"amount\":1e400}", 100), &ctx);
+    try std.testing.expectError(error.RecordSkipped, op.processElement(ProcessingRecord.init(key, "{\"amount\":1e400}", 100), &ctx));
     try std.testing.expectEqual(@as(usize, 0), collector.count());
 
     // A sum that overflows is written as null.
@@ -662,5 +676,54 @@ test "JsonAggregateOperator — output is JSON for any key, and a value past f64
         defer parsed.deinit();
         try std.testing.expectEqualStrings(key, parsed.value.key);
         try std.testing.expectEqual(if (finite) @as(?f64, 1.5e308) else null, parsed.value.value);
+    }
+}
+
+test "JsonAggregateOperator — a record that runs out of memory anywhere and is run again counts once, running and in a count window" {
+    const allocator = std.testing.allocator;
+    const Mode = struct { window: JsonAggregateOperator.WindowConfig, feed: []const []const u8, want_value: f64, want_count: u64 };
+    for ([_]Mode{
+        .{ .window = .none, .feed = &.{"{\"value\":5}"}, .want_value = 5, .want_count = 1 },
+        .{ .window = .{ .tumbling_count = 2 }, .feed = &.{ "{\"value\":5}", "{\"value\":5}" }, .want_value = 10, .want_count = 2 },
+    }) |m| {
+        var fail_at: usize = 0;
+        while (fail_at < 64) : (fail_at += 1) {
+            var agg = try JsonAggregateOperator.init(allocator, "total", .sum, "$.value", m.window);
+            defer agg.deinit();
+            const op = agg.operator();
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(allocator);
+            var failed_once = false;
+            for (m.feed, 0..) |rec_text, i| {
+                const last = i == m.feed.len - 1;
+                var collector = OutputCollector.init(allocator);
+                defer collector.deinit();
+                var metrics = OperatorMetrics{};
+                var arena = std.heap.ArenaAllocator.init(allocator);
+                defer arena.deinit();
+                // The last record first on memory that runs out at `fail_at`.
+                var failing = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = fail_at });
+                var ctx = OperatorContext{ .collector = &collector, .metrics = &metrics, .allocator = if (last) failing.allocator() else arena.allocator(), .current_processing_time_ms = 0, .operator_name = "t" };
+                const rec = ProcessingRecord.init("", rec_text, 0);
+                if (op.processElement(rec, &ctx)) |_| {} else |err| {
+                    try std.testing.expectEqual(error.OutOfMemory, err);
+                    failed_once = true;
+                    collector.clear();
+                    ctx.allocator = arena.allocator();
+                    try op.processElement(rec, &ctx);
+                }
+                if (last) {
+                    try std.testing.expectEqual(@as(usize, 1), collector.count());
+                    const Result = struct { key: []const u8, value: ?f64, count: u64 };
+                    const parsed = try std.json.parseFromSlice(Result, allocator, collector.records.items[0].value, .{});
+                    defer parsed.deinit();
+                    try std.testing.expectEqual(@as(?f64, m.want_value), parsed.value.value);
+                    try std.testing.expectEqual(m.want_count, parsed.value.count);
+                }
+            }
+            if (!failed_once) break;
+        }
+        // It did fail somewhere before running clean.
+        try std.testing.expect(fail_at > 0);
     }
 }
