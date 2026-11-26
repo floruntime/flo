@@ -2018,9 +2018,14 @@ pub const ProcessingHandler = struct {
             // the chain failed on is counted and skipped: passing it through
             // raw would write what the operators were there to change.
             var skips: Skips = .{};
-            const output_records = applyOperatorChain(pipe.operators, json, ts_ms, arena.allocator(), &skips) catch |err| blk: {
-                self.noteChainError(shard, err);
-                break :blk @as(?[]const ProcessingRecord, &.{});
+            const output_records = applyOperatorChain(pipe.operators, json, ts_ms, arena.allocator(), &skips) catch |err| switch (err) {
+                // Short of memory the batch stops here, the record still
+                // ahead of the cursor: not a record to skip.
+                error.OutOfMemory => break,
+                else => blk: {
+                    self.noteChainError(shard, err);
+                    break :blk @as(?[]const ProcessingRecord, &.{});
+                },
             };
             if (skips.n > 0) {
                 var sb: [48]u8 = undefined;
@@ -2081,9 +2086,17 @@ pub const ProcessingHandler = struct {
             defer _ = arena.reset(.retain_capacity);
             batch.beginRecord();
             var skips: Skips = .{};
-            const output_records = applyOperatorChain(pipe.operators, payload, @import("stdx").time.milliTimestamp(), arena.allocator(), &skips) catch |err| blk: {
-                self.noteChainError(shard, err);
-                break :blk @as(?[]const ProcessingRecord, &.{});
+            const output_records = applyOperatorChain(pipe.operators, payload, @import("stdx").time.milliTimestamp(), arena.allocator(), &skips) catch |err| switch (err) {
+                // Short of memory the batch stops here, the record still
+                // ahead of the cursor: not a record to skip.
+                error.OutOfMemory => {
+                    all = false;
+                    break;
+                },
+                else => blk: {
+                    self.noteChainError(shard, err);
+                    break :blk @as(?[]const ProcessingRecord, &.{});
+                },
             };
             if (skips.n > 0) {
                 var sb: [48]u8 = undefined;
