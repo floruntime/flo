@@ -492,3 +492,37 @@ test "e2e/namespace: a namespace's run-history quota is bound on every shard, it
     // A refused alter changed nothing.
     try expectBound(ctx, "hq", shards, null);
 }
+
+test "e2e/namespace: quotas set, rounded up per shard, and their binds come back from the log after a restart" {
+    const shards = 4;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards } });
+    defer ctx.deinit();
+    try ctx.exec(&.{ "namespace", "create", "hq-a" });
+    try ctx.exec(&.{ "namespace", "create", "hq-b" });
+    // A quota that doesn't divide by the shards: each part rounds up.
+    const odd: u64 = (20 << 30) + 1;
+    var qb: [32]u8 = undefined;
+    try ctx.exec(&.{ "namespace", "alter", "hq-a", "--history-quota", try std.fmt.bufPrint(&qb, "{d}", .{odd}) });
+    try ctx.exec(&.{ "namespace", "alter", "hq-b", "--history-quota", "none" });
+    const part = (odd + shards - 1) / shards;
+    try expectBound(ctx, "hq-a", shards, part);
+    try expectBound(ctx, "hq-b", shards, null);
+    try ctx.restartServer();
+    // Replayed: the settings and every shard's bind, with no transient
+    // default part on the way.
+    {
+        const info = try quotaInfo(ctx, "hq-a");
+        defer info.deinit();
+        try testing.expectEqual(@as(?u64, odd), info.value.history_quota);
+        for (info.value.shards) |s| try testing.expectEqual(@as(?u64, part), s.part_bytes);
+    }
+    {
+        const info = try quotaInfo(ctx, "hq-b");
+        defer info.deinit();
+        try testing.expectEqual(@as(?u64, null), info.value.history_quota);
+        for (info.value.shards) |s| {
+            try testing.expect(s.bound);
+            try testing.expectEqual(@as(?u64, null), s.part_bytes);
+        }
+    }
+}

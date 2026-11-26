@@ -11179,6 +11179,64 @@ test "quota binds: once a whole walk at one epoch and term finds every part boun
     try std.testing.expect(shard.quota_looked > clean);
 }
 
+test "quota binds: a quota set A, then B, then A again binds each in turn, and a full batch of 64 binds 64 namespaces at once" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    const names = shard.namespace_handler.table;
+    var items: [settings_entries.MAX_QUOTA_BINDS]settings_entries.QuotaItem.Value = undefined;
+    var buf: [settings_machine.SetQuotaBind.max_size]u8 = undefined;
+    const walks = ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 2;
+    var at: u64 = 1;
+    for ([_]struct { u64, u64 }{ .{ 8 << 30, 5 }, .{ 4 << 30, 6 }, .{ 8 << 30, 7 } }) |step| {
+        names.publishQuota(ns_table.DEFAULT, step[0], step[1]);
+        for (0..walks) |_| {
+            const n = shard.quotaBindsDue(&items);
+            if (n == 0) continue;
+            _ = try applySettings(&shard, at, .settings_quota_bind, try quotaBind(&buf, items[0..n]));
+            at += 1;
+        }
+        try std.testing.expectEqual(settings_machine.QuotaPart.Value{ .part_bytes = step[0], .published_index = step[1] }, settings_machine.boundQuota(read, ns_table.DEFAULT).?);
+    }
+    // 64 namespaces published at once: one tick's walk fills one batch.
+    for (0..settings_entries.MAX_QUOTA_BINDS) |i| names.publishQuota(.of(@intCast(16 + i)), 2 << 30, 9);
+    shard.quota_cursor = 0;
+    shard.quota_clean = null;
+    const n = shard.quotaBindsDue(&items);
+    try std.testing.expectEqual(@as(usize, settings_entries.MAX_QUOTA_BINDS), n);
+    try std.testing.expect((try applySettings(&shard, at, .settings_quota_bind, try quotaBind(&buf, items[0..n]))).refused() == null);
+    for (0..settings_entries.MAX_QUOTA_BINDS) |i| try std.testing.expectEqual(@as(u64, 2 << 30), settings_machine.boundQuota(read, .of(@intCast(16 + i))).?.part_bytes);
+}
+
+test "namespace.info: a shard that can't say its part fails the info whole, never answers with some shards' rows" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const ca = try TestClient.open(a);
+    defer _ = std.c.close(ca.pair[1]);
+    // Created on shard 0, not yet published: shard 1 can't name it.
+    a.runRequest(ca.conn, try ParkTest.request(.namespace_create, 1, "", "gx", "", ""), .client);
+    _ = a.applyCommitted();
+    try std.testing.expect(two.namespaces.lookup("gx") == null);
+    var out: [1024]u8 = undefined;
+    a.runRequest(ca.conn, try ParkTest.request(.namespace_info, 2, "", "gx", "", ""), .client);
+    for (0..8) |_| for (&two.shards) |*s| {
+        _ = s.drainInbox();
+    };
+    var got = try nextAnswer(ca, a, &out);
+    while (got.header.request_id != 2) got = try nextAnswer(ca, a, &out);
+    // Refused by shard 1's part, as the gather fails on any part's refusal.
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), got.header.status);
+    try std.testing.expect(std.mem.indexOf(u8, (try got.refused()).message, "hasn't published the namespace yet") != null);
+}
+
 test "settings: a pool share over 1000 per-mille is refused at apply, writing no row" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
