@@ -848,6 +848,16 @@ pub const Shard = struct {
     /// cap with work left, or resumed connections proposed writes the next
     /// pump sends. Only a leader sets it; nothing clears it on a follower.
     more_work: bool,
+    /// A processing pipeline reads at the next tick: it mustn't sleep
+    /// first. Set apart from `more_work`, which the step passes assign
+    /// outright after the producers ran; recomputed at every tick's end.
+    producers_due: bool = false,
+    /// When the earliest processing pipeline not yet due becomes due
+    /// (wall-clock ms), so the idle sleep ends then: a poll interval under
+    /// the loop's idle wake is kept, not stretched to it. Null: none.
+    producers_deadline_ms: ?i64 = null,
+    /// Ticks entered without sleeping only because a pipeline was due.
+    processing_unslept_ticks: u64 = 0,
     /// Connections marked closing (`markClosing`), closed at the end of the
     /// tick. Room for one entry per connection is reserved as each is
     /// added, so marking never fails.
@@ -930,6 +940,14 @@ pub const Shard = struct {
     /// its walk of the namespace table goes on from.
     quota_bind_pending: ?BudgetPropose = null,
     quota_cursor: u32 = 0,
+    /// The table's quota epoch and this shard's term when the walk now
+    /// under way began, and whether it has found anything to bind; and the
+    /// epoch and term of the last whole walk that found nothing, which
+    /// lets the walk stop until either moves.
+    quota_walk: struct { epoch: u64 = 0, term: u64 = 0, found: bool = true } = .{},
+    quota_clean: ?struct { epoch: u64, term: u64 } = null,
+    /// Ids the walk has looked at, since start: for its tests.
+    quota_looked: u64 = 0,
     /// A budget too small to share among the shards was logged once.
     bind_zero_warned: bool = false,
 
@@ -7049,13 +7067,31 @@ pub const Shard = struct {
     /// the cursor: how many.
     fn quotaBindsDue(self: *Shard, out: []settings_entries.QuotaItem.Value) usize {
         const names = self.namespace_handler.table;
+        const epoch = names.quotaEpoch();
+        const term = self.raft_node.current_term;
+        // A whole walk at this epoch and term found every part bound: none
+        // is due until a quota is published or another term binds.
+        if (self.quota_clean) |c| {
+            if (c.epoch == epoch and c.term == term) return 0;
+            self.quota_clean = null;
+        }
         const read: contract_view.ReadView = .{ .store = &self.defaultPartition().store };
         const shards = self.router.shard_count;
         var n: usize = 0;
         var looked: u32 = 0;
         while (n < out.len and looked < QUOTA_SCAN_PER_TICK) : (looked += 1) {
+            if (self.quota_cursor == 0) {
+                // A walk ends: clean if it found nothing at one epoch and term.
+                if (!self.quota_walk.found and self.quota_walk.epoch == epoch and self.quota_walk.term == term) {
+                    self.quota_clean = .{ .epoch = epoch, .term = term };
+                    self.quota_walk = .{ .epoch = epoch, .term = term, .found = true };
+                    return n;
+                }
+                self.quota_walk = .{ .epoch = epoch, .term = term, .found = false };
+            }
             const id: ns_table.Id = .of(self.quota_cursor);
             self.quota_cursor = (self.quota_cursor + 1) % ns_table.CAPACITY;
+            self.quota_looked += 1;
             const q = names.quotaOf(id) orelse continue;
             const part = quotaPart(q.quota, shards);
             if (settings_machine.boundQuota(read, id)) |b| {
@@ -7063,6 +7099,7 @@ pub const Shard = struct {
             }
             out[n] = .{ .ns = id.int(), .part_bytes = part, .published_index = q.index };
             n += 1;
+            self.quota_walk.found = true;
         }
         return n;
     }
@@ -7444,7 +7481,47 @@ pub const Shard = struct {
         if (leads or holds) self.runStepping();
 
         self.settleConnections();
+        // Last, after everything this tick applied: what the pipelines do
+        // next decides how long the next tick may sleep. Only a leader's,
+        // not halted, run; every tick, so it clears the tick it's done.
+        // `leads` is as it stood before this tick's applies: one that just
+        // stepped down is cleared by the next tick.
+        self.notePipelinesNext(leads);
         return events.len;
+    }
+
+    fn notePipelinesNext(self: *Shard, leads: bool) void {
+        const next: ProcessingHandler.Next = if (leads and self.halted == null)
+            self.processing_handler.nextWork(self, @import("stdx").time.milliTimestamp())
+        else
+            .{};
+        self.producers_due = next.due;
+        self.producers_deadline_ms = next.deadline_ms;
+    }
+
+    /// How long the next tick may sleep: 0 while there's work (counted
+    /// when a due pipeline is all of it), else `idleTimeoutMs`.
+    fn loopTimeoutMs(self: *Shard, slicing: bool, now_ms: i64) u32 {
+        const others = self.more_work or self.apply_behind or slicing or self.resume_fds.items.len > 0;
+        if (others) return 0;
+        if (self.producers_due) {
+            self.processing_unslept_ticks += 1;
+            if (self.metrics_registry) |m| _ = m.processing.unslept_ticks_total.fetchAdd(1, .monotonic);
+            return 0;
+        }
+        return self.idleTimeoutMs(now_ms);
+    }
+
+    /// How long an idle tick may sleep: the loop's 100 ms, or less when a
+    /// pipeline becomes due sooner. Never 0: a pipeline already due keeps
+    /// the loop busy instead, and a due one that waits gives no deadline.
+    /// The deadline is wall-clock ms, as a pipeline's `last_poll_ms` is:
+    /// keep both on one clock. A clock step only shortens a sleep to 1 ms
+    /// or caps it at 100.
+    fn idleTimeoutMs(self: *const Shard, now_ms: i64) u32 {
+        const IDLE_MS = 100;
+        const at = self.producers_deadline_ms orelse return IDLE_MS;
+        return @intCast(std.math.clamp(at - now_ms, 1, IDLE_MS));
     }
 
     /// The leader's stepping duty: first steps of runs whose start has
@@ -7545,8 +7622,7 @@ pub const Shard = struct {
         while (!self.stop_requested.load(.acquire)) {
             // Connections re-queued while the last tick settled run next.
             const slicing = if (self.snapshot_window) |w| w.slices_left > 0 else false;
-            const busy = self.more_work or self.apply_behind or slicing or self.resume_fds.items.len > 0;
-            _ = self.tick(if (busy) 0 else 100) catch |err| {
+            _ = self.tick(self.loopTimeoutMs(slicing, @import("stdx").time.milliTimestamp())) catch |err| {
                 // A shard whose tick keeps failing serves nothing: say so,
                 // not once per tick, and do not spin a core while it lasts.
                 const now = nowMs();
@@ -11040,8 +11116,12 @@ test "quota binds: a namespace with none published binds nothing, a part bound c
     // stands in for an unpublished quota.
     for (0..ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 1) |_| try std.testing.expectEqual(@as(usize, 0), shard.quotaBindsDue(&items));
     names.publishQuota(ns_table.DEFAULT, 8 << 30, 5);
+    // Due once: the walk that finds it, before its bind applies.
     var n: usize = 0;
-    for (0..ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 1) |_| n += shard.quotaBindsDue(items[n..]);
+    for (0..ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 1) |_| {
+        n = shard.quotaBindsDue(&items);
+        if (n > 0) break;
+    }
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqual(@as(u64, 8 << 30), items[0].part_bytes);
     var buf: [settings_machine.SetQuotaBind.max_size]u8 = undefined;
@@ -11057,6 +11137,108 @@ test "quota binds: a namespace with none published binds nothing, a part bound c
     // None splits to none.
     try std.testing.expectEqual(settings_machine.NO_QUOTA, Shard.quotaPart(settings_machine.NO_QUOTA, 8));
     try std.testing.expectEqual(@as(u64, 2), Shard.quotaPart(7, 4));
+}
+
+test "quota binds: once a whole walk at one epoch and term finds every part bound, the walk reads nothing until a quota is published or the term moves" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const names = shard.namespace_handler.table;
+    var items: [settings_entries.MAX_QUOTA_BINDS]settings_entries.QuotaItem.Value = undefined;
+    var buf: [settings_machine.SetQuotaBind.max_size]u8 = undefined;
+    names.publishQuota(ns_table.DEFAULT, 8 << 30, 5);
+    const walks = ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 2;
+    var at: u64 = 1;
+    for (0..walks) |_| {
+        const n = shard.quotaBindsDue(&items);
+        if (n > 0) {
+            _ = try applySettings(&shard, at, .settings_quota_bind, try quotaBind(&buf, items[0..n]));
+            at += 1;
+        }
+    }
+    // Two whole walks: one that bound, one that found nothing. Clean now.
+    for (0..walks) |_| try std.testing.expectEqual(@as(usize, 0), shard.quotaBindsDue(&items));
+    const looked = shard.quota_looked;
+    for (0..walks) |_| try std.testing.expectEqual(@as(usize, 0), shard.quotaBindsDue(&items));
+    try std.testing.expectEqual(looked, shard.quota_looked);
+    // A quota published moves the epoch: the walk runs again, and binds it.
+    names.publishQuota(ns_table.DEFAULT, 4 << 30, 6);
+    var found: usize = 0;
+    for (0..walks) |_| {
+        found = shard.quotaBindsDue(&items);
+        if (found > 0) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), found);
+    try std.testing.expect(shard.quota_looked > looked);
+    // So does a new term, with nothing published.
+    _ = try applySettings(&shard, at, .settings_quota_bind, try quotaBind(&buf, &.{.{ .ns = ns_table.DEFAULT.int(), .part_bytes = 4 << 30, .published_index = 6 }}));
+    for (0..2 * walks) |_| try std.testing.expectEqual(@as(usize, 0), shard.quotaBindsDue(&items));
+    const clean = shard.quota_looked;
+    shard.raft_node.current_term += 1;
+    _ = shard.quotaBindsDue(&items);
+    try std.testing.expect(shard.quota_looked > clean);
+}
+
+test "quota binds: a quota set A, then B, then A again binds each in turn, and a full batch of 64 binds 64 namespaces at once" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    const names = shard.namespace_handler.table;
+    var items: [settings_entries.MAX_QUOTA_BINDS]settings_entries.QuotaItem.Value = undefined;
+    var buf: [settings_machine.SetQuotaBind.max_size]u8 = undefined;
+    const walks = ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 2;
+    var at: u64 = 1;
+    for ([_]struct { u64, u64 }{ .{ 8 << 30, 5 }, .{ 4 << 30, 6 }, .{ 8 << 30, 7 } }) |step| {
+        names.publishQuota(ns_table.DEFAULT, step[0], step[1]);
+        for (0..walks) |_| {
+            const n = shard.quotaBindsDue(&items);
+            if (n == 0) continue;
+            _ = try applySettings(&shard, at, .settings_quota_bind, try quotaBind(&buf, items[0..n]));
+            at += 1;
+        }
+        try std.testing.expectEqual(settings_machine.QuotaPart.Value{ .part_bytes = step[0], .published_index = step[1] }, settings_machine.boundQuota(read, ns_table.DEFAULT).?);
+    }
+    // 64 namespaces published at once: one tick's walk fills one batch.
+    for (0..settings_entries.MAX_QUOTA_BINDS) |i| names.publishQuota(.of(@intCast(16 + i)), 2 << 30, 9);
+    shard.quota_cursor = 0;
+    shard.quota_clean = null;
+    const n = shard.quotaBindsDue(&items);
+    try std.testing.expectEqual(@as(usize, settings_entries.MAX_QUOTA_BINDS), n);
+    try std.testing.expect((try applySettings(&shard, at, .settings_quota_bind, try quotaBind(&buf, items[0..n]))).refused() == null);
+    for (0..settings_entries.MAX_QUOTA_BINDS) |i| try std.testing.expectEqual(@as(u64, 2 << 30), settings_machine.boundQuota(read, .of(@intCast(16 + i))).?.part_bytes);
+}
+
+test "namespace.info: a shard that can't say its part fails the info whole, never answers with some shards' rows" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    const ca = try TestClient.open(a);
+    defer _ = std.c.close(ca.pair[1]);
+    // Created on shard 0, not yet published: shard 1 can't name it.
+    a.runRequest(ca.conn, try ParkTest.request(.namespace_create, 1, "", "gx", "", ""), .client);
+    _ = a.applyCommitted();
+    try std.testing.expect(two.namespaces.lookup("gx") == null);
+    var out: [1024]u8 = undefined;
+    a.runRequest(ca.conn, try ParkTest.request(.namespace_info, 2, "", "gx", "", ""), .client);
+    for (0..8) |_| for (&two.shards) |*s| {
+        _ = s.drainInbox();
+    };
+    var got = try nextAnswer(ca, a, &out);
+    while (got.header.request_id != 2) got = try nextAnswer(ca, a, &out);
+    // Refused by shard 1's part, as the gather fails on any part's refusal.
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), got.header.status);
+    try std.testing.expect(std.mem.indexOf(u8, (try got.refused()).message, "hasn't published the namespace yet") != null);
 }
 
 test "settings: a pool share over 1000 per-mille is refused at apply, writing no row" {
@@ -12939,6 +13121,15 @@ test "Shard: a gather refused for room frees its state and this shard's part, an
     f.client.conn.forwards_in_flight = 0;
 }
 
+/// A name, `prefix` and a number, that namespace `ns` puts on shard `want`.
+fn nameOn(shard: *Shard, ns: ns_table.Id, want: u16, prefix: []const u8, buf: []u8) ![]const u8 {
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const k = try std.fmt.bufPrint(buf, "{s}{d}", .{ prefix, i });
+        if (shard.router.hashToShard(node_router.routeNsKey(ns, k)) == want) return k;
+    }
+}
+
 /// A key that namespace `ns` puts on shard `want` of `shard`'s node.
 fn keyOn(shard: *Shard, ns: ns_table.Id, want: u16, buf: []u8) ![]const u8 {
     var i: usize = 0;
@@ -12965,6 +13156,22 @@ fn entryAt(shard: *Shard, t: entry_mod.EntryType, from: u64) ?u64 {
 }
 
 /// The records stream `name` in namespace `ns` holds on `s`.
+/// The last payload of stream `name`, copied into `buf`, or null.
+fn lastStreamPayload(s: *Shard, name: []const u8, ns: []const u8, buf: []u8) ?[]const u8 {
+    var got: ?[]const u8 = null;
+    var after: @import("../projection/stream.zig").StreamID = .{ .timestamp_ms = 0, .sequence = 0 };
+    while (true) {
+        const r = s.stream_handler.readPayloadsForStream(name, ns, after, 1000);
+        defer r.deinit(s.stream_handler.allocator);
+        if (r.payloads.len == 0) return got;
+        const p = r.payloads[r.payloads.len - 1];
+        if (p.len > buf.len) return null;
+        @memcpy(buf[0..p.len], p);
+        got = buf[0..p.len];
+        after = r.last_id;
+    }
+}
+
 fn streamRecords(s: *Shard, name: []const u8, ns: []const u8) usize {
     var n: usize = 0;
     var after: @import("../projection/stream.zig").StreamID = .{ .timestamp_ms = 0, .sequence = 0 };
@@ -14231,6 +14438,13 @@ test "Shard: a processing sink in a namespace not yet published writes nothing u
     // Not published: the pipeline waits, and says why, and the node counts it.
     var it = a.processing_handler.pipelines.valueIterator();
     try std.testing.expectEqualStrings("pns", it.next().?.wait.namespace);
+    // Waiting on a namespace not yet published: neither due nor timed, so
+    // the loop sleeps its own wake, not a poll interval's.
+    {
+        const n = a.processing_handler.nextWork(a, @import("stdx").time.milliTimestamp() + 5_000);
+        try std.testing.expect(!n.due);
+        try std.testing.expectEqual(@as(?i64, null), n.deadline_ms);
+    }
     try std.testing.expectEqual(@as(usize, 0), entriesOf(a, .processing_sink_batch, from_a));
     try std.testing.expectEqual(@as(u64, 1), metrics.processing.pipelines_waiting_namespace.load(.monotonic));
     // A node that stops leading says nothing of it, gauge included, and
@@ -14665,6 +14879,21 @@ test "Shard: operators that can't be rebuilt for a new term make the pipeline wa
     // Ticks before the next poll don't try again.
     const tried = failing.alloc_index;
     for (0..5) |_| _ = a.processing_handler.tickPipelines(a);
+    // Its retry is the next poll's, not the loop's: no deadline, so a
+    // failing rebuild at a short poll interval can't wake it each ms.
+    {
+        const nw = a.processing_handler.nextWork(a, pipe.last_poll_ms + 1);
+        try std.testing.expect(!nw.due);
+        try std.testing.expectEqual(@as(?i64, null), nw.deadline_ms);
+    }
+    // With records waiting too: still the next poll's, never every tick.
+    pipe.more = true;
+    for (0..5) |_| {
+        _ = a.processing_handler.tickPipelines(a);
+        const nw = a.processing_handler.nextWork(a, pipe.last_poll_ms + 1);
+        try std.testing.expect(!nw.due);
+        try std.testing.expectEqual(@as(?i64, null), nw.deadline_ms);
+    }
     try std.testing.expectEqual(tried, failing.alloc_index);
     try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
     // Memory back, at the next poll: rebuilt for this term, and reading.
@@ -14673,6 +14902,255 @@ test "Shard: operators that can't be rebuilt for a new term make the pipeline wa
     two.settle();
     try std.testing.expect(pipe.wait == .none);
     try std.testing.expectEqual(raft.current_term, pipe.ops_term);
+}
+
+/// A stream job polling every `poll_ms`, its source `source`, sinking to
+/// `sinks`, submitted and applied; its pipeline.
+fn pacedJob(two: *TwoShards, c: TestClient, name: []const u8, source: []const u8, poll_ms: u32, sinks: []const u8) !*ProcessingHandler.PipelineState {
+    const a = &two.shards[0];
+    var ybuf: [1024]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: {s}
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s}, poll_interval_ms: {d} }}
+        \\sinks:
+        \\{s}
+    , .{ name, source, poll_ms, sinks });
+    // The one pipeline the submit adds.
+    var before: [8][]const u8 = undefined;
+    var n: usize = 0;
+    var bit = a.processing_handler.pipelines.keyIterator();
+    while (bit.next()) |k| : (n += 1) before[n] = k.*;
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.iterator();
+    next: while (pit.next()) |e| {
+        for (before[0..n]) |k| if (std.mem.eql(u8, k, e.key_ptr.*)) continue :next;
+        return e.value_ptr;
+    }
+    return error.NoPipeline;
+}
+
+test "Shard: an idle pipeline wakes its shard at its own poll interval, no sooner; two wake at the earlier; none on a follower or for a stopped job" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sb: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sb);
+    var tb: [16]u8 = undefined;
+    const target = try keyOn(a, .default, 0, &tb);
+    var yb: [128]u8 = undefined;
+    const sinks = try std.fmt.bufPrint(&yb, "  - name: out\n    stream: {{ name: {s}-out }}", .{target});
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    const fast = try pacedJob(&two, c, "fast", source, 10, sinks);
+    _ = a.processing_handler.tickPipelines(a);
+    const h = a.processing_handler;
+    const t = fast.last_poll_ms;
+    try std.testing.expect(t != 0);
+    // Polled at t, the source empty: due again at t + 10, not before.
+    for (0..10) |k| {
+        const n = h.nextWork(a, t + @as(i64, @intCast(k)));
+        try std.testing.expect(!n.due);
+        try std.testing.expectEqual(@as(?i64, t + 10), n.deadline_ms);
+    }
+    try std.testing.expect(h.nextWork(a, t + 10).due);
+    // The idle sleep ends at the deadline, at least 1 ms and at most 100.
+    a.producers_deadline_ms = t + 10;
+    try std.testing.expectEqual(@as(u32, 10), a.idleTimeoutMs(t));
+    try std.testing.expectEqual(@as(u32, 1), a.idleTimeoutMs(t + 10));
+    a.producers_deadline_ms = t + 500;
+    try std.testing.expectEqual(@as(u32, 100), a.idleTimeoutMs(t));
+    a.producers_deadline_ms = null;
+    try std.testing.expectEqual(@as(u32, 100), a.idleTimeoutMs(t));
+    // An empty source: the loop never stays up for it, so nothing is
+    // counted as an un-slept tick, and its sleep ends at the deadline.
+    a.more_work = false;
+    for (0..10) |k| {
+        const now = t + @as(i64, @intCast(k));
+        a.notePipelinesNext(true);
+        a.producers_due = h.nextWork(a, now).due;
+        a.producers_deadline_ms = h.nextWork(a, now).deadline_ms;
+        try std.testing.expectEqual(@as(u32, @intCast(10 - k)), a.loopTimeoutMs(false, now));
+    }
+    try std.testing.expectEqual(@as(u64, 0), a.processing_unslept_ticks);
+    // Due: the next tick doesn't sleep, and that is counted, on the shard
+    // and in the metric a server exports.
+    var metrics = MetricsRegistry.init(std.testing.allocator);
+    defer metrics.deinit();
+    a.setMetricsRegistry(&metrics);
+    defer a.metrics_registry = null;
+    a.producers_due = true;
+    try std.testing.expectEqual(@as(u32, 0), a.loopTimeoutMs(false, t + 10));
+    try std.testing.expectEqual(@as(u64, 1), a.processing_unslept_ticks);
+    try std.testing.expectEqual(@as(u64, 1), metrics.processing.unslept_ticks_total.load(.monotonic));
+    a.producers_due = false;
+
+    // A second job, every 50 ms, polled later: the earlier deadline wins.
+    var s2: [16]u8 = undefined;
+    const source2 = try keyOn(a, .default, 0, &s2);
+    const slow = try pacedJob(&two, c, "slow", source2, 50, sinks);
+    _ = a.processing_handler.tickPipelines(a);
+    try std.testing.expect(slow.last_poll_ms >= t);
+    const n2 = h.nextWork(a, slow.last_poll_ms);
+    try std.testing.expectEqual(@as(?i64, @min(fast.last_poll_ms + 10, slow.last_poll_ms + 50)), n2.deadline_ms);
+
+    // A node that doesn't lead keeps no deadline, nor is it due.
+    a.notePipelinesNext(false);
+    try std.testing.expect(!a.producers_due);
+    try std.testing.expectEqual(@as(?i64, null), a.producers_deadline_ms);
+    // A held job gives none either.
+    var rit = h.runs.valueIterator();
+    while (rit.next()) |r| r.held = true;
+    const n3 = h.nextWork(a, t + 1000);
+    try std.testing.expect(!n3.due);
+    try std.testing.expectEqual(@as(?i64, null), n3.deadline_ms);
+}
+
+test "Shard: a pipeline with records left whose batch is in the log, or that waits at a full outbox, keeps the loop neither awake nor timed, tick after tick; freed, it's due" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    var qb: [16]u8 = undefined;
+    const q = try queueOwnedBy(&two, 1, &qb);
+    // More records than one page: `more` is set after the first.
+    for (0..200) |i| {
+        var rb: [8]u8 = undefined;
+        _ = try a.stream_handler.appendPayloadToStream(source, "default", try std.fmt.bufPrint(&rb, "r{d}", .{i}));
+    }
+    two.settle();
+    // One byte a channel: the first batch fills it.
+    a.outbox_caps = .{ .sink = .{ .shard = 1 << 30, .channel = 1 } };
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var yb: [128]u8 = undefined;
+    const pipe = try pacedJob(&two, c, "held", source, 1, try std.fmt.bufPrint(&yb, "  - name: out\n    queue: {{ name: {s} }}", .{q.name}));
+    const h = a.processing_handler;
+    _ = h.tickPipelines(a);
+    // Its batch proposed, not yet applied: skipped, neither due nor timed.
+    if (pipe.batch_index > a.raft_node.last_applied) {
+        const n = h.nextWork(a, pipe.last_poll_ms + 1000);
+        try std.testing.expect(!n.due);
+        try std.testing.expectEqual(@as(?i64, null), n.deadline_ms);
+    }
+    two.settle();
+    const taken = pipe.records_in;
+    try std.testing.expect(taken > 0 and taken < 200);
+    try std.testing.expect(pipe.more);
+    // Every later tick finds the full outbox: more stays set, nothing is
+    // read, and the loop is told neither to stay up nor when to wake.
+    for (0..20) |_| {
+        _ = h.tickPipelines(a);
+        two.settle();
+        try std.testing.expect(pipe.wait == .outbox);
+        try std.testing.expect(pipe.more);
+        try std.testing.expectEqual(taken, pipe.records_in);
+        const n = h.nextWork(a, @import("stdx").time.milliTimestamp());
+        try std.testing.expect(!n.due);
+        try std.testing.expectEqual(@as(?i64, null), n.deadline_ms);
+    }
+    // Delivered and trimmed: room, and the pipeline is due at once.
+    pumpChannels(&two);
+    two.settle();
+    try std.testing.expect(h.nextWork(a, @import("stdx").time.milliTimestamp()).due);
+
+    // Its sink's shard halted: a wait, so neither due nor timed.
+    var slots: [2]health_mod.ShardSlot = @splat(.{});
+    const had = a.node_health;
+    a.node_health = &slots;
+    defer a.node_health = had;
+    slots[1].set(.halted);
+    for (0..5) |_| {
+        const n = h.nextWork(a, @import("stdx").time.milliTimestamp());
+        try std.testing.expect(!n.due);
+        try std.testing.expectEqual(@as(?i64, null), n.deadline_ms);
+    }
+    slots[1].set(.ok);
+    try std.testing.expect(h.nextWork(a, @import("stdx").time.milliTimestamp()).due);
+
+    // A page asked of another shard, not yet come: nothing until it does.
+    const now = @import("stdx").time.milliTimestamp();
+    pipe.read_seq = 1;
+    pipe.read_sent_ms = now;
+    try std.testing.expect(!h.nextWork(a, now + 10).due);
+    try std.testing.expectEqual(@as(?i64, null), h.nextWork(a, now + 10).deadline_ms);
+    // Past its deadline it's asked again: due.
+    try std.testing.expect(h.nextWork(a, now + 6_000).due);
+    pipe.read_seq = 0;
+
+    // Cancelled with records left: no run, so nothing due or timed.
+    var ib: [64]u8 = undefined;
+    var rit = h.runs.keyIterator();
+    const id = try std.fmt.bufPrint(&ib, "{s}", .{rit.next().?.*});
+    a.runRequest(c.conn, try ParkTest.request(.processing_cancel, 6, "", id, "", ""), .client);
+    two.settle();
+    _ = h.tickPipelines(a);
+    const n = h.nextWork(a, @import("stdx").time.milliTimestamp() + 1000);
+    try std.testing.expect(!n.due);
+    try std.testing.expectEqual(@as(?i64, null), n.deadline_ms);
+}
+
+test "Shard: a filter that drops whole pages keeps its pipeline due while records remain, and not after" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    for (0..200) |i| {
+        var rb: [8]u8 = undefined;
+        _ = try a.stream_handler.appendPayloadToStream(source, "default", try std.fmt.bufPrint(&rb, "r{d}", .{i}));
+    }
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: dropper
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s}, poll_interval_ms: 1000, batch_size: 1000 }}
+        \\operators:
+        \\  - name: none
+        \\    type: filter
+        \\    condition: value_contains:never-in-a-record
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: dropped }}
+    , .{source});
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    const pipe = pit.next().?;
+    const h = a.processing_handler;
+    // Page after page is dropped whole: nothing written, and the poll not
+    // yet due again, yet each tick reads on.
+    var last: u64 = 0;
+    var ticks: usize = 0;
+    while (pipe.records_in < 200) : (ticks += 1) {
+        if (ticks > 0) try std.testing.expect(h.nextWork(a, pipe.last_poll_ms).due);
+        _ = h.tickPipelines(a);
+        two.settle();
+        try std.testing.expect(pipe.records_in > last);
+        last = pipe.records_in;
+        if (ticks > 20) return error.NoProgress;
+    }
+    // Caught up: not due until its next poll, which is the deadline.
+    _ = h.tickPipelines(a);
+    two.settle();
+    const n = h.nextWork(a, pipe.last_poll_ms + 1);
+    try std.testing.expect(!n.due);
+    try std.testing.expectEqual(@as(?i64, pipe.last_poll_ms + 1000), n.deadline_ms);
 }
 
 test "Shard: a pipeline waits while its outbox to a sink's shard, or all its outboxes, hold their cap, and reads on once they're taken" {
@@ -15012,6 +15490,141 @@ test "Shard: a TS sink drops a record lacking a tag's field, counted and shown o
     try std.testing.expectEqual(pipe.stream_cursor_seq, at.b);
     try std.testing.expectEqual(pipe.stream_cursor_ts, at.a);
     try std.testing.expectEqual(@as(u64, 4), job.records_processed);
+}
+
+test "Shard: an operator chain out of memory ends the batch before its record: nothing written, skipped or passed, and the next tick takes it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    var target_buf: [24]u8 = undefined;
+    const target = try nameOn(a, .default, 0, "tout", &target_buf);
+    for ([_][]const u8{ "{\"v\":1}", "{\"v\":2}", "{\"v\":3}" }) |r| _ = try a.stream_handler.appendPayloadToStream(source, "default", r);
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: short
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\operators:
+        \\  - name: m
+        \\    type: map
+        \\    v: "$.v"
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: {s} }}
+    , .{ source, target });
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    const pipe = pit.next().?;
+    const h = a.processing_handler;
+
+    // Every allocation of the chain's arena fails.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    h.chain_backing = failing.allocator();
+    tickNow(a, pipe);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 0), pipe.records_in);
+    try std.testing.expectEqual(@as(u64, 0), pipe.stream_cursor_ts);
+    try std.testing.expectEqual(@as(u64, 0), h.sink_drops);
+    try std.testing.expectEqual(@as(u64, 0), h.chain_errors);
+    try std.testing.expectEqual(@as(u64, 0), h.firstJob().?.drops);
+    try std.testing.expectEqual(@as(usize, 0), streamRecords(a, target, "default"));
+    // The stall shows on the job: not a silent RUNNING.
+    {
+        const job = h.firstJob().?;
+        var nb: [512]u8 = undefined;
+        try std.testing.expect(std.mem.indexOf(u8, h.liveNote(&job, &nb).?, "1 batch stopped short of memory, each record tried again") != null);
+    }
+
+    // Just stalled: a wait, neither due nor timed, until the shard's own
+    // wake retries it.
+    {
+        const n = h.nextWork(a, pipe.stalled_ms + 1);
+        try std.testing.expect(!n.due);
+        try std.testing.expectEqual(@as(?i64, null), n.deadline_ms);
+    }
+
+    // Memory back, the wait over: the same records, every one, once.
+    h.chain_backing = null;
+    pipe.stalled_ms = 0;
+    pipe.last_batch_ms = 0;
+    tickNow(a, pipe);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+    try std.testing.expectEqual(@as(usize, 3), streamRecords(a, target, "default"));
+    try std.testing.expectEqual(@as(u64, 0), h.firstJob().?.drops);
+}
+
+test "Shard: a running sum out of memory is run again and counts each record once" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    var target_buf: [24]u8 = undefined;
+    const target = try nameOn(a, .default, 0, "tsum", &target_buf);
+    for ([_][]const u8{ "{\"v\":1}", "{\"v\":2}", "{\"v\":3}" }) |r| _ = try a.stream_handler.appendPayloadToStream(source, "default", r);
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: summed
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\operators:
+        \\  - name: s
+        \\    type: aggregate
+        \\    function: sum
+        \\    field: "$.v"
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: {s} }}
+    , .{ source, target });
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = a.processing_handler.pipelines.valueIterator();
+    const pipe = pit.next().?;
+    const h = a.processing_handler;
+    // Fails at every allocation number in turn, then runs clean: whatever
+    // failed, the totals are 1, 3 and 6, each record counted once.
+    var fail_at: usize = 0;
+    while (fail_at < 40) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_at });
+        h.chain_backing = failing.allocator();
+        pipe.last_batch_ms = 0;
+        pipe.stalled_ms = 0;
+        tickNow(a, pipe);
+        two.settle();
+        h.chain_backing = null;
+        if (pipe.records_in == 3) break;
+    }
+    pipe.last_batch_ms = 0;
+    pipe.stalled_ms = 0;
+    tickNow(a, pipe);
+    two.settle();
+    pumpChannels(&two);
+    try std.testing.expectEqual(@as(u64, 3), pipe.records_in);
+    try std.testing.expect(h.memory_stalls > 0);
+    try std.testing.expectEqual(@as(usize, 3), streamRecords(a, target, "default"));
+    var lb: [128]u8 = undefined;
+    const last = lastStreamPayload(a, target, "default", &lb) orelse return error.NoRecord;
+    try std.testing.expect(std.mem.indexOf(u8, last, "\"value\":6,\"count\":3") != null);
 }
 
 test "Shard: a job's processed count takes each record once, across batches not logged, logged, and refused" {

@@ -570,13 +570,15 @@ test "CommandResult: count occurrences" {
 
 /// Whether `args` run a command that refuses -e/--endpoint: `server start`,
 /// which listens, `server metrics`, which reads the metrics endpoint, and the
-/// cluster commands that administer a node over its admin socket (promote,
-/// remove, repair) rather than the client port.
+/// commands that administer a node over its admin socket (cluster promote,
+/// remove and repair, namespace alter) rather than the client port.
 fn takesNoEndpoint(args: []const []const u8) bool {
     if (args.len < 2) return false;
     if (std.mem.eql(u8, args[0], "server"))
         return std.mem.eql(u8, args[1], "start") or std.mem.eql(u8, args[1], "metrics");
     if (std.mem.eql(u8, args[0], "cluster"))
         return std.mem.eql(u8, args[1], "promote") or std.mem.eql(u8, args[1], "remove") or std.mem.eql(u8, args[1], "repair");
+    if (std.mem.eql(u8, args[0], "namespace") or std.mem.eql(u8, args[0], "ns"))
+        return std.mem.eql(u8, args[1], "alter");
     return false;
 }

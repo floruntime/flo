@@ -9,8 +9,8 @@ pub const MAX_DEPTH: usize = 128;
 
 pub const Error = Stringify.Error || error{NestingTooDeep};
 
-/// `value` as JSON: strings and keys escaped, floats in decimal, a
-/// non-finite float as null. Nested deeper than `MAX_DEPTH` is refused.
+/// `value` as JSON: strings and keys escaped, floats as `writeNumber`
+/// writes them. Nested deeper than `MAX_DEPTH` is refused.
 pub fn writeValue(jw: *Stringify, value: std.json.Value) Error!void {
     return writeAt(jw, value, 0);
 }
@@ -20,7 +20,7 @@ fn writeAt(jw: *Stringify, value: std.json.Value, depth: usize) Error!void {
         .null => try jw.write(null),
         .bool => |b| try jw.write(b),
         .integer => |i| try jw.write(i),
-        .float => |f| if (std.math.isFinite(f)) try jw.print("{d}", .{f}) else try jw.write(null),
+        .float => |f| try writeNumber(jw, f),
         // The parser kept the number's own text.
         .number_string => |s| try jw.print("{s}", .{s}),
         .string => |s| try jw.write(s),
@@ -41,6 +41,17 @@ fn writeAt(jw: *Stringify, value: std.json.Value, depth: usize) Error!void {
             try jw.endObject();
         },
     }
+}
+
+/// A number in a form every operator reads back as one: plain between
+/// 1e-6 and 2^53, where it is exact and short, and with an exponent outside
+/// it (a long run of digits parses as text, and a tiny value would print
+/// hundreds of zeros), so it is at most ~24 bytes. Non-finite is null.
+pub fn writeNumber(jw: *Stringify, value: f64) Stringify.Error!void {
+    if (!std.math.isFinite(value)) return jw.write(null);
+    const mag = @abs(value);
+    if (mag == 0 or (mag >= 1e-6 and mag < 9007199254740992.0)) return jw.write(value);
+    return jw.print("{e}", .{value});
 }
 
 /// `value` as an allocated JSON text.

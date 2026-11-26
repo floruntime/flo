@@ -67,7 +67,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Operator = @import("../operator.zig").Operator;
-const OperatorContext = @import("../context.zig").OperatorContext;
+const context_mod = @import("../context.zig");
+const OperatorContext = context_mod.OperatorContext;
 const record_mod = @import("../record.zig");
 const ProcessingRecord = record_mod.ProcessingRecord;
 
@@ -170,8 +171,13 @@ pub const ExprFilterOperator = struct {
 
     fn processElement(ptr: *anyopaque, rec: ProcessingRecord, ctx: *OperatorContext) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        if (self.evaluate(rec)) {
-            try ctx.emit(rec);
+        switch (try self.judge(rec, ctx.allocator)) {
+            .pass => return ctx.emit(rec),
+            .fail => {},
+            // A json: condition can't decide on a record it can't read:
+            // that's a skip, counted, not a record that failed the test.
+            .unreadable => return ctx.skip("filter: the record isn't JSON its json: condition can read"),
+            .out_of_range => return ctx.skip("filter: the record's number is past what a json: condition compares"),
         }
     }
 
@@ -186,30 +192,70 @@ pub const ExprFilterOperator = struct {
     // Condition evaluation
     // =========================================================================
 
-    pub fn evaluate(self: *const Self, rec: ProcessingRecord) bool {
-        return evaluateCondition(&self.parsed, rec);
-    }
+    /// What a condition makes of a record. A record that doesn't pass and
+    /// that a json: part of it couldn't read, or whose number it couldn't
+    /// compare, is `unreadable` or `out_of_range`, whichever came first.
+    pub const Verdict = enum { pass, fail, unreadable, out_of_range };
 
-    fn evaluateCondition(cond: *const ParsedCondition, rec: ProcessingRecord) bool {
-        return switch (cond.*) {
-            .single => |s| evaluateSingle(&s, rec),
-            .or_expr => |compound| {
-                for (compound.items[0..compound.len]) |*sub| {
-                    if (evaluateSingle(sub, rec)) return true;
-                }
-                return false;
-            },
-            .and_expr => |compound| {
-                for (compound.items[0..compound.len]) |*sub| {
-                    if (!evaluateSingle(sub, rec)) return false;
-                }
-                return true;
-            },
+    /// The record, parsed once, when a json: part first asks for it, into
+    /// `arena`; a parse that runs out of memory is an error, not a verdict.
+    const Doc = struct {
+        arena: std.mem.Allocator,
+        text: []const u8,
+        state: union(enum) { unparsed, parsed: std.json.Value, bad } = .unparsed,
+
+        fn root(d: *Doc) error{OutOfMemory}!?std.json.Value {
+            switch (d.state) {
+                .parsed => |v| return v,
+                .bad => return null,
+                .unparsed => {},
+            }
+            const v = std.json.parseFromSliceLeaky(std.json.Value, d.arena, d.text, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    d.state = .bad;
+                    return null;
+                },
+            };
+            d.state = .{ .parsed = v };
+            return v;
+        }
+    };
+
+    /// One record against the condition, parsing it at most once, in `arena`.
+    pub fn judge(self: *const Self, rec: ProcessingRecord, arena: std.mem.Allocator) error{OutOfMemory}!Verdict {
+        var doc: Doc = .{ .arena = arena, .text = rec.value };
+        return switch (self.parsed) {
+            .single => |*c| evaluateSingle(c, rec, &doc),
+            // Every part is asked, so a record a json: part couldn't read is
+            // counted whatever order the parts come in.
+            .or_expr => |*compound| combine(compound.items[0..compound.len], rec, &doc, true),
+            .and_expr => |*compound| combine(compound.items[0..compound.len], rec, &doc, false),
         };
     }
 
-    fn evaluateSingle(cond: *const SingleCondition, rec: ProcessingRecord) bool {
-        return switch (cond.*) {
+    fn combine(subs: []const SingleCondition, rec: ProcessingRecord, doc: *Doc, any: bool) error{OutOfMemory}!Verdict {
+        var trues: usize = 0;
+        var why: ?Verdict = null;
+        for (subs) |*sub| switch (try evaluateSingle(sub, rec, doc)) {
+            .pass => trues += 1,
+            .fail => {},
+            else => |v| why = why orelse v,
+        };
+        if (if (any) trues > 0 else trues == subs.len) return .pass;
+        return why orelse .fail;
+    }
+
+    /// The condition's answer for a record, as a bool: a record it can't
+    /// read doesn't pass.
+    pub fn evaluate(self: *const Self, rec: ProcessingRecord) bool {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        return (self.judge(rec, arena.allocator()) catch return false) == .pass;
+    }
+
+    fn evaluateSingle(cond: *const SingleCondition, rec: ProcessingRecord, doc: *Doc) error{OutOfMemory}!Verdict {
+        const yes = switch (cond.*) {
             .value_contains => |substr| std.mem.indexOf(u8, rec.value, substr) != null,
             .key_contains => |substr| std.mem.indexOf(u8, rec.key, substr) != null,
             .key_equals => |exact| std.mem.eql(u8, rec.key, exact),
@@ -217,9 +263,10 @@ pub const ExprFilterOperator = struct {
             .value_prefix => |prefix| std.mem.startsWith(u8, rec.value, prefix),
             .not_empty => rec.value.len > 0,
             .key_not_empty => rec.key.len > 0,
-            .json_expr => |expr| evaluateJsonExpr(rec.value, expr),
+            .json_expr => |expr| return evaluateJsonExpr(doc, expr),
             .min_length => |n| rec.value.len >= n,
         };
+        return if (yes) .pass else .fail;
     }
 
     // =========================================================================
@@ -338,6 +385,8 @@ pub const ExprFilterOperator = struct {
     /// A finite decimal number: digits, an optional sign, point and exponent;
     /// not hex, not `_`-separated, not nan or inf, and not too big for f64.
     fn isPlainNumber(value: []const u8) bool {
+        // As JSON writes a number: no leading `+`.
+        if (value.len == 0 or value[0] == '+') return false;
         for (value) |c| switch (c) {
             '0'...'9', '-', '+', '.', 'e', 'E' => {},
             else => return false,
@@ -356,21 +405,19 @@ pub const ExprFilterOperator = struct {
     // JSON expression evaluation
     // =========================================================================
 
-    /// Evaluate a JSON field expression against a record value.
-    fn evaluateJsonExpr(value: []const u8, expr: JsonExpr) bool {
-        const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, value, .{}) catch return false;
-        defer parsed.deinit();
-
-        const root = parsed.value;
-        const field = resolveJsonField(root, expr.path) orelse return false;
-
-        return switch (field) {
+    /// A JSON field expression against the record.
+    fn evaluateJsonExpr(doc: *Doc, expr: JsonExpr) error{OutOfMemory}!Verdict {
+        const root = (try doc.root()) orelse return .unreadable;
+        const field = resolveJsonField(root, expr.path) orelse return .fail;
+        const yes = switch (field) {
             .string => |s| evalStringOp(s, expr.op, expr.value),
-            .integer => |n| evalNumericOp(@floatFromInt(n), expr.op, expr.value),
-            .float => |f| evalNumericOp(f, expr.op, expr.value),
+            .integer => |n| return evalNumber(.{ .int = n }, expr.op, expr.value),
+            .float => |f| return evalNumber(.{ .float = f }, expr.op, expr.value),
+            .number_string => |t| return evalNumber(.{ .text = t }, expr.op, expr.value),
             .bool => |b| evalBoolOp(b, expr.op, expr.value),
             else => false,
         };
+        return if (yes) .pass else .fail;
     }
 
     /// Resolve a (possibly dotted, possibly `$.`-prefixed) JSONPath against a parsed value.
@@ -404,6 +451,40 @@ pub const ExprFilterOperator = struct {
             .not_contains => std.mem.indexOf(u8, s, value) == null,
             .gt, .gte, .lt, .lte => false, // numeric ops on strings → false
         };
+    }
+
+    const Number = union(enum) { int: i64, float: f64, text: []const u8 };
+
+    /// A number against the condition's value. `=` and `!=` between two
+    /// whole numbers that fit an i128 compare exactly, so an id past 2^53
+    /// matches only itself; ordering, and a literal with a fraction or an
+    /// exponent (`9007199254740993.0`), compare as f64. A number past f64's
+    /// range can't be compared. The literal is read as strictly as JSON reads
+    /// the record: `1_00` or `+5` is no number.
+    fn evalNumber(n: Number, op: JsonOp, value: []const u8) Verdict {
+        if (!plainNumber(value)) return .fail;
+        if (op == .eq or op == .neq) {
+            const want: ?i128 = std.fmt.parseInt(i128, value, 10) catch null;
+            const have: ?i128 = switch (n) {
+                .int => |i| i,
+                .text => |t| std.fmt.parseInt(i128, t, 10) catch null,
+                .float => null,
+            };
+            if (want != null and have != null) return if ((want.? == have.?) == (op == .eq)) .pass else .fail;
+        }
+        const f: f64 = switch (n) {
+            .int => |i| @floatFromInt(i),
+            .float => |x| x,
+            .text => |t| std.fmt.parseFloat(f64, t) catch return .out_of_range,
+        };
+        if (!std.math.isFinite(f)) return .out_of_range;
+        return if (evalNumericOp(f, op, value)) .pass else .fail;
+    }
+
+    /// Whether `t` is a number as JSON writes one: no `_`, no leading `+`.
+    fn plainNumber(t: []const u8) bool {
+        if (t.len == 0 or t[0] == '+') return false;
+        return std.mem.indexOfScalar(u8, t, '_') == null;
     }
 
     fn evalNumericOp(n: f64, op: JsonOp, value: []const u8) bool {
@@ -760,4 +841,74 @@ test "ExprFilterOperator — plain float numeric comparison" {
     var op = try ExprFilterOperator.init("float-gt", "json:latency_ms>5000");
     try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "{\"latency_ms\":6000.5}", 0)));
     try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "{\"latency_ms\":10.0}", 0)));
+}
+
+test "ExprFilterOperator — = and != on whole numbers compare exactly, past 2^53 and past an i64" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const eq = try ExprFilterOperator.init("f", "json:id=12345678901234567890");
+    const ne = try ExprFilterOperator.init("f", "json:id!=12345678901234567890");
+    const rec = struct {
+        fn of(v: []const u8) ProcessingRecord {
+            return ProcessingRecord.init("k", v, 0);
+        }
+    }.of;
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.pass, try eq.judge(rec("{\"id\":12345678901234567890}"), a));
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.fail, try eq.judge(rec("{\"id\":12345678901234567891}"), a));
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.fail, try ne.judge(rec("{\"id\":12345678901234567890}"), a));
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.pass, try ne.judge(rec("{\"id\":12345678901234567891}"), a));
+    // Between 2^53 and 2^63, an i64 the f64 can't hold.
+    const mid = try ExprFilterOperator.init("f", "json:id=9007199254740993");
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.pass, try mid.judge(rec("{\"id\":9007199254740993}"), a));
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.fail, try mid.judge(rec("{\"id\":9007199254740992}"), a));
+    // Ordering still compares as numbers.
+    const gt = try ExprFilterOperator.init("f", "json:id>9007199254740992");
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.pass, try gt.judge(rec("{\"id\":12345678901234567890}"), a));
+    // Past f64's range a number can't be compared: a skip, not a match.
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.out_of_range, try gt.judge(rec("{\"id\":1e400}"), a));
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.out_of_range, try eq.judge(rec("{\"id\":-1e400}"), a));
+}
+
+test "ExprFilterOperator — under OR and AND a record a json: part can't read is unreadable unless the condition passes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const and_op = try ExprFilterOperator.init("f", "value_contains:x AND json:n>1");
+    const or_op = try ExprFilterOperator.init("f", "value_contains:x OR json:n>1");
+    const rec = struct {
+        fn of(v: []const u8) ProcessingRecord {
+            return ProcessingRecord.init("k", v, 0);
+        }
+    }.of;
+    // AND: whichever half fails, a record the json: half can't read is unreadable.
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.unreadable, try and_op.judge(rec("x not json"), a));
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.unreadable, try and_op.judge(rec("y not json"), a));
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.fail, try and_op.judge(rec("{\"n\":5}"), a));
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.pass, try and_op.judge(rec("{\"n\":5,\"x\":1}"), a));
+    // OR: the other half passing decides; failing, the record is unreadable.
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.pass, try or_op.judge(rec("x not json"), a));
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.unreadable, try or_op.judge(rec("y not json"), a));
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.fail, try or_op.judge(rec("{\"n\":0}"), a));
+}
+
+test "ExprFilterOperator — a numeric literal is read as strictly as the record: 1_00 and +5 are no numbers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `=` compares a string too, so such a literal matches no number.
+    for ([_][]const u8{ "json:n=1_00", "json:n=+5" }) |c| {
+        const op = try ExprFilterOperator.init("f", c);
+        for ([_][]const u8{ "{\"n\":100}", "{\"n\":5}", "{\"n\":2}" }) |v|
+            try std.testing.expectEqual(ExprFilterOperator.Verdict.fail, try op.judge(ProcessingRecord.init("k", v, 0), a));
+    }
+    // An ordering takes only a number: refused when the condition is read.
+    for ([_][]const u8{ "json:n>+1", "json:n<1_000" }) |c|
+        try std.testing.expectError(error.InvalidCondition, ExprFilterOperator.init("f", c));
+    // Up to 2^127 compares exactly; a fractional literal as f64.
+    const big = try ExprFilterOperator.init("f", "json:id=170141183460469231731687303715884105727");
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.pass, try big.judge(ProcessingRecord.init("k", "{\"id\":170141183460469231731687303715884105727}", 0), a));
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.fail, try big.judge(ProcessingRecord.init("k", "{\"id\":170141183460469231731687303715884105726}", 0), a));
+    const frac = try ExprFilterOperator.init("f", "json:id=9007199254740993.0");
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.pass, try frac.judge(ProcessingRecord.init("k", "{\"id\":9007199254740992}", 0), a));
 }

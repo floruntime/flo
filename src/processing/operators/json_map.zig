@@ -162,10 +162,7 @@ pub const JsonMapOperator = struct {
             self.allocator,
             rec.value,
             .{},
-        ) catch {
-            // If input isn't valid JSON, skip this record
-            return;
-        };
+        ) catch |err| return if (err == error.OutOfMemory) err else ctx.skip("map: the record isn't JSON it can read");
         defer parsed.deinit();
 
         // Build output JSON object
@@ -469,7 +466,7 @@ test "JsonMapOperator — invalid JSON input skipped" {
     };
 
     const op = mapper.operator();
-    try op.processElement(ProcessingRecord.init("k1", "not-json", 100), &ctx);
+    try std.testing.expectError(error.RecordSkipped, op.processElement(ProcessingRecord.init("k1", "not-json", 100), &ctx));
 
     try std.testing.expectEqual(@as(usize, 0), collector.count());
 

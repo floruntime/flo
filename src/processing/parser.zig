@@ -779,6 +779,16 @@ fn parseOneSink(allocator: Allocator, d: D, item: JsonValue, index: usize, defau
             if (t.len == 0) return d.fail(ParseError.InvalidFormat, "a tag's {s} can't be empty", .{if (i % 2 == 0) "name" else "record field"});
             if (i % 2 == 0) if (mem.indexOfAny(u8, t, ",=") != null) return d.fail(ParseError.InvalidFormat, "a tag's name can't hold ',' or '=': \"{s}\"", .{t});
         }
+        // Names are stored trimmed: one of spaces only is no name, and two
+        // that trim alike are one tag given twice, so every record would drop.
+        var ti: usize = 0;
+        while (ti < snk.ts_tag_keys.len) : (ti += 2) {
+            const name = mem.trim(u8, snk.ts_tag_keys[ti], " \t");
+            if (name.len == 0) return d.fail(ParseError.InvalidFormat, "a tag's name can't be only spaces", .{});
+            var tj: usize = 0;
+            while (tj < ti) : (tj += 2) if (mem.eql(u8, name, mem.trim(u8, snk.ts_tag_keys[tj], " \t")))
+                return d.fail(ParseError.InvalidFormat, "tags \"{s}\" and \"{s}\" are one tag once trimmed: a point has each key once", .{ snk.ts_tag_keys[tj], snk.ts_tag_keys[ti] });
+        }
         for (snk.ts_field_keys, 0..) |v, i| if (i % 2 == 1) {
             // No record field is named "": the sink would drop every record.
             if (v.len == 0) return d.fail(ParseError.InvalidFormat, "a field's record field can't be empty", .{});
@@ -2430,6 +2440,15 @@ test "parser: a TS source at either limit names its series: the runtime's tag ha
         var buf: [ts_mod.MAX_TAG_STRING]u8 = undefined;
         try std.testing.expect(ts_mod.canonicalTagHashPairs(pairs[0 .. tags.len / 2], &buf) != 0);
     }
+}
+
+test "parser: a TS sink's tag names that trim alike, or to nothing, are refused at submit" {
+    try expectRefused(
+        \\{"kind":"Processing","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m","tags":{"a":"x"," a":"y"}}}]}
+    , ParseError.InvalidFormat, "tags \"a\" and \" a\" are one tag once trimmed: a point has each key once at sinks[0].ts");
+    try expectRefused(
+        \\{"kind":"Processing","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m","tags":{"  ":"x"}}}]}
+    , ParseError.InvalidFormat, "a tag's name can't be only spaces at sinks[0].ts");
 }
 
 test "parser: a TS sink takes at most 32 tags, and reads no record field named past 253 bytes" {

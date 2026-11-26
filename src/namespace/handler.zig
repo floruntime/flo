@@ -488,7 +488,7 @@ pub const NamespaceHandler = struct {
     /// at least 1, so the built-in default namespace's counts as published).
     fn publishQuotaOf(self: *NamespaceHandler, id: ns_table.Id, name: []const u8, created_index: u64) void {
         if (ns_machine.settings(self.read(), name)) |s|
-            self.table.publishQuota(id, s.history_quota, s.set_index)
+            self.table.publishQuota(id, ns_machine.quotaOf(s), s.set_index)
         else
             self.table.publishQuota(id, ns_machine.DEFAULT_HISTORY_QUOTA, @max(created_index, 1));
     }
@@ -500,7 +500,7 @@ pub const NamespaceHandler = struct {
         while (it.next() catch unreachable) |rec| { // written by the machine alone
             const name = rec.key[ns_machine.NAME_PREFIX.len..];
             const id = if (ns_machine.isDefault(name)) ns_table.DEFAULT else if (ns_machine.meta(self.read(), name)) |m| ns_table.Id.of(m.id) else continue;
-            self.table.publishQuota(id, rec.value.v.history_quota, rec.value.v.set_index);
+            self.table.publishQuota(id, ns_machine.quotaOf(rec.value.v), rec.value.v.set_index);
         }
     }
 
@@ -716,7 +716,10 @@ pub const NamespaceHandler = struct {
                 const now = @import("stdx").time.milliTimestamp();
                 if (now - self.flush_warn_ms >= 30_000) {
                     self.flush_warn_ms = now;
-                    log.warn("namespace: {d} created namespaces are not on disk ({s}); they are not published until they are", .{ self.unpublished.items.len, @errorName(err) });
+                    if (self.unpublished.items.len > 0)
+                        log.warn("namespace: {d} created namespaces are not on disk ({s}); they are not published until they are", .{ self.unpublished.items.len, @errorName(err) })
+                    else
+                        log.warn("namespace: a quota set is not on disk ({s}); it is not published until it is", .{@errorName(err)});
                 }
                 break :publish;
             };
@@ -894,9 +897,9 @@ pub const NamespaceHandler = struct {
         if (!ns_machine.isDefault(name)) if (nameRefusal(name)) |why| return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(why) } };
         const meta = self.metaOf(name) orelse return error.NoNamespace;
         const own = ns_machine.settings(self.read(), name);
-        const quota = if (own) |s| s.history_quota else ns_machine.DEFAULT_HISTORY_QUOTA;
+        const quota = ns_machine.quotaOf(own);
         const state = try shard.allocator.create(InfoGather);
-        state.* = .{ .created_at_ms = @intCast(meta.created_at_ns / std.time.ns_per_ms), .quota = if (quota == ns_machine.NO_QUOTA) null else quota, .own = own != null };
+        state.* = .{ .created_at_ms = @intCast(meta.created_at_ns / std.time.ns_per_ms), .quota = if (quota == ns_machine.NO_QUOTA) null else quota, .own = ns_machine.quotaOwn(own) };
         var state_owned = true;
         defer if (state_owned) shard.allocator.destroy(state);
         const n = shard.shardCount();
@@ -956,11 +959,8 @@ pub const NamespaceHandler = struct {
             .bound = bound != null,
             .part_bytes = if (bound) |b| (if (b.part_bytes == settings_machine.NO_QUOTA) null else b.part_bytes) else null,
             .usage_bytes = u.bytes,
-            .reserved_workflow_bytes = 0,
-            .reserved_action_bytes = 0,
             .orphans = u.orphans,
             .orphan_bytes = u.orphan_bytes,
-            .held_runs = 0,
         };
     }
 
@@ -975,28 +975,34 @@ pub const NamespaceHandler = struct {
         table_run.answer(ShardQuota, shard, conn, req.header.request_id, localQuota(shard, id));
     }
 
-    const FLOOR_MESSAGE = std.fmt.comptimePrint("bad request: a history quota is at least {d} bytes on every shard, one run's reserve on each", .{ns_machine.PART_FLOOR});
+    /// A quota below one run's reserve on every shard, told as the total it
+    /// must reach. Valid until the thread's next call.
+    fn floorMessage(floor: u64, shards: usize) []const u8 {
+        const S = struct {
+            threadlocal var buf: [160]u8 = undefined;
+        };
+        return std.fmt.bufPrint(&S.buf, "bad request: a history quota is at least {d} bytes on {d} shards, one run's reserve ({d} bytes) on each", .{ floor, shards, ns_machine.PART_FLOOR }) catch "bad request: a history quota is at least one run's reserve on every shard";
+    }
 
     /// namespace.alter: a namespace's quota set on shard 0, answered once
     /// it applies. Below one shard's floor on this node, refused here.
-    fn runAlter(shard: *Shard, _: *Connection, req: Request, history_quota: ?u64) Error!table_run.Outcome(Empty) {
+    fn runAlter(shard: *Shard, _: *Connection, req: Request, mode: ns_machine.QuotaMode, bytes: ?u64) Error!table_run.Outcome(Empty) {
         const self = shard.namespace_handler;
         const name = req.key;
         if (!ns_machine.isDefault(name)) {
             if (nameRefusal(name)) |why| return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(why) } };
             if (self.metaOf(name) == null) return error.NoNamespace;
         }
-        const quota = history_quota orelse ns_machine.NO_QUOTA;
         const floor = ns_machine.PART_FLOOR *| shard.shardCount();
-        if (ns_machine.quotaRefusal(quota, floor)) |why| {
-            const msg = if (quota != 0) FLOOR_MESSAGE else why;
-            return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .out_of_range, .ran = .no, .message = msg } } };
+        if (ns_machine.quotaRefusal(mode, bytes, floor)) |why| {
+            const below = mode == .bytes and bytes != null and bytes.? != 0 and bytes.? < floor;
+            return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .out_of_range, .ran = .no, .message = if (below) floorMessage(floor, shard.shardCount()) else why } } };
         }
         if (!shard.raft_node.leaderReady()) return .{ .refused = .{ .status = .unavailable, .refusal = .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: a new leader is catching up; the quota wasn't set — retry" } } };
         const P = namespace_entries.Alter;
         var buf: [P.max_size]u8 = undefined;
-        const bytes = P.encodeInto(&buf, .{ .name = if (name.len == 0) "default" else name, .history_quota = quota }) catch return error.Internal;
-        const proposed = shard.raft_node.propose(.namespace_alter, entry_mod.Flags.NONE, bytes) catch |err| return proposeError(err);
+        const payload = P.encodeInto(&buf, .{ .name = name, .mode = mode, .bytes = bytes orelse 0 }) catch return error.Internal;
+        const proposed = shard.raft_node.propose(.namespace_alter, entry_mod.Flags.NONE, payload) catch |err| return proposeError(err);
         return .{ .park = .{ .proposed = proposed, .answer = answerAlter } };
     }
 

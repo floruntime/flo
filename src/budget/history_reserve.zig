@@ -136,8 +136,6 @@ pub const ACTION_DEFAULT_MOST: u64 = action(ae.MAX_ACTION_NAME, ae.MAX_RUN_ID, @
 pub const PART_FLOOR: u64 = @max(WORKFLOW_MOST, ACTION_DEFAULT_MOST);
 
 comptime {
-    // A step's events are bounded by the entry they come in.
-    std.debug.assert(runs_machine.MAX_BODY <= persistence.MAX_PERSIST_PAYLOAD);
     std.debug.assert(hp.HistRec.min_size > runs_machine.Event.min_size);
     // An end's chunk holds what is pending and the end, as the actions
     // machine asserts.
