@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 72;
+pub const CURRENT: u32 = 73;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -263,6 +263,10 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // A time-series write whose tags repeat a key, lack one, aren't UTF-8,
     // or pass 32 pairs or 1024 bytes is refused where it applies.
     .{ .format = 72, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
+    // A processing job's TS sink with `value_field` beside `fields`, or
+    // naming a value field other than "value" in a job with both a stream
+    // and a TS source, is refused where its submit applies, kept failed.
+    .{ .format = 73, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
 };
 
 comptime {
