@@ -1780,8 +1780,9 @@ pub const ProcessingHandler = struct {
         // Its batch in the log: nothing more until it applies.
         if (pipe.batch_term == raft.current_term and pipe.batch_index > raft.last_applied) return .skip;
         // A page asked of the shard owning its source: nothing until it
-        // comes, and its coming wakes the shard (or it's asked again once
-        // its deadline passes).
+        // comes, and its coming wakes the shard. One lost is asked again
+        // once READ_DEADLINE_MS passes, at the shard's next own wake: with
+        // the deadline at 5 s, at most 100 ms late, so it adds no deadline.
         if (pipe.read_seq != 0 and now_ms - pipe.read_sent_ms < READ_DEADLINE_MS) return .skip;
         return .ready;
     }
@@ -1795,6 +1796,9 @@ pub const ProcessingHandler = struct {
     /// as before, so a wait at a short poll interval can't wake it each ms.
     pub const Next = struct { due: bool = false, deadline_ms: ?i64 = null };
 
+    /// It walks every pipeline, asking the waiting checks of each ready or
+    /// not-due one, on every tick of a leading shard: O(pipelines) a tick,
+    /// fine at today's job counts; many jobs would want it cached.
     pub fn nextWork(self: *const ProcessingHandler, shard: *Shard, now_ms: i64) Next {
         var next: Next = .{};
         const raft = shard.raft_node;

@@ -7420,6 +7420,9 @@ pub const Shard = struct {
     /// How long an idle tick may sleep: the loop's 100 ms, or less when a
     /// pipeline becomes due sooner. Never 0: a pipeline already due keeps
     /// the loop busy instead, and a due one that waits gives no deadline.
+    /// The deadline is wall-clock ms, as a pipeline's `last_poll_ms` is:
+    /// keep both on one clock. A clock step only shortens a sleep to 1 ms
+    /// or caps it at 100.
     fn idleTimeoutMs(self: *const Shard, now_ms: i64) u32 {
         const IDLE_MS = 100;
         const at = self.producers_deadline_ms orelse return IDLE_MS;
