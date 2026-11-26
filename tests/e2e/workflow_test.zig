@@ -157,7 +157,8 @@ test "e2e/workflow: a round-robin plan's breaker opens on its executor's failure
     try awaitHistory(ctx, "cb-3", "plan_breaker_skip", 2000);
     var none = try ctx.cli.run(&.{ "worker", "await", "call-api", "--worker-id", "cb-w", "--block", "0" });
     defer none.deinit();
-    try testing.expect(extractTaskId(std.mem.trim(u8, none.stdout, &std.ascii.whitespace)) == null);
+    // An answer with no task, not an error: primary was never called.
+    try testing.expectEqualStrings("(no tasks)", std.mem.trim(u8, none.stdout, &std.ascii.whitespace));
 }
 
 test "e2e/workflow: create workflow with retry config" {

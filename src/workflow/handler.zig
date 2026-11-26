@@ -274,17 +274,18 @@ pub const WorkflowHandler = struct {
     /// Registered when a workflow with a `schedule:` block is created.
     schedules: std.StringHashMap(ScheduleState),
 
-    /// Plan executor health, by (namespace id, workflow, plan, executor) (`healthKey`).
-    /// Used by health-weighted selection to route to the healthiest executor and
-    /// by circuit breakers to skip failing executors.
+    /// Plan executor health, by (namespace id, workflow, plan, executor)
+    /// (`healthKey`): health-weighted selection orders by it, and each
+    /// executor's breaker is kept in it. Changed only by a step that logs
+    /// (`applyPlanEffects`).
     plan_health: std.StringHashMap(plan_types.ExecutorHealth),
-    /// Round-robin selection: each plan's next starting executor, as this
-    /// leader counts its passes (`healthKey` with no executor). Leader
-    /// memory, kept only for `selection_term`: a new leader starts at 0.
+    /// Each plan's passes this leader has started (`healthKey` with no
+    /// executor): where round-robin starts the next, and what random's
+    /// shuffle is drawn from.
     plan_cursors: std.StringHashMap(u32),
-    /// Random selection's source, seeded from the shard and term when this
-    /// leader starts selecting in a term, so a simulated run replays it.
-    selection_prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
+    /// The term `plan_health` and `plan_cursors` were kept in: both are
+    /// this leader's memory, and a new term starts without them, so a node
+    /// leading again doesn't act on what it saw before (`planMemory`).
     selection_term: u64 = 0,
 
     /// The longest workflow name: its runs' history names it as its owner.
@@ -389,9 +390,8 @@ pub const WorkflowHandler = struct {
         /// Index of the current executor within a plan (reset on step transition).
         plan_executor_idx: u8 = 0,
 
-        /// Natural index into plan.executors[] for the active executor.
-        /// In health-weighted mode, plan_executor_idx tracks position in
-        /// the sorted order while this holds the actual executor index.
+        /// Natural index into plan.executors[] for the active executor:
+        /// plan_executor_idx is its position in the pass's `plan_order`.
         plan_executor_natural_idx: u8 = 0,
 
         /// Retry counter for the current plan executor (reset on executor advance).
@@ -438,6 +438,11 @@ pub const WorkflowHandler = struct {
         /// The call this decision makes (an encoded `ae.Call`), logged with
         /// the step that waits on it.
         call_payload: ?[]const u8 = null,
+        /// What this decision does to the leader's plan memory: kept until
+        /// its step logs (`commitRun`), since one not logged is decided
+        /// again and would count the same result, or start the same pass,
+        /// twice.
+        plan_effects: std.ArrayListUnmanaged(PlanEffect) = .empty,
         /// The run's end this decision reached, and what its last event says.
         ending: ?RunStatus = null,
         ending_detail_owned: ?[]const u8 = null,
@@ -707,61 +712,126 @@ pub const WorkflowHandler = struct {
         }
         self.schedules.deinit();
 
-        // Free plan health state
-        var phit = self.plan_health.iterator();
-        while (phit.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit(self.allocator);
-        }
+        self.forgetPlans(null);
         self.plan_health.deinit();
-        self.clearPlanCursors();
         self.plan_cursors.deinit();
     }
 
-    fn clearPlanCursors(self: *WorkflowHandler) void {
-        var it = self.plan_cursors.keyIterator();
-        while (it.next()) |k| self.allocator.free(k.*);
-        self.plan_cursors.clearRetainingCapacity();
+    /// The leader's plan memory for workflow `of` (namespace id and name),
+    /// or for every workflow, gone.
+    fn forgetPlans(self: *WorkflowHandler, of: ?struct { ns: NamespaceId, workflow: []const u8 }) void {
+        var buf: [16 + 24 + MAX_WORKFLOW_NAME_LEN]u8 = undefined;
+        // `healthKey` up to the plan's name: no other workflow's keys start so.
+        const prefix: []const u8 = if (of) |w|
+            std.fmt.bufPrint(&buf, "{s}{d}:{s}", .{ &w.ns.bytes(), w.workflow.len, w.workflow }) catch return
+        else
+            "";
+        var hit = self.plan_health.iterator();
+        while (hit.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
+            const key = entry.key_ptr.*;
+            entry.value_ptr.deinit(self.allocator);
+            self.plan_health.removeByPtr(entry.key_ptr);
+            self.allocator.free(key);
+            hit = self.plan_health.iterator();
+        }
+        var cit = self.plan_cursors.keyIterator();
+        while (cit.next()) |k| {
+            if (!std.mem.startsWith(u8, k.*, prefix)) continue;
+            const key = k.*;
+            self.plan_cursors.removeByPtr(k);
+            self.allocator.free(key);
+            cit = self.plan_cursors.keyIterator();
+        }
+    }
+
+    /// Starts this term's plan memory afresh if it was kept in another.
+    fn planMemory(self: *WorkflowHandler, shard: *const Shard) void {
+        const term = shard.raft_node.current_term;
+        if (self.selection_term == term) return;
+        self.forgetPlans(null);
+        self.selection_term = term;
+    }
+
+    /// A change a decision makes to the leader's plan memory, under its
+    /// key (`healthKey`; a pass's has no executor), owned.
+    pub const PlanEffect = struct {
+        key: []u8,
+        what: union(enum) {
+            /// An executor's call ended, succeeding or not.
+            result: struct { success: bool, breaker: ?plan_types.CircuitBreakerConfig },
+            /// A call was made as its half-open breaker's probe.
+            probe,
+            /// A pass started: the plan's next starts one further along.
+            pass,
+        },
+        at_ms: i64,
+    };
+
+    /// `what` kept on `run`'s copy, for when its step logs. Short of memory
+    /// it is not kept: a result counted once less, a pass's start not
+    /// moved on.
+    fn stagePlanEffect(self: *WorkflowHandler, run: *RunRecord, ns: NamespaceId, plan_name: []const u8, executor_name: []const u8, what: @FieldType(PlanEffect, "what"), at_ms: i64) void {
+        const key = healthKey(self.allocator, ns, run.workflow_name_owned, plan_name, executor_name) catch return;
+        run.plan_effects.append(self.allocator, .{ .key = key, .what = what, .at_ms = at_ms }) catch self.allocator.free(key);
+    }
+
+    /// The plan memory `run`'s logged step changes.
+    fn applyPlanEffects(self: *WorkflowHandler, shard: *const Shard, run: *RunRecord) void {
+        self.planMemory(shard);
+        for (run.plan_effects.items) |e| switch (e.what) {
+            .pass => {
+                const got = self.plan_cursors.getOrPut(e.key) catch continue;
+                if (got.found_existing) got.value_ptr.* +%= 1 else {
+                    got.key_ptr.* = self.allocator.dupe(u8, e.key) catch {
+                        self.plan_cursors.removeByPtr(got.key_ptr);
+                        continue;
+                    };
+                    got.value_ptr.* = 1;
+                }
+            },
+            .result, .probe => {
+                const health = self.healthAt(e.key) orelse continue;
+                switch (e.what) {
+                    .result => |r| {
+                        health.recordApiAttempt(r.success, 0, e.at_ms);
+                        if (r.breaker) |cfg| health.updateBreakerState(cfg, r.success, e.at_ms);
+                    },
+                    .probe => health.markProbe(e.at_ms),
+                    .pass => unreachable,
+                }
+            },
+        };
     }
 
     /// A fresh pass's executor order, by the plan's selection: definition
     /// order; health-weighted, healthiest first; round-robin, starting one
-    /// further along each pass this leader makes; random, shuffled. The order
-    /// is logged with the run's progress, so a new leader resumes the pass
-    /// as it was; only the next pass's start is this leader's.
-    fn orderPass(self: *WorkflowHandler, shard: *const Shard, plan: definition.InlinePlan, ns: NamespaceId, workflow: []const u8, order: []u8) void {
+    /// further along each pass this leader logs; random, shuffled from the
+    /// shard, term and pass. The order is logged with the run's progress,
+    /// so a new leader resumes the pass as it was; only the next pass's
+    /// start is this leader's.
+    fn orderPass(self: *WorkflowHandler, shard: *const Shard, run: *RunRecord, plan: definition.InlinePlan, ns: NamespaceId, order: []u8) void {
         for (order, 0..) |*slot, i| slot.* = @intCast(i);
         switch (plan.selection) {
             .static_order => {},
-            .health_weighted => self.sortExecutorsByHealth(order, plan, ns, workflow),
+            .health_weighted => self.sortExecutorsByHealth(order, plan, ns, run.workflow_name_owned),
             .round_robin, .random => {
-                const term = shard.raft_node.current_term;
-                if (self.selection_term != term) {
-                    self.clearPlanCursors();
-                    var seed: [10]u8 = undefined;
-                    std.mem.writeInt(u64, seed[0..8], term, .little);
-                    std.mem.writeInt(u16, seed[8..10], shard.id, .little);
-                    self.selection_prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0, &seed));
-                    self.selection_term = term;
-                }
-                if (plan.selection == .random) return self.selection_prng.random().shuffle(u8, order);
-                std.mem.rotate(u8, order, self.nextCursor(ns, workflow, plan.name) % order.len);
+                const key = healthKey(self.allocator, ns, run.workflow_name_owned, plan.name, "") catch return;
+                defer self.allocator.free(key);
+                const pass = self.plan_cursors.get(key) orelse 0;
+                self.stagePlanEffect(run, ns, plan.name, "", .pass, 0);
+                if (plan.selection == .round_robin) return std.mem.rotate(u8, order, pass % order.len);
+                var h = std.hash.Wyhash.init(0);
+                var head: [14]u8 = undefined;
+                std.mem.writeInt(u64, head[0..8], shard.raft_node.current_term, .little);
+                std.mem.writeInt(u16, head[8..10], shard.id, .little);
+                std.mem.writeInt(u32, head[10..14], pass, .little);
+                h.update(&head);
+                h.update(key);
+                var prng = std.Random.DefaultPrng.init(h.final());
+                prng.random().shuffle(u8, order);
             },
         }
-    }
-
-    /// The plan's next round-robin start, counted on. Short of memory to
-    /// keep one, the pass starts at the first executor.
-    fn nextCursor(self: *WorkflowHandler, ns: NamespaceId, workflow: []const u8, plan_name: []const u8) usize {
-        const key = healthKey(self.allocator, ns, workflow, plan_name, "") catch return 0;
-        const got = self.plan_cursors.getOrPut(key) catch {
-            self.allocator.free(key);
-            return 0;
-        };
-        if (got.found_existing) self.allocator.free(key) else got.value_ptr.* = 0;
-        const at = got.value_ptr.*;
-        got.value_ptr.* = at +% 1;
-        return at;
     }
 
     fn freeRunRecord(self: *WorkflowHandler, run: *RunRecord) void {
@@ -780,6 +850,8 @@ pub const WorkflowHandler = struct {
         if (run.took_call) |c| self.allocator.free(c);
         for (run.takes.items) |t| self.allocator.free(t);
         run.takes.deinit(self.allocator);
+        for (run.plan_effects.items) |e| self.allocator.free(e.key);
+        run.plan_effects.deinit(self.allocator);
         if (run.call_payload) |c| self.allocator.free(c);
         if (run.ending_detail_owned) |d| self.allocator.free(d);
         if (run.step_outputs) |*so| {
@@ -2294,8 +2366,9 @@ pub const WorkflowHandler = struct {
         // The parser refuses a longer list.
         std.debug.assert(plan.executors.len <= plan_types.MAX_PLAN_EXECUTORS);
         const exec_count: u8 = @intCast(plan.executors.len);
+        self.planMemory(shard);
         if (run.plan_order_len != exec_count) {
-            self.orderPass(shard, plan, ns, run.workflow_name_owned, run.plan_order[0..exec_count]);
+            self.orderPass(shard, run, plan, ns, run.plan_order[0..exec_count]);
             run.plan_order_len = exec_count;
         }
         const exec_order = run.plan_order[0..exec_count];
@@ -2305,15 +2378,18 @@ pub const WorkflowHandler = struct {
             const executor = plan.executors[natural_idx];
 
             // Its breaker, under any selection, before attempting it.
+            // Half-open lets one call through, the probe, until its result.
             if (executor.breaker) |breaker_cfg| {
-                if (self.getOrCreateHealth(ns, run.workflow_name_owned, plan_name, executor.name)) |health| {
-                    if (!health.shouldAllowRequest(breaker_cfg, now_ms)) {
+                if (self.healthOf(ns, run.workflow_name_owned, plan_name, executor.name)) |health| switch (health.admits(breaker_cfg, now_ms)) {
+                    .yes => {},
+                    .probe => self.stagePlanEffect(run, ns, plan_name, executor.name, .probe, now_ms),
+                    .no => {
                         self.addHistoryEvent(run, "plan_breaker_skip", executor.name, now_ms);
                         run.plan_executor_idx += 1;
                         run.plan_executor_retry_count = 0;
                         continue;
-                    }
-                }
+                    },
+                };
             }
 
             // Track natural index for async resume health recording
@@ -2342,7 +2418,7 @@ pub const WorkflowHandler = struct {
 
             // Health for synchronous completions: health-weighted orders by
             // it, and every breaker counts its failures.
-            self.recordPlanHealth(ns, run.workflow_name_owned, plan_name, executor, success, now_ms);
+            self.stageResult(run, ns, plan_name, executor, success, now_ms);
 
             // Success — reset plan state and return
             if (success) {
@@ -2377,8 +2453,8 @@ pub const WorkflowHandler = struct {
         for (order) |i| {
             const executor = plan.executors[i];
             const cfg = executor.breaker orelse return true;
-            const health = self.getOrCreateHealth(ns, workflow, plan_name, executor.name) orelse return true;
-            if (health.wouldAllowRequest(cfg, now_ms)) return true;
+            const health = self.healthOf(ns, workflow, plan_name, executor.name) orelse return true;
+            if (health.admits(cfg, now_ms) != .no) return true;
         }
         return false;
     }
@@ -3124,7 +3200,7 @@ pub const WorkflowHandler = struct {
                         if (run.plan_executor_natural_idx < plan.executors.len) {
                             const attempted_executor = plan.executors[run.plan_executor_natural_idx];
                             const is_success = std.mem.eql(u8, outcome, definition.StepOutcome.success);
-                            self.recordPlanHealth(ns, run.workflow_name_owned, run_step.targetName(), attempted_executor, is_success, now_ms);
+                            self.stageResult(run, ns, run_step.targetName(), attempted_executor, is_success, now_ms);
                         }
                     }
                 }
@@ -3156,8 +3232,8 @@ pub const WorkflowHandler = struct {
                     std.mem.eql(u8, outcome, definition.StepOutcome.target_not_found)))
                 {
                     if (def.getPlan(run_step.targetName())) |plan| {
-                        // Use natural index — in health-weighted mode plan_executor_idx
-                        // is the position in sorted order, not the index into plan.executors[].
+                        // Use natural index: plan_executor_idx is the position in the
+                        // pass's order, not the index into plan.executors[].
                         std.debug.assert(plan.executors.len <= plan_types.MAX_PLAN_EXECUTORS);
                         const exec_count: u8 = @intCast(plan.executors.len);
 
@@ -3378,6 +3454,7 @@ pub const WorkflowHandler = struct {
             }
         };
         _ = index;
+        self.applyPlanEffects(shard, run);
         const owned = self.allocator.dupe(u8, run_key) catch return .logged;
         const gop = self.stepping.getOrPut(self.allocator, owned) catch {
             self.allocator.free(owned);
@@ -4259,51 +4336,32 @@ pub const WorkflowHandler = struct {
 
     // ── Plan Health Helpers ─────────────────────────────────────────────
 
-    /// Get or create the health record for a plan executor.
-    /// Returns null on allocation failure; callers must handle gracefully.
-    fn getOrCreateHealth(
-        self: *WorkflowHandler,
-        ns: NamespaceId,
-        workflow: []const u8,
-        plan_name: []const u8,
-        executor_name: []const u8,
-    ) ?*plan_types.ExecutorHealth {
+    /// The health record kept under `key` (`healthKey`), made if there is
+    /// none; null when out of memory.
+    fn healthAt(self: *WorkflowHandler, key: []const u8) ?*plan_types.ExecutorHealth {
+        const got = self.plan_health.getOrPut(key) catch return null;
+        if (got.found_existing) return got.value_ptr;
+        const owned = self.allocator.dupe(u8, key) catch {
+            self.plan_health.removeByPtr(got.key_ptr);
+            return null;
+        };
+        got.key_ptr.* = owned;
+        got.value_ptr.* = plan_types.ExecutorHealth.initWithName(&.{});
+        return got.value_ptr;
+    }
+
+    /// A plan executor's health record, if a logged step made one: none is
+    /// a closed breaker and full health.
+    fn healthOf(self: *WorkflowHandler, ns: NamespaceId, workflow: []const u8, plan_name: []const u8, executor_name: []const u8) ?*const plan_types.ExecutorHealth {
         const key = healthKey(self.allocator, ns, workflow, plan_name, executor_name) catch return null;
-
-        if (self.plan_health.getPtr(key)) |health| {
-            self.allocator.free(key);
-            return health;
-        }
-
-        const owned_name = self.allocator.dupe(u8, executor_name) catch {
-            self.allocator.free(key);
-            return null;
-        };
-
-        self.plan_health.put(key, plan_types.ExecutorHealth.initWithName(owned_name)) catch {
-            self.allocator.free(key);
-            self.allocator.free(owned_name);
-            return null;
-        };
+        defer self.allocator.free(key);
         return self.plan_health.getPtr(key);
     }
 
-    /// Record an API attempt outcome against a plan executor's health state.
-    /// Updates circuit breaker state if the executor has breaker config.
-    fn recordPlanHealth(
-        self: *WorkflowHandler,
-        ns: NamespaceId,
-        workflow: []const u8,
-        plan_name: []const u8,
-        executor: definition.ExecutorConfig,
-        success: bool,
-        now_ms: i64,
-    ) void {
-        const health = self.getOrCreateHealth(ns, workflow, plan_name, executor.name) orelse return;
-        health.recordApiAttempt(success, 0, now_ms);
-        if (executor.breaker) |breaker_cfg| {
-            health.updateBreakerState(breaker_cfg, success, now_ms);
-        }
+    /// An executor's call ended: counted, and its breaker moved, once the
+    /// step that takes the result logs.
+    fn stageResult(self: *WorkflowHandler, run: *RunRecord, ns: NamespaceId, plan_name: []const u8, executor: definition.ExecutorConfig, success: bool, now_ms: i64) void {
+        self.stagePlanEffect(run, ns, plan_name, executor.name, .{ .result = .{ .success = success, .breaker = executor.breaker } }, now_ms);
     }
 
     /// Sort executor indices by health score (descending). Used by health-weighted
@@ -5123,6 +5181,8 @@ pub const WorkflowHandler = struct {
         const name = keyName(def_key);
         const built = self.producers_built.get(def_key);
         if (built == null or built.? != d.created_index) {
+            // Redefined: its plans may not be the ones kept.
+            if (built != null) self.forgetPlans(.{ .ns = ns, .workflow = name });
             self.buildProducers(def_key, d) catch |err| {
                 // Not noted as built: the definitions are walked again.
                 if (err == error.OutOfMemory) self.producers_lost = true;
@@ -6289,9 +6349,21 @@ test "step executor: missing action yields target_not_found" {
     try testing.expectEqual(WorkflowHandler.RunStatus.failed, run.status);
 }
 
+/// The leader's health record for an executor of a plan in the default
+/// namespace, made in the shard's current term.
+fn testHealth(handler: *WorkflowHandler, shard: *const Shard, workflow: []const u8, plan_name: []const u8, executor: []const u8) *plan_types.ExecutorHealth {
+    handler.planMemory(shard);
+    const key = WorkflowHandler.healthKey(testing.allocator, .default, workflow, plan_name, executor) catch unreachable;
+    defer testing.allocator.free(key);
+    return handler.healthAt(key).?;
+}
+
 test "step executor: a plan's executor waits when the only other's breaker is open, and not when it could run" {
     const allocator = testing.allocator;
-    for ([_]bool{ true, false }) |open| {
+    for ([_][]const u8{ "health-weighted", "static-order" }) |selection| for ([_]bool{ true, false }) |open| {
+        var jb: [test_plan_exhaust_workflow_json.len]u8 = undefined;
+        _ = std.mem.replace(u8, test_plan_exhaust_workflow_json, "health-weighted", selection, &jb);
+        const json = jb[0..std.mem.replacementSize(u8, test_plan_exhaust_workflow_json, "health-weighted", selection)];
         var handler = WorkflowHandler.init(allocator);
         defer handler.deinit();
         var actions = ActionsHandler.init(allocator);
@@ -6302,15 +6374,15 @@ test "step executor: a plan's executor waits when the only other's breaker is op
         handler.history = shard.stream_handler;
         shard.workflow_handler = &handler;
 
-        createTestDef(&handler, testKey(.default, "plan-wf"), "plan-wf", test_plan_exhaust_workflow_json);
+        createTestDef(&handler, testKey(.default, "plan-wf"), "plan-wf", json);
         createTestRun(&handler, testKey(.default, "run-b"), "run-b", "plan-wf");
-        const paypal = handler.getOrCreateHealth(.default, "plan-wf", "charge", "paypal").?;
+        const paypal = testHealth(&handler, &shard, "plan-wf", "charge", "paypal");
         if (open) {
             paypal.breaker_state = .open;
             paypal.breaker_opened_at_ms = @import("stdx").time.milliTimestamp();
         }
         // stripe is tried first either way: as listed first, and as the
-        // healthier when paypal's breaker is open.
+        // healthier when paypal's breaker is open. Under any selection.
         handler.advanceWorkflow(&shard, testKey(.default, "run-b"));
         // Its call waits for an action not registered only when the other
         // executor can't run.
@@ -6321,7 +6393,7 @@ test "step executor: a plan's executor waits when the only other's breaker is op
         var diag: wire_schema.Diagnostic = .{};
         const step = try runs_machine.Step.decodeAll(entry_mod.CommandPayload.deserialize(e.payload).?.value, &diag);
         try testing.expectEqual(open, (try ae.Call.decodeAll(step.call, &diag)).can_wait);
-    }
+    };
 }
 
 test "workflow duty: looks only at runs parked on an action or a child" {
@@ -7526,18 +7598,29 @@ test "step executor: a plan whose executors all fail fails the step after one pa
     try testing.expectEqual([2]u32{ 1, 1 }, exhausted);
 }
 
-/// A plan of `executors` executors e0, e1, ..., by `selection`, the first
-/// with a breaker that opens on its first failure and stays open.
-fn selectionWorkflowJson(buf: []u8, selection: []const u8, executors: usize) []const u8 {
+const SelectionOpts = struct {
+    /// How many executors, from the first, have a breaker.
+    breakers: usize = 1,
+    /// Their failures to open, and then open for an hour.
+    threshold: u32 = 1,
+    /// The step's input is the run's `s` twice.
+    doubled_input: bool = false,
+};
+
+/// A plan of `executors` executors e0, e1, ..., by `selection`, each tried
+/// once a pass; the first `opts.breakers` with a breaker.
+fn selectionWorkflowJson(buf: []u8, selection: []const u8, executors: usize, opts: SelectionOpts) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.print("{{\"kind\":\"Workflow\",\"name\":\"sel-wf\",\"version\":\"1.0.0\",\"plans\":{{\"p\":{{\"selection\":\"{s}\",\"executors\":[", .{selection}) catch unreachable;
     for (0..executors) |i| {
         if (i > 0) w.writeAll(",") catch unreachable;
         w.print("{{\"name\":\"e{d}\",\"run\":\"@actions/e{d}\",\"retry\":{{\"max_attempts\":1}}", .{ i, i }) catch unreachable;
-        if (i == 0) w.writeAll(",\"breaker\":{\"failure_threshold\":1,\"cooldown_ms\":3600000}") catch unreachable;
+        if (i < opts.breakers) w.print(",\"breaker\":{{\"failure_threshold\":{d},\"cooldown_ms\":3600000}}", .{opts.threshold}) catch unreachable;
         w.writeAll("}") catch unreachable;
     }
-    w.writeAll("]}},\"start\":{\"run\":\"@plan/p\",\"transitions\":{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}") catch unreachable;
+    w.writeAll("]}},\"start\":{\"run\":\"@plan/p\",") catch unreachable;
+    if (opts.doubled_input) w.writeAll("\"input_mapping\":\"{\\\"a\\\":\\\"$.input.s\\\",\\\"b\\\":\\\"$.input.s\\\"}\",") catch unreachable;
+    w.writeAll("\"transitions\":{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}") catch unreachable;
     return w.buffered();
 }
 
@@ -7576,7 +7659,7 @@ const SelectionFixture = struct {
     actions: ActionsHandler,
     shard: Shard,
 
-    fn init(self: *SelectionFixture, selection: []const u8, executors: usize) !void {
+    fn init(self: *SelectionFixture, selection: []const u8, executors: usize, opts: SelectionOpts) !void {
         self.handler = WorkflowHandler.init(testing.allocator);
         self.actions = ActionsHandler.init(testing.allocator);
         self.shard = try createTestShard(&self.actions);
@@ -7586,7 +7669,13 @@ const SelectionFixture = struct {
         var nb: [8]u8 = undefined;
         for (0..executors) |i| registerTestAction(&self.shard, std.fmt.bufPrint(&nb, "e{d}", .{i}) catch unreachable);
         var jb: [2048]u8 = undefined;
-        createTestDef(&self.handler, testKey(.default, "sel-wf"), "sel-wf", selectionWorkflowJson(&jb, selection, executors));
+        createTestDef(&self.handler, testKey(.default, "sel-wf"), "sel-wf", selectionWorkflowJson(&jb, selection, executors, opts));
+    }
+
+    /// e`i`'s health record, if a logged step made one.
+    fn health(self: *SelectionFixture, i: usize) ?*const plan_types.ExecutorHealth {
+        var nb: [8]u8 = undefined;
+        return self.handler.healthOf(.default, "sel-wf", "p", std.fmt.bufPrint(&nb, "e{d}", .{i}) catch unreachable);
     }
 
     fn deinit(self: *SelectionFixture) void {
@@ -7598,38 +7687,92 @@ const SelectionFixture = struct {
 
 test "plan selection: round-robin starts one executor further along each pass, and again at the first in a new term" {
     var f: SelectionFixture = undefined;
-    try f.init("round-robin", 3);
+    try f.init("round-robin", 3, .{ .threshold = 100 });
     defer f.deinit();
     var buf: [64]u8 = undefined;
     var nb: [8]u8 = undefined;
-    // Each pass's first executor succeeds: e0, e1, e2, then e0 again.
-    for ([_][]const u8{ "e0", "e1", "e2", "e0" }, 0..) |want, i|
-        try testing.expectEqualStrings(want, runSelectionPass(&f.handler, &f.shard, std.fmt.bufPrint(&nb, "rr{d}", .{i}) catch unreachable, "success", &buf));
+    // Every executor fails: each pass's whole order shows.
+    for ([_][]const u8{ "e0e1e2", "e1e2e0", "e2e0e1", "e0e1e2" }, 0..) |want, i|
+        try testing.expectEqualStrings(want, runSelectionPass(&f.handler, &f.shard, std.fmt.bufPrint(&nb, "rr{d}", .{i}) catch unreachable, "failure", &buf));
     // A new term's leader starts its count at 0.
     f.shard.raft_node.current_term += 1;
-    try testing.expectEqualStrings("e0", runSelectionPass(&f.handler, &f.shard, "rr-term", "success", &buf));
+    try testing.expectEqualStrings("e0e1e2", runSelectionPass(&f.handler, &f.shard, "rr-term", "failure", &buf));
 }
 
-test "plan selection: random shuffles each pass, the same way for the same shard and term" {
+test "plan selection: a pass resumed by a new leader goes on in its logged order; the next starts at the first" {
+    var f: SelectionFixture = undefined;
+    try f.init("round-robin", 3, .{ .threshold = 100 });
+    defer f.deinit();
+    var buf: [64]u8 = undefined;
+    _ = runSelectionPass(&f.handler, &f.shard, "first", "success", &buf);
+    // The second pass starts at e1; its first call fails.
+    var kb: [KEY_PREFIX + 32]u8 = undefined;
+    const key = writeKey(&kb, .default, "mid");
+    createTestRun(&f.handler, key, "mid", "sel-wf");
+    f.handler.advanceWorkflow(&f.shard, key);
+    settleTest(&f.shard);
+    completeTestActionWith(&f.shard, f.handler.inspect(key).?.pending_action_run_id_owned.?, "failure");
+    f.handler.checkPendingActions(&f.shard);
+    settleTest(&f.shard);
+    // A new leader: the pass goes on with e2, then e0, as logged.
+    f.shard.raft_node.current_term += 1;
+    for (0..4) |_| {
+        const run = f.handler.inspect(key).?;
+        if (run.status.isTerminal()) break;
+        completeTestActionWith(&f.shard, run.pending_action_run_id_owned.?, "failure");
+        f.handler.checkPendingActions(&f.shard);
+        settleTest(&f.shard);
+    }
+    var pos: usize = 0;
+    var last: []const u8 = "";
+    for (f.handler.inspect(key).?.history.items) |evt| {
+        if (!std.mem.eql(u8, evt.event_type_owned, "plan_executor_start") or std.mem.eql(u8, evt.detail_owned, last)) continue;
+        last = evt.detail_owned;
+        @memcpy(buf[pos..][0..evt.detail_owned.len], evt.detail_owned);
+        pos += evt.detail_owned.len;
+    }
+    try testing.expectEqualStrings("e1e2e0", buf[0..pos]);
+    try testing.expectEqualStrings("e0e1e2", runSelectionPass(&f.handler, &f.shard, "next", "failure", &buf));
+}
+
+test "plan selection: a pass not logged doesn't move round-robin's start on" {
+    var f: SelectionFixture = undefined;
+    try f.init("round-robin", 3, .{ .threshold = 100 });
+    defer f.deinit();
+    var kb: [KEY_PREFIX + 32]u8 = undefined;
+    const key = writeKey(&kb, .default, "held");
+    createTestRun(&f.handler, key, "held", "sel-wf");
+    f.shard.raft_node.writes_stopped = true;
+    const before = f.shard.raft_node.log.lastIndex();
+    for (0..2) |_| f.handler.advanceWorkflow(&f.shard, key);
+    try testing.expectEqual(before, f.shard.raft_node.log.lastIndex());
+    f.shard.raft_node.writes_stopped = false;
+    f.handler.advanceWorkflow(&f.shard, key);
+    settleTest(&f.shard);
+    // The logged pass started at e0, and the next at e1.
+    const items = f.handler.inspect(key).?.history.items;
+    try testing.expectEqualStrings("e0", items[items.len - 1].detail_owned);
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("e1e2e0", runSelectionPass(&f.handler, &f.shard, "after", "failure", &buf));
+}
+
+test "plan selection: random tries every executor once a pass, shuffled, the same way for the same shard and term" {
     var orders: [2][8][4]u8 = undefined;
     for (&orders) |*run_set| {
         var f: SelectionFixture = undefined;
-        try f.init("random", 4);
+        try f.init("random", 4, .{ .threshold = 100 });
         defer f.deinit();
         var buf: [64]u8 = undefined;
         var nb: [8]u8 = undefined;
         for (run_set, 0..) |*o, i| {
-            // Every executor fails but the last: the whole order shows.
+            // Every executor fails: the whole order shows.
             const got = runSelectionPass(&f.handler, &f.shard, std.fmt.bufPrint(&nb, "rn{d}", .{i}) catch unreachable, "failure", &buf);
-            @memset(o, 0);
-            var k: usize = 0;
-            var j: usize = 0;
-            while (j + 1 < got.len) : (j += 2) {
-                o[k] = got[j + 1];
-                k += 1;
-            }
-            // Its breaker open after the first pass, e0 is skipped from then on.
-            if (i > 0) for (o) |c| try testing.expect(c != '0');
+            try testing.expectEqual(@as(usize, 8), got.len);
+            for (o, 0..) |*c, k| c.* = got[2 * k + 1];
+            // A permutation: each once.
+            var sorted = o.*;
+            std.mem.sort(u8, &sorted, {}, std.sort.asc(u8));
+            try testing.expectEqualStrings("0123", &sorted);
         }
     }
     // Replayed for the same shard and term: the same orders.
@@ -7645,7 +7788,7 @@ test "plan selection: random shuffles each pass, the same way for the same shard
 test "plan selection: under every strategy an executor whose breaker opened is skipped, and never chosen while it's open" {
     for ([_][]const u8{ "static-order", "round-robin", "random", "health-weighted" }) |selection| {
         var f: SelectionFixture = undefined;
-        try f.init(selection, 3);
+        try f.init(selection, 3, .{});
         defer f.deinit();
         var buf: [64]u8 = undefined;
         var nb: [16]u8 = undefined;
@@ -7667,6 +7810,129 @@ test "plan selection: under every strategy an executor whose breaker opened is s
         if (std.mem.eql(u8, selection, "static-order")) try testing.expectEqual(@as(usize, 6), skips);
         if (std.mem.eql(u8, selection, "round-robin")) try testing.expect(skips > 0);
     }
+}
+
+test "plan selection: a result is counted once, by the step that logs it, however often it is decided first" {
+    var f: SelectionFixture = undefined;
+    try f.init("static-order", 2, .{ .threshold = 3 });
+    defer f.deinit();
+    var kb: [KEY_PREFIX + 32]u8 = undefined;
+    const key = writeKey(&kb, .default, "once");
+    createTestRun(&f.handler, key, "once", "sel-wf");
+    f.handler.advanceWorkflow(&f.shard, key);
+    settleTest(&f.shard);
+    completeTestActionWith(&f.shard, f.handler.inspect(key).?.pending_action_run_id_owned.?, "failure");
+    // Its step decided, and not logged, a few times: nothing counted.
+    f.shard.raft_node.writes_stopped = true;
+    for (0..4) |_| f.handler.checkPendingActions(&f.shard);
+    try testing.expect(f.health(0) == null);
+    f.shard.raft_node.writes_stopped = false;
+    f.handler.checkPendingActions(&f.shard);
+    settleTest(&f.shard);
+    try testing.expectEqual(@as(i64, 1), f.health(0).?.api_failures);
+    try testing.expectEqual(plan_types.CircuitBreakerState.closed, f.health(0).?.breaker_state);
+}
+
+test "plan selection: a synchronous failure counts on its executor's breaker under any selection" {
+    var f: SelectionFixture = undefined;
+    try f.init("static-order", 2, .{ .doubled_input = true });
+    defer f.deinit();
+    // A step input no call may carry fails each executor without a call.
+    const big = try testing.allocator.alloc(u8, ae.MAX_INPUT / 2 + 16);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    @memcpy(big[0..6], "{\"s\":\"");
+    @memcpy(big[big.len - 2 ..], "\"}");
+    var kb: [KEY_PREFIX + 32]u8 = undefined;
+    const key = writeKey(&kb, .default, "big");
+    createTestRunWithInput(&f.handler, key, "big", "sel-wf", big);
+    f.handler.advanceWorkflow(&f.shard, key);
+    settleTest(&f.shard);
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, f.handler.inspect(key).?.status);
+    try testing.expectEqual(plan_types.CircuitBreakerState.open, f.health(0).?.breaker_state);
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("e1", runSelectionPass(&f.handler, &f.shard, "next", "success", &buf));
+}
+
+test "plan selection: with every breaker open the step fails once, each skipped" {
+    var f: SelectionFixture = undefined;
+    try f.init("round-robin", 3, .{ .breakers = 3 });
+    defer f.deinit();
+    const now = @import("stdx").time.milliTimestamp();
+    for ([_][]const u8{ "e0", "e1", "e2" }) |e| {
+        const h = testHealth(&f.handler, &f.shard, "sel-wf", "p", e);
+        h.breaker_state = .open;
+        h.breaker_opened_at_ms = now;
+    }
+    var kb: [KEY_PREFIX + 32]u8 = undefined;
+    const key = writeKey(&kb, .default, "shut");
+    createTestRun(&f.handler, key, "shut", "sel-wf");
+    f.handler.advanceWorkflow(&f.shard, key);
+    settleTest(&f.shard);
+    const run = f.handler.inspect(key).?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, run.status);
+    var skips: usize = 0;
+    for (run.history.items) |evt| {
+        if (std.mem.eql(u8, evt.event_type_owned, "plan_breaker_skip")) skips += 1;
+        try testing.expect(!std.mem.eql(u8, evt.event_type_owned, "plan_executor_start"));
+    }
+    try testing.expectEqual(@as(usize, 3), skips);
+}
+
+test "plan selection: half-open lets one probe through; the others skip it until its result" {
+    var f: SelectionFixture = undefined;
+    try f.init("static-order", 2, .{});
+    defer f.deinit();
+    const h = testHealth(&f.handler, &f.shard, "sel-wf", "p", "e0");
+    h.breaker_state = .open;
+    h.breaker_opened_at_ms = @import("stdx").time.milliTimestamp() - 3_600_001;
+    var keys: [3][KEY_PREFIX + 8]u8 = undefined;
+    var nb: [8]u8 = undefined;
+    var started: [3][]const u8 = undefined;
+    for (&keys, 0..) |*kb, i| {
+        const key = writeKey(kb, .default, std.fmt.bufPrint(&nb, "h{d}", .{i}) catch unreachable);
+        createTestRun(&f.handler, key, "", "sel-wf");
+        f.handler.advanceWorkflow(&f.shard, key);
+        settleTest(&f.shard);
+        const items = f.handler.inspect(key).?.history.items;
+        started[i] = items[items.len - 1].detail_owned;
+    }
+    // The first is the probe; the rest go to e1.
+    try testing.expectEqualStrings("e0", started[0]);
+    try testing.expectEqualStrings("e1", started[1]);
+    try testing.expectEqualStrings("e1", started[2]);
+    // The probe succeeds: the breaker closes, and e0 is tried again.
+    const probe = writeKey(&keys[0], .default, "h0");
+    completeTestActionWith(&f.shard, f.handler.inspect(probe).?.pending_action_run_id_owned.?, "success");
+    f.handler.checkPendingActions(&f.shard);
+    settleTest(&f.shard);
+    try testing.expectEqual(plan_types.CircuitBreakerState.closed, f.health(0).?.breaker_state);
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("e0", runSelectionPass(&f.handler, &f.shard, "closed", "success", &buf));
+}
+
+test "plan selection: a redefinition and a new term forget the leader's plan memory" {
+    var f: SelectionFixture = undefined;
+    try f.init("round-robin", 3, .{});
+    defer f.deinit();
+    f.handler.syncProducers(testKey(.default, "sel-wf"));
+    var buf: [64]u8 = undefined;
+    _ = runSelectionPass(&f.handler, &f.shard, "a", "failure", &buf);
+    try testing.expect(f.handler.plan_health.count() > 0);
+    try testing.expect(f.handler.plan_cursors.count() > 0);
+    // Another workflow's memory stays when this one is redefined.
+    f.handler.forgetPlans(.{ .ns = .default, .workflow = "other-wf" });
+    try testing.expect(f.handler.plan_health.count() > 0);
+    var jb: [2048]u8 = undefined;
+    createTestDef(&f.handler, testKey(.default, "sel-wf"), "sel-wf", selectionWorkflowJson(&jb, "round-robin", 2, .{}));
+    f.handler.syncProducers(testKey(.default, "sel-wf"));
+    try testing.expectEqual(@as(u32, 0), f.handler.plan_health.count());
+    try testing.expectEqual(@as(u32, 0), f.handler.plan_cursors.count());
+    // e0's breaker opens again; a new term starts without it.
+    _ = runSelectionPass(&f.handler, &f.shard, "b", "failure", &buf);
+    try testing.expectEqual(plan_types.CircuitBreakerState.open, f.health(0).?.breaker_state);
+    f.shard.raft_node.current_term += 1;
+    try testing.expectEqualStrings("e0", runSelectionPass(&f.handler, &f.shard, "c", "success", &buf));
 }
 
 test "step executor: an action run that timed out takes the step's failure transition" {

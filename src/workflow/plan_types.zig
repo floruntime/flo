@@ -79,8 +79,10 @@ pub const CircuitBreakerState = enum(u8) {
 pub const CircuitBreakerConfig = struct {
     /// Number of consecutive failures before opening
     failure_threshold: u32 = 5,
-    /// How long to stay open before half-open (ms). Half-open lets every
-    /// call through until one's result closes the breaker or opens it again.
+    /// How long to stay open before half-open (ms). Half-open lets one call
+    /// through at a time, a probe, until its result closes the breaker or
+    /// opens it again; a probe with no result after another cooldown is
+    /// given up, and the next call probes instead.
     cooldown_ms: i64 = 60000,
 };
 
@@ -222,6 +224,8 @@ pub const ExecutorHealth = struct {
     // Circuit breaker state
     breaker_state: CircuitBreakerState = .closed,
     breaker_opened_at_ms: i64 = 0,
+    /// When half-open's probe started.
+    breaker_probe_at_ms: i64 = 0,
 
     // Latency percentiles (ms)
     latency_p50_ms: i64 = 0,
@@ -338,28 +342,23 @@ pub const ExecutorHealth = struct {
         }
     }
 
-    /// Check if circuit breaker should allow request
-    /// What `shouldAllowRequest` would answer, changing nothing.
-    pub fn wouldAllowRequest(self: *const ExecutorHealth, config: CircuitBreakerConfig, now_ms: i64) bool {
-        return self.breaker_state != .open or now_ms - self.breaker_opened_at_ms >= config.cooldown_ms;
+    pub const Admit = enum { yes, probe, no };
+
+    /// Whether the breaker lets a call through now, changing nothing: a
+    /// call while half-open is the probe (`markProbe` once it is made).
+    pub fn admits(self: *const ExecutorHealth, config: CircuitBreakerConfig, now_ms: i64) Admit {
+        return switch (self.breaker_state) {
+            .closed => .yes,
+            .open => if (now_ms - self.breaker_opened_at_ms >= config.cooldown_ms) .probe else .no,
+            .half_open => if (now_ms - self.breaker_probe_at_ms >= config.cooldown_ms) .probe else .no,
+        };
     }
 
-    pub fn shouldAllowRequest(self: *ExecutorHealth, config: CircuitBreakerConfig, now_ms: i64) bool {
-        switch (self.breaker_state) {
-            .closed => return true,
-            .open => {
-                // Check if cooldown has passed
-                if (now_ms - self.breaker_opened_at_ms >= config.cooldown_ms) {
-                    self.breaker_state = .half_open;
-                    return true;
-                }
-                return false;
-            },
-            .half_open => {
-                // Every call until a result decides.
-                return true;
-            },
-        }
+    /// A probe was made: no other call goes through until its result, or a
+    /// cooldown.
+    pub fn markProbe(self: *ExecutorHealth, now_ms: i64) void {
+        self.breaker_state = .half_open;
+        self.breaker_probe_at_ms = now_ms;
     }
 
     /// Update circuit breaker state after attempt
@@ -423,7 +422,7 @@ test "ExecutorHealth: circuit breaker state machine" {
 
     // Initially closed
     try testing.expectEqual(CircuitBreakerState.closed, health.breaker_state);
-    try testing.expect(health.shouldAllowRequest(config, now_ms));
+    try testing.expectEqual(ExecutorHealth.Admit.yes, health.admits(config, now_ms));
 
     // Record failures up to threshold
     health.recordApiAttempt(false, 100, now_ms);
@@ -440,12 +439,16 @@ test "ExecutorHealth: circuit breaker state machine" {
     try testing.expectEqual(CircuitBreakerState.open, health.breaker_state);
 
     // Should not allow request while open
-    try testing.expect(!health.shouldAllowRequest(config, now_ms));
+    try testing.expectEqual(ExecutorHealth.Admit.no, health.admits(config, now_ms));
 
-    // After cooldown, transitions to half-open
+    // After cooldown, one call probes; no other goes through meanwhile
     now_ms += config.cooldown_ms + 1;
-    try testing.expect(health.shouldAllowRequest(config, now_ms));
+    try testing.expectEqual(ExecutorHealth.Admit.probe, health.admits(config, now_ms));
+    health.markProbe(now_ms);
     try testing.expectEqual(CircuitBreakerState.half_open, health.breaker_state);
+    try testing.expectEqual(ExecutorHealth.Admit.no, health.admits(config, now_ms + 1));
+    // A probe that never reports is given up after a cooldown
+    try testing.expectEqual(ExecutorHealth.Admit.probe, health.admits(config, now_ms + config.cooldown_ms));
 
     // Success in half-open closes breaker
     health.recordApiAttempt(true, 50, now_ms);
