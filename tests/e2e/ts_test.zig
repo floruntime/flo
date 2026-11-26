@@ -133,6 +133,8 @@ test "e2e/ts: write refuses tags that repeat a key, lack one or aren't UTF-8, na
         .{ .tags = "host=web,=x", .why = "tag \"=x\" has no key" },
         .{ .tags = "\xff=1", .why = "tags must be UTF-8" },
         .{ .tags = "host=caf\xc3", .why = "tags must be UTF-8" },
+        .{ .tags = "host=web,flag", .why = "tag \"flag\" has no value: a tag is key=value" },
+        .{ .tags = "host=", .why = "tag \"host=\" has no value: a tag is key=value" },
     }) |c| {
         var r = try ctx.cli.run(&.{ "ts", "write", "bad_tags", "--tags", c.tags, "--value", "7" });
         defer r.deinit();

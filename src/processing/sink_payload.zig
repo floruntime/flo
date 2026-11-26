@@ -84,7 +84,10 @@ pub fn stream(buf: []u8, scratch: std.mem.Allocator, ns: NamespaceId, name: []co
 pub fn ts(buf: []u8, ns: NamespaceId, measurement: []const u8, field: []const u8, value: f64, timestamp_ns: u64, tags: []const u8) Result {
     if (measurement.len == 0) return .{ .refused = .{ .why = "measurement is required" } };
     if (measurement.len > persistence.MAX_ENTRY_KEY) return .{ .refused = .{ .why = "measurement name too long" } };
-    if (ts_mod.tagSetProblem(tags)) |p| return .{ .refused = .{ .why = p.fixed() } };
+    // Written into `buf`, which holds no payload when the write is refused.
+    // A non-UTF-8 tag can't come from a JSON record (one is dropped as not
+    // JSON first), but the check stays for any other writer.
+    if (ts_mod.tagSetProblem(tags)) |p| return .{ .refused = .{ .why = p.sinkText(buf) } };
     var vb: [ts_mod.MAX_TAG_STRING + 512]u8 = undefined;
     const encoded = ts_mod.TsWriteValue.encode(&vb, .{ .value = value, .timestamp_ns = timestamp_ns, .field_name = field, .tags = tags }) orelse
         return .{ .refused = .{ .why = "ts write: field/tags too large" } };
@@ -148,7 +151,9 @@ test "sink payloads: a TS sink's point whose tags repeat a key or aren't UTF-8 i
     for ([_][]const u8{ "a=1,a=2", "=x", "h=\xff" }) |tags| {
         const r = ts(&buf, .of(21), "cpu", "value", 1, 0, tags);
         try testing.expect(r == .refused);
-        try testing.expectEqualStrings(ts_mod.tagSetProblem(tags).?.fixed(), r.refused.why);
+        var wb: [128]u8 = undefined;
+        try testing.expectEqualStrings(ts_mod.tagSetProblem(tags).?.sinkText(&wb), r.refused.why);
+        try testing.expect(!std.mem.startsWith(u8, r.refused.why, "bad request"));
     }
     try testing.expect(ts(&buf, .of(21), "cpu", "value", 1, 0, "a=1,b=2") == .built);
 }

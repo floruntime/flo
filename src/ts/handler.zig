@@ -78,9 +78,6 @@ pub const TSHandler = struct {
     next_ual_index: u64,
 
     /// Set after init by Shard.wireHandlerShardPtrs(). Required to propose Raft entries.
-    /// A tag refusal naming its pair or key; the answer is sent before
-    /// the next write on this shard can use it.
-    tag_refusal: [160]u8 = undefined,
     shard_ptr: ?*anyopaque,
 
     /// Holds a refusal that names the request's own input. The next
@@ -371,9 +368,12 @@ pub const TSHandler = struct {
         // Canonical tag hash — sorted pairs, so tag ordering is not part of
         // the series identity (see ts_mod.canonicalTagHash).
         const tags_str: []const u8 = if (req.findOption(.ts_tags)) |opt| opt.asString() else "";
-        if (ts_mod.tagSetProblem(tags_str)) |p| return .{ .err = .{ .code = .invalid_request, .message = p.text(&self.tag_refusal) } };
+        // Refused here naming the part or key (the answer is sent before
+        // the next request can reuse the buffer), so the propose below needn't
+        // look again.
+        if (ts_mod.tagSetProblem(tags_str)) |p| return .{ .err = .{ .code = .invalid_request, .message = p.text(&self.why_buf) } };
 
-        if (self.shard_ptr) |sptr| return proposeWrite(shardFromPtr(sptr), req.namespace, measurement, field_name, value, client_ts, tags_str, entry_mod.Flags.NONE);
+        if (self.shard_ptr) |sptr| return proposeChecked(shardFromPtr(sptr), req.namespace, measurement, field_name, value, client_ts, tags_str, entry_mod.Flags.NONE);
         // No shard (unit tests): insert directly (the projection
         // canonicalizes the tag set and owns hashing + dictionary
         // registration).
@@ -389,11 +389,13 @@ pub const TSHandler = struct {
     /// shard that owns its measurement comes here too, with `Flags.SINK`.
     /// A null `timestamp_ns` takes the entry's stamp.
     pub fn proposeWrite(shard: *Shard, namespace: []const u8, measurement: []const u8, field_name: []const u8, value: f64, timestamp_ns: ?u64, tags: []const u8, flags: u16) CommandResult {
-        if (ts_mod.tagSetProblem(tags)) |p| {
-            // A connection's error message outlives this call: the fixed
-            // text, the pair or key named only where it is static.
-            return .{ .err = .{ .code = .invalid_request, .message = p.fixed() } };
-        }
+        // Its answer outlives this call: the fixed text, without the key.
+        if (ts_mod.tagSetProblem(tags)) |p| return .{ .err = .{ .code = .invalid_request, .message = p.fixed() } };
+        return proposeChecked(shard, namespace, measurement, field_name, value, timestamp_ns, tags, flags);
+    }
+
+    /// `proposeWrite` for tags already checked.
+    fn proposeChecked(shard: *Shard, namespace: []const u8, measurement: []const u8, field_name: []const u8, value: f64, timestamp_ns: ?u64, tags: []const u8, flags: u16) CommandResult {
         // The value carries the reading AND the field name, client timestamp and
         // tag set (ts_mod.TsWriteValue). Persisting only the 8 value bytes — as
         // this did — meant replay reconstructed every point as `<measurement>/
