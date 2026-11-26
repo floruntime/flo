@@ -710,6 +710,10 @@ pub const NamespaceHandler = struct {
     /// too long.
     pub fn settle(self: *NamespaceHandler, shard: *Shard) void {
         if (!self.owner) return;
+        // A quota published here is bound by every shard's walk: wake the
+        // ones asleep rather than leave it to their next 100 ms tick.
+        const epoch = self.table.quotaEpoch();
+        defer if (self.table.quotaEpoch() != epoch) shard.wakePeerShards();
 
         if (self.unpublished.items.len > 0 or self.publish_from_store or self.quotas_unpublished) publish: {
             shard.flushSegmentToDisk() catch |err| {
@@ -996,7 +1000,7 @@ pub const NamespaceHandler = struct {
         const floor = ns_machine.PART_FLOOR *| shard.shardCount();
         if (ns_machine.quotaRefusal(mode, bytes, floor)) |why| {
             const below = mode == .bytes and bytes != null and bytes.? != 0 and bytes.? < floor;
-            return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = .out_of_range, .ran = .no, .message = if (below) floorMessage(floor, shard.shardCount()) else why } } };
+            return .{ .refused = .{ .status = .bad_request, .refusal = .{ .reason = why.reason, .ran = .no, .message = if (below) floorMessage(floor, shard.shardCount()) else why.message } } };
         }
         if (!shard.raft_node.leaderReady()) return .{ .refused = .{ .status = .unavailable, .refusal = .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: a new leader is catching up; the quota wasn't set — retry" } } };
         const P = namespace_entries.Alter;

@@ -93,6 +93,7 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
                 .examples(&.{
                     "flo namespace alter myapp --history-quota 20GiB",
                     "flo namespace alter myapp --history-quota none",
+                    "flo namespace alter myapp --history-quota default",
                 })
                 .arg("name", "Name of the namespace")
                 .stringFlag("history-quota", 0, "", "Bytes over every shard (a number, or with KiB, MiB, GiB or TiB), none to turn it off, or default for the server's")
@@ -227,6 +228,8 @@ fn runAlter(ctx: *commander.Context) commander.Error!void {
     // the node's admin socket, which carries it to shard 0's leader.
     if (ctx.flagChanged("endpoint") or ctx.flagChanged("port"))
         return outcome.usage(ctx, "-e/--endpoint and -p/--port name a server to talk to, but this command goes to a node's admin socket; name the node with --config/--data-dir and run it on a member", .{});
+    if (ctx.flagChanged("namespace"))
+        return outcome.usage(ctx, "-n/--namespace isn't read here: the namespace to alter is the name given, as in flo namespace alter myapp", .{});
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try server_cmd.adminSocketPath(ctx, &path_buf);
     if (path.len > stdx.net.UNIX_PATH_MAX)

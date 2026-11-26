@@ -17,6 +17,7 @@ const machine_mod = @import("../contract/machine.zig");
 const delivery = @import("../contract/delivery.zig");
 const persistence = @import("../storage/persistence.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
+const proto = @import("../protocol/proto.zig");
 const namespace_entries = @import("../protocol/namespace_entries.zig");
 const ns_table = @import("table.zig");
 
@@ -159,14 +160,28 @@ pub fn settings(read: ReadView, name: []const u8) ?Settings.Value {
 
 /// Why a quota set as `mode` with `bytes` can't be, held to `floor` bytes:
 /// null if it can. Bytes come with the bytes mode and only with it.
-pub fn quotaRefusal(mode: QuotaMode, bytes: ?u64, floor: u64) ?[]const u8 {
-    if (mode != .bytes) return if (bytes == null) null else "bad request: a history quota's bytes come with its bytes mode only";
-    const b = bytes orelse return "bad request: a history quota set in bytes needs its bytes";
-    if (b == 0) return "bad request: a history quota of 0 would refuse every run; set none to turn it off";
-    if (b == NO_QUOTA) return "bad request: a history quota is at most 2^64 - 2 bytes; set none to turn it off";
-    if (b < floor) return "bad request: a history quota is at least one run's reserve on every shard";
+pub fn quotaRefusal(mode: QuotaMode, bytes: ?u64, floor: u64) ?QuotaRefusal {
+    if (mode != .bytes) return if (bytes == null) null else .malformed("bad request: a history quota's bytes come with its bytes mode only");
+    const b = bytes orelse return .malformed("bad request: a history quota set in bytes needs its bytes");
+    if (b == 0) return .outOfRange("bad request: a history quota of 0 would refuse every run; set none to turn it off");
+    if (b == NO_QUOTA) return .outOfRange("bad request: a history quota is at most 2^64 - 2 bytes; set none to turn it off");
+    if (b < floor) return .outOfRange("bad request: a history quota is at least one run's reserve on every shard");
     return null;
 }
+
+/// Why a quota is refused: a mode and bytes that don't go together is a
+/// malformed request; a figure out of bounds is out of range.
+pub const QuotaRefusal = struct {
+    reason: proto.Reason,
+    message: []const u8,
+
+    fn malformed(m: []const u8) QuotaRefusal {
+        return .{ .reason = .malformed, .message = m };
+    }
+    fn outOfRange(m: []const u8) QuotaRefusal {
+        return .{ .reason = .out_of_range, .message = m };
+    }
+};
 
 pub fn meta(read: ReadView, name: []const u8) ?Meta.Value {
     if (name.len == 0 or name.len > MAX_NAME_LEN) return null;
@@ -237,10 +252,12 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     try view.put(CountsFam, counts_key, .{ .v = .{ .next_id = c.id + 1, .live = now.live + 1 } });
 }
 
-/// An alter of a namespace's settings, on shard 0: refused for a name with
-/// no namespace or a quota below one shard's floor, as its op refuses them
-/// before proposing; a quota per shard below the floor on this node is the
-/// op's to refuse, since apply reads no node config.
+/// An alter of a namespace's settings, on shard 0: a well-formed entry is
+/// refused, not halted on, for a name with no namespace or a quota below
+/// one shard's floor, as its op refuses them before proposing; a quota per
+/// shard below the floor on this node is the op's to refuse, since apply
+/// reads no node config. One that doesn't decode (a mode no build writes)
+/// halts: the op's schema refuses it before anything is proposed.
 fn applyAlter(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     if (view.place) |p| if (p.group != 0) return error.Halt;
     var diag: schema.Diagnostic = .{};
@@ -249,7 +266,7 @@ fn applyAlter(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     var kb: [1 + MAX_NAME_LEN]u8 = undefined;
     const k = nameKey(&kb, a.name);
     if (!isDefault(a.name) and try view.get(NameFam, k) == null) return out.refuse(.no_namespace, .not_found, "namespace not found");
-    if (quotaRefusal(a.mode, if (a.mode == .bytes) a.bytes else if (a.bytes == 0) null else a.bytes, PART_FLOOR)) |why| return out.refuse(.bad_request, .out_of_range, why);
+    if (quotaRefusal(a.mode, if (a.mode == .bytes) a.bytes else if (a.bytes == 0) null else a.bytes, PART_FLOOR)) |why| return out.refuse(.bad_request, why.reason, why.message);
     try view.put(SettingsFam, k, .{ .v = .{ .mode = a.mode, .bytes = if (a.mode == .bytes) a.bytes else 0, .set_index = e.header.index } });
 }
 
@@ -370,10 +387,20 @@ test "namespaces machine: an alter sets a namespace's quota with its index, defa
     try testing.expectEqual(Settings.Value{ .mode = .default, .bytes = 0, .set_index = 4 }, settings(f.read(), "orders").?);
     try testing.expectEqual(DEFAULT_HISTORY_QUOTA, quotaOf(settings(f.read(), "orders")));
     try testing.expect(!quotaOwn(settings(f.read(), "orders")));
-    for ([_]struct { []const u8, QuotaMode, u64 }{ .{ "never", .bytes, 20 << 30 }, .{ "orders", .bytes, 0 }, .{ "orders", .bytes, PART_FLOOR - 1 }, .{ "orders", .none, 20 << 30 }, .{ "orders", .bytes, NO_QUOTA } }) |c| {
+    // A mode and bytes that don't go together is malformed; a figure out
+    // of bounds is out of range.
+    for ([_]struct { []const u8, QuotaMode, u64, proto.Reason }{
+        .{ "never", .bytes, 20 << 30, .not_found },
+        .{ "orders", .bytes, 0, .out_of_range },
+        .{ "orders", .bytes, PART_FLOOR - 1, .out_of_range },
+        .{ "orders", .none, 20 << 30, .malformed },
+        .{ "orders", .default, 20 << 30, .malformed },
+        .{ "orders", .bytes, NO_QUOTA, .out_of_range },
+    }) |c| {
         const out = try alter(&f, 5, c[0], c[1], c[2]);
-        try testing.expect(out.refused() != null);
+        try testing.expectEqual(c[3], out.refused().?.refusal.reason);
     }
+    try testing.expectEqual(proto.Reason.malformed, quotaRefusal(.bytes, null, PART_FLOOR).?.reason);
     try testing.expectEqual(@as(u64, 4), settings(f.read(), "orders").?.set_index);
     try testing.expect(settings(f.read(), "never") == null);
     // Only shard 0 logs alters.

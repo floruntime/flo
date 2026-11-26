@@ -500,6 +500,22 @@ test "e2e/namespace: a namespace's run-history quota is bound on every shard, it
         try testing.expectEqual(src.protocol.proto.StatusCode.unauthorized, r.status);
         try testing.expectEqual(src.protocol.proto.Reason.admin_only, r.reason());
     }
+    // On the admin socket, bytes with another mode is a malformed request,
+    // not one out of range.
+    {
+        const src = @import("src");
+        var conn = src.cli_client.Client.init(testing.allocator, ctx.server.admin_socket);
+        defer conn.deinit();
+        try conn.connectUnix(ctx.server.admin_socket);
+        var r = try src.cli_client.namespace.alter(&conn, "hq", .none, 40 << 30);
+        defer r.deinit();
+        try testing.expectEqual(src.protocol.proto.StatusCode.bad_request, r.status);
+        try testing.expectEqual(src.protocol.proto.Reason.malformed, r.reason());
+    }
+    // -n names no namespace here: the one altered is the name given.
+    var named = try ctx.cli.run(&.{ "namespace", "alter", "hq", "--history-quota", "20GiB", "-n", "other", "--config", ctx.server.config_file });
+    defer named.deinit();
+    try stdx.testing.assertContains(named, "-n/--namespace isn't read here");
     // A refused alter changed nothing.
     try expectBound(ctx, "hq", shards, null);
 }

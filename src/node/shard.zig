@@ -2972,7 +2972,7 @@ pub const Shard = struct {
             // sender no config names, or one that wrongly believes it's a
             // voter). A non-leader voter forwards, below, which the guard admits.
             if (self.isReplica())
-                return self.redirectToLeader(conn, req, if (membership_op or repair_op) .admin else .write);
+                return self.redirectToLeader(conn, req, if (membership_op or repair_op or table.isAdmin(req.header.op_code)) .admin else .write);
             if (conn.replyTo() == .remote) {
                 // Already forwarded once; a second hop during an election
                 // could bounce between nodes. The client retries instead.
@@ -4426,7 +4426,7 @@ pub const Shard = struct {
     /// A replica serves reads but can't carry a write or a cluster admin change
     /// to the leader (the leader's replica guard refuses a non-voter's forward),
     /// so it points the caller straight at the leader: a write to the leader's
-    /// client port, a cluster admin command to a voter's admin socket. The two
+    /// client port, an admin command to a voter's admin socket. The two
     /// share the stem; only the tail and the destination port differ.
     fn redirectToLeader(self: *Shard, conn: *Connection, req: proto.Request, kind: RedirectKind) void {
         const leader = self.raft_node.leader_id;
@@ -4441,9 +4441,9 @@ pub const Shard = struct {
             else
                 REPLICA_WRITE_NONE,
             .admin => if (addr) |a|
-                std.fmt.bufPrint(&buf, stem ++ "a cluster admin command must go to a voter's admin socket — the leader is node {d} at {d}.{d}.{d}.{d}:{d}", .{ leader, a.ip4[0], a.ip4[1], a.ip4[2], a.ip4[3], a.port }) catch REPLICA_ADMIN_NONE
+                std.fmt.bufPrint(&buf, stem ++ "an admin command must go to a voter's admin socket — the leader is node {d} at {d}.{d}.{d}.{d}:{d}", .{ leader, a.ip4[0], a.ip4[1], a.ip4[2], a.ip4[3], a.port }) catch REPLICA_ADMIN_NONE
             else if (leader != 0)
-                std.fmt.bufPrint(&buf, stem ++ "a cluster admin command must go to a voter's admin socket — the leader is node {d}", .{leader}) catch REPLICA_ADMIN_NONE
+                std.fmt.bufPrint(&buf, stem ++ "an admin command must go to a voter's admin socket — the leader is node {d}", .{leader}) catch REPLICA_ADMIN_NONE
             else
                 REPLICA_ADMIN_NONE,
         };
@@ -4451,7 +4451,7 @@ pub const Shard = struct {
     }
 
     const REPLICA_WRITE_NONE = "unavailable: this node is a replica and knows no leader yet; send writes to a voter — retry";
-    const REPLICA_ADMIN_NONE = "unavailable: this node is a replica and knows no leader yet; a cluster admin command must go to a voter — retry";
+    const REPLICA_ADMIN_NONE = "unavailable: this node is a replica and knows no leader yet; an admin command must go to a voter — retry";
 
     /// Send a client's write to the leader, and
     /// hold the client until the leader answers. With no leader known the
@@ -7104,6 +7104,29 @@ pub const Shard = struct {
         return n;
     }
 
+    /// Whether this shard's leader has a quota walk under way: the loop
+    /// doesn't sleep between its stretches. Not while its bind is in flight
+    /// (the commit wakes the loop), and false the moment a whole walk at
+    /// this epoch and term is clean, so an idle shard still sleeps.
+    fn quotaWalkDue(self: *const Shard) bool {
+        const raft = self.raft_node;
+        if (!raft.leaderReady() or self.offline != null or self.halted != null) return false;
+        if (self.quota_bind_pending) |p| {
+            if (p.term == raft.current_term and p.index > raft.last_applied) return false;
+        }
+        const c = self.quota_clean orelse return true;
+        return c.epoch != self.namespace_handler.table.quotaEpoch() or c.term != raft.current_term;
+    }
+
+    /// Wake every other shard that sleeps: shard 0 published a quota, which
+    /// each shard's walk binds. A busy shard costs a load.
+    pub fn wakePeerShards(self: *Shard) void {
+        const all = self.peer_mailboxes orelse return;
+        for (all, 0..) |mb, i| {
+            if (i != self.id) mb.wake.ring();
+        }
+    }
+
     /// Propose a settings entry; return its term and index to mark it in
     /// flight, or null when the propose was refused (not the leader now, or the
     /// outstanding cap is full) so the next tick tries again.
@@ -7502,7 +7525,7 @@ pub const Shard = struct {
     /// How long the next tick may sleep: 0 while there's work (counted
     /// when a due pipeline is all of it), else `idleTimeoutMs`.
     fn loopTimeoutMs(self: *Shard, slicing: bool, now_ms: i64) u32 {
-        const others = self.more_work or self.apply_behind or slicing or self.resume_fds.items.len > 0;
+        const others = self.more_work or self.apply_behind or slicing or self.resume_fds.items.len > 0 or self.quotaWalkDue();
         if (others) return 0;
         if (self.producers_due) {
             self.processing_unslept_ticks += 1;
@@ -11181,6 +11204,44 @@ test "quota binds: once a whole walk at one epoch and term finds every part boun
     shard.raft_node.current_term += 1;
     _ = shard.quotaBindsDue(&items);
     try std.testing.expect(shard.quota_looked > clean);
+}
+
+test "quota binds: the loop doesn't sleep while a walk is under way, a published quota is bound in back-to-back ticks, and an idle shard sleeps again" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    const names = shard.namespace_handler.table;
+    const now = @import("stdx").time.milliTimestamp();
+    // A table walked a stretch a tick: a few whole walks bound it.
+    const most = 4 * (ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 2);
+    for ([_]struct { u64, u64 }{ .{ 8 << 30, 5 }, .{ 4 << 30, 6 } }) |step| {
+        names.publishQuota(ns_table.DEFAULT, step[0], step[1]);
+        try std.testing.expect(shard.quotaWalkDue());
+        var ticks: usize = 0;
+        while (shard.quotaWalkDue()) : (ticks += 1) {
+            try std.testing.expect(ticks < most);
+            // Every tick of the walk is un-slept.
+            try std.testing.expectEqual(@as(u32, 0), shard.loopTimeoutMs(false, now));
+            _ = try shard.tick(0);
+        }
+        try std.testing.expectEqual(step[0], settings_machine.boundQuota(read, ns_table.DEFAULT).?.part_bytes);
+        // Clean: the walk keeps nothing awake, and the loop may sleep.
+        try std.testing.expect(shard.quota_clean != null);
+        shard.more_work = false;
+        shard.apply_behind = false;
+        try std.testing.expect(shard.loopTimeoutMs(false, now) > 0);
+    }
+    // A follower walks nothing, and keeps nothing awake for it.
+    names.publishQuota(ns_table.DEFAULT, 2 << 30, 7);
+    try std.testing.expect(shard.quotaWalkDue());
+    shard.raft_node.role = .follower;
+    defer shard.raft_node.role = .leader;
+    try std.testing.expect(!shard.quotaWalkDue());
 }
 
 test "quota binds: a quota set A, then B, then A again binds each in turn, and a full batch of 64 binds 64 namespaces at once" {
@@ -14969,7 +15030,9 @@ test "Shard: an idle pipeline wakes its shard at its own poll interval, no soone
     try std.testing.expectEqual(@as(u32, 100), a.idleTimeoutMs(t));
     // An empty source: the loop never stays up for it, so nothing is
     // counted as an un-slept tick, and its sleep ends at the deadline.
+    // (A new leader's first quota walk keeps the loop up too: count it done.)
     a.more_work = false;
+    a.quota_clean = .{ .epoch = a.namespace_handler.table.quotaEpoch(), .term = a.raft_node.current_term };
     for (0..10) |k| {
         const now = t + @as(i64, @intCast(k));
         a.notePipelinesNext(true);
@@ -26303,9 +26366,32 @@ test "Shard: a replica refuses an admin-socket membership change up front, and r
     // it (the client would see a stray not_found). So the replica refuses the
     // change up front, naming the leader, and forwards nothing.
     const before = t.shard.forward_count;
-    try expectAnswer(try t.promote(2, &buf), .unavailable, "this node is a replica; a cluster admin command must go to a voter");
+    try expectAnswer(try t.promote(2, &buf), .unavailable, "this node is a replica; an admin command must go to a voter");
     try std.testing.expectEqual(before, t.shard.forward_count);
     try std.testing.expect(!t.conn.response_deferred);
+}
+
+test "Shard: a replica points a namespace alter from its admin socket at a voter's admin socket, not the leader's client port" {
+    var t: AdminTest = undefined;
+    try t.init(3, .join);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    const cfg = membership.Config.ofVoters(&.{ 1, 2 }).withJoiner(3, true);
+    raft.setMembership(&cfg, 1);
+    raft.lost_log = .none;
+    raft.leader_id = 1;
+
+    // The client port refuses an alter, so "send writes to the leader"
+    // would send it where it can't run.
+    var vb: [64]u8 = undefined;
+    const value = try table_run.op("namespace.alter").request.encodeInto(&vb, .{ .history_quota_mode = .none, .history_quota_bytes = null });
+    const before = t.shard.forward_count;
+    t.shard.runRequest(t.conn, .{ .header = proto.RequestHeader.init(.namespace_alter, 7), .namespace = "", .key = "orders", .value = value }, .admin);
+    var buf: [512]u8 = undefined;
+    var into: [1]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &into);
+    try expectAnswer(into[0], .unavailable, "this node is a replica; an admin command must go to a voter's admin socket");
+    try std.testing.expectEqual(before, t.shard.forward_count);
 }
 
 test "Shard: a list page whose scan couldn't hold its names is refused, not cut short" {
@@ -29844,7 +29930,7 @@ test "Shard: a replica refuses a repair from its admin socket up front, naming t
     // refuses it up front, naming the leader, rather than holding a forward
     // the leader won't answer.
     const answer = (try t.repairSkip(.admin, 5, false, &buf)) orelse return error.TestExpectedRefusal;
-    try expectAnswer(answer, .unavailable, "cluster admin command must go to a voter");
+    try expectAnswer(answer, .unavailable, "an admin command must go to a voter");
     try std.testing.expect(std.mem.indexOf(u8, answer.data, "node 1") != null); // names the leader
     try std.testing.expectEqual(held, t.shard.forward_count); // not forwarded
     try std.testing.expect(!t.conn.response_deferred); // answered here, not held
