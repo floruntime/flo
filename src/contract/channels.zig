@@ -127,8 +127,16 @@ pub const ParkFam = view_mod.Family(59, "channel.parked", .shard, Stored(Parked)
 /// What one namespace's messages to one peer hold of its outbox, in
 /// payload bytes: what its share is held to before it sends (`shareHeld`). A record only
 /// while it holds any, so the family is as sparse as the traffic.
+///
+/// `delivered` is what of `bytes` its receiver has already taken, waiting on
+/// the trim. Only the history lane has one: its receiver is this group, so
+/// the inbound that lands a message writes the same store as its send.
+/// Landing moves a message's bytes from here to its namespace's history
+/// usage in one apply, and the trim takes them off `bytes` and `delivered`
+/// together, so `usage + bytes - delivered` doesn't move at either.
 pub const NsBytes = Record(&.{
     .{ .name = "bytes", .T = Int(u64) },
+    .{ .name = "delivered", .T = Int(u64) },
 });
 
 pub const OutNsFam = view_mod.Family(54, "channel.out_ns", .shard, Stored(NsBytes));
@@ -160,6 +168,24 @@ pub fn nsBytesOf(read: ReadView, to: u16, lane: Lane, ns: ns_table.Id) u64 {
     var kb: [OUT_NS_KEY]u8 = undefined;
     const v = read.get(OutNsFam, outNsKey(&kb, to, lane, ns)) catch null;
     return if (v) |x| x.v.bytes else 0;
+}
+
+/// The payload bytes namespace `ns`'s history messages to this group `own`
+/// hold that no inbound has taken yet: sent, not landed.
+pub fn nsUntakenOf(read: ReadView, own: u16, ns: ns_table.Id) u64 {
+    var kb: [OUT_NS_KEY]u8 = undefined;
+    const v = read.get(OutNsFam, outNsKey(&kb, own, .history, ns)) catch null;
+    return if (v) |x| x.v.bytes - x.v.delivered else 0;
+}
+
+/// A history message of `ns`, `len` bytes, taken by its inbound: landed,
+/// refused or skipped, its bytes no longer in flight.
+fn takeHistory(view: *View, own: u16, ns: ns_table.Id, len: u64) ApplyError!void {
+    var nk: [OUT_NS_KEY]u8 = undefined;
+    const ns_key = outNsKey(&nk, own, .history, ns);
+    const held = (try view.getOwn(OutNsFam, ns_key)) orelse return error.Halt;
+    if (held.v.delivered + len > held.v.bytes) return error.Halt;
+    try view.putOwn(OutNsFam, ns_key, .{ .v = .{ .bytes = held.v.bytes, .delivered = held.v.delivered + len } });
 }
 
 /// Parked keys live under a namespace of their own, so an unpark can declare
@@ -456,8 +482,8 @@ pub fn writeSends(view: *View, index: u64) ApplyError!void {
         try view.putOwn(MetaFam, meta_key, .{ .v = meta });
         var nk: [OUT_NS_KEY]u8 = undefined;
         const ns_key = outNsKey(&nk, to, lane, s.origin.ns);
-        const held: u64 = if (try view.getOwn(OutNsFam, ns_key)) |v| v.v.bytes else 0;
-        try view.putOwn(OutNsFam, ns_key, .{ .v = .{ .bytes = held + s.payload.len } });
+        const held: NsBytes.Value = if (try view.getOwn(OutNsFam, ns_key)) |v| v.v else .{ .bytes = 0, .delivered = 0 };
+        try view.putOwn(OutNsFam, ns_key, .{ .v = .{ .bytes = held.bytes + s.payload.len, .delivered = held.delivered } });
     }
     view.sends.clearRetainingCapacity();
 }
@@ -729,6 +755,7 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 // is taken, so a resend is a duplicate.
                 if (skip) |*sk| if (sk.skips(seq)) {
                     try skipMessage(view, e, m, p.from, lane, seq, ordinal, sk);
+                    if (lane == .history) try takeHistory(view, place.group, .of(m.origin_ns), m.payload.len);
                     applied = seq;
                     continue;
                 };
@@ -789,6 +816,8 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                     if (r.refused() == null) if (tooMuchSent(view.sends.items[mark.sends..])) |why| r.refuse(.bad_request, .malformed, why);
                 }
                 if (r.refused() != null) try view.rollback(mark) else try writeSends(view, e.header.index);
+                // Landed or refused, after any rollback: taken either way.
+                if (lane == .history) try takeHistory(view, place.group, .of(m.origin_ns), m.payload.len);
                 try store.messages.append(store.allocator, .{ .entry = as, .result = r, .ordinal = ordinal, .from = p.from, .seq = seq, .sender_bug = bug });
                 store.applying = null;
                 applied = seq;
@@ -1065,7 +1094,14 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 const ns_key = outNsKey(&nk, p.to, lane, .of(out.v.origin_ns));
                 const held = (try view.get(OutNsFam, ns_key)) orelse return error.Halt;
                 if (held.v.bytes < out.v.payload.len) return error.Halt;
-                if (held.v.bytes == out.v.payload.len) try view.delete(OutNsFam, ns_key) else try view.put(OutNsFam, ns_key, .{ .v = .{ .bytes = held.v.bytes - out.v.payload.len } });
+                // A history message is trimmed only once its inbound took it.
+                const taken: u64 = if (lane == .history) out.v.payload.len else 0;
+                if (held.v.delivered < taken) return error.Halt;
+                const left: NsBytes.Value = .{ .bytes = held.v.bytes - out.v.payload.len, .delivered = held.v.delivered - taken };
+                if (left.bytes == 0) {
+                    if (left.delivered != 0) return error.Halt;
+                    try view.delete(OutNsFam, ns_key);
+                } else try view.put(OutNsFam, ns_key, .{ .v = left });
                 try view.delete(OutFam, key);
             }
             meta.acked = p.through;
@@ -1200,6 +1236,33 @@ fn inboundOn(sender: *Group, from: u16, to: u16, lane: Lane, first: u64, n: u64,
         try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = o.layout_epoch, .flags = o.flags, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload });
     }
     return ce.Inbound.encodeInto(buf, .{ .from = from, .lane = @backingInt(lane), .first_seq = first, .messages = .{ .bytes = mw.written(), .count = @intCast(n) } }) catch unreachable;
+}
+
+test "channels: a history message's bytes stay in its outbox until the trim, but are untaken only until its inbound takes them" {
+    // A quota counts a namespace's history as landed plus untaken: the
+    // inbound that lands a message and the later trim each leave that sum
+    // where it was, so a hold at it doesn't flap.
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    try a.probeTo(2, "hist-one-000000H");
+    try a.probeTo(2, "hist-two-000000H");
+    const one = a.outOn(0, .history, 1).?.payload.len;
+    const ns = probe.PROBE_ORIGIN.ns;
+    try testing.expectEqual(2 * one, nsUntakenOf(a.read(), 0, ns));
+    var buf: [8192]u8 = undefined;
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .history, 1, 1, &buf));
+    try testing.expectEqual(2 * one, nsBytesOf(a.read(), 0, .history, ns));
+    try testing.expectEqual(one, nsUntakenOf(a.read(), 0, ns));
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .history, 1, 2, &buf));
+    try testing.expectEqual(@as(u64, 0), nsUntakenOf(a.read(), 0, ns));
+    // Another namespace's untaken bytes are none of this one's.
+    try testing.expectEqual(@as(u64, 0), nsUntakenOf(a.read(), 0, .of(ns.int() + 1)));
+    var tb: [64]u8 = undefined;
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&tb, .{ .to = 0, .lane = @backingInt(Lane.history), .first = 1, .through = 1 }));
+    try testing.expectEqual(one, nsBytesOf(a.read(), 0, .history, ns));
+    try testing.expectEqual(@as(u64, 0), nsUntakenOf(a.read(), 0, ns));
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&tb, .{ .to = 0, .lane = @backingInt(Lane.history), .first = 2, .through = 2 }));
+    try testing.expectEqual(@as(usize, 0), a.store.family(OutNsFam.ID).count);
 }
 
 test "channels: a history message rides its own lane, with its own seqs, outbox, mark and trims; the main lane's go on beside it" {
