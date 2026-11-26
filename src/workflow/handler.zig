@@ -178,8 +178,11 @@ pub const WorkflowHandler = struct {
     /// leaves when any entry of its own applies (its wait as applied arms
     /// what it needs) or the hold clears, so only live runs are held, once
     /// each. Leader memory (`clearCaches`).
-    held: std.StringHashMapUnmanaged(Hold) = .empty,
-    holds_count: std.AutoHashMapUnmanaged(Hold, u32) = .empty,
+    held: std.StringHashMapUnmanaged(Held) = .empty,
+    /// Each hold's runs, keys borrowed from `held`: a hold that clears walks
+    /// its own list alone, so no pass scans the whole held set, and one
+    /// namespace's flapping hold costs another's nothing.
+    held_by: std.AutoHashMapUnmanaged(Hold, std.ArrayListUnmanaged([]const u8)) = .empty,
     /// How many times in a row each run's timer step was refused at apply,
     /// keys owned: its recheck backs off, so a step refused the same way
     /// every time costs a log entry a minute, not a second. Cleared when an
@@ -662,8 +665,15 @@ pub const WorkflowHandler = struct {
 
     const Timer = struct { at_ms: i64, ns_key: []const u8 };
     /// What holds a run's step: its namespace's share of this shard's
-    /// history lane, or (`parent_shard`) its parent's outbox.
-    pub const Hold = struct { ns: NamespaceId, parent_shard: ?u16 = null };
+    /// history lane (`lane`), its parent's outbox (`parent`, at
+    /// `parent_shard`), or its namespace's run-history quota (`quota`).
+    pub const Hold = struct {
+        ns: NamespaceId,
+        kind: enum { lane, parent, quota } = .lane,
+        parent_shard: ?u16 = null,
+    };
+    /// A held run's hold, and where its key is in that hold's list.
+    const Held = struct { hold: Hold, at: u32 };
     const Ending = struct { index: u64, term: u64 };
 
     fn timerCompare(_: void, a: Timer, b: Timer) std.math.Order {
@@ -723,7 +733,7 @@ pub const WorkflowHandler = struct {
         self.timers.deinit(self.allocator);
         self.clearHeld();
         self.held.deinit(self.allocator);
-        self.holds_count.deinit(self.allocator);
+        self.held_by.deinit(self.allocator);
         self.refusals.deinit(self.allocator);
 
         // Free stream trigger state
@@ -3537,7 +3547,7 @@ pub const WorkflowHandler = struct {
                     const ns = keyNamespace(run_key);
                     const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
                     const p = children_mod.parentOf(read, ns, run.run_id_owned) orelse return .{ .held = .{ .ns = ns } };
-                    return .{ .held = .{ .ns = ns, .parent_shard = shard.router.slotToShard(p.parent_slot) } };
+                    return .{ .held = .{ .ns = ns, .kind = .parent, .parent_shard = shard.router.slotToShard(p.parent_slot) } };
                 },
                 // For now: tried again, quietly, as each try would say it.
                 error.Overloaded, error.NotLeader, error.WritesStopped, error.Halted, error.OutOfMemory => {
@@ -4966,35 +4976,58 @@ pub const WorkflowHandler = struct {
     /// Run `run_key`'s timer, popped while `hold` held its step, kept until
     /// the hold clears (`releaseHeld`).
     fn holdTimer(self: *WorkflowHandler, hold: Hold, run_key: []const u8) void {
-        if (self.held.getPtr(run_key)) |was| {
-            if (std.meta.eql(was.*, hold)) return;
-            self.uncount(was.*);
-            was.* = hold;
+        var key: []const u8 = undefined;
+        if (self.held.getEntry(run_key)) |was| {
+            if (std.meta.eql(was.value_ptr.hold, hold)) return;
+            key = was.key_ptr.*;
+            self.unlist(was.value_ptr.*);
         } else {
-            const owned = self.allocator.dupe(u8, run_key) catch return self.lostIndex(run_key);
-            self.held.put(self.allocator, owned, hold) catch {
-                self.allocator.free(owned);
+            key = self.allocator.dupe(u8, run_key) catch return self.lostIndex(run_key);
+            self.held.put(self.allocator, key, undefined) catch {
+                self.allocator.free(key);
                 return self.lostIndex(run_key);
             };
         }
-        const gop = self.holds_count.getOrPut(self.allocator, hold) catch {
-            // Uncounted, it would never be asked: walked again instead.
-            self.unhold(run_key);
-            return self.lostIndex(run_key);
+        const gop = self.held_by.getOrPut(self.allocator, hold) catch {
+            // Listed nowhere, it would never be asked: walked again instead.
+            return self.dropHeld(run_key);
         };
-        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        gop.value_ptr.append(self.allocator, key) catch {
+            if (gop.value_ptr.items.len == 0) _ = self.held_by.remove(hold);
+            return self.dropHeld(run_key);
+        };
+        self.held.getPtr(run_key).?.* = .{ .hold = hold, .at = @intCast(gop.value_ptr.items.len - 1) };
     }
 
-    fn uncount(self: *WorkflowHandler, hold: Hold) void {
-        const n = self.holds_count.getPtr(hold) orelse return;
-        n.* -= 1;
-        if (n.* == 0) _ = self.holds_count.remove(hold);
+    /// A held run off its hold's list; the hold goes with its last run.
+    fn unlist(self: *WorkflowHandler, h: Held) void {
+        const list = self.held_by.getPtr(h.hold) orelse return;
+        _ = list.swapRemove(h.at);
+        if (h.at < list.items.len) self.held.getPtr(list.items[h.at]).?.at = h.at;
+        if (list.items.len == 0) {
+            list.deinit(self.allocator);
+            _ = self.held_by.remove(h.hold);
+        }
+    }
+
+    /// A run in `held` that couldn't be listed: out, and its index lost.
+    fn dropHeld(self: *WorkflowHandler, run_key: []const u8) void {
+        const kv = self.held.fetchRemove(run_key) orelse return;
+        self.lostIndex(run_key);
+        self.allocator.free(kv.key);
+    }
+
+    /// How many runs `hold` holds.
+    pub fn holdCount(self: *const WorkflowHandler, hold: Hold) usize {
+        return if (self.held_by.get(hold)) |l| l.items.len else 0;
     }
 
     /// Run `run_key` out of the held set, if it's there.
     fn unhold(self: *WorkflowHandler, run_key: []const u8) void {
-        const kv = self.held.fetchRemove(run_key) orelse return;
-        self.uncount(kv.value);
+        const h = (self.held.get(run_key)) orelse return;
+        self.unlist(h);
+        const kv = self.held.fetchRemove(run_key).?;
         self.allocator.free(kv.key);
     }
 
@@ -5002,15 +5035,20 @@ pub const WorkflowHandler = struct {
         var it = self.held.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.held.clearRetainingCapacity();
-        self.holds_count.clearRetainingCapacity();
+        var lit = self.held_by.valueIterator();
+        while (lit.next()) |l| l.deinit(self.allocator);
+        self.held_by.clearRetainingCapacity();
         var rit = self.refusals.keyIterator();
         while (rit.next()) |k| self.allocator.free(k.*);
         self.refusals.clearRetainingCapacity();
     }
 
     fn holds(shard: *Shard, hold: Hold) bool {
-        if (hold.parent_shard) |to| return shard.sendWait(to, .main, hold.ns) != null;
-        return shard.historyWait(hold.ns) != null;
+        return switch (hold.kind) {
+            .parent => shard.sendWait(hold.parent_shard.?, .main, hold.ns) != null,
+            .lane => shard.historyWait(hold.ns) != null,
+            .quota => false,
+        };
     }
 
     /// Held timers whose hold has cleared, put back on `timers`, due at
@@ -5023,33 +5061,26 @@ pub const WorkflowHandler = struct {
     fn releaseHeld(self: *WorkflowHandler, shard: *Shard, now_ms: i64) void {
         var cleared: [32]Hold = undefined;
         var n: usize = 0;
-        var hit = self.holds_count.keyIterator();
+        var hit = self.held_by.keyIterator();
         while (hit.next()) |h| {
             if (holds(shard, h.*)) continue;
             cleared[n] = h.*;
             n += 1;
             if (n == cleared.len) break;
         }
-        if (n == 0) return;
-        var released: [RELEASE_PER_PASS][]const u8 = undefined;
         var m: usize = 0;
-        var it = self.held.iterator();
-        while (m < released.len) {
-            const e = it.next() orelse break;
-            for (cleared[0..n]) |c| if (std.meta.eql(c, e.value_ptr.*)) {
-                released[m] = e.key_ptr.*;
-                m += 1;
-                break;
-            };
-        }
-        // Each key's ownership moves from the set to the heap.
-        for (released[0..m]) |k| {
-            const kv = self.held.fetchRemove(k).?;
-            self.uncount(kv.value);
-            self.timers.push(self.allocator, .{ .at_ms = now_ms, .ns_key = k }) catch {
-                self.lostIndex(k);
-                self.allocator.free(k);
-            };
+        for (cleared[0..n]) |c| {
+            while (m < RELEASE_PER_PASS) : (m += 1) {
+                const list = self.held_by.getPtr(c) orelse break;
+                const k = list.items[list.items.len - 1];
+                self.unlist(self.held.get(k).?);
+                // Its key's ownership moves from the set to the heap.
+                const kv = self.held.fetchRemove(k).?;
+                self.timers.push(self.allocator, .{ .at_ms = now_ms, .ns_key = kv.key }) catch {
+                    self.lostIndex(kv.key);
+                    self.allocator.free(kv.key);
+                };
+            }
         }
     }
 
@@ -6656,7 +6687,7 @@ test "workflow duty: a timer due while the history lane holds steps fires once t
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.inspect(testKey(.default, "due")).?.status);
     try testing.expectEqual(@as(usize, 0), handler.timers.count());
     try testing.expect(handler.held.contains(testKey(.default, "due")));
-    try testing.expectEqual(@as(?u32, 1), handler.holds_count.get(.{ .ns = .default }));
+    try testing.expectEqual(@as(usize, 1), handler.holdCount(.{ .ns = .default }));
     try testing.expect(handler.hasDutyWork());
     for (0..3) |_| handler.checkPendingActions(&shard);
     try testing.expectEqual(taken, handler.taken);
@@ -6664,7 +6695,7 @@ test "workflow duty: a timer due while the history lane holds steps fires once t
     // walk arms the run's timer again.
     handler.dropStartedRuns(&shard);
     try testing.expectEqual(@as(usize, 0), handler.held.count());
-    try testing.expectEqual(@as(usize, 0), handler.holds_count.count());
+    try testing.expectEqual(@as(usize, 0), handler.held_by.count());
     handler.leadCaches(shard.raft_node.current_term);
     while (handler.walk != .idle) handler.leadCaches(shard.raft_node.current_term);
     try testing.expect(handler.timers.count() >= 1);
@@ -6719,7 +6750,7 @@ test "workflow duty: runs held by one namespace's history share don't delay anot
     handler.checkPendingActionsAt(&shard, now + 2);
     try testing.expectEqual(taken0, handler.taken);
     try testing.expectEqual(@as(usize, N), handler.held.count());
-    try testing.expectEqual(@as(?u32, N), handler.holds_count.get(.{ .ns = .default }));
+    try testing.expectEqual(@as(usize, N), handler.holdCount(.{ .ns = .default }));
     // Once the quiet run's timer is due, one pass fires it: the held runs
     // are neither ahead of it nor copied again.
     const taken = handler.taken;
@@ -6739,7 +6770,7 @@ test "workflow duty: runs held by one namespace's history share don't delay anot
         settleTest(&shard);
     }
     try testing.expectEqual(@as(usize, 0), handler.held.count());
-    try testing.expectEqual(@as(usize, 0), handler.holds_count.count());
+    try testing.expectEqual(@as(usize, 0), handler.held_by.count());
     for (kb[0..N], 0..) |*k, i| {
         var nb: [8]u8 = undefined;
         const name = std.fmt.bufPrint(&nb, "r{d}", .{i}) catch unreachable;
@@ -6770,7 +6801,7 @@ test "workflow duty: a held run leaves the held set when an entry of its own app
     // The signal it waits on applies: it leaves, and its hold's count goes.
     try testSignal(&handler, testKey(.default, "due"), "go");
     try testing.expect(!handler.held.contains(testKey(.default, "due")));
-    try testing.expectEqual(@as(usize, 0), handler.holds_count.count());
+    try testing.expectEqual(@as(usize, 0), handler.held_by.count());
 }
 
 test "workflow duty: a timer's step refused at apply is armed again" {
@@ -6936,14 +6967,14 @@ test "workflow duty: a hold that clears puts back only its own runs" {
     handler.holdTimer(.{ .ns = TEST_NS_A }, testKey(TEST_NS_A, "d"));
     // Held again under the same hold: still once.
     handler.holdTimer(.{ .ns = TEST_NS_A }, testKey(TEST_NS_A, "d"));
-    try testing.expectEqual(@as(?u32, 2), handler.holds_count.get(.{ .ns = TEST_NS_A }));
+    try testing.expectEqual(@as(usize, 2), handler.holdCount(.{ .ns = TEST_NS_A }));
     const now = @import("stdx").time.milliTimestamp();
     handler.releaseHeld(&shard, now);
     try testing.expectEqual(@as(usize, 2), handler.held.count());
     try testing.expect(handler.held.contains(testKey(.default, "a")));
     try testing.expect(handler.held.contains(testKey(.default, "b")));
-    try testing.expectEqual(@as(?u32, 2), handler.holds_count.get(.{ .ns = .default }));
-    try testing.expect(handler.holds_count.get(.{ .ns = TEST_NS_A }) == null);
+    try testing.expectEqual(@as(usize, 2), handler.holdCount(.{ .ns = .default }));
+    try testing.expect(handler.holdCount(.{ .ns = TEST_NS_A }) == 0);
     try testing.expectEqual(@as(usize, 2), handler.timers.count());
     try testing.expectEqual(now, handler.timers.peek().?.at_ms);
 }
@@ -7010,7 +7041,7 @@ test "workflow duty: a child's end its timer decided, held for its parent's outb
     const before = shard.raft_node.log.lastIndex();
     handler.checkPendingActions(&shard);
     try testing.expectEqual(before, shard.raft_node.log.lastIndex());
-    try testing.expectEqual(WorkflowHandler.Hold{ .ns = .default, .parent_shard = 0 }, handler.held.get(testKey(.default, "kid")).?);
+    try testing.expectEqual(WorkflowHandler.Hold{ .ns = .default, .kind = .parent, .parent_shard = 0 }, handler.held.get(testKey(.default, "kid")).?.hold);
     // Room: its end is logged.
     shard.outbox_caps = .{};
     handler.checkPendingActions(&shard);
