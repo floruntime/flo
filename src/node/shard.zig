@@ -7117,7 +7117,7 @@ pub const Shard = struct {
     /// at this epoch and term is clean, so an idle shard still sleeps.
     fn quotaWalkDue(self: *const Shard) bool {
         const raft = self.raft_node;
-        if (!raft.leaderReady() or self.offline != null or self.halted != null or self.quota_propose_refused) return false;
+        if (!raft.leaderReady() or self.offline != null or self.halted != null or raft.writes_stopped or self.quota_propose_refused) return false;
         if (self.quota_bind_pending) |p| {
             if (p.term == raft.current_term and p.index > raft.last_applied) return false;
         }
@@ -7126,11 +7126,13 @@ pub const Shard = struct {
     }
 
     /// Wake every other shard that sleeps: shard 0 published a quota, which
-    /// each shard's walk binds. A busy shard costs a load.
+    /// each shard's walk binds. A flag, not a bare ring: a shard about to
+    /// sleep re-checks the flags, so one that read the old epoch doesn't
+    /// sleep through it. A busy shard costs a load.
     pub fn wakePeerShards(self: *Shard) void {
         const all = self.peer_mailboxes orelse return;
         for (all, 0..) |mb, i| {
-            if (i != self.id) mb.wake.ring();
+            if (i != self.id) mb.wake.set(.quota_published);
         }
     }
 
@@ -11287,11 +11289,52 @@ test "quota binds: a bind whose propose is refused lets the loop sleep, and bind
     // Proposes go again: the walk runs to its bind.
     shard.raft_node.writes_stopped = false;
     ticks = 0;
-    while (settings_machine.boundQuota(read, ns_table.DEFAULT) == null) : (ticks += 1) {
-        try std.testing.expect(ticks < most);
+    while (settings_machine.boundQuota(read, ns_table.DEFAULT) == null or shard.quotaWalkDue()) : (ticks += 1) {
+        try std.testing.expect(ticks < 2 * most);
         _ = try shard.tick(0);
     }
     try std.testing.expectEqual(@as(u64, 8 << 30), settings_machine.boundQuota(read, ns_table.DEFAULT).?.part_bytes);
+    // Clean: it sleeps again.
+    try std.testing.expect(shard.quota_clean != null);
+}
+
+test "quota binds: a bind refused at the log's outstanding cap, apply held, lets the loop sleep, and binds once apply catches up" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    const raft = shard.raft_node;
+    const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
+    const now = @import("stdx").time.milliTimestamp();
+    const most = 4 * (ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 2);
+    // The log full of entries not yet applied: every propose is Overloaded.
+    while (raft.log.lastIndex() - raft.last_applied < raft_node_mod.MAX_OUTSTANDING)
+        _ = try raft.propose(.raft_noop, entry_mod.Flags.NONE, "");
+    shard.namespace_handler.table.publishQuota(ns_table.DEFAULT, 8 << 30, 5);
+    var ticks: usize = 0;
+    while (!shard.quota_propose_refused) : (ticks += 1) {
+        try std.testing.expect(ticks < most);
+        shard.proposeQuotaBinds();
+    }
+    for (0..most) |_| {
+        try std.testing.expect(!shard.quotaWalkDue());
+        shard.more_work = false;
+        shard.apply_behind = false;
+        try std.testing.expect(shard.loopTimeoutMs(false, now) > 0);
+        shard.proposeQuotaBinds();
+    }
+    try std.testing.expect(settings_machine.boundQuota(read, ns_table.DEFAULT) == null);
+    // Apply catches up: the walk binds, then is clean, and the loop sleeps.
+    ticks = 0;
+    while (settings_machine.boundQuota(read, ns_table.DEFAULT) == null or shard.quotaWalkDue()) : (ticks += 1) {
+        try std.testing.expect(ticks < 2 * most);
+        _ = try shard.tick(0);
+    }
+    try std.testing.expectEqual(@as(u64, 8 << 30), settings_machine.boundQuota(read, ns_table.DEFAULT).?.part_bytes);
+    try std.testing.expect(!shard.quotaWalkDue());
 }
 
 test "quota binds: a quota set A, then B, then A again binds each in turn, and a full batch of 64 binds 64 namespaces at once" {
