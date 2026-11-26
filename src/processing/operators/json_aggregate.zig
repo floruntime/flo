@@ -206,29 +206,34 @@ pub const JsonAggregateOperator = struct {
         // Get or create group for this key
         const group = try self.getOrCreateGroup(rec.key);
 
-        // Update accumulator
+        // The record's total, built apart and kept only once what it emits
+        // is built: a record that runs out of memory there leaves the group
+        // as it was, so running it again counts it once.
+        var next = group.*;
         if (numeric_val) |val| {
-            group.addValue(val);
+            next.addValue(val);
         } else {
-            group.addCount();
+            next.addCount();
         }
 
         // Emit based on window mode
         switch (self.window) {
             .none => {
                 // Running aggregate — emit on every record
-                try self.emitResult(rec.key, group, rec.event_time_ms, ctx);
+                try self.emitResult(rec.key, &next, rec.event_time_ms, ctx);
+                group.* = next;
             },
             .tumbling_count => |threshold| {
-                if (group.count >= threshold) {
-                    try self.emitResult(rec.key, group, rec.event_time_ms, ctx);
+                if (next.count >= threshold) {
+                    try self.emitResult(rec.key, &next, rec.event_time_ms, ctx);
                     // A window that emitted leaves nothing to keep: the key's
                     // next record starts a fresh one, so only keys with a
                     // window open hold memory.
                     if (self.groups.fetchSwapRemove(rec.key)) |kv| self.allocator.free(kv.key);
-                }
+                } else group.* = next;
             },
         }
+        ctx.changed_state = true;
     }
 
     fn getName(ptr: *anyopaque) []const u8 {
@@ -671,5 +676,54 @@ test "JsonAggregateOperator — output is JSON for any key, and a value past f64
         defer parsed.deinit();
         try std.testing.expectEqualStrings(key, parsed.value.key);
         try std.testing.expectEqual(if (finite) @as(?f64, 1.5e308) else null, parsed.value.value);
+    }
+}
+
+test "JsonAggregateOperator — a record that runs out of memory anywhere and is run again counts once, running and in a count window" {
+    const allocator = std.testing.allocator;
+    const Mode = struct { window: JsonAggregateOperator.WindowConfig, feed: []const []const u8, want_value: f64, want_count: u64 };
+    for ([_]Mode{
+        .{ .window = .none, .feed = &.{"{\"value\":5}"}, .want_value = 5, .want_count = 1 },
+        .{ .window = .{ .tumbling_count = 2 }, .feed = &.{ "{\"value\":5}", "{\"value\":5}" }, .want_value = 10, .want_count = 2 },
+    }) |m| {
+        var fail_at: usize = 0;
+        while (fail_at < 64) : (fail_at += 1) {
+            var agg = try JsonAggregateOperator.init(allocator, "total", .sum, "$.value", m.window);
+            defer agg.deinit();
+            const op = agg.operator();
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(allocator);
+            var failed_once = false;
+            for (m.feed, 0..) |rec_text, i| {
+                const last = i == m.feed.len - 1;
+                var collector = OutputCollector.init(allocator);
+                defer collector.deinit();
+                var metrics = OperatorMetrics{};
+                var arena = std.heap.ArenaAllocator.init(allocator);
+                defer arena.deinit();
+                // The last record first on memory that runs out at `fail_at`.
+                var failing = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = fail_at });
+                var ctx = OperatorContext{ .collector = &collector, .metrics = &metrics, .allocator = if (last) failing.allocator() else arena.allocator(), .current_processing_time_ms = 0, .operator_name = "t" };
+                const rec = ProcessingRecord.init("", rec_text, 0);
+                if (op.processElement(rec, &ctx)) |_| {} else |err| {
+                    try std.testing.expectEqual(error.OutOfMemory, err);
+                    failed_once = true;
+                    collector.clear();
+                    ctx.allocator = arena.allocator();
+                    try op.processElement(rec, &ctx);
+                }
+                if (last) {
+                    try std.testing.expectEqual(@as(usize, 1), collector.count());
+                    const Result = struct { key: []const u8, value: ?f64, count: u64 };
+                    const parsed = try std.json.parseFromSlice(Result, allocator, collector.records.items[0].value, .{});
+                    defer parsed.deinit();
+                    try std.testing.expectEqual(@as(?f64, m.want_value), parsed.value.value);
+                    try std.testing.expectEqual(m.want_count, parsed.value.count);
+                }
+            }
+            if (!failed_once) break;
+        }
+        // It did fail somewhere before running clean.
+        try std.testing.expect(fail_at > 0);
     }
 }

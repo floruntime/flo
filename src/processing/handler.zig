@@ -120,8 +120,11 @@ pub const ProcessingHandler = struct {
     sink_drops: u64 = 0,
     /// See `sinkRead`.
     sink_read: ?*SinkRead = null,
-    /// What an operator chain's arena allocates from, when set: a test
-    /// gives it an allocator that fails. Null is the shard's.
+    /// Batches stopped short of memory, across jobs.
+    memory_stalls: u64 = 0,
+    /// What an operator chain's arena allocates from, when set. For tests
+    /// only, which give it an allocator that fails; null, the shard's, in
+    /// every server.
     chain_backing: ?Allocator = null,
     chain_errors: u64 = 0,
     chain_warn_ms: i64 = 0,
@@ -367,6 +370,8 @@ pub const ProcessingHandler = struct {
         /// Single sink writes dropped, and the last one's sink and reason.
         write_drops: u64 = 0,
         last_write_drop: []const u8 = "",
+        /// Batches this leader stopped short of memory before a record.
+        memory_stalls: u64 = 0,
     };
 
     /// How long a run held for want of memory waits to be built again.
@@ -391,6 +396,10 @@ pub const ProcessingHandler = struct {
         last_write_drop: [160]u8 = undefined,
         last_write_drop_len: usize = 0,
         drop_warn_ms: i64 = 0,
+        /// Batches stopped short of memory before a record, retried at the
+        /// next tick, and when one was last logged.
+        memory_stalls: u64 = 0,
+        memory_warn_ms: i64 = 0,
         /// Held for want of memory: built again at a later look
         /// (`reconcileAt`), not only when the jobs change.
         short: bool = false,
@@ -517,6 +526,7 @@ pub const ProcessingHandler = struct {
             v.last_drop = run.last_drop[0..run.last_drop_len];
             v.write_drops = run.write_drops;
             v.last_write_drop = run.last_write_drop[0..run.last_write_drop_len];
+            v.memory_stalls = run.memory_stalls;
         };
         return v;
     }
@@ -1159,6 +1169,10 @@ pub const ProcessingHandler = struct {
         if (job.write_drops > 0) {
             if (w.end > 0) w.writeAll("; ") catch {};
             w.print("{d} record{s} dropped by a sink, the last by {s}", .{ job.write_drops, if (job.write_drops == 1) "" else "s", job.last_write_drop }) catch {};
+        }
+        if (job.memory_stalls > 0) {
+            if (w.end > 0) w.writeAll("; ") catch {};
+            w.print("{d} batch{s} stopped short of memory, each record tried again", .{ job.memory_stalls, if (job.memory_stalls == 1) "" else "es" }) catch {};
         }
         return if (w.end == 0) null else w.buffered();
     }
@@ -2015,7 +2029,12 @@ pub const ProcessingHandler = struct {
             // Format TS point as JSON record. Short of memory, the batch
             // stops here, the point still ahead of the cursor.
             const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
-            const json = tsPointJson(arena.allocator(), pipe.src_measurement, pipe.src_field, pt.value, ts_ms, pt.tags) catch break;
+            var ab: [48]u8 = undefined;
+            const at = std.fmt.bufPrint(&ab, "point {d}/{d}", .{ pt.timestamp_ns, pt.ual }) catch "a point";
+            const json = tsPointJson(arena.allocator(), pipe.src_measurement, pipe.src_field, pt.value, ts_ms, pt.tags) catch {
+                self.noteMemoryStall(at);
+                break;
+            };
             batch.beginRecord();
             // Apply operator chain (or pass through directly). A record
             // the chain failed on is counted and skipped: passing it through
@@ -2024,7 +2043,15 @@ pub const ProcessingHandler = struct {
             const output_records = applyOperatorChain(pipe.operators, json, ts_ms, arena.allocator(), &skips) catch |err| switch (err) {
                 // Short of memory the batch stops here, the record still
                 // ahead of the cursor: not a record to skip.
-                error.OutOfMemory => break,
+                error.OutOfMemory => {
+                    self.noteMemoryStall(at);
+                    break;
+                },
+                // An aggregate had counted it: run again it would count twice.
+                error.OutOfMemoryAfterState => blk: {
+                    self.noteSkips(shard, at, OOM_AFTER_STATE, 1);
+                    break :blk @as(?[]const ProcessingRecord, &.{});
+                },
                 else => blk: {
                     self.noteChainError(shard, err);
                     break :blk @as(?[]const ProcessingRecord, &.{});
@@ -2089,12 +2116,20 @@ pub const ProcessingHandler = struct {
             defer _ = arena.reset(.retain_capacity);
             batch.beginRecord();
             var skips: Skips = .{};
+            var ab: [48]u8 = undefined;
+            const at = std.fmt.bufPrint(&ab, "record {d}-{d}", .{ id.timestamp_ms, id.sequence }) catch "a record";
             const output_records = applyOperatorChain(pipe.operators, payload, @import("stdx").time.milliTimestamp(), arena.allocator(), &skips) catch |err| switch (err) {
                 // Short of memory the batch stops here, the record still
                 // ahead of the cursor: not a record to skip.
                 error.OutOfMemory => {
+                    self.noteMemoryStall(at);
                     all = false;
                     break;
+                },
+                // An aggregate had counted it: run again it would count twice.
+                error.OutOfMemoryAfterState => blk: {
+                    self.noteSkips(shard, at, OOM_AFTER_STATE, 1);
+                    break :blk @as(?[]const ProcessingRecord, &.{});
                 },
                 else => blk: {
                     self.noteChainError(shard, err);
@@ -2534,6 +2569,8 @@ pub const ProcessingHandler = struct {
         }
     }
 
+    const OOM_AFTER_STATE = "short of memory after an aggregate had counted it: not run again, so it isn't counted twice";
+
     /// The records an operator skipped because it couldn't read them: how
     /// many, and the last one's reason.
     pub const Skips = struct {
@@ -2563,13 +2600,22 @@ pub const ProcessingHandler = struct {
             .current_processing_time_ms = @import("stdx").time.milliTimestamp(),
             .operator_name = "",
         };
-        try runOperator(operators[0], ProcessingRecord.fromValue(value, event_time_ms), &ctx, skips);
+        return chainBody(operators, value, event_time_ms, arena, &collector, &ctx, skips) catch |err| switch (err) {
+            // Short of memory once an operator kept state from the record,
+            // it can't be run again without counting it twice.
+            error.OutOfMemory => if (ctx.changed_state) error.OutOfMemoryAfterState else error.OutOfMemory,
+            else => err,
+        };
+    }
+
+    fn chainBody(operators: []Operator, value: []const u8, event_time_ms: i64, arena: Allocator, collector: *OutputCollector, ctx: *OperatorContext, skips: *Skips) ![]const ProcessingRecord {
+        try runOperator(operators[0], ProcessingRecord.fromValue(value, event_time_ms), ctx, skips);
         // Each operator takes the one before's output; a staged record and
         // what it points at stay in the arena, so one passed through, still
         // pointing at them, stays good.
         for (operators[1..]) |op| {
             const staged = try collector.records.toOwnedSlice(arena);
-            for (staged) |rec| try runOperator(op, rec, &ctx, skips);
+            for (staged) |rec| try runOperator(op, rec, ctx, skips);
         }
         return collector.records.items;
     }
@@ -2686,6 +2732,20 @@ pub const ProcessingHandler = struct {
         if (now - job.drop_warn_ms < 30_000) return;
         job.drop_warn_ms = now;
         log.err("job '{s}': {s} skipped: {s} ({d} skipped by this job so far)", .{ self.ticking_job, at, why, job.drops });
+    }
+
+    /// A batch stopped short of memory before the record at `at`: that
+    /// record and the rest are read again at the next tick. Counted on the
+    /// job, shown in its status, and logged at most once every 30 s.
+    fn noteMemoryStall(self: *ProcessingHandler, at: []const u8) void {
+        self.memory_stalls += 1;
+        const job = self.runs.getPtr(self.ticking_job) orelse return;
+        self.reported = true;
+        job.memory_stalls += 1;
+        const now = @import("stdx").time.milliTimestamp();
+        if (now - job.memory_warn_ms < 30_000) return;
+        job.memory_warn_ms = now;
+        log.warn("job '{s}': short of memory at {s}: the batch stops before it, and it is read again next tick ({d} so far)", .{ self.ticking_job, at, job.memory_stalls });
     }
 
     /// `n` records an operator couldn't read, skipped: counted as dropped,

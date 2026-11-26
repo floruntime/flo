@@ -62,6 +62,9 @@ pub const OperatorContext = struct {
     operator_name: []const u8,
     /// Why the record in hand was skipped, set by `skip`.
     skipped: ?[]const u8 = null,
+    /// An operator kept state from the record in hand (an aggregate's
+    /// total): running the record again would count it twice.
+    changed_state: bool = false,
 
     /// An operator that can't read its record skips it with a reason: the
     /// chain's caller counts it where the job's status shows it, so a

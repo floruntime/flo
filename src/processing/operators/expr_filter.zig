@@ -385,6 +385,8 @@ pub const ExprFilterOperator = struct {
     /// A finite decimal number: digits, an optional sign, point and exponent;
     /// not hex, not `_`-separated, not nan or inf, and not too big for f64.
     fn isPlainNumber(value: []const u8) bool {
+        // As JSON writes a number: no leading `+`.
+        if (value.len == 0 or value[0] == '+') return false;
         for (value) |c| switch (c) {
             '0'...'9', '-', '+', '.', 'e', 'E' => {},
             else => return false,
@@ -454,10 +456,13 @@ pub const ExprFilterOperator = struct {
     const Number = union(enum) { int: i64, float: f64, text: []const u8 };
 
     /// A number against the condition's value. `=` and `!=` between two
-    /// whole numbers compare exactly (an id past 2^53 matches only
-    /// itself); ordering, and anything with a fraction, compare as f64. A
-    /// number past f64's range can't be compared.
+    /// whole numbers that fit an i128 compare exactly, so an id past 2^53
+    /// matches only itself; ordering, and a literal with a fraction or an
+    /// exponent (`9007199254740993.0`), compare as f64. A number past f64's
+    /// range can't be compared. The literal is read as strictly as JSON reads
+    /// the record: `1_00` or `+5` is no number.
     fn evalNumber(n: Number, op: JsonOp, value: []const u8) Verdict {
+        if (!plainNumber(value)) return .fail;
         if (op == .eq or op == .neq) {
             const want: ?i128 = std.fmt.parseInt(i128, value, 10) catch null;
             const have: ?i128 = switch (n) {
@@ -474,6 +479,12 @@ pub const ExprFilterOperator = struct {
         };
         if (!std.math.isFinite(f)) return .out_of_range;
         return if (evalNumericOp(f, op, value)) .pass else .fail;
+    }
+
+    /// Whether `t` is a number as JSON writes one: no `_`, no leading `+`.
+    fn plainNumber(t: []const u8) bool {
+        if (t.len == 0 or t[0] == '+') return false;
+        return std.mem.indexOfScalar(u8, t, '_') == null;
     }
 
     fn evalNumericOp(n: f64, op: JsonOp, value: []const u8) bool {
@@ -879,4 +890,25 @@ test "ExprFilterOperator — under OR and AND a record a json: part can't read i
     try std.testing.expectEqual(ExprFilterOperator.Verdict.pass, try or_op.judge(rec("x not json"), a));
     try std.testing.expectEqual(ExprFilterOperator.Verdict.unreadable, try or_op.judge(rec("y not json"), a));
     try std.testing.expectEqual(ExprFilterOperator.Verdict.fail, try or_op.judge(rec("{\"n\":0}"), a));
+}
+
+test "ExprFilterOperator — a numeric literal is read as strictly as the record: 1_00 and +5 are no numbers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `=` compares a string too, so such a literal matches no number.
+    for ([_][]const u8{ "json:n=1_00", "json:n=+5" }) |c| {
+        const op = try ExprFilterOperator.init("f", c);
+        for ([_][]const u8{ "{\"n\":100}", "{\"n\":5}", "{\"n\":2}" }) |v|
+            try std.testing.expectEqual(ExprFilterOperator.Verdict.fail, try op.judge(ProcessingRecord.init("k", v, 0), a));
+    }
+    // An ordering takes only a number: refused when the condition is read.
+    for ([_][]const u8{ "json:n>+1", "json:n<1_000" }) |c|
+        try std.testing.expectError(error.InvalidCondition, ExprFilterOperator.init("f", c));
+    // Up to 2^127 compares exactly; a fractional literal as f64.
+    const big = try ExprFilterOperator.init("f", "json:id=170141183460469231731687303715884105727");
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.pass, try big.judge(ProcessingRecord.init("k", "{\"id\":170141183460469231731687303715884105727}", 0), a));
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.fail, try big.judge(ProcessingRecord.init("k", "{\"id\":170141183460469231731687303715884105726}", 0), a));
+    const frac = try ExprFilterOperator.init("f", "json:id=9007199254740993.0");
+    try std.testing.expectEqual(ExprFilterOperator.Verdict.pass, try frac.judge(ProcessingRecord.init("k", "{\"id\":9007199254740992}", 0), a));
 }
