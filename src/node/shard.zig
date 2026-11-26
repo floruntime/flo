@@ -11116,8 +11116,12 @@ test "quota binds: a namespace with none published binds nothing, a part bound c
     // stands in for an unpublished quota.
     for (0..ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 1) |_| try std.testing.expectEqual(@as(usize, 0), shard.quotaBindsDue(&items));
     names.publishQuota(ns_table.DEFAULT, 8 << 30, 5);
+    // Due once: the walk that finds it, before its bind applies.
     var n: usize = 0;
-    for (0..ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 1) |_| n += shard.quotaBindsDue(items[n..]);
+    for (0..ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 1) |_| {
+        n = shard.quotaBindsDue(&items);
+        if (n > 0) break;
+    }
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqual(@as(u64, 8 << 30), items[0].part_bytes);
     var buf: [settings_machine.SetQuotaBind.max_size]u8 = undefined;
