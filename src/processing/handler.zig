@@ -2868,6 +2868,7 @@ pub const ProcessingHandler = struct {
             return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, switch (err) {
                 error.TagsTooLong => std.fmt.comptimePrint("its tags pass {d} bytes", .{ts_mod.MAX_TAG_STRING}),
                 error.NoTagField => std.fmt.bufPrint(&wb, "the record has no string field \"{s}\" for a tag", .{missing}) catch "the record has no field for a tag",
+                error.TagValueEmpty => std.fmt.bufPrint(&wb, "the record's field \"{s}\" for a tag is empty: a tag needs a value", .{missing}) catch "a tag's value is empty",
                 error.TagValueComma => std.fmt.bufPrint(&wb, "the record's field \"{s}\" holds ',', which would split its tag", .{missing}) catch "a tag's value holds ','",
                 error.TagValueControl => std.fmt.bufPrint(&wb, "the record's field \"{s}\" holds a control character, which no read of a tag can name", .{missing}) catch "a tag's value holds a control character",
             });
@@ -2976,7 +2977,7 @@ pub const ProcessingHandler = struct {
     /// trailing space is trimmed there, as for any TS write, so "a" and "a "
     /// are one series; a value holding a tab or any control character is
     /// dropped here.
-    fn computeTsSinkTags(tag_keys: []const u8, values: []const ?record_fields.Field, buf: []u8, missing: *[]const u8) error{ TagsTooLong, NoTagField, TagValueComma, TagValueControl }![]const u8 {
+    fn computeTsSinkTags(tag_keys: []const u8, values: []const ?record_fields.Field, buf: []u8, missing: *[]const u8) error{ TagsTooLong, NoTagField, TagValueEmpty, TagValueComma, TagValueControl }![]const u8 {
         if (tag_keys.len == 0) return "";
         var pos: usize = 0;
         var it = FlatPairIterator.init(tag_keys);
@@ -2991,6 +2992,12 @@ pub const ProcessingHandler = struct {
                 missing.* = pair.value;
                 return error.NoTagField;
             };
+            // Empty, or only spaces the stored form trims away: no tag a
+            // filter can name.
+            if (std.mem.trim(u8, v, " \t").len == 0) {
+                missing.* = pair.value;
+                return error.TagValueEmpty;
+            }
             // Tags are split again on `,`: one in a value would make two.
             if (std.mem.indexOfScalar(u8, v, ',') != null) {
                 missing.* = pair.value;

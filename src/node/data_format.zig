@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 71;
+pub const CURRENT: u32 = 72;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -260,6 +260,9 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // retries no longer parses: its create is refused, and a log holding one
     // from before would halt where it applies.
     .{ .format = 71, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
+    // A time-series write whose tags repeat a key, lack one, aren't UTF-8,
+    // or pass 32 pairs or 1024 bytes is refused where it applies.
+    .{ .format = 72, .segment_version = 43, .entries = 0xe6ceccda0f0155e2 },
 };
 
 comptime {
