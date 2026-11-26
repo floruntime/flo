@@ -4557,10 +4557,18 @@ test "e2e/workflow/cluster: a node that missed a schedule and a timer run while 
     try testing.expectEqual(first, try clusterLeader(&cluster, null));
 }
 
-test "e2e/workflow: on 12 shards, every op by a run's id in a namespace never created says so, by a chosen id or a generated one" {
-    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 12 } });
+test "e2e/workflow: on 1 shard and on 12, every op by a run's id in a namespace never created says so, by a chosen id or a generated one" {
+    for ([_]u8{ 1, 12 }) |shards| try neverCreatedAnswers(shards);
+}
+
+fn neverCreatedAnswers(shards: u8) !void {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards } });
     defer ctx.deinit();
-    const ids = [_][]const u8{ "never-run-1", "wf-1a2b3c4d5e6f00-3-1c" };
+    const ids = [_][]const u8{ "never-run-1", "wfr-1a2b3c4d5e6f00-3-1c" };
+    // One the client chose, and one of the server's form, which routes by
+    // its slot bits.
+    const run_id = @import("src").node.run_id;
+    try testing.expect(!run_id.looksGenerated(.workflow, ids[0]) and run_id.looksGenerated(.workflow, ids[1]));
     for (ids) |rid| {
         for ([_][]const []const u8{
             &.{ "workflow", "status", rid, "-n", "never-made" },
@@ -4571,7 +4579,7 @@ test "e2e/workflow: on 12 shards, every op by a run's id in a namespace never cr
         }) |args| {
             var r = try ctx.cli.run(args);
             defer r.deinit();
-            if (!r.contains("namespace not found [no_namespace/not_found]")) std.debug.print("{s} {s}: {s}{s}\n", .{ args[1], rid, r.stdout, r.stderr });
+            if (!r.contains("namespace not found [no_namespace/not_found]")) std.debug.print("{d} shards, {s} {s}: {s}{s}\n", .{ shards, args[1], rid, r.stdout, r.stderr });
             try testing.expect(r.contains("namespace not found [no_namespace/not_found]"));
         }
     }

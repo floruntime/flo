@@ -2442,7 +2442,9 @@ pub const Shard = struct {
         // On a node of several shards, a write that creates nothing in a
         // namespace that doesn't exist is refused as having none through
         // shard 0, as shard 0's answer to another shard's ask refuses it
-        // there. A lone shard answers it as it always has.
+        // there. A lone shard answers other writes as it always has; one by
+        // a workflow run's id says the namespace isn't there on any node, as
+        // that op's reads do.
         const creates = op < proto.MAX_OPCODES and dispatcher_mod.opCreates(@fromBackingInt(@intCast(op)));
         if (req.key.len > 0 and namespaced(op)) {
             const name = if (req.namespace.len == 0) "default" else req.namespace;
@@ -2454,7 +2456,7 @@ pub const Shard = struct {
                     return self.route(conn, routed, auth);
                 }
                 if (self.id != 0) return self.askShard0(conn, req, name, auth.origin);
-                if (self.shardCount() > 1 and requestWrites(req) and !creates and !nh.creating(name)) return self.sendRefusal(conn, req.header.request_id, .no_namespace, NO_NAMESPACE);
+                if ((self.shardCount() > 1 or isWorkflowRunOp(op)) and requestWrites(req) and !creates and !nh.creating(name)) return self.sendRefusal(conn, req.header.request_id, .no_namespace, NO_NAMESPACE);
             }
             // Shard 0 routes by its own registry's id a namespace it applied
             // but hasn't published, and the owning shard, which resolves
@@ -2533,10 +2535,14 @@ pub const Shard = struct {
     /// start. A generated id carries its workflow's slot, so its op routes
     /// straight there; a chosen one carries none, and the run is on the
     /// shard of its workflow's name, which the op doesn't name.
-    fn runIdUnplaced(self: *const Shard, req: proto.Request) bool {
-        const by_run_id = for (WORKFLOW_RUN_OPS) |op| {
-            if (req.header.op_code == @backingInt(op)) break true;
+    fn isWorkflowRunOp(op: u16) bool {
+        return for (WORKFLOW_RUN_OPS) |o| {
+            if (op == @backingInt(o)) break true;
         } else false;
+    }
+
+    fn runIdUnplaced(self: *const Shard, req: proto.Request) bool {
+        const by_run_id = isWorkflowRunOp(req.header.op_code);
         // Only the server mints ids of the generated form (a start refuses a
         // chosen one), so this splits them exactly; a chosen id can decode as
         // a slot (`order-123`), and that slot names no run's shard.

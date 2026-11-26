@@ -358,7 +358,6 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     var result = client_mod.workflow.status(&client, namespace, run_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-
     try outcome.check(ctx, result);
 
     const data = result.asRawData() orelse return outcome.malformed(ctx, "workflow run status (empty)");
@@ -622,7 +621,6 @@ fn runCancel(ctx: *commander.Context) commander.Error!void {
 
     var result = client_mod.workflow.cancel(&client, namespace, run_id, reason_val) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
-
 
     try outcome.check(ctx, result);
 
