@@ -112,4 +112,15 @@ pub const table = [_]ops.Op{
         .cli = .{ .expose = .none },
         .doc = "Whether a shard holds a workflow run whose id the client chose: such an id names no shard.",
     },
+    .{
+        .name = "system.history_quota",
+        .code = 0x004,
+        .class = .read,
+        .origin = .internal,
+        .route = .local,
+        .request = Record(&.{}),
+        .response = @import("namespace_ops.zig").ShardQuota,
+        .cli = .{ .expose = .none },
+        .doc = "A shard's part of the namespace its key names, and the run history it holds, for that namespace's info.",
+    },
 };
