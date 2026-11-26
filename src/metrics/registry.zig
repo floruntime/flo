@@ -201,6 +201,9 @@ pub const WorkflowMetrics = struct {
     /// their shard at its memory share, or waiting after a start refused
     /// there. As of the leader's last pass.
     duties_memory_held: Atomic(u64) = Atomic(u64).init(0),
+    /// Schedules and triggers holding their starts at their namespace's
+    /// run-history quota, or waiting after a start refused there.
+    duties_quota_held: Atomic(u64) = Atomic(u64).init(0),
 
     pub fn init() WorkflowMetrics {
         return .{};
@@ -279,6 +282,7 @@ pub const WorkflowMetrics = struct {
         active_schedules: u64,
         action_expires_held: u64,
         duties_memory_held: u64,
+        duties_quota_held: u64,
     };
 
     pub fn snapshot(self: *const WorkflowMetrics) Snapshot {
@@ -297,6 +301,7 @@ pub const WorkflowMetrics = struct {
             .active_schedules = self.active_schedules.load(.monotonic),
             .action_expires_held = self.action_expires_held.load(.monotonic),
             .duties_memory_held = self.duties_memory_held.load(.monotonic),
+            .duties_quota_held = self.duties_quota_held.load(.monotonic),
         };
     }
 };
@@ -1904,6 +1909,9 @@ fn writeWorkflowMetrics(writer: anytype, snapshot: WorkflowMetrics.Snapshot) !vo
     try writer.print("# HELP flo_workflow_duties_memory_held Schedules and triggers holding their starts at their last attempt: their shard at its memory share, or waiting after a start refused there\n", .{});
     try writer.print("# TYPE flo_workflow_duties_memory_held gauge\n", .{});
     try writer.print("flo_workflow_duties_memory_held {d}\n", .{snapshot.duties_memory_held});
+    try writer.print("# HELP flo_workflow_duties_quota_held Schedules and triggers holding their starts at their last attempt: their namespace at its run-history quota on the shard, or waiting after a start refused there\n", .{});
+    try writer.print("# TYPE flo_workflow_duties_quota_held gauge\n", .{});
+    try writer.print("flo_workflow_duties_quota_held {d}\n", .{snapshot.duties_quota_held});
 }
 
 /// Write processing metrics in Prometheus format

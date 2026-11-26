@@ -31,6 +31,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
 const gate = @import("../budget/gate.zig");
+const hq = @import("../budget/history_quota.zig");
 const raft_node_mod = @import("../raft/node.zig");
 const proto = @import("../protocol/proto.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
@@ -211,6 +212,8 @@ pub const WorkflowHandler = struct {
     child_scan_after: std.ArrayListUnmanaged(u8) = .empty,
     /// The schedules and triggers this shard last counted held.
     memory_held: u64 = 0,
+    /// The same for the namespace's run-history quota.
+    quota_held: u64 = 0,
     /// Holds said in the log, one per episode.
     holds_said: u64 = 0,
 
@@ -495,6 +498,7 @@ pub const WorkflowHandler = struct {
         resync_index: u64 = 0,
         /// Kept with `proposed` and `resync_index`, as one.
         hold: MemoryHold = .{},
+        quota_hold: QuotaHold = .{},
         last_poll_ms: i64,
         /// A read of a stream another shard owns, in flight (0 for none):
         /// its number and the term it was asked in. At most one at a time.
@@ -551,58 +555,74 @@ pub const WorkflowHandler = struct {
         return self.appliedCursor(def_key, ns, t.stream_name_owned, t.stream_made_ns);
     }
 
-    /// A schedule's or trigger's starts held to its shard's memory share.
-    /// At the share it proposes none. After a start refused for memory it
-    /// waits before the next, each wait twice the last (`callRetryMs`): the
-    /// share is only checked before proposing, and a start just under it
-    /// is still refused at apply. A start of it admitted, or a new term,
-    /// begins again. Leader memory.
-    pub const MemoryHold = struct {
-        term: u64 = 0,
-        refusals: u32 = 0,
-        until_ms: i64 = std.math.minInt(i64),
-        /// The share it is held at, at it or waiting after a refusal there;
-        /// null while it isn't held.
-        share: ?u64 = null,
-        /// Said in the log until then: at most once a minute, however often
-        /// a shard hovering at its share holds it, and across a new term.
-        said_until_ms: i64 = std.math.minInt(i64),
+    /// What holds a schedule's or trigger's starts: its shard's memory
+    /// share, or its namespace's run-history quota on the shard.
+    pub const Bound = enum { memory, quota };
 
-        const SAY_EVERY_MS: i64 = 60_000;
+    /// A schedule's or trigger's starts held to one bound. At it, it
+    /// proposes none. After a start refused there it waits before the next,
+    /// each wait twice the last (`callRetryMs` for memory, `quotaRetryMs`
+    /// for the quota): the bound is only checked before proposing, and a
+    /// start just under it is still refused at apply. A start of it
+    /// admitted, or a new term, begins again. Leader memory.
+    pub fn StartHold(comptime bound: Bound) type {
+        return struct {
+            const Self = @This();
+            term: u64 = 0,
+            refusals: u32 = 0,
+            until_ms: i64 = std.math.minInt(i64),
+            /// The figure it is held at (the share, or the namespace's
+            /// part), at it or waiting after a refusal there; null while it
+            /// isn't held.
+            share: ?u64 = null,
+            /// Said in the log until then: at most once a minute, however
+            /// often a shard hovering at the bound holds it, and across a
+            /// new term.
+            said_until_ms: i64 = std.math.minInt(i64),
 
-        /// Begun again, in `term`: what was said stands.
-        fn reset(h: *MemoryHold, term: u64) void {
-            h.* = .{ .term = term, .said_until_ms = h.said_until_ms };
-        }
+            const SAY_EVERY_MS: i64 = 60_000;
 
-        /// Whether it waits out a refusal now, in `term`.
-        fn waiting(h: *MemoryHold, term: u64, now_ms: i64) bool {
-            if (h.term != term) h.reset(term);
-            return now_ms < h.until_ms;
-        }
+            /// Begun again, in `term`: what was said stands.
+            fn reset(h: *Self, term: u64) void {
+                h.* = .{ .term = term, .said_until_ms = h.said_until_ms };
+            }
 
-        /// Held at `share`; true when it is to be said.
-        fn held(h: *MemoryHold, share: u64, now_ms: i64) bool {
-            h.share = share;
-            if (now_ms < h.said_until_ms) return false;
-            h.said_until_ms = now_ms +| SAY_EVERY_MS;
-            return true;
-        }
+            /// Whether it waits out a refusal now, in `term`.
+            fn waiting(h: *Self, term: u64, now_ms: i64) bool {
+                if (h.term != term) h.reset(term);
+                return now_ms < h.until_ms;
+            }
 
-        /// A start of it refused for memory in `term`: it waits.
-        fn refused(h: *MemoryHold, term: u64, now_ms: i64, share: u64) bool {
-            if (h.term != term) h.reset(term);
-            const first = h.held(share, now_ms);
-            h.refusals +|= 1;
-            h.until_ms = now_ms +| @as(i64, @intCast(callRetryMs(h.refusals)));
-            return first;
-        }
+            /// Held at `share`; true when it is to be said.
+            fn held(h: *Self, share: u64, now_ms: i64) bool {
+                h.share = share;
+                if (now_ms < h.said_until_ms) return false;
+                h.said_until_ms = now_ms +| SAY_EVERY_MS;
+                return true;
+            }
 
-        /// Not at the share now; a wait still stands until a run starts.
-        fn clear(h: *MemoryHold) void {
-            h.share = null;
-        }
-    };
+            /// A start of it refused at the bound in `term`: it waits.
+            fn refused(h: *Self, term: u64, now_ms: i64, share: u64) bool {
+                if (h.term != term) h.reset(term);
+                const first = h.held(share, now_ms);
+                h.refusals +|= 1;
+                const wait = switch (bound) {
+                    .memory => callRetryMs(h.refusals),
+                    .quota => quotaRetryMs(h.refusals),
+                };
+                h.until_ms = now_ms +| @as(i64, @intCast(wait));
+                return first;
+            }
+
+            /// Not at the bound now; a wait still stands until a run starts.
+            fn clear(h: *Self) void {
+                h.share = null;
+            }
+        };
+    }
+
+    pub const MemoryHold = StartHold(.memory);
+    pub const QuotaHold = StartHold(.quota);
 
     pub const ScheduleState = struct {
         workflow_name_owned: []const u8,
@@ -628,6 +648,7 @@ pub const WorkflowHandler = struct {
         proposed_ms: i64 = std.math.minInt(i64),
         proposed_term: u64 = 0,
         hold: MemoryHold = .{},
+        quota_hold: QuotaHold = .{},
     };
 
     const Timer = struct { at_ms: i64, ns_key: []const u8 };
@@ -2773,9 +2794,10 @@ pub const WorkflowHandler = struct {
         const run_key = self.nsKey(ns, run_id) orelse return error.OutOfMemory;
         defer self.allocator.free(run_key);
         const taken = self.appliedRun(run_key) != null;
-        // At its shard's memory share the start would be held at apply: the
-        // parent is told now, and asks again.
-        const answer: ?ae.Answer = if (taken) .conflict else if (!held) .no_action else if (gate.atShare(&shard.defaultPartition().store) != null) .over_budget else null;
+        // At its shard's memory share, or its namespace's quota here, the
+        // start would be refused at apply: the parent is told now, and asks
+        // again. The quota first, as at apply.
+        const answer: ?ae.Answer = if (taken) .conflict else if (!held) .no_action else if (hq.preCheck(self.defsRead(), ns, runs_machine.reserveOf(p.workflow, run_id)) != null) .over_quota else if (gate.atShare(&shard.defaultPartition().store) != null) .over_budget else null;
         if (answer) |a| {
             // A refusal is told to the parent: not past its outbox's room.
             if (shard.sendWait(shard.router.slotToShard(p.parent_slot), .main, ns) != null) return error.Overloaded;
@@ -4015,10 +4037,18 @@ pub const WorkflowHandler = struct {
             // frees, as one missed while no leader was ready.
             if (schedule.hold.waiting(term, now_ms)) continue;
             if (at_share) |o| {
-                if (schedule.hold.held(o.share, now_ms)) self.noteStartsHeld("schedule", schedule.ns, schedule.workflow_name_owned, shard.id, o.share);
+                if (schedule.hold.held(o.share, now_ms)) self.noteStartsHeld("schedule", .memory, schedule.ns, schedule.workflow_name_owned, shard.id, o.share);
                 continue;
             }
             schedule.hold.clear();
+            // Held at its namespace's quota: the same, until runs end or
+            // are deleted, or the quota is raised.
+            if (schedule.quota_hold.waiting(term, now_ms)) continue;
+            if (quotaHeld(self.defsRead(), schedule.ns, schedule.workflow_name_owned)) |part| {
+                if (schedule.quota_hold.held(part, now_ms)) self.noteStartsHeld("schedule", .quota, schedule.ns, schedule.workflow_name_owned, shard.id, part);
+                continue;
+            }
+            schedule.quota_hold.clear();
 
             // Check max_concurrent
             if (schedule.max_concurrent > 0) {
@@ -4033,9 +4063,21 @@ pub const WorkflowHandler = struct {
         }
     }
 
-    fn noteStartsHeld(self: *WorkflowHandler, what: []const u8, ns: NamespaceId, workflow: []const u8, shard_id: u16, share: u64) void {
+    fn noteStartsHeld(self: *WorkflowHandler, what: []const u8, bound: Bound, ns: NamespaceId, workflow: []const u8, shard_id: u16, at: u64) void {
         self.holds_said += 1;
-        log.warn("workflow {s} (namespace {d}): its {s} holds its starts while shard {d} is at its memory share ({d} bytes); they go on once memory frees", .{ workflow, ns.int(), what, shard_id, share });
+        switch (bound) {
+            .memory => log.warn("workflow {s} (namespace {d}): its {s} holds its starts while shard {d} is at its memory share ({d} bytes); they go on once memory frees", .{ workflow, ns.int(), what, shard_id, at }),
+            .quota => log.warn("workflow {s} (namespace {d}): its {s} holds its starts while the namespace is at its run-history quota on shard {d} (a part of {d} bytes); they go on once runs are deleted or the quota is raised", .{ workflow, ns.int(), what, shard_id, at }),
+        }
+    }
+
+    /// Whether a leader's start of `workflow` in `ns` would pass the
+    /// namespace's quota here: its part when it would, null when it fits.
+    /// The run's id isn't made yet, so the longest a server makes is
+    /// counted: at most a few hundred bytes of the part above its own.
+    fn quotaHeld(read: @import("../contract/view.zig").ReadView, ns: NamespaceId, workflow: []const u8) ?u64 {
+        const own = @import("../budget/history_reserve.zig").workflow(workflow.len, run_id_mod.MAX_ID_LEN);
+        return if (hq.preCheck(read, ns, own)) |o| o.part else null;
     }
 
     /// This node no longer runs the duties (it stepped down, or its shard
@@ -4043,9 +4085,15 @@ pub const WorkflowHandler = struct {
     /// shard's count. The next term that leads begins its holds again.
     pub fn dropHolds(self: *WorkflowHandler, shard: *Shard) void {
         var sit = self.schedules.valueIterator();
-        while (sit.next()) |s| s.hold.reset(0);
+        while (sit.next()) |s| {
+            s.hold.reset(0);
+            s.quota_hold.reset(0);
+        }
         var tit = self.stream_triggers.valueIterator();
-        while (tit.next()) |t| t.hold.reset(0);
+        while (tit.next()) |t| {
+            t.hold.reset(0);
+            t.quota_hold.reset(0);
+        }
         self.countDutiesHeld(shard);
     }
 
@@ -4053,13 +4101,22 @@ pub const WorkflowHandler = struct {
     /// shard adds what moved since it last counted.
     fn countDutiesHeld(self: *WorkflowHandler, shard: *Shard) void {
         var n: u64 = 0;
+        var q: u64 = 0;
         var sit = self.schedules.valueIterator();
-        while (sit.next()) |s| n += @intFromBool(s.hold.share != null);
+        while (sit.next()) |s| {
+            n += @intFromBool(s.hold.share != null);
+            q += @intFromBool(s.quota_hold.share != null);
+        }
         var tit = self.stream_triggers.valueIterator();
-        while (tit.next()) |t| n += @intFromBool(t.hold.share != null);
+        while (tit.next()) |t| {
+            n += @intFromBool(t.hold.share != null);
+            q += @intFromBool(t.quota_hold.share != null);
+        }
         defer self.memory_held = n;
+        defer self.quota_held = q;
         const m = shard.metrics_registry orelse return;
         if (n > self.memory_held) _ = m.workflow.duties_memory_held.fetchAdd(n - self.memory_held, .monotonic) else _ = m.workflow.duties_memory_held.fetchSub(self.memory_held - n, .monotonic);
+        if (q > self.quota_held) _ = m.workflow.duties_quota_held.fetchAdd(q - self.quota_held, .monotonic) else _ = m.workflow.duties_quota_held.fetchSub(self.quota_held - q, .monotonic);
     }
 
     /// Start a workflow run for a schedule's slot. Its idempotency key
@@ -4118,10 +4175,16 @@ pub const WorkflowHandler = struct {
             // Held at the share: its place stays where it is.
             if (trigger.hold.waiting(shard.raft_node.current_term, now_ms)) continue;
             if (at_share) |o| {
-                if (trigger.hold.held(o.share, now_ms)) self.noteStartsHeld("trigger", trigger.ns, trigger.workflow_name_owned, shard.id, o.share);
+                if (trigger.hold.held(o.share, now_ms)) self.noteStartsHeld("trigger", .memory, trigger.ns, trigger.workflow_name_owned, shard.id, o.share);
                 continue;
             }
             trigger.hold.clear();
+            if (trigger.quota_hold.waiting(shard.raft_node.current_term, now_ms)) continue;
+            if (quotaHeld(self.defsRead(), trigger.ns, trigger.workflow_name_owned)) |part| {
+                if (trigger.quota_hold.held(part, now_ms)) self.noteStartsHeld("trigger", .quota, trigger.ns, trigger.workflow_name_owned, shard.id, part);
+                continue;
+            }
+            trigger.quota_hold.clear();
 
             // As many events as this shard can start runs for now; with room
             // for none the trigger waits, its cursor where it is.
@@ -4735,25 +4798,37 @@ pub const WorkflowHandler = struct {
         const key = self.nsKey(keyNamespace(cmd.key), s.workflow) orelse return;
         defer self.allocator.free(key);
         const memory = if (out.refused()) |r| r.refusal.reason == .memory_budget else false;
+        const quota = if (out.refused()) |r| r.refusal.reason == .history_quota else false;
         // A run made, not an answer from an earlier one.
         var r = out.reader();
         const made = out.refused() == null and (r.int(u8) orelse 0) == 1;
         const now_ms = @import("stdx").time.milliTimestamp();
         if (s.trigger != null) {
             const trigger = self.stream_triggers.getPtr(key) orelse return;
-            if (out.refused() != null) return self.triggerRefused(trigger, e, lead, memory, now_ms);
-            if (made and e.header.index > trigger.resync_index) trigger.hold.reset(lead.term);
+            if (out.refused() != null) return self.triggerRefused(trigger, e, lead, memory, quota, now_ms);
+            if (made and e.header.index > trigger.resync_index) {
+                trigger.hold.reset(lead.term);
+                trigger.quota_hold.reset(lead.term);
+            }
         } else if (std.mem.eql(u8, s.event, "schedule_started")) {
             const schedule = self.schedules.getPtr(key) orelse return;
-            if (made) schedule.hold.reset(lead.term);
-            if (!memory) return;
+            if (made) {
+                schedule.hold.reset(lead.term);
+                schedule.quota_hold.reset(lead.term);
+            }
+            if (!memory and !quota) return;
             // Its slot may be proposed again, once its wait is out.
             const idem = s.idem orelse return;
             const colon = std.mem.lastIndexOfScalar(u8, idem, ':') orelse return;
             const slot = std.fmt.parseInt(i64, idem[colon + 1 ..], 10) catch return;
             if (schedule.proposed_term != lead.term or schedule.proposed_ms != slot) return;
             schedule.proposed_ms = std.math.minInt(i64);
-            if (schedule.hold.refused(lead.term, now_ms, self.boundShare())) self.noteStartsHeld("schedule", schedule.ns, schedule.workflow_name_owned, self.shardOf(), self.boundShare());
+            if (memory) {
+                if (schedule.hold.refused(lead.term, now_ms, self.boundShare())) self.noteStartsHeld("schedule", .memory, schedule.ns, schedule.workflow_name_owned, self.shardOf(), self.boundShare());
+            } else {
+                const part = self.boundPart(schedule.ns);
+                if (schedule.quota_hold.refused(lead.term, now_ms, part)) self.noteStartsHeld("schedule", .quota, schedule.ns, schedule.workflow_name_owned, self.shardOf(), part);
+            }
         }
     }
 
@@ -4762,11 +4837,20 @@ pub const WorkflowHandler = struct {
     /// place logged, a new chain. Refusals of the chain it broke, at or
     /// below the log's last index now, are passed over: one refusal is one
     /// re-read, and, for memory, one wait before it.
-    fn triggerRefused(self: *WorkflowHandler, trigger: *StreamTriggerState, e: *const entry_mod.Entry, lead: Lead, memory: bool, now_ms: i64) void {
+    fn triggerRefused(self: *WorkflowHandler, trigger: *StreamTriggerState, e: *const entry_mod.Entry, lead: Lead, memory: bool, quota: bool, now_ms: i64) void {
         if (e.header.index <= trigger.resync_index) return;
         trigger.proposed = null;
         trigger.resync_index = lead.last_index;
-        if (memory) if (trigger.hold.refused(lead.term, now_ms, self.boundShare())) self.noteStartsHeld("trigger", trigger.ns, trigger.workflow_name_owned, self.shardOf(), self.boundShare());
+        if (memory) if (trigger.hold.refused(lead.term, now_ms, self.boundShare())) self.noteStartsHeld("trigger", .memory, trigger.ns, trigger.workflow_name_owned, self.shardOf(), self.boundShare());
+        if (quota) {
+            const part = self.boundPart(trigger.ns);
+            if (trigger.quota_hold.refused(lead.term, now_ms, part)) self.noteStartsHeld("trigger", .quota, trigger.ns, trigger.workflow_name_owned, self.shardOf(), part);
+        }
+    }
+
+    /// Namespace `ns`'s part bound on this shard, 0 for none.
+    fn boundPart(self: *const WorkflowHandler, ns: NamespaceId) u64 {
+        return if (@import("../settings/machine.zig").boundQuota(self.defsRead(), ns)) |q| q.part_bytes else 0;
     }
 
     fn shardOf(self: *const WorkflowHandler) u16 {
@@ -9844,7 +9928,6 @@ test "step executor: a call that can't wait, held over its action's shard's memo
 }
 
 test "step executor: a call that can't wait, held at its callee's namespace's quota, waits anyway, says so once, and starts once there is room" {
-    const hq = @import("../budget/history_quota.zig");
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
@@ -10269,15 +10352,82 @@ test "a step calling an action named longer than an action may be fails, saying 
 
 /// A start of `run` as this leader's entry `index` in `term`, applied: refused
 /// for memory, or admitted, `made` saying whether it created its run.
-fn decidedStart(handler: *WorkflowHandler, eb: []u8, comptime ns: NamespaceId, comptime run: []const u8, value: []const u8, term: u64, index: u64, verdict: enum { memory, made, idem }) void {
+fn decidedStart(handler: *WorkflowHandler, eb: []u8, comptime ns: NamespaceId, comptime run: []const u8, value: []const u8, term: u64, index: u64, verdict: enum { memory, quota, made, idem }) void {
     const e = entry_mod.buildCommandEntry(.workflow_start, entry_mod.Flags.NONE, term, index, 0, ns, testKey(ns, run), value, eb).?;
     var out = Result.start(&e);
     switch (verdict) {
         .memory => out.refuse(.limit, .memory_budget, "shard 0 memory: past its share"),
+        .quota => out.refuse(.limit, .history_quota, "limit: ns 16 history 1+1 of 1 on shard 0"),
         .made => out.putInt(u8, 1),
         .idem => out.putInt(u8, 0),
     }
     handler.entryApplied(&e, &out, .{ .term = term, .last_index = index + 9 });
+}
+
+test "workflow schedule: at its namespace's quota a slot isn't proposed; refused for the quota it waits its own, longer, backoff, then fires once, late" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    const store = &shard.defaultPartition().store;
+
+    const interval: i64 = 3_600_000;
+    const now = @import("stdx").time.milliTimestamp();
+    const anchor = now - 10 * interval;
+    try testing.expectEqual(.created, shard.namespace_handler.applyCreate("a"));
+    try handler.registerSchedule(TEST_NS_A, "wf", .{ .interval_ms = interval, .max_concurrent = 0 }, anchor);
+    const sched = handler.schedules.getPtr(testKey(TEST_NS_A, "wf")).?;
+    const latest = anchor + 10 * interval;
+    const term = shard.raft_node.current_term;
+
+    // At the quota: nothing proposed, counted held at the quota alone.
+    try hq.setForTest(store, TEST_NS_A, 1 << 30, 1 << 30);
+    var before = shard.raft_node.log.lastIndex();
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before, shard.raft_node.log.lastIndex());
+    try testing.expectEqual(@as(?u64, 1 << 30), sched.quota_hold.share);
+    try testing.expectEqual(@as(u64, 1), handler.quota_held);
+    try testing.expectEqual(@as(u64, 0), handler.memory_held);
+    // Another namespace's usage holds nothing of this one.
+    try hq.setForTest(store, TEST_NS_A, 1 << 30, 0);
+    try hq.setForTest(store, .default, 1 << 30, 1 << 30);
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before + 1, shard.raft_node.log.lastIndex());
+    try testing.expectEqual(latest, sched.proposed_ms);
+    try testing.expectEqual(@as(u64, 0), handler.quota_held);
+
+    // Refused at apply for the quota: the slot is free again, after the
+    // quota's wait, which is its own and longer than memory's past a minute.
+    var buf: [256]u8 = undefined;
+    var key_buf: [128]u8 = undefined;
+    var eb: [512]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "_schedule:16:wf:{d}", .{latest});
+    const value = startValue(&buf, "wf", "schedule_started", key);
+    decidedStart(&handler, &eb, TEST_NS_A, "r1", value, term, 50, .quota);
+    try testing.expectEqual(std.math.minInt(i64), sched.proposed_ms);
+    try testing.expectEqual(@as(u32, 1), sched.quota_hold.refusals);
+    try testing.expectEqual(@as(u32, 0), sched.hold.refusals);
+    before = shard.raft_node.log.lastIndex();
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before, shard.raft_node.log.lastIndex());
+    sched.quota_hold.until_ms = 0;
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before + 1, shard.raft_node.log.lastIndex());
+    // Refused again, it waits twice as long; past a minute the quota's
+    // wait outgrows memory's, up to 10 minutes.
+    decidedStart(&handler, &eb, TEST_NS_A, "r2", value, term, 60, .quota);
+    try testing.expectEqual(@as(u32, 2), sched.quota_hold.refusals);
+    try testing.expect(sched.quota_hold.until_ms >= now + @as(i64, @intCast(WorkflowHandler.quotaRetryMs(2))));
+    try testing.expect(WorkflowHandler.quotaRetryMs(8) > WorkflowHandler.callRetryMs(8));
+    // A run it started ends the wait.
+    decidedStart(&handler, &eb, TEST_NS_A, "r3", value, term, 70, .made);
+    try testing.expectEqual(@as(u32, 0), sched.quota_hold.refusals);
 }
 
 test "workflow schedule: at its shard's memory share a slot isn't proposed; refused for memory it waits, then fires once, late" {
@@ -10398,6 +10548,44 @@ test "workflow handler: a trigger's start refused for memory waits before readin
     try testing.expectEqual(@as(u32, 0), t.hold.refusals);
 }
 
+test "workflow handler: a trigger at its namespace's quota reads nothing; its start refused for the quota waits once for the chain it broke, on the quota's hold alone" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    createTestDef(&handler, testKey(.default, "wf"), "wf", "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1\",\"trigger\":{\"stream\":\"events\"},\"start\":{\"wait_for_signal\":{\"type\":\"never\"},\"transitions\":{\"success\":\"flo.Completed\"}}}");
+    const t = handler.stream_triggers.getPtr(testKey(.default, "wf")).?;
+    // At the quota: its poll reads nothing, and it is counted held.
+    try hq.setForTest(&shard.defaultPartition().store, .default, 1 << 30, 1 << 30);
+    handler.triggers_dirty = true;
+    handler.tickStreamTriggers(&shard);
+    try testing.expectEqual(@as(?u64, 1 << 30), t.quota_hold.share);
+    try testing.expect(t.proposed == null);
+    // A refusal at apply breaks its chain and waits, on the quota's hold.
+    const at: StreamID = .{ .timestamp_ms = 1800, .sequence = 0 };
+    var buf: [256]u8 = undefined;
+    var kb: [128]u8 = undefined;
+    var eb: [512]u8 = undefined;
+    const value = triggerStartValue(&buf, &kb, "wf", .default, 1, "events", 1700, 0, .{ 0, 0 });
+    t.proposed = .{ .at = at, .term = 3, .chain = at };
+    decidedStart(&handler, &eb, .default, "r1", value, 3, 31, .quota);
+    try testing.expect(t.proposed == null);
+    try testing.expectEqual(@as(u32, 1), t.quota_hold.refusals);
+    try testing.expectEqual(@as(u32, 0), t.hold.refusals);
+    // The rest of its chain, refused: no more waiting.
+    decidedStart(&handler, &eb, .default, "r2", value, 3, 35, .quota);
+    try testing.expectEqual(@as(u32, 1), t.quota_hold.refusals);
+    // A run made above it ends the wait.
+    decidedStart(&handler, &eb, .default, "r3", value, 3, 51, .made);
+    try testing.expectEqual(@as(u32, 0), t.quota_hold.refusals);
+}
+
 test "workflow handler: a trigger re-created on its stream keeps what its leader read, its resync and its wait; moved to another stream it begins again" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
@@ -10496,6 +10684,40 @@ test "workflow schedule: re-created, a schedule keeps its hold, as a trigger doe
     const h = handler.schedules.getPtr(testKey(TEST_NS_A, "wf")).?.hold;
     try testing.expectEqual(@as(u32, 2), h.refusals);
     try testing.expectEqual(@as(i64, 5), h.said_until_ms);
+}
+
+test "a child at its namespace's quota is answered over_quota by its leader, not started, and its parent waits" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    registerTestAction(&shard, "step-a");
+    createTestDef(&handler, testKey(.default, "par-wf"), "par-wf", test_parent_json);
+    createTestDef(&handler, testKey(.default, "kid-wf"), "kid-wf", test_kid_json);
+    createTestRun(&handler, testKey(.default, "par"), "par", "par-wf");
+    handler.advanceWorkflow(&shard, testKey(.default, "par"));
+    settleTest(&shard);
+    const run = handler.inspect(testKey(.default, "par")).?;
+    var kb: [ae.MAX_RUN_ID]u8 = undefined;
+    const kid_id = kb[0..run.pending_action_run_id_owned.?.len];
+    @memcpy(kid_id, run.pending_action_run_id_owned.?);
+    const store = &shard.defaultPartition().store;
+    try testing.expect(children_mod.parentOf(.{ .store = store }, .default, kid_id) != null);
+    // The child's reserve won't fit: the leader answers the call itself.
+    try hq.setForTest(store, .default, runs_machine.reserveOf("kid-wf", kid_id) - 1, 0);
+    startTestChildren(&handler, &shard);
+    try testing.expect(children_mod.parentOf(.{ .store = store }, .default, kid_id) == null);
+    var rk: [KEY_PREFIX + ae.MAX_RUN_ID]u8 = undefined;
+    try testing.expect(handler.appliedRun(writeKey(&rk, .default, kid_id)) == null);
+    const c = WorkflowHandler.callOf(&shard, handler.inspect(testKey(.default, "par")).?, kid_id).?;
+    try testing.expectEqual(calls_mod.State.over_quota, c.state);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.inspect(testKey(.default, "par")).?.status);
 }
 
 test "a child its shard is at its memory share for is answered over_budget by its leader, not started, and its parent waits" {

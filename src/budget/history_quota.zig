@@ -116,6 +116,20 @@ pub fn verdict(comptime Own: type, view: *View, ns: NamespaceId, own: u64, arm: 
     return null;
 }
 
+/// A leader's check before it proposes a start or a child of `ns` that
+/// would reserve `own`: the same rule as `verdict`, from the committed
+/// store alone. It can race a chunk landing between the read and the
+/// apply, so the apply's refusal stays handled.
+pub fn preCheck(read: ReadView, ns: NamespaceId, own: u64) ?Over {
+    const part = (settings.boundQuota(read, ns) orelse return null).part_bytes;
+    if (part == settings.NO_QUOTA) return null;
+    const use = hm.usageOf(read, ns).bytes;
+    const reserved = reservedOf(WorkflowReserved, read, ns) +| reservedOf(ActionReserved, read, ns) +| own;
+    const over: Over = .{ .use = use, .reserved = reserved, .part = part, .own = own };
+    if (use >= part or use +| reserved > part) return over;
+    return null;
+}
+
 /// The refusal for an admission `o` holds back, under 128 bytes, from the
 /// namespace's own id and figures alone. A run whose own reserve is past
 /// the part is told so: deleting runs can't admit it, and a smaller run or
