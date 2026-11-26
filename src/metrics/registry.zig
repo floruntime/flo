@@ -322,6 +322,9 @@ pub const ProcessingMetrics = struct {
     records_processed_total: Atomic(u64) = Atomic(u64).init(0),
     /// Total records dropped (late data, rejected)
     records_dropped_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Loop turns a shard took without sleeping only because a pipeline
+    /// was due to read.
+    unslept_ticks_total: Atomic(u64) = Atomic(u64).init(0),
     /// Sink batches proposed: a pipeline's writes with the cursor they move it to.
     sink_batches_total: Atomic(u64) = Atomic(u64).init(0),
     /// Records skipped because their writes don't fit one entry.
@@ -403,6 +406,7 @@ pub const ProcessingMetrics = struct {
         jobs_cancelled_total: u64,
         records_processed_total: u64,
         records_dropped_total: u64,
+        unslept_ticks_total: u64,
         sink_batches_total: u64,
         records_too_large_total: u64,
         errors_total: u64,
@@ -419,6 +423,7 @@ pub const ProcessingMetrics = struct {
             .jobs_cancelled_total = self.jobs_cancelled_total.load(.monotonic),
             .records_processed_total = self.records_processed_total.load(.monotonic),
             .records_dropped_total = self.records_dropped_total.load(.monotonic),
+            .unslept_ticks_total = self.unslept_ticks_total.load(.monotonic),
             .sink_batches_total = self.sink_batches_total.load(.monotonic),
             .records_too_large_total = self.records_too_large_total.load(.monotonic),
             .errors_total = self.errors_total.load(.monotonic),
@@ -1921,6 +1926,9 @@ fn writeProcessingMetrics(writer: anytype, snapshot: ProcessingMetrics.Snapshot)
     try writer.print("# HELP flo_processing_records_dropped_total Total records dropped\n", .{});
     try writer.print("# TYPE flo_processing_records_dropped_total counter\n", .{});
     try writer.print("flo_processing_records_dropped_total {d}\n", .{snapshot.records_dropped_total});
+    try writer.print("# HELP flo_processing_unslept_ticks_total Loop turns a shard took without sleeping only because a pipeline was due\n", .{});
+    try writer.print("# TYPE flo_processing_unslept_ticks_total counter\n", .{});
+    try writer.print("flo_processing_unslept_ticks_total {d}\n", .{snapshot.unslept_ticks_total});
 
     try writer.print("# HELP flo_processing_sink_batches_total Sink batches proposed: a pipeline's writes with the cursor they move it to\n", .{});
     try writer.print("# TYPE flo_processing_sink_batches_total counter\n", .{});
