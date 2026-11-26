@@ -190,6 +190,40 @@ pub fn setHistoryForTest(store: *store_mod.Store, own: u16, ns: ns_table.Id, byt
     } else store.link(OutNsFam.ID, try store.allocRecord(k), try store.allocator.dupe(u8, v));
 }
 
+/// Why this group's history lane's per-namespace rows aren't its outbox's
+/// messages, or null: each namespace's `bytes` is its messages' payloads
+/// still in the outbox, and its `delivered` those of them its inbound has
+/// taken. With the history usage's own rule, it holds a namespace's
+/// in-flight history to what its sends and lands put there.
+pub fn historyTakenRule(read: ReadView, a: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
+    const own: u16 = if (read.store.place) |pl| pl.group else 0;
+    const meta = metaOf(read, own, .history);
+    const applied = if (inOf(read, own, .history)) |i| i.applied else 0;
+    var sums: std.AutoHashMapUnmanaged(u32, NsBytes.Value) = .empty;
+    defer sums.deinit(a);
+    var seq = meta.acked + 1;
+    while (seq < meta.next_seq) : (seq += 1) {
+        var ok: [OUT_KEY]u8 = undefined;
+        const out = (read.get(OutFam, outKey(&ok, own, .history, seq)) catch return "a history outbox message could not be read") orelse return "a history outbox message is missing";
+        const gop = try sums.getOrPut(a, out.v.origin_ns);
+        if (!gop.found_existing) gop.value_ptr.* = .{ .bytes = 0, .delivered = 0 };
+        gop.value_ptr.bytes += out.v.payload.len;
+        if (seq <= applied) gop.value_ptr.delivered += out.v.payload.len;
+    }
+    var pb: [1 + OUT_NS.len + CHAN_LEN]u8 = undefined;
+    var it = read.range(OutNsFam, outNsPrefix(&pb, own, .history));
+    var rows: usize = 0;
+    while (it.next() catch return "the history lane's namespace rows could not be read") |item| {
+        rows += 1;
+        const id = std.mem.readInt(u32, item.key[item.key.len - 4 ..][0..4], .big);
+        const want = sums.get(id) orelse return "a history lane's namespace row holds bytes no outbox message has";
+        if (item.value.v.bytes != want.bytes) return "a history lane's namespace bytes aren't its outbox messages'";
+        if (item.value.v.delivered != want.delivered) return "a history lane's namespace taken bytes aren't what its inbound took";
+    }
+    if (rows != sums.count()) return "a namespace's history outbox messages have no row";
+    return null;
+}
+
 /// A history message of `ns`, `len` bytes, taken by its inbound: landed,
 /// refused or skipped, its bytes no longer in flight.
 fn takeHistory(view: *View, own: u16, ns: ns_table.Id, len: u64) ApplyError!void {

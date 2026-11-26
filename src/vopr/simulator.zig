@@ -3164,6 +3164,7 @@ pub const Simulator = struct {
         var arena = std.heap.ArenaAllocator.init(store.allocator);
         defer arena.deinit();
         if (hm.usageRule(.{ .store = store }, arena.allocator()) catch return "the history rows could not be read") |why| return why;
+        if (@import("../contract/channels.zig").historyTakenRule(.{ .store = store }, arena.allocator()) catch return "the history lane could not be read") |why| return why;
         // Each store holds one machine's runs: the other's rule finds none.
         if (@import("../workflow/runs_machine.zig").reserveRule(store, arena.allocator()) catch return "the runs could not be read") |why| return why;
         return @import("../actions/machine.zig").reserveRule(store, arena.allocator()) catch "the runs could not be read";

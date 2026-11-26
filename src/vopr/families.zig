@@ -1291,6 +1291,7 @@ pub const Actions = struct {
         if (hm.ruleOf(hm.Actions, self.read(), arena.allocator()) catch return "the history rows could not be read") |why| return why;
         if (self.store.history_usage_drift != 0) return "a history usage subtract went past zero";
         if (hm.usageRule(self.read(), arena.allocator()) catch return "the history rows could not be read") |why| return why;
+        if (@import("../contract/channels.zig").historyTakenRule(self.read(), arena.allocator()) catch return "the history lane could not be read") |why| return why;
         return action_machine.reserveRule(&self.store, arena.allocator()) catch "the runs could not be read";
     }
 

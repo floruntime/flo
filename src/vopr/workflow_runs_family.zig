@@ -1101,6 +1101,7 @@ pub const WorkflowRuns = struct {
         if (!sweep) return if (touched) |t| self.runRule(store, a, t, true) else null;
         if (store.history_usage_drift != 0) return "a history usage subtract went past zero";
         if (try hm.usageRule(rv, a)) |why| return why;
+        if (try @import("../contract/channels.zig").historyTakenRule(rv, a)) |why| return why;
         if (try rm.reserveRule(store, a)) |why| return why;
         // On the store alone: counts, idempotency keys naming their run, and
         // a run's wait agreeing with its status.
