@@ -289,14 +289,15 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
             if (info.history_quota) |q| ctx.print("History quota: {s} over every shard ({s})\n", .{ bytesText(&qb, q), if (info.history_quota_own) "its own" else "the default" }) else ctx.print("History quota: none ({s})\n", .{if (info.history_quota_own) "its own" else "the default"});
             var table = output.Table.init(ctx.allocator);
             defer table.deinit();
-            for ([_][]const u8{ "SHARD", "PART", "USAGE", "RESERVED", "HELD", "ORPHANS" }) |h| table.addColumn(h, .left) catch return error.OutOfMemory;
+            for ([_][]const u8{ "SHARD", "PART", "USAGE", "IN FLIGHT", "RESERVED", "HELD", "ORPHANS" }) |h| table.addColumn(h, .left) catch return error.OutOfMemory;
             var it = info.shards.iterator();
             while (it.next() catch return outcome.malformed(ctx, "namespace.info answer")) |s| {
-                var b: [6][24]u8 = undefined;
+                var b: [7][24]u8 = undefined;
                 table.addRow(&.{
                     std.fmt.bufPrint(&b[0], "{d}", .{s.shard}) catch unreachable,
                     if (!s.bound) "not bound" else if (s.part_bytes) |p| bytesText(&b[1], p) else "none",
                     bytesText(&b[2], s.usage_bytes),
+                    bytesText(&b[6], s.in_flight_bytes),
                     bytesText(&b[4], s.reserved_workflow_bytes +| s.reserved_action_bytes),
                     if (s.held_runs) |h| std.fmt.bufPrint(&b[5], "{d}", .{h}) catch unreachable else "-",
                     std.fmt.bufPrint(&b[3], "{d}", .{s.orphans}) catch unreachable,

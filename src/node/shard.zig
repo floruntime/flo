@@ -6049,6 +6049,7 @@ pub const Shard = struct {
             sm.history_usage_drift.store(self.defaultPartition().store.history_usage_drift, .monotonic);
             sm.quota_reserve_drift.store(self.defaultPartition().store.quota_reserve_drift, .monotonic);
             sm.quota_refusals.store(self.defaultPartition().store.quota_refusals, .monotonic);
+            sm.quota_held_runs.store(if (self.raft_node.role == .leader) self.workflow_handler.quota_held_runs else 0, .monotonic);
             sm.runs_unlisted[0].store(self.workflow_handler.missing_runs, .monotonic);
             sm.runs_unlisted[1].store(self.actions_handler.unlisted_runs, .monotonic);
             for (&sm.ts_late, self.defaultPartition().store.ts_late_points) |*m, n| m.store(n, .monotonic);
@@ -11094,6 +11095,41 @@ test "settings: a quota bind puts each part, skipping one older than the bound a
     // A later publish rebinds; one as old as the bound one too.
     _ = try applySettings(&shard, 3, .settings_quota_bind, try quotaBind(&buf, &.{.{ .ns = a.int(), .part_bytes = 300, .published_index = 5 }}));
     try std.testing.expectEqual(@as(u64, 300), settings_machine.boundQuota(read, a).?.part_bytes);
+}
+
+test "settings: a quota bind eases a namespace whose part it raises or first binds, and none whose part it keeps or lowers" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = shard.applyCommitted();
+    shard.raft_node.role = .leader;
+    // The apply's mark reaches the leader's holds; the store keeps none.
+    const store = &shard.defaultPartition().store;
+    const wf = shard.workflow_handler;
+    const a: ns_table.Id = .of(16);
+    var buf: [settings_machine.SetQuotaBind.max_size]u8 = undefined;
+    wf.quota_eased = .{};
+    _ = try applySettings(&shard, 1, .settings_quota_bind, try quotaBind(&buf, &.{.{ .ns = a.int(), .part_bytes = 100, .published_index = 5 }}));
+    try std.testing.expect(wf.quota_eased.has(a.int()));
+    try std.testing.expect(!store.quota_eased.any());
+    wf.quota_eased = .{};
+    _ = try applySettings(&shard, 2, .settings_quota_bind, try quotaBind(&buf, &.{.{ .ns = a.int(), .part_bytes = 50, .published_index = 6 }}));
+    try std.testing.expect(!wf.quota_eased.any());
+    _ = try applySettings(&shard, 3, .settings_quota_bind, try quotaBind(&buf, &.{.{ .ns = a.int(), .part_bytes = 50, .published_index = 7 }}));
+    try std.testing.expect(!wf.quota_eased.any());
+    _ = try applySettings(&shard, 4, .settings_quota_bind, try quotaBind(&buf, &.{.{ .ns = a.int(), .part_bytes = 51, .published_index = 8 }}));
+    try std.testing.expect(wf.quota_eased.has(a.int()));
+    try std.testing.expect(!wf.quota_eased.all);
+    // A follower clears the mark and notes nothing.
+    wf.quota_eased = .{};
+    shard.raft_node.role = .follower;
+    _ = try applySettings(&shard, 5, .settings_quota_bind, try quotaBind(&buf, &.{.{ .ns = a.int(), .part_bytes = 60, .published_index = 9 }}));
+    try std.testing.expect(!wf.quota_eased.any());
+    try std.testing.expect(!store.quota_eased.any());
+    shard.raft_node.role = .leader;
 }
 
 test "quota binds: a namespace with none published binds nothing, a part bound changes only when it differs, and an older publish never binds again" {

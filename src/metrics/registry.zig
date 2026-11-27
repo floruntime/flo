@@ -822,6 +822,9 @@ pub const ShardMetrics = struct {
     /// Starts, invokes and signals refused here at a namespace's run-history
     /// quota, since start.
     quota_refusals: Atomic(u64) = Atomic(u64).init(0),
+    /// Workflow runs whose steps this shard's leader holds at their
+    /// namespace's run-history quota, as of its last pass; 0 off a leader.
+    quota_held_runs: Atomic(u64) = Atomic(u64).init(0),
     /// Runs a run list passed over, its index row there but the run gone
     /// or its entry unlistable (a Flo bug): workflow runs, action runs.
     runs_unlisted: [2]Atomic(u64) = @splat(Atomic(u64).init(0)),
@@ -1090,6 +1093,7 @@ pub const ShardMetrics = struct {
         history_usage_drift: u64,
         quota_reserve_drift: u64,
         quota_refusals: u64,
+        quota_held_runs: u64,
         runs_unlisted: [2]u64,
         ts_late: [TS_LATE_EDGES.len]u64,
         channel_sender_bugs: [SENDER_BUGS]u64,
@@ -1167,6 +1171,7 @@ pub const ShardMetrics = struct {
             .history_usage_drift = self.history_usage_drift.load(.monotonic),
             .quota_reserve_drift = self.quota_reserve_drift.load(.monotonic),
             .quota_refusals = self.quota_refusals.load(.monotonic),
+            .quota_held_runs = self.quota_held_runs.load(.monotonic),
             .runs_unlisted = .{ self.runs_unlisted[0].load(.monotonic), self.runs_unlisted[1].load(.monotonic) },
             .ts_late = blk: {
                 var v: [TS_LATE_EDGES.len]u64 = undefined;
@@ -2076,6 +2081,7 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_history_usage_drift_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.history_usage_drift });
     try writer.print("flo_shard_quota_reserve_drift_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.quota_reserve_drift });
     try writer.print("flo_shard_quota_refusals_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.quota_refusals });
+    try writer.print("flo_shard_workflow_quota_held_runs{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.quota_held_runs });
     for ([_][]const u8{ "workflow", "action" }, snap.runs_unlisted) |family, n| try writer.print("flo_shard_runs_unlisted_total{{shard_id=\"{d}\",family=\"{s}\"}} {d}\n", .{ snap.shard_id, family, n });
     for (TS_LATE_EDGES, snap.ts_late) |edge, n| try writer.print("flo_ts_late_points_total{{shard_id=\"{d}\",behind=\"{s}\"}} {d}\n", .{ snap.shard_id, edge, n });
     for (std.enums.values(SenderBug), snap.channel_sender_bugs) |bug, n| try writer.print("flo_shard_channel_sender_bugs_total{{shard_id=\"{d}\",reason=\"{s}\"}} {d}\n", .{ snap.shard_id, @tagName(bug), n });
@@ -2292,6 +2298,7 @@ test "registry: a shard's pool share has no line until one is bound" {
     try testing.expect(std.mem.indexOf(u8, text, "flo_shard_pool_share_bytes{shard_id=\"0\"}") == null);
     try testing.expect(std.mem.indexOf(u8, text, "flo_shard_memory_refusals_total{shard_id=\"1\"} 0\n") != null);
     try testing.expect(std.mem.indexOf(u8, text, "flo_shard_history_usage_drift_total{shard_id=\"1\"} 0\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "flo_shard_workflow_quota_held_runs{shard_id=\"1\"} 0\n") != null);
     try testing.expect(std.mem.indexOf(u8, text, "flo_shard_runs_unlisted_total{shard_id=\"1\",family=\"action\"} 0\n") != null);
 }
 
