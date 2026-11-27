@@ -262,29 +262,19 @@ test "e2e/names: every name a request carries refuses control characters: consum
         if (!r.contains(says)) std.debug.print("{s}: {s} {s}\n", .{ c.file, r.stdout, r.stderr });
         try testing.expect(r.contains(says));
     }
-    // A create whose request names another workflow than its definition is
-    // refused, and one with a control key too, by the key or by the match.
-    const proto = @import("src").protocol.proto;
-    var out: [512]u8 = undefined;
-    const body = "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1.0.0\",\"start\":{\"wait_for_signal\":{\"type\":\"go\"},\"transitions\":{\"success\":\"flo.Completed\"}}}";
-    for ([_][]const u8{ "other", "w\nf" }) |key| {
-        const r = try rawCall(ctx, proto.OpCode.workflow_create, "", key, body, &out);
-        try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
-        try testing.expect(std.mem.indexOf(u8, r.data, "workflow name and its definition's name differ") != null);
-    }
-    const list = try ctx.execCapture(&.{ "workflow", "list" });
-    try testing.expect(std.mem.indexOf(u8, list, "other") == null);
-    try testing.expect(std.mem.indexOf(u8, list, "w\nf") == null);
 }
 
 test "e2e/names: the CLI keys a workflow create by its definition's own name, however its text runs" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
-    for ([_]struct { def: []const u8, file: []const u8, name: []const u8 }{
+    // Stored under the parsed name, not one taken from the file name.
+    const proto = @import("src").protocol.proto;
+    var out: [4096]u8 = undefined;
+    for ([_]struct { def: []const u8, file: []const u8, stem: []const u8, name: []const u8 }{
         // A nested "name" comes first in the text.
-        .{ .def = "{\"kind\":\"Workflow\",\"plans\":{\"p\":{\"executors\":[{\"name\":\"e1\",\"run\":\"@actions/send\"}]}},\"name\":\"nested\",\"version\":\"1.0.0\",\"start\":{\"run\":\"@plan/p\",\"transitions\":{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}", .file = "e2e-name-nested.yaml", .name = "nested" },
+        .{ .def = "{\"kind\":\"Workflow\",\"plans\":{\"p\":{\"executors\":[{\"name\":\"e1\",\"run\":\"@actions/send\"}]}},\"name\":\"nested\",\"version\":\"1.0.0\",\"start\":{\"run\":\"@plan/p\",\"transitions\":{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}", .file = "e2e-file-one.yaml", .stem = "e2e-file-one", .name = "nested" },
         // A comment after the name.
-        .{ .def = "kind: Workflow\nname: commented  # the name\nversion: 1.0.0\nstart:\n  wait_for_signal:\n    type: go\n  transitions:\n    success: flo.Completed\n", .file = "e2e-name-comment.yaml", .name = "commented" },
+        .{ .def = "kind: Workflow\nname: commented  # the name\nversion: 1.0.0\nstart:\n  wait_for_signal:\n    type: go\n  transitions:\n    success: flo.Completed\n", .file = "e2e-file-two.yaml", .stem = "e2e-file-two", .name = "commented" },
     }) |c| {
         const path = try stdx.testing.writeTempYaml(testing.allocator, c.def, c.file);
         defer stdx.testing.cleanupTempFile(testing.allocator, path);
@@ -294,5 +284,54 @@ test "e2e/names: the CLI keys a workflow create by its definition's own name, ho
         const says = try std.fmt.bufPrint(&want, "Created workflow: {s}\n", .{c.name});
         if (!std.mem.eql(u8, r.stdout, says)) std.debug.print("{s}: {s} {s}\n", .{ c.file, r.stdout, r.stderr });
         try testing.expectEqualStrings(says, r.stdout);
+        try testing.expectEqual(@as(u8, 0), (try rawCall(ctx, proto.OpCode.workflow_get_definition, "", c.name, "", &out)).status);
+        try testing.expectEqual(@backingInt(proto.StatusCode.not_found), (try rawCall(ctx, proto.OpCode.workflow_get_definition, "", c.stem, "", &out)).status);
     }
+}
+
+test "e2e/names: a workflow create or signal the server must refuse is refused by status: a key unlike the definition's name, a control byte in a trigger stream or a signal type" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const proto = @import("src").protocol.proto;
+    const bad = @backingInt(proto.StatusCode.bad_request);
+    var out: [512]u8 = undefined;
+
+    // Key "a", definition named "b": refused, and neither name is stored.
+    const b = "{\"kind\":\"Workflow\",\"name\":\"b\",\"version\":\"1.0.0\",\"start\":{\"wait_for_signal\":{\"type\":\"go\"},\"transitions\":{\"success\":\"flo.Completed\"}}}";
+    for ([_][]const u8{ "a", "b\n" }) |key| {
+        const r = try rawCall(ctx, proto.OpCode.workflow_create, "", key, b, &out);
+        try testing.expectEqual(bad, r.status);
+        try testing.expectEqualStrings("bad request: the request's workflow name and its definition's name differ", r.data);
+    }
+    for ([_][]const u8{ "a", "b" }) |name| {
+        const r = try rawCall(ctx, proto.OpCode.workflow_get_definition, "", name, "", &out);
+        try testing.expectEqual(@backingInt(proto.StatusCode.not_found), r.status);
+    }
+
+    // A control byte in a trigger stream, or in a wait_for_signal type.
+    for ([_]struct { name: []const u8, def: []const u8, says: []const u8 }{
+        .{ .name = "trig", .def = "{\"kind\":\"Workflow\",\"name\":\"trig\",\"version\":\"1.0.0\",\"trigger\":{\"stream\":\"in\\u0009x\"},\"start\":{\"wait_for_signal\":{\"type\":\"go\"},\"transitions\":{\"success\":\"flo.Completed\"}}}", .says = "a stream name" },
+        .{ .name = "sig", .def = "{\"kind\":\"Workflow\",\"name\":\"sig\",\"version\":\"1.0.0\",\"start\":{\"wait_for_signal\":{\"type\":\"g\\u000ao\"},\"transitions\":{\"success\":\"flo.Completed\"}}}", .says = "a signal type" },
+    }) |c| {
+        const r = try rawCall(ctx, proto.OpCode.workflow_create, "", c.name, c.def, &out);
+        try testing.expectEqual(bad, r.status);
+        var want: [128]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "bad request: {s} must not contain control characters (bytes 0x00-0x1f or 0x7f)", .{c.says}), r.data);
+        const got = try rawCall(ctx, proto.OpCode.workflow_get_definition, "", c.name, "", &out);
+        try testing.expectEqual(@backingInt(proto.StatusCode.not_found), got.status);
+    }
+
+    // A signal with a control type, to a run that waits: refused, and the
+    // run still waits for its own signal.
+    const wpath = try stdx.testing.writeTempYaml(testing.allocator, b, "e2e-name-raw-b.yaml");
+    defer stdx.testing.cleanupTempFile(testing.allocator, wpath);
+    try ctx.exec(&.{ "workflow", "create", "-f", wpath });
+    try ctx.exec(&.{ "workflow", "start", "b", "{}", "--run-id", "rb1" });
+    var sig: [8]u8 = undefined;
+    std.mem.writeInt(u16, sig[0..2], 3, .little);
+    @memcpy(sig[2..5], "g\x1bo");
+    const r = try rawCall(ctx, proto.OpCode.workflow_signal, "", "rb1", sig[0..5], &out);
+    try testing.expectEqual(bad, r.status);
+    try testing.expectEqualStrings("bad request: a signal type must not contain control characters (bytes 0x00-0x1f or 0x7f)", r.data);
+    try testing.expect(try waitFor(ctx, &.{ "workflow", "status", "rb1" }, "waiting"));
 }
