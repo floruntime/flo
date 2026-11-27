@@ -5201,8 +5201,10 @@ pub const WorkflowHandler = struct {
         var hit = self.held_by.keyIterator();
         while (hit.next()) |h| {
             if (h.kind != .quota) continue;
+            if (self.quota_episodes.get(h.ns.int())) |e| if (e.open) continue;
+            // A list still draining after its quota let go opens nothing.
+            if (!holds(shard, h.*)) continue;
             const gop = self.quota_episodes.getOrPut(self.allocator, h.ns.int()) catch continue;
-            if (gop.found_existing and gop.value_ptr.open) continue;
             const said = !gop.found_existing or now_ms -| gop.value_ptr.said_at_ms >= QUOTA_LOG_MIN_MS;
             gop.value_ptr.* = .{ .open = true, .said = said, .said_at_ms = if (said) now_ms else gop.value_ptr.said_at_ms };
             if (said) {
@@ -11237,6 +11239,52 @@ test "workflow quota: a namespace's stretch at its quota logs held once and no l
     // A leader's step-down forgets every stretch.
     handler.clearHeld();
     try testing.expectEqual(@as(u32, 0), handler.quota_episodes.count());
+}
+
+test "workflow quota: a stretch whose release takes more than a pass ends once, and its draining list opens no other" {
+    const Eased = @import("../contract/store.zig").Eased;
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    quotaTestHandler(&handler, &shard);
+    const store = &shard.defaultPartition().store;
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    const N = 100;
+    var kb: [N][KEY_PREFIX + 8]u8 = undefined;
+    var keys: [N][]const u8 = undefined;
+    for (0..N) |i| {
+        var nb: [8]u8 = undefined;
+        keys[i] = writeKey(&kb[i], .default, std.fmt.bufPrint(&nb, "d{d}", .{i}) catch unreachable);
+        createTestRun(&handler, keys[i], "", "test-wf");
+    }
+    try hq.setForTest(store, .default, 1 << 30, 1 << 30);
+    for (keys) |k| handler.advanceWorkflow(&shard, k);
+    const quota: WorkflowHandler.Hold = .{ .ns = .default, .kind = .quota };
+    try testing.expectEqual(@as(usize, N), handler.holdCount(quota));
+    const t0: i64 = 1_000_000;
+    handler.checkPendingActionsAt(&shard, t0);
+    try testing.expectEqual(@as(u64, 1), handler.quota_lines);
+
+    // Let go past the interval: the first pass ends the stretch, and the
+    // passes that drain the rest say nothing more.
+    try hq.setForTest(store, .default, 1 << 30, 0);
+    var own: Eased = .{};
+    own.add(NamespaceId.default.int());
+    handler.noteEased(own);
+    var now = t0 + 2 * WorkflowHandler.QUOTA_LOG_MIN_MS;
+    handler.checkPendingActionsAt(&shard, now);
+    try testing.expectEqual(@as(u64, 2), handler.quota_lines);
+    try testing.expect(handler.holdCount(quota) > 0);
+    while (handler.holdCount(quota) > 0) {
+        settleTest(&shard);
+        now += 1;
+        handler.checkPendingActionsAt(&shard, now);
+        try testing.expectEqual(@as(u64, 2), handler.quota_lines);
+    }
 }
 
 test "workflow quota: a held run cancelled while its namespace is at its quota leaves the stretch open; it ends only once the quota no longer holds" {
