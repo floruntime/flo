@@ -140,6 +140,10 @@ pub const WorkflowHandler = struct {
     /// stream run on: monotonic, so a wall-clock step can't stop a trigger
     /// polling. A test seam.
     mono_ms: *const fn () u64 = @import("stdx").time.monotonicMs,
+    /// The clock a schedule's or trigger's start holds are timed on, from
+    /// a start refused at apply (`startDecided`) to the polls that wait it
+    /// out. A test seam.
+    wall_clock_ms: *const fn () i64 = @import("stdx").time.milliTimestamp,
 
     /// Runs not ended that wait on nothing (`workflow.run`'s wait), by key,
     /// owned: a leader's index of applied state (`leadCaches`), kept as
@@ -4252,7 +4256,7 @@ pub const WorkflowHandler = struct {
         const now_ms = self.triggerNowMs();
         // Holds are timed on the wall clock, as a schedule's are, and by
         // the starts refused at apply (`startDecided`).
-        const wall_ms = @import("stdx").time.milliTimestamp();
+        const wall_ms = self.wall_clock_ms();
 
         // A `stream_appended` wake flag (push-wake) forces an immediate poll of
         // every trigger this tick, bypassing each trigger's poll-interval timer.
@@ -4918,7 +4922,7 @@ pub const WorkflowHandler = struct {
         // A run made, not an answer from an earlier one.
         var r = out.reader();
         const made = out.refused() == null and (r.int(u8) orelse 0) == 1;
-        const now_ms = @import("stdx").time.milliTimestamp();
+        const now_ms = self.wall_clock_ms();
         if (s.trigger != null) {
             const trigger = self.stream_triggers.getPtr(key) orelse return;
             if (out.refused() != null) return self.triggerRefused(trigger, e, lead, memory, quota, now_ms);
@@ -10903,6 +10907,61 @@ test "workflow handler: a trigger re-created on its stream keeps what its leader
     try testing.expectEqual(@as(u32, 0), t.hold.refusals);
 }
 
+test "workflow handler: a trigger's start refused for memory or the quota waits on the wall clock, its polls on the monotonic" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    // Far apart: a wait stamped on one and read on the other would last
+    // decades, or not at all.
+    const Clocks = struct {
+        var wall: i64 = 1_000_000_000_000;
+        fn wallNow() i64 {
+            return wall;
+        }
+        fn mono() u64 {
+            return 500;
+        }
+    };
+    handler.wall_clock_ms = Clocks.wallNow;
+    handler.mono_ms = Clocks.mono;
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.store = &shard.defaultPartition().store;
+    handler.history = shard.stream_handler;
+    shard.workflow_handler = &handler;
+    shard.raft_node.current_term = 3;
+    createTestDef(&handler, testKey(.default, "wf"), "wf", "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1\",\"trigger\":{\"stream\":\"events\"},\"start\":{\"wait_for_signal\":{\"type\":\"never\"},\"transitions\":{\"success\":\"flo.Completed\"}}}");
+    const t = handler.stream_triggers.getPtr(testKey(.default, "wf")).?;
+    const at: StreamID = .{ .timestamp_ms = 1800, .sequence = 0 };
+    var buf: [256]u8 = undefined;
+    var kb: [128]u8 = undefined;
+    var eb: [512]u8 = undefined;
+    const value = triggerStartValue(&buf, &kb, "wf", .default, 1, "events", 1700, 0, .{ 0, 0 });
+    for ([_]bool{ true, false }, 0..) |memory, k| {
+        t.proposed = .{ .at = at, .term = 3, .chain = at };
+        const index: u64 = 31 + 100 * @as(u64, k);
+        if (memory)
+            decidedStart(&handler, &eb, .default, "r1", value, 3, index, .memory)
+        else
+            decidedStart(&handler, &eb, .default, "r2", value, 3, index, .quota);
+        const until = if (memory) t.hold.until_ms else t.quota_hold.until_ms;
+        try testing.expect(until > Clocks.wall);
+        // Waiting: even a forced poll reads nothing.
+        t.last_poll_ms = WorkflowHandler.NEVER_MS;
+        Clocks.wall = until - 1;
+        handler.triggers_dirty = true;
+        handler.tickStreamTriggers(&shard);
+        try testing.expectEqual(WorkflowHandler.NEVER_MS, t.last_poll_ms);
+        // Its wait out, by the wall clock: it polls, stamped by its own.
+        Clocks.wall = until;
+        handler.triggers_dirty = true;
+        handler.tickStreamTriggers(&shard);
+        try testing.expectEqual(@as(i64, 500), t.last_poll_ms);
+    }
+}
+
 test "workflow handler: a trigger polls on the monotonic clock, at once when new, then at its interval" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
@@ -10933,7 +10992,8 @@ test "workflow handler: a trigger polls on the monotonic clock, at once when new
     try testing.expectEqual(@as(i64, 500), t.last_poll_ms);
     Clock.ms = 1_500;
     handler.tickStreamTriggers(&shard);
-    try testing.expectEqual(@as(i64, 1_500), t.last_poll_ms); // Its stream made again: read again at once, as a trigger never polled.
+    try testing.expectEqual(@as(i64, 1_500), t.last_poll_ms);
+    // Its stream made again: read again at once, as a trigger never polled.
     t.stream_made_ns = 5;
     try testing.expect(!handler.sameStream(testKey(.default, "wf"), t, .default, 6));
     try testing.expectEqual(WorkflowHandler.NEVER_MS, t.last_poll_ms);
@@ -10948,6 +11008,19 @@ test "workflow handler: at its shard's memory share a trigger reads nothing, its
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
+    // Its holds on the wall clock, its polls on another: a hold timed on
+    // the poll clock would never say itself again.
+    const Clocks = struct {
+        var wall: i64 = 1_000_000_000_000;
+        fn wallNow() i64 {
+            return wall;
+        }
+        fn mono() u64 {
+            return 500;
+        }
+    };
+    handler.wall_clock_ms = Clocks.wallNow;
+    handler.mono_ms = Clocks.mono;
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
     var shard = try createTestShard(&actions);
@@ -10986,7 +11059,7 @@ test "workflow handler: at its shard's memory share a trigger reads nothing, its
     handler.tickStreamTriggers(&shard);
     try testing.expectEqual(@as(u64, 1), handler.holds_said);
     // Past it: said again.
-    t.hold.said_until_ms = 0;
+    Clocks.wall += 60_001;
     handler.triggers_dirty = true;
     handler.tickStreamTriggers(&shard);
     try testing.expectEqual(@as(u64, 2), handler.holds_said);

@@ -35453,6 +35453,41 @@ test "Shard: a trigger's page from a replica behind a remake of its stream is dr
     try std.testing.expectEqual(newer, t.trigger().stream_made_ns.?);
 }
 
+test "Shard: a trigger on another shard's stream polls at its interval, unforced, by its own clock" {
+    var t: TriggerPair = .{};
+    try t.init();
+    defer t.deinit();
+    const Clock = struct {
+        var ms: u64 = 500;
+        fn now() u64 {
+            return ms;
+        }
+    };
+    const a = &t.two.shards[0];
+    const wf = a.workflow_handler;
+    wf.mono_ms = Clock.now;
+    try t.append(1);
+    t.round();
+    try std.testing.expectEqual(@as(usize, 1), t.runs());
+    try std.testing.expectEqual(@as(i64, 500), t.trigger().last_poll_ms);
+    try t.append(1);
+    const seq = t.trigger().read_seq;
+    const every: u64 = t.trigger().poll_interval_ms;
+    // Not yet its interval: no ask.
+    Clock.ms = 500 + every - 1;
+    wf.triggers_dirty = false;
+    wf.tickStreamTriggers(a);
+    try std.testing.expectEqual(seq, t.trigger().read_seq);
+    // Its interval: asked, though nothing forced it.
+    Clock.ms = 500 + every;
+    wf.triggers_dirty = false;
+    wf.tickStreamTriggers(a);
+    try std.testing.expect(t.trigger().read_seq != seq);
+    try std.testing.expectEqual(@as(i64, @intCast(500 + every)), t.trigger().last_poll_ms);
+    t.two.settle();
+    try std.testing.expectEqual(@as(usize, 2), t.runs());
+}
+
 test "Shard: a trigger's read with no answer is asked again after the deadline, not before" {
     var t: TriggerPair = .{};
     try t.init();
