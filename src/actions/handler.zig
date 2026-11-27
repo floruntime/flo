@@ -56,6 +56,8 @@ const NamespaceId = @import("../namespace/table.zig").Id;
 pub const DEFAULT_LEASE_MS: u64 = 5 * 60 * 1000;
 /// Attempts in all, the first counted, for a register that names none (0).
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+/// The register entry's own bound, so a refusal here and at apply agree.
+pub const MAX_ATTEMPTS: u32 = 1000;
 
 /// The most ready runs one selection looks at before answering none: runs
 /// the worker's labels don't match are skipped, never scanned without end.
@@ -386,7 +388,9 @@ pub const ActionsHandler = struct {
         const lease_ms = if (timeout_ms == 0) DEFAULT_LEASE_MS else timeout_ms;
         if (lease_ms < ae.MIN_LEASE_MS or lease_ms > ae.MAX_LEASE_MS)
             return .{ .err = .{ .code = .invalid_request, .message = std.fmt.comptimePrint("bad request: an action's timeout is its lease: at least {d} ms and at most {d} ms, or 0 for {d} ms", .{ ae.MIN_LEASE_MS, ae.MAX_LEASE_MS, DEFAULT_LEASE_MS }) } };
-        const proposed = propose(shard, .action_register, ae.Register.Value{ .ns = ns.int(), .name = name, .owner = owner, .lease_ms = lease_ms, .max_attempts = if (max_attempts == 0) DEFAULT_MAX_ATTEMPTS else std.math.clamp(max_attempts, 1, 1000) }) catch |err|
+        if (max_attempts > MAX_ATTEMPTS)
+            return .{ .err = .{ .code = .invalid_request, .message = std.fmt.comptimePrint("bad request: an action's attempts count the first: at most {d}, or 0 for {d}", .{ MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS }) } };
+        const proposed = propose(shard, .action_register, ae.Register.Value{ .ns = ns.int(), .name = name, .owner = owner, .lease_ms = lease_ms, .max_attempts = if (max_attempts == 0) DEFAULT_MAX_ATTEMPTS else max_attempts }) catch |err|
             return .{ .err = persistence.failureError(err, "action not persisted") };
         return .{ .parked = proposed };
     }
@@ -1998,6 +2002,11 @@ const test_support = struct {
     /// The run `id` in `ns`, from the shard's store.
     pub fn run(shard: *Shard, ns: NamespaceId, id: []const u8) ?Run {
         return getRun(shard, ns, id);
+    }
+
+    /// Action `name`'s attempts in `ns`, as registered.
+    pub fn maxAttempts(shard: *Shard, ns: NamespaceId, name: []const u8) ?u32 {
+        return if (getDef(shard, ns, name)) |d| d.max_attempts else null;
     }
 
     /// Action `name`'s version in `ns`.

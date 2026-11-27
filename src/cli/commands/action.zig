@@ -212,7 +212,7 @@ fn runRegister(ctx: *commander.Context) commander.Error!void {
     const timeout = ctx.getUint("timeout") orelse 0;
     const max_attempts = ctx.getUint("max-attempts") orelse 0;
     if (timeout > std.math.maxInt(u32)) return outcome.usage(ctx, "--timeout is at most {d} ms", .{std.math.maxInt(u32)});
-    if (max_attempts > std.math.maxInt(u32)) return outcome.usage(ctx, "--max-attempts is at most 1000", .{});
+    if (max_attempts > 1000) return outcome.usage(ctx, "--max-attempts is at most 1000", .{});
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 

@@ -24723,6 +24723,19 @@ test "queues: a dead-letter list's cursor holds its place when the message it na
     try std.testing.expect(page.cursor == null);
 }
 
+test "actions: a register past 1000 attempts is refused, saying so, not clamped" {
+    var t: ActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var reg: [11]u8 = undefined;
+    const resp = try t.call(.action_register, "act", ActionsHandler.for_tests.registerValue(&reg, 0, 1001));
+    try std.testing.expectEqualStrings("bad request: an action's attempts count the first: at most 1000, or 0 for 3", (try resp.refused()).message);
+    try std.testing.expect(ActionsHandler.for_tests.version(&t.shard, .default, "act") == null);
+
+    _ = try t.ok(.action_register, "act", ActionsHandler.for_tests.registerValue(&reg, 0, 1000));
+    try std.testing.expectEqual(@as(?u32, 1000), ActionsHandler.for_tests.maxAttempts(&t.shard, .default, "act"));
+}
+
 test "actions: a fail with retry readies the run after delay_ms, one without retry fails it with its error, and an abandoned one counts no failure" {
     var t: ActionsTest = undefined;
     try t.init();

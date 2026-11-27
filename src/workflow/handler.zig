@@ -5816,11 +5816,12 @@ const test_retry_workflow_json =
 ;
 
 // Poll workflow: action returns `pending`; the engine should re-arm a backoff
-// poll (delays 0 for test speed) and follow `timeout` after max_attempts=2.
+// poll (the least delay, with the test's clock stepped past it) and follow
+// `timeout` after max_attempts=2.
 const test_poll_workflow_json =
     \\{"kind":"Workflow","name":"poll-wf","version":"1.0.0",
     \\"start":{"run":"@actions/poller",
-    \\"poll":{"max_attempts":2,"initial_delay_ms":0,"base_delay_ms":0,"max_delay_ms":0,"backoff":"constant"},
+    \\"poll":{"max_attempts":2,"initial_delay_ms":0,"base_delay_ms":10,"max_delay_ms":10,"backoff":"constant"},
     \\"transitions":{"success":"flo.Completed","failure":"flo.Failed","timeout":"flo.TimedOut"}}}
 ;
 
@@ -8436,6 +8437,7 @@ test "step executor: poll re-arms on pending and times out after max_attempts" {
     // Drive remaining poll cycles: each tick either fires the due poll timer
     // (re-invoking the action) or processes the re-invoked action's `pending`
     // completion (re-arming). max_attempts=2 → exhausted → `timeout` → flo.TimedOut.
+    const start_ms = @import("stdx").time.milliTimestamp();
     var i: u32 = 0;
     while (i < 12) : (i += 1) {
         const run = handler.inspect(testKey(.default, "run-poll")).?;
@@ -8443,7 +8445,7 @@ test "step executor: poll re-arms on pending and times out after max_attempts" {
         if (run.pending_action_run_id_owned) |rid| {
             completeTestActionWith(&shard, rid, "pending");
         }
-        handler.checkPendingActions(&shard);
+        handler.checkPendingActionsAt(&shard, start_ms + 1000 * @as(i64, i + 1));
         settleTest(&shard);
     }
 
