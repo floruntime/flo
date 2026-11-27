@@ -224,7 +224,9 @@ pub fn Model(comptime cfg: Config) type {
 
         /// `[holder][0][request_key]`, in the namespace: a holder's request
         /// keys. A holder holds no NUL, so one's keys never run into
-        /// another's.
+        /// another's: every op that names a holder refuses a control byte
+        /// in it (a group's consumer in the group handler, an action
+        /// worker's id in the actions and worker handlers).
         pub fn requestKey(buf: []u8, holder: []const u8, request_key: []const u8) []const u8 {
             @memcpy(buf[0..holder.len], holder);
             buf[holder.len] = 0;

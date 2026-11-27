@@ -335,3 +335,88 @@ test "e2e/names: a workflow create or signal the server must refuse is refused b
     try testing.expectEqualStrings("bad request: a signal type must not contain control characters (bytes 0x00-0x1f or 0x7f)", r.data);
     try testing.expect(try waitFor(ctx, &.{ "workflow", "status", "rb1" }, "waiting"));
 }
+
+test "e2e/names: a holder holding a NUL or control byte is refused by status: a group's consumer on read, ack, pending and steal, a worker's id on await, and a machine id" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const src = @import("src").protocol;
+    const proto = src.proto;
+    const bad = @backingInt(proto.StatusCode.bad_request);
+    var out: [1024]u8 = undefined;
+    try ctx.exec(&.{ "stream", "append", "s", "job" });
+    try ctx.exec(&.{ "stream", "group", "read", "s", "--group", "g", "--consumer", "c", "--limit", "1" });
+
+    const consumer_says = "bad request: a consumer name must not contain control characters (bytes 0x00-0x1f or 0x7f)";
+    // [group_len:u16][group][consumer_len:u16][consumer]: a read, an ack
+    // and a pending list name their consumer the same way.
+    for ([_][]const u8{ "c\x00d", "c\x1b[31m" }) |consumer| {
+        var vb: [64]u8 = undefined;
+        std.mem.writeInt(u16, vb[0..2], 1, .little);
+        vb[2] = 'g';
+        std.mem.writeInt(u16, vb[3..5], @intCast(consumer.len), .little);
+        @memcpy(vb[5..][0..consumer.len], consumer);
+        const v = vb[0 .. 5 + consumer.len];
+        for ([_]proto.OpCode{ .stream_group_read, .stream_group_ack, .stream_group_nack, .stream_group_touch, .stream_group_pending }) |op| {
+            const r = try rawCall(ctx, op, "", "s", v, &out);
+            if (r.status != bad) std.debug.print("{t}: {d} {s}\n", .{ op, r.status, r.data });
+            try testing.expectEqual(bad, r.status);
+            try testing.expectEqualStrings(consumer_says, r.data);
+        }
+
+        const steal = src.stream_ops.op("stream.group.steal");
+        var sb: [256]u8 = undefined;
+        const body = try steal.request.encodeInto(&sb, .{ .group = "g", .consumer = consumer, .min_idle_ms = 1, .lease_ms = null, .records = .{ .bytes = "", .count = 0 } });
+        const r = try rawCall(ctx, proto.OpCode.stream_group_steal, "", "s", body, &out);
+        try testing.expectEqual(bad, r.status);
+        try testing.expectEqualStrings(consumer_says, r.data);
+    }
+    // Nothing taken: the group's only member is still the reader.
+    const members = try ctx.execCapture(&.{ "stream", "group", "members", "s", "g", "-o", "raw" });
+    try testing.expect(std.mem.indexOf(u8, members, "c\x1b") == null);
+    try testing.expect(std.mem.indexOf(u8, members, "c\x00") == null);
+
+    try ctx.exec(&.{ "action", "register", "send" });
+    const await_op = src.action_ops.op("action.await");
+    var nb: [64]u8 = undefined;
+    const names = try src.action_ops.actionNames(&nb, &.{"send"});
+    var ab: [256]u8 = undefined;
+    const await_body = try await_op.request.encodeInto(&ab, .{ .actions = names, .block_ms = 0, .request_key = null });
+    for ([_][]const u8{ "w\x00x", "w\nx" }) |worker| {
+        const r = try rawCall(ctx, proto.OpCode.action_await, "", worker, await_body, &out);
+        try testing.expectEqual(bad, r.status);
+        try testing.expectEqualStrings("bad request: a worker id must not contain control characters (bytes 0x00-0x1f or 0x7f)", r.data);
+    }
+
+    // [type:u8][max_concurrency:u32][process_count:u16][has_metadata:u8][has_machine_id:u8][len:u16][machine id]
+    var reg: [32]u8 = undefined;
+    reg[0] = 0;
+    std.mem.writeInt(u32, reg[1..5], 1, .little);
+    std.mem.writeInt(u16, reg[5..7], 0, .little);
+    reg[7] = 0;
+    reg[8] = 1;
+    std.mem.writeInt(u16, reg[9..11], 3, .little);
+    @memcpy(reg[11..14], "m\nx");
+    const r = try rawCall(ctx, proto.OpCode.worker_register, "", "w1", reg[0..14], &out);
+    try testing.expectEqual(bad, r.status);
+    try testing.expect(std.mem.indexOf(u8, r.data, "a machine id must not contain control characters") != null);
+    const workers = try ctx.execCapture(&.{ "worker", "list" });
+    try testing.expect(std.mem.indexOf(u8, workers, "w1") == null);
+}
+
+test "e2e/names: a workflow whose version or a later step's signal type holds a control byte is refused by status, and nothing is stored" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const proto = @import("src").protocol.proto;
+    var out: [512]u8 = undefined;
+    for ([_]struct { name: []const u8, def: []const u8, says: []const u8 }{
+        .{ .name = "ver", .def = "{\"kind\":\"Workflow\",\"name\":\"ver\",\"version\":\"1\\n.0\",\"start\":{\"wait_for_signal\":{\"type\":\"go\"},\"transitions\":{\"success\":\"flo.Completed\"}}}", .says = "a workflow version" },
+        .{ .name = "later", .def = "{\"kind\":\"Workflow\",\"name\":\"later\",\"version\":\"1.0.0\",\"start\":{\"wait_for_signal\":{\"type\":\"go\"},\"transitions\":{\"success\":\"w\"}},\"steps\":{\"w\":{\"wait_for_signal\":{\"type\":\"g\\u0007o\"},\"transitions\":{\"success\":\"flo.Completed\"}}}}", .says = "a signal type" },
+    }) |c| {
+        const r = try rawCall(ctx, proto.OpCode.workflow_create, "", c.name, c.def, &out);
+        try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
+        var want: [128]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "bad request: {s} must not contain control characters (bytes 0x00-0x1f or 0x7f)", .{c.says}), r.data);
+        const got = try rawCall(ctx, proto.OpCode.workflow_get_definition, "", c.name, "", &out);
+        try testing.expectEqual(@backingInt(proto.StatusCode.not_found), got.status);
+    }
+}

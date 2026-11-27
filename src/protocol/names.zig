@@ -65,6 +65,8 @@ pub const Escaped = struct {
 test "names: a log line shows controls, a backslash and bytes that aren't UTF-8 escaped, and UTF-8 as written" {
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("caf\xc3\xa9 r\\x0a1\\x0a\\x1b\\x7f \\\\ \\xff\\xc3", try std.fmt.bufPrint(&buf, "{f}", .{escaped("caf\xc3\xa9 r\n1\x0a\x1b\x7f \\ \xff\xc3")}));
+    // A lead byte whose continuation isn't one is escaped, not written.
+    try std.testing.expectEqualStrings("\\xc3(", try std.fmt.bufPrint(&buf, "{f}", .{escaped("\xc3\x28")}));
 }
 
 test "names: control characters and DEL are refused; UTF-8 and printable bytes are not" {

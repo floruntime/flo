@@ -351,6 +351,9 @@ pub const WorkerHandler = struct {
         // worker.list answers with it, so it must fit the list's bound.
         if (reg.machine_id) |m| if (m.len > worker_ops.MAX_MACHINE_ID)
             return pastLimit(allocator, &reg, .field_too_long, std.fmt.comptimePrint("machine id longer than {d} bytes", .{worker_ops.MAX_MACHINE_ID}));
+        // Listed and shown as a name is: no control character.
+        if (reg.machine_id) |m| if (client_names.hasControl(m))
+            return refuse(allocator, &reg, comptime client_names.controlRefusal("a machine id"));
 
         if (!r.done()) return refuse(allocator, &reg, "registration has bytes past its end");
         return .{ .ok = reg };

@@ -2029,6 +2029,36 @@ test "parser: classify operator with default tag" {
     try std.testing.expect(has_default);
 }
 
+test "parser: a TS name holding a control character is refused at submit, each name on its own" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"kind":"Processing","name":"j","sources":[{"ts":{"measurement":"c\npu","field":"f"}}],"sinks":[{"stream":{"name":"out"}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"ts":{"measurement":"cpu","field":"f\u001bx"}}],"sinks":[{"stream":{"name":"out"}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m\tx"}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m","value_field":"v\u007f"}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m","fields":{"lo\nad":"l"}}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m","tags":{"h\u0000":"h"}}}]}
+    }) |json_def| {
+        var def = try parseJobDefinitionWithNamespace(allocator, json_def, "acme", null);
+        defer def.deinit(allocator);
+        try std.testing.expectEqualStrings(comptime @import("../protocol/names.zig").controlRefusal("a measurement, field or tag key name"), def.namespaceRefusal().?);
+    }
+    for ([_][]const u8{
+        \\{"kind":"Processing","name":"j","sources":[{"ts":{"measurement":"cpu","field":"f"}}],"sinks":[{"stream":{"name":"out"}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m","value_field":"v","tags":{"h":"h"}}},{"ts":{"measurement":"n","fields":{"load":"l"}}}]}
+    }) |json_def| {
+        var ok = try parseJobDefinitionWithNamespace(allocator, json_def, "acme", null);
+        defer ok.deinit(allocator);
+        try std.testing.expect(ok.namespaceRefusal() == null);
+    }
+}
+
 test "parser: a stream or queue name holding a control character, or too long, is refused at submit" {
     const allocator = std.testing.allocator;
     for ([_][]const u8{

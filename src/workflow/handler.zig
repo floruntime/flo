@@ -1177,6 +1177,11 @@ pub const WorkflowHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, comptime @import("../protocol/names.zig").controlRefusal("a workflow name"));
             return null;
         }
+        // Its version is listed beside its name, one row each.
+        if (@import("../protocol/names.zig").hasControl(def.version)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, comptime @import("../protocol/names.zig").controlRefusal("a workflow version"));
+            return null;
+        }
         // The names it waits on and reads from are names, as a request's are.
         if (def.trigger) |t| if (@import("../protocol/names.zig").hasControl(t.stream)) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, comptime @import("../protocol/names.zig").controlRefusal("a stream name"));

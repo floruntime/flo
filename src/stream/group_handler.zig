@@ -220,6 +220,11 @@ fn refuse(shard: *Shard, conn: *Connection, request_id: u64, status: proto.Statu
     shard.sendRefusal(conn, request_id, status, proto.unclassified(status, message));
 }
 
+/// A consumer is a holder: stored with what it takes, shown by members and
+/// status, and the first part of its request keys, which a NUL in it would
+/// run into another holder's. Every op naming one refuses a control byte.
+const CONSUMER_CONTROL = client_names.controlRefusal("a consumer name");
+
 /// A request's group and, if it names one, consumer.
 const Named = struct { group: []const u8, consumer: []const u8, rest: WireReader };
 
@@ -376,7 +381,7 @@ pub fn dispatchRead(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) v
     const n = named(req, true) orelse return refuse(shard, conn, req.header.request_id, .bad_request, "bad request: a group name is required");
     const consumer = if (n.consumer.len > 0) n.consumer else "default";
     if (consumer.len > ae.Holder.max_size) return refuse(shard, conn, req.header.request_id, .bad_request, "bad request: consumer name too long");
-    if (client_names.hasControl(consumer)) return refuse(shard, conn, req.header.request_id, .bad_request, comptime client_names.controlRefusal("a consumer name"));
+    if (client_names.hasControl(consumer)) return refuse(shard, conn, req.header.request_id, .bad_request, CONSUMER_CONTROL);
     const asked = req.getCount() orelse 0;
     const count: u32 = if (asked == 0) 100 else @min(asked, ge.MAX_BATCH);
     const block_ms: u64 = req.getBlockMs() orelse 0;
@@ -637,6 +642,7 @@ fn report(shard: *Shard, conn: *Connection, req: Request, kind: Report) void {
     if (!check(shard, conn, req)) return;
     var n = named(req, true) orelse return refuse(shard, conn, req.header.request_id, .bad_request, "bad request: a group name is required");
     const consumer = if (n.consumer.len > 0) n.consumer else "default";
+    if (client_names.hasControl(consumer)) return refuse(shard, conn, req.header.request_id, .bad_request, CONSUMER_CONTROL);
     const scope = machine.scopeOf(req.ns_id, req.key, n.group);
     var buf: [ge.Items.max_size]u8 = undefined;
     const parsed = parseReport(shard, req.ns_id, scope, consumer, &n.rest, &buf) orelse
@@ -752,6 +758,7 @@ pub fn dispatchPending(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request
     const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
     if (!check(shard, conn, req)) return;
     const n = named(req, true) orelse return refuse(shard, conn, req.header.request_id, .bad_request, "bad request: a group name is required");
+    if (client_names.hasControl(n.consumer)) return refuse(shard, conn, req.header.request_id, .bad_request, CONSUMER_CONTROL);
     if (metaOf(shard, req.ns_id, req.key, n.group) == null) return refuse(shard, conn, req.header.request_id, .not_found, machine.NO_GROUP);
     const scope = machine.scopeOf(req.ns_id, req.key, n.group);
     var w: std.Io.Writer.Allocating = .init(shard.allocator);
@@ -975,6 +982,7 @@ pub const Operator = struct {
     pub fn runSteal(shard: *Shard, _: *Connection, req: Request, group: []const u8, consumer: []const u8, min_idle_ms: u64, lease_ms: ?u64, records: Leased.Value) Error!table_run.Outcome(StealResponse) {
         if (try opChecks(shard, req, group)) |r| return .{ .refused = r };
         if (consumer.len == 0) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: a steal names the consumer that takes the records") } };
+        if (client_names.hasControl(consumer)) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(CONSUMER_CONTROL) } };
         // Nothing to take: answered here, as a dead-letter requeue of none
         // is, with no entry logged for it.
         if (records.count == 0) return .{ .answer = .{ .term = 0, .index = 0, .expires_at_ms = 0, .stolen = .{ .bytes = "", .count = 0 }, .refused = .{ .bytes = "", .count = 0 } } };
