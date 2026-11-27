@@ -1559,7 +1559,9 @@ test "e2e/action/routing: on 12 shards, in a namespace of its own, runs of actio
     const ns = "ar-ns";
     try ctx.exec(&.{ "namespace", "create", ns });
     // The first namespace created takes the first allocated id, so its
-    // actions' shards follow from it, as the server routes them.
+    // actions' shards follow from it, as the server routes them. Each run
+    // id says where the server put its run: checked below, so a wrong
+    // guess here fails rather than testing shard 0.
     const first: @import("src").node.router.NamespaceId = .of(16);
 
     // Actions whose runs live off shard 0, each on a shard of its own.
@@ -1597,6 +1599,13 @@ test "e2e/action/routing: on 12 shards, in a namespace of its own, runs of actio
             @memcpy(run_buf[0..r.len], r);
             break :blk run_buf[0..r.len];
         };
+        // The run is on the shard its id's slot names, the action's, and not 0.
+        {
+            const slot = @import("src").node.run_id.extractSlot(run) orelse return error.TestFailed;
+            const at = @import("src").node.router.Router.init(shards, 0).slotToShard(slot);
+            try testing.expect(at != 0);
+            try testing.expectEqual(shardOfName(shards, first, action), at);
+        }
 
         // Delivered, touched and failed: pending again, with the error.
         var first_task = try ctx.cli.run(&.{ "worker", "await", action, "--worker-id", worker, "--block", "5000", "-n", ns });

@@ -3880,7 +3880,9 @@ test "e2e/processing/routing: on 12 shards, in a namespace of its own, jobs home
     try ctx.exec(&.{ "namespace", "create", ns });
     // The first namespace created takes the first allocated id. A job's
     // home is its first source's shard, which follows from the stream's
-    // name as the server's router places it.
+    // name as the server's router places it. Each job id says where the
+    // server homed its job: checked below, so a wrong guess here fails
+    // rather than testing shard 0.
     const router = @import("src").node.router;
     const first: router.NamespaceId = .of(16);
     const r = router.Router.init(shards, 0);
@@ -3927,6 +3929,7 @@ test "e2e/processing/routing: on 12 shards, in a namespace of its own, jobs home
             @memcpy(id_buf[0..got.len], got);
             break :blk id_buf[0..got.len];
         };
+        try testing.expectEqual(home, r.slotToShard(@import("src").node.run_id.extractSlot(id) orelse return error.NoJobId));
         {
             var s = try ctx.cli.run(&.{ "processing", "status", id, "-n", ns });
             defer s.deinit();
