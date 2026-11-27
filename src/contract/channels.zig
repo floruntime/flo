@@ -1062,7 +1062,7 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
         /// An unpark to propose: its entry, the target it is for, and
         /// whether it took as many messages as one entry holds, so more of
         /// that target's may be waiting behind it.
-        pub const NextUnpark = struct { entry: []const u8, target: Target, full: bool };
+        pub const NextUnpark = struct { entry: []const u8, target: Target, full: bool, count: u32 };
 
         /// The unpark this group's leader should propose next, encoded in
         /// `buf` (over a message list built in `msgs`), or null: the first
@@ -1127,7 +1127,7 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
             }
             if (n == 0) return null;
             const entry = ce.Unpark.encodeInto(buf, .{ .target = &target, .messages = .{ .bytes = w.written(), .count = n } }) catch return null;
-            return .{ .entry = entry, .target = target, .full = full };
+            return .{ .entry = entry, .target = target, .full = full, .count = n };
         }
 
         /// Whether `raw` is the first parked key of its sender under its
