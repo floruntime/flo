@@ -14598,8 +14598,16 @@ test "Shard: a processing sink in a namespace not yet published writes nothing u
     try std.testing.expectEqual(@as(usize, 0), entriesOf(a, .processing_sink_batch, from_a));
     try std.testing.expectEqual(@as(u64, 1), metrics.processing.pipelines_waiting_namespace.load(.monotonic));
     // A node that stops leading says nothing of it, gauge included, and
-    // keeps no pipelines: its next leader builds its own.
+    // keeps no pipelines: its next leader builds its own. Until they go,
+    // a pipeline's wait is no longer its.
     a.raft_node.role = .follower;
+    {
+        var wit = a.processing_handler.pipelines.valueIterator();
+        const waiting = wit.next().?;
+        try std.testing.expect(waiting.held_since_ms != ProcessingHandler.NEVER_MS);
+        _ = a.processing_handler.tickPipelines(a);
+        try std.testing.expectEqual(ProcessingHandler.NEVER_MS, waiting.held_since_ms);
+    }
     _ = try a.tick(0);
     try std.testing.expectEqual(@as(u32, 0), a.processing_handler.pipelines.count());
     try std.testing.expectEqual(@as(u64, 0), metrics.processing.pipelines_waiting_namespace.load(.monotonic));
@@ -15614,6 +15622,24 @@ test "Shard: pressure that arrived as a send-only shard's outbox emptied still e
     p.pressure_ms = Shard.nowMs();
     a.tickChannels();
     try std.testing.expect(p.probe_ms > 0);
+    // Read on the pipelines' clock: pressure stamped as of it holds the
+    // pipeline, though the host's clock is long past the stamp.
+    {
+        const Clock = struct {
+            fn read() u64 {
+                return 1_000;
+            }
+        };
+        const since = pipe.held_since_ms;
+        const counted = pipe.wait_counted_ms;
+        a.processing_handler.mono_ms = Clock.read;
+        p.pressure_ms = 1_000;
+        tickNow(a, pipe);
+        try std.testing.expect(pipe.wait == .pressure);
+        a.processing_handler.mono_ms = @import("stdx").time.monotonicMs;
+        pipe.held_since_ms = since;
+        pipe.wait_counted_ms = counted;
+    }
     // The last answer carrying it was long ago, and the driver's own clock
     // stopped then: it is gone by the time now, and the pipeline reads on.
     p.pressure_ms = 1;
@@ -15623,6 +15649,8 @@ test "Shard: pressure that arrived as a send-only shard's outbox emptied still e
     two.settle();
     try std.testing.expect(pipe.wait == .none);
     try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
+    // Reading again, it no longer waits: a next wait starts its own count.
+    try std.testing.expectEqual(ProcessingHandler.NEVER_MS, pipe.held_since_ms);
 }
 
 test "Shard: records whose operators emit nothing aren't read again while their cursor waits to be logged" {
@@ -35429,10 +35457,21 @@ test "Shard: a trigger's read with no answer is asked again after the deadline, 
     var t: TriggerPair = .{};
     try t.init();
     defer t.deinit();
+    // The trigger's clock, near 0 as just after boot: the deadline runs
+    // on it, not the wall clock.
+    const Clock = struct {
+        var ms: u64 = 500;
+        fn now() u64 {
+            return ms;
+        }
+    };
+    const wf = t.two.shards[0].workflow_handler;
+    wf.mono_ms = Clock.now;
     try t.append(1);
     t.ask();
     const seq = t.trigger().read_seq;
     try std.testing.expect(seq != 0);
+    try std.testing.expectEqual(@as(i64, 500), t.trigger().read_sent_ms);
     // The ask is lost: the owner never sees it.
     const b = &t.two.shards[1];
     var lost: [8]InboxMessage = undefined;
@@ -35440,9 +35479,10 @@ test "Shard: a trigger's read with no answer is asked again after the deadline, 
         const bytes = Shard.inboxPayload(msg);
         if (bytes.len > 0) b.allocator.free(bytes);
     }
+    Clock.ms = 500 + WorkflowHandler.TRIGGER_READ_DEADLINE_MS - 1;
     t.ask();
     try std.testing.expectEqual(seq, t.trigger().read_seq);
-    t.trigger().read_sent_ms -= WorkflowHandler.TRIGGER_READ_DEADLINE_MS;
+    Clock.ms = 500 + WorkflowHandler.TRIGGER_READ_DEADLINE_MS;
     t.ask();
     try std.testing.expect(t.trigger().read_seq != seq);
     t.two.settle();
