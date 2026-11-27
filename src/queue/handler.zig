@@ -21,6 +21,7 @@ const std = @import("std");
 const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
+const client_names = @import("../protocol/names.zig");
 const result_mod = @import("../protocol/result.zig");
 const schema = @import("../protocol/schema.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
@@ -417,6 +418,8 @@ pub const QueueHandler = struct {
         return .{ .queue_enqueued = .{ .message_id = id_str } };
     }
 
+    const CONTROL_IN_NAME = client_names.controlRefusal("queue");
+
     fn handleCommand(self: *QueueHandler, req: Request) CommandResult {
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         if (req.key.len == 0 and op != .queue_list) return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
@@ -434,6 +437,7 @@ pub const QueueHandler = struct {
         if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
         if (req.value.len > qe.MAX_MESSAGE) return .{ .err = .{ .code = .invalid_request, .message = "message too large: a queue message holds at most 64 KiB" } };
         if (req.key.len > qe.QueueName.max_size) return .{ .err = .{ .code = .invalid_request, .message = "queue name too long" } };
+        if (client_names.hasControl(req.key)) return .{ .err = .{ .code = .invalid_request, .message = CONTROL_IN_NAME } };
         const priority: u32 = if (req.getPriority()) |p| p else 0;
         if (req.findOption(.dedup_key) != null) return .{ .err = .{ .code = .invalid_request, .message = "bad request: dedup_key isn't supported: a queue keeps no deduplication window" } };
         const delay_ms: u64 = if (req.findOption(.delay_ms)) |o| o.asU64() orelse return .{ .err = .{ .code = .invalid_request, .message = "bad request: delay_ms is a u64" } } else 0;
@@ -461,6 +465,7 @@ pub const QueueHandler = struct {
 
     fn handlePurge(_: *QueueHandler, shard: *Shard, req: Request) CommandResult {
         if (req.key.len > qe.QueueName.max_size) return .{ .err = .{ .code = .invalid_request, .message = "queue name too long" } };
+        if (client_names.hasControl(req.key)) return .{ .err = .{ .code = .invalid_request, .message = CONTROL_IN_NAME } };
         if (metaOf(shard, req.ns_id, req.key) == null) return .{ .queue_purged = .{ .count = 0 } };
         const proposed = propose(shard, .queue_purge, qe.Purge.Value{ .ns = req.ns_id.int(), .queue = req.key }) catch |err|
             return .{ .err = persistence_mod.failureError(err, "purge not persisted") };
@@ -563,6 +568,7 @@ pub const QueueHandler = struct {
         if (req.key.len == 0) return error.NoQueue;
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
         if (req.key.len > qe.QueueName.max_size) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: queue name too long") } };
+        if (client_names.hasControl(req.key)) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: " ++ CONTROL_IN_NAME) } };
         const params: Params = .{ .ns = req.ns_id, .count = count, .lease_ms = lease_ms orelse qe.DEFAULT_LEASE_MS, .ack = ack, .consumer = consumer };
         const self = shard.queue_handler;
         if (try self.deliverHere(shard, conn.replyTo(), req.header.request_id, req.key, params)) return .wait;
@@ -916,6 +922,7 @@ pub const QueueHandler = struct {
     fn deadChecks(shard: *Shard, req: Request) Error!?table_run.Refused {
         if (req.key.len == 0) return error.NoQueue;
         if (req.key.len > qe.QueueName.max_size) return .{ .status = .bad_request, .refusal = proto.notRun("bad request: queue name too long") };
+        if (client_names.hasControl(req.key)) return .{ .status = .bad_request, .refusal = proto.notRun("bad request: " ++ CONTROL_IN_NAME) };
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
         if (req.ns_id == .invalid) return .{ .status = persistence_mod.failureStatus(error.NamespaceUnknown), .refusal = persistence_mod.failureRefusal(error.NamespaceUnknown, "not run") };
         if (metaOf(shard, req.ns_id, req.key) == null) return NO_QUEUE_REFUSAL;

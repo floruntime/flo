@@ -81,6 +81,7 @@
 //! ```
 
 const std = @import("std");
+const client_names = @import("../protocol/names.zig");
 const limits = @import("../protocol/limits.zig");
 const Allocator = std.mem.Allocator;
 
@@ -413,7 +414,7 @@ pub const JobDefinition = struct {
 
     fn resourceRefusal(name: []const u8) ?[]const u8 {
         if (name.len == 0) return null; // kv and ts endpoints name no stream or queue
-        if (std.mem.indexOfScalar(u8, name, 0) != null) return "stream or queue name must not contain NUL";
+        if (client_names.hasControl(name)) return comptime client_names.controlRefusal("stream or queue");
         if (name.len > limits.MAX_QUALIFIED_KEY) return "stream or queue name too long";
         return null;
     }

@@ -120,7 +120,8 @@ const ShownKey = struct {
 
     pub fn format(self: ShownKey, w: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.key.len < KEY_PREFIX) return w.writeAll("(no key)");
-        try w.print("{s} (namespace {d})", .{ keyName(self.key), keyNamespace(self.key).int() });
+        // Escaped: a run id may be the client's own choice.
+        try w.print("{f} (namespace {d})", .{ std.zig.fmtString(keyName(self.key)), keyNamespace(self.key).int() });
     }
 };
 
@@ -1144,7 +1145,7 @@ pub const WorkflowHandler = struct {
     fn parseStored(self: *WorkflowHandler, yaml: []const u8, def_key: []const u8) parser.ParseError!parser.WorkflowDefinition {
         var diag: parser.Diagnostic = .{};
         return parser.parseWorkflow(self.allocator, yaml, &diag) catch |err| {
-            log.err("workflow {f} not loaded: {s}", .{ shown(def_key), if (err == error.OutOfMemory) "out of memory" else diag.message() });
+            log.err("workflow {f} not loaded: {f}", .{ shown(def_key), std.zig.fmtString(if (err == error.OutOfMemory) "out of memory" else diag.message()) });
             return err;
         };
     }
@@ -1171,6 +1172,10 @@ pub const WorkflowHandler = struct {
         };
         defer def.deinit(self.allocator);
 
+        if (@import("../protocol/names.zig").hasControl(def.name)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, comptime "bad request: " ++ @import("../protocol/names.zig").controlRefusal("a workflow"));
+            return null;
+        }
         // Its runs' history names it: no longer than that may.
         if (def.name.len > MAX_WORKFLOW_NAME_LEN) {
             var mb: [96]u8 = undefined;
@@ -3253,7 +3258,7 @@ pub const WorkflowHandler = struct {
         // point into the call's record, a copy of applied state this shard
         // keeps until the clear below applies.
         const call = callOf(shard, run, action_rid);
-        if (call == null) log.warn("workflow run {f}: the call of action run {s} its step waits for is gone; the step fails", .{ shown(run_ns_key), action_rid });
+        if (call == null) log.warn("workflow run {f}: the call of action run {f} its step waits for is gone; the step fails", .{ shown(run_ns_key), std.zig.fmtString(action_rid) });
         const Settled = enum { completed, failed, timed_out, no_action, refused, lost };
         const settled: Settled = if (call) |c| switch (c.state) {
             .done => switch (std.enums.fromInt(ae.DoneStatus, c.status) orelse .failed) {
@@ -3873,7 +3878,7 @@ pub const WorkflowHandler = struct {
                 run.run_id_owned,
             );
             return resolver.resolve(trimmed) catch |err| {
-                log.warn("Workflow output path resolution failed for '{s}': {}", .{ trimmed, err });
+                log.warn("Workflow output path resolution failed for '{f}': {}", .{ std.zig.fmtString(trimmed), err });
                 return null;
             };
         }
@@ -11492,6 +11497,13 @@ test "workflow quota: a held run cancelled while its namespace is at its quota l
     // Closed and past the interval: forgotten.
     handler.checkPendingActionsAt(&shard, t0 + WorkflowHandler.QUOTA_LOG_MIN_MS);
     try testing.expectEqual(@as(u32, 0), handler.quota_episodes.count());
+}
+
+test "workflow handler: a key in a log line shows its name escaped, so a client's run id can't break the line" {
+    var kb: [KEY_PREFIX + 16]u8 = undefined;
+    var out: [64]u8 = undefined;
+    const line = try std.fmt.bufPrint(&out, "{f}", .{shown(writeKey(&kb, .default, "r\n1\x1b"))});
+    try testing.expectEqualStrings("r\\n1\\x1b (namespace 1)", line);
 }
 
 test "workflow quota: a due timer or signal timeout is held without a copy, and its release arms it again from its wait" {

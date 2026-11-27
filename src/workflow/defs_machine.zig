@@ -104,7 +104,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             var diag: parser.Diagnostic = .{};
             var def = parser.parseWorkflow(view.arena, cmd.value, &diag) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
-                log.err("workflow definition at index {d} doesn't parse: {s}", .{ e.header.index, diag.message() });
+                log.err("workflow definition at index {d} doesn't parse: {f}", .{ e.header.index, std.zig.fmtString(diag.message()) });
                 return error.Halt;
             };
             defer def.deinit(view.arena);

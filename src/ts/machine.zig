@@ -27,6 +27,7 @@ const view_mod = @import("../contract/view.zig");
 const machine_mod = @import("../contract/machine.zig");
 const router = @import("../node/router.zig");
 const tsp = @import("../projection/ts.zig");
+const client_names = @import("../protocol/names.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -267,7 +268,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
     }
 }
 
-const NUL_IN_NAME = "bad request: a measurement or field name must not contain NUL";
+const CONTROL_IN_NAME = "bad request: " ++ client_names.controlRefusal("a measurement or field");
 /// Reads answer a point's time as i64 nanoseconds.
 const TIME_TOO_LATE = std.fmt.comptimePrint("bad request: a point's time is at most {d} ns", .{std.math.maxInt(i64)});
 
@@ -279,8 +280,8 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             // reading, field, client timestamp and tags (`TsWriteValue`).
             var canon_buf: [tsp.MAX_TAG_STRING]u8 = undefined;
             const w = writeOf(e, &canon_buf) orelse return error.Halt;
-            if (std.mem.indexOfScalar(u8, w.cmd.key, 0) != null or std.mem.indexOfScalar(u8, w.rec.field_name, 0) != null)
-                return out.refuse(.bad_request, .unclassified, NUL_IN_NAME);
+            if (client_names.hasControl(w.cmd.key) or client_names.hasControl(w.rec.field_name))
+                return out.refuse(.bad_request, .unclassified, CONTROL_IN_NAME);
             // As its proposer refuses it: every stored series keeps a tag
             // set a filter can name, each key once.
             if (tsp.tagSetProblem(w.rec.tags)) |p| return out.refuse(.bad_request, .unclassified, p.fixed());
@@ -311,7 +312,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         .ts_delete => {
             const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return error.Halt;
             // `c\0pu` would reach measurement `c`, field `pu`.
-            if (std.mem.indexOfScalar(u8, cmd.key, 0) != null) return out.refuse(.bad_request, .unclassified, NUL_IN_NAME);
+            if (client_names.hasControl(cmd.key)) return out.refuse(.bad_request, .unclassified, CONTROL_IN_NAME);
             var canon_buf: [tsp.MAX_TAG_STRING]u8 = undefined;
             var preds_buf: [tsp.MAX_TAGS]tsp.TagPredicate = undefined;
             const f = switch (tsp.parseTagFilter(cmd.value, &canon_buf, &preds_buf)) {
@@ -327,7 +328,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         .ts_retention => {
             const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return error.Halt;
             if (cmd.value.len != 8) return error.Halt;
-            if (std.mem.indexOfScalar(u8, cmd.key, 0) != null) return out.refuse(.bad_request, .unclassified, NUL_IN_NAME);
+            if (client_names.hasControl(cmd.key)) return out.refuse(.bad_request, .unclassified, CONTROL_IN_NAME);
             const age_ms = std.mem.readInt(u64, cmd.value[0..8], .little);
             _ = try applyRetention(view, cmd.namespace_id, cmd.key, tsp.retentionCutoffNs(e.header.timestamp_ns, age_ms));
         },
@@ -576,6 +577,25 @@ test "time series: the families' snapshot bytes load into a store that reads the
     try testing.expectEqual(ra.summarize(.of(7), "cpu", &fa), rc.summarize(.of(7), "cpu", &fc));
 }
 
+test "time series: a measurement or field holding any control character is refused at apply; UTF-8 is not" {
+    var log: TestLog = .{};
+    defer log.deinit();
+    try log.write(.of(7), "c\npu", "usage", 1, 1000, "");
+    try log.write(.of(7), "cpu", "us\x1bage", 1, 1000, "");
+    try log.write(.of(7), "c\x7fpu", "usage", 1, 1000, "");
+    try log.write(.of(7), "c\xc3\xa9pu", "usage", 1, 1000, "");
+    var s = store_mod.Store.init(testing.allocator);
+    defer s.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    for (log.entries.items, 0..) |*e, i| {
+        var o = Result.start(e);
+        try machine_mod.applyEntry(&machine, &s, &scratch, e, &o);
+        if (i < 3) try testing.expectEqualStrings(CONTROL_IN_NAME, o.refused().?.refusal.message) else try testing.expect(o.refused() == null);
+    }
+    try testing.expectEqual(@as(usize, 1), s.family(Points.ID).count);
+}
+
 test "time series: a name holding NUL is refused, and changes nothing" {
     var log: TestLog = .{};
     defer log.deinit();
@@ -599,7 +619,7 @@ test "time series: a name holding NUL is refused, and changes nothing" {
     for (log.entries.items[1..], 0..) |*e, i| {
         var o = Result.start(e);
         try machine_mod.applyEntry(&machine, &s, &scratch, e, &o);
-        if (i == 0) try testing.expect(o.refused() == null) else try testing.expectEqualStrings(NUL_IN_NAME, o.refused().?.refusal.message);
+        if (i == 0) try testing.expect(o.refused() == null) else try testing.expectEqualStrings(CONTROL_IN_NAME, o.refused().?.refusal.message);
     }
     try testing.expectEqual(@as(usize, 1), s.family(Points.ID).count);
     try testing.expectEqual(@as(usize, 1), s.family(Series.ID).count);

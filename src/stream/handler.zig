@@ -29,6 +29,7 @@ const stdx = @import("stdx");
 const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
+const client_names = @import("../protocol/names.zig");
 const result_mod = @import("../protocol/result.zig");
 const stream_mod = @import("../projection/stream.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
@@ -547,11 +548,11 @@ pub const StreamHandler = struct {
     // ── Core Command Logic ──────────────────────────────────────────────
 
     /// Why a request's stream name cannot be used, or null: none, one
-    /// holding a NUL, or one too long for a key. Checked here for every
+    /// holding a control character, or one too long for a key. Checked here for every
     /// request but list, before any key is built.
     fn nameRefusal(op: OpCode, req: Request) ?[]const u8 {
         if (op == .stream_list) return null; // key is a filter, never a name
-        if (std.mem.indexOfScalar(u8, req.key, 0) != null) return "stream name must not contain NUL";
+        if (client_names.hasControl(req.key)) return comptime client_names.controlRefusal("stream");
         if (req.key.len == 0) return "stream name is required";
         if (req.key.len > ns_keys.MAX_QUALIFIED_KEY) return "stream name too long";
         return null;
@@ -3000,7 +3001,10 @@ test "stream handler: pre-route by stream" {
 test "stream handler: a stream name is refused when empty, holding a NUL, or too long for a key; a list's key is a filter" {
     const long: [ns_keys.MAX_QUALIFIED_KEY + 1]u8 = @splat('s');
     try testing.expectEqualStrings("stream name is required", StreamHandler.nameRefusal(.stream_append, makeRequest(.stream_append, "", "", "")).?);
-    try testing.expectEqualStrings("stream name must not contain NUL", StreamHandler.nameRefusal(.stream_read, makeRequest(.stream_read, "a\x00b", "", "")).?);
+    try testing.expectEqualStrings(comptime client_names.controlRefusal("stream"), StreamHandler.nameRefusal(.stream_read, makeRequest(.stream_read, "a\x00b", "", "")).?);
+    try testing.expectEqualStrings(comptime client_names.controlRefusal("stream"), StreamHandler.nameRefusal(.stream_append, makeRequest(.stream_append, "a\nb", "", "")).?);
+    try testing.expectEqualStrings(comptime client_names.controlRefusal("stream"), StreamHandler.nameRefusal(.stream_append, makeRequest(.stream_append, "a\x7f", "", "")).?);
+    try testing.expectEqual(@as(?[]const u8, null), StreamHandler.nameRefusal(.stream_append, makeRequest(.stream_append, "orders-\xc3\xa9", "", "")));
     try testing.expectEqualStrings("stream name too long", StreamHandler.nameRefusal(.stream_append, makeRequest(.stream_append, &long, "", "")).?);
     try testing.expect(StreamHandler.nameRefusal(.stream_append, makeRequest(.stream_append, long[0..ns_keys.MAX_QUALIFIED_KEY], "", "")) == null);
     try testing.expect(StreamHandler.nameRefusal(.stream_list, makeRequest(.stream_list, "a\x00b", "", "")) == null);

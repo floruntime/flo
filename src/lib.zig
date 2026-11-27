@@ -23,6 +23,7 @@ pub const protocol = struct {
     pub const channel_entries = @import("protocol/channel_entries.zig");
     pub const schema = @import("protocol/schema.zig");
     pub const limits = @import("protocol/limits.zig");
+    pub const names = @import("protocol/names.zig");
     pub const request_builder = @import("protocol/request_builder.zig");
     pub const result = @import("protocol/result.zig");
 };

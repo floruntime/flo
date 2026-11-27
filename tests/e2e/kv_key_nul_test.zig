@@ -160,7 +160,7 @@ test "e2e/stream: a stream name holding a NUL is refused, so one namespace can't
     }) |c| {
         const r = try rawCall(ctx, c.op, "a", "b\x00orders", c.value, &out);
         try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
-        try testing.expect(std.mem.indexOf(u8, r.data, "stream name must not contain NUL") != null);
+        try testing.expect(std.mem.indexOf(u8, r.data, "stream name must not contain control characters") != null);
     }
 
     var info = try ctx.cli.run(&.{ "stream", "info", "orders", "-n", "b" });
@@ -172,4 +172,43 @@ test "e2e/stream: a stream name holding a NUL is refused, so one namespace can't
     var listed = try ctx.cli.run(&.{ "stream", "list", "-n", "b" });
     defer listed.deinit();
     try testing.expect(listed.contains("orders"));
+}
+
+test "e2e/names: a name holding a control character is refused, saying so, and nothing is made" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const proto = @import("src").protocol.proto;
+    var out: [512]u8 = undefined;
+    for ([_]struct { op: proto.OpCode, key: []const u8, value: []const u8 }{
+        .{ .op = .stream_append, .key = "orders\nx", .value = "o1" },
+        .{ .op = .stream_group_read, .key = "orders", .value = "\x02\x00g\x1b" },
+        .{ .op = .queue_enqueue, .key = "jobs\tx", .value = "m" },
+        .{ .op = .action_register, .key = "send\x7f", .value = "" },
+        .{ .op = .worker_register, .key = "w\rx", .value = "" },
+    }) |c| {
+        const r = try rawCall(ctx, c.op, "", c.key, c.value, &out);
+        if (std.mem.indexOf(u8, r.data, "must not contain control characters") == null) std.debug.print("{s}: {d} {s}\n", .{ @tagName(c.op), r.status, r.data });
+        try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
+        try testing.expect(std.mem.indexOf(u8, r.data, "must not contain control characters") != null);
+    }
+    // A workflow, and a processing job's stream, by the CLI's own path.
+    for ([_]struct { args: []const []const u8, def: []const u8, file: []const u8 }{
+        .{ .args = &.{ "workflow", "create", "-f" }, .def = "{\"kind\":\"Workflow\",\"name\":\"wf\\u0009x\",\"version\":\"1.0.0\",\"start\":{\"wait_for_signal\":{\"type\":\"go\"},\"transitions\":{\"success\":\"flo.Completed\"}}}", .file = "e2e-name-wf.yaml" },
+        .{ .args = &.{ "processing", "submit" }, .def = "{\"kind\":\"Processing\",\"name\":\"j\",\"sources\":[{\"stream\":{\"name\":\"in\\u000ax\"}}],\"sinks\":[{\"stream\":{\"name\":\"out\"}}]}", .file = "e2e-name-job.yaml" },
+    }) |c| {
+        const path = try stdx.testing.writeTempYaml(testing.allocator, c.def, c.file);
+        defer stdx.testing.cleanupTempFile(testing.allocator, path);
+        var argv: [4][]const u8 = undefined;
+        for (c.args, 0..) |a, i| argv[i] = a;
+        argv[c.args.len] = path;
+        var r = try ctx.cli.run(argv[0 .. c.args.len + 1]);
+        defer r.deinit();
+        if (!r.contains("must not contain control characters")) std.debug.print("{s}: {s} {s}\n", .{ c.args[0], r.stdout, r.stderr });
+        try testing.expect(r.contains("must not contain control characters"));
+    }
+    // Nothing made: no stream, queue, action or workflow by those names.
+    const streams = try ctx.execCapture(&.{ "stream", "list" });
+    try testing.expect(std.mem.indexOf(u8, streams, "orders") == null);
+    const actions = try ctx.execCapture(&.{ "action", "list" });
+    try testing.expect(std.mem.indexOf(u8, actions, "send") == null);
 }

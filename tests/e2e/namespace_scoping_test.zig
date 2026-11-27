@@ -271,7 +271,7 @@ test "e2e/scoping: a name holding a NUL, which could spell another namespace's k
     for ([_]proto.OpCode{ .action_register, .action_delete }) |op| {
         const r = try rawCall(ctx, op, "", "b\x00x", "", &out);
         try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
-        try testing.expect(std.mem.indexOf(u8, r.data, "must not contain NUL") != null);
+        try testing.expect(std.mem.indexOf(u8, r.data, "must not contain control characters") != null);
     }
     // b's action x is still there, as it was registered.
     const list = try ctx.execCapture(&.{ "action", "list", "-n", "b" });

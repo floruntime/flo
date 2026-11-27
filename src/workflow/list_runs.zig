@@ -176,9 +176,9 @@ fn missingRun(handler: *WorkflowHandler, at: RunAt.Value) void {
     handler.missing_runs_logged += 1;
     // A Flo bug, so an error; a test that plants one expects it.
     if (@import("builtin").is_test)
-        log.warn("workflow run list: run {s} is indexed but not there; skipped", .{at.run_id})
+        log.warn("workflow run list: run {f} is indexed but not there; skipped", .{std.zig.fmtString(at.run_id)})
     else
-        log.err("workflow run list: run {s} is indexed but not there; skipped", .{at.run_id});
+        log.err("workflow run list: run {f} is indexed but not there; skipped", .{std.zig.fmtString(at.run_id)});
 }
 
 /// A run whose entry breaks the page's schema (a Flo bug): logged, and
@@ -188,9 +188,9 @@ fn unlistable(handler: *WorkflowHandler, at: RunAt.Value, err: anyerror) void {
     if (handler.unlistable_said) return;
     handler.unlistable_said = true;
     if (@import("builtin").is_test)
-        log.warn("workflow run list: run {s} can't be listed ({s}); skipped", .{ at.run_id, @errorName(err) })
+        log.warn("workflow run list: run {f} can't be listed ({s}); skipped", .{ std.zig.fmtString(at.run_id), @errorName(err) })
     else
-        log.err("workflow run list: run {s} can't be listed ({s}); skipped", .{ at.run_id, @errorName(err) });
+        log.err("workflow run list: run {f} can't be listed ({s}); skipped", .{ std.zig.fmtString(at.run_id), @errorName(err) });
 }
 
 fn atOf(r: WorkflowHandler.RunInfo) RunAt.Value {

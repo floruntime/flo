@@ -691,6 +691,10 @@ pub const Shard = struct {
     outbox_caps: channel_driver.OutboxCaps = .{},
     /// When `noteSenderBug` last logged.
     sender_bug_warn_ms: u64 = 0,
+    /// When `noteGroupReadUnproposed` last logged, and the reads it has
+    /// counted since.
+    group_read_warn_ms: u64 = 0,
+    group_reads_unproposed: u64 = 0,
     /// When `noteSinkRefusal` last logged, and how many it has counted.
     sink_refusal_warn_ms: u64 = 0,
     sink_refusals_total: u64 = 0,
@@ -1739,6 +1743,22 @@ pub const Shard = struct {
         self.sink_skipped_bytes += m.entry.payload.len;
         var lb: [96]u8 = undefined;
         log.err("shard {d}: a repair skipped a processing sink's write to {s} sent by shard {d} ({d} bytes); its records are lost to that sink ({d} skipped writes here so far)", .{ self.id, targetLabel(&m.entry, &lb), m.from, m.entry.payload.len, self.sink_skipped_writes });
+    }
+
+    /// A consumer group's read whose delivery wasn't proposed (the log
+    /// full, writes stopped, memory, leadership): counted, and said at most
+    /// once every 30 s with the count since, as clients choose these names
+    /// and can ask as often as they like.
+    pub fn noteGroupReadUnproposed(self: *Shard, group: []const u8, stream: []const u8, err: anyerror) void {
+        self.noteGroupReadUnproposedAt(group, stream, err, nowMs());
+    }
+
+    fn noteGroupReadUnproposedAt(self: *Shard, group: []const u8, stream: []const u8, err: anyerror, now: u64) void {
+        self.group_reads_unproposed += 1;
+        if (self.group_read_warn_ms != 0 and now -| self.group_read_warn_ms < 30_000) return;
+        self.group_read_warn_ms = now;
+        log.warn("shard {d}: read of group {f} on stream {f} not proposed: {s} ({d} such reads since the last line)", .{ self.id, std.zig.fmtString(group), std.zig.fmtString(stream), @errorName(err), self.group_reads_unproposed });
+        self.group_reads_unproposed = 0;
     }
 
     fn noteSinkRefusal(self: *Shard, m: *const contract_store.AppliedMessage, r: persistence_mod.Refused) void {
@@ -33754,6 +33774,22 @@ test "Shard: an unpark try that fails still moves the deadline a whole interval 
         b.channel.allocator = allocator;
         raft.writes_stopped = false;
     }
+}
+
+test "Shard: a group read not proposed is said at once, then once per 30 s with the count since" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    a.noteGroupReadUnproposedAt("g\nx", "s\x1b", error.Overloaded, 1_000);
+    try std.testing.expectEqual(@as(u64, 1_000), a.group_read_warn_ms);
+    try std.testing.expectEqual(@as(u64, 0), a.group_reads_unproposed);
+    for (0..5) |k| a.noteGroupReadUnproposedAt("g", "s", error.Overloaded, 1_000 + 29_999 - k);
+    try std.testing.expectEqual(@as(u64, 1_000), a.group_read_warn_ms);
+    try std.testing.expectEqual(@as(u64, 5), a.group_reads_unproposed);
+    a.noteGroupReadUnproposedAt("g", "s", error.Overloaded, 31_000);
+    try std.testing.expectEqual(@as(u64, 31_000), a.group_read_warn_ms);
+    try std.testing.expectEqual(@as(u64, 0), a.group_reads_unproposed);
 }
 
 test "Shard: the unpark's wait is reckoned from elapsed time, at any unpark_ms, and the loop sleeps the earliest of it and the pipelines' deadline" {

@@ -93,6 +93,6 @@ test "e2e/exit: a batch line the server refuses makes the batch exit 3" {
     var r = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", path, "--precision", "ms" });
     defer r.deinit();
     try testing.expectEqual(@as(u8, 3), r.exit_code);
-    try testing.expect(r.stderrContains("line 2: field v (0 of 1 fields written): bad request: a measurement or field name must not contain NUL [bad_request]"));
+    try testing.expect(r.stderrContains("line 2: field v (0 of 1 fields written): bad request: a measurement or field name must not contain control characters (bytes 0x00-0x1f or 0x7f) [bad_request]"));
     try testing.expect(r.stderrContains("1 of 2 lines failed"));
 }

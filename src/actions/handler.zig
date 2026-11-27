@@ -14,6 +14,7 @@ const std = @import("std");
 const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
+const client_names = @import("../protocol/names.zig");
 const result_mod = @import("../protocol/result.zig");
 const schema = @import("../protocol/schema.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
@@ -299,7 +300,7 @@ pub const ActionsHandler = struct {
 
     // ── Errors ──────────────────────────────────────────────────────────
 
-    pub const Error = error{ NotFound, OutOfMemory, StoredTooLong, NotLeading, Stale, Unproposed, NameHasNul };
+    pub const Error = error{ NotFound, OutOfMemory, StoredTooLong, NotLeading, Stale, Unproposed, NameHasControl };
 
     pub fn refusal(err: Error) table_run.Refused {
         return switch (err) {
@@ -309,7 +310,7 @@ pub const ActionsHandler = struct {
             error.NotLeading => .{ .status = .unavailable, .refusal = .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: this node's leadership isn't settled yet — retry" } },
             error.Stale => .{ .status = .conflict, .refusal = .{ .reason = .stale_report, .ran = .no, .message = "stale report: the run was delivered again since" } },
             error.Unproposed => .{ .status = .unavailable, .refusal = .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: the report could not be proposed — retry" } },
-            error.NameHasNul => .{ .status = .bad_request, .refusal = .{ .reason = .malformed, .ran = .no, .message = machine.NAME_HAS_NUL } },
+            error.NameHasControl => .{ .status = .bad_request, .refusal = .{ .reason = .malformed, .ran = .no, .message = machine.NAME_HAS_CONTROL } },
         };
     }
 
@@ -320,8 +321,8 @@ pub const ActionsHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         switch (op) {
-            .action_register, .action_invoke, .action_delete => if (std.mem.indexOfScalar(u8, req.key, 0) != null) {
-                return sendActionResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "action name must not contain NUL" } });
+            .action_register, .action_invoke, .action_delete => if (client_names.hasControl(req.key)) {
+                return sendActionResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = comptime client_names.controlRefusal("action") } });
             },
             else => {},
         }
@@ -534,9 +535,9 @@ pub const ActionsHandler = struct {
                 if (!self.missing_run_said) {
                     self.missing_run_said = true;
                     if (@import("builtin").is_test)
-                        log.warn("action run list: run {s} is indexed but not there; skipped", .{at.run})
+                        log.warn("action run list: run {f} is indexed but not there; skipped", .{std.zig.fmtString(at.run)})
                     else
-                        log.err("action run list: run {s} is indexed but not there; skipped", .{at.run});
+                        log.err("action run list: run {f} is indexed but not there; skipped", .{std.zig.fmtString(at.run)});
                 }
                 read += 1;
                 last = at;
@@ -558,9 +559,9 @@ pub const ActionsHandler = struct {
                 if (!self.unlistable_said) {
                     self.unlistable_said = true;
                     if (@import("builtin").is_test)
-                        log.warn("action run list: run {s} can't be listed ({s}); skipped", .{ at.run, @errorName(err) })
+                        log.warn("action run list: run {f} can't be listed ({s}); skipped", .{ std.zig.fmtString(at.run), @errorName(err) })
                     else
-                        log.err("action run list: run {s} can't be listed ({s}); skipped", .{ at.run, @errorName(err) });
+                        log.err("action run list: run {f} can't be listed ({s}); skipped", .{ std.zig.fmtString(at.run), @errorName(err) });
                 }
                 read += 1;
                 last = at;
@@ -1130,7 +1131,7 @@ pub const ActionsHandler = struct {
             const owned_key = try self.allocator.dupe(u8, run_key);
             const proposed = propose(shard, .action_deliver, ae.Deliver.Value{ .ns = ns.int(), .action = action, .run = run_id, .due_ns = due, .holder = holder, .request_key = request_key, .lease_ms = def.lease_ms }) catch |err| {
                 self.allocator.free(owned_key);
-                if (!shard.quietHalted(err)) log.warn("shard {d}: run {s} not delivered: {s}", .{ shard.id, run_id, @errorName(err) });
+                if (!shard.quietHalted(err)) log.warn("shard {d}: run {f} not delivered: {s}", .{ shard.id, std.zig.fmtString(run_id), @errorName(err) });
                 return .none;
             };
             self.reserved.putAssumeCapacity(owned_key, {});

@@ -25,6 +25,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
+const client_names = @import("../protocol/names.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
@@ -202,9 +203,10 @@ pub const WorkerHandler = struct {
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
 
         // A worker id is a run's holder, and a holder's request keys are
-        // `[holder][0][key]`: one holding a NUL could spell another's.
-        if (std.mem.indexOfScalar(u8, req.key, 0) != null) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "worker id must not contain NUL");
+        // `[holder][0][key]`: one holding a NUL could spell another's. No
+        // other control character either, as no client name holds one.
+        if (client_names.hasControl(req.key)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, INVALID_ID);
             return;
         }
 
@@ -542,7 +544,7 @@ pub const WorkerHandler = struct {
 
     fn info(self: *WorkerHandler, ns: NamespaceId, worker_id: []const u8) Error!InfoResponse.Value {
         // No worker's id holds a NUL (`dispatchWorkerCmd`).
-        if (std.mem.indexOfScalar(u8, worker_id, 0) != null) return error.InvalidId;
+        if (client_names.hasControl(worker_id)) return error.InvalidId;
         const w = self.find(ns, worker_id) orelse return error.NotFound;
         const buf = self.info_buf orelse blk: {
             const b = try self.allocator.alloc(u8, worker_ops.Processes.byte_bound.?);
@@ -570,9 +572,11 @@ pub const WorkerHandler = struct {
             error.OutOfMemory => .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "internal error: out of memory" } },
             error.GatherBusy => .{ .status = .overloaded, .refusal = .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many reads across shards are under way; this request was not run — retry" } },
             error.NotFound => .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = "worker not found" } },
-            error.InvalidId => .{ .status = .bad_request, .refusal = .{ .reason = .malformed, .ran = .no, .message = "worker id must not contain NUL" } },
+            error.InvalidId => .{ .status = .bad_request, .refusal = .{ .reason = .malformed, .ran = .no, .message = INVALID_ID } },
         };
     }
+
+    const INVALID_ID = "worker id must not contain control characters (bytes 0x00-0x1f or 0x7f)";
 
     /// worker.list: each shard holds the workers that registered on it, so
     /// every shard answers its own page after `cursor` and the pages merge.

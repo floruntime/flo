@@ -39,6 +39,7 @@ const std = @import("std");
 const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
+const client_names = @import("../protocol/names.zig");
 const schema = @import("../protocol/schema.zig");
 const ae = @import("../protocol/action_entries.zig");
 const ge = @import("../protocol/group_entries.zig");
@@ -244,11 +245,12 @@ fn check(shard: *Shard, conn: *Connection, req: Request) bool {
         shard.sendRefusal(conn, req.header.request_id, Operator.RESERVED_REFUSAL.status, Operator.RESERVED_REFUSAL.refusal);
         return false;
     }
-    // Names hold no NUL, as streams' and every other resource's don't.
+    // Names hold no control character, as streams' and every other
+    // resource's don't.
     var r = WireReader.init(req.value);
     const group = r.readLengthPrefixed(u16) orelse "";
-    if (std.mem.indexOfScalar(u8, req.key, 0) != null or std.mem.indexOfScalar(u8, group, 0) != null) {
-        refuse(shard, conn, req.header.request_id, .bad_request, "bad request: a stream or group name must not contain NUL");
+    if (client_names.hasControl(req.key) or client_names.hasControl(group)) {
+        refuse(shard, conn, req.header.request_id, .bad_request, comptime "bad request: " ++ client_names.controlRefusal("a stream or group"));
         return false;
     }
     if (group.len > ge.MAX_GROUP_NAME) {
@@ -489,7 +491,7 @@ fn deliverHere(self: *Groups, shard: *Shard, reply_to: ReplyTo, request_id: u64,
         } else through = id;
     }
     const proposed = propose(shard, .group_deliver, ge.Deliver.Value{ .ns = p.ns.int(), .stream = stream, .group = group, .count = take, .max_bytes = max_bytes, .holder = p.consumer, .lease_ms = lease_ms, .create = true, .ready = .{ .bytes = rb[0..rw], .count = nr }, .through_ms = through.timestamp_ms, .through_seq = through.sequence, .max_held = caps.max_messages, .max_held_bytes = caps.max_bytes, .shard_held_bytes = caps.shard_held_bytes }) catch |err| {
-        if (!shard.quietHalted(err)) log.warn("shard {d}: read of group {s} on stream {s} not proposed: {s}", .{ shard.id, group, stream, @errorName(err) });
+        if (!shard.quietHalted(err)) shard.noteGroupReadUnproposed(group, stream, err);
         return false;
     };
     self.claimed.putAssumeCapacity(gk, held + take);
