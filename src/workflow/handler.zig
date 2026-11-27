@@ -190,6 +190,11 @@ pub const WorkflowHandler = struct {
     quota_eased: @import("../contract/store.zig").Eased = .{},
     /// Runs held at their namespace's quota here, for the shard's gauge.
     quota_held_runs: u64 = 0,
+    /// Each namespace's stretch at its quota here, as the log tells it
+    /// (`noteQuotaEpisodes`). Leader memory (`clearHeld`).
+    quota_episodes: std.AutoHashMapUnmanaged(u32, QuotaEpisode) = .empty,
+    /// The lines `noteQuotaEpisodes` has logged, both kinds.
+    quota_lines: u64 = 0,
     /// How many times in a row each run's timer step was refused at apply,
     /// keys owned: its recheck backs off, so a step refused the same way
     /// every time costs a log entry a minute, not a second. Cleared when an
@@ -681,6 +686,10 @@ pub const WorkflowHandler = struct {
     };
     /// A held run's hold, and where its key is in that hold's list.
     const Held = struct { hold: Hold, at: u32 };
+    /// `open`: a pass saw the namespace's steps held, and none since found
+    /// it under its quota. `said_at_ms`: when its last "held" line was
+    /// logged; `said`: whether this stretch's was.
+    const QuotaEpisode = struct { open: bool, said: bool, said_at_ms: i64 };
     const Ending = struct { index: u64, term: u64 };
 
     fn timerCompare(_: void, a: Timer, b: Timer) std.math.Order {
@@ -741,6 +750,7 @@ pub const WorkflowHandler = struct {
         self.clearHeld();
         self.held.deinit(self.allocator);
         self.held_by.deinit(self.allocator);
+        self.quota_episodes.deinit(self.allocator);
         self.refusals.deinit(self.allocator);
 
         // Free stream trigger state
@@ -5060,10 +5070,7 @@ pub const WorkflowHandler = struct {
             return self.dropHeld(run_key);
         };
         self.held.getPtr(run_key).?.* = .{ .hold = hold, .at = @intCast(gop.value_ptr.items.len - 1) };
-        if (hold.kind == .quota) {
-            self.quota_held_runs += 1;
-            if (gop.value_ptr.items.len == 1) log.info("namespace {d}: its workflow runs' steps are held at its run-history quota on shard {d}; they go on once runs are deleted or the quota is raised", .{ hold.ns.int(), self.shardId() });
-        }
+        if (hold.kind == .quota) self.quota_held_runs += 1;
     }
 
     fn shardId(self: *const WorkflowHandler) u16 {
@@ -5079,7 +5086,6 @@ pub const WorkflowHandler = struct {
         if (list.items.len == 0) {
             list.deinit(self.allocator);
             _ = self.held_by.remove(h.hold);
-            if (h.hold.kind == .quota) log.info("namespace {d}: its workflow runs' steps are no longer held at its run-history quota on shard {d}", .{ h.hold.ns.int(), self.shardId() });
         }
     }
 
@@ -5112,6 +5118,7 @@ pub const WorkflowHandler = struct {
         self.held_by.clearRetainingCapacity();
         self.quota_held_runs = 0;
         self.quota_eased = .{};
+        self.quota_episodes.clearRetainingCapacity();
         var rit = self.refusals.keyIterator();
         while (rit.next()) |k| self.allocator.free(k.*);
         self.refusals.clearRetainingCapacity();
@@ -5142,6 +5149,7 @@ pub const WorkflowHandler = struct {
         var n: usize = 0;
         var eased = self.quota_eased;
         self.quota_eased = .{};
+        self.noteQuotaEpisodes(shard, &eased, now_ms);
         var hit = self.held_by.keyIterator();
         while (hit.next()) |h| {
             // A quota hold is asked only once its namespace eased: nothing
@@ -5181,6 +5189,47 @@ pub const WorkflowHandler = struct {
             if (c.kind == .quota and self.held_by.contains(c)) self.quota_eased.add(c.ns.int());
         }
     }
+
+    /// Opens a stretch for each namespace with runs held at its quota, and
+    /// ends each one an eased namespace's quota no longer holds, its runs
+    /// released or gone (a run cancelled while the namespace is at its
+    /// quota leaves it there). Each says so at most once per stretch, and
+    /// a namespace says "held" at most once per `QUOTA_LOG_MIN_MS`, so
+    /// how often a tenant fills and drains its quota doesn't set how much
+    /// the server logs.
+    fn noteQuotaEpisodes(self: *WorkflowHandler, shard: *Shard, eased: *const @import("../contract/store.zig").Eased, now_ms: i64) void {
+        var hit = self.held_by.keyIterator();
+        while (hit.next()) |h| {
+            if (h.kind != .quota) continue;
+            const gop = self.quota_episodes.getOrPut(self.allocator, h.ns.int()) catch continue;
+            if (gop.found_existing and gop.value_ptr.open) continue;
+            const said = !gop.found_existing or now_ms -| gop.value_ptr.said_at_ms >= QUOTA_LOG_MIN_MS;
+            gop.value_ptr.* = .{ .open = true, .said = said, .said_at_ms = if (said) now_ms else gop.value_ptr.said_at_ms };
+            if (said) {
+                self.quota_lines += 1;
+                log.info("namespace {d}: its workflow runs' steps are held at its run-history quota on shard {d}; they go on once runs are deleted or the quota is raised", .{ h.ns.int(), self.shardId() });
+            }
+        }
+        var eit = self.quota_episodes.iterator();
+        while (eit.next()) |e| {
+            const ns_int = e.key_ptr.*;
+            if (!e.value_ptr.open) {
+                // Kept only while its "held" line still holds the next back.
+                if (now_ms -| e.value_ptr.said_at_ms >= QUOTA_LOG_MIN_MS) self.quota_episodes.removeByPtr(e.key_ptr);
+                continue;
+            }
+            if (!eased.has(ns_int)) continue;
+            if (holds(shard, .{ .ns = .of(ns_int), .kind = .quota })) continue;
+            e.value_ptr.open = false;
+            if (e.value_ptr.said) {
+                self.quota_lines += 1;
+                log.info("namespace {d}: its workflow runs' steps are no longer held at its run-history quota on shard {d}", .{ ns_int, self.shardId() });
+            }
+        }
+    }
+
+    /// The least time between a namespace's "held" lines on a shard.
+    const QUOTA_LOG_MIN_MS: i64 = 60_000;
 
     /// Held runs put back on `timers` a pass, at most: half the due timers
     /// a pass handles, so other runs' timers keep the rest. A tick runs up
@@ -11102,6 +11151,148 @@ test "workflow quota: a hold releases past a pass's room over passes, and past t
     handler.checkPendingActions(&shard);
     try testing.expectEqual(@as(usize, 0), handler.held.count());
     try testing.expectEqual(@as(u32, 0), handler.held_by.count());
+}
+
+/// Run `name` of `test-wf` in the default namespace, created under its
+/// quota and then stepped: held, if the namespace is at its quota.
+fn quotaTestRun(handler: *WorkflowHandler, shard: *Shard, buf: *[KEY_PREFIX + 8]u8, name: []const u8) []const u8 {
+    const k = writeKey(buf, .default, name);
+    handler.advanceWorkflow(shard, k);
+    return k;
+}
+
+/// Run `key` cancelled, as its entry's apply and `afterApply` leave it.
+fn quotaTestCancel(handler: *WorkflowHandler, key: []const u8) !void {
+    const c: runs_machine.Complete = .{ .status = .cancelled, .output = null, .event = "workflow_cancelled", .detail = "stop", .workflow = "test-wf", .created_ns = handler.appliedRun(key).?.created_ns };
+    var buf: [128]u8 = undefined;
+    var out: Result = .{};
+    try handler.replayComplete(key, c.encode(&buf).?, 7, &out);
+    try testing.expect(out.refused() == null);
+    handler.runApplied(.workflow_complete, key);
+}
+
+test "workflow quota: a namespace's stretch at its quota logs held once and no longer held once, however its runs come and go, and held at most once a QUOTA_LOG_MIN_MS" {
+    const Eased = @import("../contract/store.zig").Eased;
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    quotaTestHandler(&handler, &shard);
+    const store = &shard.defaultPartition().store;
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    var kb: [6][KEY_PREFIX + 8]u8 = undefined;
+    const names = [_][]const u8{ "e0", "e1", "e2", "e3", "e4", "e5" };
+    for (names, 0..) |n, i| createTestRun(&handler, writeKey(&kb[i], .default, n), "", "test-wf");
+    const quota: WorkflowHandler.Hold = .{ .ns = .default, .kind = .quota };
+    var own: Eased = .{};
+    own.add(NamespaceId.default.int());
+    const t0: i64 = 1_000_000;
+
+    // At the quota: one run held, then another, each pass after: one line.
+    try hq.setForTest(store, .default, 1 << 30, 1 << 30);
+    _ = quotaTestRun(&handler, &shard, &kb[0], names[0]);
+    try testing.expectEqual(@as(usize, 1), handler.holdCount(quota));
+    handler.checkPendingActionsAt(&shard, t0);
+    try testing.expectEqual(@as(u64, 1), handler.quota_lines);
+    _ = quotaTestRun(&handler, &shard, &kb[1], names[1]);
+    handler.checkPendingActionsAt(&shard, t0 + 1);
+    // Eased but still at it: no line, and its runs stay held.
+    handler.noteEased(own);
+    handler.checkPendingActionsAt(&shard, t0 + 2);
+    try testing.expectEqual(@as(u64, 1), handler.quota_lines);
+    try testing.expectEqual(@as(usize, 2), handler.holdCount(quota));
+
+    // Under it and eased: released, and one line saying so.
+    try hq.setForTest(store, .default, 1 << 30, 0);
+    handler.noteEased(own);
+    handler.checkPendingActionsAt(&shard, t0 + 3);
+    settleTest(&shard);
+    try testing.expectEqual(@as(usize, 0), handler.holdCount(quota));
+    try testing.expectEqual(@as(u64, 2), handler.quota_lines);
+    // Nothing more while it stays under.
+    handler.noteEased(own);
+    handler.checkPendingActionsAt(&shard, t0 + 4);
+    try testing.expectEqual(@as(u64, 2), handler.quota_lines);
+
+    // At it again inside the interval: held, and nothing logged, either way.
+    try hq.setForTest(store, .default, 1 << 30, 1 << 30);
+    _ = quotaTestRun(&handler, &shard, &kb[2], names[2]);
+    try testing.expectEqual(@as(usize, 1), handler.holdCount(quota));
+    handler.checkPendingActionsAt(&shard, t0 + 5);
+    try hq.setForTest(store, .default, 1 << 30, 0);
+    handler.noteEased(own);
+    handler.checkPendingActionsAt(&shard, t0 + 6);
+    settleTest(&shard);
+    try testing.expectEqual(@as(usize, 0), handler.holdCount(quota));
+    try testing.expectEqual(@as(u64, 2), handler.quota_lines);
+
+    // Past the interval since the last "held": said again.
+    try hq.setForTest(store, .default, 1 << 30, 1 << 30);
+    _ = quotaTestRun(&handler, &shard, &kb[3], names[3]);
+    handler.checkPendingActionsAt(&shard, t0 + WorkflowHandler.QUOTA_LOG_MIN_MS);
+    try testing.expectEqual(@as(u64, 3), handler.quota_lines);
+    // A leader's step-down forgets every stretch.
+    handler.clearHeld();
+    try testing.expectEqual(@as(u32, 0), handler.quota_episodes.count());
+}
+
+test "workflow quota: a held run cancelled while its namespace is at its quota leaves the stretch open; it ends only once the quota no longer holds" {
+    const Eased = @import("../contract/store.zig").Eased;
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    quotaTestHandler(&handler, &shard);
+    const store = &shard.defaultPartition().store;
+    createTestDef(&handler, testKey(.default, "test-wf"), "test-wf", test_workflow_json);
+    var kb: [2][KEY_PREFIX + 8]u8 = undefined;
+    const names = [_][]const u8{ "c0", "c1" };
+    for (names, 0..) |n, i| createTestRun(&handler, writeKey(&kb[i], .default, n), "", "test-wf");
+    const quota: WorkflowHandler.Hold = .{ .ns = .default, .kind = .quota };
+    var own: Eased = .{};
+    own.add(NamespaceId.default.int());
+    const t0: i64 = 1_000_000;
+
+    try hq.setForTest(store, .default, 1 << 30, 1 << 30);
+    const k0 = quotaTestRun(&handler, &shard, &kb[0], names[0]);
+    handler.checkPendingActionsAt(&shard, t0);
+    try testing.expectEqual(@as(u64, 1), handler.quota_lines);
+    // Its only held run ends, the namespace still at its quota: the hold
+    // goes, the stretch and its silence stay, eased or not.
+    try quotaTestCancel(&handler, k0);
+    try testing.expectEqual(@as(usize, 0), handler.holdCount(quota));
+    try testing.expectEqual(@as(u64, 0), handler.quota_held_runs);
+    handler.noteEased(own);
+    handler.checkPendingActionsAt(&shard, t0 + 1);
+    try testing.expectEqual(@as(u64, 1), handler.quota_lines);
+    // Another held in the same stretch: nothing new to say.
+    _ = quotaTestRun(&handler, &shard, &kb[1], names[1]);
+    try testing.expectEqual(@as(usize, 1), handler.holdCount(quota));
+    handler.checkPendingActionsAt(&shard, t0 + 2);
+    try testing.expectEqual(@as(u64, 1), handler.quota_lines);
+    // That one ends too; then the quota lets go, with no run held: the
+    // stretch ends, and says so once.
+    try quotaTestCancel(&handler, writeKey(&kb[1], .default, names[1]));
+    try testing.expectEqual(@as(usize, 0), handler.holdCount(quota));
+    try hq.setForTest(store, .default, 1 << 30, 0);
+    handler.checkPendingActionsAt(&shard, t0 + 3);
+    // Not eased: not asked.
+    try testing.expectEqual(@as(u64, 1), handler.quota_lines);
+    handler.noteEased(own);
+    handler.checkPendingActionsAt(&shard, t0 + 4);
+    try testing.expectEqual(@as(u64, 2), handler.quota_lines);
+    handler.noteEased(own);
+    handler.checkPendingActionsAt(&shard, t0 + 5);
+    try testing.expectEqual(@as(u64, 2), handler.quota_lines);
+    // Closed and past the interval: forgotten.
+    handler.checkPendingActionsAt(&shard, t0 + WorkflowHandler.QUOTA_LOG_MIN_MS);
+    try testing.expectEqual(@as(u32, 0), handler.quota_episodes.count());
 }
 
 test "workflow quota: a due timer or signal timeout is held without a copy, and its release arms it again from its wait" {
