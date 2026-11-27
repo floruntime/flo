@@ -33746,9 +33746,8 @@ test "Shard: the unpark's wait is reckoned from elapsed time, at any unpark_ms, 
     try std.testing.expectEqual(Shard.UnparkDue{ .in_ms = 100 }, b.unparkDue(std.math.maxInt(u64)));
     // The loop reads each wait on its own writer's clock: the unpark's on
     // the shard's, which set `unpark_ms`; the pipelines' deadline on the
-    // processing handler's, held here far ahead of the shard's. Bounds are
-    // upper only, as the scheduler may run late between these lines; read
-    // on the wrong clock, either wait lands outside them.
+    // processing handler's, held here far ahead of the shard's. Read on the
+    // wrong clock, either wait lands outside these bounds.
     const Clock = struct {
         var now: u64 = 0;
         fn read() u64 {
@@ -33764,14 +33763,18 @@ test "Shard: the unpark's wait is reckoned from elapsed time, at any unpark_ms, 
     b.apply_behind = false;
     b.producers_due = false;
     b.producers_deadline_ms = null;
-    b.unpark_ms = @import("stdx").time.monotonicMs() - 60;
+    // Stamped 10 ms back just before each call: correct code fails only
+    // on a 90 ms stall between two adjacent lines.
+    b.unpark_ms = @import("stdx").time.monotonicMs() - 10;
     const slept = b.loopTimeoutMs(false);
-    try std.testing.expect(slept >= 1 and slept <= 40);
+    try std.testing.expect(slept >= 1 and slept <= 90);
     b.producers_deadline_ms = h_now + 20;
+    b.unpark_ms = @import("stdx").time.monotonicMs() - 10;
     try std.testing.expect(b.loopTimeoutMs(false) <= 20);
     b.producers_deadline_ms = h_now + 500;
+    b.unpark_ms = @import("stdx").time.monotonicMs() - 10;
     const later = b.loopTimeoutMs(false);
-    try std.testing.expect(later >= 1 and later <= 40);
+    try std.testing.expect(later >= 1 and later <= 90);
     const t: i64 = 1_000_000;
     try std.testing.expectEqual(@as(u32, 30), Shard.sleepMs(t + 50, t, .{ .in_ms = 30 }));
     try std.testing.expectEqual(@as(u32, 10), Shard.sleepMs(t + 10, t, .{ .in_ms = 30 }));
