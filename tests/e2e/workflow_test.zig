@@ -4692,3 +4692,71 @@ test "e2e/workflow: on 12 shards, in a namespace of its own, a run by a generate
     }
     try testing.expect(off_zero >= 2);
 }
+
+// The CLI built these requests in fixed 8 KiB buffers, so an input past
+// that failed client-side ("the request can't be built") though the server
+// takes up to 64 KiB. Inputs well past 8 KiB must reach it whole; past
+// 64 KiB, the server refuses them.
+test "e2e/workflow: start, signal and invoke carry inputs past 8 KiB to the server" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const big = "{\"p\":\"" ++ @as([48 * 1024]u8, @splat('p')) ++ "\"}";
+    const over = "{\"p\":\"" ++ @as([70 * 1024]u8, @splat('p')) ++ "\"}";
+
+    try ctx.exec(&.{ "action", "register", "big-in" });
+    const workflow_def =
+        \\kind: Workflow
+        \\name: big-input
+        \\version: 1.0.0
+        \\start.wait_for_signal.type: go
+        \\start.transitions.success: flo.Completed
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "big-input.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+
+    {
+        var r = try ctx.execResult(&.{ "workflow", "start", "big-input", big, "--run-id", "big-1" });
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 0), r.exit_code);
+    }
+    {
+        var st = try ctx.execResult(&.{ "workflow", "status", "big-1" });
+        defer st.deinit();
+        try testing.expectEqual(@as(u8, 0), st.exit_code);
+        try testing.expect(st.stdoutContains(big));
+    }
+    {
+        var r = try ctx.execResult(&.{ "workflow", "signal", "big-1", "--type", "go", "--payload", big });
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 0), r.exit_code);
+    }
+    var done = false;
+    for (0..50) |_| {
+        var st = try ctx.execResult(&.{ "workflow", "status", "big-1" });
+        defer st.deinit();
+        if (st.stdoutContains("completed")) {
+            done = true;
+            break;
+        }
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expect(done);
+    {
+        var r = try ctx.execResult(&.{ "action", "invoke", "big-in", big });
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 0), r.exit_code);
+    }
+
+    // Past the bound: the server's refusal, not the client's.
+    for ([_][]const []const u8{
+        &.{ "workflow", "start", "big-input", over, "--run-id", "big-2" },
+        &.{ "action", "invoke", "big-in", over },
+    }) |args| {
+        var r = try ctx.execResult(args);
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 3), r.exit_code);
+        try testing.expect(r.stderrContains("[bad_request]"));
+    }
+}
