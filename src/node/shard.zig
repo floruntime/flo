@@ -7489,7 +7489,7 @@ pub const Shard = struct {
 
     fn notePipelinesNext(self: *Shard, leads: bool) void {
         const next: ProcessingHandler.Next = if (leads and self.halted == null)
-            self.processing_handler.nextWork(self, @import("stdx").time.milliTimestamp())
+            self.processing_handler.nextWork(self, self.processing_handler.nowMs())
         else
             .{};
         self.producers_due = next.due;
@@ -7512,9 +7512,8 @@ pub const Shard = struct {
     /// How long an idle tick may sleep: the loop's 100 ms, or less when a
     /// pipeline becomes due sooner. Never 0: a pipeline already due keeps
     /// the loop busy instead, and a due one that waits gives no deadline.
-    /// The deadline is wall-clock ms, as a pipeline's `last_poll_ms` is:
-    /// keep both on one clock. A clock step only shortens a sleep to 1 ms
-    /// or caps it at 100.
+    /// The deadline is on the processing handler's monotonic `nowMs`, as a
+    /// pipeline's `last_poll_ms` is: keep both on one clock.
     fn idleTimeoutMs(self: *const Shard, now_ms: i64) u32 {
         const IDLE_MS = 100;
         const at = self.producers_deadline_ms orelse return IDLE_MS;
@@ -7619,7 +7618,7 @@ pub const Shard = struct {
         while (!self.stop_requested.load(.acquire)) {
             // Connections re-queued while the last tick settled run next.
             const slicing = if (self.snapshot_window) |w| w.slices_left > 0 else false;
-            _ = self.tick(self.loopTimeoutMs(slicing, @import("stdx").time.milliTimestamp())) catch |err| {
+            _ = self.tick(self.loopTimeoutMs(slicing, self.processing_handler.nowMs())) catch |err| {
                 // A shard whose tick keeps failing serves nothing: say so,
                 // not once per tick, and do not spin a core while it lasts.
                 const now = nowMs();
@@ -14595,7 +14594,7 @@ test "Shard: a processing sink in a namespace not yet published writes nothing u
     // Waiting on a namespace not yet published: neither due nor timed, so
     // the loop sleeps its own wake, not a poll interval's.
     {
-        const n = a.processing_handler.nextWork(a, @import("stdx").time.milliTimestamp() + 5_000);
+        const n = a.processing_handler.nextWork(a, a.processing_handler.nowMs() + 5_000);
         try std.testing.expect(!n.due);
         try std.testing.expectEqual(@as(?i64, null), n.deadline_ms);
     }
@@ -14698,7 +14697,7 @@ test "Shard: a TS sink whose measurement is on another shard writes through that
     const from_b = b.raft_node.log.lastIndex() + 1;
     const from_a = a.raft_node.log.lastIndex() + 1;
     var pit = a.processing_handler.pipelines.valueIterator();
-    pit.next().?.last_poll_ms = 0;
+    pit.next().?.last_poll_ms = ProcessingHandler.NEVER_MS;
     _ = a.processing_handler.tickPipelines(a);
     // Proposed, not yet applied anywhere: shard 1's store is untouched.
     try std.testing.expectEqual(@as(usize, 0), try tsPoints(b, .default, measurement, "value"));
@@ -14780,7 +14779,7 @@ fn moveCursor(two: *TwoShards, ns: ns_table.Id, key: []const u8, from: anytype, 
 }
 
 fn tickNow(a: *Shard, pipe: *ProcessingHandler.PipelineState) void {
-    pipe.last_poll_ms = 0;
+    pipe.last_poll_ms = ProcessingHandler.NEVER_MS;
     _ = a.processing_handler.tickPipelines(a);
 }
 
@@ -14894,7 +14893,7 @@ test "Shard: a poll reads its batch_size, a page after another as each batch app
         const pipe = try batchJob(&two, c, source, batch_size);
         // One poll: its pages follow one another without waiting for the
         // poll interval, each once the last batch applies.
-        pipe.last_poll_ms = 0;
+        pipe.last_poll_ms = ProcessingHandler.NEVER_MS;
         for (0..20) |_| {
             _ = a.processing_handler.tickPipelines(a);
             two.settle();
@@ -14902,7 +14901,7 @@ test "Shard: a poll reads its batch_size, a page after another as each batch app
         try std.testing.expectEqual(@as(u64, @min(batch_size, 200)), pipe.records_in);
         // The next poll reads the next batch_size.
         if (batch_size < 200) {
-            pipe.last_poll_ms = 0;
+            pipe.last_poll_ms = ProcessingHandler.NEVER_MS;
             for (0..20) |_| {
                 _ = a.processing_handler.tickPipelines(a);
                 two.settle();
@@ -15209,14 +15208,14 @@ test "Shard: a pipeline with records left whose batch is in the log, or that wai
         try std.testing.expect(pipe.wait == .outbox);
         try std.testing.expect(pipe.more);
         try std.testing.expectEqual(taken, pipe.records_in);
-        const n = h.nextWork(a, @import("stdx").time.milliTimestamp());
+        const n = h.nextWork(a, h.nowMs());
         try std.testing.expect(!n.due);
         try std.testing.expectEqual(@as(?i64, null), n.deadline_ms);
     }
     // Delivered and trimmed: room, and the pipeline is due at once.
     pumpChannels(&two);
     two.settle();
-    try std.testing.expect(h.nextWork(a, @import("stdx").time.milliTimestamp()).due);
+    try std.testing.expect(h.nextWork(a, h.nowMs()).due);
 
     // Its sink's shard halted: a wait, so neither due nor timed.
     var slots: [2]health_mod.ShardSlot = @splat(.{});
@@ -15225,15 +15224,15 @@ test "Shard: a pipeline with records left whose batch is in the log, or that wai
     defer a.node_health = had;
     slots[1].set(.halted);
     for (0..5) |_| {
-        const n = h.nextWork(a, @import("stdx").time.milliTimestamp());
+        const n = h.nextWork(a, h.nowMs());
         try std.testing.expect(!n.due);
         try std.testing.expectEqual(@as(?i64, null), n.deadline_ms);
     }
     slots[1].set(.ok);
-    try std.testing.expect(h.nextWork(a, @import("stdx").time.milliTimestamp()).due);
+    try std.testing.expect(h.nextWork(a, h.nowMs()).due);
 
     // A page asked of another shard, not yet come: nothing until it does.
-    const now = @import("stdx").time.milliTimestamp();
+    const now = h.nowMs();
     pipe.read_seq = 1;
     pipe.read_sent_ms = now;
     try std.testing.expect(!h.nextWork(a, now + 10).due);
@@ -15249,9 +15248,75 @@ test "Shard: a pipeline with records left whose batch is in the log, or that wai
     a.runRequest(c.conn, try ParkTest.request(.processing_cancel, 6, "", id, "", ""), .client);
     two.settle();
     _ = h.tickPipelines(a);
-    const n = h.nextWork(a, @import("stdx").time.milliTimestamp() + 1000);
+    const n = h.nextWork(a, h.nowMs() + 1000);
     try std.testing.expect(!n.due);
     try std.testing.expectEqual(@as(?i64, null), n.deadline_ms);
+}
+
+test "Shard: a pipeline polls on the monotonic clock: a wall-clock step neither stops nor hurries it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    // Far from any wall-clock time, so a poll timed by the wall clock
+    // would read as long overdue, or decades ahead; and under one poll
+    // interval, as a monotonic clock is just after boot.
+    const Clock = struct {
+        var now: u64 = 500;
+        fn read() u64 {
+            return now;
+        }
+    };
+    a.processing_handler.mono_ms = Clock.read;
+    const h = a.processing_handler;
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "r0");
+    two.settle();
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: mono
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s}, poll_interval_ms: 1000 }}
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: mono-out }}
+    , .{source});
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "", "", yaml, ""), .client);
+    two.settle();
+    var pit = h.pipelines.valueIterator();
+    const pipe = pit.next().?;
+    // Never polled: due at once, though the clock is near 0.
+    try std.testing.expect(h.nextWork(a, h.nowMs()).due);
+    _ = h.tickPipelines(a);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
+    try std.testing.expectEqual(@as(i64, 500), pipe.last_poll_ms);
+    // The next poll is 1000 ms on, by this clock, and the loop sleeps to it.
+    Clock.now = 900;
+    const n = h.nextWork(a, h.nowMs());
+    try std.testing.expect(!n.due);
+    try std.testing.expectEqual(@as(?i64, 1_500), n.deadline_ms);
+    a.notePipelinesNext(true);
+    try std.testing.expectEqual(@as(u32, 100), a.idleTimeoutMs(h.nowMs()));
+    Clock.now = 1_450;
+    try std.testing.expectEqual(@as(u32, 50), a.idleTimeoutMs(h.nowMs()));
+    // A record waits; not read before the poll, read at it.
+    _ = try a.stream_handler.appendPayloadToStream(source, "default", "r1");
+    two.settle();
+    _ = h.tickPipelines(a);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 1), pipe.records_in);
+    Clock.now = 1_500;
+    _ = h.tickPipelines(a);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 2), pipe.records_in);
+    try std.testing.expectEqual(@as(i64, 1_500), pipe.last_poll_ms);
 }
 
 test "Shard: a filter that drops whole pages keeps its pipeline due while records remain, and not after" {
@@ -32016,7 +32081,7 @@ test "Shard: a processing sink whose shard is capped while apply is suspended ho
     const Tick = struct {
         fn pipelines(s: *Shard) void {
             var it = s.processing_handler.pipelines.valueIterator();
-            while (it.next()) |p| p.last_poll_ms = 0;
+            while (it.next()) |p| p.last_poll_ms = ProcessingHandler.NEVER_MS;
             _ = s.processing_handler.tickPipelines(s);
         }
     };
