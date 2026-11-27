@@ -251,8 +251,8 @@ pub const ProcessingHandler = struct {
         last_read_count: u32 = 0,
         /// Highest event-time watermark observed (0 = none / processing-time source).
         watermark_ms: i64 = 0,
-        /// When it began waiting; 0 while it reads.
-        held_since_ms: i64 = 0,
+        /// When it began waiting; NEVER_MS while it reads.
+        held_since_ms: i64 = NEVER_MS,
         /// Why it last couldn't read (`waitOf`).
         wait: Wait = .none,
         /// Its cursor as its last applied batch left it: the `from` of its
@@ -292,10 +292,10 @@ pub const ProcessingHandler = struct {
         read_seq: u64 = 0,
         read_term: u64 = 0,
         read_sent_ms: i64 = 0,
-        /// When a batch last stopped short of memory (`nowMs`; 0:
-        /// never). For a while after, the pipeline waits: its retry is the
-        /// shard's own wake, not its poll interval's.
-        stalled_ms: i64 = 0,
+        /// When a batch last stopped short of memory (`nowMs`). For a while
+        /// after, the pipeline waits: its retry is the shard's own wake, not
+        /// its poll interval's.
+        stalled_ms: i64 = NEVER_MS,
         next_read_seq: u64 = 0,
         /// Per-tick processing time (ns) over productive ticks: last/max/sum/count.
         tick_ns_last: u64 = 0,
@@ -1699,7 +1699,7 @@ pub const ProcessingHandler = struct {
         const caps = shard.outbox_caps.sink;
         // The driver's clock moves only while it ticks; pressure is read
         // against the time now, so it expires though nothing is sent.
-        const now_ms = @import("stdx").time.monotonicMs();
+        const now_ms = self.mono_ms();
         const total = shard.outboxBytes(.sink);
         if (total >= caps.shard) return .{ .outbox = .{ .to = null, .bytes = total, .cap = caps.shard } };
         // One namespace's sinks may send to every shard, so its share of
@@ -1779,7 +1779,7 @@ pub const ProcessingHandler = struct {
         if (run.held or run.failure_owned.len > 0) return .skip;
         // Short of memory a moment ago: a wait, retried on the shard's own
         // wake, so a short poll interval doesn't retry it every ms.
-        if (pipe.stalled_ms != 0 and now_ms - pipe.stalled_ms < MEMORY_STALL_MS) return .skip;
+        if (now_ms - pipe.stalled_ms < MEMORY_STALL_MS) return .skip;
         // A poll reads up to `batch_size` records, a page at a time:
         // while a page fills its batch, the next is read as soon as
         // that batch applies, not at the next poll.
@@ -1863,7 +1863,7 @@ pub const ProcessingHandler = struct {
             // that doesn't lead says nothing, and one led again starts over.
             if (!leads) {
                 pipe.wait = .none;
-                pipe.held_since_ms = 0;
+                pipe.held_since_ms = NEVER_MS;
                 pipe.more = false;
                 continue;
             }
@@ -1886,7 +1886,7 @@ pub const ProcessingHandler = struct {
                     pipe.wait = .{ .operators = why };
                     pipe.last_poll_ms = now_ms;
                     self.reported = true;
-                    self.noteWait(shard, pipe, true);
+                    self.noteWait(shard.metrics_registry, pipe, true);
                     continue;
                 };
                 pipe.ops_term = raft.current_term;
@@ -1897,10 +1897,10 @@ pub const ProcessingHandler = struct {
                 self.reported = true;
                 // Counted once a poll; a poll it was partway through goes
                 // on once the wait ends.
-                self.noteWait(shard, pipe, now_ms - pipe.wait_counted_ms >= poll_ms);
+                self.noteWait(shard.metrics_registry, pipe, now_ms - pipe.wait_counted_ms >= poll_ms);
                 continue;
             }
-            pipe.held_since_ms = 0;
+            pipe.held_since_ms = NEVER_MS;
             if (!pipe.more) {
                 pipe.last_poll_ms = now_ms;
                 pipe.poll_left = pipe.batch_size;
@@ -2129,11 +2129,11 @@ pub const ProcessingHandler = struct {
                 },
                 // An aggregate had counted it: run again it would count twice.
                 error.OutOfMemoryAfterState => blk: {
-                    self.noteSkips(shard, at, OOM_AFTER_STATE, 1);
+                    self.noteSkips(shard.metrics_registry, at, OOM_AFTER_STATE, 1);
                     break :blk @as(?[]const ProcessingRecord, &.{});
                 },
                 else => blk: {
-                    self.noteChainError(shard, err);
+                    self.noteChainError(shard.metrics_registry, err);
                     break :blk @as(?[]const ProcessingRecord, &.{});
                 },
             };
@@ -2208,11 +2208,11 @@ pub const ProcessingHandler = struct {
                 },
                 // An aggregate had counted it: run again it would count twice.
                 error.OutOfMemoryAfterState => blk: {
-                    self.noteSkips(shard, at, OOM_AFTER_STATE, 1);
+                    self.noteSkips(shard.metrics_registry, at, OOM_AFTER_STATE, 1);
                     break :blk @as(?[]const ProcessingRecord, &.{});
                 },
                 else => blk: {
-                    self.noteChainError(shard, err);
+                    self.noteChainError(shard.metrics_registry, err);
                     break :blk @as(?[]const ProcessingRecord, &.{});
                 },
             };
@@ -2573,7 +2573,7 @@ pub const ProcessingHandler = struct {
     fn skipTooLarge(self: *ProcessingHandler, shard: *Shard, at: []const u8) Ended {
         self.too_large += 1;
         if (shard.metrics_registry) |m| m.processing.recordTooLarge();
-        self.noteDrop(shard, at, std.fmt.comptimePrint("its writes don't fit one entry (at most {d} writes and {d} bytes a record)", .{ channels_mod.MAX_SENDS, channels_mod.MAX_SEND_BYTES }));
+        self.noteDrop(shard.metrics_registry, at, std.fmt.comptimePrint("its writes don't fit one entry (at most {d} writes and {d} bytes a record)", .{ channels_mod.MAX_SENDS, channels_mod.MAX_SEND_BYTES }));
         return .skipped;
     }
 
@@ -2661,7 +2661,7 @@ pub const ProcessingHandler = struct {
 
         /// The skipped records counted as dropped, in the job's status.
         fn note(self: Skips, handler: *ProcessingHandler, shard: *Shard, at: []const u8) void {
-            handler.noteSkips(shard, at, self.why, self.n);
+            handler.noteSkips(shard.metrics_registry, at, self.why, self.n);
         }
     };
 
@@ -2719,13 +2719,13 @@ pub const ProcessingHandler = struct {
     /// pipeline has waited 30 s, at most every 30 s. One waiting for a
     /// namespace, or for its operators to be rebuilt, is logged when the
     /// wait begins.
-    fn noteWait(self: *ProcessingHandler, shard: *Shard, pipe: *PipelineState, count: bool) void {
+    fn noteWait(self: *ProcessingHandler, metrics: ?*MetricsRegistry, pipe: *PipelineState, count: bool) void {
         const now = self.nowMs();
         if (count) {
             pipe.wait_counted_ms = now;
-            if (shard.metrics_registry) |m| m.processing.recordHeldTick();
+            if (metrics) |m| m.processing.recordHeldTick();
         }
-        if (pipe.held_since_ms == 0) pipe.held_since_ms = now;
+        if (pipe.held_since_ms == NEVER_MS) pipe.held_since_ms = now;
         const held_for = now - pipe.held_since_ms;
         // Only an operator, or memory, ends these: said at once.
         const prompt = (pipe.wait == .namespace or pipe.wait == .operators) and held_for == 0;
@@ -2802,9 +2802,9 @@ pub const ProcessingHandler = struct {
     /// A whole record skipped by every sink: counted as dropped, said in
     /// the job's status with where and why, and logged at most once every
     /// 30 s per job.
-    fn noteDrop(self: *ProcessingHandler, shard: *Shard, at: []const u8, why: []const u8) void {
+    fn noteDrop(self: *ProcessingHandler, metrics: ?*MetricsRegistry, at: []const u8, why: []const u8) void {
         self.sink_drops += 1;
-        if (shard.metrics_registry) |m| m.processing.recordDropped();
+        if (metrics) |m| m.processing.recordDropped();
         const job = self.runs.getPtr(self.ticking_job) orelse return;
         self.reported = true;
         job.drops += 1;
@@ -2834,9 +2834,9 @@ pub const ProcessingHandler = struct {
     /// `n` records an operator couldn't read, skipped: counted as dropped,
     /// the last named in the job's status, and logged at most once every
     /// 30 s per job, as a warning: their doing, not the server's.
-    fn noteSkips(self: *ProcessingHandler, shard: *Shard, at: []const u8, why: []const u8, n: u32) void {
+    fn noteSkips(self: *ProcessingHandler, metrics: ?*MetricsRegistry, at: []const u8, why: []const u8, n: u32) void {
         self.sink_drops += n;
-        if (shard.metrics_registry) |m| m.processing.recordDroppedN(n);
+        if (metrics) |m| m.processing.recordDroppedN(n);
         const job = self.runs.getPtr(self.ticking_job) orelse return;
         self.reported = true;
         job.drops += n;
@@ -2850,9 +2850,9 @@ pub const ProcessingHandler = struct {
 
     /// A record the operator chain failed on is skipped; said once per
     /// interval with the count.
-    fn noteChainError(self: *ProcessingHandler, shard: *Shard, err: anyerror) void {
+    fn noteChainError(self: *ProcessingHandler, metrics: ?*MetricsRegistry, err: anyerror) void {
         self.chain_errors += 1;
-        if (shard.metrics_registry) |m| m.processing.recordError();
+        if (metrics) |m| m.processing.recordError();
         const now = self.nowMs();
         if (now - self.chain_warn_ms < 30_000) return;
         self.chain_warn_ms = now;
@@ -4139,6 +4139,51 @@ test "ProcessingHandler: a two-source job short of memory at any point leaves no
             break;
         }
     }
+}
+
+test "ProcessingHandler: waits, stalls and warnings are timed on the pipelines' clock, from just after boot" {
+    var t: JobsTest = undefined;
+    t.init(std.testing.allocator);
+    defer t.deinit();
+    // Under one poll interval and one warning interval: a monotonic clock
+    // just after boot. A time from the wall clock would be decades past it.
+    const Clock = struct {
+        var ms: u64 = 500;
+        fn now() u64 {
+            return ms;
+        }
+    };
+    t.h.mono_ms = Clock.now;
+    _ = try t.submit("job-w", .running, "kind: Processing\nname: w\nsources: [{stream: {name: in}}]\nsinks: [{stream: {name: out}}]\n", 1);
+    t.reconcile();
+    const pipe = t.h.pipelines.getPtr("job-w").?;
+    const run = t.h.runs.getPtr("job-w").?;
+    t.h.ticking_job = "job-w";
+    // Never counted, stalled or warned: each is due, though the clock is
+    // under its interval.
+    try std.testing.expect(500 - pipe.wait_counted_ms >= pipe.src_poll_ms);
+    // A stall holds a pipeline 100 ms: at 50 ms of uptime, none holds it.
+    try std.testing.expect(50 - pipe.stalled_ms >= 100);
+    // A wait: counted, begun and said now.
+    pipe.wait = .{ .namespace = "absent" };
+    t.h.noteWait(null, pipe, true);
+    try std.testing.expectEqual(@as(i64, 500), pipe.wait_counted_ms);
+    try std.testing.expectEqual(@as(i64, 500), pipe.held_since_ms);
+    try std.testing.expectEqual(@as(i64, 500), t.h.held_warn_ms);
+    // Each warning says itself now.
+    t.h.noteMemoryStall(pipe, "r0");
+    try std.testing.expectEqual(@as(i64, 500), pipe.stalled_ms);
+    try std.testing.expectEqual(@as(i64, 500), run.memory_warn_ms);
+    t.h.noteChainError(null, error.TestFailure);
+    try std.testing.expectEqual(@as(i64, 500), t.h.chain_warn_ms);
+    t.h.noteDrop(null, "r0", "dropped");
+    try std.testing.expectEqual(@as(i64, 500), run.drop_warn_ms);
+    run.drop_warn_ms = ProcessingHandler.NEVER_MS;
+    t.h.noteSkips(null, "r0", "skipped", 1);
+    try std.testing.expectEqual(@as(i64, 500), run.drop_warn_ms);
+    run.drop_warn_ms = ProcessingHandler.NEVER_MS;
+    t.h.noteSinkDrop(null, "stream", "out", "refused");
+    try std.testing.expectEqual(@as(i64, 500), run.drop_warn_ms);
 }
 
 test "ProcessingHandler: a run held for want of memory is built again a second later, though no job changed" {

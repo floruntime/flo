@@ -7498,7 +7498,7 @@ pub const Shard = struct {
 
     /// How long the next tick may sleep: 0 while there's work (counted
     /// when a due pipeline is all of it), else `idleTimeoutMs`.
-    fn loopTimeoutMs(self: *Shard, slicing: bool, now_ms: i64) u32 {
+    fn loopTimeoutMs(self: *Shard, slicing: bool) u32 {
         const others = self.more_work or self.apply_behind or slicing or self.resume_fds.items.len > 0 or self.quotaWalkDue();
         if (others) return 0;
         if (self.producers_due) {
@@ -7506,7 +7506,7 @@ pub const Shard = struct {
             if (self.metrics_registry) |m| _ = m.processing.unslept_ticks_total.fetchAdd(1, .monotonic);
             return 0;
         }
-        return self.idleTimeoutMs(now_ms);
+        return self.idleTimeoutMs(self.processing_handler.nowMs());
     }
 
     /// How long an idle tick may sleep: the loop's 100 ms, or less when a
@@ -7618,7 +7618,7 @@ pub const Shard = struct {
         while (!self.stop_requested.load(.acquire)) {
             // Connections re-queued while the last tick settled run next.
             const slicing = if (self.snapshot_window) |w| w.slices_left > 0 else false;
-            _ = self.tick(self.loopTimeoutMs(slicing, self.processing_handler.nowMs())) catch |err| {
+            _ = self.tick(self.loopTimeoutMs(slicing)) catch |err| {
                 // A shard whose tick keeps failing serves nothing: say so,
                 // not once per tick, and do not spin a core while it lasts.
                 const now = nowMs();
@@ -11224,7 +11224,6 @@ test "quota binds: the loop doesn't sleep while a walk is under way, a published
     _ = shard.applyCommitted();
     const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
     const names = shard.namespace_handler.table;
-    const now = @import("stdx").time.milliTimestamp();
     // A table walked a stretch a tick: a few whole walks bound it.
     const most = 4 * (ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 2);
     for ([_]struct { u64, u64 }{ .{ 8 << 30, 5 }, .{ 4 << 30, 6 } }) |step| {
@@ -11234,7 +11233,7 @@ test "quota binds: the loop doesn't sleep while a walk is under way, a published
         while (shard.quotaWalkDue()) : (ticks += 1) {
             try std.testing.expect(ticks < most);
             // Every tick of the walk is un-slept.
-            try std.testing.expectEqual(@as(u32, 0), shard.loopTimeoutMs(false, now));
+            try std.testing.expectEqual(@as(u32, 0), shard.loopTimeoutMs(false));
             _ = try shard.tick(0);
         }
         try std.testing.expectEqual(step[0], settings_machine.boundQuota(read, ns_table.DEFAULT).?.part_bytes);
@@ -11242,7 +11241,7 @@ test "quota binds: the loop doesn't sleep while a walk is under way, a published
         try std.testing.expect(shard.quota.clean != null);
         shard.more_work = false;
         shard.apply_behind = false;
-        try std.testing.expect(shard.loopTimeoutMs(false, now) > 0);
+        try std.testing.expect(shard.loopTimeoutMs(false) > 0);
     }
     // A follower walks nothing, and keeps nothing awake for it.
     names.publishQuota(ns_table.DEFAULT, 2 << 30, 7);
@@ -11261,7 +11260,6 @@ test "quota binds: a bind whose propose is refused lets the loop sleep, and bind
     shard.wireHandlerShardPtrs();
     _ = shard.applyCommitted();
     const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
-    const now = @import("stdx").time.milliTimestamp();
     const most = 4 * (ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 2);
     shard.namespace_handler.table.publishQuota(ns_table.DEFAULT, 8 << 30, 5);
     shard.raft_node.writes_stopped = true;
@@ -11277,7 +11275,7 @@ test "quota binds: a bind whose propose is refused lets the loop sleep, and bind
         try std.testing.expect(!shard.quotaWalkDue());
         shard.more_work = false;
         shard.apply_behind = false;
-        try std.testing.expect(shard.loopTimeoutMs(false, now) > 0);
+        try std.testing.expect(shard.loopTimeoutMs(false) > 0);
         // Each later try walks on and is refused again, never clearing it.
         for (0..most) |_| {
             shard.proposeQuotaBinds();
@@ -11307,7 +11305,6 @@ test "quota binds: a bind refused at the log's outstanding cap, apply held, lets
     _ = shard.applyCommitted();
     const raft = shard.raft_node;
     const read: contract_view.ReadView = .{ .store = &shard.defaultPartition().store };
-    const now = @import("stdx").time.milliTimestamp();
     const most = 4 * (ns_table.CAPACITY / Shard.QUOTA_SCAN_PER_TICK + 2);
     // The log full of entries not yet applied: every propose is Overloaded.
     while (raft.log.lastIndex() - raft.last_applied < raft_node_mod.MAX_OUTSTANDING)
@@ -11322,7 +11319,7 @@ test "quota binds: a bind refused at the log's outstanding cap, apply held, lets
         try std.testing.expect(!shard.quotaWalkDue());
         shard.more_work = false;
         shard.apply_behind = false;
-        try std.testing.expect(shard.loopTimeoutMs(false, now) > 0);
+        try std.testing.expect(shard.loopTimeoutMs(false) > 0);
         shard.proposeQuotaBinds();
     }
     try std.testing.expect(settings_machine.boundQuota(read, ns_table.DEFAULT) == null);
@@ -15125,13 +15122,23 @@ test "Shard: an idle pipeline wakes its shard at its own poll interval, no soone
     // (A new leader's first quota walk keeps the loop up too: count it done.)
     a.more_work = false;
     a.quota.clean = .{ .epoch = a.namespace_handler.table.quotaEpoch(), .term = a.raft_node.current_term };
+    // The loop reads the pipelines' clock: held at each `now` in turn.
+    const Clock = struct {
+        var now: u64 = 0;
+        fn read() u64 {
+            return now;
+        }
+    };
+    h.mono_ms = Clock.read;
     for (0..10) |k| {
         const now = t + @as(i64, @intCast(k));
+        Clock.now = @intCast(now);
         a.notePipelinesNext(true);
         a.producers_due = h.nextWork(a, now).due;
         a.producers_deadline_ms = h.nextWork(a, now).deadline_ms;
-        try std.testing.expectEqual(@as(u32, @intCast(10 - k)), a.loopTimeoutMs(false, now));
+        try std.testing.expectEqual(@as(u32, @intCast(10 - k)), a.loopTimeoutMs(false));
     }
+    h.mono_ms = @import("stdx").time.monotonicMs;
     try std.testing.expectEqual(@as(u64, 0), a.processing_unslept_ticks);
     // Due: the next tick doesn't sleep, and that is counted, on the shard
     // and in the metric a server exports.
@@ -15140,7 +15147,7 @@ test "Shard: an idle pipeline wakes its shard at its own poll interval, no soone
     a.setMetricsRegistry(&metrics);
     defer a.metrics_registry = null;
     a.producers_due = true;
-    try std.testing.expectEqual(@as(u32, 0), a.loopTimeoutMs(false, t + 10));
+    try std.testing.expectEqual(@as(u32, 0), a.loopTimeoutMs(false));
     try std.testing.expectEqual(@as(u64, 1), a.processing_unslept_ticks);
     try std.testing.expectEqual(@as(u64, 1), metrics.processing.unslept_ticks_total.load(.monotonic));
     a.producers_due = false;
@@ -15303,9 +15310,14 @@ test "Shard: a pipeline polls on the monotonic clock: a wall-clock step neither 
     try std.testing.expect(!n.due);
     try std.testing.expectEqual(@as(?i64, 1_500), n.deadline_ms);
     a.notePipelinesNext(true);
-    try std.testing.expectEqual(@as(u32, 100), a.idleTimeoutMs(h.nowMs()));
+    // As the loop asks it, with nothing else to do (a new leader's first
+    // quota walk counted done).
+    a.more_work = false;
+    a.apply_behind = false;
+    a.quota.clean = .{ .epoch = a.namespace_handler.table.quotaEpoch(), .term = a.raft_node.current_term };
+    try std.testing.expectEqual(@as(u32, 100), a.loopTimeoutMs(false));
     Clock.now = 1_450;
-    try std.testing.expectEqual(@as(u32, 50), a.idleTimeoutMs(h.nowMs()));
+    try std.testing.expectEqual(@as(u32, 50), a.loopTimeoutMs(false));
     // A record waits; not read before the poll, read at it.
     _ = try a.stream_handler.appendPayloadToStream(source, "default", "r1");
     two.settle();
@@ -15748,10 +15760,21 @@ test "Shard: an operator chain out of memory ends the batch before its record: n
     const pipe = pit.next().?;
     const h = a.processing_handler;
 
-    // Every allocation of the chain's arena fails.
+    // Every allocation of the chain's arena fails, at a time the
+    // pipelines' clock gives.
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     h.chain_backing = failing.allocator();
+    const Clock = struct {
+        fn read() u64 {
+            return 700;
+        }
+    };
+    h.mono_ms = Clock.read;
     tickNow(a, pipe);
+    try std.testing.expectEqual(@as(i64, 700), pipe.stalled_ms);
+    // Waiting while the stall lasts, by that clock; not after.
+    try std.testing.expect(!h.nextWork(a, 799).due);
+    h.mono_ms = @import("stdx").time.monotonicMs;
     two.settle();
     pumpChannels(&two);
     try std.testing.expectEqual(@as(u64, 0), pipe.records_in);
@@ -15777,7 +15800,7 @@ test "Shard: an operator chain out of memory ends the batch before its record: n
 
     // Memory back, the wait over: the same records, every one, once.
     h.chain_backing = null;
-    pipe.stalled_ms = 0;
+    pipe.stalled_ms = ProcessingHandler.NEVER_MS;
     pipe.last_batch_ms = 0;
     tickNow(a, pipe);
     two.settle();
@@ -15829,14 +15852,14 @@ test "Shard: a running sum out of memory is run again and counts each record onc
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_at });
         h.chain_backing = failing.allocator();
         pipe.last_batch_ms = 0;
-        pipe.stalled_ms = 0;
+        pipe.stalled_ms = ProcessingHandler.NEVER_MS;
         tickNow(a, pipe);
         two.settle();
         h.chain_backing = null;
         if (pipe.records_in == 3) break;
     }
     pipe.last_batch_ms = 0;
-    pipe.stalled_ms = 0;
+    pipe.stalled_ms = ProcessingHandler.NEVER_MS;
     tickNow(a, pipe);
     two.settle();
     pumpChannels(&two);
