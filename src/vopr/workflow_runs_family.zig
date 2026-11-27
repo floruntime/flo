@@ -183,6 +183,9 @@ pub const WorkflowRuns = struct {
     held_stepped: [RUNS.len]bool = @splat(false),
     /// How many times its runs reached the part.
     quota_crossings: u64 = 0,
+    /// The share of entries made bulk deletes: 0 but in the bulk-deletes
+    /// slice, which draws for it.
+    bulk_percent: u8 = 0,
 
     /// What a run waits for, as its last step set it.
     const WaitL = struct {
@@ -280,6 +283,8 @@ pub const WorkflowRuns = struct {
         delete_orphaned,
         /// A start of a deleted run's id.
         deleted_id_reused,
+        /// A run a bulk delete took.
+        bulk_deleted,
         /// A signal refused past the share.
         signal_held,
         /// A signal that wakes its run, taken past the share within the slack.
@@ -289,6 +294,11 @@ pub const WorkflowRuns = struct {
         /// A step or cancel for an earlier incarnation of its workflow.
         stale_incarnation,
     };
+
+    /// Classes reached only in the bulk-deletes slice.
+    pub fn bulkOnly(c: Class) bool {
+        return c == .bulk_deleted;
+    }
 
     /// Classes reached only under a memory share.
     pub fn underShareOnly(c: Class) bool {
@@ -361,10 +371,10 @@ pub const WorkflowRuns = struct {
     const GONE = 32;
     pub const GoneL = struct { wf: usize, run: usize, idem: ?usize, created_ns: u64, completed_ms: i64, orphaned: bool };
 
-    pub const FAMILIES = [_]u16{ rm.RunFam.ID, hm.Workflows.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID, calls_mod.Calls.ID, rm.SigFam.ID, rm.RunAtFam.ID, rm.RunAllFam.ID, hm.UsageFam.ID, @import("../budget/history_quota.zig").WorkflowReserved.ID };
-    pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "history.wf", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents", "step.calls", "workflow.sig", "workflow.run_at", "workflow.run_all", "history.usage", "workflow.reserved" };
+    pub const FAMILIES = [_]u16{ rm.RunFam.ID, hm.Workflows.ID, rm.OutFam.ID, rm.IdemFam.ID, rm.PerDefFam.ID, rm.Parents.ID, calls_mod.Calls.ID, rm.SigFam.ID, rm.RunAtFam.ID, rm.RunAllFam.ID, hm.UsageFam.ID, @import("../budget/history_quota.zig").WorkflowReserved.ID, rm.EndedAtFam.ID };
+    pub const FAMILY_NAMES = [_][]const u8{ "workflow.run", "history.wf", "workflow.out", "workflow.idem", "workflow.per_def", "workflow.parents", "step.calls", "workflow.sig", "workflow.run_at", "workflow.run_all", "history.usage", "workflow.reserved", "workflow.ended_at" };
 
-    pub const Kind = enum { start, step, complete, child_start, child_refuse, reply, done, retry, clear, signal, delete };
+    pub const Kind = enum { start, step, complete, child_start, child_refuse, reply, done, retry, clear, signal, delete, bulk_delete };
 
     pub const Effect = struct {
         kind: Kind,
@@ -411,7 +421,7 @@ pub const WorkflowRuns = struct {
 
     pub fn owns(entry_type: u8) bool {
         return switch (@as(EntryType, @fromBackingInt(entry_type))) {
-            .workflow_start, .workflow_step, .workflow_complete, .child_start, .child_refuse, .workflow_signal, .workflow_run_delete => true,
+            .workflow_start, .workflow_step, .workflow_complete, .child_start, .child_refuse, .workflow_signal, .workflow_run_delete, .workflow_runs_delete => true,
             .call_reply, .call_done, .step_call_retry, .step_call_clear => true,
             else => false,
         };
@@ -543,6 +553,29 @@ pub const WorkflowRuns = struct {
                 l.parents[r] = null;
             },
             .reply, .done, .retry, .clear => return self.predictCall(e, kind),
+            .bulk_delete => {
+                const p = ae.RunsDelete.decodeAll(e.payload, &diag) catch return null;
+                // Each run as its own delete would take it: of this
+                // workflow and incarnation, ended when it says and before
+                // the bound; any other is passed over.
+                var it = p.runs.iterator();
+                while (it.next() catch return null) |item| {
+                    const r = indexOf(&RUNS, item.run) orelse continue;
+                    const run = l.runs[r] orelse continue;
+                    if (run.created_ns != item.created_ns or !std.mem.eql(u8, NAMES[run.wf], p.owner)) continue;
+                    if (!run.status.isTerminal() or run.completed_ms != item.completed_ms or run.completed_ms >= p.before_ms) continue;
+                    if (run.idem) |k| if (l.idem[run.wf][k] == r) {
+                        l.idem[run.wf][k] = null;
+                    };
+                    l.runs[r] = null;
+                    l.deleted[r] = true;
+                    const orphan = history_lane.orphaned(NAMES[run.wf], RUNS[r], run.created_ns);
+                    if (orphan) want.classes.insert(.delete_orphaned);
+                    l.gone[l.gone_next % GONE] = .{ .wf = run.wf, .run = r, .idem = run.idem, .created_ns = run.created_ns, .completed_ms = run.completed_ms, .orphaned = orphan };
+                    l.gone_next += 1;
+                    want.classes.insert(.bulk_deleted);
+                }
+            },
             .start, .step, .complete, .signal, .delete => {
                 const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return null;
                 const r = indexOf(&RUNS, cmd.key[4..]) orelse return null;
@@ -962,6 +995,7 @@ pub const WorkflowRuns = struct {
             .step_call_clear => .clear,
             .workflow_signal => .signal,
             .workflow_run_delete => .delete,
+            .workflow_runs_delete => .bulk_delete,
             else => .child_refuse,
         };
     }
@@ -1141,18 +1175,26 @@ pub const WorkflowRuns = struct {
         // On the store alone: counts, idempotency keys naming their run, and
         // a run's wait agreeing with its status.
         var active: [NAMES.len]u32 = @splat(0);
+        var ended: [NAMES.len]u64 = @splat(0);
+        if (store.ended_drift != 0) return "a workflow's ended count went past zero";
         var runs = rv.range(rm.RunFam, "");
         var stored: usize = 0;
         while (runs.next() catch return "a run could not be read") |item| : (stored += 1) {
             const v = item.value.v;
             const w = indexOf(&NAMES, v.workflow) orelse return "a run of a workflow the workload never names";
             const s = std.enums.fromInt(RunStatus, v.status) orelse return "a run's status is not a status";
-            if (!s.isTerminal()) active[w] += 1;
+            if (!s.isTerminal()) active[w] += 1 else {
+                ended[w] += 1;
+                // Each ended run in its workflow's ended index, at its end.
+                if ((rv.get(rm.EndedAtFam, try rm.endedAtKey(a, NS, v.workflow, v.completed_at_ms, item.key[4..])) catch return "an ended-index row could not be read") == null)
+                    return "an ended run isn't in its workflow's ended index";
+            }
             if (if (s.isTerminal()) v.wait != .none else (s == .waiting) != (v.wait != .none)) return "a run's status and its wait disagree";
         }
         for (NAMES, active, l.per_def) |name, n, want| {
             const got = rm.perDefOf(rv, view_mod.idKey(try a.alloc(u8, 4 + name.len), NS, name) catch unreachable);
             if ((if (got) |g| g.active else 0) != n) return "a workflow's count is not its runs not ended";
+            if ((if (got) |g| g.ended else 0) != ended[indexOf(&NAMES, name).?]) return "a workflow's ended count is not its ended runs";
             if ((got == null) != (want == null)) return "a workflow's record is not the ledger's";
             if (got) |g| if (g.active != want.?.active or g.fired_ms != want.?.fired_ms) return "a workflow's count or fired slot is not the ledger's";
             if (got) |g| if (!samePlace(g, want.?.place)) return "a workflow's trigger place is not the ledger's";
@@ -1202,6 +1244,13 @@ pub const WorkflowRuns = struct {
             while (rows.next()) |_| n += 1;
             if (n != want_runs) return "the lists' index rows are not one per run";
         }
+        // One ended-index row per ended run, and none besides.
+        var total_ended: u64 = 0;
+        for (ended) |n| total_ended += n;
+        var ended_rows = store.range(rm.EndedAtFam.ID, "");
+        var held_ended: u64 = 0;
+        while (ended_rows.next()) |_| held_ended += 1;
+        if (held_ended != total_ended) return "the ended index's rows are not one per ended run";
         return null;
     }
 
@@ -1400,6 +1449,33 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
     }
     const any = r.uintLessThan(usize, RUNS.len);
     var kb: [16]u8 = undefined;
+    // Only in the bulk-deletes slice, so no other draws from the stream
+    // move: a bulk delete of one workflow's runs that ended before a bound,
+    // as its leader read them: mostly right; now and then naming another
+    // incarnation, another end, or a run still live, each passed over.
+    if (leader.bulk_percent > 0 and r.uintLessThan(u8, 100) < leader.bulk_percent and held.n > 0) {
+        const w = l.runs[held.at(r)].?.wf;
+        var list: [ae.MAX_RUNS_DELETE * ae.DeletedRun.max_size]u8 = undefined;
+        var at: usize = 0;
+        var n: u32 = 0;
+        var latest: i64 = 0;
+        for (l.runs, 0..) |x, i| {
+            const run = x orelse continue;
+            if (run.wf != w or n == ae.MAX_RUNS_DELETE) continue;
+            if (!run.status.isTerminal() and r.uintLessThan(u8, 100) >= 10) continue;
+            var item: ae.DeletedRun.Value = .{ .run = RUNS[i], .created_ns = run.created_ns, .completed_ms = run.completed_ms };
+            const k = r.uintLessThan(u8, 100);
+            if (k < 5) item.created_ns +%= 1 else if (k < 10) item.completed_ms += 1;
+            latest = @max(latest, run.completed_ms);
+            const b = ae.DeletedRun.encodeInto(list[at..], item) catch break;
+            at += b.len;
+            n += 1;
+        }
+        // A bound past them all, or one that cuts through them.
+        const before = if (r.boolean()) latest + 1 else latest - @as(i64, r.uintLessThan(u8, 50));
+        const p = ae.RunsDelete.encodeInto(buf, .{ .ns = NS.int(), .owner = NAMES[w], .before_ms = before, .runs = .{ .bytes = list[0..at], .count = n }, .orphans = .{ .bytes = "", .count = 0 } }) catch return null;
+        return .{ .entry_type = .workflow_runs_delete, .payload = p };
+    }
     const roll = r.uintLessThan(u8, 100);
     // The live run holding the most signals: pressed on until it holds as
     // many as it may, and mostly spared ending and taking meanwhile; once

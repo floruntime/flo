@@ -75,3 +75,5 @@ workflow-quota-start-admits.json	quota_start_admits	--workflows	-	workflow_run_r
 actions-quota-invoke-admits.json	quota_invoke_admits	--actions	-	action_rule	an invoke was admitted past its namespace.s quota
 workflow-history-skip-untaken.json	history_skip_untaken	--workflows	-	workflow_run_rule	taken bytes aren.t what its inbound took
 workflow-quota-reserve-omits-step.json	quota_reserve_omits_step	--workflows	-	workflow_run_rule	grew past what their reserves held
+workflow-runs-bulk-bound.json	runs_bulk_ignores_bound	--workflows --bulk-deletes	-	workflow_run_rule	a run the ledger holds is gone
+actions-bulk-bound.json	runs_bulk_ignores_bound	--actions --bulk-deletes	-	action_rule	a bulk delete took a run its own delete wouldn.t

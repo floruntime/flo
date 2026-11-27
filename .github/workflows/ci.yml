@@ -357,6 +357,11 @@ jobs:
       - name: Swarm with workflow entries
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --workflows --seed-timeout=120 --out-dir=/tmp/vopr-workflows
         timeout-minutes: 20
+      - name: Swarm with workflow entries and bulk deletes
+        # A share of the runs' entries bulk deletes, each checked against
+        # the ledger: a run its own delete would take goes, any other stays.
+        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --workflows --bulk-deletes --seed-timeout=120 --out-dir=/tmp/vopr-workflows-bulk
+        timeout-minutes: 20
   # The simulator runs ReleaseSafe (-Drelease selects it) so any UB in the
   # unit under test traps instead of silently corrupting a run. Seeds 1-20
   # are the known-green set; the wider swarm finds real bugs and is run
@@ -462,6 +467,9 @@ jobs:
         # fails if fewer than 3 seeds settle and expire leases from an
         # earlier term.
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --actions --seed-timeout=120 --out-dir=/tmp/vopr-actions
+        timeout-minutes: 10
+      - name: Swarm with action entries and bulk deletes
+        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --actions --bulk-deletes --seed-timeout=120 --out-dir=/tmp/vopr-actions-bulk
         timeout-minutes: 10
       - name: Swarm with queue entries
         # Queue entries made from the leader's own state, some spoiled, each

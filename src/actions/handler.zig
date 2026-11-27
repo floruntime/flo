@@ -52,6 +52,10 @@ const OpCode = proto.OpCode;
 const ReadView = view_mod.ReadView;
 const Run = machine.Run.Value;
 const NamespaceId = @import("../namespace/table.zig").Id;
+const hm = @import("../stream/history_machine.zig");
+const bulk = @import("../stream/runs_delete.zig");
+const WorkflowHandler = @import("../workflow/handler.zig").WorkflowHandler;
+const RunsDeleteResponse = action_ops.RunsDeleteResponse;
 
 /// An action's lease when its register names none.
 pub const DEFAULT_LEASE_MS: u64 = 5 * 60 * 1000;
@@ -159,6 +163,10 @@ fn propose(shard: *Shard, comptime etype: EntryType, body: anytype) !persistence
 pub const ActionsHandler = struct {
     allocator: Allocator,
 
+    /// Orphaned histories this leader's bulk deletes sent a drop for, this
+    /// term: none is proposed again while its drop may be on the lane.
+    orphans_sent: hm.OrphansSent = .{},
+
     /// Runs a deliver is proposed for and hasn't applied, by store key: no
     /// other await is given them meanwhile.
     reserved: std.StringHashMapUnmanaged(void) = .empty,
@@ -252,6 +260,7 @@ pub const ActionsHandler = struct {
     }
 
     pub fn deinit(self: *ActionsHandler) void {
+        self.orphans_sent.deinit(self.allocator);
         self.forgetLeading();
         self.held_expires.deinit(self.allocator);
         self.expire_after.deinit(self.allocator);
@@ -280,6 +289,7 @@ pub const ActionsHandler = struct {
         dispatcher.registerWithRoute(.action_history, table_run.handler("action.history", history_ops.Ops, history_ops.Ops.actionHistory), run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.action_run_delete, table_run.handler("action.run_delete", ActionsHandler, runRunDelete), run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.action_info, table_run.handler("action.info", ActionsHandler, runInfo), preRouteByAction);
+        dispatcher.registerWithRoute(.action_runs_delete, table_run.handler("action.runs_delete", ActionsHandler, runRunsDelete), preRouteByAction);
         dispatcher.registerPagedWalk(.action_list, dispatchAction, localScanActions);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
         dispatcher.registerWithRoute(.action_list_runs, table_run.handler("action.list_runs", ActionsHandler, runListRuns), preRouteByAction);
@@ -1482,6 +1492,53 @@ pub const ActionsHandler = struct {
         const proposed = propose(shard, .action_run_delete, ae.RunDelete.Value{ .ns = req.ns_id.int(), .action = run.action, .run = req.key, .created_ns = run.created_ns }) catch |err|
             return .{ .refused = .{ .status = persistence.failureStatus(err), .refusal = persistence.failureRefusal(err, "delete not persisted") } };
         return .{ .park = .{ .proposed = proposed, .answer = answerEmpty } };
+    }
+
+    /// An action's runs that ended before a time, oldest first, up to
+    /// `limit`, read from its ended index, with the orphaned histories
+    /// under it, as `workflow.runs_delete` takes a workflow's. The action
+    /// needn't be registered: its runs outlive its definition.
+    fn runRunsDelete(shard: *Shard, _: *Connection, req: Request, before_ms: i64, limit: u32) Error!table_run.Outcome(RunsDeleteResponse) {
+        if (!shard.raft_node.leaderReady()) return error.NotLeading;
+        if (req.key.len == 0 or req.key.len > ae.MAX_ACTION_NAME) return error.NotFound;
+        if (client_names.hasControl(req.key)) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(comptime client_names.controlRefusal("an action name")) } };
+        const self = shard.actions_handler;
+        var arena_state = std.heap.ArenaAllocator.init(shard.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const read = readOf(shard);
+        const ns = req.ns_id;
+        var ab: machine.RunAtBuf = undefined;
+        var kb: [@sizeOf(u32) + @sizeOf(machine.RunAtBuf)]u8 = undefined;
+        const under = storeKey(&kb, ns, machine.endedAtPrefix(&ab, req.key)) orelse return error.NotFound;
+        var runs: std.ArrayListUnmanaged(u8) = .empty;
+        var n: u32 = 0;
+        var it = read.range(machine.EndedAt, under);
+        while (n < limit) {
+            const item = (it.next() catch null) orelse break;
+            const ended_ms = bulk.endedMsOf(item.key, under.len);
+            if (ended_ms >= before_ms) break;
+            const id = item.key[under.len + 8 ..];
+            const run = getRun(shard, ns, id) orelse continue;
+            try WorkflowHandler.appendItem(a, &runs, .{ .run = id, .created_ns = run.created_ns, .completed_ms = ended_ms });
+            n += 1;
+        }
+        self.orphans_sent.at(self.allocator, shard.raft_node.current_term);
+        try self.orphans_sent.prune(self.allocator, read, .action);
+        var found: [ae.MAX_RUNS_DELETE]hm.Orphan = undefined;
+        const room = if (self.orphans_sent.full()) 0 else ae.MAX_RUNS_DELETE - n;
+        const got = try hm.orphansOf(read, a, .action, ns, req.key, found[0..room], WorkflowHandler.Skip{ .before_ms = before_ms, .sent = &self.orphans_sent, .ns = ns, .owner = req.key });
+        if (n == 0 and got.n == 0) return .{ .answer = .{ .deleted = 0, .more = false, .orphans_left = got.left } };
+        var orphans: std.ArrayListUnmanaged(u8) = .empty;
+        for (found[0..got.n]) |o| try WorkflowHandler.appendItem(a, &orphans, .{ .run = o.run, .created_ns = o.created_ns, .completed_ms = @intCast(@min(o.completed_ms, std.math.maxInt(i64))) });
+        const proposed = propose(shard, .action_runs_delete, ae.RunsDelete.Value{ .ns = ns.int(), .owner = req.key, .before_ms = before_ms, .runs = .{ .bytes = runs.items, .count = n }, .orphans = .{ .bytes = orphans.items, .count = @intCast(got.n) } }) catch |err|
+            return .{ .refused = .{ .status = persistence.failureStatus(err), .refusal = persistence.failureRefusal(err, "delete not persisted") } };
+        for (found[0..got.n]) |o| try self.orphans_sent.note(self.allocator, ns, req.key, o);
+        return .{ .park = .{ .proposed = proposed, .answer = answerRunsDelete } };
+    }
+
+    fn answerRunsDelete(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        table_run.answer(RunsDeleteResponse, shard, conn, request_id, WorkflowHandler.answerOf(result));
     }
 
     fn answerEmpty(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {

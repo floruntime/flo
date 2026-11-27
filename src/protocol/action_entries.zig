@@ -87,6 +87,33 @@ pub const RunDelete = Record(&.{
     .{ .name = "created_ns", .T = Int(u64) },
 });
 
+/// The most runs and orphaned histories one bulk delete takes, together:
+/// each sends one `history_drop`, one short of what an entry may send.
+pub const MAX_RUNS_DELETE: u32 = 63;
+/// A workflow run id's longest, which an action's is under.
+pub const MAX_ANY_RUN_ID: u32 = 596;
+
+/// One ended run a bulk delete takes, as its leader read it: its
+/// incarnation, and when it ended, which keys its place in the ended index.
+pub const DeletedRun = Record(&.{
+    .{ .name = "run", .T = Bytes(MAX_ANY_RUN_ID) },
+    .{ .name = "created_ns", .T = Int(u64) },
+    .{ .name = "completed_ms", .T = Int(i64) },
+});
+
+const deleted_bytes = MAX_RUNS_DELETE * DeletedRun.max_size + @sizeOf(u32);
+
+/// A workflow's or an action's ended runs deleted, those that ended
+/// before `before_ms`, with their histories; and the histories its leader
+/// found orphaned under that owner. Each is checked again at apply.
+pub const RunsDelete = Record(&.{
+    .{ .name = "ns", .T = NamespaceId },
+    .{ .name = "owner", .T = Bytes(MAX_OWNER) },
+    .{ .name = "before_ms", .T = Int(i64) },
+    .{ .name = "runs", .T = BoundedList(DeletedRun, MAX_RUNS_DELETE, deleted_bytes) },
+    .{ .name = "orphans", .T = BoundedList(DeletedRun, MAX_RUNS_DELETE, deleted_bytes) },
+});
+
 pub const Invoke = Record(&.{
     .{ .name = "ns", .T = NamespaceId },
     .{ .name = "action", .T = ActionName },
@@ -353,6 +380,10 @@ pub const table = [_]entries.Entry{
     .{ .name = "call.reply", .type_code = 0x7C, .payload = Reply, .max_payload = Reply.max_size, .doc = "A message: the callee's shard's answer to a call's start." },
     .{ .name = "call.done", .type_code = 0x7D, .payload = Done, .max_payload = Done.max_size, .doc = "A message: a called run ended, and what it returned." },
     .{ .name = "workflow.child_start", .type_code = 0x55, .payload = ChildStart, .max_payload = ChildStart.max_size, .doc = "A message: a child workflow's start, kept as its parent until it ends." },
+    // The action range (0x70-0x7F) is full: both bulk deletes sit after
+    // the workflow entries.
+    .{ .name = "workflow.runs_delete", .type_code = 0x59, .payload = RunsDelete, .max_payload = RunsDelete.max_size, .doc = "A workflow's ended runs deleted, oldest first, with their histories." },
+    .{ .name = "action.runs_delete", .type_code = 0x5A, .payload = RunsDelete, .max_payload = RunsDelete.max_size, .doc = "An action's ended runs deleted, oldest first, with their histories." },
     .{ .name = "workflow.child_refuse", .type_code = 0x56, .payload = ChildRefuse, .max_payload = ChildRefuse.max_size, .doc = "A child its shard couldn't start: its parent told why." },
     .{ .name = "action.abandon_send", .type_code = 0x7E, .payload = Abandon, .max_payload = Abandon.max_size, .doc = "A task its await couldn't give, sent back to its run's shard." },
     .{ .name = "action.abandon", .type_code = 0x7F, .payload = Abandon, .max_payload = Abandon.max_size, .doc = "A message, after its commit: a task handed back, whose lease the run's leader ends." },

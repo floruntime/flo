@@ -4760,3 +4760,87 @@ test "e2e/workflow: start, signal and invoke carry inputs past 8 KiB to the serv
         try testing.expect(r.stderrContains("[bad_request]"));
     }
 }
+
+test "e2e/workflow/runs-delete: on 12 shards, in a namespace of its own, a workflow off shard 0 has its ended runs deleted, its live one kept" {
+    const shards = 12;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards } });
+    defer ctx.deinit();
+    const ns = "wrd-ns";
+    try ctx.exec(&.{ "namespace", "create", ns });
+    // The first namespace created takes the first allocated id.
+    const router = @import("src").node.router;
+    const first: router.NamespaceId = .of(16);
+    var nb: [16]u8 = undefined;
+    const wf = blk: {
+        var i: usize = 0;
+        while (i < 256) : (i += 1) {
+            const name = try std.fmt.bufPrint(&nb, "wrd-wf-{d}", .{i});
+            const on: u16 = switch (router.Router.init(shards, 0).route(router.routeNsKey(first, name))) {
+                .local => 0,
+                .shard => |s| s.shard_id,
+            };
+            if (on != 0) break :blk name;
+        }
+        return error.TooFewShards;
+    };
+    var yb: [512]u8 = undefined;
+    const def = try std.fmt.bufPrint(&yb,
+        \\kind: Workflow
+        \\name: {s}
+        \\version: 1.0.0
+        \\start.wait_for_signal.type: proceed
+        \\start.wait_for_signal.timeout_ms: 300000
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.timeout: flo.Failed
+    , .{wf});
+    const path = try writeDottedToTempYaml(testing.allocator, def, "runs-delete-wf.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", ns });
+    // Generated ids, each on the shard its slot names: the workflow's, not 0.
+    const want_shard: u16 = switch (router.Router.init(shards, 0).route(router.routeNsKey(first, wf))) {
+        .local => 0,
+        .shard => |s| s.shard_id,
+    };
+    var ids: [3][64]u8 = undefined;
+    var id_lens: [3]usize = undefined;
+    for (0..3) |k| {
+        var started = try ctx.cli.run(&.{ "workflow", "start", wf, "{}", "-o", "json", "-n", ns });
+        defer started.deinit();
+        const parsed = try std.json.parseFromSlice(struct { run_id: []const u8 }, testing.allocator, started.stdout, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const rid = parsed.value.run_id;
+        const slot = @import("src").node.run_id.extractSlot(rid) orelse return error.TestFailed;
+        const at = router.Router.init(shards, 0).slotToShard(slot);
+        try testing.expect(at != 0);
+        try testing.expectEqual(want_shard, at);
+        @memcpy(ids[k][0..rid.len], rid);
+        id_lens[k] = rid.len;
+    }
+    const id1 = ids[0][0..id_lens[0]];
+    const id2 = ids[1][0..id_lens[1]];
+    const id3 = ids[2][0..id_lens[2]];
+    try ctx.exec(&.{ "workflow", "cancel", id1, "-n", ns });
+    try ctx.exec(&.{ "workflow", "cancel", id2, "-n", ns });
+
+    var deleted = try ctx.cli.run(&.{ "workflow", "runs-delete", wf, "--ended-before", "9999999999999", "-n", ns });
+    defer deleted.deinit();
+    try stdx.testing.assertContains(deleted, "Deleted 2 ended run(s) of ");
+    for ([_][]const u8{ id1, id2 }) |id| {
+        var s = try ctx.cli.run(&.{ "workflow", "status", id, "-n", ns });
+        defer s.deinit();
+        try stdx.testing.assertFailed(s);
+        try stdx.testing.assertContains(s, "not found");
+    }
+    var live = try ctx.cli.run(&.{ "workflow", "status", id3, "-n", ns });
+    defer live.deinit();
+    try stdx.testing.assertContains(live, "waiting");
+    // A bound before they ended takes nothing; nor does a second run.
+    try ctx.exec(&.{ "workflow", "cancel", id3, "-n", ns });
+    var early = try ctx.cli.run(&.{ "workflow", "runs-delete", wf, "--ended-before", "1", "-n", ns });
+    defer early.deinit();
+    try stdx.testing.assertContains(early, "Deleted 0 ended run(s) of ");
+    var bad = try ctx.cli.run(&.{ "workflow", "runs-delete", wf, "--older-than", "3w", "-n", ns });
+    defer bad.deinit();
+    try stdx.testing.assertFailed(bad);
+    try stdx.testing.assertContains(bad, "give exactly one of --older-than");
+}

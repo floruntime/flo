@@ -1671,3 +1671,68 @@ test "e2e/action/routing: on 12 shards, in a namespace of its own, runs of actio
         }
     }
 }
+
+test "e2e/action/runs-delete: on 12 shards, in a namespace of its own, an action off shard 0 has its ended runs deleted, its live one kept" {
+    const shards = 12;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards } });
+    defer ctx.deinit();
+    const ns = "rd-ns";
+    try ctx.exec(&.{ "namespace", "create", ns });
+    const first: @import("src").node.router.NamespaceId = .of(16);
+    var nb: [16]u8 = undefined;
+    const action = blk: {
+        var i: usize = 0;
+        while (i < 256) : (i += 1) {
+            const name = try std.fmt.bufPrint(&nb, "rd-act-{d}", .{i});
+            if (shardOfName(shards, first, name) != 0) break :blk name;
+        }
+        return error.TooFewShards;
+    };
+    try ctx.exec(&.{ "action", "register", action, "-n", ns });
+    try ctx.exec(&.{ "worker", "register", "rd-w", action, "-n", ns });
+    var runs: [3][64]u8 = undefined;
+    var lens: [3]usize = undefined;
+    for (0..3) |k| {
+        const out = try ctx.execCapture(&.{ "action", "invoke", action, "{}", "-n", ns });
+        const r = extractRunId(out) orelse return error.TestFailed;
+        @memcpy(runs[k][0..r.len], r);
+        lens[k] = r.len;
+        // The run is on the shard its id's slot names, the action's, and not
+        // 0: a wrong guess at the namespace's id fails here.
+        const slot = @import("src").node.run_id.extractSlot(r) orelse return error.TestFailed;
+        const at = @import("src").node.router.Router.init(shards, 0).slotToShard(slot);
+        try testing.expect(at != 0);
+        try testing.expectEqual(shardOfName(shards, first, action), at);
+    }
+    // Two complete; the third is taken and stays live.
+    for (0..3) |k| {
+        var got = try ctx.cli.run(&.{ "worker", "await", action, "--worker-id", "rd-w", "--block", "5000", "-n", ns });
+        defer got.deinit();
+        const task = taskIdOf(got.stdout) orelse return error.TestFailed;
+        if (k < 2) try ctx.exec(&.{ "worker", "complete", task, "--worker-id", "rd-w", "-n", ns });
+    }
+    // Neither bound, or both: a usage error, nothing sent.
+    var neither = try ctx.cli.run(&.{ "action", "runs-delete", action, "-n", ns });
+    defer neither.deinit();
+    try stdx.testing.assertFailed(neither);
+    try stdx.testing.assertContains(neither, "give exactly one of --older-than");
+    // Ended before far in the future: the two that ended go.
+    var deleted = try ctx.cli.run(&.{ "action", "runs-delete", action, "--ended-before", "9999999999999", "-n", ns });
+    defer deleted.deinit();
+    try stdx.testing.assertContains(deleted, "Deleted 2 ended run(s) of ");
+    var gone: usize = 0;
+    for (&runs, lens) |*rb, len| {
+        var s = try ctx.cli.run(&.{ "action", "status", rb[0..len], "-n", ns });
+        defer s.deinit();
+        if (s.stdoutContains("Run not found") or s.stderrContains("Run not found")) gone += 1 else try stdx.testing.assertContains(s, "status: running");
+    }
+    try testing.expectEqual(@as(usize, 2), gone);
+    // Again: nothing left before the bound.
+    var again = try ctx.cli.run(&.{ "action", "runs-delete", action, "--ended-before", "9999999999999", "-n", ns });
+    defer again.deinit();
+    try stdx.testing.assertContains(again, "Deleted 0 ended run(s) of ");
+    // Its counts moved with them.
+    var info = try ctx.cli.run(&.{ "action", "info", action, "-n", ns });
+    defer info.deinit();
+    try stdx.testing.assertContains(info, "completed: 0");
+}

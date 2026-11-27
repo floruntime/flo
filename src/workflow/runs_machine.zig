@@ -39,6 +39,8 @@ const schema = @import("../protocol/schema.zig");
 const ae = @import("../protocol/action_entries.zig");
 const he = @import("../protocol/history_entries.zig");
 const hp = @import("../stream/history_producer.zig");
+const he_machine = @import("../stream/history_machine.zig");
+const bulk = @import("../stream/runs_delete.zig");
 const limits = @import("../protocol/limits.zig");
 const proto = @import("../protocol/proto.zig");
 const view_mod = @import("../contract/view.zig");
@@ -276,9 +278,12 @@ pub const PerDef = Record(&.{
     .{ .name = "trig_stream", .T = Bytes(MAX_PERSIST_PAYLOAD) },
     .{ .name = "trig_ts", .T = Int(u64) },
     .{ .name = "trig_seq", .T = Int(u64) },
+    // Its runs that have ended and aren't deleted: its rows in
+    // `workflow.ended_at`.
+    .{ .name = "ended", .T = Int(u64) },
 });
 
-pub const PER_DEF_NONE: PerDef.Value = .{ .active = 0, .fired_ms = 0, .trig_ns = 0, .trig_made = 0, .trig_stream = "", .trig_ts = 0, .trig_seq = 0 };
+pub const PER_DEF_NONE: PerDef.Value = .{ .active = 0, .fired_ms = 0, .trig_ns = 0, .trig_made = 0, .trig_stream = "", .trig_ts = 0, .trig_seq = 0, .ended = 0 };
 
 pub const ParentState = enum(u8) {
     /// Not started yet: this shard's leader starts it, or refuses it.
@@ -310,6 +315,10 @@ pub const SigFam = view_mod.Family(67, "workflow.sig", .id, Stored(Sig));
 /// them from its cursor instead of reading and sorting every run.
 pub const RunAtFam = view_mod.Family(72, "workflow.run_at", .id, delivery.Empty);
 pub const RunAllFam = view_mod.Family(73, "workflow.run_all", .id, delivery.Empty);
+/// Every ended run, as a bulk delete walks its workflow's: oldest first,
+/// then by id. Written in the apply that ends the run, gone at its delete;
+/// the keys alone. Its workflow's `per_def.ended` counts them.
+pub const EndedAtFam = view_mod.Family(81, "workflow.ended_at", .id, delivery.Empty);
 
 /// A start time as the index keys order it: the newest first.
 pub fn listedAt(created_ms: i64) u64 {
@@ -325,6 +334,22 @@ pub fn runAtKey(a: std.mem.Allocator, ns: NamespaceId, workflow: []const u8, cre
     std.mem.writeInt(u64, k[at..][0..8], listedAt(created_ms), .big);
     @memcpy(k[at + 8 ..], run);
     return k;
+}
+
+/// `ns ‖ len ‖ workflow ‖ completed_ms ‖ run`: an ended run in its
+/// workflow's ended index, oldest first, the id last as in `runAtKey`.
+pub fn endedAtKey(a: std.mem.Allocator, ns: NamespaceId, workflow: []const u8, completed_ms: i64, run: []const u8) error{OutOfMemory}![]u8 {
+    const k = try underName(a, ns, workflow, 8 + run.len);
+    const at = KEY_PREFIX + 2 + workflow.len;
+    std.mem.writeInt(u64, k[at..][0..8], @intCast(@max(completed_ms, 0)), .big);
+    @memcpy(k[at + 8 ..], run);
+    return k;
+}
+
+/// `ns ‖ len ‖ name`: every key under one workflow, in a family keyed so
+/// (its ended runs, its idempotency rows).
+pub fn underWorkflow(a: std.mem.Allocator, ns: NamespaceId, workflow: []const u8) error{OutOfMemory}![]u8 {
+    return underName(a, ns, workflow, 0);
 }
 
 /// `ns ‖ len ‖ workflow`: every run of one workflow in its list.
@@ -409,6 +434,10 @@ pub fn idemKey(a: std.mem.Allocator, ns: NamespaceId, workflow: []const u8, key:
     const k = try underName(a, ns, workflow, key.len);
     @memcpy(k[k.len - key.len ..], key);
     return k;
+}
+
+pub fn idKeyOf(a: std.mem.Allocator, ns: NamespaceId, k: []const u8) error{OutOfMemory}![]u8 {
+    return idKeyAlloc(a, ns, k);
 }
 
 fn idKeyAlloc(a: std.mem.Allocator, ns: NamespaceId, k: []const u8) error{OutOfMemory}![]u8 {
@@ -720,6 +749,7 @@ fn command(e: *const Entry) ?entry_mod.CommandPayload {
 
 fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
     if (calls_mod.owns(typeOf(e) orelse return)) return calls_mod.keys(e, out);
+    if (typeOf(e).? == .workflow_runs_delete) return runsDeleteKeys(e, out);
     const n = named(e) orelse return;
     if (n.ns == .invalid) return;
     const arena = out.allocator;
@@ -738,6 +768,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             const ms = msOfNs(e.header.timestamp_ns);
             try out.addIn(RunAtFam.ID, n.ns, (try runAtKey(arena, n.ns, s.workflow, ms, n.run))[KEY_PREFIX..]);
             try out.addIn(RunAllFam.ID, n.ns, (try runAllKey(arena, n.ns, ms, n.run))[KEY_PREFIX..]);
+            if (s.status.isTerminal()) try out.addIn(EndedAtFam.ID, n.ns, (try endedAtKey(arena, n.ns, s.workflow, ms, n.run))[KEY_PREFIX..]);
         },
         .workflow_step => {
             const cmd = command(e).?;
@@ -752,6 +783,8 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             const st = Step.decodeAll(cmd.value, &diag) catch return;
             if (st.settles.len > 0) if (try calls_mod.callKeyAlloc(arena, n.ns, st.caller_slot, st.settles)) |k| try out.addIn(calls_mod.Calls.ID, n.ns, k[KEY_PREFIX..]);
             try out.addIn(PerDefFam.ID, n.ns, st.workflow);
+            // A step that ends its run puts its ended row, at its stamp.
+            try out.addIn(EndedAtFam.ID, n.ns, (try endedAtKey(arena, n.ns, st.workflow, msOfNs(e.header.timestamp_ns), n.run))[KEY_PREFIX..]);
             if (st.call.len > 0) {
                 const p = ae.Call.decodeAll(st.call, &diag) catch return;
                 if (try calls_mod.recordKey(arena, p)) |k| try out.addIn(calls_mod.Calls.ID, n.ns, k[KEY_PREFIX..]);
@@ -775,6 +808,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             out.addRangeIn(SigFam.ID, n.ns, range) catch return error.OutOfMemory;
             const c = Complete.parse(cmd.value) orelse return;
             try out.addIn(PerDefFam.ID, n.ns, c.workflow);
+            try out.addIn(EndedAtFam.ID, n.ns, (try endedAtKey(arena, n.ns, c.workflow, msOfNs(e.header.timestamp_ns), n.run))[KEY_PREFIX..]);
         },
         .workflow_run_delete => {
             const cmd = command(e).?;
@@ -784,11 +818,41 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             out.addRangeIn(SigFam.ID, n.ns, range) catch return error.OutOfMemory;
             const d = Delete.parse(cmd.value) orelse return;
             if (d.idem.len > 0) try out.addIn(IdemFam.ID, n.ns, (try idemKey(arena, n.ns, d.workflow, d.idem))[KEY_PREFIX..]);
+            // Its count, and its ended row, keyed by when it ended, which
+            // its record says.
+            try out.addIn(PerDefFam.ID, n.ns, d.workflow);
+            out.addRangeIn(EndedAtFam.ID, n.ns, (try underWorkflow(arena, n.ns, d.workflow))[KEY_PREFIX..]) catch return error.OutOfMemory;
             const ms = msOfNs(d.created_ns);
             try out.addIn(RunAtFam.ID, n.ns, (try runAtKey(arena, n.ns, d.workflow, ms, n.run))[KEY_PREFIX..]);
             try out.addIn(RunAllFam.ID, n.ns, (try runAllKey(arena, n.ns, ms, n.run))[KEY_PREFIX..]);
         },
         else => {},
+    }
+}
+
+/// A bulk delete's: each run's row, the rows under it and its places in
+/// the lists; its workflow's count; and, as ranges under the workflow, its
+/// idempotency rows (a run's own is found from its record) and its ended
+/// index. An orphan's mark is read committed, and declares nothing.
+fn runsDeleteKeys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
+    var diag: schema.Diagnostic = .{};
+    const p = ae.RunsDelete.decodeAll(e.payload, &diag) catch return;
+    const ns: NamespaceId = .of(p.ns);
+    if (ns == .invalid) return;
+    const arena = out.allocator;
+    try out.addIn(PerDefFam.ID, ns, p.owner);
+    const under = (try underWorkflow(arena, ns, p.owner))[KEY_PREFIX..];
+    out.addRangeIn(IdemFam.ID, ns, under) catch return error.OutOfMemory;
+    out.addRangeIn(EndedAtFam.ID, ns, under) catch return error.OutOfMemory;
+    var runs = p.runs.iterator();
+    while (runs.next() catch return) |item| {
+        try out.addIn(RunFam.ID, ns, item.run);
+        const range = (try runRange(arena, ns, item.run))[KEY_PREFIX..];
+        out.addRangeIn(OutFam.ID, ns, range) catch return error.OutOfMemory;
+        out.addRangeIn(SigFam.ID, ns, range) catch return error.OutOfMemory;
+        const ms = msOfNs(item.created_ns);
+        try out.addIn(RunAtFam.ID, ns, (try runAtKey(arena, ns, p.owner, ms, item.run))[KEY_PREFIX..]);
+        try out.addIn(RunAllFam.ID, ns, (try runAllKey(arena, ns, ms, item.run))[KEY_PREFIX..]);
     }
 }
 
@@ -804,6 +868,7 @@ fn namespaceOf(e: *const Entry) ?u32 {
 
 fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     if (calls_mod.owns(typeOf(e) orelse return error.Halt)) return calls_mod.apply(view, e, out);
+    if (typeOf(e).? == .workflow_runs_delete) return applyRunsDelete(view, e, out);
     const n = named(e) orelse return error.Halt;
     if (n.ns == .invalid) return error.Halt;
     const stamp_ms: i64 = @intCast(e.header.timestamp_ns / std.time.ns_per_ms);
@@ -994,6 +1059,12 @@ fn applyStart(view: *View, n: Named, cmd: entry_mod.CommandPayload, stamp_ns: u6
 
     var per = if (try view.get(PerDefFam, def_key)) |p| p.v else PER_DEF_NONE;
     if (!s.status.isTerminal()) per.active +|= 1;
+    // One that starts ended is in the ended index from here, staged after
+    // the mark, so a refused child start takes it back with the rest.
+    if (s.status.isTerminal()) {
+        per.ended +|= 1;
+        try view.put(EndedAtFam, try endedAtKey(arena, n.ns, s.workflow, stamp_ms, n.run), .{});
+    }
     if (s.idem) |k| noteFired(&per, s.event, k);
     if (s.trigger) |t| notePlace(&per, t);
     try view.put(PerDefFam, def_key, .{ .v = per });
@@ -1084,7 +1155,7 @@ fn notePlace(per: *PerDef.Value, t: TriggerAt) void {
             return;
         }
     }
-    per.* = .{ .active = per.active, .fired_ms = per.fired_ms, .trig_ns = t.ns, .trig_made = t.made, .trig_stream = t.stream, .trig_ts = t.ts, .trig_seq = t.seq };
+    per.* = .{ .active = per.active, .fired_ms = per.fired_ms, .trig_ns = t.ns, .trig_made = t.made, .trig_stream = t.stream, .trig_ts = t.ts, .trig_seq = t.seq, .ended = per.ended };
 }
 
 /// A disabled child's start: no run, and its parent's call is refused,
@@ -1345,19 +1416,82 @@ fn applyDelete(view: *View, n: Named, cmd: entry_mod.CommandPayload, out: *Resul
     if (run.created_ns != d.created_ns or !std.mem.eql(u8, run.workflow, d.workflow) or !std.mem.eql(u8, run.idempotency_key, d.idem))
         return out.refuse(.not_found, .not_found, "run not found");
     if (comptime plant.active != .runs_delete_takes_live) if (!statusOf(run).isTerminal()) return out.refuse(.bad_request, .run_live, RUN_LIVE);
+    return deleteEnded(view, n, cmd.key, &run);
+}
+
+/// An ended run deleted, whichever delete took it: its idempotency row
+/// (only if it names this run: a key is one run's at a time), the rows
+/// under it, its summary, its places in the lists and the ended index, one
+/// off its workflow's ended count, and its history dropped on the history
+/// lane, after its last chunk. One send, the drop.
+fn deleteEnded(view: *View, n: Named, run_key: []const u8, run: *const Run.Value) ApplyError!void {
     const arena = view.arena;
-    if ((comptime plant.active != .runs_delete_keeps_idem) and d.idem.len > 0) {
-        const k = try idemKey(arena, n.ns, d.workflow, d.idem);
-        // Only this run's: a key is only ever one run's at a time.
+    if ((comptime plant.active != .runs_delete_keeps_idem) and run.idempotency_key.len > 0) {
+        const k = try idemKey(arena, n.ns, run.workflow, run.idempotency_key);
         if (try view.get(IdemFam, k)) |i| if (std.mem.eql(u8, i.v.run, n.run)) try view.delete(IdemFam, k);
     }
     const range = try runRange(arena, n.ns, n.run);
     try view.deleteRange(OutFam, range, null);
     try view.deleteRange(SigFam, range, null);
-    try view.delete(RunFam, cmd.key);
+    try view.delete(RunFam, run_key);
     if (comptime plant.active != .runs_delete_keeps_index) try view.delete(RunAtFam, try runAtKey(arena, n.ns, run.workflow, run.created_at_ms, n.run));
     try view.delete(RunAllFam, try runAllKey(arena, n.ns, run.created_at_ms, n.run));
-    try hp.sendDrop(view, ownerOf(n, &run), run.completed_at_ms);
+    try view.delete(EndedAtFam, try endedAtKey(arena, n.ns, run.workflow, run.completed_at_ms, n.run));
+    const def_key = try idKeyAlloc(arena, n.ns, run.workflow);
+    var per = if (try view.get(PerDefFam, def_key)) |p| p.v else PER_DEF_NONE;
+    if (per.ended == 0) view.ended_drift += 1;
+    per.ended -|= 1;
+    try view.put(PerDefFam, def_key, .{ .v = per });
+    try hp.sendDrop(view, ownerOf(n, run), run.completed_at_ms);
+}
+
+/// A workflow's ended runs that ended before the entry's bound, deleted
+/// as one, and the orphaned histories its leader found under it dropped.
+/// Each is checked again here: a run gone, another incarnation, another
+/// workflow's, live, ended at another time or not before the bound is
+/// passed over, as is an orphan no longer marked. Answers how many runs
+/// it deleted.
+fn applyRunsDelete(view: *View, e: *const Entry, out: *Result) ApplyError!void {
+    var diag: schema.Diagnostic = .{};
+    // Only a leader proposes one: one that doesn't decode, or holds more
+    // than its sends allow, is a Flo bug.
+    const p = ae.RunsDelete.decodeAll(e.payload, &diag) catch return error.Halt;
+    if (p.runs.count + p.orphans.count > ae.MAX_RUNS_DELETE) return error.Halt;
+    const ns: NamespaceId = .of(p.ns);
+    if (ns == .invalid) return error.Halt;
+    const arena = view.arena;
+    var deleted: u32 = 0;
+    var runs = p.runs.iterator();
+    while (runs.next() catch return error.Halt) |item| {
+        const n: Named = .{ .ns = ns, .run = item.run };
+        const k = try idKeyAlloc(arena, ns, item.run);
+        const run = ((try view.get(RunFam, k)) orelse continue).v;
+        if (run.created_ns != item.created_ns or !std.mem.eql(u8, run.workflow, p.owner)) continue;
+        if (!statusOf(run).isTerminal() or run.completed_at_ms != item.completed_ms) continue;
+        if (comptime plant.active != .runs_bulk_ignores_bound) if (run.completed_at_ms >= p.before_ms) continue;
+        try deleteEnded(view, n, k, &run);
+        deleted += 1;
+    }
+    var orphans = p.orphans.iterator();
+    while (orphans.next() catch return error.Halt) |o| {
+        // Still marked, and this owner's in this namespace: its drop goes
+        // again, which takes its rows and its mark when it lands.
+        {
+            const mark = he_machine.orphanRow(.{ .store = view.store }, arena, .workflow, ns, p.owner, o.run, o.created_ns) orelse continue;
+            if (mark.completed_ms != @as(u64, @intCast(@max(o.completed_ms, 0))) or o.completed_ms >= p.before_ms) continue;
+        }
+        try hp.sendDrop(view, .{ .family = .workflow, .ns = ns, .owner = p.owner, .run = o.run, .created_ns = o.created_ns, .slot = calls_mod.callerSlot(ns, p.owner) }, o.completed_ms);
+    }
+    // What its client asks about next, the same on every replica: whether
+    // a run that ended before the bound is left, and how many orphans
+    // before it this entry didn't drop.
+    const under = try underWorkflow(arena, ns, p.owner);
+    var rest = try view.range(EndedAtFam, under);
+    const more = if (try rest.next()) |r| bulk.endedMsOf(r.key, under.len) < p.before_ms else false;
+    const left = try he_machine.orphansOf(.{ .store = view.store }, arena, .workflow, ns, p.owner, &.{}, bulk.Skip{ .before_ms = p.before_ms, .taken = p.orphans });
+    out.putInt(u32, deleted);
+    out.putInt(u8, @intFromBool(more));
+    out.putInt(u32, left.left);
 }
 
 /// `run` ended `status` at `stamp_ms`: no longer counted among its
@@ -1384,12 +1518,12 @@ fn endRun(view: *View, n: Named, run_key: []const u8, run: *Run.Value, status: R
     try view.put(RunFam, run_key, .{ .v = run.* });
 
     const def_key = try idKeyAlloc(arena, n.ns, run.workflow);
-    if (try view.get(PerDefFam, def_key)) |found| {
-        var per = found;
-        const cancel_keeps = comptime plant.active == .runs_cancel_keeps_active;
-        if (!cancel_keeps or status != .cancelled) per.v.active -|= 1;
-        try view.put(PerDefFam, def_key, per);
-    }
+    var per = if (try view.get(PerDefFam, def_key)) |found| found.v else PER_DEF_NONE;
+    const cancel_keeps = comptime plant.active == .runs_cancel_keeps_active;
+    if (!cancel_keeps or status != .cancelled) per.active -|= 1;
+    per.ended +|= 1;
+    try view.put(PerDefFam, def_key, .{ .v = per });
+    try view.put(EndedAtFam, try endedAtKey(arena, n.ns, run.workflow, stamp_ms, n.run), .{});
 
     var pk: [KEY_PREFIX + ae.MAX_RUN_ID]u8 = undefined;
     if (n.run.len > ae.MAX_RUN_ID) return;
@@ -1525,7 +1659,7 @@ fn writeJsonEscaped(w: *std.Io.Writer, s: []const u8) !void {
 
 pub const machine: machine_mod.Machine = .{
     .name = "workflow runs",
-    .entry_types = &.{ .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .workflow_run_delete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done },
+    .entry_types = &.{ .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .workflow_run_delete, .workflow_runs_delete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done },
     .families = &.{
         machine_mod.info(calls_mod.Calls),
         machine_mod.info(Parents),
@@ -1536,6 +1670,7 @@ pub const machine: machine_mod.Machine = .{
         machine_mod.info(SigFam),
         machine_mod.info(RunAtFam),
         machine_mod.info(RunAllFam),
+        machine_mod.info(EndedAtFam),
         machine_mod.info(hq.WorkflowReserved),
     },
     .keys = keys,
@@ -1711,6 +1846,59 @@ const Fixture = struct {
     fn deleteOf(f: *Fixture, run_id: []const u8) !Result {
         const r = f.get(run_id).?;
         return f.delete(run_id, .{ .workflow = r.workflow, .idem = r.idempotency_key, .created_ns = r.created_ns });
+    }
+
+    /// A bulk delete of `wf`'s runs that ended before `before_ms`, as its
+    /// leader read them, and of the orphans it found.
+    fn bulkDelete(f: *Fixture, wf: []const u8, before_ms: i64, runs: []const ae.DeletedRun.Value, orphans: []const ae.DeletedRun.Value) !Result {
+        // Not the scratch arena: the apply resets it.
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var rl: std.ArrayListUnmanaged(u8) = .empty;
+        for (runs) |r| try rl.appendSlice(a, try ae.DeletedRun.encodeInto(try a.alloc(u8, ae.DeletedRun.max_size), r));
+        var ol: std.ArrayListUnmanaged(u8) = .empty;
+        for (orphans) |r| try ol.appendSlice(a, try ae.DeletedRun.encodeInto(try a.alloc(u8, ae.DeletedRun.max_size), r));
+        const body: ae.RunsDelete.Value = .{ .ns = NamespaceId.default.int(), .owner = wf, .before_ms = before_ms, .runs = .{ .bytes = rl.items, .count = @intCast(runs.len) }, .orphans = .{ .bytes = ol.items, .count = @intCast(orphans.len) } };
+        const payload = try ae.RunsDelete.encodeInto(try a.alloc(u8, ae.RunsDelete.max_size), body);
+        f.index += 1;
+        const e = entry_mod.buildEntry(.workflow_runs_delete, entry_mod.Flags.NONE, 1, f.index, 95 * std.time.ns_per_ms, payload);
+        return run(&machine, f, &e);
+    }
+
+    /// Run `run_id` as a bulk delete's leader reads it.
+    fn deletedOf(f: *Fixture, run_id: []const u8) ae.DeletedRun.Value {
+        const r = f.get(run_id).?;
+        return .{ .run = run_id, .created_ns = r.created_ns, .completed_ms = r.completed_at_ms };
+    }
+
+    /// Whether `wf`'s ended index holds run `run_id`, ended at `ms`.
+    fn inEnded(f: *Fixture, wf: []const u8, ms: i64, run_id: []const u8) bool {
+        const k = endedAtKey(f.scratch.allocator(), .default, wf, ms, run_id) catch unreachable;
+        return ((ReadView{ .store = &f.store }).get(EndedAtFam, k) catch unreachable) != null;
+    }
+
+    /// An orphan mark planted for run `run_id`'s incarnation `created_ns`.
+    fn plantOrphan(f: *Fixture, wf: []const u8, run_id: []const u8, created_ns: u64, completed_ms: u64) !void {
+        const a = f.scratch.allocator();
+        const k = try he_machine.orphanRowKey(a, .default, wf, run_id, created_ns);
+        var ks = view_mod.KeySet.init(a);
+        try ks.add(he_machine.Workflows.ID, "", k);
+        var view = View.init(&f.store, a, &ks);
+        view.strict = false;
+        var row = std.mem.zeroes(he_machine.Row.Value);
+        row.owner = wf;
+        row.completed_ms = completed_ms;
+        row.retries = he_machine.MAX_DROP_RETRIES;
+        try view.put(he_machine.Workflows, k, .{ .v = row });
+        try view.commit();
+    }
+
+    /// A bulk delete's answer: how many it deleted, whether more ended
+    /// before its bound, and the orphans it left.
+    fn bulkAnswer(r: *const Result) struct { deleted: u32, more: bool, left: u32 } {
+        var rd = r.reader();
+        return .{ .deleted = rd.int(u32).?, .more = rd.int(u8).? != 0, .left = rd.int(u32).? };
     }
 
     fn idemOf(f: *Fixture, wf: []const u8, key: []const u8) ?[]const u8 {
@@ -2084,6 +2272,173 @@ test "workflow runs machine: a run's start puts it in both lists' index, its del
     try testing.expect((try f.deleteOf("r1")).refused() == null);
     try testing.expectEqual(@as(usize, 0), f.store.families[RunAtFam.ID].count);
     try testing.expectEqual(@as(usize, 0), f.store.families[RunAllFam.ID].count);
+}
+
+test "workflow runs machine: every way a run ends puts it in its workflow's ended index and counts it, and every delete takes both off" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("r1", "wf", "workflow_started", "", 1);
+    _ = try f.start("r2", "wf", "workflow_started", "", 1);
+    var vb: [512]u8 = undefined;
+    // A cancel, a step that ends its run, and a start that ends at once.
+    _ = try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 50);
+    try testing.expect((try f.step("r2", .{ .rev = f.get("r2").?.rev, .ends = .completed })).refused() == null);
+    var sb: [512]u8 = undefined;
+    var kb: [64]u8 = undefined;
+    const ended = (Start{ .workflow = "wf", .version = "1", .status = .completed, .event = "workflow_started", .idem = null, .trigger = null, .input = "" }).encode(&sb).?;
+    try testing.expect((try f.command(.workflow_start, view_mod.idKey(&kb, .default, "r3") catch unreachable, ended, 60)).refused() == null);
+    try testing.expectEqual(@as(u64, 3), f.active("wf").?.ended);
+    try testing.expectEqual(@as(usize, 3), f.store.families[EndedAtFam.ID].count);
+    try testing.expect(f.inEnded("wf", 50, "r1"));
+    try testing.expect(f.inEnded("wf", f.get("r2").?.completed_at_ms, "r2"));
+    try testing.expect(f.inEnded("wf", 60, "r3"));
+    // A second end of an ended run puts nothing again.
+    _ = try f.complete("r1", completeValue(&vb, .cancelled, "wf"), 70);
+    try testing.expectEqual(@as(u64, 3), f.active("wf").?.ended);
+    // The single delete, then the bulk one.
+    try testing.expect((try f.deleteOf("r1")).refused() == null);
+    try testing.expectEqual(@as(u64, 2), f.active("wf").?.ended);
+    try testing.expect(!f.inEnded("wf", 50, "r1"));
+    const out = try f.bulkDelete("wf", 1000, &.{ f.deletedOf("r2"), f.deletedOf("r3") }, &.{});
+    try testing.expectEqual(@as(u32, 2), Fixture.bulkAnswer(&out).deleted);
+    try testing.expectEqual(@as(u64, 0), f.active("wf").?.ended);
+    try testing.expectEqual(@as(usize, 0), f.store.families[EndedAtFam.ID].count);
+    try testing.expectEqual(@as(u64, 0), f.store.ended_drift);
+}
+
+/// A workflow other than "wf" whose runs' history this fixture's group
+/// takes too, so a run of it can end here.
+fn otherWorkflowHere(f: *const Fixture) []const u8 {
+    const names = [_][]const u8{ "wf1", "wf2", "wf3", "wf4", "wf5", "wf6", "wf7", "wf8", "wf9", "wfa", "wfb", "wfc" };
+    for (names) |n| if (channels.ownerOf(.{ .group = 0, .count = 2 }, calls_mod.callerSlot(.default, n)) == f.store.place.?.group) return n;
+    unreachable;
+}
+
+test "workflow runs machine: a bulk delete takes only a run of its workflow, of the incarnation and end it was read with, ended before its bound; it says whether more did" {
+    var f = Fixture.init();
+    defer f.deinit();
+    for ([_][]const u8{ "a", "b", "c", "live" }) |id| _ = try f.start(id, "wf", "workflow_started", "", 1);
+    var vb: [512]u8 = undefined;
+    _ = try f.complete("a", completeValue(&vb, .cancelled, "wf"), 10);
+    _ = try f.complete("b", completeValue(&vb, .cancelled, "wf"), 20);
+    _ = try f.complete("c", completeValue(&vb, .cancelled, "wf"), 30);
+    const a = f.deletedOf("a");
+    const b_right = f.deletedOf("b");
+    var b = f.deletedOf("b");
+    b.completed_ms += 1;
+    var stale = f.deletedOf("a");
+    stale.created_ns += 1;
+    const out = try f.bulkDelete("wf", 25, &.{
+        stale, // another incarnation: passed over
+        b, // another end than its own
+        f.deletedOf("c"), // ended at 30, past the bound
+        .{ .run = "live", .created_ns = f.get("live").?.created_ns, .completed_ms = 0 },
+        // Named for another workflow: its owner is checked.
+        .{ .run = "c", .created_ns = f.get("c").?.created_ns, .completed_ms = 30 },
+        .{ .run = "gone", .created_ns = 1, .completed_ms = 5 },
+        a,
+    }, &.{});
+    try testing.expect(out.refused() == null);
+    const got = Fixture.bulkAnswer(&out);
+    try testing.expectEqual(@as(u32, 1), got.deleted);
+    // b ended before the bound and is still there.
+    try testing.expect(got.more);
+    try testing.expect(f.get("a") == null);
+    for ([_][]const u8{ "b", "c", "live" }) |id| try testing.expect(f.get(id) != null);
+    try testing.expectEqual(@as(usize, 1), (try f.drops()).len);
+    // Alone, each spoiled read takes nothing: another incarnation of a
+    // run that would go, and a run of another workflow named for this one.
+    var stale_b = b_right;
+    stale_b.created_ns += 1;
+    try testing.expectEqual(@as(u32, 0), Fixture.bulkAnswer(&(try f.bulkDelete("wf", 25, &.{stale_b}, &.{}))).deleted);
+    try testing.expectEqual(@as(u32, 0), Fixture.bulkAnswer(&(try f.bulkDelete("wf", 25, &.{b}, &.{}))).deleted);
+    const other = otherWorkflowHere(&f);
+    _ = try f.start("o", other, "workflow_started", "", 1);
+    _ = try f.complete("o", completeValue(&vb, .cancelled, other), 10);
+    try testing.expectEqual(@as(u32, 0), Fixture.bulkAnswer(&(try f.bulkDelete("wf", 25, &.{f.deletedOf("o")}, &.{}))).deleted);
+    try testing.expect(f.get("o") != null);
+    // Read right, b goes; then none is left before the bound.
+    const next = try f.bulkDelete("wf", 25, &.{b_right}, &.{});
+    try testing.expectEqual(@as(u32, 1), Fixture.bulkAnswer(&next).deleted);
+    try testing.expect(!Fixture.bulkAnswer(&next).more);
+    try testing.expect(f.get("c") != null);
+}
+
+test "workflow runs machine: a bulk delete drops an orphan still marked before its bound, and counts the ones it leaves" {
+    var f = Fixture.init();
+    defer f.deinit();
+    try f.plantOrphan("wf", "o1", 7, 10);
+    try f.plantOrphan("wf", "o2", 8, 11);
+    try f.plantOrphan("wf", "late", 9, 40);
+    try f.plantOrphan("wf2", "theirs", 9, 10);
+    const out = try f.bulkDelete("wf", 25, &.{}, &.{
+        .{ .run = "o1", .created_ns = 7, .completed_ms = 10 },
+        .{ .run = "o1", .created_ns = 8, .completed_ms = 10 }, // no such mark
+        .{ .run = "late", .created_ns = 9, .completed_ms = 40 }, // past the bound
+        .{ .run = "theirs", .created_ns = 9, .completed_ms = 10 }, // another workflow's
+    });
+    const got = Fixture.bulkAnswer(&out);
+    try testing.expectEqual(@as(u32, 0), got.deleted);
+    try testing.expect(!got.more);
+    // o2 is before the bound and wasn't taken.
+    try testing.expectEqual(@as(u32, 1), got.left);
+    const drops = try f.drops();
+    try testing.expectEqual(@as(usize, 1), drops.len);
+    try testing.expectEqualStrings("o1", drops[0].run);
+    try testing.expectEqual(@as(u64, 7), drops[0].created_ns);
+}
+
+test "workflow runs machine: a leader's sent orphan leaves its set once its mark is gone, so the one past MAX is taken once earlier drops land" {
+    var f = Fixture.init();
+    defer f.deinit();
+    const gpa = testing.allocator;
+    const a = f.scratch.allocator();
+    const read: ReadView = .{ .store = &f.store };
+    var sent: he_machine.OrphansSent = .{};
+    defer sent.deinit(gpa);
+    sent.at(gpa, 1);
+    try f.plantOrphan("wf", "held", 1, 10);
+    try sent.note(gpa, .default, "wf", .{ .run = "held", .created_ns = 1, .completed_ms = 10 });
+    // The rest of the set: sent drops whose marks are gone, as they landed.
+    var i: u64 = 0;
+    while (!sent.full()) : (i += 1) try sent.note(gpa, .default, "wf", .{ .run = "landed", .created_ns = 100 + i, .completed_ms = 10 });
+    try f.plantOrphan("wf", "next", 2, 10);
+    const Skip = struct {
+        sent: *const he_machine.OrphansSent,
+        pub fn has(s: @This(), o: he_machine.Orphan) bool {
+            return s.sent.has(.default, "wf", o);
+        }
+    };
+    var out: [4]he_machine.Orphan = undefined;
+    // At MAX a bulk delete has no room for orphans: the next is left, and counted.
+    const at_cap = try he_machine.orphansOf(read, a, .workflow, .default, "wf", out[0..0], Skip{ .sent = &sent });
+    try testing.expectEqual(@as(u32, 1), at_cap.left);
+    // Pruned, only the one still marked stays; the next is taken, it isn't.
+    try sent.prune(gpa, read, .workflow);
+    try testing.expectEqual(@as(usize, 1), sent.rows.count());
+    const got = try he_machine.orphansOf(read, a, .workflow, .default, "wf", &out, Skip{ .sent = &sent });
+    try testing.expectEqual(@as(usize, 1), got.n);
+    try testing.expectEqualStrings("next", out[0].run);
+    // Its drop lands: it leaves too.
+    const k = try he_machine.orphanRowKey(a, .default, "wf", "held", 1);
+    var ks = view_mod.KeySet.init(a);
+    try ks.add(he_machine.Workflows.ID, "", k);
+    var view = View.init(&f.store, a, &ks);
+    view.strict = false;
+    try view.delete(he_machine.Workflows, k);
+    try view.commit();
+    try sent.prune(gpa, read, .workflow);
+    try testing.expectEqual(@as(usize, 0), sent.rows.count());
+}
+
+test "workflow runs machine: a bulk delete that names more than one entry may send is a Flo bug" {
+    var f = Fixture.init();
+    defer f.deinit();
+    var items: [ae.MAX_RUNS_DELETE + 1]ae.DeletedRun.Value = undefined;
+    for (&items) |*i| i.* = .{ .run = "x", .created_ns = 1, .completed_ms = 1 };
+    try testing.expectError(error.Halt, f.bulkDelete("wf", 25, items[0..40], items[40..]));
+    comptime std.debug.assert(ae.MAX_RUNS_DELETE + 1 <= channels.MAX_SENDS);
+    comptime std.debug.assert(ae.MAX_RUNS_DELETE * he.Drop.max_size <= channels.MAX_SEND_BYTES);
 }
 
 test "workflow runs machine: a schedule's slot fires once, its run deleted or not; an older slot after a newer one is refused" {

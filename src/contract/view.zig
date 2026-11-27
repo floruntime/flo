@@ -247,7 +247,7 @@ pub const Message = struct {
     slot: u16 = 0,
 };
 
-pub const Mark = struct { ops: usize, sends: usize, late: [8]u64, drift: u64, reserve_drift: u64, eased: store_mod.Eased };
+pub const Mark = struct { ops: usize, sends: usize, late: [8]u64, drift: u64, reserve_drift: u64, ended_drift: u64 = 0, eased: store_mod.Eased };
 
 pub const View = struct {
     store: *Store,
@@ -272,6 +272,9 @@ pub const View = struct {
     /// Run-history reserve lowers past zero this entry made
     /// (`Store.quota_reserve_drift`), counted at commit as the usage drift is.
     quota_reserve_drift: u64 = 0,
+    /// Ended-run count lowers past zero this entry made
+    /// (`Store.ended_drift`), counted at commit as the reserve's are.
+    ended_drift: u64 = 0,
     /// The namespaces this entry may have eased the quota of
     /// (`Store.Eased`), merged into the store's at commit.
     quota_eased: store_mod.Eased = .{},
@@ -325,7 +328,7 @@ pub const View = struct {
 
     /// A point `rollback` returns the staged writes and sends to.
     pub fn mark(self: *const View) Mark {
-        return .{ .ops = self.ops.items.len, .sends = self.sends.items.len, .late = self.ts_late_points, .drift = self.history_usage_drift, .reserve_drift = self.quota_reserve_drift, .eased = self.quota_eased };
+        return .{ .ops = self.ops.items.len, .sends = self.sends.items.len, .late = self.ts_late_points, .drift = self.history_usage_drift, .reserve_drift = self.quota_reserve_drift, .ended_drift = self.ended_drift, .eased = self.quota_eased };
     }
 
     /// Drops what was staged after `m`: a refused message inside a batch
@@ -337,6 +340,7 @@ pub const View = struct {
         self.ts_late_points = m.late;
         self.history_usage_drift = m.drift;
         self.quota_reserve_drift = m.reserve_drift;
+        self.ended_drift = m.ended_drift;
         self.quota_eased = m.eased;
         // A range delete staged after the mark goes with it: left in, it
         // would still hide keys from later reads and unlink them at commit.
@@ -572,6 +576,7 @@ pub const View = struct {
         for (&self.store.ts_late_points, self.ts_late_points) |*n, d| n.* += d;
         self.store.history_usage_drift += self.history_usage_drift;
         self.store.quota_reserve_drift += self.quota_reserve_drift;
+        self.store.ended_drift += self.ended_drift;
         self.store.quota_eased.merge(self.quota_eased);
     }
 

@@ -106,10 +106,10 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
 
         // Workflows: their contract machines (workflow/defs_machine.zig,
         // workflow/runs_machine.zig).
-        .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step, .workflow_signal, .workflow_run_delete => .none,
+        .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step, .workflow_signal, .workflow_run_delete, .workflow_runs_delete => .none,
         .namespace_create, .namespace_alter => .none,
         // Actions: their contract machine (actions/machine.zig).
-        .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_run_delete => .none,
+        .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_run_delete, .action_runs_delete => .none,
         // Calls: the runs machine (workflow/runs_machine.zig).
         .step_call_retry, .step_call_clear, .call_reply, .call_done => .none,
         // A child workflow's start and refusal: the runs machine.

@@ -54,6 +54,8 @@ const hp = @import("../stream/history_producer.zig");
 const he = @import("../protocol/history_entries.zig");
 const channels = @import("../contract/channels.zig");
 const router = @import("../node/router.zig");
+const hm = @import("../stream/history_machine.zig");
+const bulk = @import("../stream/runs_delete.zig");
 const fnv1a64 = @import("stdx").hash.fnv1a64;
 const plant = @import("../plant.zig");
 const settings = @import("../settings/machine.zig");
@@ -160,6 +162,10 @@ pub const Runs = view_mod.Family(21, "action.run", .id, Stored(Run));
 /// Every run, as its action's list orders it: newest first, then by id in
 /// byte order. Written at its invoke and gone at its delete; keys alone.
 pub const RunAt = view_mod.Family(74, "action.run_at", .id, delivery.Empty);
+/// Every ended run, as a bulk delete walks its action's: oldest first,
+/// then by id. Written in the apply that ends the run, gone at its delete;
+/// keys alone. Its action's counts (completed, failed, timed out) count them.
+pub const EndedAt = view_mod.Family(82, "action.ended_at", .id, delivery.Empty);
 
 /// The key after the namespace of run `run`'s place in its action's list:
 /// `len ‖ action ‖ ~created_ms ‖ run`, the id last with no length before
@@ -183,6 +189,26 @@ pub fn runAtPrefix(buf: *RunAtBuf, action: []const u8) []const u8 {
 }
 
 pub const RunAtBuf = [2 + ae.MAX_ACTION_NAME + 8 + ae.MAX_RUN_ID]u8;
+
+/// The key after the namespace of run `run`'s place in its action's ended
+/// index: `len ‖ action ‖ completed_ms ‖ run`, oldest first.
+pub fn endedAtKey(buf: *RunAtBuf, action: []const u8, completed_ms: i64, run: []const u8) []const u8 {
+    std.debug.assert(action.len <= ae.MAX_ACTION_NAME and run.len <= ae.MAX_RUN_ID);
+    std.mem.writeInt(u16, buf[0..2], @intCast(action.len), .big);
+    @memcpy(buf[2..][0..action.len], action);
+    std.mem.writeInt(u64, buf[2 + action.len ..][0..8], @intCast(@max(completed_ms, 0)), .big);
+    @memcpy(buf[2 + action.len + 8 ..][0..run.len], run);
+    return buf[0 .. 2 + action.len + 8 + run.len];
+}
+
+/// The key after the namespace under which every one of `action`'s ended
+/// runs is: `len ‖ action`.
+pub fn endedAtPrefix(buf: *RunAtBuf, action: []const u8) []const u8 {
+    std.debug.assert(action.len <= ae.MAX_ACTION_NAME);
+    std.mem.writeInt(u16, buf[0..2], @intCast(action.len), .big);
+    @memcpy(buf[2..][0..action.len], action);
+    return buf[0 .. 2 + action.len];
+}
 
 /// An action's runs by where they are, kept as they move, so its info
 /// reads one row whatever its runs. Keyed by the action, as its definition.
@@ -253,6 +279,14 @@ fn typeOf(e: *const Entry) EntryType {
     return @fromBackingInt(@intCast(e.header.entry_type));
 }
 
+/// The ended row an end at `stamp` puts, for an entry that may end run
+/// `run` of `action`.
+fn addEndedKey(out: *KeySet, ns: NamespaceId, action: []const u8, stamp: u64, run: []const u8) error{OutOfMemory}!void {
+    if (action.len > ae.MAX_ACTION_NAME or run.len > ae.MAX_RUN_ID) return;
+    var ab: RunAtBuf = undefined;
+    try out.addIn(EndedAt.ID, ns, endedAtKey(&ab, action, msOf(stamp), run));
+}
+
 fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
     var diag: schema.Diagnostic = .{};
     var b: KeyBuf = undefined;
@@ -295,6 +329,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             const ns: NamespaceId = .of(p.ns);
             try out.addIn(Runs.ID, ns, p.run);
             try out.addIn(Counts.ID, ns, p.action);
+            try addEndedKey(out, ns, p.action, stamp, p.run);
             try out.add(Deadlines.ID, "", deadlineKey(&b, p.expiry_ns, ns, p.run));
             if (p.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, p.holder, k));
             try hq.addKeys(hq.ActionReserved, out, ns);
@@ -304,6 +339,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             const ns: NamespaceId = .of(p.ns);
             try out.addIn(Runs.ID, ns, p.run);
             try out.addIn(Counts.ID, ns, p.action);
+            try addEndedKey(out, ns, p.action, stamp, p.run);
             try out.addIn(Ready.ID, ns, readyKey(&b, p.action, {}, after(stamp, p.delay_ms), p.run));
             try out.add(Deadlines.ID, "", deadlineKey(&b, p.expiry_ns, ns, p.run));
             if (p.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, p.holder, k));
@@ -326,6 +362,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
                 try out.addIn(Ready.ID, ns, readyKey(&b, item.action, {}, stamp, item.run));
                 if (item.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, item.holder, k));
                 try out.addIn(Counts.ID, ns, item.action);
+                try addEndedKey(out, ns, item.action, stamp, item.run);
                 try hq.addKeys(hq.ActionReserved, out, ns);
             }
         },
@@ -335,6 +372,22 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             var ab: RunAtBuf = undefined;
             try out.addIn(RunAt.ID, .of(p.ns), runAtKey(&ab, p.action, msOf(p.created_ns), p.run));
             try out.addIn(Counts.ID, .of(p.ns), p.action);
+            // Its ended row, keyed by when it ended, which its record says.
+            out.addRangeIn(EndedAt.ID, .of(p.ns), endedAtPrefix(&ab, p.action)) catch return error.OutOfMemory;
+        },
+        .action_runs_delete => {
+            const p = ae.RunsDelete.decodeAll(e.payload, &diag) catch return;
+            const ns: NamespaceId = .of(p.ns);
+            if (p.owner.len > ae.MAX_ACTION_NAME) return;
+            try out.addIn(Counts.ID, ns, p.owner);
+            var ab: RunAtBuf = undefined;
+            out.addRangeIn(EndedAt.ID, ns, endedAtPrefix(&ab, p.owner)) catch return error.OutOfMemory;
+            var it = p.runs.iterator();
+            while (it.next() catch return) |item| {
+                if (item.run.len > ae.MAX_RUN_ID) continue;
+                try out.addIn(Runs.ID, ns, item.run);
+                try out.addIn(RunAt.ID, ns, runAtKey(&ab, p.owner, msOf(item.created_ns), item.run));
+            }
         },
         // A hand-back reads and writes nothing here.
         .action_abandon => {},
@@ -593,6 +646,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         // It changes nothing here.
         .action_abandon => {},
         .action_run_delete => return applyRunDelete(view, e, out),
+        .action_runs_delete => return applyRunsDelete(view, e, out),
         .action_abandon_send => {
             // Only an await's shard makes these, from a task it holds.
             const p = ae.Abandon.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -844,6 +898,8 @@ fn endRun(view: *View, ns: NamespaceId, id: []const u8, run: *Run.Value, status:
     try moveCount(view, ns, run.action, run.status, status);
     run.status = status;
     run.completed_ns = stamp;
+    var ab: RunAtBuf = undefined;
+    try view.put(EndedAt, try idKey(view, ns, endedAtKey(&ab, run.action, msOf(stamp), id)), .{});
     try tellCaller(view, ns, id, run.*, result);
     if (comptime plant.active != .actions_end_keeps_input) run.input = "";
     run.labels = null;
@@ -875,12 +931,62 @@ fn applyRunDelete(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     const run = (try inScope(view, rk, p.action)) orelse return out.refuse(.not_found, .not_found, NO_RUN);
     if (run.v.created_ns != p.created_ns) return out.refuse(.not_found, .not_found, NO_RUN);
     if (run.v.completed_ns == 0) return out.refuse(.bad_request, .run_live, RUN_LIVE);
+    return deleteEnded(view, ns, rk, p.run, &run.v);
+}
+
+/// An ended run deleted, whichever delete took it: its row, its places in
+/// its action's list and ended index, its count, and its history dropped.
+/// One send, the drop.
+fn deleteEnded(view: *View, ns: NamespaceId, rk: []const u8, id: []const u8, run: *const Run.Value) ApplyError!void {
     try view.delete(Runs, rk);
     var ab: RunAtBuf = undefined;
-    try view.delete(RunAt, try idKey(view, ns, runAtKey(&ab, run.v.action, msOf(run.v.created_ns), p.run)));
-    try moveCount(view, ns, run.v.action, run.v.status, null);
+    try view.delete(RunAt, try idKey(view, ns, runAtKey(&ab, run.action, msOf(run.created_ns), id)));
+    try view.delete(EndedAt, try idKey(view, ns, endedAtKey(&ab, run.action, msOf(run.completed_ns), id)));
+    try moveCount(view, ns, run.action, run.status, null);
     if (comptime plant.active == .actions_delete_keeps_history) return;
-    try hp.sendDrop(view, ownerOf(ns, p.run, &run.v), msOf(run.v.completed_ns));
+    try hp.sendDrop(view, ownerOf(ns, id, run), msOf(run.completed_ns));
+}
+
+/// An action's ended runs that ended before the entry's bound, deleted as
+/// one, and the orphaned histories its leader found under it dropped. Each
+/// is checked again here, as `workflow_runs_delete`'s are. Answers how
+/// many runs it deleted.
+fn applyRunsDelete(view: *View, e: *const Entry, out: *Result) ApplyError!void {
+    var diag: schema.Diagnostic = .{};
+    const p = ae.RunsDelete.decodeAll(e.payload, &diag) catch return error.Halt;
+    if (p.runs.count + p.orphans.count > ae.MAX_RUNS_DELETE or p.owner.len > ae.MAX_ACTION_NAME) return error.Halt;
+    const ns: NamespaceId = .of(p.ns);
+    if (ns == .invalid) return error.Halt;
+    var deleted: u32 = 0;
+    var runs = p.runs.iterator();
+    while (runs.next() catch return error.Halt) |item| {
+        if (item.run.len > ae.MAX_RUN_ID) continue;
+        const rk = try idKey(view, ns, item.run);
+        const run = (try inScope(view, rk, p.owner)) orelse continue;
+        if (run.v.created_ns != item.created_ns or run.v.completed_ns == 0) continue;
+        const ended_ms = msOf(run.v.completed_ns);
+        if (ended_ms != item.completed_ms) continue;
+        if (comptime plant.active != .runs_bulk_ignores_bound) if (ended_ms >= p.before_ms) continue;
+        try deleteEnded(view, ns, rk, item.run, &run.v);
+        deleted += 1;
+    }
+    var orphans = p.orphans.iterator();
+    while (orphans.next() catch return error.Halt) |o| {
+        {
+            const mark = hm.orphanRow(.{ .store = view.store }, view.arena, .action, ns, p.owner, o.run, o.created_ns) orelse continue;
+            if (mark.completed_ms != @as(u64, @intCast(@max(o.completed_ms, 0))) or o.completed_ms >= p.before_ms) continue;
+        }
+        try hp.sendDrop(view, .{ .family = .action, .ns = ns, .owner = p.owner, .run = o.run, .created_ns = o.created_ns, .slot = @intCast(router.nsKeySlot(ns, p.owner)) }, o.completed_ms);
+    }
+    // What its client asks about next, as `workflow_runs_delete` answers.
+    var ab: RunAtBuf = undefined;
+    const under = try idKey(view, ns, endedAtPrefix(&ab, p.owner));
+    var rest = try view.range(EndedAt, under);
+    const more = if (try rest.next()) |r| bulk.endedMsOf(r.key, under.len) < p.before_ms else false;
+    const left = try hm.orphansOf(.{ .store = view.store }, view.arena, .action, ns, p.owner, &.{}, bulk.Skip{ .before_ms = p.before_ms, .taken = p.orphans });
+    out.putInt(u32, deleted);
+    out.putInt(u8, @intFromBool(more));
+    out.putInt(u32, left.left);
 }
 
 const holds = delivery.holds;
@@ -892,8 +998,8 @@ const idKey = M.inNs;
 
 pub const machine: machine_mod.Machine = .{
     .name = "actions",
-    .entry_types = &.{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_run_delete, .action_abandon_send, .action_abandon },
-    .families = &([_]machine_mod.FamilyInfo{ machine_mod.info(Defs), machine_mod.info(Runs), machine_mod.info(RunAt), machine_mod.info(Counts), machine_mod.info(hq.ActionReserved) } ++ M.FAMILIES),
+    .entry_types = &.{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_run_delete, .action_runs_delete, .action_abandon_send, .action_abandon },
+    .families = &([_]machine_mod.FamilyInfo{ machine_mod.info(Defs), machine_mod.info(Runs), machine_mod.info(RunAt), machine_mod.info(EndedAt), machine_mod.info(Counts), machine_mod.info(hq.ActionReserved) } ++ M.FAMILIES),
     .keys = keys,
     .apply = apply,
     .skipped = skipped,
@@ -1794,6 +1900,92 @@ test "actions machine: a delete of an ended run removes it and drops its history
     try testing.expectEqual(@as(usize, 1), (try histDrops(&t, a)).len);
     try invoke(&t, "r1", 50 * ms);
     try testing.expectEqual(Status.ready, t.run(.default, "r1").?.status);
+}
+
+/// A bulk delete of action "send"'s runs that ended before `before_ms`.
+fn bulkOf(a: std.mem.Allocator, before_ms: i64, runs: []const ae.DeletedRun.Value, orphans: []const ae.DeletedRun.Value) !ae.RunsDelete.Value {
+    var rl: std.ArrayListUnmanaged(u8) = .empty;
+    for (runs) |r| try rl.appendSlice(a, try ae.DeletedRun.encodeInto(try a.alloc(u8, ae.DeletedRun.max_size), r));
+    var ol: std.ArrayListUnmanaged(u8) = .empty;
+    for (orphans) |r| try ol.appendSlice(a, try ae.DeletedRun.encodeInto(try a.alloc(u8, ae.DeletedRun.max_size), r));
+    return .{ .ns = DEFAULT, .owner = "send", .before_ms = before_ms, .runs = .{ .bytes = rl.items, .count = @intCast(runs.len) }, .orphans = .{ .bytes = ol.items, .count = @intCast(orphans.len) } };
+}
+
+fn deletedOf(t: *TestActions, id: []const u8) ae.DeletedRun.Value {
+    const r = t.run(.default, id).?;
+    return .{ .run = id, .created_ns = r.created_ns, .completed_ms = msOf(r.completed_ns) };
+}
+
+test "actions machine: an ended run is in its action's ended index until a delete, single or bulk, takes it; a bulk delete takes only what it was read with, before its bound" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 3);
+    for ([_][]const u8{ "r1", "r2", "r3", "live" }) |id| try invoke(&t, id, 10 * ms);
+    for ([_][]const u8{ "r1", "r2", "r3" }, [_]u64{ 20, 30, 40 }) |id, at| {
+        _ = try deliver(&t, id, 10 * ms, at * ms - ms);
+        try testing.expect((try t.apply(.action_settle, settleOf(&t, id), at * ms)).refused() == null);
+    }
+    try testing.expectEqual(@as(usize, 3), t.count(EndedAt));
+    // The single delete takes its row.
+    const r1 = t.run(.default, "r1").?;
+    try testing.expect((try t.apply(.action_run_delete, ae.RunDelete.Value{ .ns = DEFAULT, .action = "send", .run = "r1", .created_ns = r1.created_ns }, 50 * ms)).refused() == null);
+    try testing.expectEqual(@as(usize, 2), t.count(EndedAt));
+    // A bulk delete before 35: r2 only; r3 ended at 40, live hasn't, and a
+    // stale incarnation of r2 is passed over.
+    var old = deletedOf(&t, "r2");
+    old.created_ns += 1;
+    // Alone, another incarnation takes nothing.
+    var alone = (try t.apply(.action_runs_delete, try bulkOf(a, 35, &.{old}, &.{}), 55 * ms)).reader();
+    try testing.expectEqual(@as(u32, 0), alone.int(u32).?);
+    try testing.expect(t.run(.default, "r2") != null);
+    const live = t.run(.default, "live").?;
+    const out = try t.apply(.action_runs_delete, try bulkOf(a, 35, &.{ old, deletedOf(&t, "r3"), .{ .run = "live", .created_ns = live.created_ns, .completed_ms = 0 }, deletedOf(&t, "r2") }, &.{}), 60 * ms);
+    try testing.expect(out.refused() == null);
+    var rd = out.reader();
+    try testing.expectEqual(@as(u32, 1), rd.int(u32).?);
+    try testing.expectEqual(@as(u8, 0), rd.int(u8).?);
+    try testing.expect(t.run(.default, "r2") == null);
+    try testing.expect(t.run(.default, "r3") != null);
+    try testing.expect(t.run(.default, "live") != null);
+    try testing.expectEqual(@as(usize, 1), t.count(EndedAt));
+    // Its counts moved with it: one completed run left.
+    try testing.expectEqual(@as(u64, 1), countsOf(.{ .store = &t.store }, .default, "send").completed);
+    try testing.expectEqual(@as(usize, 2), (try histDrops(&t, a)).len);
+}
+
+test "actions machine: a bulk delete drops only an orphan still marked, of its action, before its bound" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    for ([_]struct { owner: []const u8, run: []const u8, ended: u64 }{ .{ .owner = "send", .run = "o1", .ended = 10 }, .{ .owner = "send", .run = "o2", .ended = 11 }, .{ .owner = "other", .run = "o3", .ended = 10 } }) |o| {
+        const k = try hm.orphanRowKey(a, .default, o.owner, o.run, 7);
+        var ks = view_mod.KeySet.init(a);
+        try ks.add(hm.Actions.ID, "", k);
+        var view = View.init(&t.store, a, &ks);
+        view.strict = false;
+        var row = std.mem.zeroes(hm.Row.Value);
+        row.owner = o.owner;
+        row.completed_ms = o.ended;
+        try view.put(hm.Actions, k, .{ .v = row });
+        try view.commit();
+    }
+    const out = try t.apply(.action_runs_delete, try bulkOf(a, 25, &.{}, &.{
+        .{ .run = "o1", .created_ns = 7, .completed_ms = 10 },
+        .{ .run = "o3", .created_ns = 7, .completed_ms = 10 }, // another action's
+        .{ .run = "o9", .created_ns = 7, .completed_ms = 10 }, // not marked
+    }), 60 * ms);
+    var rd = out.reader();
+    try testing.expectEqual(@as(u32, 0), rd.int(u32).?);
+    try testing.expectEqual(@as(u8, 0), rd.int(u8).?);
+    try testing.expectEqual(@as(u32, 1), rd.int(u32).?);
+    const drops = try histDrops(&t, a);
+    try testing.expectEqual(@as(usize, 1), drops.len);
+    try testing.expectEqualStrings("o1", drops[0].run);
 }
 
 /// The events `records` holds, in order.

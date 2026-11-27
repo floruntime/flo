@@ -12418,7 +12418,7 @@ fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8)
             body.block_ms = ms;
             return table_run.op("action.await").request.encodeInto(buf, body) catch unreachable;
         },
-        .action_complete, .action_fail, .action_touch, .action_deliver, .action_history, .action_status, .workflow_history, .action_run_delete, .workflow_run_delete, .action_list_runs, .system_runs_page => return value,
+        .action_complete, .action_fail, .action_touch, .action_deliver, .action_history, .action_status, .workflow_history, .action_run_delete, .workflow_run_delete, .action_runs_delete, .workflow_runs_delete, .action_list_runs, .system_runs_page => return value,
         // A dequeue's count and wait from its options, encoded as the op's
         // body would be but with the wait unbounded, so one past its bound
         // reaches the server.
@@ -24197,6 +24197,37 @@ test "actions: a delete of a live run is refused run_live; of an ended one, its 
     try std.testing.expect(ActionsHandler.for_tests.run(&t.shard, .default, run_id) == null);
 }
 
+test "actions: an action's bulk delete takes its runs that ended before the bound, at most limit a call, and says whether more did" {
+    var t: ActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    _ = try t.ok(.action_register, "act", "");
+    var body: [1024]u8 = undefined;
+    for (0..3) |_| {
+        _ = try t.ok(.action_invoke, "act", "\x00in");
+        const task = (try t.take("w1", "act", 0, null)).?;
+        var run_buf: [64]u8 = undefined;
+        const run_id = run_buf[0..task.run.len];
+        @memcpy(run_id, task.run);
+        _ = try t.ok(.action_complete, run_id, try ActionsHandler.for_tests.completeBody(&body, task, "w1", "", "done"));
+    }
+    const Op = table_run.op("action.runs_delete");
+    var rb: [Op.request.max_size]u8 = undefined;
+    var diag: schema.Diagnostic = .{};
+    for ([_]struct { before: i64, limit: u32, deleted: u32, more: bool }{
+        .{ .before = 0, .limit = 63, .deleted = 0, .more = false },
+        .{ .before = std.math.maxInt(i64), .limit = 2, .deleted = 2, .more = true },
+        .{ .before = std.math.maxInt(i64), .limit = 2, .deleted = 1, .more = false },
+    }) |q| {
+        const r = try Op.response.decodeAll((try t.ok(.action_runs_delete, "act", try Op.request.encodeInto(&rb, .{ .ended_before_ms = q.before, .limit = q.limit }))).data, &diag);
+        try std.testing.expectEqual(q.deleted, r.deleted);
+        try std.testing.expectEqual(q.more, r.more);
+    }
+    // A name no action can have is refused, as a register naming it is.
+    const bad = try t.call(.action_runs_delete, "a\x01ct", try Op.request.encodeInto(&rb, .{ .ended_before_ms = std.math.maxInt(i64), .limit = 63 }));
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), bad.header.status);
+}
+
 test "actions: an action's runs list newest first by cursor, to the last page; a cursor no run can be at is refused" {
     var t: ActionsTest = undefined;
     try t.init();
@@ -35955,6 +35986,68 @@ test "Shard: a guarded node's vouch comes back with its guard at boot, exactly; 
     try @import("stdx").fs.writeAll(f, buf[0 .. full.len - 5]);
     @import("stdx").fs.closeFile(f);
     try std.testing.expectError(error.Truncated, Shard.init(std.testing.allocator, 0, 2, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 2, .join, .{}, .{}));
+}
+
+test "Shard: a workflow's bulk delete takes its runs that ended before the bound, at most limit a call, and says whether more did" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [16 * 1024]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    const def =
+        \\{"kind":"Workflow","name":"gate","version":"1.0.0",
+        \\"start":{"wait_for_signal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    shard.runRequest(conn, try ParkTest.request(.workflow_create, 1, "a", "gate", def, ""), .client);
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    var id: u64 = 2;
+    for ("123") |c| {
+        const named = [_]u8{ 0, 0, 0, 1, 2, 0, 'r', c };
+        shard.runRequest(conn, try ParkTest.request(.workflow_start, id, "a", "gate", &named, ""), .client);
+        try ParkTest.ack(&shard);
+        try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+        shard.runRequest(conn, try ParkTest.request(.workflow_cancel, id + 1, "a", &.{ 'r', c }, "", ""), .client);
+        try ParkTest.ack(&shard);
+        try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+        id += 2;
+    }
+    const Op = table_run.op("workflow.runs_delete");
+    var rb: [Op.request.max_size]u8 = undefined;
+    var diag: schema.Diagnostic = .{};
+    for ([_]struct { before: i64, limit: u32, deleted: u32, more: bool }{
+        // None ended before the epoch: nothing proposed, answered at once.
+        .{ .before = 0, .limit = 63, .deleted = 0, .more = false },
+        .{ .before = std.math.maxInt(i64), .limit = 2, .deleted = 2, .more = true },
+        .{ .before = std.math.maxInt(i64), .limit = 2, .deleted = 1, .more = false },
+    }) |q| {
+        const last = shard.raft_node.log.lastIndex();
+        shard.runRequest(conn, try ParkTest.request(.workflow_runs_delete, id, "a", "gate", try Op.request.encodeInto(&rb, .{ .ended_before_ms = q.before, .limit = q.limit }), ""), .client);
+        if (q.deleted > 0) try ParkTest.ack(&shard) else try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
+        try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+        const r = try Op.response.decodeAll(one[0].data, &diag);
+        try std.testing.expectEqual(q.deleted, r.deleted);
+        try std.testing.expectEqual(q.more, r.more);
+        id += 1;
+    }
+    // A name no workflow can have is refused, as a create naming it is.
+    shard.runRequest(conn, try ParkTest.request(.workflow_runs_delete, id, "a", "ga\x01te", try Op.request.encodeInto(&rb, .{ .ended_before_ms = std.math.maxInt(i64), .limit = 63 }), ""), .client);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
 }
 
 test "Shard: a workflow run's history read waits while its chunks are on the history lane, and is answered once they land" {

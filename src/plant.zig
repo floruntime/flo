@@ -148,6 +148,8 @@ pub const Plant = enum {
     runs_delete_keeps_index,
     /// A child's start puts no place in the lists.
     runs_child_unindexed,
+    /// A bulk delete takes a run that ended at or after its bound.
+    runs_bulk_ignores_bound,
     /// A history fold's row counts only its own message, not the rows it folded.
     history_fold_total_dropped,
     /// A history drop takes its run's rows off nothing: usage keeps them.

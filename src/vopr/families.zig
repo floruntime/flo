@@ -718,12 +718,15 @@ pub const Actions = struct {
     /// What landed of each run's history: its store is a group of one,
     /// which sends its history to itself.
     landed: history_lane.Landed = .{},
+    /// The share of entries made bulk deletes: 0 but in the bulk-deletes
+    /// slice, which draws for it.
+    bulk_percent: u8 = 0,
 
-    pub const FAMILIES = [_]u16{ action_machine.Defs.ID, action_machine.Runs.ID, action_machine.Ready.ID, action_machine.Deadlines.ID, action_machine.Requests.ID, hm.Actions.ID, action_machine.RunAt.ID, action_machine.Counts.ID, hm.UsageFam.ID, @import("../budget/history_quota.zig").ActionReserved.ID };
-    pub const NAMES = [_][]const u8{ "action.def", "action.run", "action.ready", "action.deadline", "action.request", "history.act", "action.run_at", "action.counts", "history.usage", "action.reserved" };
+    pub const FAMILIES = [_]u16{ action_machine.Defs.ID, action_machine.Runs.ID, action_machine.Ready.ID, action_machine.Deadlines.ID, action_machine.Requests.ID, hm.Actions.ID, action_machine.RunAt.ID, action_machine.Counts.ID, hm.UsageFam.ID, @import("../budget/history_quota.zig").ActionReserved.ID, action_machine.EndedAt.ID };
+    pub const NAMES = [_][]const u8{ "action.def", "action.run", "action.ready", "action.deadline", "action.request", "history.act", "action.run_at", "action.counts", "history.usage", "action.reserved", "action.ended_at" };
     const PLACE: view_mod.Place = .{ .group = 0, .count = 1 };
 
-    pub const Kind = enum { register, delete, invoke, deliver, settle, release, extend, expire, run_delete };
+    pub const Kind = enum { register, delete, invoke, deliver, settle, release, extend, expire, run_delete, runs_delete };
 
     pub const Effect = struct {
         kind: Kind,
@@ -805,6 +808,7 @@ pub const Actions = struct {
             .action_release => .release,
             .action_extend => .extend,
             .action_run_delete => .run_delete,
+            .action_runs_delete => .runs_delete,
             else => .expire,
         };
     }
@@ -837,6 +841,11 @@ pub const Actions = struct {
                 var it = p.items.iterator();
                 while (it.next() catch return error.Halt) |item| try self.note(ba, &touched, .of(item.ns), item.run);
             },
+            .runs_delete => {
+                const p = ae.RunsDelete.decodeAll(e.payload, &diag) catch return error.Halt;
+                var it = p.runs.iterator();
+                while (it.next() catch return error.Halt) |item| try self.note(ba, &touched, .of(p.ns), item.run);
+            },
             inline else => |k| {
                 const P = switch (k) {
                     .invoke => ae.Invoke,
@@ -845,7 +854,7 @@ pub const Actions = struct {
                     .release => ae.Release,
                     .extend => ae.Extend,
                     .run_delete => ae.RunDelete,
-                    else => unreachable,
+                    else => comptime unreachable,
                 };
                 const p = P.decodeAll(e.payload, &diag) catch return error.Halt;
                 try self.note(ba, &touched, .of(p.ns), p.run);
@@ -993,6 +1002,7 @@ pub const Actions = struct {
     fn check(self: *Actions, e: *const entry_mod.Entry, stamp: u64, touched: []const Touched, cross_term: *bool) ?[]const u8 {
         var diag: schema.Diagnostic = .{};
         if (kindOf(e.header.entry_type) == .run_delete) return self.deleteRule(e, touched[0]);
+        if (kindOf(e.header.entry_type) == .runs_delete) return self.bulkRule(e, touched);
         for (touched) |t| {
             const pre = t.before orelse continue;
             const post = self.run(t.ns, t.id) orelse return "an applied action entry deleted a run";
@@ -1132,6 +1142,45 @@ pub const Actions = struct {
         return null;
     }
 
+    /// An applied bulk delete: every run it names that its own delete
+    /// would take (this action's, this incarnation, ended when it says,
+    /// before the bound) is gone as a single delete leaves it, its place
+    /// in the ended index too; every other is as it was.
+    fn bulkRule(self: *Actions, e: *const entry_mod.Entry, touched: []const Touched) ?[]const u8 {
+        var diag: schema.Diagnostic = .{};
+        const p = ae.RunsDelete.decodeAll(e.payload, &diag) catch unreachable;
+        var it = p.runs.iterator();
+        while (it.next() catch unreachable) |item| {
+            const t = for (touched) |x| {
+                if (std.mem.eql(u8, x.id, item.run)) break x;
+            } else unreachable;
+            const pre = t.before orelse {
+                if (self.run(t.ns, t.id) != null) return "a bulk delete made a run";
+                continue;
+            };
+            const ended_ms: i64 = @intCast(pre.completed_ns / std.time.ns_per_ms);
+            const takes = pre.completed_ns != 0 and pre.created_ns == item.created_ns and std.mem.eql(u8, pre.action, p.owner) and ended_ms == item.completed_ms and ended_ms < p.before_ms;
+            if (!takes) {
+                if (self.run(t.ns, t.id) == null) return "a bulk delete took a run its own delete wouldn't";
+                continue;
+            }
+            if (self.run(t.ns, t.id) != null) return "a bulk delete left a run it should have taken";
+            if (self.listed(t.ns, t.id, pre)) return "a bulk-deleted run is still in its action's list";
+            var ab: action_machine.RunAtBuf = undefined;
+            var kb: [@sizeOf(u32) + @sizeOf(action_machine.RunAtBuf)]u8 = undefined;
+            const k = view_mod.idKey(&kb, t.ns, action_machine.endedAtKey(&ab, pre.action, ended_ms, t.id)) catch unreachable;
+            if ((self.read().get(action_machine.EndedAt, k) catch null) != null) return "a bulk-deleted run is still in its action's ended index";
+            var arena = std.heap.ArenaAllocator.init(self.store.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const at = pre.completed_ns / std.time.ns_per_ms;
+            if (history_lane.orphaned(pre.action, t.id, pre.created_ns)) {
+                if (hm.orphanRow(self.read(), a, .action, t.ns, pre.action, t.id, pre.created_ns) == null) return "a bulk-deleted run whose drop was lost past its retries isn't marked orphaned";
+            } else if (hm.holdsAny(self.read(), a, .action, t.ns, pre.action, t.id, pre.created_ns, at) catch true) return "a bulk-deleted run's history rows aren't gone";
+        }
+        return null;
+    }
+
     const Want = struct { event: []const u8, detail: []const u8, extra: []const u8 };
 
     /// An attempt's event as its entry carried it: a preview, `extra`
@@ -1204,7 +1253,7 @@ pub const Actions = struct {
                     n = if (post.completed_ns != 0) 2 else 1;
                 }
             },
-            .register, .delete, .extend, .run_delete => {},
+            .register, .delete, .extend, .run_delete, .runs_delete => {},
         }
         // What it added: the records past the run's seq before it, in the
         // chunks it landed and then still pending.
