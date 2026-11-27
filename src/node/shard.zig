@@ -702,9 +702,14 @@ pub const Shard = struct {
     unpark_index: u64 = 0,
     unpark_term: u64 = 0,
     unpark_ms: u64 = 0,
-    /// The target that unpark was for, where the next looks from; and
-    /// whether it took a whole entry's worth, so the next goes at once.
+    /// The target that unpark was for, where the next looks from.
     unpark_after: ?[channels_mod.TARGET_LEN]u8 = null,
+    /// How many messages that unpark carried when it was a whole entry's
+    /// worth, else 0; and, once it applied, whether every one left
+    /// parking, so the next goes at once. A full entry that lands fewer
+    /// met a target that is full again: the next waits, or a consumer
+    /// freeing one slot at a time would draw a full entry per slot.
+    unpark_carried: u32 = 0,
     unpark_full: bool = false,
     /// When `publishParked` last logged.
     parked_warn_ms: u64 = 0,
@@ -1808,27 +1813,53 @@ pub const Shard = struct {
     /// How often a leader looks for a parked target with room again.
     const UNPARK_EVERY_MS = 100;
 
-    /// Proposes the next unpark (`Channels.nextUnpark`): one at a time, so
-    /// one in the log isn't proposed again before it applies. Once one that
-    /// took a whole entry's worth applies, the next goes at once, so a
-    /// target written faster than one entry per wait still drains; each
-    /// starts past the target the last was for, so none starves another.
-    fn tickUnpark(self: *Shard, st: *contract_store.Store) void {
-        if (st.families[channels_mod.ParkFam.ID].count == 0 or self.halted != null) return;
+    /// When this leader's next unpark try is due: `.none` while it has
+    /// nothing to try (not leading, halted, nothing parked, or its last
+    /// unpark still unapplied in this term); `.now` once a full unpark
+    /// that every message left applied, or the wait is over; else in how
+    /// many ms. The one test `tickUnpark` and the loop's sleep both ask,
+    /// on the gate `tick` runs channels under: a halted leader holds its
+    /// channels but tries no unpark.
+    const UnparkDue = union(enum) { none, now, in_ms: u64 };
+
+    fn unparkDue(self: *const Shard, now: u64) UnparkDue {
         const raft = self.raft_node;
-        if (self.unpark_term == raft.current_term and self.unpark_index > raft.last_applied) return;
+        if (!raft.leaderReady() or self.offline != null or self.halted != null) return .none;
+        if (self.partitions[0].store.families[channels_mod.ParkFam.ID].count == 0) return .none;
+        if (self.unpark_term == raft.current_term and self.unpark_index > raft.last_applied) return .none;
+        if (self.unpark_full and self.unpark_term == raft.current_term) return .now;
+        // Elapsed, not unpark_ms + the wait: no overflow at any unpark_ms.
+        const since = now -| self.unpark_ms;
+        return if (since >= UNPARK_EVERY_MS) .now else .{ .in_ms = UNPARK_EVERY_MS - since };
+    }
+
+    /// Proposes the next unpark (`Channels.nextUnpark`): one at a time, so
+    /// one in the log isn't proposed again before it applies. Once a full
+    /// one applies with every message it carried out of parking, the next
+    /// goes at once, so a target written faster than one entry per wait
+    /// still drains; each starts past the target the last was for, so
+    /// none starves another. Every try moves `unpark_ms`, failed or not,
+    /// so the loop's deadline never sits in the past.
+    fn tickUnpark(self: *Shard, st: *contract_store.Store) void {
         const now = nowMs();
-        const again = self.unpark_full and self.unpark_term == raft.current_term;
-        if (!again and now -| self.unpark_ms < UNPARK_EVERY_MS) return;
+        if (self.unparkDue(now) != .now) return;
         self.unpark_ms = now;
         self.unpark_full = false;
         if (!self.channel.buffers()) return;
         const next = contract_machines.Channels.nextUnpark(.{ .store = st }, self.channel.buf, self.channel.msgs, self.unpark_after) orelse return;
-        const r = raft.propose(.channel_unpark, entry_mod.Flags.NONE, next.entry) catch return;
+        const r = self.raft_node.propose(.channel_unpark, entry_mod.Flags.NONE, next.entry) catch return;
         self.unpark_index = r.index;
         self.unpark_term = r.term;
         self.unpark_after = next.target;
-        self.unpark_full = next.full;
+        self.unpark_carried = if (next.full) next.count else 0;
+    }
+
+    /// This leader's unpark applied: whether it took every message it
+    /// carried (refused ones too, which leave parking); an overloaded
+    /// target or a stale entry stops short.
+    fn unparkApplied(self: *Shard, e: *const entry_mod.Entry, taken: usize) void {
+        if (e.header.index != self.unpark_index or e.header.term != self.unpark_term) return;
+        self.unpark_full = self.unpark_carried > 0 and taken == self.unpark_carried;
     }
 
     /// A channel frame from another shard, or this one. Its sender is the
@@ -6769,6 +6800,8 @@ pub const Shard = struct {
         // Each message an inbound or unpark applied is, to these steps, an
         // entry of its own: a blocking read waits on its key, a dequeue on
         // its queue.
+        if (entry.header.entry_type == @backingInt(entry_mod.EntryType.channel_unpark))
+            self.unparkApplied(entry, self.defaultPartition().store.messages.items.len);
         if (entry.header.entry_type == @backingInt(entry_mod.EntryType.channel_inbound) or
             entry.header.entry_type == @backingInt(entry_mod.EntryType.channel_unpark))
         {
@@ -7506,19 +7539,32 @@ pub const Shard = struct {
             if (self.metrics_registry) |m| _ = m.processing.unslept_ticks_total.fetchAdd(1, .monotonic);
             return 0;
         }
-        return self.idleTimeoutMs(now_ms);
+        // Uncounted: a due unpark keeps the loop up one tick, which tries
+        // it and moves its deadline on (`tickUnpark`).
+        const unpark = self.unparkDue(nowMs());
+        if (unpark == .now) return 0;
+        return sleepMs(self.producers_deadline_ms, now_ms, unpark);
     }
 
     /// How long an idle tick may sleep: the loop's 100 ms, or less when a
-    /// pipeline becomes due sooner. Never 0: a pipeline already due keeps
-    /// the loop busy instead, and a due one that waits gives no deadline.
-    /// The deadline is wall-clock ms, as a pipeline's `last_poll_ms` is:
-    /// keep both on one clock. A clock step only shortens a sleep to 1 ms
-    /// or caps it at 100.
+    /// pipeline or the next unpark try becomes due sooner. Never 0: either
+    /// already due keeps the loop busy instead, and a due pipeline that
+    /// waits gives no deadline.
     fn idleTimeoutMs(self: *const Shard, now_ms: i64) u32 {
+        return sleepMs(self.producers_deadline_ms, now_ms, self.unparkDue(nowMs()));
+    }
+
+    /// The earliest of the pipelines' deadline and the unpark's wait,
+    /// within [1, 100] ms. Each stays on its own clock: the pipelines'
+    /// deadline is wall-clock ms, as a pipeline's `last_poll_ms` is; the
+    /// unpark's wait is already a span, from the monotonic `unpark_ms`. A
+    /// wall-clock step only shortens a sleep to 1 ms or caps it at 100.
+    fn sleepMs(producers_deadline_ms: ?i64, now_ms: i64, unpark: UnparkDue) u32 {
         const IDLE_MS = 100;
-        const at = self.producers_deadline_ms orelse return IDLE_MS;
-        return @intCast(std.math.clamp(at - now_ms, 1, IDLE_MS));
+        var ms: i64 = IDLE_MS;
+        if (producers_deadline_ms) |at| ms = @min(ms, at - now_ms);
+        if (unpark == .in_ms) ms = @min(ms, @as(i64, @intCast(@min(unpark.in_ms, IDLE_MS))));
+        return @intCast(std.math.clamp(ms, 1, IDLE_MS));
     }
 
     /// The leader's stepping duty: first steps of runs whose start has
@@ -33431,6 +33477,227 @@ test "Shard: an unpark that took a whole entry's worth is followed at once, not 
     try std.testing.expectEqual(@as(usize, 4), ticks);
 }
 
+/// Fills shard 1's queue and parks one capped at it, and `n` behind
+/// that capped at `cap` messages each; then empties the queue unless `purge` is
+/// false. Each enqueue keeps the caps it was sent with.
+fn parkBehindFull(two: *TwoShards, qb: []u8, n: usize, cap: u32, purge: bool) !void {
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    two.settle();
+    b.channel.stamp = null;
+    const q = try queueOwnedBy(two, 1, qb);
+    var eb: [256]u8 = undefined;
+    var nb: [16]u8 = undefined;
+    try sendFromApplyFlagged(a, q.slot, .queue_enqueue, entry_mod.Flags.SINK, try sinkEnqueue(&eb, q.name, "fill", 1));
+    try sendFromApplyFlagged(a, q.slot, .queue_enqueue, entry_mod.Flags.SINK, try sinkEnqueue(&eb, q.name, "capped", 1));
+    for (0..n) |i| try sendFromApplyFlagged(a, q.slot, .queue_enqueue, entry_mod.Flags.SINK, try sinkEnqueue(&eb, q.name, try std.fmt.bufPrint(&nb, "m{d}", .{i}), cap));
+    pumpChannels(two);
+    const read: contract_view.ReadView = .{ .store = &b.defaultPartition().store };
+    try std.testing.expectEqual(@as(u64, n + 1), channels_mod.shardParked(read).count);
+    if (purge) try purgeQueue(b, q.name);
+}
+
+test "Shard: a full unpark followed at once is due at once, so the loop doesn't sleep between entries" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const b = &two.shards[1];
+    var qb: [16]u8 = undefined;
+    const n = 3 * @import("../protocol/channel_entries.zig").MAX_BATCH;
+    try parkBehindFull(&two, &qb, n, 1 << 20, true);
+    // Nothing else keeps this shard up: the loop's sleep is the unpark's.
+    b.quota_propose_refused = true;
+    b.more_work = false;
+    b.apply_behind = false;
+    b.producers_due = false;
+    const read: contract_view.ReadView = .{ .store = &b.defaultPartition().store };
+    const st = &b.defaultPartition().store;
+    b.unpark_ms = 0;
+    var entries: usize = 0;
+    while (channels_mod.shardParked(read).count > 0 and entries < 8) : (entries += 1) {
+        try std.testing.expectEqual(Shard.UnparkDue.now, b.unparkDue(@import("stdx").time.monotonicMs()));
+        try std.testing.expectEqual(@as(u32, 0), b.loopTimeoutMs(false, @import("stdx").time.milliTimestamp()));
+        b.tickUnpark(st);
+        // The wait never over: only a full unpark's follow-up is due.
+        b.unpark_ms = std.math.maxInt(u64);
+        two.settle();
+    }
+    try std.testing.expectEqual(@as(u64, 0), channels_mod.shardParked(read).count);
+    try std.testing.expectEqual(@as(usize, 4), entries);
+    // The last carried one message, not a full entry: the next waits.
+    try std.testing.expectEqual(Shard.UnparkDue.none, b.unparkDue(@import("stdx").time.monotonicMs()));
+}
+
+test "Shard: a full unpark that lands fewer than it carried waits out the interval, so a slot freed at a time draws no full entry each" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const b = &two.shards[1];
+    var qb: [16]u8 = undefined;
+    const max = @import("../protocol/channel_entries.zig").MAX_BATCH;
+    // Each capped at one: after the purge only the first fits.
+    try parkBehindFull(&two, &qb, 2 * max, 1, true);
+    b.quota_propose_refused = true;
+    b.more_work = false;
+    b.apply_behind = false;
+    b.producers_due = false;
+    const read: contract_view.ReadView = .{ .store = &b.defaultPartition().store };
+    b.unpark_ms = 0;
+    b.tickUnpark(&b.defaultPartition().store);
+    try std.testing.expectEqual(@as(u32, max), b.unpark_carried);
+    b.unpark_ms = std.math.maxInt(u64);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 2 * max), channels_mod.shardParked(read).count);
+    try std.testing.expect(!b.unpark_full);
+    try std.testing.expectEqual(Shard.UnparkDue{ .in_ms = Shard.UNPARK_EVERY_MS }, b.unparkDue(@import("stdx").time.monotonicMs()));
+    try std.testing.expectEqual(@as(u32, Shard.UNPARK_EVERY_MS), b.loopTimeoutMs(false, @import("stdx").time.milliTimestamp()));
+}
+
+test "Shard: no unpark is due where tick runs no channels, while one is in flight, or with nothing parked, however primed" {
+    const Case = enum { not_ready, offline, halted, follower, in_flight, nothing_parked };
+    for (std.enums.values(Case)) |case| {
+        var two: TwoShards = undefined;
+        try two.init();
+        defer two.deinit();
+        const b = &two.shards[1];
+        var qb: [16]u8 = undefined;
+        try parkBehindFull(&two, &qb, 2, 1 << 20, true);
+        const raft = b.raft_node;
+        switch (case) {
+            .not_ready => raft.ready_index = raft.last_applied + 1,
+            .offline => b.offline = silent_loss.Damage.init(.applier_failed, "test", .{}),
+            .halted => haltForTest(b, raft.last_applied + 1),
+            .follower => raft.role = .follower,
+            .in_flight => {
+                b.unpark_ms = 0;
+                b.tickUnpark(&b.defaultPartition().store);
+                try std.testing.expect(b.unpark_index > raft.last_applied);
+            },
+            .nothing_parked => two.settle(),
+        }
+        if (case == .nothing_parked) {
+            // The parking's own pumps tried, with no room, just now.
+            b.unpark_ms = 0;
+            b.tickUnpark(&b.defaultPartition().store);
+            two.settle();
+            const read: contract_view.ReadView = .{ .store = &b.defaultPartition().store };
+            try std.testing.expectEqual(@as(u64, 0), channels_mod.shardParked(read).count);
+        }
+        // Primed as if a full unpark just applied, long ago.
+        b.unpark_full = true;
+        b.unpark_term = raft.current_term;
+        b.unpark_ms = 0;
+        try std.testing.expectEqual(Shard.UnparkDue.none, b.unparkDue(@import("stdx").time.monotonicMs() + 1_000_000));
+        try std.testing.expectEqual(@as(u32, 100), b.idleTimeoutMs(@import("stdx").time.milliTimestamp()));
+        if (case == .halted) b.halted = null;
+        if (case == .offline) b.offline = null;
+        if (case == .follower) raft.role = .leader;
+    }
+}
+
+test "Shard: an unpark try that fails still moves the deadline a whole interval out, so the loop doesn't wake every millisecond" {
+    const Case = enum { refused, no_buffers, no_room };
+    for (std.enums.values(Case)) |case| {
+        var two: TwoShards = undefined;
+        try two.init();
+        defer two.deinit();
+        const b = &two.shards[1];
+        var qb: [16]u8 = undefined;
+        // No room: the queue stays full.
+        try parkBehindFull(&two, &qb, 2, 1, case != .no_room);
+        const raft = b.raft_node;
+        const allocator = b.channel.allocator;
+        switch (case) {
+            .refused => raft.writes_stopped = true,
+            .no_buffers => {
+                allocator.free(b.channel.buf);
+                allocator.free(b.channel.msgs);
+                b.channel.buf = &.{};
+                b.channel.msgs = &.{};
+                b.channel.allocator = std.testing.failing_allocator;
+            },
+            .no_room => {},
+        }
+        const last = raft.log.lastIndex();
+        b.unpark_full = true;
+        b.unpark_term = raft.current_term;
+        b.unpark_ms = 0;
+        try std.testing.expectEqual(Shard.UnparkDue.now, b.unparkDue(@import("stdx").time.monotonicMs()));
+        const at = @import("stdx").time.monotonicMs();
+        b.tickUnpark(&b.defaultPartition().store);
+        try std.testing.expectEqual(last, raft.log.lastIndex());
+        try std.testing.expect(!b.unpark_full);
+        try std.testing.expect(b.unpark_ms >= at);
+        try std.testing.expectEqual(Shard.UnparkDue{ .in_ms = Shard.UNPARK_EVERY_MS }, b.unparkDue(b.unpark_ms));
+        b.channel.allocator = allocator;
+        raft.writes_stopped = false;
+    }
+}
+
+test "Shard: the unpark's wait is reckoned from elapsed time, at any unpark_ms, and the loop sleeps the earliest of it and the pipelines' deadline" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const b = &two.shards[1];
+    var qb: [16]u8 = undefined;
+    try parkBehindFull(&two, &qb, 2, 1, false);
+    // A boot's: 0, at an uptime under the interval and past it.
+    b.unpark_ms = 0;
+    try std.testing.expectEqual(Shard.UnparkDue{ .in_ms = 100 }, b.unparkDue(0));
+    try std.testing.expectEqual(Shard.UnparkDue{ .in_ms = 60 }, b.unparkDue(40));
+    try std.testing.expectEqual(Shard.UnparkDue.now, b.unparkDue(100));
+    // Ahead of now, as a test that holds the wait sets it: no overflow.
+    b.unpark_ms = std.math.maxInt(u64);
+    try std.testing.expectEqual(Shard.UnparkDue{ .in_ms = 100 }, b.unparkDue(@import("stdx").time.monotonicMs()));
+    try std.testing.expectEqual(Shard.UnparkDue{ .in_ms = 100 }, b.unparkDue(std.math.maxInt(u64)));
+    // The loop reads the wait on the monotonic clock it was set on, while
+    // the pipelines' deadline is wall-clock.
+    b.quota_propose_refused = true;
+    b.more_work = false;
+    b.apply_behind = false;
+    b.producers_due = false;
+    b.producers_deadline_ms = null;
+    b.unpark_ms = @import("stdx").time.monotonicMs() - 60;
+    const slept = b.loopTimeoutMs(false, @import("stdx").time.milliTimestamp());
+    try std.testing.expect(slept >= 30 and slept <= 40);
+    const t: i64 = 1_000_000;
+    try std.testing.expectEqual(@as(u32, 30), Shard.sleepMs(t + 50, t, .{ .in_ms = 30 }));
+    try std.testing.expectEqual(@as(u32, 10), Shard.sleepMs(t + 10, t, .{ .in_ms = 30 }));
+    try std.testing.expectEqual(@as(u32, 30), Shard.sleepMs(null, t, .{ .in_ms = 30 }));
+    try std.testing.expectEqual(@as(u32, 100), Shard.sleepMs(null, t, .{ .in_ms = 500 }));
+    try std.testing.expectEqual(@as(u32, 100), Shard.sleepMs(null, t, .none));
+    try std.testing.expectEqual(@as(u32, 1), Shard.sleepMs(t - 5, t, .none));
+}
+
+test "Shard: only this leader's own full unpark, applied whole, makes the next due at once; a partial one, or one of another term at its index, does not" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const b = &two.shards[1];
+    var qb: [16]u8 = undefined;
+    // Two behind the capped one, all with room after the purge: one entry
+    // that isn't full.
+    try parkBehindFull(&two, &qb, 2, 1 << 20, true);
+    const read: contract_view.ReadView = .{ .store = &b.defaultPartition().store };
+    b.unpark_ms = 0;
+    b.tickUnpark(&b.defaultPartition().store);
+    try std.testing.expectEqual(@as(u32, 0), b.unpark_carried);
+    two.settle();
+    try std.testing.expectEqual(@as(u64, 0), channels_mod.shardParked(read).count);
+    try std.testing.expect(!b.unpark_full);
+    // A full one's apply, matched by index and term.
+    var e = entry_mod.buildEntry(.channel_unpark, entry_mod.Flags.NONE, b.unpark_term + 1, b.unpark_index, 0, "");
+    b.unpark_carried = 64;
+    b.unparkApplied(&e, 64);
+    try std.testing.expect(!b.unpark_full);
+    e.header.term = b.unpark_term;
+    b.unparkApplied(&e, 63);
+    try std.testing.expect(!b.unpark_full);
+    b.unparkApplied(&e, 64);
+    try std.testing.expect(b.unpark_full);
+}
+
 test "Shard: a leader in a new term unparks again past an unpark its last term left unapplied, and each message lands once, in order" {
     var two: TwoShards = undefined;
     try two.init();
@@ -33460,7 +33727,9 @@ test "Shard: a leader in a new term unparks again past an unpark its last term l
     const first = raft.log.lastIndex();
     try std.testing.expect(first > raft.last_applied);
     raft.current_term += 1;
-    raft.ready_index = raft.log.lastIndex();
+    // Ready, as the loop needs before it tries: the unpark is keyed on
+    // the term, not on readiness.
+    raft.ready_index = raft.last_applied;
     // The new term's leader doesn't wait on it: it proposes its own.
     b.unpark_ms = 0;
     b.tickUnpark(st);
