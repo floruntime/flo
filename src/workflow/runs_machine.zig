@@ -2887,6 +2887,27 @@ test "workflow runs machine: a child's start at its namespace's quota is answere
     try testing.expectEqual(@as(u64, 1), f.store.quota_refusals);
 }
 
+test "workflow runs machine: a leader's over_quota refusal of a child counts once, only while its parent's record waits" {
+    var f = Fixture.init();
+    defer f.deinit();
+    var crb: [ae.ChildRefuse.max_size]u8 = undefined;
+    const refusal = try ae.ChildRefuse.encodeInto(&crb, .{ .ns = NamespaceId.default.int(), .run = "kid1", .answer = .over_quota, .why = "limit: ns 1 history 1+1 over 1" });
+    try askChild(&f, "kid1");
+    _ = try f.answer(.child_refuse, refusal);
+    try testing.expectEqual(@as(u64, 1), f.store.quota_refusals);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "kid1") == null);
+    // Refused by an earlier leader already: its record is gone, not counted.
+    _ = try f.answer(.child_refuse, refusal);
+    try testing.expectEqual(@as(u64, 1), f.store.quota_refusals);
+    // Started meanwhile: its record no longer waits, not counted.
+    try askChild(&f, "kid2");
+    try testing.expect((try f.start("kid2", "wf", "child_started", "", 9)).refused() == null);
+    var crb2: [ae.ChildRefuse.max_size]u8 = undefined;
+    _ = try f.answer(.child_refuse, try ae.ChildRefuse.encodeInto(&crb2, .{ .ns = NamespaceId.default.int(), .run = "kid2", .answer = .over_quota, .why = null }));
+    try testing.expectEqual(@as(u64, 1), f.store.quota_refusals);
+    try testing.expect(f.get("kid2") != null);
+}
+
 test "workflow runs machine: past its shard's share a client's, a schedule's and a trigger's start are refused, writing nothing" {
     const pool = @import("../budget/pool.zig");
     const settings = @import("../settings/machine.zig");

@@ -1253,6 +1253,26 @@ test "history usage: a lost chunk counts nothing, and a run ended at its live ro
     try expectUsageRule(&t);
 }
 
+test "history usage: a chunk or a fold that lands eases nothing; a drop that lands eases its namespace alone" {
+    var t = H.init();
+    defer t.deinit();
+    const r: H.Run = .{};
+    const elsewhere: H.Run = .{ .ns = .of(17), .owner = "other" };
+    try t.chunk(elsewhere, 1, 1, false, 0);
+    // Sixteen land and a fold makes them one row: each adds its own bytes
+    // to usage as it leaves the lane.
+    for (0..16) |i| try t.chunk(r, i + 1, i + 1, false, 0);
+    try t.pump();
+    var rows: [2]Row.Value = undefined;
+    try testing.expectEqual(@as(usize, 1), t.live(r, &rows).len);
+    try testing.expect(!t.store.quota_eased.any());
+    // A drop takes the run's rows and adds nothing: eased, its own alone.
+    try t.dropOf(r, 0);
+    try t.pump();
+    try testing.expect(t.store.quota_eased.has(r.ns.int()));
+    try testing.expect(!t.store.quota_eased.has(elsewhere.ns.int()));
+}
+
 test "history usage: an orphaned run is counted once with its rows' bytes, however often its drop is lost, and a later drop takes both" {
     var t = H.init();
     defer t.deinit();

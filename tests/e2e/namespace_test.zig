@@ -944,6 +944,87 @@ test "e2e/namespace: on 12 shards, in a namespace of its own, a run's steps are 
     try testing.expectEqual(@as(?u32, 0), (try heldOn(ctx, ns, at)).held);
 }
 
+test "e2e/namespace: on 12 shards, in a namespace of its own, a run's steps held at its shard's part go on once runs there are deleted" {
+    const shards = 12;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = shards } });
+    defer ctx.deinit();
+    const ns = "qd-ns";
+    try ctx.exec(&.{ "namespace", "create", ns });
+    var nb: [16]u8 = undefined;
+    const wf = try nameOff(&nb, "qd-wf-", &.{});
+    const at = shardIn(wf);
+    var def_buf: [512]u8 = undefined;
+    const def = try std.fmt.bufPrint(&def_buf,
+        \\kind: Workflow
+        \\name: {s}
+        \\version: 1.0.0
+        \\start.wait_for_signal.type: proceed
+        \\start.wait_for_signal.timeout_ms: 300000
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.timeout: flo.Failed
+    , .{wf});
+    const path = try stdx.testing.writeDottedToTempYaml(testing.allocator, def, "qd-wf.yaml");
+    defer stdx.testing.cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", ns });
+    const big = try testing.allocator.alloc(u8, 3_000);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    big[0] = '"';
+    big[big.len - 1] = '"';
+    for (0..90) |k| {
+        var rb: [16]u8 = undefined;
+        try ctx.exec(&.{ "workflow", "start", wf, big, "--run-id", try std.fmt.bufPrint(&rb, "qd-fill-{d}", .{k}), "-n", ns });
+    }
+    try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", "qd-held", "-n", ns });
+    var used: u64 = 0;
+    for (0..100) |_| {
+        used = (try heldOn(ctx, ns, at)).usage;
+        if (used >= 90 * 3_000) break;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expect(used >= 90 * 3_000);
+    const floor: u64 = 214_905;
+    var qb: [32]u8 = undefined;
+    try ctx.exec(&.{ "namespace", "alter", ns, "--history-quota", try std.fmt.bufPrint(&qb, "{d}", .{floor * shards}), "--config", ctx.server.config_file });
+    try expectBound(ctx, ns, shards, floor);
+    try ctx.exec(&.{ "workflow", "signal", "qd-held", "--type", "proceed", "-n", ns });
+    var held = false;
+    for (0..100) |_| {
+        if ((try heldOn(ctx, ns, at)).held == 1) {
+            held = true;
+            break;
+        }
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expect(held);
+    // The quota stays; the fillers are cancelled (a cancel is no step, so
+    // goes past the hold) and deleted. Their drops lower the shard's
+    // history, which eases the namespace: its hold is asked, and the held
+    // run takes its step to its end.
+    for (0..90) |k| {
+        var rb: [16]u8 = undefined;
+        const rid = try std.fmt.bufPrint(&rb, "qd-fill-{d}", .{k});
+        try ctx.exec(&.{ "workflow", "cancel", rid, "-n", ns });
+        try ctx.exec(&.{ "workflow", "run-delete", rid, "-n", ns });
+    }
+    try testing.expectEqual(@as(usize, 1), try runsOf(ctx, ns, wf));
+    var done = false;
+    for (0..100) |_| {
+        var s2 = try ctx.cli.run(&.{ "workflow", "status", "qd-held", "-n", ns });
+        defer s2.deinit();
+        if (std.mem.indexOf(u8, s2.stdout, "completed") != null) {
+            done = true;
+            break;
+        }
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expect(done);
+    const after = try heldOn(ctx, ns, at);
+    try testing.expectEqual(@as(?u32, 0), after.held);
+    try testing.expect(after.in_flight < floor);
+    try expectBound(ctx, ns, shards, floor);
+}
+
 /// The first `prefix`-N on shard `at`.
 fn nameOn(buf: []u8, prefix: []const u8, at: u16) ![]const u8 {
     var i: usize = 0;
