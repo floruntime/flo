@@ -293,9 +293,11 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // Names refuse control characters (bytes up to 0x1f, and 0x7f) where they
     // refused only NUL, and some of those checks run at apply. A log from
     // before applies differently where an entry holds one: an action
-    // register, a TS write or delete, or a stream append a channel brought
-    // is refused with its reason, and a processing submit records its job
-    // as failed with it. Nothing halts.
+    // register; a TS write (its measurement, field or a tag key), delete or
+    // retention; or a stream append a channel brought is refused with its
+    // reason. A processing submit naming one (a stream or queue, or a TS
+    // measurement, field or tag key) records its job as failed with it.
+    // Nothing halts.
     .{ .format = 78, .segment_version = 45, .entries = 0x056c0002022ce186 },
 };
 

@@ -407,6 +407,25 @@ test "processing: a logged submit the parser now refuses applies as a failed job
     try testing.expect(std.mem.startsWith(u8, job.failure, "TS sink 'default-sink-0' can't give both \"value_field\" and \"fields\""));
 }
 
+test "processing: a logged submit naming a control character applies as a failed job, saying why" {
+    var t = T.init();
+    defer t.deinit();
+    var cb: [512]u8 = undefined;
+    var vb: [256]u8 = undefined;
+    for ([_][]const u8{
+        "kind: Processing\nsources: [{stream: {name: \"in\\nx\"}}]\nsinks: [{stream: {name: out}}]\n",
+        "kind: Processing\nsources: [{stream: {name: in}}]\nsinks: [{ts: {measurement: m, fields: {\"lo\tad\": l}}}]\n",
+        "kind: Processing\nsources: [{stream: {name: in}}]\nsinks: [{ts: {measurement: m, tags: {\"h\x1bost\": h}, fields: {load: l}}}]\n",
+    }, 0..) |yaml, i| {
+        var nb: [8]u8 = undefined;
+        const key = try std.fmt.bufPrint(&nb, "job{d}", .{i});
+        try t.command(.processing_submit, key, encodeSubmit(&vb, .running, 0, "default", yaml).?, &cb);
+        const job = jobOf(t.read(), .of(21), key).?;
+        try testing.expectEqual(@backingInt(JobStatus.failed), job.status);
+        try testing.expect(std.mem.indexOf(u8, job.failure, "must not contain control characters") != null);
+    }
+}
+
 test "processing: removing a job drops it and its pipelines' cursors, and no other job's" {
     var t = T.init();
     defer t.deinit();

@@ -418,7 +418,7 @@ pub const QueueHandler = struct {
         return .{ .queue_enqueued = .{ .message_id = id_str } };
     }
 
-    const CONTROL_IN_NAME = client_names.controlRefusal("queue");
+    const CONTROL_IN_NAME = client_names.controlRefusal("a queue name");
 
     fn handleCommand(self: *QueueHandler, req: Request) CommandResult {
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
@@ -568,7 +568,8 @@ pub const QueueHandler = struct {
         if (req.key.len == 0) return error.NoQueue;
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
         if (req.key.len > qe.QueueName.max_size) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: queue name too long") } };
-        if (client_names.hasControl(req.key)) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: " ++ CONTROL_IN_NAME) } };
+        if (client_names.hasControl(req.key)) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(CONTROL_IN_NAME) } };
+        if (client_names.hasControl(consumer)) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(comptime client_names.controlRefusal("a consumer name")) } };
         const params: Params = .{ .ns = req.ns_id, .count = count, .lease_ms = lease_ms orelse qe.DEFAULT_LEASE_MS, .ack = ack, .consumer = consumer };
         const self = shard.queue_handler;
         if (try self.deliverHere(shard, conn.replyTo(), req.header.request_id, req.key, params)) return .wait;
@@ -649,7 +650,7 @@ pub const QueueHandler = struct {
         try self.claimed.ensureUnusedCapacity(self.allocator, 1);
         const max_bytes = queue_ops.MESSAGES_BYTES - take * MESSAGE_FRAMING;
         const proposed = propose(shard, .queue_deliver, qe.Deliver.Value{ .ns = p.ns.int(), .queue = name, .count = take, .max_bytes = max_bytes, .holder = p.consumer, .lease_ms = p.lease_ms }) catch |err| {
-            if (!shard.quietHalted(err)) log.warn("shard {d}: dequeue from queue {s} not proposed: {s}", .{ shard.id, name, @errorName(err) });
+            if (!shard.quietHalted(err)) shard.noteDequeueUnproposed(name, err);
             return false;
         };
         self.claimed.putAssumeCapacity(queue, held + take);
@@ -711,7 +712,7 @@ pub const QueueHandler = struct {
         self.acking.ensureUnusedCapacity(self.allocator, 1) catch return shard.deliverDeferred(pd.reply_to, out);
         const leased_owned = self.allocator.dupe(u8, out) catch return shard.deliverDeferred(pd.reply_to, out);
         const proposed = propose(shard, .queue_settle, qe.Settle.Value{ .ns = p.ns, .queue = p.queue, .holder = p.holder, .token = token, .expiry_ns = expiry, .items = .{ .bytes = items_buf[0..items_len], .count = list.count } }) catch |err| {
-            if (!shard.quietHalted(err)) log.warn("shard {d}: an acked dequeue from queue {s} not completed: {s}; answered as leased", .{ shard.id, p.queue, @errorName(err) });
+            if (!shard.quietHalted(err)) shard.noteSettleUnproposed(p.queue, err);
             defer self.allocator.free(leased_owned);
             return shard.deliverDeferred(pd.reply_to, leased_owned);
         };
@@ -922,7 +923,7 @@ pub const QueueHandler = struct {
     fn deadChecks(shard: *Shard, req: Request) Error!?table_run.Refused {
         if (req.key.len == 0) return error.NoQueue;
         if (req.key.len > qe.QueueName.max_size) return .{ .status = .bad_request, .refusal = proto.notRun("bad request: queue name too long") };
-        if (client_names.hasControl(req.key)) return .{ .status = .bad_request, .refusal = proto.notRun("bad request: " ++ CONTROL_IN_NAME) };
+        if (client_names.hasControl(req.key)) return .{ .status = .bad_request, .refusal = proto.notRun(CONTROL_IN_NAME) };
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
         if (req.ns_id == .invalid) return .{ .status = persistence_mod.failureStatus(error.NamespaceUnknown), .refusal = persistence_mod.failureRefusal(error.NamespaceUnknown, "not run") };
         if (metaOf(shard, req.ns_id, req.key) == null) return NO_QUEUE_REFUSAL;

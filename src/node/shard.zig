@@ -30,6 +30,7 @@
 //! and adds it to the pool.
 
 const std = @import("std");
+const client_names = @import("../protocol/names.zig");
 const stdx = @import("stdx");
 const builtin = @import("builtin");
 const posix = std.posix;
@@ -691,10 +692,12 @@ pub const Shard = struct {
     outbox_caps: channel_driver.OutboxCaps = .{},
     /// When `noteSenderBug` last logged.
     sender_bug_warn_ms: u64 = 0,
-    /// When `noteGroupReadUnproposed` last logged, and the reads it has
-    /// counted since.
-    group_read_warn_ms: u64 = 0,
-    group_reads_unproposed: u64 = 0,
+    /// Group reads and queue dequeues whose delivery wasn't proposed, or
+    /// whose acked dequeue wasn't completed: each said once per window per
+    /// reason (`LineThrottle`).
+    group_read_lines: LineThrottle = .{},
+    queue_dequeue_lines: LineThrottle = .{},
+    queue_settle_lines: LineThrottle = .{},
     /// When `noteSinkRefusal` last logged, and how many it has counted.
     sink_refusal_warn_ms: u64 = 0,
     sink_refusals_total: u64 = 0,
@@ -1745,20 +1748,68 @@ pub const Shard = struct {
         log.err("shard {d}: a repair skipped a processing sink's write to {s} sent by shard {d} ({d} bytes); its records are lost to that sink ({d} skipped writes here so far)", .{ self.id, targetLabel(&m.entry, &lb), m.from, m.entry.payload.len, self.sink_skipped_writes });
     }
 
+    /// A line a client can cause as often as it asks: said at once the
+    /// first time for each reason, then at most once per `EVERY_MS` for it,
+    /// with how many went unsaid in between. Keyed by the error's name, so
+    /// one reason's lines never hide another's first.
+    pub const LineThrottle = struct {
+        const SLOTS = 8;
+        pub const EVERY_MS: u64 = 30_000;
+        keys: [SLOTS][]const u8 = @splat(""),
+        said_ms: [SLOTS]u64 = @splat(0),
+        unsaid: [SLOTS]u64 = @splat(0),
+
+        /// `key` must outlive the throttle: an error's name is.
+        /// Null to stay quiet; else how many lines for `key` went unsaid
+        /// since the last one said, the one to say now not counted.
+        pub fn take(t: *LineThrottle, key: []const u8, now: u64) ?u64 {
+            var slot: usize = 0;
+            for (t.keys, 0..) |k, i| {
+                if (std.mem.eql(u8, k, key)) {
+                    slot = i;
+                    break;
+                }
+                // A free slot, or else the one said longest ago.
+                if (k.len == 0 or t.said_ms[i] < t.said_ms[slot]) slot = i;
+            } else {
+                t.keys[slot] = key;
+                t.said_ms[slot] = 0;
+                t.unsaid[slot] = 0;
+            }
+            if (t.said_ms[slot] != 0 and now -| t.said_ms[slot] < EVERY_MS) {
+                t.unsaid[slot] += 1;
+                return null;
+            }
+            const n = t.unsaid[slot];
+            t.said_ms[slot] = @max(now, 1);
+            t.unsaid[slot] = 0;
+            return n;
+        }
+    };
+
     /// A consumer group's read whose delivery wasn't proposed (the log
-    /// full, writes stopped, memory, leadership): counted, and said at most
-    /// once every 30 s with the count since, as clients choose these names
-    /// and can ask as often as they like.
+    /// full, writes stopped, memory, leadership): clients choose these names
+    /// and can ask as often as they like, so said once a window per reason.
     pub fn noteGroupReadUnproposed(self: *Shard, group: []const u8, stream: []const u8, err: anyerror) void {
         self.noteGroupReadUnproposedAt(group, stream, err, nowMs());
     }
 
     fn noteGroupReadUnproposedAt(self: *Shard, group: []const u8, stream: []const u8, err: anyerror, now: u64) void {
-        self.group_reads_unproposed += 1;
-        if (self.group_read_warn_ms != 0 and now -| self.group_read_warn_ms < 30_000) return;
-        self.group_read_warn_ms = now;
-        log.warn("shard {d}: read of group {f} on stream {f} not proposed: {s} ({d} such reads since the last line)", .{ self.id, std.zig.fmtString(group), std.zig.fmtString(stream), @errorName(err), self.group_reads_unproposed });
-        self.group_reads_unproposed = 0;
+        const unsaid = self.group_read_lines.take(@errorName(err), now) orelse return;
+        log.warn("shard {d}: read of group {f} on stream {f} not proposed: {s} ({d} more for this reason since its last line)", .{ self.id, client_names.escaped(group), client_names.escaped(stream), @errorName(err), unsaid });
+    }
+
+    /// A queue dequeue whose delivery wasn't proposed, as a group read's.
+    pub fn noteDequeueUnproposed(self: *Shard, queue: []const u8, err: anyerror) void {
+        const unsaid = self.queue_dequeue_lines.take(@errorName(err), nowMs()) orelse return;
+        log.warn("shard {d}: dequeue from queue {f} not proposed: {s} ({d} more for this reason since its last line)", .{ self.id, client_names.escaped(queue), @errorName(err), unsaid });
+    }
+
+    /// An acked dequeue whose completion wasn't proposed: answered as
+    /// leased, and said as a dequeue's is.
+    pub fn noteSettleUnproposed(self: *Shard, queue: []const u8, err: anyerror) void {
+        const unsaid = self.queue_settle_lines.take(@errorName(err), nowMs()) orelse return;
+        log.warn("shard {d}: an acked dequeue from queue {f} not completed: {s}; answered as leased ({d} more for this reason since its last line)", .{ self.id, client_names.escaped(queue), @errorName(err), unsaid });
     }
 
     fn noteSinkRefusal(self: *Shard, m: *const contract_store.AppliedMessage, r: persistence_mod.Refused) void {
@@ -33776,20 +33827,24 @@ test "Shard: an unpark try that fails still moves the deadline a whole interval 
     }
 }
 
-test "Shard: a group read not proposed is said at once, then once per 30 s with the count since" {
+test "Shard: a group read not proposed is said at once for each reason, then once per window for it, with the count unsaid" {
+    var t: Shard.LineThrottle = .{};
+    try std.testing.expectEqual(@as(?u64, 0), t.take("Overloaded", 1_000));
+    for (0..5) |k| try std.testing.expectEqual(@as(?u64, null), t.take("Overloaded", 1_000 + 29_999 - k));
+    // Another reason's first is said at once, though the first's window holds.
+    try std.testing.expectEqual(@as(?u64, 0), t.take("WritesStopped", 2_000));
+    try std.testing.expectEqual(@as(?u64, 5), t.take("Overloaded", 31_000));
+    try std.testing.expectEqual(@as(?u64, null), t.take("Overloaded", 31_001));
+    // More reasons than slots: the one said longest ago gives way.
+    var nb: [8]u8 = undefined;
+    for (0..9) |k| _ = t.take(try std.fmt.bufPrint(&nb, "E{d}", .{k}), 40_000 + k);
     var two: TwoShards = undefined;
     try two.init();
     defer two.deinit();
     const a = &two.shards[0];
     a.noteGroupReadUnproposedAt("g\nx", "s\x1b", error.Overloaded, 1_000);
-    try std.testing.expectEqual(@as(u64, 1_000), a.group_read_warn_ms);
-    try std.testing.expectEqual(@as(u64, 0), a.group_reads_unproposed);
-    for (0..5) |k| a.noteGroupReadUnproposedAt("g", "s", error.Overloaded, 1_000 + 29_999 - k);
-    try std.testing.expectEqual(@as(u64, 1_000), a.group_read_warn_ms);
-    try std.testing.expectEqual(@as(u64, 5), a.group_reads_unproposed);
-    a.noteGroupReadUnproposedAt("g", "s", error.Overloaded, 31_000);
-    try std.testing.expectEqual(@as(u64, 31_000), a.group_read_warn_ms);
-    try std.testing.expectEqual(@as(u64, 0), a.group_reads_unproposed);
+    a.noteGroupReadUnproposedAt("g", "s", error.Overloaded, 1_001);
+    try std.testing.expectEqual(@as(?u64, 1), a.group_read_lines.take("Overloaded", 31_001));
 }
 
 test "Shard: the unpark's wait is reckoned from elapsed time, at any unpark_ms, and the loop sleeps the earliest of it and the pipelines' deadline" {

@@ -48,6 +48,7 @@
 //!   ```
 
 const std = @import("std");
+const client_names = @import("../../protocol/names.zig");
 const Allocator = std.mem.Allocator;
 const Operator = @import("../operator.zig").Operator;
 const OperatorSpec = @import("../definition.zig").OperatorSpec;
@@ -174,7 +175,7 @@ pub fn create(allocator: Allocator, spec: *const OperatorSpec, tag_registry: ?*c
 
 fn createExprFilter(allocator: Allocator, spec: *const OperatorSpec) CreateError!CreateResult {
     const condition = spec.getConfig("condition") orelse {
-        log.err("Native operator '{f}' (type=filter) missing required 'condition' config", .{std.zig.fmtString(spec.name)});
+        log.err("Native operator '{f}' (type=filter) missing required 'condition' config", .{client_names.escaped(spec.name)});
         return CreateError.MissingConfig;
     };
 
@@ -185,7 +186,7 @@ fn createExprFilter(allocator: Allocator, spec: *const OperatorSpec) CreateError
     errdefer allocator.free(owned_condition);
 
     const filter = ExprFilterOperator.init(owned_name, owned_condition) catch {
-        log.err("Native operator '{f}' (type=filter) condition \"{f}\": {f}", .{ std.zig.fmtString(spec.name), std.zig.fmtString(condition), std.zig.fmtString(ExprFilterOperator.check(condition) orelse "invalid") });
+        log.err("Native operator '{f}' (type=filter) condition \"{f}\": {f}", .{ client_names.escaped(spec.name), client_names.escaped(condition), client_names.escaped(ExprFilterOperator.check(condition) orelse "invalid") });
         return CreateError.MissingConfig;
     };
     const ptr = allocator.create(ExprFilterOperator) catch return CreateError.OutOfMemory;
@@ -209,7 +210,7 @@ fn createPassthrough(allocator: Allocator, spec: *const OperatorSpec) CreateErro
 
 fn createJsonKeyBy(allocator: Allocator, spec: *const OperatorSpec) CreateError!CreateResult {
     const key_expression = spec.getConfig("key_expression") orelse {
-        log.err("Native operator '{f}' (type=keyby) missing required 'key_expression' config (e.g., \"$.user_id\")", .{std.zig.fmtString(spec.name)});
+        log.err("Native operator '{f}' (type=keyby) missing required 'key_expression' config (e.g., \"$.user_id\")", .{client_names.escaped(spec.name)});
         return CreateError.MissingConfig;
     };
 
@@ -225,19 +226,19 @@ fn createJsonKeyBy(allocator: Allocator, spec: *const OperatorSpec) CreateError!
 
 fn createJsonAggregate(allocator: Allocator, spec: *const OperatorSpec) CreateError!CreateResult {
     const func_str = spec.getConfig("function") orelse {
-        log.err("Native operator '{f}' (type=aggregate) missing required 'function' config (sum|count|avg|min|max)", .{std.zig.fmtString(spec.name)});
+        log.err("Native operator '{f}' (type=aggregate) missing required 'function' config (sum|count|avg|min|max)", .{client_names.escaped(spec.name)});
         return CreateError.MissingConfig;
     };
 
     const function = JsonAggregateOperator.AggFunction.fromString(func_str) orelse {
-        log.err("Native operator '{f}' (type=aggregate) unknown function '{f}' — expected sum|count|avg|min|max", .{ std.zig.fmtString(spec.name), std.zig.fmtString(func_str) });
+        log.err("Native operator '{f}' (type=aggregate) unknown function '{f}' — expected sum|count|avg|min|max", .{ client_names.escaped(spec.name), client_names.escaped(func_str) });
         return CreateError.MissingConfig;
     };
 
     // field is required for sum/avg/min/max, optional for count
     const field_expr: ?[]const u8 = spec.getConfig("field");
     if (field_expr == null and function != .count) {
-        log.err("Native operator '{f}' (type=aggregate, function={f}) missing required 'field' config (e.g., \"$.amount\")", .{ std.zig.fmtString(spec.name), std.zig.fmtString(func_str) });
+        log.err("Native operator '{f}' (type=aggregate, function={f}) missing required 'field' config (e.g., \"$.amount\")", .{ client_names.escaped(spec.name), client_names.escaped(func_str) });
         return CreateError.MissingConfig;
     }
 
@@ -245,22 +246,22 @@ fn createJsonAggregate(allocator: Allocator, spec: *const OperatorSpec) CreateEr
     const window: JsonAggregateOperator.WindowConfig = blk: {
         const window_type = spec.getConfig("window") orelse break :blk .none;
         const window_size_str = spec.getConfig("window_size") orelse {
-            log.err("Native operator '{f}' (type=aggregate) has 'window' but missing 'window_size'", .{std.zig.fmtString(spec.name)});
+            log.err("Native operator '{f}' (type=aggregate) has 'window' but missing 'window_size'", .{client_names.escaped(spec.name)});
             return CreateError.MissingConfig;
         };
 
         if (std.mem.eql(u8, window_type, "count")) {
             const count = std.fmt.parseInt(u64, window_size_str, 10) catch {
-                log.err("Native operator '{f}' (type=aggregate) invalid window_size '{f}' — expected integer count", .{ std.zig.fmtString(spec.name), std.zig.fmtString(window_size_str) });
+                log.err("Native operator '{f}' (type=aggregate) invalid window_size '{f}' — expected integer count", .{ client_names.escaped(spec.name), client_names.escaped(window_size_str) });
                 return CreateError.MissingConfig;
             };
             if (count == 0) {
-                log.err("Native operator '{f}' (type=aggregate) window_size 0 — expected a positive count", .{std.zig.fmtString(spec.name)});
+                log.err("Native operator '{f}' (type=aggregate) window_size 0 — expected a positive count", .{client_names.escaped(spec.name)});
                 return CreateError.MissingConfig;
             }
             break :blk .{ .tumbling_count = count };
         } else {
-            log.err("Native operator '{f}' (type=aggregate) unknown window type '{f}' — expected count", .{ std.zig.fmtString(spec.name), std.zig.fmtString(window_type) });
+            log.err("Native operator '{f}' (type=aggregate) unknown window type '{f}' — expected count", .{ client_names.escaped(spec.name), client_names.escaped(window_type) });
             return CreateError.MissingConfig;
         }
     };
@@ -299,7 +300,7 @@ fn createJsonMap(allocator: Allocator, spec: *const OperatorSpec) CreateError!Cr
 
 fn createJsonFlatMap(allocator: Allocator, spec: *const OperatorSpec) CreateError!CreateResult {
     const array_field = spec.getConfig("array_field") orelse {
-        log.err("Native operator '{f}' (type=flatmap) missing required 'array_field' config (e.g., \"$.items\")", .{std.zig.fmtString(spec.name)});
+        log.err("Native operator '{f}' (type=flatmap) missing required 'array_field' config (e.g., \"$.items\")", .{client_names.escaped(spec.name)});
         return CreateError.MissingConfig;
     };
 
@@ -317,14 +318,14 @@ fn createJsonFlatMap(allocator: Allocator, spec: *const OperatorSpec) CreateErro
 
 fn createKvLookup(allocator: Allocator, spec: *const OperatorSpec) CreateError!CreateResult {
     const lookup_key = spec.getConfig("lookup_key") orelse {
-        log.err("Native operator '{f}' (type=kv_lookup) missing required 'lookup_key' config (e.g., \"account:${{$.account_id}}\")", .{std.zig.fmtString(spec.name)});
+        log.err("Native operator '{f}' (type=kv_lookup) missing required 'lookup_key' config (e.g., \"account:${{$.account_id}}\")", .{client_names.escaped(spec.name)});
         return CreateError.MissingConfig;
     };
 
     const namespace = spec.getConfig("namespace") orelse "default";
     const mode_str = spec.getConfig("mode") orelse "filter";
     const mode = KvLookupMode.fromString(mode_str) orelse {
-        log.err("Native operator '{f}' (type=kv_lookup) unknown mode '{f}' — expected filter|enrich", .{ std.zig.fmtString(spec.name), std.zig.fmtString(mode_str) });
+        log.err("Native operator '{f}' (type=kv_lookup) unknown mode '{f}' — expected filter|enrich", .{ client_names.escaped(spec.name), client_names.escaped(mode_str) });
         return CreateError.MissingConfig;
     };
     const enrich_field = spec.getConfig("enrich_field") orelse "_kv";
@@ -341,7 +342,7 @@ fn createKvLookup(allocator: Allocator, spec: *const OperatorSpec) CreateError!C
 
 fn createClassify(allocator: Allocator, spec: *const OperatorSpec, tag_registry: ?*const TagRegistry) CreateError!CreateResult {
     const entries = spec.config orelse {
-        log.err("Native operator '{f}' (type=classify) missing rules config", .{std.zig.fmtString(spec.name)});
+        log.err("Native operator '{f}' (type=classify) missing rules config", .{client_names.escaped(spec.name)});
         return CreateError.MissingConfig;
     };
 
@@ -354,7 +355,7 @@ fn createClassify(allocator: Allocator, spec: *const OperatorSpec, tag_registry:
     }
 
     if (rule_count == 0) {
-        log.err("Native operator '{f}' (type=classify) no rules found — expected condition_0/tag_0 pairs", .{std.zig.fmtString(spec.name)});
+        log.err("Native operator '{f}' (type=classify) no rules found — expected condition_0/tag_0 pairs", .{client_names.escaped(spec.name)});
         return CreateError.MissingConfig;
     }
 
@@ -380,12 +381,12 @@ fn createClassify(allocator: Allocator, spec: *const OperatorSpec, tag_registry:
         // Resolve tag value: with a registry, treat as tag name; without, as numeric bit position
         const tag_bit: u5 = if (tag_registry) |reg| blk: {
             break :blk reg.resolve(tag_val) orelse {
-                log.err("Native operator '{f}' (type=classify) unknown tag name '{f}' for rule {d}", .{ std.zig.fmtString(spec.name), std.zig.fmtString(tag_val), i });
+                log.err("Native operator '{f}' (type=classify) unknown tag name '{f}' for rule {d}", .{ client_names.escaped(spec.name), client_names.escaped(tag_val), i });
                 return CreateError.MissingConfig;
             };
         } else blk: {
             break :blk std.fmt.parseInt(u5, tag_val, 10) catch {
-                log.err("Native operator '{f}' (type=classify) invalid tag bit '{f}' for rule {d}", .{ std.zig.fmtString(spec.name), std.zig.fmtString(tag_val), i });
+                log.err("Native operator '{f}' (type=classify) invalid tag bit '{f}' for rule {d}", .{ client_names.escaped(spec.name), client_names.escaped(tag_val), i });
                 return CreateError.MissingConfig;
             };
         };
@@ -395,7 +396,7 @@ fn createClassify(allocator: Allocator, spec: *const OperatorSpec, tag_registry:
         // must outlive the operator.
         const owned_condition = allocator.dupe(u8, condition) catch return CreateError.OutOfMemory;
         const parsed = ExprFilterOperator.init(owned_name, owned_condition) catch {
-            log.err("Native operator '{f}' (type=classify) rule {d} condition \"{f}\": {f}", .{ std.zig.fmtString(spec.name), i, std.zig.fmtString(condition), std.zig.fmtString(ExprFilterOperator.check(condition) orelse "invalid") });
+            log.err("Native operator '{f}' (type=classify) rule {d} condition \"{f}\": {f}", .{ client_names.escaped(spec.name), i, client_names.escaped(condition), client_names.escaped(ExprFilterOperator.check(condition) orelse "invalid") });
             allocator.free(owned_condition);
             return CreateError.MissingConfig;
         };
@@ -411,12 +412,12 @@ fn createClassify(allocator: Allocator, spec: *const OperatorSpec, tag_registry:
     const default_tag_bit: ?u5 = if (spec.getConfig("default_tag")) |default_val| blk: {
         if (tag_registry) |reg| {
             break :blk reg.resolve(default_val) orelse {
-                log.err("Native operator '{f}' (type=classify) unknown default tag name '{f}'", .{ std.zig.fmtString(spec.name), std.zig.fmtString(default_val) });
+                log.err("Native operator '{f}' (type=classify) unknown default tag name '{f}'", .{ client_names.escaped(spec.name), client_names.escaped(default_val) });
                 return CreateError.MissingConfig;
             };
         } else {
             break :blk std.fmt.parseInt(u5, default_val, 10) catch {
-                log.err("Native operator '{f}' (type=classify) invalid default tag bit '{f}'", .{ std.zig.fmtString(spec.name), std.zig.fmtString(default_val) });
+                log.err("Native operator '{f}' (type=classify) invalid default tag bit '{f}'", .{ client_names.escaped(spec.name), client_names.escaped(default_val) });
                 return CreateError.MissingConfig;
             };
         }

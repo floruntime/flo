@@ -348,7 +348,7 @@ pub const NO_ACTION = "not found: no such action";
 pub const NO_RUN = "not found: no such run";
 pub const RUN_EXISTS = "conflict: a run with this id exists";
 pub const NOT_READY = "conflict: the run isn't ready to deliver";
-pub const NAME_HAS_CONTROL = "bad request: " ++ client_names.controlRefusal("an action");
+pub const NAME_HAS_CONTROL = client_names.controlRefusal("an action name");
 pub const NOT_ITS_LEASE = "bad request: an extend names its delivery's own lease and start";
 
 /// Answers: register, the action's version (u32, 1 then one more each

@@ -212,3 +212,87 @@ test "e2e/names: a name holding a control character is refused, saying so, and n
     const actions = try ctx.execCapture(&.{ "action", "list" });
     try testing.expect(std.mem.indexOf(u8, actions, "send") == null);
 }
+
+test "e2e/names: every name a request carries refuses control characters: consumers, task types, signal types, TS tag keys and a job's TS names" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const says = "must not contain control characters";
+    try ctx.exec(&.{ "stream", "append", "orders", "o1" });
+    try ctx.exec(&.{ "queue", "enqueue", "jobs", "m" });
+    try ctx.exec(&.{ "action", "register", "send" });
+    // A run waiting for a signal, for one sent with a control type.
+    const waits = "{\"kind\":\"Workflow\",\"name\":\"waits\",\"version\":\"1.0.0\",\"start\":{\"wait_for_signal\":{\"type\":\"go\"},\"transitions\":{\"success\":\"flo.Completed\"}}}";
+    const wpath = try stdx.testing.writeTempYaml(testing.allocator, waits, "e2e-name-waits.yaml");
+    defer stdx.testing.cleanupTempFile(testing.allocator, wpath);
+    try ctx.exec(&.{ "workflow", "create", "-f", wpath });
+    try ctx.exec(&.{ "workflow", "start", "waits", "{}", "--run-id", "w1" });
+    for ([_][]const []const u8{
+        &.{ "stream", "group", "read", "or\nders", "--group", "g", "--consumer", "c" },
+        &.{ "stream", "group", "read", "orders", "--group", "g", "--consumer", "c\x1b" },
+        &.{ "queue", "dequeue", "jobs", "--consumer", "c\tx" },
+        &.{ "queue", "dequeue", "jo\tbs" },
+        &.{ "queue", "purge", "jo\tbs" },
+        &.{ "queue", "dlq", "list", "jo\tbs" },
+        &.{ "action", "invoke", "se\x1bnd", "{}" },
+        &.{ "worker", "register", "w1", "ty\tpe" },
+        &.{ "worker", "await", "se\x7fnd", "--worker-id", "w2", "--block", "0" },
+        &.{ "workflow", "signal", "w1", "--type", "g\to" },
+        &.{ "ts", "write", "cpu", "--tags", "ho\x1bst=a", "--value", "1" },
+    }) |args| {
+        var r = try ctx.cli.run(args);
+        defer r.deinit();
+        if (!r.contains(says)) std.debug.print("{s} {s}: {s} {s}\n", .{ args[0], args[1], r.stdout, r.stderr });
+        try testing.expect(r.contains(says));
+    }
+    // Definitions: a workflow's trigger stream and signal types, a job's
+    // name and its TS sink's field.
+    for ([_]struct { args: []const []const u8, def: []const u8, file: []const u8 }{
+        .{ .args = &.{ "workflow", "create", "-f" }, .def = "{\"kind\":\"Workflow\",\"name\":\"trig\",\"version\":\"1.0.0\",\"trigger\":{\"stream\":\"in\\u0009x\"},\"start\":{\"wait_for_signal\":{\"type\":\"go\"},\"transitions\":{\"success\":\"flo.Completed\"}}}", .file = "e2e-name-trig.yaml" },
+        .{ .args = &.{ "workflow", "create", "-f" }, .def = "{\"kind\":\"Workflow\",\"name\":\"sig\",\"version\":\"1.0.0\",\"start\":{\"wait_for_signal\":{\"type\":\"g\\u000ao\"},\"transitions\":{\"success\":\"flo.Completed\"}}}", .file = "e2e-name-sig.yaml" },
+        .{ .args = &.{ "processing", "submit" }, .def = "{\"kind\":\"Processing\",\"name\":\"j\\u0009x\",\"sources\":[{\"stream\":{\"name\":\"in\"}}],\"sinks\":[{\"stream\":{\"name\":\"out\"}}]}", .file = "e2e-name-jobname.yaml" },
+        .{ .args = &.{ "processing", "submit" }, .def = "{\"kind\":\"Processing\",\"name\":\"tsj\",\"sources\":[{\"stream\":{\"name\":\"in\"}}],\"sinks\":[{\"ts\":{\"measurement\":\"m\",\"fields\":{\"lo\\u0009ad\":\"l\"}}}]}", .file = "e2e-name-tsfield.yaml" },
+    }) |c| {
+        const path = try stdx.testing.writeTempYaml(testing.allocator, c.def, c.file);
+        defer stdx.testing.cleanupTempFile(testing.allocator, path);
+        var argv: [4][]const u8 = undefined;
+        for (c.args, 0..) |a, i| argv[i] = a;
+        argv[c.args.len] = path;
+        var r = try ctx.cli.run(argv[0 .. c.args.len + 1]);
+        defer r.deinit();
+        if (!r.contains(says)) std.debug.print("{s}: {s} {s}\n", .{ c.file, r.stdout, r.stderr });
+        try testing.expect(r.contains(says));
+    }
+    // A create whose request names another workflow than its definition is
+    // refused, and one with a control key too, by the key or by the match.
+    const proto = @import("src").protocol.proto;
+    var out: [512]u8 = undefined;
+    const body = "{\"kind\":\"Workflow\",\"name\":\"wf\",\"version\":\"1.0.0\",\"start\":{\"wait_for_signal\":{\"type\":\"go\"},\"transitions\":{\"success\":\"flo.Completed\"}}}";
+    for ([_][]const u8{ "other", "w\nf" }) |key| {
+        const r = try rawCall(ctx, proto.OpCode.workflow_create, "", key, body, &out);
+        try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
+        try testing.expect(std.mem.indexOf(u8, r.data, "workflow name and its definition's name differ") != null);
+    }
+    const list = try ctx.execCapture(&.{ "workflow", "list" });
+    try testing.expect(std.mem.indexOf(u8, list, "other") == null);
+    try testing.expect(std.mem.indexOf(u8, list, "w\nf") == null);
+}
+
+test "e2e/names: the CLI keys a workflow create by its definition's own name, however its text runs" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    for ([_]struct { def: []const u8, file: []const u8, name: []const u8 }{
+        // A nested "name" comes first in the text.
+        .{ .def = "{\"kind\":\"Workflow\",\"plans\":{\"p\":{\"executors\":[{\"name\":\"e1\",\"run\":\"@actions/send\"}]}},\"name\":\"nested\",\"version\":\"1.0.0\",\"start\":{\"run\":\"@plan/p\",\"transitions\":{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}", .file = "e2e-name-nested.yaml", .name = "nested" },
+        // A comment after the name.
+        .{ .def = "kind: Workflow\nname: commented  # the name\nversion: 1.0.0\nstart:\n  wait_for_signal:\n    type: go\n  transitions:\n    success: flo.Completed\n", .file = "e2e-name-comment.yaml", .name = "commented" },
+    }) |c| {
+        const path = try stdx.testing.writeTempYaml(testing.allocator, c.def, c.file);
+        defer stdx.testing.cleanupTempFile(testing.allocator, path);
+        var r = try ctx.cli.run(&.{ "workflow", "create", "-f", path });
+        defer r.deinit();
+        var want: [64]u8 = undefined;
+        const says = try std.fmt.bufPrint(&want, "Created workflow: {s}\n", .{c.name});
+        if (!std.mem.eql(u8, r.stdout, says)) std.debug.print("{s}: {s} {s}\n", .{ c.file, r.stdout, r.stderr });
+        try testing.expectEqualStrings(says, r.stdout);
+    }
+}

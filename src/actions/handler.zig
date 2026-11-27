@@ -322,7 +322,7 @@ pub const ActionsHandler = struct {
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         switch (op) {
             .action_register, .action_invoke, .action_delete => if (client_names.hasControl(req.key)) {
-                return sendActionResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = comptime client_names.controlRefusal("action") } });
+                return sendActionResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = comptime client_names.controlRefusal("an action name") } });
             },
             else => {},
         }
@@ -535,9 +535,9 @@ pub const ActionsHandler = struct {
                 if (!self.missing_run_said) {
                     self.missing_run_said = true;
                     if (@import("builtin").is_test)
-                        log.warn("action run list: run {f} is indexed but not there; skipped", .{std.zig.fmtString(at.run)})
+                        log.warn("action run list: run {f} is indexed but not there; skipped", .{client_names.escaped(at.run)})
                     else
-                        log.err("action run list: run {f} is indexed but not there; skipped", .{std.zig.fmtString(at.run)});
+                        log.err("action run list: run {f} is indexed but not there; skipped", .{client_names.escaped(at.run)});
                 }
                 read += 1;
                 last = at;
@@ -559,9 +559,9 @@ pub const ActionsHandler = struct {
                 if (!self.unlistable_said) {
                     self.unlistable_said = true;
                     if (@import("builtin").is_test)
-                        log.warn("action run list: run {f} can't be listed ({s}); skipped", .{ std.zig.fmtString(at.run), @errorName(err) })
+                        log.warn("action run list: run {f} can't be listed ({s}); skipped", .{ client_names.escaped(at.run), @errorName(err) })
                     else
-                        log.err("action run list: run {f} can't be listed ({s}); skipped", .{ std.zig.fmtString(at.run), @errorName(err) });
+                        log.err("action run list: run {f} can't be listed ({s}); skipped", .{ client_names.escaped(at.run), @errorName(err) });
                 }
                 read += 1;
                 last = at;
@@ -764,7 +764,10 @@ pub const ActionsHandler = struct {
             want.labels = w.metadata_owned;
         };
         var it = actions.iterator();
-        while (it.next() catch null) |name| want.names.add(name);
+        while (it.next() catch null) |name| {
+            if (client_names.hasControl(name)) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(comptime client_names.controlRefusal("an action name")) } };
+            want.names.add(name);
+        }
         if (want.names.len == 0) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: an await names at least one action") } };
         want.asked = want.names.len;
         // Refused now rather than once it has to wait, so an await is
@@ -1131,7 +1134,7 @@ pub const ActionsHandler = struct {
             const owned_key = try self.allocator.dupe(u8, run_key);
             const proposed = propose(shard, .action_deliver, ae.Deliver.Value{ .ns = ns.int(), .action = action, .run = run_id, .due_ns = due, .holder = holder, .request_key = request_key, .lease_ms = def.lease_ms }) catch |err| {
                 self.allocator.free(owned_key);
-                if (!shard.quietHalted(err)) log.warn("shard {d}: run {f} not delivered: {s}", .{ shard.id, std.zig.fmtString(run_id), @errorName(err) });
+                if (!shard.quietHalted(err)) log.warn("shard {d}: run {f} not delivered: {s}", .{ shard.id, client_names.escaped(run_id), @errorName(err) });
                 return .none;
             };
             self.reserved.putAssumeCapacity(owned_key, {});

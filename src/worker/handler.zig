@@ -324,6 +324,7 @@ pub const WorkerHandler = struct {
         var process_bytes: usize = 0;
         for (0..count) |_| {
             const name = r.prefixed() orelse return refuse(allocator, &reg, "registration cut short in its process list");
+            if (client_names.hasControl(name)) return refuse(allocator, &reg, comptime client_names.controlRefusal("a process name"));
             const kind_byte = r.byte() orelse return refuse(allocator, &reg, "registration cut short in its process list");
             const kind = std.enums.fromInt(ProcessKind, kind_byte) orelse return refuse(allocator, &reg, "unknown process kind");
             process_bytes += worker_ops.ProcessRow.encodedSize(.{ .name = name, .kind = @fromBackingInt(kind_byte), .run_count = 0, .fail_count = 0, .last_run_at_ms = 0 }) catch
@@ -576,7 +577,7 @@ pub const WorkerHandler = struct {
         };
     }
 
-    const INVALID_ID = "worker id must not contain control characters (bytes 0x00-0x1f or 0x7f)";
+    const INVALID_ID = client_names.controlRefusal("a worker id");
 
     /// worker.list: each shard holds the workers that registered on it, so
     /// every shard answers its own page after `cursor` and the pages merge.
@@ -841,6 +842,7 @@ test "worker.info: the row, metadata and processes, as registered; an unknown wo
 
     try std.testing.expectError(error.NotFound, h.info(A, "w"));
     try std.testing.expectError(error.InvalidId, h.info(.default, "b\x00w"));
+    try std.testing.expectError(error.InvalidId, h.info(.default, "b\nw"));
 }
 
 test "workers: a registration whose processes worker.info couldn't list is refused" {

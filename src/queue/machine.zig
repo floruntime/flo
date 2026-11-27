@@ -19,6 +19,7 @@
 //! each it still holds; the rest are answered by what became of them.
 
 const std = @import("std");
+const client_names = @import("../protocol/names.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence = @import("../storage/persistence.zig");
 const schema = @import("../protocol/schema.zig");
@@ -721,7 +722,7 @@ fn namespaceOf(e: *const Entry) ?u32 {
 fn labelOf(e: *const Entry, buf: []u8) []const u8 {
     var diag: schema.Diagnostic = .{};
     const p = qe.Enqueue.decodeAll(e.payload, &diag) catch return "a queue";
-    return std.fmt.bufPrint(buf, "queue {s}", .{p.queue}) catch "a queue";
+    return std.fmt.bufPrint(buf, "queue {f}", .{client_names.escaped(p.queue)}) catch "a queue";
 }
 
 /// An enqueue's target: its queue, by namespace and name hash. Only an

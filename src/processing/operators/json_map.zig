@@ -35,6 +35,7 @@
 //!   ```
 
 const std = @import("std");
+const client_names = @import("../../protocol/names.zig");
 const json_out = @import("json_out.zig");
 const Allocator = std.mem.Allocator;
 const path_segments = @import("path_segments.zig");
@@ -177,7 +178,7 @@ pub const JsonMapOperator = struct {
 
         const output = try ctx.allocator.dupe(u8, output_buf);
 
-        log.debug("JsonMapOperator: emitting output='{s}'", .{output});
+        log.debug("JsonMapOperator: emitting output='{f}'", .{client_names.escaped(output)});
 
         try ctx.emit(.{
             .key = rec.key,

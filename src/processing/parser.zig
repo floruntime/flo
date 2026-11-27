@@ -2042,7 +2042,7 @@ test "parser: a stream or queue name holding a control character, or too long, i
     }) |json_def| {
         var def = try parseJobDefinitionWithNamespace(allocator, json_def, "acme", null);
         defer def.deinit(allocator);
-        try std.testing.expectEqualStrings(comptime @import("../protocol/names.zig").controlRefusal("stream or queue"), def.namespaceRefusal().?);
+        try std.testing.expectEqualStrings(comptime @import("../protocol/names.zig").controlRefusal("a stream or queue name"), def.namespaceRefusal().?);
     }
     // The limit is the name's own, as for a stream or queue outside a job:
     // the namespace's name doesn't count against it.

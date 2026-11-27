@@ -196,6 +196,8 @@ pub const TagProblem = union(enum) {
     no_value: []const u8,
     /// The key given twice.
     repeated: []const u8,
+    /// The key holding a control character: a key is a name.
+    control_key: []const u8,
 
     /// The refusal a client is answered, naming the part or key where it
     /// has one.
@@ -215,6 +217,7 @@ pub const TagProblem = union(enum) {
             .empty_key => |part| try echo(&w, "tag \"", part, "\" has no key"),
             .no_value => |part| try echo(&w, "tag \"", part, "\" has no value: a tag is key=value"),
             .repeated => |key| try echo(&w, "tag key \"", key, "\" is given twice; a series has each key once"),
+            .control_key => |key| try echo(&w, "tag key \"", key, "\" must not contain control characters (bytes 0x00-0x1f or 0x7f)"),
             else => w.writeAll(p.fixed()["bad request: ".len..]) catch return error.NoSpaceLeft,
         }
         return w.buffered();
@@ -240,6 +243,7 @@ pub const TagProblem = union(enum) {
             .empty_key => TAG_EMPTY_KEY,
             .no_value => TAG_NO_VALUE,
             .repeated => TAG_REPEATED,
+            .control_key => TAG_CONTROL_KEY,
         };
     }
 };
@@ -250,6 +254,7 @@ pub const TAG_NOT_UTF8 = "bad request: tags must be UTF-8";
 pub const TAG_EMPTY_KEY = "bad request: a tag has no key";
 pub const TAG_NO_VALUE = "bad request: a tag has no value: a tag is key=value";
 pub const TAG_REPEATED = "bad request: a tag key is given twice; a series has each key once";
+pub const TAG_CONTROL_KEY = @import("../protocol/names.zig").controlRefusal("a tag key");
 
 /// The first problem with `tags`, split and trimmed as
 /// `canonicalTagString` reads it; null when it has none.
@@ -266,6 +271,7 @@ pub fn tagSetProblem(tags: []const u8) ?TagProblem {
         const eq = std.mem.indexOfScalar(u8, part, '=') orelse return .{ .no_value = part };
         const key = part[0..eq];
         if (key.len == 0) return .{ .empty_key = part };
+        if (@import("../protocol/names.zig").hasControl(key)) return .{ .control_key = key };
         if (eq + 1 == part.len) return .{ .no_value = part };
         for (keys[0..n]) |k| if (std.mem.eql(u8, k, key)) return .{ .repeated = key };
         keys[n] = key;
@@ -276,6 +282,10 @@ pub fn tagSetProblem(tags: []const u8) ?TagProblem {
 
 test "tagSetProblem: a repeated or empty key, bytes that aren't UTF-8, and a set past the limits" {
     try std.testing.expectEqual(@as(?TagProblem, null), tagSetProblem(""));
+    // A key is a name: no control character. A value is data: any.
+    try std.testing.expectEqualStrings("ho\x1bst", tagSetProblem("ho\x1bst=a").?.control_key);
+    try std.testing.expectEqualStrings("a\x7fb", tagSetProblem("env=prod,a\x7fb=1").?.control_key);
+    try std.testing.expectEqual(@as(?TagProblem, null), tagSetProblem("host=a\x1bb"));
     try std.testing.expectEqual(@as(?TagProblem, null), tagSetProblem("host=a, env=prod,,"));
     // A tag is key=value, both non-empty: what a tag filter can name.
     try std.testing.expectEqualStrings("flag", tagSetProblem("host=a, env=prod,,flag").?.no_value);
@@ -308,7 +318,7 @@ test "tagSetProblem: a repeated or empty key, bytes that aren't UTF-8, and a set
     const msg = tagSetProblem(long ++ "=1," ++ long ++ "=2").?.text(&tb);
     try std.testing.expect(std.unicode.utf8ValidateSlice(msg));
     try std.testing.expect(std.mem.indexOf(u8, msg, "\xc3") == null);
-    try std.testing.expectEqualStrings("bad request: tag key \"a\\x1b[31m\" is given twice; a series has each key once", tagSetProblem("a\x1b[31m=1,a\x1b[31m=2").?.text(&tb));
+    try std.testing.expectEqualStrings("bad request: tag key \"a\\x1b[31m\" must not contain control characters (bytes 0x00-0x1f or 0x7f)", tagSetProblem("a\x1b[31m=1,a\x1b[31m=2").?.text(&tb));
 }
 
 test "tagSetProblem: every random tag set it accepts canonicalises to itself, has no repeated key, and a tag filter can name it" {

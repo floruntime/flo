@@ -392,7 +392,19 @@ pub const JobDefinition = struct {
             if (src.ts_measurement.len > limits.MAX_QUALIFIED_KEY) return "measurement name too long";
             if (src.ts_field.len > std.math.maxInt(u16)) return "field name too long";
         }
-        for (self.sinks.items) |snk| if (resourceRefusal(snk.target)) |why| return why;
+        for (self.sinks.items) |snk| if (snk.kind != .ts) if (resourceRefusal(snk.target)) |why| return why;
+        // A TS sink's measurement, field and tag-key names, and a TS
+        // source's, are names as a native write's are: refused here, at
+        // submit, so no job runs whose every point its apply would refuse.
+        for (self.sources.items) |src| if (client_names.hasControl(src.ts_measurement) or client_names.hasControl(src.ts_field)) return TS_NAME_CONTROL;
+        for (self.sinks.items) |snk| if (snk.kind == .ts) {
+            if (client_names.hasControl(snk.target) or client_names.hasControl(snk.ts_measurement) or client_names.hasControl(snk.ts_value_field)) return TS_NAME_CONTROL;
+            if (snk.target.len > limits.MAX_QUALIFIED_KEY) return "measurement name too long";
+            var i: usize = 0;
+            while (i < snk.ts_field_keys.len) : (i += 2) if (client_names.hasControl(snk.ts_field_keys[i])) return TS_NAME_CONTROL;
+            i = 0;
+            while (i < snk.ts_tag_keys.len) : (i += 2) if (client_names.hasControl(snk.ts_tag_keys[i])) return TS_NAME_CONTROL;
+        };
         for (self.sinks.items) |snk| if (snk.kind == .stream and reservedStreamName(snk.target)) return names.RESERVED_WHY;
         return null;
     }
@@ -412,9 +424,11 @@ pub const JobDefinition = struct {
         return false;
     }
 
+    const TS_NAME_CONTROL = client_names.controlRefusal("a measurement, field or tag key name");
+
     fn resourceRefusal(name: []const u8) ?[]const u8 {
         if (name.len == 0) return null; // kv and ts endpoints name no stream or queue
-        if (client_names.hasControl(name)) return comptime client_names.controlRefusal("stream or queue");
+        if (client_names.hasControl(name)) return comptime client_names.controlRefusal("a stream or queue name");
         if (name.len > limits.MAX_QUALIFIED_KEY) return "stream or queue name too long";
         return null;
     }

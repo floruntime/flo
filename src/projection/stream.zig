@@ -192,7 +192,7 @@ pub fn appendRefusal(payload: []const u8) ?[]const u8 {
     // As a client's append is refused for its name: none, one with a
     // control character, or one longer than a stream list can name.
     if (cmd.key.len == 0) return "stream append: stream name is required";
-    if (client_names.hasControl(cmd.key)) return comptime "stream append: " ++ client_names.controlRefusal("stream");
+    if (client_names.hasControl(cmd.key)) return comptime client_names.controlRefusal("a stream name");
     if (cmd.key.len > MAX_QUALIFIED_KEY) return "stream append: stream name too long";
     _ = BatchIterator.init(decodeAppendValue(cmd.value).payload) catch |err| return switch (err) {
         error.TooManyRecords => "stream append: a batch over the record limit",

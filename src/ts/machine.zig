@@ -268,7 +268,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
     }
 }
 
-const CONTROL_IN_NAME = "bad request: " ++ client_names.controlRefusal("a measurement or field");
+const CONTROL_IN_NAME = client_names.controlRefusal("a measurement or field name");
 /// Reads answer a point's time as i64 nanoseconds.
 const TIME_TOO_LATE = std.fmt.comptimePrint("bad request: a point's time is at most {d} ns", .{std.math.maxInt(i64)});
 
@@ -594,6 +594,16 @@ test "time series: a measurement or field holding any control character is refus
         if (i < 3) try testing.expectEqualStrings(CONTROL_IN_NAME, o.refused().?.refusal.message) else try testing.expect(o.refused() == null);
     }
     try testing.expectEqual(@as(usize, 1), s.family(Points.ID).count);
+    // A delete or retention naming one is refused the same way.
+    var age: [8]u8 = undefined;
+    std.mem.writeInt(u64, &age, 0, .little);
+    try log.add(.ts_delete, .of(7), "c\npu", "", 2000);
+    try log.add(.ts_retention, .of(7), "c\tpu", &age, 2000);
+    for (log.entries.items[4..]) |*e| {
+        var o = Result.start(e);
+        try machine_mod.applyEntry(&machine, &s, &scratch, e, &o);
+        try testing.expectEqualStrings(CONTROL_IN_NAME, o.refused().?.refusal.message);
+    }
 }
 
 test "time series: a name holding NUL is refused, and changes nothing" {

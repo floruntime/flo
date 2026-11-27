@@ -250,7 +250,7 @@ fn check(shard: *Shard, conn: *Connection, req: Request) bool {
     var r = WireReader.init(req.value);
     const group = r.readLengthPrefixed(u16) orelse "";
     if (client_names.hasControl(req.key) or client_names.hasControl(group)) {
-        refuse(shard, conn, req.header.request_id, .bad_request, comptime "bad request: " ++ client_names.controlRefusal("a stream or group"));
+        refuse(shard, conn, req.header.request_id, .bad_request, comptime client_names.controlRefusal("a stream or group name"));
         return false;
     }
     if (group.len > ge.MAX_GROUP_NAME) {
@@ -376,6 +376,7 @@ pub fn dispatchRead(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) v
     const n = named(req, true) orelse return refuse(shard, conn, req.header.request_id, .bad_request, "bad request: a group name is required");
     const consumer = if (n.consumer.len > 0) n.consumer else "default";
     if (consumer.len > ae.Holder.max_size) return refuse(shard, conn, req.header.request_id, .bad_request, "bad request: consumer name too long");
+    if (client_names.hasControl(consumer)) return refuse(shard, conn, req.header.request_id, .bad_request, comptime client_names.controlRefusal("a consumer name"));
     const asked = req.getCount() orelse 0;
     const count: u32 = if (asked == 0) 100 else @min(asked, ge.MAX_BATCH);
     const block_ms: u64 = req.getBlockMs() orelse 0;

@@ -123,6 +123,10 @@ test "sink payloads: each kind is the entry its target applies, routed by namesp
     defer arena.deinit();
     const s = stream(&buf, arena.allocator(), ns, "events", "payload").built;
     try testing.expect(stream_mod.appendRefusal(s.payload) == null);
+    // A stream name holding a control character is refused as its append's
+    // apply would refuse it.
+    var bad_buf: [512]u8 = undefined;
+    try testing.expectEqualStrings("bad request: a stream name must not contain control characters (bytes 0x00-0x1f or 0x7f)", stream(&bad_buf, arena.allocator(), ns, "ev\nents", "payload").refused.why);
     const cmd = entry_mod.CommandPayload.deserialize(s.payload).?;
     try testing.expectEqual(ns, cmd.namespace_id);
     try testing.expectEqualStrings("events", cmd.key);

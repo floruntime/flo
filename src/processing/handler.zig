@@ -22,6 +22,7 @@
 //! | processing_list      | (unused)   | [limit:u32][cursor...]?        |
 
 const std = @import("std");
+const client_names = @import("../protocol/names.zig");
 const NamespaceId = @import("../namespace/table.zig").Id;
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
@@ -485,7 +486,7 @@ pub const ProcessingHandler = struct {
     fn holdJob(self: *ProcessingHandler, id: []const u8, run: *JobRun, reason: []const u8) void {
         if (!run.held) {
             run.held = true;
-            log.warn("processing job {s} held on this node: {f}", .{ id, std.zig.fmtString(reason) });
+            log.warn("processing job {s} held on this node: {f}", .{ id, client_names.escaped(reason) });
         }
         self.freeHeldReason(run);
         run.held_owned = self.allocator.dupe(u8, reason[0..@min(reason.len, MAX_FAILURE_REASON)]) catch HELD_NO_MEMORY;
@@ -501,7 +502,7 @@ pub const ProcessingHandler = struct {
 
     /// Job `id`'s definition doesn't build on this node, for `reason`.
     fn failRun(self: *ProcessingHandler, id: []const u8, run: *JobRun, reason: []const u8) void {
-        log.err("processing job {s} not started: {f}", .{ id, std.zig.fmtString(reason) });
+        log.err("processing job {s} not started: {f}", .{ id, client_names.escaped(reason) });
         if (run.failure_owned.len > 0) self.allocator.free(run.failure_owned);
         run.failure_owned = self.allocator.dupe(u8, reason[0..@min(reason.len, MAX_FAILURE_REASON)]) catch "";
     }
@@ -779,7 +780,7 @@ pub const ProcessingHandler = struct {
             return;
         }
         if (@import("../protocol/names.zig").hasControl(def.name)) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, comptime @import("../protocol/names.zig").controlRefusal("job"));
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, comptime @import("../protocol/names.zig").controlRefusal("a job name"));
             return;
         }
         const home = if (req.namespace.len > 0) req.namespace else "default";
@@ -1470,7 +1471,7 @@ pub const ProcessingHandler = struct {
         var count: usize = 0;
         for (specs) |*spec| {
             const result = native_registry.create(self.allocator, spec, tags) catch |err| {
-                if (loud) log.err("processing job {s}: pipeline not started: operator '{f}' (type {f}) can't be built: {}", .{ job_id, std.zig.fmtString(spec.name), std.zig.fmtString(spec.type_name), err });
+                if (loud) log.err("processing job {s}: pipeline not started: operator '{f}' (type {f}) can't be built: {}", .{ job_id, client_names.escaped(spec.name), client_names.escaped(spec.type_name), err });
                 for (backings[0..count]) |*b| b.deinit(self.allocator);
                 return null;
             };
@@ -2800,7 +2801,7 @@ pub const ProcessingHandler = struct {
         if (now - job.drop_warn_ms < 30_000) return;
         job.drop_warn_ms = now;
         // Its records' doing, not the server's.
-        log.warn("job '{s}': {s} sink '{f}': record dropped: {f} ({d} dropped by this job so far)", .{ self.ticking_job, kind, std.zig.fmtString(target), std.zig.fmtString(why), job.write_drops });
+        log.warn("job '{s}': {s} sink '{f}': record dropped: {f} ({d} dropped by this job so far)", .{ self.ticking_job, kind, client_names.escaped(target), client_names.escaped(why), job.write_drops });
     }
 
     /// A whole record skipped by every sink: counted as dropped, said in
@@ -2817,7 +2818,7 @@ pub const ProcessingHandler = struct {
         const now = self.nowMs();
         if (now - job.drop_warn_ms < 30_000) return;
         job.drop_warn_ms = now;
-        log.err("job '{s}': {f} skipped: {f} ({d} skipped by this job so far)", .{ self.ticking_job, std.zig.fmtString(at), std.zig.fmtString(why), job.drops });
+        log.err("job '{s}': {f} skipped: {f} ({d} skipped by this job so far)", .{ self.ticking_job, client_names.escaped(at), client_names.escaped(why), job.drops });
     }
 
     /// A batch stopped short of memory before the record at `at`: that
@@ -2832,7 +2833,7 @@ pub const ProcessingHandler = struct {
         const now = self.nowMs();
         if (now - job.memory_warn_ms < 30_000) return;
         job.memory_warn_ms = now;
-        log.warn("job '{s}': short of memory at {f}: the batch stops before it, and it is read again next tick ({d} so far)", .{ self.ticking_job, std.zig.fmtString(at), job.memory_stalls });
+        log.warn("job '{s}': short of memory at {f}: the batch stops before it, and it is read again next tick ({d} so far)", .{ self.ticking_job, client_names.escaped(at), job.memory_stalls });
     }
 
     /// `n` records an operator couldn't read, skipped: counted as dropped,
@@ -2849,7 +2850,7 @@ pub const ProcessingHandler = struct {
         const now = self.nowMs();
         if (now - job.drop_warn_ms < 30_000) return;
         job.drop_warn_ms = now;
-        log.warn("job '{s}': {f} skipped: {f} ({d} skipped by this job so far)", .{ self.ticking_job, std.zig.fmtString(at), std.zig.fmtString(why), job.drops });
+        log.warn("job '{s}': {f} skipped: {f} ({d} skipped by this job so far)", .{ self.ticking_job, client_names.escaped(at), client_names.escaped(why), job.drops });
     }
 
     /// A record the operator chain failed on is skipped; said once per

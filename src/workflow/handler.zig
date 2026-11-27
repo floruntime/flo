@@ -28,6 +28,7 @@
 //! | workflow_list_defs   | (unused)          | (empty)                             |
 
 const std = @import("std");
+const client_names = @import("../protocol/names.zig");
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
 const gate = @import("../budget/gate.zig");
@@ -121,7 +122,7 @@ const ShownKey = struct {
     pub fn format(self: ShownKey, w: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.key.len < KEY_PREFIX) return w.writeAll("(no key)");
         // Escaped: a run id may be the client's own choice.
-        try w.print("{f} (namespace {d})", .{ std.zig.fmtString(keyName(self.key)), keyNamespace(self.key).int() });
+        try w.print("{f} (namespace {d})", .{ client_names.escaped(keyName(self.key)), keyNamespace(self.key).int() });
     }
 };
 
@@ -1145,7 +1146,7 @@ pub const WorkflowHandler = struct {
     fn parseStored(self: *WorkflowHandler, yaml: []const u8, def_key: []const u8) parser.ParseError!parser.WorkflowDefinition {
         var diag: parser.Diagnostic = .{};
         return parser.parseWorkflow(self.allocator, yaml, &diag) catch |err| {
-            log.err("workflow {f} not loaded: {f}", .{ shown(def_key), std.zig.fmtString(if (err == error.OutOfMemory) "out of memory" else diag.message()) });
+            log.err("workflow {f} not loaded: {f}", .{ shown(def_key), client_names.escaped(if (err == error.OutOfMemory) "out of memory" else diag.message()) });
             return err;
         };
     }
@@ -1173,7 +1174,26 @@ pub const WorkflowHandler = struct {
         defer def.deinit(self.allocator);
 
         if (@import("../protocol/names.zig").hasControl(def.name)) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, comptime "bad request: " ++ @import("../protocol/names.zig").controlRefusal("a workflow"));
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, comptime @import("../protocol/names.zig").controlRefusal("a workflow name"));
+            return null;
+        }
+        // The names it waits on and reads from are names, as a request's are.
+        if (def.trigger) |t| if (@import("../protocol/names.zig").hasControl(t.stream)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, comptime @import("../protocol/names.zig").controlRefusal("a stream name"));
+            return null;
+        };
+        const waitsOnControl = struct {
+            fn of(step: definition.Step) bool {
+                return switch (step) {
+                    .wait_for_signal => |w| @import("../protocol/names.zig").hasControl(w.signal_type),
+                    else => false,
+                };
+            }
+        }.of;
+        var control_signal = waitsOnControl(def.start);
+        for (def.steps) |s| control_signal = control_signal or waitsOnControl(s.step);
+        if (control_signal) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, comptime @import("../protocol/names.zig").controlRefusal("a signal type"));
             return null;
         }
         // Its runs' history names it: no longer than that may.
@@ -1213,11 +1233,16 @@ pub const WorkflowHandler = struct {
             return null;
         }
 
-        // Workflow name must be sent as req.key by all callers (CLI extracts
-        // it from YAML client-side). The server validates it matches the
-        // parsed definition to catch mismatches early.
+        // The name is the request's key (the CLI takes it from the
+        // definition), and the definition is stored under it: the two must
+        // be the same name, or the definition would be kept under one name
+        // while its text says another.
         if (req.key.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow name is required as key");
+            return null;
+        }
+        if (!std.mem.eql(u8, req.key, def.name)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: the request's workflow name and its definition's name differ");
             return null;
         }
         const name = req.key;
@@ -1652,6 +1677,10 @@ pub const WorkflowHandler = struct {
             return null;
         }
         const signal_type = req.value[2 .. 2 + sig_len];
+        if (@import("../protocol/names.zig").hasControl(signal_type)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, comptime @import("../protocol/names.zig").controlRefusal("a signal type"));
+            return null;
+        }
         // A leading '_' is reserved for types the server makes.
         if (signal_type.len > 0 and signal_type[0] == '_') {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "reserved signal type: a leading '_' is the system's");
@@ -3258,7 +3287,7 @@ pub const WorkflowHandler = struct {
         // point into the call's record, a copy of applied state this shard
         // keeps until the clear below applies.
         const call = callOf(shard, run, action_rid);
-        if (call == null) log.warn("workflow run {f}: the call of action run {f} its step waits for is gone; the step fails", .{ shown(run_ns_key), std.zig.fmtString(action_rid) });
+        if (call == null) log.warn("workflow run {f}: the call of action run {f} its step waits for is gone; the step fails", .{ shown(run_ns_key), client_names.escaped(action_rid) });
         const Settled = enum { completed, failed, timed_out, no_action, refused, lost };
         const settled: Settled = if (call) |c| switch (c.state) {
             .done => switch (std.enums.fromInt(ae.DoneStatus, c.status) orelse .failed) {
@@ -3878,7 +3907,7 @@ pub const WorkflowHandler = struct {
                 run.run_id_owned,
             );
             return resolver.resolve(trimmed) catch |err| {
-                log.warn("Workflow output path resolution failed for '{f}': {}", .{ std.zig.fmtString(trimmed), err });
+                log.warn("Workflow output path resolution failed for '{f}': {}", .{ client_names.escaped(trimmed), err });
                 return null;
             };
         }
@@ -11503,7 +11532,7 @@ test "workflow handler: a key in a log line shows its name escaped, so a client'
     var kb: [KEY_PREFIX + 16]u8 = undefined;
     var out: [64]u8 = undefined;
     const line = try std.fmt.bufPrint(&out, "{f}", .{shown(writeKey(&kb, .default, "r\n1\x1b"))});
-    try testing.expectEqualStrings("r\\n1\\x1b (namespace 1)", line);
+    try testing.expectEqualStrings("r\\x0a1\\x1b (namespace 1)", line);
 }
 
 test "workflow quota: a due timer or signal timeout is held without a copy, and its release arms it again from its wait" {
