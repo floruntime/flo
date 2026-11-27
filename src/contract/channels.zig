@@ -42,6 +42,7 @@ const persistence = @import("../storage/persistence.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const node_router = @import("../node/router.zig");
 const store_mod = @import("store.zig");
+const plant = @import("../plant.zig");
 const ns_table = @import("../namespace/table.zig");
 
 const Entry = entry_mod.Entry;
@@ -127,8 +128,16 @@ pub const ParkFam = view_mod.Family(59, "channel.parked", .shard, Stored(Parked)
 /// What one namespace's messages to one peer hold of its outbox, in
 /// payload bytes: what its share is held to before it sends (`shareHeld`). A record only
 /// while it holds any, so the family is as sparse as the traffic.
+///
+/// `delivered` is what of `bytes` its receiver has already taken, waiting on
+/// the trim. Only the history lane has one: its receiver is this group, so
+/// the inbound that lands a message writes the same store as its send.
+/// Landing moves a message's bytes from here to its namespace's history
+/// usage in one apply, and the trim takes them off `bytes` and `delivered`
+/// together, so `usage + bytes - delivered` doesn't move at either.
 pub const NsBytes = Record(&.{
     .{ .name = "bytes", .T = Int(u64) },
+    .{ .name = "delivered", .T = Int(u64) },
 });
 
 pub const OutNsFam = view_mod.Family(54, "channel.out_ns", .shard, Stored(NsBytes));
@@ -160,6 +169,81 @@ pub fn nsBytesOf(read: ReadView, to: u16, lane: Lane, ns: ns_table.Id) u64 {
     var kb: [OUT_NS_KEY]u8 = undefined;
     const v = read.get(OutNsFam, outNsKey(&kb, to, lane, ns)) catch null;
     return if (v) |x| x.v.bytes else 0;
+}
+
+/// The payload bytes namespace `ns`'s history messages to this group `own`
+/// hold that no inbound has taken yet: sent, not landed. Saturating: the
+/// applies cap `delivered` at `bytes`, but this is read by the leader's
+/// step check and by `namespace info`, where a slip must read as none
+/// rather than panic.
+pub fn nsUntakenOf(read: ReadView, own: u16, ns: ns_table.Id) u64 {
+    var kb: [OUT_NS_KEY]u8 = undefined;
+    const v = read.get(OutNsFam, outNsKey(&kb, own, .history, ns)) catch null;
+    return if (v) |x| x.v.bytes -| x.v.delivered else 0;
+}
+
+/// A test's store with `ns`'s history-lane row to group `own` at `bytes`,
+/// `delivered` of them taken, as sends and inbounds would leave it.
+pub fn setHistoryForTest(store: *store_mod.Store, own: u16, ns: ns_table.Id, bytes: u64, delivered: u64) !void {
+    var kb: [OUT_NS_KEY]u8 = undefined;
+    const k = outNsKey(&kb, own, .history, ns);
+    var vb: [NsBytes.max_size]u8 = undefined;
+    const v = try NsBytes.encodeInto(&vb, .{ .bytes = bytes, .delivered = delivered });
+    if (store.find(OutNsFam.ID, k)) |node| {
+        store.replace(OutNsFam.ID, node, try store.allocator.dupe(u8, v));
+    } else store.link(OutNsFam.ID, try store.allocRecord(k), try store.allocator.dupe(u8, v));
+}
+
+/// Why this group's history lane's per-namespace rows aren't its outbox's
+/// messages, or null: each namespace's `bytes` is its messages' payloads
+/// still in the outbox, and its `delivered` those of them its inbound has
+/// taken. With the history usage's own rule, it holds a namespace's
+/// in-flight history to what its sends and lands put there.
+pub fn historyTakenRule(read: ReadView, a: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
+    const own: u16 = if (read.store.place) |pl| pl.group else 0;
+    const meta = metaOf(read, own, .history);
+    const applied = if (inOf(read, own, .history)) |i| i.applied else 0;
+    var sums: std.AutoHashMapUnmanaged(u32, NsBytes.Value) = .empty;
+    defer sums.deinit(a);
+    var seq = meta.acked + 1;
+    while (seq < meta.next_seq) : (seq += 1) {
+        var ok: [OUT_KEY]u8 = undefined;
+        const out = (read.get(OutFam, outKey(&ok, own, .history, seq)) catch return "a history outbox message could not be read") orelse return "a history outbox message is missing";
+        const gop = try sums.getOrPut(a, out.v.origin_ns);
+        if (!gop.found_existing) gop.value_ptr.* = .{ .bytes = 0, .delivered = 0 };
+        gop.value_ptr.bytes += out.v.payload.len;
+        if (seq <= applied) gop.value_ptr.delivered += out.v.payload.len;
+    }
+    var pb: [1 + OUT_NS.len + CHAN_LEN]u8 = undefined;
+    var it = read.range(OutNsFam, outNsPrefix(&pb, own, .history));
+    var rows: usize = 0;
+    while (it.next() catch return "the history lane's namespace rows could not be read") |item| {
+        rows += 1;
+        const id = std.mem.readInt(u32, item.key[item.key.len - 4 ..][0..4], .big);
+        const want = sums.get(id) orelse return "a history lane's namespace row holds bytes no outbox message has";
+        if (item.value.v.bytes != want.bytes) return "a history lane's namespace bytes aren't its outbox messages'";
+        if (item.value.v.delivered != want.delivered) return "a history lane's namespace taken bytes aren't what its inbound took";
+    }
+    if (rows != sums.count()) return "a namespace's history outbox messages have no row";
+    return null;
+}
+
+/// A history message of `ns`, `len` bytes, taken by its inbound: landed,
+/// refused or skipped, its bytes no longer in flight.
+fn takeHistory(view: *View, own: u16, ns: ns_table.Id, len: u64) ApplyError!void {
+    var nk: [OUT_NS_KEY]u8 = undefined;
+    const ns_key = outNsKey(&nk, own, .history, ns);
+    // Sent and not trimmed, so its row is there, as the trim holds it to.
+    const held = (try view.getOwn(OutNsFam, ns_key)) orelse return error.Halt;
+    // Taken past what was sent is an accounting slip, not a broken log:
+    // capped and counted with the history usage's drift, never a halt,
+    // which every replica would hit again on replay.
+    var delivered = held.v.delivered + len;
+    if (delivered > held.v.bytes) {
+        view.history_usage_drift += 1;
+        delivered = held.v.bytes;
+    }
+    try view.putOwn(OutNsFam, ns_key, .{ .v = .{ .bytes = held.v.bytes, .delivered = delivered } });
 }
 
 /// Parked keys live under a namespace of their own, so an unpark can declare
@@ -456,8 +540,8 @@ pub fn writeSends(view: *View, index: u64) ApplyError!void {
         try view.putOwn(MetaFam, meta_key, .{ .v = meta });
         var nk: [OUT_NS_KEY]u8 = undefined;
         const ns_key = outNsKey(&nk, to, lane, s.origin.ns);
-        const held: u64 = if (try view.getOwn(OutNsFam, ns_key)) |v| v.v.bytes else 0;
-        try view.putOwn(OutNsFam, ns_key, .{ .v = .{ .bytes = held + s.payload.len } });
+        const held: NsBytes.Value = if (try view.getOwn(OutNsFam, ns_key)) |v| v.v else .{ .bytes = 0, .delivered = 0 };
+        try view.putOwn(OutNsFam, ns_key, .{ .v = .{ .bytes = held.bytes + s.payload.len, .delivered = held.delivered } });
     }
     view.sends.clearRetainingCapacity();
 }
@@ -729,6 +813,12 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 // is taken, so a resend is a duplicate.
                 if (skip) |*sk| if (sk.skips(seq)) {
                     try skipMessage(view, e, m, p.from, lane, seq, ordinal, sk);
+                    // A skipped history message adds less than its bytes to
+                    // its namespace's usage, if anything: eased.
+                    if (lane == .history and comptime plant.active != .history_skip_untaken) {
+                        try takeHistory(view, place.group, .of(m.origin_ns), m.payload.len);
+                        view.quota_eased.add(m.origin_ns);
+                    }
                     applied = seq;
                     continue;
                 };
@@ -789,6 +879,14 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                     if (r.refused() == null) if (tooMuchSent(view.sends.items[mark.sends..])) |why| r.refuse(.bad_request, .malformed, why);
                 }
                 if (r.refused() != null) try view.rollback(mark) else try writeSends(view, e.header.index);
+                // Landed or refused, after any rollback: taken either way.
+                // A refused one added nothing to its namespace's usage, and
+                // the rollback took back any ease its apply marked, so its
+                // taken bytes lower the in-flight history here.
+                if (lane == .history) {
+                    try takeHistory(view, place.group, .of(m.origin_ns), m.payload.len);
+                    if (r.refused() != null) view.quota_eased.add(m.origin_ns);
+                }
                 try store.messages.append(store.allocator, .{ .entry = as, .result = r, .ordinal = ordinal, .from = p.from, .seq = seq, .sender_bug = bug });
                 store.applying = null;
                 applied = seq;
@@ -1065,7 +1163,22 @@ pub fn Channels(comptime targets: []const machine_mod.Machine) type {
                 const ns_key = outNsKey(&nk, p.to, lane, .of(out.v.origin_ns));
                 const held = (try view.get(OutNsFam, ns_key)) orelse return error.Halt;
                 if (held.v.bytes < out.v.payload.len) return error.Halt;
-                if (held.v.bytes == out.v.payload.len) try view.delete(OutNsFam, ns_key) else try view.put(OutNsFam, ns_key, .{ .v = .{ .bytes = held.v.bytes - out.v.payload.len } });
+                // A history message is trimmed only once its inbound took
+                // it. One that wasn't, or taken bytes left with none sent, is
+                // an accounting slip: counted as the history usage's drift,
+                // never a halt (`takeHistory`).
+                const taken: u64 = if (lane == .history) out.v.payload.len else 0;
+                // Trimming bytes no inbound took lowers in-flight history.
+                if (held.v.delivered < taken) {
+                    view.history_usage_drift += 1;
+                    view.quota_eased.add(out.v.origin_ns);
+                }
+                var left: NsBytes.Value = .{ .bytes = held.v.bytes - out.v.payload.len, .delivered = held.v.delivered -| taken };
+                if (left.delivered > left.bytes) {
+                    view.history_usage_drift += 1;
+                    left.delivered = left.bytes;
+                }
+                if (left.bytes == 0) try view.delete(OutNsFam, ns_key) else try view.put(OutNsFam, ns_key, .{ .v = left });
                 try view.delete(OutFam, key);
             }
             meta.acked = p.through;
@@ -1200,6 +1313,106 @@ fn inboundOn(sender: *Group, from: u16, to: u16, lane: Lane, first: u64, n: u64,
         try ce.Message.encode(&mw, .{ .slot = o.slot, .entry_type = o.entry_type, .layout_epoch = o.layout_epoch, .flags = o.flags, .origin_kind = o.origin_kind, .origin_ns = o.origin_ns, .payload = o.payload });
     }
     return ce.Inbound.encodeInto(buf, .{ .from = from, .lane = @backingInt(lane), .first_seq = first, .messages = .{ .bytes = mw.written(), .count = @intCast(n) } }) catch unreachable;
+}
+
+test "channels: a history message's bytes stay in its outbox until the trim, but are untaken only until its inbound takes them" {
+    // A quota counts a namespace's history as landed plus untaken: the
+    // inbound that lands a message and the later trim each leave that sum
+    // where it was, so a hold at it doesn't flap.
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    try a.probeTo(2, "hist-one-000000H");
+    try a.probeTo(2, "hist-two-000000H");
+    const one = a.outOn(0, .history, 1).?.payload.len;
+    const ns = probe.PROBE_ORIGIN.ns;
+    try testing.expectEqual(2 * one, nsUntakenOf(a.read(), 0, ns));
+    var buf: [8192]u8 = undefined;
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .history, 1, 1, &buf));
+    try testing.expectEqual(2 * one, nsBytesOf(a.read(), 0, .history, ns));
+    try testing.expectEqual(one, nsUntakenOf(a.read(), 0, ns));
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .history, 1, 2, &buf));
+    try testing.expectEqual(@as(u64, 0), nsUntakenOf(a.read(), 0, ns));
+    // Another namespace's untaken bytes are none of this one's.
+    try testing.expectEqual(@as(u64, 0), nsUntakenOf(a.read(), 0, .of(ns.int() + 1)));
+    var tb: [64]u8 = undefined;
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&tb, .{ .to = 0, .lane = @backingInt(Lane.history), .first = 1, .through = 1 }));
+    try testing.expectEqual(one, nsBytesOf(a.read(), 0, .history, ns));
+    try testing.expectEqual(@as(u64, 0), nsUntakenOf(a.read(), 0, ns));
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&tb, .{ .to = 0, .lane = @backingInt(Lane.history), .first = 2, .through = 2 }));
+    try testing.expectEqual(@as(usize, 0), a.store.family(OutNsFam.ID).count);
+}
+
+test "channels: a partial trim of a history lane leaves its namespace's untaken bytes where they were" {
+    // Three sent, two taken, one trimmed: what's left in the outbox and
+    // taken both lose the trimmed message, so untaken doesn't move.
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    try a.probeTo(2, "hist-one-000000H");
+    try a.probeTo(2, "hist-two-000000H");
+    try a.probeTo(2, "hist-thr-000000H");
+    const one = a.outOn(0, .history, 1).?.payload.len;
+    const ns = probe.PROBE_ORIGIN.ns;
+    var buf: [8192]u8 = undefined;
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .history, 1, 2, &buf));
+    try testing.expectEqual(one, nsUntakenOf(a.read(), 0, ns));
+    var tb: [64]u8 = undefined;
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&tb, .{ .to = 0, .lane = @backingInt(Lane.history), .first = 1, .through = 1 }));
+    try testing.expectEqual(2 * one, nsBytesOf(a.read(), 0, .history, ns));
+    try testing.expectEqual(one, nsUntakenOf(a.read(), 0, ns));
+    try testing.expectEqual(@as(u64, 0), a.store.history_usage_drift);
+    try testing.expect(!a.store.quota_eased.any());
+    try testing.expectEqual(@as(?[]const u8, null), try historyTakenRule(a.read(), testing.allocator));
+}
+
+test "channels: a history message's taken bytes past what was sent are capped and counted as drift, and read as none untaken" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    try a.probeTo(2, "hist-one-000000H");
+    try a.probeTo(2, "hist-two-000000H");
+    const one = a.outOn(0, .history, 1).?.payload.len;
+    const ns = probe.PROBE_ORIGIN.ns;
+    // A row whose taken bytes passed what it holds reads as none untaken,
+    // never an overflow.
+    try setHistoryForTest(&a.store, 0, ns, one, 3 * one);
+    try testing.expectEqual(@as(u64, 0), nsUntakenOf(a.read(), 0, ns));
+    // The inbound's take past what was sent is capped there and counted.
+    try setHistoryForTest(&a.store, 0, ns, 2 * one, 2 * one);
+    var buf: [8192]u8 = undefined;
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .history, 1, 1, &buf));
+    try testing.expectEqual(@as(u64, 1), a.store.history_usage_drift);
+    try testing.expectEqual(@as(u64, 0), nsUntakenOf(a.read(), 0, ns));
+    // A trim leaving more taken than held caps it too, and counts it.
+    try setHistoryForTest(&a.store, 0, ns, 2 * one, 2 * one + 5);
+    var tb: [64]u8 = undefined;
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&tb, .{ .to = 0, .lane = @backingInt(Lane.history), .first = 1, .through = 1 }));
+    try testing.expectEqual(@as(u64, 2), a.store.history_usage_drift);
+    try testing.expectEqual(one, nsBytesOf(a.read(), 0, .history, ns));
+    try testing.expectEqual(@as(u64, 0), nsUntakenOf(a.read(), 0, ns));
+}
+
+test "channels: a refused history message, or a trim of one no inbound took, eases its namespace; a landed one doesn't" {
+    var a = Group.init(0, 2);
+    defer a.deinit();
+    try a.probeTo(2, "hist-one-000000H");
+    try a.probeTo(2, "refuse-this-000H");
+    try a.probeTo(2, "hist-thr-000000H");
+    try a.probeTo(2, "hist-fou-000000H");
+    const ns = probe.PROBE_ORIGIN.ns;
+    var buf: [8192]u8 = undefined;
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .history, 1, 1, &buf));
+    try testing.expect(!a.store.quota_eased.any());
+    _ = try a.run(&Probed.machine, .channel_inbound, try inboundOn(&a, 0, 0, .history, 2, 1, &buf));
+    try testing.expect(a.got("refuse-this-000H") == null);
+    try testing.expect(a.store.quota_eased.has(ns.int()));
+    try testing.expect(!a.store.quota_eased.all);
+    a.store.quota_eased = .{};
+    var tb: [64]u8 = undefined;
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&tb, .{ .to = 0, .lane = @backingInt(Lane.history), .first = 1, .through = 2 }));
+    try testing.expect(!a.store.quota_eased.any());
+    // Message 3 was never taken: trimming it lowers in-flight history.
+    _ = try a.run(&Probed.machine, .channel_trim, try ce.Trim.encodeInto(&tb, .{ .to = 0, .lane = @backingInt(Lane.history), .first = 3, .through = 3 }));
+    try testing.expect(a.store.quota_eased.has(ns.int()));
+    try testing.expectEqual(@as(u64, 1), a.store.history_usage_drift);
 }
 
 test "channels: a history message rides its own lane, with its own seqs, outbox, mark and trims; the main lane's go on beside it" {

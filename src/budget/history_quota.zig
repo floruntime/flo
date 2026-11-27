@@ -18,6 +18,8 @@ const delivery = @import("../contract/delivery.zig");
 const persistence = @import("../storage/persistence.zig");
 const settings = @import("../settings/machine.zig");
 const hm = @import("../stream/history_machine.zig");
+const channels = @import("../contract/channels.zig");
+const entry_mod = @import("../storage/ual/entry.zig");
 const NamespaceId = @import("../namespace/table.zig").Id;
 
 const View = view_mod.View;
@@ -108,7 +110,7 @@ pub fn verdict(comptime Own: type, view: *View, ns: NamespaceId, own: u64, arm: 
     const read: ReadView = .{ .store = view.store };
     const part = (settings.boundQuota(read, ns) orelse return null).part_bytes;
     if (part == settings.NO_QUOTA) return null;
-    const use = hm.usageOf(read, ns).bytes;
+    const use = inFlightIn(view, ns);
     const reserved = (try reservedIn(Own, view, ns)) +| reservedOf(Other, read, ns);
     const over: Over = .{ .use = use, .reserved = reserved, .part = part, .own = own };
     if (use >= part) return over;
@@ -123,19 +125,52 @@ pub fn verdict(comptime Own: type, view: *View, ns: NamespaceId, own: u64, arm: 
 pub fn preCheck(read: ReadView, ns: NamespaceId, own: u64) ?Over {
     const part = (settings.boundQuota(read, ns) orelse return null).part_bytes;
     if (part == settings.NO_QUOTA) return null;
-    const use = hm.usageOf(read, ns).bytes;
+    const use = inFlight(read, ns);
     const reserved = reservedOf(WorkflowReserved, read, ns) +| reservedOf(ActionReserved, read, ns) +| own;
     const over: Over = .{ .use = use, .reserved = reserved, .part = part, .own = own };
     if (use >= part or use +| reserved > part) return over;
     return null;
 }
 
-/// Whether `ns`'s usage has reached its part, as committed: a non-waking
-/// signal's arm, for a model to predict.
+/// Whether `ns`'s in-flight history has reached its part, as committed: a
+/// non-waking signal's arm, for a model to predict, and what holds a
+/// namespace's runs' steps (the step hold).
+///
+/// A bare compare, with no hysteresis: a hold at it doesn't flap only
+/// because `inFlight` doesn't move when a chunk lands or is trimmed
+/// (`channels.NsBytes.delivered`). A change to what `inFlight` counts must
+/// keep that, or holds start and clear with every land. What lowers it (a
+/// lost chunk, a fold left unread or skipped, a drop) and a larger bound
+/// part mark the namespace eased (`Store.Eased`), which is what asks its
+/// holds again.
 pub fn atUsage(read: ReadView, ns: NamespaceId) bool {
     const part = (settings.boundQuota(read, ns) orelse return false).part_bytes;
     if (part == settings.NO_QUOTA) return false;
-    return hm.usageOf(read, ns).bytes >= part;
+    return inFlight(read, ns) >= part;
+}
+
+/// `ns`'s history on this shard as committed, landed or on its way: its
+/// usage and what of its own history-lane bytes no inbound has taken. Its
+/// own namespace's alone: never the lane's total, nor its cap.
+pub fn inFlight(read: ReadView, ns: NamespaceId) u64 {
+    const own: u16 = if (read.store.place) |pl| pl.group else 0;
+    return hm.usageOf(read, ns).bytes +| channels.nsUntakenOf(read, own, ns);
+}
+
+/// `inFlight` as this apply sees it, as `historyHeld` sums a lane: the
+/// committed figure, which a land earlier in the apply leaves where it was,
+/// with the sends it holds for `ns` (origin `ns`, on the history lane). An
+/// earlier message's sends in the same inbound are already in the outbox's
+/// staged rows, which this doesn't read: so it may count up to one inbound's
+/// history short, and admit, never hold, on it. That is the one step in
+/// flight the workflow reserve counts.
+fn inFlightIn(view: *const View, ns: NamespaceId) u64 {
+    const read: ReadView = .{ .store = view.store };
+    var n = inFlight(read, ns);
+    for (view.sends.items) |snd| if (snd.flags & entry_mod.Flags.HISTORY != 0 and snd.origin.ns == ns) {
+        n +|= snd.payload.len;
+    };
+    return n;
 }
 
 /// The refusal for an admission `o` holds back, under 128 bytes, from the
@@ -224,6 +259,40 @@ test "history quota: a leader's check sums both machines' reserves and its own a
     try setForTest(&store, .default, 1000, 1000);
     try testing.expect(preCheck(read, .default, 0) != null);
     try testing.expect(atUsage(read, .default));
+}
+
+test "history quota: a namespace's in-flight history is its usage and its own untaken lane bytes; another namespace's, landed, untaken or staged, moves nothing of it" {
+    const Store = @import("../contract/store.zig").Store;
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    store.place = .{ .group = 0, .count = 1 };
+    const read: ReadView = .{ .store = &store };
+    const a: NamespaceId = .of(7);
+    const b: NamespaceId = .of(8);
+    try setForTest(&store, a, 1000, 600);
+    // Its own: 300 sent, 100 of them taken (landed, in its usage already).
+    try channels.setHistoryForTest(&store, 0, a, 300, 100);
+    try testing.expectEqual(@as(u64, 800), inFlight(read, a));
+    try testing.expect(!atUsage(read, a));
+    // Another namespace's: far past the part, landed and untaken.
+    try setForTest(&store, b, 1000, 5000);
+    try channels.setHistoryForTest(&store, 0, b, 9000, 10);
+    try testing.expectEqual(@as(u64, 800), inFlight(read, a));
+    try testing.expect(!atUsage(read, a));
+    try testing.expect(preCheck(read, a, 200) == null);
+    // Staged in an apply: only its own sends count.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var keys = KeySet.init(arena.allocator());
+    var view = View.init(&store, arena.allocator(), &keys);
+    view.place = store.place;
+    try view.sends.append(arena.allocator(), .{ .origin = .user(b), .slot = 0, .entry_type = 0, .flags = entry_mod.Flags.HISTORY, .payload = &@as([500]u8, @splat('x')) });
+    try testing.expectEqual(@as(u64, 800), inFlightIn(&view, a));
+    try view.sends.append(arena.allocator(), .{ .origin = .user(a), .slot = 0, .entry_type = 0, .flags = entry_mod.Flags.HISTORY, .payload = &@as([200]u8, @splat('x')) });
+    try testing.expectEqual(@as(u64, 1000), inFlightIn(&view, a));
+    // A send that isn't history is none of it.
+    try view.sends.append(arena.allocator(), .{ .origin = .user(a), .slot = 0, .entry_type = 0, .flags = 0, .payload = &@as([200]u8, @splat('x')) });
+    try testing.expectEqual(@as(u64, 1000), inFlightIn(&view, a));
 }
 
 test "history quota: the refusal names the namespace's own figures in under 128 bytes, and a run past its part says so" {

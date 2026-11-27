@@ -6,6 +6,13 @@
 //! run's last chunk. The records each apply landed are kept until the
 //! next, for its family to check against the entry that sent them.
 //!
+//! Once a deliver lands anything, the lane's taken messages are trimmed
+//! after it, all of them or the older half, as an entry's index picks, so
+//! the lane's per-namespace rows see trims, partial ones and none, and the
+//! conservation rule (`historyTakenRule`) is checked across them. A
+//! deliver that lands nothing trims nothing, so a refused entry still
+//! leaves the store as it was.
+//!
 //! A deleted run's drop is lost, as a repair's skip loses it, as many times
 //! as `dropLosses` says for its incarnation: none, once or twice for some,
 //! as many as the machine's retries for others, so each family sees a drop land, land
@@ -85,10 +92,13 @@ pub const Landed = struct {
         self.dropFresh(a);
         var k: u64 = 0;
         while (true) : (k += 1) {
-            if (k + 1 >= STRIDE) return error.Halt;
+            if (k + 2 >= STRIDE) return error.Halt;
             const next = channels.metaOf(rv, 0, .history).next_seq;
             const applied = if (channels.inOf(rv, 0, .history)) |i| i.applied else 0;
-            if (applied + 1 >= next) return null;
+            if (applied + 1 >= next) {
+                if (k > 0) try trim(store, scratch, e, applied);
+                return null;
+            }
             const seq = applied + 1;
             var kb: [channels.OUT_KEY]u8 = undefined;
             const o = ((rv.get(channels.OutFam, channels.outKey(&kb, 0, .history, seq)) catch return error.Halt) orelse return error.Halt).v;
@@ -118,6 +128,26 @@ pub const Landed = struct {
             try machine_mod.applyEntry(&Lane.machine, store, scratch, &ie, &res);
             if (res.refused() != null) return error.Halt;
         }
+    }
+
+    /// The lane's taken messages trimmed after entry `e`'s delivers: all,
+    /// or the older half; on every third index none.
+    fn trim(store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, e: *const entry_mod.Entry, applied: u64) persistence.ApplyError!void {
+        const acked = channels.metaOf(.{ .store = store }, 0, .history).acked;
+        if (applied <= acked or e.header.index % 3 == 0) return;
+        const span = applied - acked;
+        const through = acked + @min(if (e.header.index % 3 == 1) span else (span + 1) / 2, ce.MAX_TRIM_SPAN);
+        var tb: [64]u8 = undefined;
+        const payload = ce.Trim.encodeInto(&tb, .{ .to = 0, .lane = @backingInt(channels.Lane.history), .first = acked + 1, .through = through }) catch return error.Halt;
+        var h = std.mem.zeroes(entry_mod.Header);
+        h.entry_type = @backingInt(entry_mod.EntryType.channel_trim);
+        h.index = e.header.index * STRIDE + STRIDE - 1;
+        h.timestamp_ns = e.header.timestamp_ns;
+        h.payload_len = @intCast(payload.len);
+        const te: entry_mod.Entry = .{ .header = h, .payload = payload };
+        var res = persistence.Result.start(&te);
+        try machine_mod.applyEntry(&Lane.machine, store, scratch, &te, &res);
+        if (res.refused() != null) return error.Halt;
     }
 
     /// The ids of the run incarnations whose chunks the last `deliver`

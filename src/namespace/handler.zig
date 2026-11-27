@@ -968,6 +968,9 @@ pub const NamespaceHandler = struct {
             .orphan_bytes = u.orphan_bytes,
             .reserved_workflow_bytes = hq.reservedOf(hq.WorkflowReserved, rv, ns),
             .reserved_action_bytes = hq.reservedOf(hq.ActionReserved, rv, ns),
+            .in_flight_bytes = hq.inFlight(rv, ns),
+            // Leader memory: only the shard's leader knows it.
+            .held_runs = if (shard.raft_node.role == .leader) @intCast(shard.workflow_handler.holdCount(.{ .ns = ns, .kind = .quota })) else null,
         };
     }
 

@@ -271,10 +271,27 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     // its chunk came to: one that came to another is misrouted or forged,
     // and would key rows a move of that slot couldn't find.
     if (router.nsKeySlot(h.ns, h.owner) != msg.slot) return error.Halt;
-    return switch (h.family) {
+    const before = usageBytes(view, h.ns);
+    try switch (h.family) {
         .workflow => applyIn(Workflows, view, e, msg, h),
         .action => applyIn(Actions, view, e, msg, h),
     };
+    easedBy(view, h.ns, before, e.payload.len);
+}
+
+fn usageBytes(view: *View, ns: NamespaceId) u64 {
+    var kb: [4]u8 = undefined;
+    const k = view_mod.idKey(&kb, ns, "") catch unreachable;
+    return if (view.get(UsageFam, k) catch null) |u| u.v.bytes else 0;
+}
+
+/// A history message's bytes leave the lane as it's taken: one whose apply
+/// added less than them to its namespace's usage (a lost chunk, a fold left
+/// unread or skipped, a drop) lowered the namespace's in-flight history,
+/// which may ease its quota. A chunk or fold that lands adds exactly its
+/// bytes, so ordinary traffic eases nothing.
+fn easedBy(view: *View, ns: NamespaceId, before: u64, taken: u64) void {
+    if (usageBytes(view, ns) < before +| taken) view.quota_eased.add(ns.int());
 }
 
 fn applyIn(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Message, h: Head) ApplyError!void {
@@ -525,10 +542,12 @@ fn sendDrop(view: *View, msg: view_mod.Message, h: Head, retries: u64) ApplyErro
 fn skipped(view: *View, e: *const Entry, _: []const u8) ApplyError!void {
     const msg = view.message orelse return;
     const h = headOfEntry(e) orelse return;
-    return switch (h.family) {
+    const before = usageBytes(view, h.ns);
+    try switch (h.family) {
         .workflow => skippedIn(Workflows, view, e, msg, h),
         .action => skippedIn(Actions, view, e, msg, h),
     };
+    easedBy(view, h.ns, before, e.payload.len);
 }
 
 fn skippedIn(comptime F: type, view: *View, e: *const Entry, msg: view_mod.Message, h: Head) ApplyError!void {
@@ -1199,14 +1218,26 @@ test "history usage: a chunk counts its whole message; folds, ends and drops kee
 }
 
 test "history usage: a lost chunk counts nothing, and a run ended at its live rows keeps their bytes" {
+    const hq = @import("../budget/history_quota.zig");
     var t = H.init();
     defer t.deinit();
     const r: H.Run = .{};
     try t.chunk(r, 1, 1, false, 0);
+    // A chunk that lands moves its bytes from the lane to usage: the
+    // namespace's in-flight history, what its quota holds steps at, stays
+    // where it was, and nothing is eased.
+    const in_flight = hq.inFlight(t.read(), r.ns);
+    try testing.expect(in_flight > 0);
+    try t.pump();
+    try testing.expectEqual(in_flight, hq.inFlight(t.read(), r.ns));
+    try testing.expect(!t.store.quota_eased.any());
     try t.chunk(r, 2, 2, true, 700);
     // Seq 2 lost; then its fold (3) and both resends (4, 5).
     t.skip = &.{ 2, 3, 4, 5 };
     try t.pump();
+    // Lost, its bytes left the lane for nothing: the namespace is eased.
+    try testing.expect(t.store.quota_eased.has(r.ns.int()));
+    try testing.expect(!t.store.quota_eased.has(r.ns.int() + 1));
     var rows: [4]Row.Value = undefined;
     const got = t.live(r, &rows);
     try testing.expectEqual(@as(usize, 2), got.len);
@@ -1220,6 +1251,26 @@ test "history usage: a lost chunk counts nothing, and a run ended at its live ro
     try t.pump();
     try testing.expectEqual(@as(u64, 0), usageOf(t.read(), r.ns).bytes);
     try expectUsageRule(&t);
+}
+
+test "history usage: a chunk or a fold that lands eases nothing; a drop that lands eases its namespace alone" {
+    var t = H.init();
+    defer t.deinit();
+    const r: H.Run = .{};
+    const elsewhere: H.Run = .{ .ns = .of(17), .owner = "other" };
+    try t.chunk(elsewhere, 1, 1, false, 0);
+    // Sixteen land and a fold makes them one row: each adds its own bytes
+    // to usage as it leaves the lane.
+    for (0..16) |i| try t.chunk(r, i + 1, i + 1, false, 0);
+    try t.pump();
+    var rows: [2]Row.Value = undefined;
+    try testing.expectEqual(@as(usize, 1), t.live(r, &rows).len);
+    try testing.expect(!t.store.quota_eased.any());
+    // A drop takes the run's rows and adds nothing: eased, its own alone.
+    try t.dropOf(r, 0);
+    try t.pump();
+    try testing.expect(t.store.quota_eased.has(r.ns.int()));
+    try testing.expect(!t.store.quota_eased.has(elsewhere.ns.int()));
 }
 
 test "history usage: an orphaned run is counted once with its rows' bytes, however often its drop is lost, and a later drop takes both" {

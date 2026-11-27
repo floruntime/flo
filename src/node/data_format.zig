@@ -11,13 +11,16 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 75;
+pub const CURRENT: u32 = 76;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
 /// an older directory is refused here at boot, naming wipe, rather than at a
 /// segment open. The check below fails the build until they move together.
 /// Refusal reasons and ops are never stored, so they don't change the hash.
+/// The hash covers log entries only, not the store's records: a change to a
+/// store family's record layout is caught by nothing but this number, so it
+/// takes a new format row by hand.
 const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     .{ .format = 1, .segment_version = 2, .entries = 0x69be2cbe871ae8d3 },
     .{ .format = 2, .segment_version = 3, .entries = 0x2bef332533330bdf },
@@ -273,8 +276,15 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     .{ .format = 74, .segment_version = 44, .entries = 0x8aa1807f14af4929 },
     // A namespace's run-history quota enforced at admission: each live run's
     // reserve (workflow.reserved, action.reserved), the over_quota answer
-    // and call state, and a run's progress noting a call held at the quota.
+    // and call state, a child's refusal saying why (child_refuse's `why`),
+    // and a run's progress noting a call held at the quota.
     .{ .format = 75, .segment_version = 45, .entries = 0x056c0002022ce186 },
+    // The store's per-namespace history-lane record (channel.out_ns) gains
+    // `delivered`, the bytes its inbound has taken: a new store-record
+    // layout, which no hash here covers. And the quota's admission arms read
+    // a namespace's in-flight history (its usage plus those bytes no inbound
+    // has taken), so which entries an apply refuses moves.
+    .{ .format = 76, .segment_version = 45, .entries = 0x056c0002022ce186 },
 };
 
 comptime {

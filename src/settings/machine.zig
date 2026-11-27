@@ -223,8 +223,12 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 if (item.part_bytes == 0) continue;
                 var kb: [4]u8 = undefined;
                 const k = view_mod.idKey(&kb, .of(item.ns), "") catch unreachable;
-                if (try view.get(QuotaFam, k)) |bound| if (item.published_index < bound.v.published_index) continue;
+                const was = try view.get(QuotaFam, k);
+                if (was) |bound| if (item.published_index < bound.v.published_index) continue;
                 try view.put(QuotaFam, k, .{ .v = .{ .part_bytes = item.part_bytes, .published_index = item.published_index } });
+                // A larger part, or a first one past none, may ease the
+                // namespace's held runs (`Store.Eased`).
+                if (was == null or item.part_bytes > was.?.v.part_bytes) view.quota_eased.add(item.ns);
             }
         },
         else => {},

@@ -822,6 +822,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
 /// namespace's quota: from its names alone, which its record keeps for
 /// life, so its end releases what its start raised.
 pub fn reserveOf(workflow: []const u8, run: []const u8) u64 {
+    if (comptime plant.active == .quota_reserve_omits_step) return 0;
     return history_reserve.workflow(workflow.len, run.len);
 }
 
@@ -2843,7 +2844,7 @@ test "workflow runs machine: at its namespace's quota a signal is refused unless
     try testing.expectEqual(Wait.none, f.get("r1").?.wait);
 }
 
-test "workflow runs machine: a start's verdict counts the action runs' reserve; a signal that doesn't wake is held to the usage arm alone" {
+test "workflow runs machine: at its namespace's quota a start's verdict counts the action runs' reserve, and a signal that doesn't wake is held to the usage arm alone" {
     var f = Fixture.init();
     defer f.deinit();
     const each = reserveOf("wf", "r1");
@@ -2877,6 +2878,34 @@ test "workflow runs machine: a child's start at its namespace's quota is answere
     try testing.expectEqual(ae.Answer.over_quota, told.answer);
     try testing.expect(std.mem.startsWith(u8, told.why.?, "limit: ns 1 history "));
     try testing.expectEqual(@as(u64, 0), hq.reservedOf(hq.WorkflowReserved, .{ .store = &f.store }, .default));
+    // Counted once, after its parent's record was found.
+    try testing.expectEqual(@as(u64, 1), f.store.quota_refusals);
+    // A child start with no parent's record waiting, at the quota all the
+    // same, starts nothing and tells no one: nothing to count.
+    try testing.expect((try f.start("kid2", "kid", "child_started", "", 3)).refused() == null);
+    try testing.expect(f.get("kid2") == null);
+    try testing.expectEqual(@as(u64, 1), f.store.quota_refusals);
+}
+
+test "workflow runs machine: a leader's over_quota refusal of a child counts once, only while its parent's record waits" {
+    var f = Fixture.init();
+    defer f.deinit();
+    var crb: [ae.ChildRefuse.max_size]u8 = undefined;
+    const refusal = try ae.ChildRefuse.encodeInto(&crb, .{ .ns = NamespaceId.default.int(), .run = "kid1", .answer = .over_quota, .why = "limit: ns 1 history 1+1 over 1" });
+    try askChild(&f, "kid1");
+    _ = try f.answer(.child_refuse, refusal);
+    try testing.expectEqual(@as(u64, 1), f.store.quota_refusals);
+    try testing.expect(parentOf(.{ .store = &f.store }, .default, "kid1") == null);
+    // Refused by an earlier leader already: its record is gone, not counted.
+    _ = try f.answer(.child_refuse, refusal);
+    try testing.expectEqual(@as(u64, 1), f.store.quota_refusals);
+    // Started meanwhile: its record no longer waits, not counted.
+    try askChild(&f, "kid2");
+    try testing.expect((try f.start("kid2", "wf", "child_started", "", 9)).refused() == null);
+    var crb2: [ae.ChildRefuse.max_size]u8 = undefined;
+    _ = try f.answer(.child_refuse, try ae.ChildRefuse.encodeInto(&crb2, .{ .ns = NamespaceId.default.int(), .run = "kid2", .answer = .over_quota, .why = null }));
+    try testing.expectEqual(@as(u64, 1), f.store.quota_refusals);
+    try testing.expect(f.get("kid2") != null);
 }
 
 test "workflow runs machine: past its shard's share a client's, a schedule's and a trigger's start are refused, writing nothing" {

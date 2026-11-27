@@ -173,6 +173,16 @@ pub const WorkflowRuns = struct {
     /// What landed of each run's history.
     landed: history_lane.Landed = .{},
     ledger: Ledger = .{},
+    /// Since its namespace's in-flight history reached its part: what it
+    /// may grow to, its in-flight history then and every live run's
+    /// reserve then. The leader holds steps there, as a shard's does, so a
+    /// run's history may grow only by what its reserve counts. Null under
+    /// the part.
+    quota_cap: ?u64 = null,
+    /// The runs that took their one step in flight past the part.
+    held_stepped: [RUNS.len]bool = @splat(false),
+    /// How many times its runs reached the part.
+    quota_crossings: u64 = 0,
 
     /// What a run waits for, as its last step set it.
     const WaitL = struct {
@@ -989,7 +999,32 @@ pub const WorkflowRuns = struct {
         // The whole store at the indices the checksums are sampled at; the
         // run the entry names, and the calls, at every one.
         if (effect.broke == null) effect.broke = self.rule(store, runOf(e, kind), e.header.index % SWEEP_EVERY == 0);
+        if (effect.broke == null) effect.broke = self.heldRule(store, e, kind, effect.refused);
         return effect;
+    }
+
+    /// Past its part, a namespace's in-flight history grows only by what
+    /// the reserves live when it got there count: the step hold holds every
+    /// step but one per run in flight, and that, a wake and an end are each
+    /// run's reserve.
+    fn heldRule(self: *WorkflowRuns, store: *store_mod.Store, e: *const entry_mod.Entry, kind: Kind, refused: bool) ?[]const u8 {
+        const rv: view_mod.ReadView = .{ .store = store };
+        if (!hq.atUsage(rv, NS)) {
+            self.quota_cap = null;
+            self.held_stepped = @splat(false);
+            return null;
+        }
+        const now = hq.inFlight(rv, NS);
+        const cap = self.quota_cap orelse {
+            self.quota_crossings += 1;
+            self.quota_cap = now +| hq.reservedOf(hq.WorkflowReserved, rv, NS) +| hq.reservedOf(hq.ActionReserved, rv, NS);
+            return null;
+        };
+        if (kind == .step and !refused) if (runOf(e, kind)) |r| {
+            self.held_stepped[r] = true;
+        };
+        if (now > cap) return "past its namespace's part, its runs' history grew past what their reserves held";
+        return null;
     }
 
     fn incarnation(run: RunL, r: usize) u64 {
@@ -1101,6 +1136,7 @@ pub const WorkflowRuns = struct {
         if (!sweep) return if (touched) |t| self.runRule(store, a, t, true) else null;
         if (store.history_usage_drift != 0) return "a history usage subtract went past zero";
         if (try hm.usageRule(rv, a)) |why| return why;
+        if (try @import("../contract/channels.zig").historyTakenRule(rv, a)) |why| return why;
         if (try rm.reserveRule(store, a)) |why| return why;
         // On the store alone: counts, idempotency keys naming their run, and
         // a run's wait agreeing with its status.
@@ -1395,7 +1431,9 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
     }
     // A step of a run the leader holds, at its rev, or now and then a rev
     // another leader moved past.
-    if (roll < 34 and held.n > 0) {
+    // Past the part the leader holds steps: one per run is decided before
+    // it got there, and lands after.
+    if (roll < 34 and held.n > 0 and !(leader.quota_cap != null and r.uintLessThan(u8, 100) >= 10)) {
         // Now and then the run with the longest history, so some pass
         // what a run keeps.
         var longest: ?usize = null;
@@ -1411,6 +1449,8 @@ pub fn make(r: std.Random, buf: []u8, leader: *const WorkflowRuns) ?Made {
         }
         const pick = r.uintLessThan(u8, 100);
         const c = if (longest != null and pick < 25) longest.? else if (pick < 45) waiting.or_(r, 100, live.or_(r, 80, held.at(r))) else live.or_(r, 80, unstepped.or_(r, 30, held.at(r)));
+        // A run that took its one step past the part is held.
+        if (leader.quota_cap != null and leader.held_stepped[c]) return null;
         const vb = buf[buf.len / 2 ..];
         const spare = hoard == c and r.uintLessThan(u8, 100) < 90;
         // Now and then one decided for an incarnation of this id deleted
