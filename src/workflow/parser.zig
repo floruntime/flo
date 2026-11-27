@@ -654,13 +654,23 @@ fn parseRetryPolicy(obj: JsonValue, d: D) ParseError!RetryPolicy {
 
 fn parsePollConfig(obj: JsonValue, d: D) ParseError!definition.PollConfig {
     try checkKeys(d, obj, &.{ "initial_delay_ms", "max_attempts", "base_delay_ms", "max_delay_ms", "backoff" });
-    return .{
+    const cfg: definition.PollConfig = .{
         .initial_delay_ms = try optAtLeast(d, obj, "initial_delay_ms", 0) orelse 0,
         .max_attempts = try optIntAs(u32, d, obj, "max_attempts") orelse 10,
         .backoff = try parseBackoff(d, obj),
         .base_delay_ms = try optIntAs(u32, d, obj, "base_delay_ms") orelse 1000,
         .max_delay_ms = try optIntAs(u32, d, obj, "max_delay_ms") orelse 60000,
     };
+    // Each poll is an action run and a logged step, so a run's polls are
+    // bounded, and only the first may come at once: with every delay 0 a
+    // pending action is re-invoked back to back.
+    if (cfg.max_attempts < 1 or cfg.max_attempts > definition.MAX_POLL_ATTEMPTS)
+        return d.fail(ParseError.InvalidFieldType, "\"max_attempts\" is the polls before the step times out, from 1 to {d}, not {d}", .{ definition.MAX_POLL_ATTEMPTS, cfg.max_attempts });
+    if (cfg.base_delay_ms < definition.MIN_POLL_DELAY_MS)
+        return d.fail(ParseError.InvalidFieldType, "\"base_delay_ms\" is the delay between polls, at least {d} ms, not {d}", .{ definition.MIN_POLL_DELAY_MS, cfg.base_delay_ms });
+    if (cfg.max_delay_ms < cfg.base_delay_ms)
+        return d.fail(ParseError.InvalidFieldType, "\"max_delay_ms\" caps the delay between polls, so it is at least \"base_delay_ms\" ({d} ms), not {d}", .{ cfg.base_delay_ms, cfg.max_delay_ms });
+    return cfg;
 }
 
 // =============================================================================
@@ -1113,6 +1123,29 @@ test "parseWorkflow: a retry count past MAX_RETRIES is refused, on a step and on
     ), ParseError.InvalidFieldType, msg ++ " at plans.p.executors[0].retry");
     var def = try parseWorkflow(std.testing.allocator, wrap("\"retry\": { \"max_attempts\": 100 },", ""), null);
     def.deinit(std.testing.allocator);
+}
+
+test "parseWorkflow: a poll's count is from 1 to MAX_POLL_ATTEMPTS, and its delays can't all be 0" {
+    const count = "\"max_attempts\" is the polls before the step times out, from 1 to 1000, not ";
+    try expectRefused(wrap("\"poll\": { \"max_attempts\": 0 },", ""), ParseError.InvalidFieldType, count ++ "0 at start.poll");
+    try expectRefused(wrap("\"poll\": { \"max_attempts\": 1001 },", ""), ParseError.InvalidFieldType, count ++ "1001 at start.poll");
+    const base = "\"base_delay_ms\" is the delay between polls, at least 10 ms, not ";
+    try expectRefused(wrap("\"poll\": { \"base_delay_ms\": 0 },", ""), ParseError.InvalidFieldType, base ++ "0 at start.poll");
+    try expectRefused(wrap("\"poll\": { \"base_delay_ms\": 9 },", ""), ParseError.InvalidFieldType, base ++ "9 at start.poll");
+    // A cap below the base would make every delay the cap, 0 included.
+    const cap = "\"max_delay_ms\" caps the delay between polls, so it is at least \"base_delay_ms\" (50 ms), not ";
+    try expectRefused(wrap("\"poll\": { \"base_delay_ms\": 50, \"max_delay_ms\": 0 },", ""), ParseError.InvalidFieldType, cap ++ "0 at start.poll");
+    try expectRefused(wrap("\"poll\": { \"base_delay_ms\": 50, \"max_delay_ms\": 49 },", ""), ParseError.InvalidFieldType, cap ++ "49 at start.poll");
+    // The bounds themselves, an immediate first poll, and the defaults parse.
+    for ([_][]const u8{
+        wrap("\"poll\": { \"max_attempts\": 1000, \"initial_delay_ms\": 0, \"base_delay_ms\": 10, \"max_delay_ms\": 10 },", ""),
+        wrap("\"poll\": { \"max_attempts\": 1 },", ""),
+        wrap("\"poll\": { \"base_delay_ms\": 50, \"max_delay_ms\": 50 },", ""),
+        wrap("\"poll\": {},", ""),
+    }) |json| {
+        var def = try parseWorkflow(std.testing.allocator, json, null);
+        def.deinit(std.testing.allocator);
+    }
 }
 
 test "parseWorkflow: a breaker given only a threshold cools down for the default 60 s" {

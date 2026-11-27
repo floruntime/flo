@@ -70,6 +70,9 @@ pub const BackoffType = plan_types.BackoffType;
 // Poll Configuration
 // =============================================================================
 
+pub const MAX_POLL_ATTEMPTS: u32 = 1000;
+pub const MIN_POLL_DELAY_MS: u32 = 10;
+
 /// Configuration for polling on "pending" outcome.
 /// When an action returns outcome="pending", if poll is configured,
 /// the workflow will re-execute the action with backoff until a terminal
