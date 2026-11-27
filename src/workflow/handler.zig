@@ -835,15 +835,24 @@ pub const WorkflowHandler = struct {
             /// A pass started: the plan's next starts one further along.
             pass,
         },
+        /// On `breakerNowMs`'s clock.
         at_ms: i64,
     };
+
+    /// The clock a breaker's cooldown runs on: monotonic, so a wall-clock
+    /// step neither holds a breaker open nor ends its cooldown early. Its
+    /// times never leave this leader: plan memory starts afresh each term
+    /// (`planMemory`), and nothing shows them.
+    fn breakerNowMs() i64 {
+        return @intCast(@import("stdx").time.monotonicMs());
+    }
 
     /// `what` kept on `run`'s copy, for when its step logs. Short of memory
     /// it is not kept: a result counted once less, a pass's start not
     /// moved on.
-    fn stagePlanEffect(self: *WorkflowHandler, run: *RunRecord, ns: NamespaceId, plan_name: []const u8, executor_name: []const u8, what: @FieldType(PlanEffect, "what"), at_ms: i64) void {
+    fn stagePlanEffect(self: *WorkflowHandler, run: *RunRecord, ns: NamespaceId, plan_name: []const u8, executor_name: []const u8, what: @FieldType(PlanEffect, "what")) void {
         const key = healthKey(self.allocator, ns, run.workflow_name_owned, plan_name, executor_name) catch return;
-        run.plan_effects.append(self.allocator, .{ .key = key, .what = what, .at_ms = at_ms }) catch self.allocator.free(key);
+        run.plan_effects.append(self.allocator, .{ .key = key, .what = what, .at_ms = breakerNowMs() }) catch self.allocator.free(key);
     }
 
     /// The plan memory `run`'s logged step changes.
@@ -890,7 +899,7 @@ pub const WorkflowHandler = struct {
                 const key = healthKey(self.allocator, ns, run.workflow_name_owned, plan.name, "") catch return;
                 defer self.allocator.free(key);
                 const pass = self.plan_cursors.get(key) orelse 0;
-                self.stagePlanEffect(run, ns, plan.name, "", .pass, 0);
+                self.stagePlanEffect(run, ns, plan.name, "", .pass);
                 if (plan.selection == .round_robin) return std.mem.rotate(u8, order, pass % order.len);
                 var h = std.hash.Wyhash.init(0);
                 var head: [14]u8 = undefined;
@@ -2473,7 +2482,7 @@ pub const WorkflowHandler = struct {
             // made past the breaker its last failure opened. Half-open lets
             // one call through, the probe, until its result.
             const admit: plan_types.ExecutorHealth.Admit = if (executor.breaker) |breaker_cfg|
-                self.admitsNow(run, ns, plan_name, executor.name, breaker_cfg, now_ms)
+                self.admitsNow(run, ns, plan_name, executor.name, breaker_cfg)
             else
                 .yes;
             if (admit == .no) {
@@ -2499,12 +2508,12 @@ pub const WorkflowHandler = struct {
 
             // With another executor to try, a missing action doesn't hold the
             // step up; the last that can run waits, as a step with no plan does.
-            const can_wait = !self.anotherExecutorCanRun(run, plan, exec_order[run.plan_executor_idx + 1 ..], ns, plan_name, now_ms);
+            const can_wait = !self.anotherExecutorCanRun(run, plan, exec_order[run.plan_executor_idx + 1 ..], ns, plan_name);
             const outcome = self.invokeAction(shard, run, resolved_action, step_input, step_label, ns, can_wait, now_ms);
 
             // The probe is the call made: one held for room is no call.
             if (admit == .probe and !(outcome == null and run.waiting_for_room))
-                self.stagePlanEffect(run, ns, plan_name, executor.name, .probe, now_ms);
+                self.stagePlanEffect(run, ns, plan_name, executor.name, .probe);
 
             // Parked for async action — will resume via resumeFromAction
             if (outcome == null) return null;
@@ -2513,7 +2522,7 @@ pub const WorkflowHandler = struct {
 
             // Health for synchronous completions: health-weighted orders by
             // it, and every breaker counts its failures.
-            self.stageResult(run, ns, plan_name, executor, success, now_ms);
+            self.stageResult(run, ns, plan_name, executor, success);
 
             // Success — reset plan state and return
             if (success) {
@@ -2544,11 +2553,11 @@ pub const WorkflowHandler = struct {
 
     /// Whether one of `order`'s executors could run: its breaker, if it has
     /// one, isn't holding it back.
-    fn anotherExecutorCanRun(self: *WorkflowHandler, run: *const RunRecord, plan: definition.InlinePlan, order: []const u8, ns: NamespaceId, plan_name: []const u8, now_ms: i64) bool {
+    fn anotherExecutorCanRun(self: *WorkflowHandler, run: *const RunRecord, plan: definition.InlinePlan, order: []const u8, ns: NamespaceId, plan_name: []const u8) bool {
         for (order) |i| {
             const executor = plan.executors[i];
             const cfg = executor.breaker orelse return true;
-            if (self.admitsNow(run, ns, plan_name, executor.name, cfg, now_ms) != .no) return true;
+            if (self.admitsNow(run, ns, plan_name, executor.name, cfg) != .no) return true;
         }
         return false;
     }
@@ -3360,7 +3369,7 @@ pub const WorkflowHandler = struct {
                         if (run.plan_executor_natural_idx < plan.executors.len) {
                             const attempted_executor = plan.executors[run.plan_executor_natural_idx];
                             const is_success = std.mem.eql(u8, outcome, definition.StepOutcome.success);
-                            self.stageResult(run, ns, run_step.targetName(), attempted_executor, is_success, now_ms);
+                            self.stageResult(run, ns, run_step.targetName(), attempted_executor, is_success);
                         }
                     }
                 }
@@ -4567,20 +4576,21 @@ pub const WorkflowHandler = struct {
     }
 
     /// What an executor's breaker admits now: its logged health, with what
-    /// `run`'s decision has staged for it so far. Out of memory, the
-    /// logged health alone.
-    fn admitsNow(self: *WorkflowHandler, run: *const RunRecord, ns: NamespaceId, plan_name: []const u8, executor_name: []const u8, cfg: plan_types.CircuitBreakerConfig, now_ms: i64) plan_types.ExecutorHealth.Admit {
+    /// `run`'s decision has staged for it so far. Out of memory it admits:
+    /// the breaker spares a failing executor calls, and a call it lets
+    /// through only fails.
+    fn admitsNow(self: *WorkflowHandler, run: *const RunRecord, ns: NamespaceId, plan_name: []const u8, executor_name: []const u8, cfg: plan_types.CircuitBreakerConfig) plan_types.ExecutorHealth.Admit {
         const key = healthKey(self.allocator, ns, run.workflow_name_owned, plan_name, executor_name) catch return .yes;
         defer self.allocator.free(key);
         var health: plan_types.ExecutorHealth = if (self.plan_health.get(key)) |h| h else .initWithName(&.{});
         for (run.plan_effects.items) |e| if (std.mem.eql(u8, e.key, key)) applyEffect(&health, e);
-        return health.admits(cfg, now_ms);
+        return health.admits(cfg, breakerNowMs());
     }
 
     /// An executor's call ended: counted, and its breaker moved, once the
     /// step that takes the result logs.
-    fn stageResult(self: *WorkflowHandler, run: *RunRecord, ns: NamespaceId, plan_name: []const u8, executor: definition.ExecutorConfig, success: bool, now_ms: i64) void {
-        self.stagePlanEffect(run, ns, plan_name, executor.name, .{ .result = .{ .success = success, .breaker = executor.breaker } }, now_ms);
+    fn stageResult(self: *WorkflowHandler, run: *RunRecord, ns: NamespaceId, plan_name: []const u8, executor: definition.ExecutorConfig, success: bool) void {
+        self.stagePlanEffect(run, ns, plan_name, executor.name, .{ .result = .{ .success = success, .breaker = executor.breaker } });
     }
 
     /// Sort executor indices by health score (descending). Used by health-weighted
@@ -6735,7 +6745,7 @@ test "step executor: a plan's executor waits when the only other's breaker is op
         const paypal = testHealth(&handler, &shard, "plan-wf", "charge", "paypal");
         if (open) {
             paypal.breaker_state = .open;
-            paypal.breaker_opened_at_ms = @import("stdx").time.milliTimestamp();
+            paypal.breaker_opened_at_ms = @as(i64, @intCast(@import("stdx").time.monotonicMs()));
         }
         // stripe is tried first either way: as listed first, and as the
         // healthier when paypal's breaker is open. Under any selection.
@@ -8214,7 +8224,7 @@ test "plan selection: with every breaker open the step fails once, each skipped"
     var f: SelectionFixture = undefined;
     try f.init("round-robin", 3, .{ .breakers = 3 });
     defer f.deinit();
-    const now = @import("stdx").time.milliTimestamp();
+    const now = @as(i64, @intCast(@import("stdx").time.monotonicMs()));
     for ([_][]const u8{ "e0", "e1", "e2" }) |e| {
         const h = testHealth(&f.handler, &f.shard, "sel-wf", "p", e);
         h.breaker_state = .open;
@@ -8241,7 +8251,7 @@ test "plan selection: half-open lets one probe through; the others skip it until
     defer f.deinit();
     const h = testHealth(&f.handler, &f.shard, "sel-wf", "p", "e0");
     h.breaker_state = .open;
-    h.breaker_opened_at_ms = @import("stdx").time.milliTimestamp() - 3_600_001;
+    h.breaker_opened_at_ms = @as(i64, @intCast(@import("stdx").time.monotonicMs())) - 3_600_001;
     var keys: [3][KEY_PREFIX + 8]u8 = undefined;
     var nb: [8]u8 = undefined;
     var started: [3][]const u8 = undefined;
@@ -8280,7 +8290,7 @@ test "plan selection: a probe held for room is no probe: the breaker stays open 
     try testing.expect(f.handler.inspect(fill).?.pending_action_run_id_owned != null);
     const h = testHealth(&f.handler, &f.shard, "sel-wf", "p", "e0");
     h.breaker_state = .open;
-    h.breaker_opened_at_ms = @import("stdx").time.milliTimestamp() - 3_600_001;
+    h.breaker_opened_at_ms = @as(i64, @intCast(@import("stdx").time.monotonicMs())) - 3_600_001;
     // e0's turn to probe, and no room: the step waits, and e0 is not marked.
     f.shard.outbox_caps = .{ .other = .{ .shard = 1 << 30, .channel = 1 } };
     var kb: [KEY_PREFIX + 8]u8 = undefined;
