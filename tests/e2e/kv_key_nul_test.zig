@@ -387,6 +387,27 @@ test "e2e/names: a holder holding a NUL or control byte is refused by status: a 
         try testing.expectEqualStrings("bad request: a worker id must not contain control characters (bytes 0x00-0x1f or 0x7f)", r.data);
     }
 
+    // A report names its worker in its body: a complete, fail or touch of
+    // a real run by a worker id holding a NUL is refused before the run is
+    // looked at.
+    const invoked = try ctx.execCapture(&.{ "action", "invoke", "send", "{}" });
+    const prefix = "Result: ";
+    try testing.expect(std.mem.startsWith(u8, invoked, prefix));
+    const run_id = std.mem.trimEnd(u8, invoked[prefix.len..], "\r\n");
+    var cb: [256]u8 = undefined;
+    const worker = "w\x00x";
+    const reports = [_]struct { op: proto.OpCode, body: []const u8 }{
+        .{ .op = .action_complete, .body = try src.action_ops.op("action.complete").request.encodeInto(cb[0..96], .{ .action = "send", .worker = worker, .deliveries = 1, .term = 1, .index = 1, .outcome = "", .result = "" }) },
+        .{ .op = .action_fail, .body = try src.action_ops.op("action.fail").request.encodeInto(cb[96..192], .{ .action = "send", .worker = worker, .deliveries = 1, .term = 1, .index = 1, .retry = true, .abandoned = false, .delay_ms = 0, .@"error" = "" }) },
+        .{ .op = .action_touch, .body = try src.action_ops.op("action.touch").request.encodeInto(cb[192..256], .{ .action = "send", .worker = worker, .deliveries = 1, .term = 1, .index = 1 }) },
+    };
+    for (reports) |rep| {
+        const r = try rawCall(ctx, rep.op, "", run_id, rep.body, &out);
+        if (r.status != bad) std.debug.print("{t}: {d} {s}\n", .{ rep.op, r.status, r.data });
+        try testing.expectEqual(bad, r.status);
+        try testing.expectEqualStrings("bad request: a worker id must not contain control characters (bytes 0x00-0x1f or 0x7f)", r.data);
+    }
+
     // [type:u8][max_concurrency:u32][process_count:u16][has_metadata:u8][has_machine_id:u8][len:u16][machine id]
     var reg: [32]u8 = undefined;
     reg[0] = 0;
