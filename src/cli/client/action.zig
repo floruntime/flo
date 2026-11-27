@@ -59,8 +59,10 @@ pub fn invoke(
     input: []const u8,
     required_labels: ?[]const u8,
 ) !Response {
-    var value_buf: [8192]u8 = undefined;
-    var fbs: std.Io.Writer = .fixed(&value_buf);
+    // Sized from the input: the server, not a stack buffer, bounds it.
+    const value_buf = try client.allocator.alloc(u8, 1 + (if (required_labels) |l| 2 + l.len else 0) + input.len);
+    defer client.allocator.free(value_buf);
+    var fbs: std.Io.Writer = .fixed(value_buf);
     const writer = &fbs;
 
     if (required_labels) |labels| {
@@ -120,8 +122,11 @@ pub fn workerRegister(
     task_types: []const []const u8,
     labels: ?[]const u8,
 ) !Response {
-    var value_buf: [4096]u8 = undefined;
-    var fbs: std.Io.Writer = .fixed(&value_buf);
+    var size: usize = 1 + 4 + 2 + 1 + (if (labels) |l| 2 + l.len else 0) + 1;
+    for (task_types) |tt| size += 2 + tt.len + 1;
+    const value_buf = try client.allocator.alloc(u8, size);
+    defer client.allocator.free(value_buf);
+    var fbs: std.Io.Writer = .fixed(value_buf);
     const writer = &fbs;
 
     // Worker type: 0 = action
@@ -131,9 +136,9 @@ pub fn workerRegister(
     try writer.writeInt(u32, 10, .little);
 
     // Process list — each task_type becomes an action process
-    try writer.writeInt(u16, @intCast(task_types.len), .little);
+    try writer.writeInt(u16, std.math.cast(u16, task_types.len) orelse return error.Overflow, .little);
     for (task_types) |tt| {
-        try writer.writeInt(u16, @intCast(tt.len), .little);
+        try writer.writeInt(u16, std.math.cast(u16, tt.len) orelse return error.Overflow, .little);
         try writer.writeAll(tt);
         try writer.writeByte(0); // kind = action
     }
@@ -141,7 +146,7 @@ pub fn workerRegister(
     // Optional metadata (labels JSON)
     if (labels) |l| {
         try writer.writeByte(1);
-        try writer.writeInt(u16, @intCast(l.len), .little);
+        try writer.writeInt(u16, std.math.cast(u16, l.len) orelse return error.LabelsTooLong, .little);
         try writer.writeAll(l);
     } else {
         try writer.writeByte(0);

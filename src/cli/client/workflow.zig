@@ -49,12 +49,15 @@ pub fn start(
     idempotency_key: ?[]const u8,
     run_id: ?[]const u8,
 ) !Response {
-    var value_buf: [8192]u8 = undefined;
-    var fbs: std.Io.Writer = .fixed(&value_buf);
+    // Sized from the input: the server, not a stack buffer, bounds it.
+    const size = 2 + workflow_version.len + 1 + (if (idempotency_key) |k| 2 + k.len else 0) + 1 + (if (run_id) |r| 2 + r.len else 0) + input.len;
+    const value_buf = try client.allocator.alloc(u8, size);
+    defer client.allocator.free(value_buf);
+    var fbs: std.Io.Writer = .fixed(value_buf);
     const writer = &fbs;
 
     // Write version with length prefix
-    try writer.writeInt(u16, @intCast(workflow_version.len), .little);
+    try writer.writeInt(u16, std.math.cast(u16, workflow_version.len) orelse return error.Overflow, .little);
     try writer.writeAll(workflow_version);
 
     // Write input (rest will be input data)
@@ -64,7 +67,7 @@ pub fn start(
     // Write optional idempotency_key
     if (idempotency_key) |key| {
         try writer.writeByte(1);
-        try writer.writeInt(u16, @intCast(key.len), .little);
+        try writer.writeInt(u16, std.math.cast(u16, key.len) orelse return error.Overflow, .little);
         try writer.writeAll(key);
     } else {
         try writer.writeByte(0);
@@ -73,7 +76,7 @@ pub fn start(
     // Write optional run_id
     if (run_id) |rid| {
         try writer.writeByte(1);
-        try writer.writeInt(u16, @intCast(rid.len), .little);
+        try writer.writeInt(u16, std.math.cast(u16, rid.len) orelse return error.Overflow, .little);
         try writer.writeAll(rid);
     } else {
         try writer.writeByte(0);
@@ -98,12 +101,13 @@ pub fn signal(
     signal_type: []const u8,
     payload: ?[]const u8,
 ) !Response {
-    var value_buf: [8192]u8 = undefined;
-    var fbs: std.Io.Writer = .fixed(&value_buf);
+    const value_buf = try client.allocator.alloc(u8, 2 + signal_type.len + (if (payload) |p| p.len else 0));
+    defer client.allocator.free(value_buf);
+    var fbs: std.Io.Writer = .fixed(value_buf);
     const writer = &fbs;
 
     // Write signal_type with length prefix
-    try writer.writeInt(u16, @intCast(signal_type.len), .little);
+    try writer.writeInt(u16, std.math.cast(u16, signal_type.len) orelse return error.Overflow, .little);
     try writer.writeAll(signal_type);
 
     // Write payload if present
