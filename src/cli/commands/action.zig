@@ -19,6 +19,7 @@ const WireReader = wire.WireReader;
 const cli_config = @import("../config.zig");
 const schema = @import("../../protocol/schema.zig");
 const action_ops = @import("../../protocol/action_ops.zig");
+const action_entries = @import("../../protocol/action_entries.zig");
 const worker_ops = @import("../../protocol/worker_ops.zig");
 const gen = @import("../gen.zig");
 
@@ -55,7 +56,7 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                 .arg("name", "Action name")
                 .stringFlag("owner", 0, "cli", "Owner/team name")
                 .uintFlag("timeout", 0, 0, "The lease: how long a run may go without its worker reporting, in ms (5000 to 43200000; 0 is the server's 300000)")
-                .uintFlag("max-attempts", 0, 0, "Attempts in all, the first counted (1 to 1000; 0 is the server's 3)")
+                .uintFlag("max-attempts", 0, 0, std.fmt.comptimePrint("Attempts in all, the first counted (1 to {d}; 0 is the server's 3)", .{action_entries.MAX_ATTEMPTS}))
                 .action(wrapHandler(runRegister)),
         )
         .subcommand(
@@ -212,7 +213,7 @@ fn runRegister(ctx: *commander.Context) commander.Error!void {
     const timeout = ctx.getUint("timeout") orelse 0;
     const max_attempts = ctx.getUint("max-attempts") orelse 0;
     if (timeout > std.math.maxInt(u32)) return outcome.usage(ctx, "--timeout is at most {d} ms", .{std.math.maxInt(u32)});
-    if (max_attempts > 1000) return outcome.usage(ctx, "--max-attempts is at most 1000", .{});
+    if (max_attempts > action_entries.MAX_ATTEMPTS) return outcome.usage(ctx, "--max-attempts is at most {d}", .{action_entries.MAX_ATTEMPTS});
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 

@@ -5816,8 +5816,8 @@ const test_retry_workflow_json =
 ;
 
 // Poll workflow: action returns `pending`; the engine should re-arm a backoff
-// poll (the least delay, with the test's clock stepped past it) and follow
-// `timeout` after max_attempts=2.
+// poll (at once, then after base_delay_ms) and follow `timeout` after
+// max_attempts=2.
 const test_poll_workflow_json =
     \\{"kind":"Workflow","name":"poll-wf","version":"1.0.0",
     \\"start":{"run":"@actions/poller",
@@ -8415,48 +8415,58 @@ test "step executor: poll re-arms on pending and times out after max_attempts" {
     createTestDef(&handler, testKey(.default, "poll-wf"), "poll-wf", test_poll_workflow_json);
     createTestRun(&handler, testKey(.default, "run-poll"), "run-poll", "poll-wf");
 
-    // Initial: poller invoked, parks for async completion.
-    handler.advanceWorkflow(&shard, testKey(.default, "run-poll"));
+    const key = testKey(.default, "run-poll");
+    // The test's clock, stepped by hand: polls come due only when it passes them.
+    const t0 = @import("stdx").time.milliTimestamp() + 1_000_000;
+
+    // The first invocation, parked for its completion.
+    handler.advanceWorkflow(&shard, key);
     settleTest(&shard);
+    var invocations: u32 = 1;
 
-    // First `pending` must ARM a poll (not fail): status waiting, attempt incremented.
-    {
-        const run = handler.inspect(testKey(.default, "run-poll")).?;
-        try testing.expect(run.pending_action_run_id_owned != null);
-        completeTestActionWith(&shard, run.pending_action_run_id_owned.?, "pending");
-    }
-    handler.checkPendingActions(&shard);
+    // `pending` arms the first poll, with no delay (initial_delay_ms 0):
+    // at once it re-invokes.
+    completeTestActionWith(&shard, handler.inspect(key).?.pending_action_run_id_owned.?, "pending");
+    handler.checkPendingActionsAt(&shard, t0);
     settleTest(&shard);
-    {
-        const run = handler.inspect(testKey(.default, "run-poll")).?;
-        try testing.expect(!run.status.isTerminal()); // pre-fix bug: would be .failed
-        try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
-        try testing.expectEqual(@as(u32, 1), run.poll_attempt);
-    }
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.inspect(key).?.status);
+    try testing.expectEqual(@as(u32, 1), handler.inspect(key).?.poll_attempt);
+    handler.checkPendingActionsAt(&shard, t0);
+    settleTest(&shard);
+    try testing.expect(handler.inspect(key).?.pending_action_run_id_owned != null);
+    invocations += 1;
 
-    // Drive remaining poll cycles: each tick either fires the due poll timer
-    // (re-invoking the action) or processes the re-invoked action's `pending`
-    // completion (re-arming). max_attempts=2 → exhausted → `timeout` → flo.TimedOut.
-    const start_ms = @import("stdx").time.milliTimestamp();
-    var i: u32 = 0;
-    while (i < 12) : (i += 1) {
-        const run = handler.inspect(testKey(.default, "run-poll")).?;
-        if (run.status.isTerminal()) break;
-        if (run.pending_action_run_id_owned) |rid| {
-            completeTestActionWith(&shard, rid, "pending");
-        }
-        handler.checkPendingActionsAt(&shard, start_ms + 1000 * @as(i64, i + 1));
-        settleTest(&shard);
-    }
+    // The second `pending` arms a poll 10 ms (base_delay_ms) out: not due
+    // at 9 ms, due at 10.
+    const t1 = t0 + 100;
+    completeTestActionWith(&shard, handler.inspect(key).?.pending_action_run_id_owned.?, "pending");
+    handler.checkPendingActionsAt(&shard, t1);
+    settleTest(&shard);
+    try testing.expectEqual(@as(u32, 2), handler.inspect(key).?.poll_attempt);
+    handler.checkPendingActionsAt(&shard, t1 + 9);
+    settleTest(&shard);
+    try testing.expect(handler.inspect(key).?.pending_action_run_id_owned == null);
+    handler.checkPendingActionsAt(&shard, t1 + 10);
+    settleTest(&shard);
+    try testing.expect(handler.inspect(key).?.pending_action_run_id_owned != null);
+    invocations += 1;
 
-    const run = handler.inspect(testKey(.default, "run-poll")).?.*;
+    // Two polls spent (max_attempts 2): the third `pending` follows `timeout`.
+    completeTestActionWith(&shard, handler.inspect(key).?.pending_action_run_id_owned.?, "pending");
+    handler.checkPendingActionsAt(&shard, t1 + 200);
+    settleTest(&shard);
+    const run = handler.inspect(key).?.*;
     try testing.expectEqual(WorkflowHandler.RunStatus.timed_out, run.status);
+    try testing.expectEqual(@as(u32, 3), invocations);
 
     var polls: u32 = 0;
+    var exhausted: u32 = 0;
     for (run.history.items) |evt| {
         if (std.mem.eql(u8, evt.event_type_owned, "poll_scheduled")) polls += 1;
+        if (std.mem.eql(u8, evt.event_type_owned, "poll_exhausted")) exhausted += 1;
     }
-    try testing.expect(polls >= 1);
+    try testing.expectEqual(@as(u32, 2), polls);
+    try testing.expectEqual(@as(u32, 1), exhausted);
 }
 
 test "step executor: checkPendingActions handles completed async action" {

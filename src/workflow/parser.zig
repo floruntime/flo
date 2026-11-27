@@ -1129,13 +1129,18 @@ test "parseWorkflow: a poll's count is from 1 to MAX_POLL_ATTEMPTS, and its dela
     const count = "\"max_attempts\" is the polls before the step times out, from 1 to 1000, not ";
     try expectRefused(wrap("\"poll\": { \"max_attempts\": 0 },", ""), ParseError.InvalidFieldType, count ++ "0 at start.poll");
     try expectRefused(wrap("\"poll\": { \"max_attempts\": 1001 },", ""), ParseError.InvalidFieldType, count ++ "1001 at start.poll");
-    try expectRefused(wrap("\"poll\": { \"base_delay_ms\": 0 },", ""), ParseError.InvalidFieldType, "\"base_delay_ms\" is the delay between polls, at least 10 ms, not 0 at start.poll");
+    const base = "\"base_delay_ms\" is the delay between polls, at least 10 ms, not ";
+    try expectRefused(wrap("\"poll\": { \"base_delay_ms\": 0 },", ""), ParseError.InvalidFieldType, base ++ "0 at start.poll");
+    try expectRefused(wrap("\"poll\": { \"base_delay_ms\": 9 },", ""), ParseError.InvalidFieldType, base ++ "9 at start.poll");
     // A cap below the base would make every delay the cap, 0 included.
-    try expectRefused(wrap("\"poll\": { \"base_delay_ms\": 50, \"max_delay_ms\": 0 },", ""), ParseError.InvalidFieldType, "\"max_delay_ms\" caps the delay between polls, so it is at least \"base_delay_ms\" (50 ms), not 0 at start.poll");
+    const cap = "\"max_delay_ms\" caps the delay between polls, so it is at least \"base_delay_ms\" (50 ms), not ";
+    try expectRefused(wrap("\"poll\": { \"base_delay_ms\": 50, \"max_delay_ms\": 0 },", ""), ParseError.InvalidFieldType, cap ++ "0 at start.poll");
+    try expectRefused(wrap("\"poll\": { \"base_delay_ms\": 50, \"max_delay_ms\": 49 },", ""), ParseError.InvalidFieldType, cap ++ "49 at start.poll");
     // The bounds themselves, an immediate first poll, and the defaults parse.
     for ([_][]const u8{
         wrap("\"poll\": { \"max_attempts\": 1000, \"initial_delay_ms\": 0, \"base_delay_ms\": 10, \"max_delay_ms\": 10 },", ""),
         wrap("\"poll\": { \"max_attempts\": 1 },", ""),
+        wrap("\"poll\": { \"base_delay_ms\": 50, \"max_delay_ms\": 50 },", ""),
         wrap("\"poll\": {},", ""),
     }) |json| {
         var def = try parseWorkflow(std.testing.allocator, json, null);

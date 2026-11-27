@@ -56,8 +56,6 @@ const NamespaceId = @import("../namespace/table.zig").Id;
 pub const DEFAULT_LEASE_MS: u64 = 5 * 60 * 1000;
 /// Attempts in all, the first counted, for a register that names none (0).
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
-/// The register entry's own bound, so a refusal here and at apply agree.
-pub const MAX_ATTEMPTS: u32 = 1000;
 
 /// The most ready runs one selection looks at before answering none: runs
 /// the worker's labels don't match are skipped, never scanned without end.
@@ -388,8 +386,8 @@ pub const ActionsHandler = struct {
         const lease_ms = if (timeout_ms == 0) DEFAULT_LEASE_MS else timeout_ms;
         if (lease_ms < ae.MIN_LEASE_MS or lease_ms > ae.MAX_LEASE_MS)
             return .{ .err = .{ .code = .invalid_request, .message = std.fmt.comptimePrint("bad request: an action's timeout is its lease: at least {d} ms and at most {d} ms, or 0 for {d} ms", .{ ae.MIN_LEASE_MS, ae.MAX_LEASE_MS, DEFAULT_LEASE_MS }) } };
-        if (max_attempts > MAX_ATTEMPTS)
-            return .{ .err = .{ .code = .invalid_request, .message = std.fmt.comptimePrint("bad request: an action's attempts count the first: at most {d}, or 0 for {d}", .{ MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS }) } };
+        if (max_attempts > ae.MAX_ATTEMPTS)
+            return .{ .err = .{ .code = .invalid_request, .message = std.fmt.comptimePrint("bad request: an action's attempts count the first: at most {d}, or 0 for {d}", .{ ae.MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS }) } };
         const proposed = propose(shard, .action_register, ae.Register.Value{ .ns = ns.int(), .name = name, .owner = owner, .lease_ms = lease_ms, .max_attempts = if (max_attempts == 0) DEFAULT_MAX_ATTEMPTS else max_attempts }) catch |err|
             return .{ .err = persistence.failureError(err, "action not persisted") };
         return .{ .parked = proposed };

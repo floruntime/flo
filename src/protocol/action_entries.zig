@@ -62,12 +62,15 @@ pub const Token = Record(&.{
     .{ .name = "index", .T = Int(u64) },
 });
 
+/// Attempts an action's runs get, the first counted.
+pub const MAX_ATTEMPTS: u32 = 1000;
+
 pub const Register = Record(&.{
     .{ .name = "ns", .T = NamespaceId },
     .{ .name = "name", .T = ActionName },
     .{ .name = "owner", .T = Bytes(MAX_OWNER) },
     .{ .name = "lease_ms", .T = LeaseMs },
-    .{ .name = "max_attempts", .T = schema.Range(u32, 1, 1000) },
+    .{ .name = "max_attempts", .T = schema.Range(u32, 1, MAX_ATTEMPTS) },
 });
 
 pub const Delete = Record(&.{
