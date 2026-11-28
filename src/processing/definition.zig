@@ -398,7 +398,7 @@ pub const JobDefinition = struct {
         // submit, so no job runs whose every point its apply would refuse.
         for (self.sources.items) |src| if (client_names.hasControl(src.ts_measurement) or client_names.hasControl(src.ts_field)) return TS_NAME_CONTROL;
         for (self.sinks.items) |snk| if (snk.kind == .ts) {
-            if (client_names.hasControl(snk.target) or client_names.hasControl(snk.ts_measurement) or client_names.hasControl(snk.ts_value_field)) return TS_NAME_CONTROL;
+            if (client_names.hasControl(snk.ts_measurement) or client_names.hasControl(snk.ts_value_field)) return TS_NAME_CONTROL;
             if (snk.target.len > limits.MAX_QUALIFIED_KEY) return "measurement name too long";
             var i: usize = 0;
             while (i < snk.ts_field_keys.len) : (i += 2) if (client_names.hasControl(snk.ts_field_keys[i])) return TS_NAME_CONTROL;
