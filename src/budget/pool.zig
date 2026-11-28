@@ -86,6 +86,9 @@ pub const CHARGED = [_]u16{
     // workflow: run_at, run_all; action: run_at. The lists' indexes
     72, 73,
     74,
+    // workflow.ended_at, action.ended_at: the ended indexes a bulk delete walks
+    81,
+    82,
     // action.counts: an action's runs by where they are
     75,
     // history.usage: a namespace's history bytes on this shard

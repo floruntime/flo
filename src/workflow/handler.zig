@@ -63,6 +63,7 @@ const Connection = connection_mod.Connection;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const router = @import("../node/router.zig");
 const ae = @import("../protocol/action_entries.zig");
+const he = @import("../protocol/history_entries.zig");
 const calls_mod = @import("../actions/calls_machine.zig");
 const wire_schema = @import("../protocol/schema.zig");
 const StreamHandler = @import("../stream/handler.zig").StreamHandler;
@@ -71,6 +72,7 @@ const history_ops = @import("../node/history_ops.zig");
 const table_run = @import("../node/table_run.zig");
 const ops = @import("../protocol/ops.zig");
 const history_machine = @import("../stream/history_machine.zig");
+const bulk = @import("../stream/runs_delete.zig");
 const waiter_pool_mod = @import("../node/waiter_pool.zig");
 const runs_machine = @import("runs_machine.zig");
 const progress_mod = @import("progress.zig");
@@ -210,6 +212,9 @@ pub const WorkflowHandler = struct {
     /// every time costs a log entry a minute, not a second. Cleared when an
     /// entry of the run's own applies. Leader memory (`clearCaches`).
     refusals: std.StringHashMapUnmanaged(u8) = .empty,
+    /// Orphaned histories this leader's bulk deletes sent a drop for, this
+    /// term: none is proposed again while its drop may be on the lane.
+    orphans_sent: history_machine.OrphansSent = .{},
     /// An index couldn't keep an entry: the runs are walked again
     /// (`leadCaches`).
     rewatch: bool = false,
@@ -726,6 +731,7 @@ pub const WorkflowHandler = struct {
     }
 
     pub fn deinit(self: *WorkflowHandler) void {
+        self.orphans_sent.deinit(self.allocator);
         self.calls_sweep_after.deinit(self.allocator);
         self.freeChildStarting();
         self.child_starting.deinit(self.allocator);
@@ -995,6 +1001,7 @@ pub const WorkflowHandler = struct {
         dispatcher.registerWithRoute(.workflow_cancel, dispatchWorkflow, run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.workflow_history, table_run.handler("workflow.history", history_ops.Ops, history_ops.Ops.workflowHistory), run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.workflow_run_delete, table_run.handler("workflow.run_delete", RunDelete, RunDelete.run), run_id_mod.preRouteByRunId);
+        dispatcher.registerWithRoute(.workflow_runs_delete, table_run.handler("workflow.runs_delete", RunsDelete, RunsDelete.run), preRouteByWorkflow);
         dispatcher.registerWalk(.workflow_list_definitions, dispatchWorkflow, localScanWorkflowDefs);
     }
 
@@ -1801,6 +1808,108 @@ pub const WorkflowHandler = struct {
             table_run.answer(Response, shard, conn, request_id, .{});
         }
     };
+
+    /// `workflow.runs_delete`: a workflow's runs that ended before a time,
+    /// oldest first, up to `limit`, read from its ended index; and, with
+    /// what room is left, the orphaned histories under it that ended before
+    /// then, unless this term already sent their drop. Each is checked
+    /// again at apply. Nothing to delete answers at once.
+    const RunsDelete = struct {
+        pub const Error = RunDelete.Error;
+        pub const refusal = RunDelete.refusal;
+        const Response = table_run.op("workflow.runs_delete").response;
+
+        fn run(shard: *Shard, _: *Connection, req: Request, before_ms: i64, limit: u32) Error!table_run.Outcome(Response) {
+            const self = shard.workflow_handler;
+            if (!shard.raft_node.leaderReady()) return error.NotLeading;
+            if (req.key.len == 0) return error.NotFound;
+            const names = @import("../protocol/names.zig");
+            if (names.hasControl(req.key)) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(comptime names.controlRefusal("a workflow name")) } };
+            // No workflow has a name that long, so none has runs: as for
+            // any other with none.
+            if (req.key.len > he.MAX_OWNER) return .{ .answer = .{ .deleted = 0, .more = false, .orphans_left = 0 } };
+            var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            const read = self.defsRead();
+            const ns = req.ns_id;
+            var runs: std.ArrayListUnmanaged(u8) = .empty;
+            var n: u32 = 0;
+            const under = try runs_machine.underWorkflow(a, ns, req.key);
+            var it = read.range(runs_machine.EndedAtFam, under);
+            while (n < limit) {
+                const item = (it.next() catch null) orelse break;
+                const ended_ms = bulk.endedMsOf(item.key, under.len);
+                if (ended_ms >= before_ms) break;
+                const id = item.key[under.len + 8 ..];
+                const rk = try runs_machine.idKeyOf(a, ns, id);
+                const rec = runs_machine.runOf(read, rk) orelse continue;
+                try appendItem(a, &runs, .{ .run = id, .created_ns = rec.created_ns, .completed_ms = ended_ms });
+                n += 1;
+            }
+            self.orphans_sent.at(self.allocator, shard.raft_node.current_term);
+            try self.orphans_sent.prune(self.allocator, read, .workflow);
+            var found: [ae.MAX_RUNS_DELETE]history_machine.Orphan = undefined;
+            const room = if (self.orphans_sent.full()) 0 else ae.MAX_RUNS_DELETE - n;
+            const got = try history_machine.orphansOf(read, a, .workflow, ns, req.key, found[0..room], Skip{ .before_ms = before_ms, .sent = &self.orphans_sent, .ns = ns, .owner = req.key });
+            // Nothing to propose: the orphans left counted as an apply counts
+            // them, its own sent ones among them, so the two answers agree.
+            if (n == 0 and got.n == 0) {
+                const left = try history_machine.orphansOf(read, a, .workflow, ns, req.key, &.{}, bulk.Skip{ .before_ms = before_ms });
+                return .{ .answer = .{ .deleted = 0, .more = false, .orphans_left = left.left } };
+            }
+            var orphans: std.ArrayListUnmanaged(u8) = .empty;
+            for (found[0..got.n]) |o| try appendItem(a, &orphans, .{ .run = o.run, .created_ns = o.created_ns, .completed_ms = @intCast(@min(o.completed_ms, std.math.maxInt(i64))) });
+            const body: ae.RunsDelete.Value = .{ .ns = ns.int(), .owner = req.key, .before_ms = before_ms, .runs = .{ .bytes = runs.items, .count = n }, .orphans = .{ .bytes = orphans.items, .count = @intCast(got.n) } };
+            const buf = try a.alloc(u8, ae.RunsDelete.encodedSize(body) catch return error.OutOfMemory);
+            const bytes = ae.RunsDelete.encodeInto(buf, body) catch return error.OutOfMemory;
+            const proposed = proposeIn(shard, ns, .workflow_runs_delete, bytes) catch |err|
+                return .{ .refused = .{ .status = persistence_mod.failureStatus(err), .refusal = persistence_mod.failureRefusal(err, "delete not persisted") } };
+            for (found[0..got.n]) |o| try self.orphans_sent.note(self.allocator, ns, req.key, o);
+            return .{ .park = .{ .proposed = proposed, .answer = answer } };
+        }
+
+        fn answer(shard: *Shard, conn: *Connection, request_id: u64, result: *const persistence_mod.Result) void {
+            table_run.answer(Response, shard, conn, request_id, answerOf(result));
+        }
+
+        /// An entry naming no namespace halts every replica that applies
+        /// it, so it is refused here, as the action side's is.
+        fn proposeIn(shard: *Shard, ns: NamespaceId, comptime etype: entry_mod.EntryType, bytes: []const u8) !persistence_mod.ProposeResult {
+            if (ns == .invalid) return error.NamespaceUnknown;
+            return shard.raft_node.propose(etype, entry_mod.Flags.NONE, bytes);
+        }
+    };
+
+    /// The orphans a bulk delete's leader leaves out: those that ended at
+    /// or after its bound, and those whose drop it sent this term.
+    pub const Skip = struct {
+        before_ms: i64,
+        sent: *const history_machine.OrphansSent,
+        ns: NamespaceId,
+        owner: []const u8,
+
+        pub fn has(self: Skip, o: history_machine.Orphan) bool {
+            if (o.completed_ms >= @as(u64, @intCast(@max(self.before_ms, 0)))) return true;
+            return self.sent.has(self.ns, self.owner, o);
+        }
+    };
+
+    /// One run a bulk delete takes, onto its encoded list.
+    pub fn appendItem(a: Allocator, list: *std.ArrayListUnmanaged(u8), v: ae.DeletedRun.Value) error{OutOfMemory}!void {
+        var b: [ae.DeletedRun.max_size]u8 = undefined;
+        try list.appendSlice(a, ae.DeletedRun.encodeInto(&b, v) catch return error.OutOfMemory);
+    }
+
+    /// A bulk delete's answer, from what its apply said: how many it
+    /// deleted, whether more ended before the bound, and the orphans left.
+    pub fn answerOf(result: *const persistence_mod.Result) table_run.op("workflow.runs_delete").response.Value {
+        var r = result.reader();
+        const deleted = r.int(u32) orelse 0;
+        const more = (r.int(u8) orelse 0) != 0;
+        const left = r.int(u32) orelse 0;
+        return .{ .deleted = deleted, .more = more, .orphans_left = left };
+    }
 
     fn noteEnding(self: *WorkflowHandler, run_key: []const u8, proposed: persistence_mod.ProposeResult) void {
         const gop = self.ending.getOrPut(self.allocator, run_key) catch return;
@@ -4843,7 +4952,7 @@ pub const WorkflowHandler = struct {
         const etype = std.enums.fromInt(entry_mod.EntryType, entry.header.entry_type) orelse return error.Halt;
         const m: *const contract_machine.Machine = switch (etype) {
             .workflow_create, .workflow_enabled => &defs_machine.machine,
-            .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .workflow_run_delete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done => &runs_machine.machine,
+            .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .workflow_run_delete, .workflow_runs_delete, .child_start, .child_refuse, .step_call_retry, .step_call_clear, .call_reply, .call_done => &runs_machine.machine,
             else => return error.Halt,
         };
         try contract_machine.applyEntry(m, self.defsRead().store, &self.def_scratch, entry, out);
@@ -4928,6 +5037,7 @@ pub const WorkflowHandler = struct {
             else => {},
         }
         if (out.refused() != null) return;
+        if (t == .workflow_runs_delete) return self.runsDeleted(e);
         switch (t) {
             .workflow_create, .workflow_enabled, .workflow_start, .workflow_step, .workflow_signal, .workflow_complete, .workflow_run_delete => {},
             // A run waiting on an action not registered may now go on.
@@ -4942,6 +5052,19 @@ pub const WorkflowHandler = struct {
         switch (t) {
             .workflow_create, .workflow_enabled => self.syncProducers(cmd.key),
             else => self.runApplied(t, cmd.key),
+        }
+    }
+
+    /// A bulk delete applied: each run it named is looked at again, so one
+    /// it deleted keeps nothing indexed, as a single delete does.
+    fn runsDeleted(self: *WorkflowHandler, e: *const entry_mod.Entry) void {
+        var diag: wire_schema.Diagnostic = .{};
+        const p = ae.RunsDelete.decodeAll(e.payload, &diag) catch return;
+        var it = p.runs.iterator();
+        while (it.next() catch return) |item| {
+            const key = self.nsKey(.of(p.ns), item.run) orelse return;
+            defer self.allocator.free(key);
+            self.runApplied(.workflow_runs_delete, key);
         }
     }
 
@@ -5737,6 +5860,18 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8) Request {
     };
 }
 
+test "workflow handler: a bulk delete's leader leaves out an orphan that ended at or after its bound, or whose drop it sent this term" {
+    var sent: history_machine.OrphansSent = .{};
+    defer sent.deinit(testing.allocator);
+    sent.at(testing.allocator, 1);
+    const skip: WorkflowHandler.Skip = .{ .before_ms = 100, .sent = &sent, .ns = .default, .owner = "wf" };
+    const early: history_machine.Orphan = .{ .run = "a", .created_ns = 1, .completed_ms = 99 };
+    try testing.expect(!skip.has(early));
+    try testing.expect(skip.has(.{ .run = "b", .created_ns = 1, .completed_ms = 100 }));
+    try sent.note(testing.allocator, .default, "wf", early);
+    try testing.expect(skip.has(early));
+}
+
 test "workflow handler: dispatcher registration" {
     var dispatcher = Dispatcher.init();
     WorkflowHandler.register(&dispatcher);
@@ -5753,8 +5888,9 @@ test "workflow handler: dispatcher registration" {
     try testing.expect(dispatcher.hasHandler(OpCode.workflow_enable));
     try testing.expect(dispatcher.hasHandler(OpCode.workflow_list_definitions));
     try testing.expect(dispatcher.hasHandler(OpCode.workflow_run_delete));
+    try testing.expect(dispatcher.hasHandler(OpCode.workflow_runs_delete));
 
-    try testing.expectEqual(@as(u16, 12), dispatcher.handler_count);
+    try testing.expectEqual(@as(u16, 13), dispatcher.handler_count);
 }
 
 test "workflow handler: init and deinit" {

@@ -145,6 +145,10 @@ pub const EntryType = enum(u8) {
     /// An ended run deleted, its history with it: keyed by the run, its
     /// incarnation in the value (`runs_machine.Delete`).
     workflow_run_delete = 0x54,
+    /// A workflow's or an action's ended runs deleted, oldest first, with
+    /// their histories (`action_entries.RunsDelete`).
+    workflow_runs_delete = 0x59,
+    action_runs_delete = 0x5A,
 
     // ── Namespace ──
     namespace_create = 0x60,
@@ -206,9 +210,9 @@ pub const EntryType = enum(u8) {
         return switch (self) {
             .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch, .kv_reap => false,
             .namespace_create, .namespace_alter => false,
-            .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_run_delete => false,
+            .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .action_run_delete, .action_runs_delete => false,
             .step_call_retry, .step_call_clear, .call_reply, .call_done, .action_abandon_send, .action_abandon => false,
-            .child_start, .child_refuse => false,
+            .child_start, .child_refuse, .workflow_runs_delete => false,
             .stream_append, .stream_trim, .stream_delete, .stream_config, .stream_clean, .stream_forget => true,
             // A run's history's payloads are schemas (`protocol/history_entries.zig`).
             .history_chunk, .history_index, .history_drop => false,

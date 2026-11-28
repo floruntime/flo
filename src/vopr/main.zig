@@ -71,6 +71,8 @@ const Args = struct {
     consumer_groups: bool = false,
     processing: bool = false,
     workflows: bool = false,
+    /// With --workflows: a share of the runs' entries bulk deletes.
+    bulk_deletes: bool = false,
     kv_reaps: bool = false,
     family_mutant: vopr.families.Mutant = .none,
     catching_up: bool = false,
@@ -105,7 +107,7 @@ const Args = struct {
 fn usage() void {
     std.debug.print(
         "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] [--jobs=N] [--out-dir=DIR] " ++
-            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--pending-reads] [--wipes] [--membership] [--byzantine] [--halts] [--actions] [--queues] [--consumer-groups] [--processing] [--workflows] [--kv-reaps] [--catching-up] [--txn-limits] [--groups=N] [--max-delivered=N] " ++
+            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--pending-reads] [--wipes] [--membership] [--byzantine] [--halts] [--actions] [--queues] [--consumer-groups] [--processing] [--workflows|--actions [--bulk-deletes]] [--kv-reaps] [--catching-up] [--txn-limits] [--groups=N] [--max-delivered=N] " ++
             "[--family-mutant=NAME] [--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
         .{},
     );
@@ -146,6 +148,8 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.processing = true;
         } else if (std.mem.eql(u8, arg, "--workflows")) {
             args.workflows = true;
+        } else if (std.mem.eql(u8, arg, "--bulk-deletes")) {
+            args.bulk_deletes = true;
         } else if (std.mem.eql(u8, arg, "--kv-reaps")) {
             args.kv_reaps = true;
         } else if (std.mem.startsWith(u8, arg, "--family-mutant=")) {
@@ -249,6 +253,10 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         Scenario.fromSeed(seed);
     if (args.volatile_mode) scenario.hard_state = .volatile_state;
     if (args.memory_gate) scenario.memory_share = if (args.actions) MEMORY_GATE_ACTIONS_SHARE else MEMORY_GATE_SHARE;
+    if (args.bulk_deletes) {
+        if (!args.workflows and !args.actions) return error.Usage;
+        scenario.bulk_delete_percent = Scenario.bulkDeletePercent(scenario.seed);
+    }
     if (args.groups > 0) {
         // These faults need more than the one node every group lives on.
         const needs_nodes: ?[]const u8 = if (args.wipes) "--wipes" else if (args.membership) "--membership" else if (args.byzantine) "--byzantine" else if (args.catching_up) "--catching-up" else null;
@@ -380,11 +388,11 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
             std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
                 s.seed,
                 mutant,
-                if (args.actions) " --actions" else "",
+                if (args.actions) (if (args.bulk_deletes) " --actions --bulk-deletes" else " --actions") else "",
                 if (args.queues) " --queues" else "",
                 if (args.consumer_groups) " --consumer-groups" else "",
                 if (args.processing) " --processing" else "",
-                if (args.workflows) " --workflows" else "",
+                if (args.workflows) (if (args.bulk_deletes and !args.actions) " --workflows --bulk-deletes" else " --workflows") else "",
                 if (args.kv_reaps) " --kv-reaps" else "",
                 if (args.small_ring) " --small-ring" else "",
                 if (args.pending_reads) " --pending-reads" else "",
@@ -738,6 +746,7 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
     if (args.consumer_groups) try argv.append(allocator, "--consumer-groups");
     if (args.processing) try argv.append(allocator, "--processing");
     if (args.workflows) try argv.append(allocator, "--workflows");
+    if (args.bulk_deletes) try argv.append(allocator, "--bulk-deletes");
     if (args.kv_reaps) try argv.append(allocator, "--kv-reaps");
     var mutant_arg: [64]u8 = undefined;
     if (args.family_mutant != .none) try argv.append(allocator, try std.fmt.bufPrint(&mutant_arg, "--family-mutant={t}", .{args.family_mutant}));
@@ -1043,7 +1052,7 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !SwarmEnd {
             std.debug.print("[vopr] FAILED: {d} passing seeds printed no workflow run counts\n", .{unread_counts});
             counted = false;
         }
-        for (WORKFLOW_RUN_CLASSES, wf_run_totals.classes) |k, n| if (n == 0 and ok_count > 0 and (!vopr.workflow_runs_family.WorkflowRuns.underShareOnly(k) or args.memory_gate) and !(args.memory_gate and vopr.workflow_runs_family.WorkflowRuns.withoutShareOnly(k))) {
+        for (WORKFLOW_RUN_CLASSES, wf_run_totals.classes) |k, n| if (n == 0 and ok_count > 0 and (!vopr.workflow_runs_family.WorkflowRuns.underShareOnly(k) or args.memory_gate) and !(args.memory_gate and vopr.workflow_runs_family.WorkflowRuns.withoutShareOnly(k)) and (args.bulk_deletes or !vopr.workflow_runs_family.WorkflowRuns.bulkOnly(k))) {
             std.debug.print("[vopr] UNCOVERED: no seed reached {t}\n", .{k});
             covered = false;
         };

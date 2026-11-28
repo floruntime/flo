@@ -280,7 +280,35 @@ pub const table = [_]ops.Op{
         .cli = .{ .expose = .command, .key = .{ .name = "action", .doc = "The action's name" }, .render = .record, .examples = &.{"flo action info send-email"} },
         .doc = "An action's definition, its runs by status and how long its newest completed runs took.",
     },
+    .{
+        .name = "action.runs_delete",
+        .code = 0x312,
+        .class = .write,
+        // On the action's shard, where its runs and their histories are.
+        .route = .key,
+        .request = RunsDeleteRequest,
+        .response = RunsDeleteResponse,
+        .cli = .{ .expose = .hand, .key = .{ .name = "action", .doc = "The action's name" }, .examples = &.{"flo action runs-delete send-email --older-than 30d"} },
+        .doc = "Delete an action's runs that ended before a time, oldest first, a batch per call, with their histories; ask again while more is true. The action needn't be registered still.",
+    },
 };
+
+/// The most runs one bulk delete takes: each, and each orphaned history it
+/// drops, is one message its entry sends.
+pub const MAX_RUNS_DELETE: u32 = @import("action_entries.zig").MAX_RUNS_DELETE;
+
+/// A bulk delete's request, an action's or a workflow's.
+pub const RunsDeleteRequest = Record(&.{
+    .{ .name = "ended_before_ms", .T = Int(i64), .doc = "Delete runs that ended before this, in Unix milliseconds" },
+    .{ .name = "limit", .T = Defaulted(schema.Range(u32, 1, MAX_RUNS_DELETE), MAX_RUNS_DELETE), .doc = "The most runs this call deletes" },
+});
+
+/// What one call of a bulk delete did.
+pub const RunsDeleteResponse = Record(&.{
+    .{ .name = "deleted", .T = Int(u32), .doc = "Runs deleted by this call" },
+    .{ .name = "more", .T = schema.Bool, .doc = "More runs ended before the bound: ask again" },
+    .{ .name = "orphans_left", .T = Int(u32), .doc = "Histories left orphaned by an earlier delete that this call didn't drop; a later call drops them" },
+});
 
 /// The most runs `action.info` reads for its latency sample, its newest,
 /// so one answer is bounded however many runs an action keeps.

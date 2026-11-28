@@ -1228,6 +1228,8 @@ pub const Simulator = struct {
                 .ns = families.Namespaces.init(allocator),
             };
             node.groups.config_percent = scenario.stream_config_percent;
+            node.wf_runs.bulk_percent = scenario.bulk_delete_percent;
+            node.actions.bulk_percent = scenario.bulk_delete_percent;
             // Drawn only with drift on, so a run without it replays as before.
             if (scenario.clock_drift_ppm > 0) {
                 const d: i32 = @intCast(scenario.clock_drift_ppm);
@@ -3817,7 +3819,8 @@ test "vopr sim: an actions run keeps every lease rule, and its replicas agree on
     // Every kind ran, and some of each the machine can refuse was.
     errdefer std.debug.print("{any}\n", .{s.actions});
     for (std.enums.values(families.Actions.Kind)) |k| {
-        if (k == .delete) continue;
+        // Bulk deletes run only in their own slice.
+        if (k == .delete or k == .runs_delete) continue;
         try testing.expect(s.actions.applied[@backingInt(k)] > 0);
         if (k != .register and k != .expire) try testing.expect(s.actions.refused[@backingInt(k)] > 0);
     }

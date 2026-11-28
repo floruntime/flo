@@ -22,6 +22,7 @@ const action_ops = @import("../../protocol/action_ops.zig");
 const action_entries = @import("../../protocol/action_entries.zig");
 const worker_ops = @import("../../protocol/worker_ops.zig");
 const gen = @import("../gen.zig");
+const runs_delete = @import("runs_delete.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -98,15 +99,16 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                 .action(wrapHandler(runDelete)),
         )
         .subcommand(
-        commander.newBuilder(allocator)
-            .name("runs")
-            .about("List action runs/tasks")
-            .aliases(&.{"tasks"})
-            .arg("name", "Action name")
-            .uintFlag("limit", 'l', 50, "Maximum runs to show")
-            .uintFlag("page", 0, 0, "Most runs to ask for a page, at most 1024 (0: the most a page holds)")
-            .action(wrapHandler(runRuns)),
-    );
+            commander.newBuilder(allocator)
+                .name("runs")
+                .about("List action runs/tasks")
+                .aliases(&.{"tasks"})
+                .arg("name", "Action name")
+                .uintFlag("limit", 'l', 50, "Maximum runs to show")
+                .uintFlag("page", 0, 0, "Most runs to ask for a page, at most 1024 (0: the most a page holds)")
+                .action(wrapHandler(runRuns)),
+        )
+        .subcommand(runs_delete.builder(allocator, "action", "Delete an action's runs that ended before a time, with their histories", "flo action runs-delete send-email --older-than 30d", wrapHandler(runRunsDelete)));
     gen.addCommands(allocator, action, &action_ops.table, &.{});
     return try action.build();
 }
@@ -781,4 +783,8 @@ test "create worker command" {
 
     try std.testing.expectEqualStrings("worker", cmd.name);
     try std.testing.expect(cmd.commands.items.len >= 3);
+}
+
+fn runRunsDelete(ctx: *commander.Context) commander.Error!void {
+    return runs_delete.run(ctx, .action_runs_delete, "action");
 }

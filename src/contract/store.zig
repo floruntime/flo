@@ -192,6 +192,9 @@ pub const Store = struct {
     /// Run-history reserve lowers that would have gone below zero (a Flo
     /// bug), saturated as the usage's are.
     quota_reserve_drift: u64 = 0,
+    /// Ended-run count lowers that would have gone below zero (a Flo bug):
+    /// a workflow's `per_def.ended`, saturated as the reserve's are.
+    ended_drift: u64 = 0,
     /// Admissions refused at a namespace's run-history quota.
     quota_refusals: u64 = 0,
     /// What the last entry eased (`Eased`), cleared after each.

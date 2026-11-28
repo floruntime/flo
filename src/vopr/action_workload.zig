@@ -70,6 +70,9 @@ pub fn make(a: *families.Actions, l: Leader, r: std.Random, op_id: u64, buf: []u
     for (ACTIONS) |name| {
         if (def(a, name) != null) have_def = true;
     }
+    // Only in the bulk-deletes slice, so no other draws from the stream
+    // move.
+    if (a.bulk_percent > 0 and r.uintLessThan(u8, 100) < a.bulk_percent) return bulkDelete(a, out, r) catch null;
     var roll = r.uintLessThan(u8, 100);
     // A leader that hasn't applied its actions yet registers one now and
     // then, as an operator would.
@@ -170,6 +173,33 @@ fn runDelete(a: *families.Actions, out: []u8, r: std.Random, spoil: bool, tag: [
         .created_ns = if (how == 1) p.run.created_ns + 1 else p.run.created_ns,
     });
     return .{ .entry_type = .action_run_delete, .payload = payload };
+}
+
+/// A bulk delete of one action's runs that ended before a bound, as the
+/// leader read them: mostly right; now and then naming another
+/// incarnation, another end, or a run still live, each passed over.
+fn bulkDelete(a: *families.Actions, out: []u8, r: std.Random) !?Made {
+    const action = ACTIONS[r.uintLessThan(usize, ACTIONS.len)];
+    var list: [ae.MAX_RUNS_DELETE * ae.DeletedRun.max_size]u8 = undefined;
+    var at: usize = 0;
+    var n: u32 = 0;
+    var latest: i64 = 0;
+    var it = a.read().range(action_machine.Runs, "");
+    while (it.next() catch null) |item| {
+        const v = item.value.v;
+        if (!std.mem.eql(u8, v.action, action) or n == ae.MAX_RUNS_DELETE) continue;
+        if (v.completed_ns == 0 and r.uintLessThan(u8, 100) >= 10) continue;
+        const ended_ms: i64 = @intCast(v.completed_ns / std.time.ns_per_ms);
+        var d: ae.DeletedRun.Value = .{ .run = item.key[@sizeOf(u32)..], .created_ns = v.created_ns, .completed_ms = ended_ms };
+        const k = r.uintLessThan(u8, 100);
+        if (k < 5) d.created_ns +%= 1 else if (k < 10) d.completed_ms += 1;
+        latest = @max(latest, ended_ms);
+        at += (ae.DeletedRun.encodeInto(list[at..], d) catch break).len;
+        n += 1;
+    }
+    const before = if (r.boolean()) latest + 1 else latest - @as(i64, r.uintLessThan(u8, 50));
+    const payload = try ae.RunsDelete.encodeInto(out, .{ .ns = NS.int(), .owner = action, .before_ms = before, .runs = .{ .bytes = list[0..at], .count = n }, .orphans = .{ .bytes = "", .count = 0 } });
+    return .{ .entry_type = .action_runs_delete, .payload = payload };
 }
 
 fn isLive(v: action_machine.Run.Value) bool {

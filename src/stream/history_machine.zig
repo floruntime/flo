@@ -168,6 +168,12 @@ fn endedKey(a: std.mem.Allocator, owner: []const u8, run: []const u8, created_ns
     return buf;
 }
 
+/// An orphan mark's whole key, for a test that plants one.
+pub fn orphanRowKey(a: std.mem.Allocator, ns: NamespaceId, owner: []const u8, run: []const u8, created_ns: u64) error{OutOfMemory}![]u8 {
+    if (!@import("builtin").is_test) @compileError("orphanRowKey is for tests");
+    return inNs(a, ns, try runKey(a, .orphan, owner, run, created_ns));
+}
+
 /// A live row's whole key, for a test that plants one.
 pub fn liveRowKey(a: std.mem.Allocator, ns: NamespaceId, owner: []const u8, run: []const u8, created_ns: u64, ual_index: u64, part: u8) error{OutOfMemory}![]u8 {
     if (!@import("builtin").is_test) @compileError("liveRowKey is for tests");
@@ -693,6 +699,135 @@ pub fn orphanRow(read: ReadView, a: std.mem.Allocator, family: he.Family, ns: Na
     const g = got orelse return null;
     return if (std.mem.eql(u8, g.v.owner, owner)) g.v else null;
 }
+
+/// An orphan mark found under an owner: the incarnation it marks and
+/// when that run ended.
+pub const Orphan = struct { run: []const u8, created_ns: u64, completed_ms: u64 };
+
+/// The most of an owner's orphans `orphansOf` counts past those it returns.
+pub const MAX_ORPHANS_COUNTED: u32 = 1024;
+
+/// Up to `out.len` of `owner`'s orphan marks in `ns`, as committed, in key
+/// order; and how many more of the owner's it found and left. Filtered on
+/// the owner each mark stores, as two names can hash alike. `skip` says
+/// which to leave out (one whose drop is already on its way).
+pub fn orphansOf(read: ReadView, a: std.mem.Allocator, family: he.Family, ns: NamespaceId, owner: []const u8, out: []Orphan, skip: anytype) error{OutOfMemory}!struct { n: usize, left: u32 } {
+    var pb: [1 + 8]u8 = undefined;
+    pb[0] = @backingInt(Tag.orphan);
+    pb[1..9].* = ownerHash(owner);
+    const prefix = try inNs(a, ns, &pb);
+    var n: usize = 0;
+    var left: u32 = 0;
+    switch (family) {
+        inline else => |f| {
+            const F = if (f == .workflow) Workflows else Actions;
+            var it = read.range(F, prefix);
+            while (it.next() catch null) |item| {
+                if (!std.mem.eql(u8, item.value.v.owner, owner)) continue;
+                // `4 ‖ 'O' ‖ hash ‖ len ‖ run ‖ created_ns`, as `runKey` wrote it.
+                const k = item.key[prefix.len..];
+                if (k.len < 2 + 8) continue;
+                const len = std.mem.readInt(u16, k[0..2], .big);
+                if (k.len != 2 + len + 8) continue;
+                const o: Orphan = .{ .run = k[2..][0..len], .created_ns = std.mem.readInt(u64, k[2 + len ..][0..8], .big), .completed_ms = item.value.v.completed_ms };
+                if (skip.has(o)) continue;
+                if (n < out.len) {
+                    out[n] = .{ .run = try a.dupe(u8, o.run), .created_ns = o.created_ns, .completed_ms = o.completed_ms };
+                    n += 1;
+                } else {
+                    left +|= 1;
+                    // Enough to say some are left: a count past it is no
+                    // more use to the caller, and the walk stays bounded.
+                    if (left >= MAX_ORPHANS_COUNTED) break;
+                }
+            }
+        },
+    }
+    return .{ .n = n, .left = left };
+}
+
+/// The orphans a leader's bulk deletes have sent a drop for and whose mark
+/// is still there: none is proposed again while its drop is on the lane.
+/// Each bulk delete first prunes the ones whose mark is gone (the drop
+/// landed), so `MAX` bounds drops in flight; at `MAX` a bulk delete takes
+/// no orphans and counts them as left. Leader memory, cleared at a new term.
+///
+/// A drop can't be lost within a term: it's sent from a committed apply
+/// into the logged outbox and delivered in order on the history lane. Only
+/// a repair skip loses one, and the history machine resends a skipped drop
+/// itself before it leaves the orphan marked. So clearing at a new term is
+/// a backstop for a mark that outlived its drop, not how one is retried.
+/// A hash two orphans share holds both back until the one sent lands.
+pub const OrphansSent = struct {
+    term: u64 = 0,
+    /// Each sent orphan's mark key, by its hash.
+    rows: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
+
+    pub const MAX = 4096;
+
+    pub fn deinit(self: *OrphansSent, a: std.mem.Allocator) void {
+        self.clear(a);
+        self.rows.deinit(a);
+    }
+
+    fn clear(self: *OrphansSent, a: std.mem.Allocator) void {
+        var it = self.rows.valueIterator();
+        while (it.next()) |k| a.free(k.*);
+        self.rows.clearRetainingCapacity();
+    }
+
+    /// Forget what an earlier term sent.
+    pub fn at(self: *OrphansSent, a: std.mem.Allocator, term: u64) void {
+        if (self.term == term) return;
+        self.term = term;
+        self.clear(a);
+    }
+
+    /// Forget those whose mark is gone from `read`: their drop landed.
+    pub fn prune(self: *OrphansSent, a: std.mem.Allocator, read: ReadView, family: he.Family) error{OutOfMemory}!void {
+        var gone: std.ArrayListUnmanaged(u64) = .empty;
+        defer gone.deinit(a);
+        var it = self.rows.iterator();
+        while (it.next()) |e| {
+            const marked = switch (family) {
+                inline else => |f| (read.get(if (f == .workflow) Workflows else Actions, e.value_ptr.*) catch continue) != null,
+            };
+            if (!marked) try gone.append(a, e.key_ptr.*);
+        }
+        for (gone.items) |h| if (self.rows.fetchRemove(h)) |kv| a.free(kv.value);
+    }
+
+    pub fn full(self: *const OrphansSent) bool {
+        return self.rows.count() >= MAX;
+    }
+
+    pub fn has(self: *const OrphansSent, ns: NamespaceId, owner: []const u8, o: Orphan) bool {
+        return self.rows.contains(id(ns, owner, o));
+    }
+
+    pub fn note(self: *OrphansSent, a: std.mem.Allocator, ns: NamespaceId, owner: []const u8, o: Orphan) error{OutOfMemory}!void {
+        if (self.full()) return;
+        const gop = try self.rows.getOrPut(a, id(ns, owner, o));
+        if (gop.found_existing) return;
+        errdefer self.rows.removeByPtr(gop.key_ptr);
+        const rk = try runKey(a, .orphan, owner, o.run, o.created_ns);
+        defer a.free(rk);
+        gop.value_ptr.* = try inNs(a, ns, rk);
+    }
+
+    // Keyed by a 64-bit hash, not the orphan: two that collide share an
+    // entry, so the second is held back as sent until the first's mark is
+    // gone and the prune frees it. A collision only defers a drop.
+    fn id(ns: NamespaceId, owner: []const u8, o: Orphan) u64 {
+        var h = std.hash.Wyhash.init(0x4f52);
+        h.update(std.mem.asBytes(&ns.int()));
+        h.update(owner);
+        h.update(&.{0});
+        h.update(o.run);
+        h.update(std.mem.asBytes(&o.created_ns));
+        return h.final();
+    }
+};
 
 /// Whether `run`'s incarnation `created_ns` holds any row: live, marker,
 /// final, orphan, or ended at `completed_ms`.
@@ -1473,4 +1608,29 @@ test "history machine: a run with its ended row and a chunk landed after it brea
     try t.chunk(r, 4, 4, false, 0);
     try t.pump();
     try testing.expectEqualStrings("a run with its ended row has live, marker or final rows besides", (try ruleOf(Actions, t.read(), arena.allocator())).?);
+}
+
+test "history machine: a leader's sent orphans are held back for their term only, and none past MAX" {
+    var sent: OrphansSent = .{};
+    defer sent.deinit(testing.allocator);
+    sent.at(testing.allocator, 3);
+    const o: Orphan = .{ .run = "r1", .created_ns = 7, .completed_ms = 10 };
+    try testing.expect(!sent.has(.default, "wf", o));
+    try sent.note(testing.allocator, .default, "wf", o);
+    try testing.expect(sent.has(.default, "wf", o));
+    // Another owner, namespace or incarnation is another orphan.
+    try testing.expect(!sent.has(.default, "wf2", o));
+    try testing.expect(!sent.has(.of(17), "wf", o));
+    try testing.expect(!sent.has(.default, "wf", .{ .run = "r1", .created_ns = 8, .completed_ms = 10 }));
+    // The same term keeps it; a new one forgets it.
+    sent.at(testing.allocator, 3);
+    try testing.expect(sent.has(.default, "wf", o));
+    sent.at(testing.allocator, 4);
+    try testing.expect(!sent.has(.default, "wf", o));
+    // Full, it takes no more.
+    var i: u64 = 0;
+    while (!sent.full()) : (i += 1) try sent.note(testing.allocator, .default, "wf", .{ .run = "r", .created_ns = i, .completed_ms = 0 });
+    try sent.note(testing.allocator, .default, "wf", o);
+    try testing.expect(!sent.has(.default, "wf", o));
+    try testing.expectEqual(@as(usize, OrphansSent.MAX), sent.rows.count());
 }

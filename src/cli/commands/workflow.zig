@@ -28,6 +28,7 @@ const history_read = @import("../../stream/history_read.zig");
 const wf_parser = @import("../../workflow/parser.zig");
 const wf_validator = @import("../../workflow/validator.zig");
 const gen = @import("../gen.zig");
+const runs_delete = @import("runs_delete.zig");
 const workflow_ops = @import("../../protocol/workflow_ops.zig");
 const system_ops = @import("../../protocol/system_ops.zig");
 
@@ -164,13 +165,14 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .action(wrapHandler(runListDefinitions)),
         )
         .subcommand(
-        commander.newBuilder(allocator)
-            .name("history")
-            .about("Get workflow run history (events)")
-            .arg("run_id", "Workflow run ID")
-            .uintFlag("limit", 'l', 100, "Maximum events to show")
-            .action(wrapHandler(runHistory)),
-    );
+            commander.newBuilder(allocator)
+                .name("history")
+                .about("Get workflow run history (events)")
+                .arg("run_id", "Workflow run ID")
+                .uintFlag("limit", 'l', 100, "Maximum events to show")
+                .action(wrapHandler(runHistory)),
+        )
+        .subcommand(runs_delete.builder(allocator, "workflow", "Delete a workflow's runs that ended before a time, with their histories", "flo workflow runs-delete order-flow --older-than 30d", wrapHandler(runRunsDelete)));
     gen.addCommands(allocator, workflow, &workflow_ops.table, &.{});
     return try workflow.build();
 }
@@ -748,4 +750,8 @@ test "workflow: a run status parses, and a cut-short one is Truncated" {
     try std.testing.expectEqual(@as(?i64, null), st.completed_at);
     try std.testing.expectEqualStrings("go", st.wait_signal.?);
     for (0..answer.len) |n| try std.testing.expectError(error.Truncated, parseRunStatus(answer[0..n]));
+}
+
+fn runRunsDelete(ctx: *commander.Context) commander.Error!void {
+    return runs_delete.run(ctx, .workflow_runs_delete, "workflow");
 }
