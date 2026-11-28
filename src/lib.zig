@@ -17,6 +17,7 @@ pub const protocol = struct {
     pub const workflow_ops = @import("protocol/workflow_ops.zig");
     pub const ts_ops = @import("protocol/ts_ops.zig");
     pub const stream_ops = @import("protocol/stream_ops.zig");
+    pub const queue_ops = @import("protocol/queue_ops.zig");
     pub const ops = @import("protocol/ops.zig");
     pub const kv_entries = @import("protocol/kv_entries.zig");
     pub const action_entries = @import("protocol/action_entries.zig");

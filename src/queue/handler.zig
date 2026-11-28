@@ -420,6 +420,14 @@ pub const QueueHandler = struct {
 
     const CONTROL_IN_NAME = client_names.controlRefusal("a queue name");
 
+    /// A consumer is a holder: stored with what it takes, and the first
+    /// part of its request keys, which a NUL in it would run into another
+    /// holder's. Every op that proposes one refuses a control byte.
+    fn consumerRefusal(consumer: []const u8) ?table_run.Refused {
+        if (!client_names.hasControl(consumer)) return null;
+        return .{ .status = .bad_request, .refusal = proto.notRun(comptime client_names.controlRefusal("a consumer name")) };
+    }
+
     fn handleCommand(self: *QueueHandler, req: Request) CommandResult {
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         if (req.key.len == 0 and op != .queue_list) return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
@@ -569,7 +577,7 @@ pub const QueueHandler = struct {
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
         if (req.key.len > qe.QueueName.max_size) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: queue name too long") } };
         if (client_names.hasControl(req.key)) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(CONTROL_IN_NAME) } };
-        if (client_names.hasControl(consumer)) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(comptime client_names.controlRefusal("a consumer name")) } };
+        if (consumerRefusal(consumer)) |r| return .{ .refused = r };
         const params: Params = .{ .ns = req.ns_id, .count = count, .lease_ms = lease_ms orelse qe.DEFAULT_LEASE_MS, .ack = ack, .consumer = consumer };
         const self = shard.queue_handler;
         if (try self.deliverHere(shard, conn.replyTo(), req.header.request_id, req.key, params)) return .wait;
@@ -812,6 +820,7 @@ pub const QueueHandler = struct {
     }
 
     fn runComplete(shard: *Shard, _: *Connection, req: Request, consumer: []const u8, term: u64, index: u64, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value) Error!table_run.Outcome(ReportResponse) {
+        if (consumerRefusal(consumer)) |r| return .{ .refused = r };
         if (req.key.len == 0) return error.NoQueue;
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
         // A namespace this node can't name, answered as a write to it is:
@@ -831,6 +840,7 @@ pub const QueueHandler = struct {
     }
 
     fn runFail(shard: *Shard, _: *Connection, req: Request, consumer: []const u8, term: u64, index: u64, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value, delay_ms: u64, dead: bool, err_text: []const u8) Error!table_run.Outcome(ReportResponse) {
+        if (consumerRefusal(consumer)) |r| return .{ .refused = r };
         if (req.key.len == 0) return error.NoQueue;
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
         // A namespace this node can't name, answered as a write to it is:
@@ -853,6 +863,7 @@ pub const QueueHandler = struct {
     /// than half of it is left; otherwise an extend is proposed and
     /// answered when it applies.
     fn runTouch(shard: *Shard, _: *Connection, req: Request, consumer: []const u8, term: u64, index: u64, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value) Error!table_run.Outcome(TouchResponse) {
+        if (consumerRefusal(consumer)) |r| return .{ .refused = r };
         if (req.key.len == 0) return error.NoQueue;
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
         // A namespace this node can't name, answered as a write to it is:

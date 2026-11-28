@@ -408,6 +408,22 @@ test "e2e/names: a holder holding a NUL or control byte is refused by status: a 
         try testing.expectEqualStrings("bad request: a worker id must not contain control characters (bytes 0x00-0x1f or 0x7f)", r.data);
     }
 
+    // A queue's report names its consumer in its body, as an action's names
+    // its worker.
+    var qb: [192]u8 = undefined;
+    const qo = src.queue_ops;
+    const queue_reports = [_]struct { op: proto.OpCode, body: []const u8 }{
+        .{ .op = .queue_complete, .body = try qo.op("queue.complete").request.encodeInto(qb[0..64], .{ .consumer = "c\x00d", .term = 1, .index = 1, .messages = .{ .bytes = "", .count = 0 } }) },
+        .{ .op = .queue_fail, .body = try qo.op("queue.fail").request.encodeInto(qb[64..128], .{ .consumer = "c\x00d", .term = 1, .index = 1, .messages = .{ .bytes = "", .count = 0 }, .delay_ms = 0, .dead = false, .@"error" = "" }) },
+        .{ .op = .queue_touch, .body = try qo.op("queue.touch").request.encodeInto(qb[128..192], .{ .consumer = "c\x00d", .term = 1, .index = 1, .messages = .{ .bytes = "", .count = 0 } }) },
+    };
+    for (queue_reports) |rep| {
+        const r = try rawCall(ctx, rep.op, "", "jobs", rep.body, &out);
+        if (r.status != bad) std.debug.print("{t}: {d} {s}\n", .{ rep.op, r.status, r.data });
+        try testing.expectEqual(bad, r.status);
+        try testing.expectEqualStrings(consumer_says, r.data);
+    }
+
     // [type:u8][max_concurrency:u32][process_count:u16][has_metadata:u8][has_machine_id:u8][len:u16][machine id]
     var reg: [32]u8 = undefined;
     reg[0] = 0;
@@ -424,19 +440,24 @@ test "e2e/names: a holder holding a NUL or control byte is refused by status: a 
     try testing.expect(std.mem.indexOf(u8, workers, "w1") == null);
 }
 
-test "e2e/names: a workflow whose version or a later step's signal type holds a control byte is refused by status, and nothing is stored" {
+test "e2e/names: a workflow whose version, step target or a later step's signal type holds a control byte is refused by status, and nothing is stored" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
     const proto = @import("src").protocol.proto;
     var out: [512]u8 = undefined;
     for ([_]struct { name: []const u8, def: []const u8, says: []const u8 }{
         .{ .name = "ver", .def = "{\"kind\":\"Workflow\",\"name\":\"ver\",\"version\":\"1\\n.0\",\"start\":{\"wait_for_signal\":{\"type\":\"go\"},\"transitions\":{\"success\":\"flo.Completed\"}}}", .says = "a workflow version" },
+        .{ .name = "target", .def = "{\"kind\":\"Workflow\",\"name\":\"target\",\"version\":\"1.0.0\",\"start\":{\"run\":\"@actions/se\\u0001nd\",\"transitions\":{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}", .says = "" },
         .{ .name = "later", .def = "{\"kind\":\"Workflow\",\"name\":\"later\",\"version\":\"1.0.0\",\"start\":{\"wait_for_signal\":{\"type\":\"go\"},\"transitions\":{\"success\":\"w\"}},\"steps\":{\"w\":{\"wait_for_signal\":{\"type\":\"g\\u0007o\"},\"transitions\":{\"success\":\"flo.Completed\"}}}}", .says = "a signal type" },
     }) |c| {
         const r = try rawCall(ctx, proto.OpCode.workflow_create, "", c.name, c.def, &out);
         try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
         var want: [128]u8 = undefined;
-        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "bad request: {s} must not contain control characters (bytes 0x00-0x1f or 0x7f)", .{c.says}), r.data);
+        // A step's target is refused by the validator, naming it.
+        if (c.says.len == 0)
+            try testing.expect(std.mem.startsWith(u8, r.data, "Invalid action/plan reference"))
+        else
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "bad request: {s} must not contain control characters (bytes 0x00-0x1f or 0x7f)", .{c.says}), r.data);
         const got = try rawCall(ctx, proto.OpCode.workflow_get_definition, "", c.name, "", &out);
         try testing.expectEqual(@backingInt(proto.StatusCode.not_found), got.status);
     }
