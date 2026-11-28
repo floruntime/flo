@@ -224,7 +224,16 @@ pub fn Model(comptime cfg: Config) type {
 
         /// `[holder][0][request_key]`, in the namespace: a holder's request
         /// keys. A holder holds no NUL, so one's keys never run into
-        /// another's.
+        /// another's. That holds because every op that proposes a holder
+        /// refuses a control byte in it before proposing: a group's
+        /// consumer on read, ack, nack, touch and steal (the group
+        /// handler), a queue's on dequeue, complete, fail and touch (the
+        /// queue handler's `consumerRefusal`), and an action worker's id
+        /// on await, deliver, complete, fail and touch (the actions
+        /// handler's `workerRefusal`). Entries made by the
+        /// server itself (expiry, hand-back, abandon) carry a holder read
+        /// back from a record those ops made. Applying takes the holder from
+        /// the entry, so nothing here re-checks it.
         pub fn requestKey(buf: []u8, holder: []const u8, request_key: []const u8) []const u8 {
             @memcpy(buf[0..holder.len], holder);
             buf[holder.len] = 0;

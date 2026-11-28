@@ -217,31 +217,21 @@ fn listDefinitions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashbo
     return try json_aw.toOwnedSlice();
 }
 
-/// Extract a top-level `name:` value from a YAML/JSON workflow definition, used
-/// only for hash-routing the create to the owning shard (the server re-parses
-/// and validates the full definition). Returns "" if not found.
-fn extractWorkflowName(content: []const u8) []const u8 {
-    var line_it = std.mem.splitScalar(u8, content, '\n');
-    while (line_it.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        const key = if (std.mem.startsWith(u8, trimmed, "name:"))
-            trimmed["name:".len..]
-        else if (std.mem.startsWith(u8, trimmed, "\"name\":"))
-            trimmed["\"name\":".len..]
-        else
-            continue;
-        return std.mem.trim(u8, key, " \t\r\"',");
-    }
-    return "";
-}
-
 /// POST /workflow/definitions?namespace= — create/define a workflow (loopback
 /// write). Body is the YAML/JSON definition.
 fn createDefinition(allocator: Allocator, query_string: ?[]const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
     if (body.len == 0) return try h.jsonError(allocator, "Empty definition body");
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
-    const wf_name = extractWorkflowName(body);
+    // Keyed by the definition's own name: the server stores it under its
+    // key, and refuses one that differs from the definition's.
+    var diag: wf_parser.Diagnostic = .{};
+    var def = wf_parser.parseWorkflow(allocator, body, &diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return try h.jsonError(allocator, diag.message());
+    };
+    defer def.deinit(allocator);
+    const wf_name = def.name;
     if (wf_name.len == 0) return try h.jsonError(allocator, "definition is missing a top-level name");
 
     var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");

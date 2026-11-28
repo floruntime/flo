@@ -2029,16 +2029,50 @@ test "parser: classify operator with default tag" {
     try std.testing.expect(has_default);
 }
 
-test "parser: a stream or queue name holding a NUL, or too long, is refused at submit" {
+test "parser: a TS name holding a control character is refused at submit, each name on its own" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"kind":"Processing","name":"j","sources":[{"ts":{"measurement":"c\npu","field":"f"}}],"sinks":[{"stream":{"name":"out"}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"ts":{"measurement":"cpu","field":"f\u001bx"}}],"sinks":[{"stream":{"name":"out"}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m\tx"}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m","value_field":"v\u007f"}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m","fields":{"lo\nad":"l"}}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m","tags":{"h\u0000":"h"}}}]}
+    }) |json_def| {
+        var def = try parseJobDefinitionWithNamespace(allocator, json_def, "acme", null);
+        defer def.deinit(allocator);
+        try std.testing.expectEqualStrings(comptime @import("../protocol/names.zig").controlRefusal("a measurement, field or tag key name"), def.namespaceRefusal().?);
+    }
+    for ([_][]const u8{
+        \\{"kind":"Processing","name":"j","sources":[{"ts":{"measurement":"cpu","field":"f"}}],"sinks":[{"stream":{"name":"out"}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"ts":{"measurement":"m","value_field":"v","tags":{"h":"h"}}},{"ts":{"measurement":"n","fields":{"load":"l"}}}]}
+    }) |json_def| {
+        var ok = try parseJobDefinitionWithNamespace(allocator, json_def, "acme", null);
+        defer ok.deinit(allocator);
+        try std.testing.expect(ok.namespaceRefusal() == null);
+    }
+}
+
+test "parser: a stream or queue name holding a control character, or too long, is refused at submit" {
     const allocator = std.testing.allocator;
     for ([_][]const u8{
         \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in\u0000x"}}],"sinks":[{"stream":{"name":"out"}}]}
         ,
         \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"queue":{"name":"q\u0000x"}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in\nx"}}],"sinks":[{"stream":{"name":"out"}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"stream":{"name":"o\u007fut"}}]}
     }) |json_def| {
         var def = try parseJobDefinitionWithNamespace(allocator, json_def, "acme", null);
         defer def.deinit(allocator);
-        try std.testing.expectEqualStrings("stream or queue name must not contain NUL", def.namespaceRefusal().?);
+        try std.testing.expectEqualStrings(comptime @import("../protocol/names.zig").controlRefusal("a stream or queue name"), def.namespaceRefusal().?);
     }
     // The limit is the name's own, as for a stream or queue outside a job:
     // the namespace's name doesn't count against it.

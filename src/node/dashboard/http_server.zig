@@ -17,6 +17,7 @@
 //! The dashboard assets are embedded at compile time from web/dist/
 
 const std = @import("std");
+const client_names = @import("../../protocol/names.zig");
 const Allocator = std.mem.Allocator;
 const api = @import("api.zig");
 const assets = @import("assets.zig");
@@ -223,7 +224,7 @@ pub const DashboardServer = struct {
                 self.sendError(client, .service_unavailable, "replaying");
                 return;
             }
-            log.debug("Dashboard: API request path={s}", .{parsed.path});
+            log.debug("Dashboard: API request path={f}", .{client_names.escaped(parsed.path)});
             self.handleApiRequest(client, parsed, body, cors_headers);
         } else if (parsed.method == .GET) {
             // Serve embedded static assets

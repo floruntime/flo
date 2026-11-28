@@ -25,6 +25,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
+const client_names = @import("../protocol/names.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
@@ -202,9 +203,10 @@ pub const WorkerHandler = struct {
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
 
         // A worker id is a run's holder, and a holder's request keys are
-        // `[holder][0][key]`: one holding a NUL could spell another's.
-        if (std.mem.indexOfScalar(u8, req.key, 0) != null) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "worker id must not contain NUL");
+        // `[holder][0][key]`: one holding a NUL could spell another's. No
+        // other control character either, as no client name holds one.
+        if (client_names.hasControl(req.key)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, INVALID_ID);
             return;
         }
 
@@ -322,6 +324,7 @@ pub const WorkerHandler = struct {
         var process_bytes: usize = 0;
         for (0..count) |_| {
             const name = r.prefixed() orelse return refuse(allocator, &reg, "registration cut short in its process list");
+            if (client_names.hasControl(name)) return refuse(allocator, &reg, comptime client_names.controlRefusal("a process name"));
             const kind_byte = r.byte() orelse return refuse(allocator, &reg, "registration cut short in its process list");
             const kind = std.enums.fromInt(ProcessKind, kind_byte) orelse return refuse(allocator, &reg, "unknown process kind");
             process_bytes += worker_ops.ProcessRow.encodedSize(.{ .name = name, .kind = @fromBackingInt(kind_byte), .run_count = 0, .fail_count = 0, .last_run_at_ms = 0 }) catch
@@ -348,6 +351,9 @@ pub const WorkerHandler = struct {
         // worker.list answers with it, so it must fit the list's bound.
         if (reg.machine_id) |m| if (m.len > worker_ops.MAX_MACHINE_ID)
             return pastLimit(allocator, &reg, .field_too_long, std.fmt.comptimePrint("machine id longer than {d} bytes", .{worker_ops.MAX_MACHINE_ID}));
+        // Listed and shown as a name is: no control character.
+        if (reg.machine_id) |m| if (client_names.hasControl(m))
+            return refuse(allocator, &reg, comptime client_names.controlRefusal("a machine id"));
 
         if (!r.done()) return refuse(allocator, &reg, "registration has bytes past its end");
         return .{ .ok = reg };
@@ -542,7 +548,7 @@ pub const WorkerHandler = struct {
 
     fn info(self: *WorkerHandler, ns: NamespaceId, worker_id: []const u8) Error!InfoResponse.Value {
         // No worker's id holds a NUL (`dispatchWorkerCmd`).
-        if (std.mem.indexOfScalar(u8, worker_id, 0) != null) return error.InvalidId;
+        if (client_names.hasControl(worker_id)) return error.InvalidId;
         const w = self.find(ns, worker_id) orelse return error.NotFound;
         const buf = self.info_buf orelse blk: {
             const b = try self.allocator.alloc(u8, worker_ops.Processes.byte_bound.?);
@@ -570,9 +576,11 @@ pub const WorkerHandler = struct {
             error.OutOfMemory => .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "internal error: out of memory" } },
             error.GatherBusy => .{ .status = .overloaded, .refusal = .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many reads across shards are under way; this request was not run — retry" } },
             error.NotFound => .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = "worker not found" } },
-            error.InvalidId => .{ .status = .bad_request, .refusal = .{ .reason = .malformed, .ran = .no, .message = "worker id must not contain NUL" } },
+            error.InvalidId => .{ .status = .bad_request, .refusal = .{ .reason = .malformed, .ran = .no, .message = INVALID_ID } },
         };
     }
+
+    const INVALID_ID = client_names.controlRefusal("a worker id");
 
     /// worker.list: each shard holds the workers that registered on it, so
     /// every shard answers its own page after `cursor` and the pages merge.
@@ -837,6 +845,7 @@ test "worker.info: the row, metadata and processes, as registered; an unknown wo
 
     try std.testing.expectError(error.NotFound, h.info(A, "w"));
     try std.testing.expectError(error.InvalidId, h.info(.default, "b\x00w"));
+    try std.testing.expectError(error.InvalidId, h.info(.default, "b\nw"));
 }
 
 test "workers: a registration whose processes worker.info couldn't list is refused" {

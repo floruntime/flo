@@ -38,6 +38,7 @@ const std = @import("std");
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence = @import("../storage/persistence.zig");
 const schema = @import("../protocol/schema.zig");
+const client_names = @import("../protocol/names.zig");
 const ae = @import("../protocol/action_entries.zig");
 const action_ops = @import("../protocol/action_ops.zig");
 const limits = @import("../protocol/limits.zig");
@@ -347,7 +348,7 @@ pub const NO_ACTION = "not found: no such action";
 pub const NO_RUN = "not found: no such run";
 pub const RUN_EXISTS = "conflict: a run with this id exists";
 pub const NOT_READY = "conflict: the run isn't ready to deliver";
-pub const NAME_HAS_NUL = "bad request: an action's name holds no NUL";
+pub const NAME_HAS_CONTROL = client_names.controlRefusal("an action name");
 pub const NOT_ITS_LEASE = "bad request: an extend names its delivery's own lease and start";
 
 /// Answers: register, the action's version (u32, 1 then one more each
@@ -361,7 +362,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     switch (typeOf(e)) {
         .action_register => {
             const p = ae.Register.decodeAll(e.payload, &diag) catch return error.Halt;
-            if (std.mem.indexOfScalar(u8, p.name, 0) != null) return out.refuse(.bad_request, .malformed, NAME_HAS_NUL);
+            if (client_names.hasControl(p.name)) return out.refuse(.bad_request, .malformed, NAME_HAS_CONTROL);
             const k = try idKey(view, .of(p.ns), p.name);
             const old = try view.get(Defs, k);
             const version: u32 = if (old) |d| d.v.version +| 1 else 1;
@@ -1082,6 +1083,17 @@ fn expiring(buf: []u8, item: ae.ExpireItem.Value) !ae.Expire.Value {
 
 fn keyOf(run_id: []const u8, expiry_ns: u64) ae.ExpireItem.Value {
     return .{ .ns = DEFAULT, .action = "send", .run = run_id, .expiry_ns = expiry_ns, .holder = "w1", .request_key = null };
+}
+
+test "actions machine: a register naming a control character is refused at apply, saying so, and a UTF-8 name is not" {
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    for ([_][]const u8{ "se\x00nd", "se\nnd", "se\x1bnd", "se\x7fnd" }) |name| {
+        const r = try t.apply(.action_register, ae.Register.Value{ .ns = DEFAULT, .name = name, .owner = "", .lease_ms = LEASE_MS, .max_attempts = 1 }, 1);
+        try testing.expectEqualStrings(NAME_HAS_CONTROL, r.refused().?.refusal.message);
+    }
+    const ok = try t.apply(.action_register, ae.Register.Value{ .ns = DEFAULT, .name = "s\xc3\xa9nd", .owner = "", .lease_ms = LEASE_MS, .max_attempts = 1 }, 1);
+    try testing.expect(ok.refused() == null);
 }
 
 test "actions machine: a run is delivered once, settled by its holder, and a resent settle answers as it did" {

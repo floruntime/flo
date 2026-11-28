@@ -27,6 +27,7 @@
 //! are system-owned and blocked from user operations.
 
 const std = @import("std");
+const client_names = @import("../protocol/names.zig");
 const time_units = @import("../util/time_units.zig");
 const Allocator = std.mem.Allocator;
 const raft_node_mod = @import("../raft/node.zig");
@@ -527,7 +528,7 @@ pub const KVHandler = struct {
         checkKey(raw_key) catch return none;
         const owner = MgetOwner.of(.{ .shard = shard, .ns_id = ns_id }, raw_key);
         if (owner != shard.id) {
-            log.err("shard {d}: kv.mget was asked for key \"{s}\", which shard {d} owns", .{ shard.id, raw_key, owner });
+            log.err("shard {d}: kv.mget was asked for key \"{f}\", which shard {d} owns", .{ shard.id, client_names.escaped(raw_key), owner });
             return error.NotOwner;
         }
         const entry = shard.kv_handler.*.kv.getIn(ns_id, raw_key) orelse return none;

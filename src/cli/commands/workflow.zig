@@ -229,6 +229,11 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
     }
     defer if (owned) ctx.allocator.free(definition);
 
+    // The definition's own name keys the request: the server stores it
+    // under that key, and refuses one that differs from the definition's.
+    var wf_name_owned: ?[]u8 = null;
+    defer if (wf_name_owned) |n| ctx.allocator.free(n);
+
     // Client-side pre-validation — catch errors before the server round-trip
     prevalidate: {
         var diag: wf_parser.Diagnostic = .{};
@@ -237,6 +242,7 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
             return outcome.usage(ctx, "{s}", .{diag.message()});
         };
         defer def.deinit(ctx.allocator);
+        wf_name_owned = try ctx.allocator.dupe(u8, def.name);
 
         var validation = wf_validator.validateWorkflow(ctx.allocator, &def) catch {
             // Non-fatal: fall through to server-side validation
@@ -256,10 +262,7 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
         }
     }
 
-    // Extract workflow name from definition for key-based routing.
-    // The server still validates the full definition; this just enables
-    // the Acceptor to hash-route the connection to the correct shard.
-    const wf_name = extractWorkflowName(definition) orelse "";
+    const wf_name: []const u8 = wf_name_owned orelse "";
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -733,68 +736,6 @@ fn runListDefinitions(ctx: *commander.Context) commander.Error!void {
 // =============================================================================
 // Helpers
 // =============================================================================
-
-/// Extract the "name" field from a workflow definition (JSON or YAML).
-///
-/// Returns a slice into `content` — no allocation needed.  Handles:
-///   JSON:  "name": "my-workflow"      (anywhere on a line)
-///   YAML:  name: my-workflow          (at start of line only)
-///
-/// Best-effort: if extraction fails, the caller should send key="" and
-/// let the server parse the full definition as fallback.
-fn extractWorkflowName(content: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (i + 4 <= content.len) {
-        const pos = std.mem.indexOfPos(u8, content, i, "name") orelse break;
-
-        // Must be a top-level key: preceded by " (JSON) or newline/start (YAML)
-        if (pos > 0) {
-            const before = content[pos - 1];
-            if (before != '"' and before != '\n' and before != '\r') {
-                i = pos + 4;
-                continue;
-            }
-        }
-
-        var j = pos + 4;
-
-        // JSON key: skip closing quote of "name"
-        if (j < content.len and content[j] == '"') j += 1;
-
-        // Skip whitespace before colon
-        while (j < content.len and (content[j] == ' ' or content[j] == '\t')) : (j += 1) {}
-
-        // Must have colon separator
-        if (j >= content.len or content[j] != ':') {
-            i = pos + 4;
-            continue;
-        }
-        j += 1;
-
-        // Skip whitespace after colon
-        while (j < content.len and (content[j] == ' ' or content[j] == '\t')) : (j += 1) {}
-        if (j >= content.len) break;
-
-        // Quoted string value
-        if (content[j] == '"') {
-            const start = j + 1;
-            if (std.mem.indexOfScalarPos(u8, content, start, '"')) |end| {
-                if (end > start) return content[start..end];
-            }
-        } else if (content[j] != '\n' and content[j] != '\r' and content[j] != '{' and content[j] != '[') {
-            // Unquoted YAML value
-            const start = j;
-            var end = j;
-            while (end < content.len and content[end] != '\n' and content[end] != '\r') : (end += 1) {}
-            // Trim trailing whitespace and commas
-            while (end > start and (content[end - 1] == ' ' or content[end - 1] == '\t' or content[end - 1] == ',')) : (end -= 1) {}
-            if (end > start) return content[start..end];
-        }
-
-        i = pos + 4;
-    }
-    return null;
-}
 
 test "workflow: a run status parses, and a cut-short one is Truncated" {
     const answer = "\x02\x00r1" ++ "\x02\x00wf" ++ "\x01\x00" ++ "1" ++ "\x02" ++ "\x01\x00s" ++

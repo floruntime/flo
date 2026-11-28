@@ -14,6 +14,7 @@ const std = @import("std");
 const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
+const client_names = @import("../protocol/names.zig");
 const result_mod = @import("../protocol/result.zig");
 const schema = @import("../protocol/schema.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
@@ -299,7 +300,7 @@ pub const ActionsHandler = struct {
 
     // ── Errors ──────────────────────────────────────────────────────────
 
-    pub const Error = error{ NotFound, OutOfMemory, StoredTooLong, NotLeading, Stale, Unproposed, NameHasNul };
+    pub const Error = error{ NotFound, OutOfMemory, StoredTooLong, NotLeading, Stale, Unproposed, NameHasControl };
 
     pub fn refusal(err: Error) table_run.Refused {
         return switch (err) {
@@ -309,7 +310,7 @@ pub const ActionsHandler = struct {
             error.NotLeading => .{ .status = .unavailable, .refusal = .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: this node's leadership isn't settled yet — retry" } },
             error.Stale => .{ .status = .conflict, .refusal = .{ .reason = .stale_report, .ran = .no, .message = "stale report: the run was delivered again since" } },
             error.Unproposed => .{ .status = .unavailable, .refusal = .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: the report could not be proposed — retry" } },
-            error.NameHasNul => .{ .status = .bad_request, .refusal = .{ .reason = .malformed, .ran = .no, .message = machine.NAME_HAS_NUL } },
+            error.NameHasControl => .{ .status = .bad_request, .refusal = .{ .reason = .malformed, .ran = .no, .message = machine.NAME_HAS_CONTROL } },
         };
     }
 
@@ -320,8 +321,8 @@ pub const ActionsHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         switch (op) {
-            .action_register, .action_invoke, .action_delete => if (std.mem.indexOfScalar(u8, req.key, 0) != null) {
-                return sendActionResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "action name must not contain NUL" } });
+            .action_register, .action_invoke, .action_delete => if (client_names.hasControl(req.key)) {
+                return sendActionResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = comptime client_names.controlRefusal("an action name") } });
             },
             else => {},
         }
@@ -534,9 +535,9 @@ pub const ActionsHandler = struct {
                 if (!self.missing_run_said) {
                     self.missing_run_said = true;
                     if (@import("builtin").is_test)
-                        log.warn("action run list: run {s} is indexed but not there; skipped", .{at.run})
+                        log.warn("action run list: run {f} is indexed but not there; skipped", .{client_names.escaped(at.run)})
                     else
-                        log.err("action run list: run {s} is indexed but not there; skipped", .{at.run});
+                        log.err("action run list: run {f} is indexed but not there; skipped", .{client_names.escaped(at.run)});
                 }
                 read += 1;
                 last = at;
@@ -558,9 +559,9 @@ pub const ActionsHandler = struct {
                 if (!self.unlistable_said) {
                     self.unlistable_said = true;
                     if (@import("builtin").is_test)
-                        log.warn("action run list: run {s} can't be listed ({s}); skipped", .{ at.run, @errorName(err) })
+                        log.warn("action run list: run {f} can't be listed ({s}); skipped", .{ client_names.escaped(at.run), @errorName(err) })
                     else
-                        log.err("action run list: run {s} can't be listed ({s}); skipped", .{ at.run, @errorName(err) });
+                        log.err("action run list: run {f} can't be listed ({s}); skipped", .{ client_names.escaped(at.run), @errorName(err) });
                 }
                 read += 1;
                 last = at;
@@ -749,6 +750,15 @@ pub const ActionsHandler = struct {
         asked: usize = 0,
     };
 
+    /// A worker id is a holder: stored with the run it takes, shown by
+    /// status and history, and the first part of its request keys, which a
+    /// NUL in it would run into another holder's. Every op naming one
+    /// refuses a control byte.
+    fn workerRefusal(worker: []const u8) ?table_run.Refused {
+        if (!client_names.hasControl(worker)) return null;
+        return .{ .status = .bad_request, .refusal = proto.notRun(comptime client_names.controlRefusal("a worker id")) };
+    }
+
     /// Take a task of one of the worker's actions. With a request key, the
     /// delivery that key got is looked for first, wherever its run is;
     /// then an action this shard owns is delivered here, and one another
@@ -757,13 +767,17 @@ pub const ActionsHandler = struct {
     fn runAwait(shard: *Shard, conn: *Connection, req: Request, actions: action_ops.ActionNames.Value, block_ms: u64, request_key: ?[]const u8) Error!table_run.Outcome(AwaitResponse) {
         const ns = req.ns_id;
         const worker_id = req.key;
+        if (workerRefusal(worker_id)) |r| return .{ .refused = r };
         if (worker_id.len > 0) if (shard.worker_handler.refusesWork(ns, worker_id)) |no| return .{ .refused = .{ .status = .bad_request, .refusal = no } };
         var want: Want = .{ .ns = ns, .worker = worker_id, .labels = null, .request_key = request_key, .block_ms = block_ms, .names = .{} };
         if (worker_id.len > 0) if (shard.worker_handler.find(ns, worker_id)) |w| {
             want.labels = w.metadata_owned;
         };
         var it = actions.iterator();
-        while (it.next() catch null) |name| want.names.add(name);
+        while (it.next() catch null) |name| {
+            if (client_names.hasControl(name)) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(comptime client_names.controlRefusal("an action name")) } };
+            want.names.add(name);
+        }
         if (want.names.len == 0) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: an await names at least one action") } };
         want.asked = want.names.len;
         // Refused now rather than once it has to wait, so an await is
@@ -1071,6 +1085,7 @@ pub const ActionsHandler = struct {
     /// leader whose term's entries haven't applied refuses it, and the
     /// worker retries.
     fn runDeliver(shard: *Shard, conn: *Connection, req: Request, holder: []const u8, labels: ?[]const u8, request_key: ?[]const u8, again_only: bool) Error!table_run.Outcome(DeliverResponse) {
+        if (workerRefusal(holder)) |r| return .{ .refused = r };
         return switch (try shard.actions_handler.deliverHere(shard, conn.replyTo(), req.header.request_id, req.ns_id, req.key, holder, labels, request_key, again_only)) {
             .proposed => .wait,
             .again => |task| .{ .answer = .{ .task = task } },
@@ -1130,7 +1145,7 @@ pub const ActionsHandler = struct {
             const owned_key = try self.allocator.dupe(u8, run_key);
             const proposed = propose(shard, .action_deliver, ae.Deliver.Value{ .ns = ns.int(), .action = action, .run = run_id, .due_ns = due, .holder = holder, .request_key = request_key, .lease_ms = def.lease_ms }) catch |err| {
                 self.allocator.free(owned_key);
-                if (!shard.quietHalted(err)) log.warn("shard {d}: run {s} not delivered: {s}", .{ shard.id, run_id, @errorName(err) });
+                if (!shard.quietHalted(err)) log.warn("shard {d}: run {f} not delivered: {s}", .{ shard.id, client_names.escaped(run_id), @errorName(err) });
                 return .none;
             };
             self.reserved.putAssumeCapacity(owned_key, {});
@@ -1413,6 +1428,7 @@ pub const ActionsHandler = struct {
     }
 
     fn runComplete(shard: *Shard, _: *Connection, req: Request, action: []const u8, worker: []const u8, deliveries: u32, term: u64, index: u64, outcome: []const u8, result: []const u8) Error!table_run.Outcome(EmptyResponse) {
+        if (workerRefusal(worker)) |r| return .{ .refused = r };
         const run = try reported(shard, req, action);
         if (endWait(shard, req.ns_id, run)) |r| return .{ .refused = r };
         const proposed = propose(shard, .action_settle, ae.Settle.Value{ .ns = req.ns_id.int(), .action = action, .run = req.key, .holder = worker, .request_key = run.request_key, .deliveries = deliveries, .token = .{ .term = term, .index = index }, .expiry_ns = run.expiry_ns, .outcome = outcome, .result = result }) catch |err|
@@ -1422,6 +1438,7 @@ pub const ActionsHandler = struct {
     }
 
     fn runFail(shard: *Shard, _: *Connection, req: Request, action: []const u8, worker: []const u8, deliveries: u32, term: u64, index: u64, retry: bool, abandoned: bool, delay_ms: u64, err_text: []const u8) Error!table_run.Outcome(EmptyResponse) {
+        if (workerRefusal(worker)) |r| return .{ .refused = r };
         const run = try reported(shard, req, action);
         // Only a fail that ends the run sends its end.
         const ends = !abandoned and (!retry or run.failures +| 1 >= run.max_attempts);
@@ -1436,6 +1453,7 @@ pub const ActionsHandler = struct {
     /// than half of it is left, or while an extend for it is in flight;
     /// otherwise an extend is proposed and answered when it applies.
     fn runTouch(shard: *Shard, _: *Connection, req: Request, action: []const u8, worker: []const u8, deliveries: u32, term: u64, index: u64) Error!table_run.Outcome(TouchResponse) {
+        if (workerRefusal(worker)) |r| return .{ .refused = r };
         const self = shard.actions_handler;
         const run = try reported(shard, req, action);
         const token: ae.Token.Value = .{ .term = term, .index = index };

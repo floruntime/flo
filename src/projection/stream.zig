@@ -16,6 +16,7 @@ const node_router = @import("../node/router.zig");
 const MAX_QUALIFIED_KEY = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
 const ce = @import("../protocol/channel_entries.zig");
 const schema = @import("../protocol/schema.zig");
+const client_names = @import("../protocol/names.zig");
 const store_mod = @import("../contract/store.zig");
 const view_mod = @import("../contract/view.zig");
 const sm = @import("../stream/machine.zig");
@@ -188,10 +189,10 @@ pub fn appendAt(payload: []const u8, part: u8) ?AppendValue {
 /// would have been refused for. Checked before its inbound commits.
 pub fn appendRefusal(payload: []const u8) ?[]const u8 {
     const cmd = entry_mod.CommandPayload.deserialize(payload) orelse return "bad request: a stream append that isn't one";
-    // As a client's append is refused for its name: none, one with NUL, or
-    // one longer than a stream list can name.
+    // As a client's append is refused for its name: none, one with a
+    // control character, or one longer than a stream list can name.
     if (cmd.key.len == 0) return "stream append: stream name is required";
-    if (std.mem.indexOfScalar(u8, cmd.key, 0) != null) return "stream append: stream name must not contain NUL";
+    if (client_names.hasControl(cmd.key)) return comptime client_names.controlRefusal("a stream name");
     if (cmd.key.len > MAX_QUALIFIED_KEY) return "stream append: stream name too long";
     _ = BatchIterator.init(decodeAppendValue(cmd.value).payload) catch |err| return switch (err) {
         error.TooManyRecords => "stream append: a batch over the record limit",

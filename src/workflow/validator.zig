@@ -24,6 +24,7 @@
 //! ```
 
 const std = @import("std");
+const client_names = @import("../protocol/names.zig");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
@@ -408,8 +409,9 @@ fn validateStepReference(result: *ValidationResult, step: Step, step_name: []con
 
 fn isValidActionOrPlanReference(target: []const u8) bool {
     // An action name is part of its registry key ("ns\x00name"): one
-    // holding a NUL could name another namespace's action.
-    if (mem.indexOfScalar(u8, target, 0) != null) return false;
+    // holding a NUL could name another namespace's action. No other
+    // control character either, as no client name holds one.
+    if (client_names.hasControl(target)) return false;
     // Valid formats:
     // @actions/<name>
     // @plan/<name>
@@ -740,7 +742,7 @@ fn validateExecutorConfig(result: *ValidationResult, exec: ExecutorConfig, plan_
 }
 
 fn isValidActionReference(target: []const u8) bool {
-    if (mem.indexOfScalar(u8, target, 0) != null) return false; // as above
+    if (client_names.hasControl(target)) return false; // as above
     // Plan executors can only reference actions, not other plans
     if (mem.startsWith(u8, target, "@actions/")) {
         return nameFits(target["@actions/".len..], MAX_ACTION_NAME);
@@ -1018,6 +1020,9 @@ test "isValidActionOrPlanReference" {
     try testing.expect(!isValidActionOrPlanReference("@plan/")); // Empty name
     try testing.expect(!isValidActionOrPlanReference("validate")); // No prefix
     try testing.expect(!isValidActionOrPlanReference("")); // Empty
+    try testing.expect(!isValidActionOrPlanReference("@actions/a\nb")); // a control character
+    try testing.expect(!isValidActionOrPlanReference("@actions/a\x7f"));
+    try testing.expect(isValidActionOrPlanReference("@actions/caf\xc3\xa9")); // UTF-8
     // At most an action's name, or a workflow's that a history may name.
     const action_name: [MAX_ACTION_NAME]u8 = @splat('a');
     const long = "@actions/".* ++ action_name;
@@ -1471,6 +1476,7 @@ test "validator: an action reference holding a NUL is not valid" {
     try std.testing.expect(isValidActionOrPlanReference("@actions/x"));
     try std.testing.expect(!isValidActionOrPlanReference("@actions/b\x00x"));
     try std.testing.expect(!isValidActionReference("@actions/b\x00x"));
+    try std.testing.expect(!isValidActionReference("@actions/b\tx"));
 }
 
 test "validateWorkflow: an input_mapping or output nested past 128 levels is refused" {

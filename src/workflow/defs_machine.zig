@@ -12,6 +12,7 @@
 //! ready leader fires them.
 
 const std = @import("std");
+const client_names = @import("../protocol/names.zig");
 const schema = @import("../protocol/schema.zig");
 const view_mod = @import("../contract/view.zig");
 const machine_mod = @import("../contract/machine.zig");
@@ -104,7 +105,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             var diag: parser.Diagnostic = .{};
             var def = parser.parseWorkflow(view.arena, cmd.value, &diag) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
-                log.err("workflow definition at index {d} doesn't parse: {s}", .{ e.header.index, diag.message() });
+                log.err("workflow definition at index {d} doesn't parse: {f}", .{ e.header.index, client_names.escaped(diag.message()) });
                 return error.Halt;
             };
             defer def.deinit(view.arena);

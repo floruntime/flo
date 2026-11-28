@@ -30,6 +30,7 @@
 //! consistent expression support across filter and classify.
 
 const std = @import("std");
+const client_names = @import("../../protocol/names.zig");
 const Allocator = std.mem.Allocator;
 const Operator = @import("../operator.zig").Operator;
 const log = @import("stdx").log;
@@ -92,10 +93,10 @@ pub const ClassifyOperator = struct {
         // Record is always emitted — classify never drops.
         var tagged_rec = rec;
         var any_matched = false;
-        log.debug("classify '{s}': processing record value[{d}]={s}", .{ self.name, rec.value.len, if (rec.value.len > 200) rec.value[0..200] else rec.value });
+        log.debug("classify '{f}': processing record value[{d}]={f}", .{ client_names.escaped(self.name), rec.value.len, client_names.escaped(if (rec.value.len > 200) rec.value[0..200] else rec.value) });
         for (self.rules) |*rule| {
             const matched = (try rule.condition.judge(rec, ctx.allocator)) == .pass;
-            log.debug("classify '{s}': rule bit={d} cond='{s}' matched={}", .{ self.name, rule.tag_bit, rule.condition.condition, matched });
+            log.debug("classify '{f}': rule bit={d} cond='{f}' matched={}", .{ client_names.escaped(self.name), rule.tag_bit, client_names.escaped(rule.condition.condition), matched });
             if (matched) {
                 tagged_rec.addTag(rule.tag_bit);
                 any_matched = true;
