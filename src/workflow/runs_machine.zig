@@ -1452,6 +1452,10 @@ fn deleteEnded(view: *View, n: Named, run_key: []const u8, run: *const Run.Value
 /// passed over, as is an orphan no longer marked. Answers how many runs
 /// it deleted.
 fn applyRunsDelete(view: *View, e: *const Entry, out: *Result) ApplyError!void {
+    // Each run or orphan it takes sends one drop: a full batch is within
+    // what one entry may send.
+    comptime std.debug.assert(ae.MAX_RUNS_DELETE + 1 <= channels.MAX_SENDS);
+    comptime std.debug.assert(ae.MAX_RUNS_DELETE * he.Drop.max_size <= channels.MAX_SEND_BYTES);
     var diag: schema.Diagnostic = .{};
     // Only a leader proposes one: one that doesn't decode, or holds more
     // than its sends allow, is a Flo bug.
@@ -1851,6 +1855,10 @@ const Fixture = struct {
     /// A bulk delete of `wf`'s runs that ended before `before_ms`, as its
     /// leader read them, and of the orphans it found.
     fn bulkDelete(f: *Fixture, wf: []const u8, before_ms: i64, runs: []const ae.DeletedRun.Value, orphans: []const ae.DeletedRun.Value) !Result {
+        return f.bulkDeleteIn(.default, wf, before_ms, runs, orphans);
+    }
+
+    fn bulkDeleteIn(f: *Fixture, ns: NamespaceId, wf: []const u8, before_ms: i64, runs: []const ae.DeletedRun.Value, orphans: []const ae.DeletedRun.Value) !Result {
         // Not the scratch arena: the apply resets it.
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
@@ -1859,7 +1867,7 @@ const Fixture = struct {
         for (runs) |r| try rl.appendSlice(a, try ae.DeletedRun.encodeInto(try a.alloc(u8, ae.DeletedRun.max_size), r));
         var ol: std.ArrayListUnmanaged(u8) = .empty;
         for (orphans) |r| try ol.appendSlice(a, try ae.DeletedRun.encodeInto(try a.alloc(u8, ae.DeletedRun.max_size), r));
-        const body: ae.RunsDelete.Value = .{ .ns = NamespaceId.default.int(), .owner = wf, .before_ms = before_ms, .runs = .{ .bytes = rl.items, .count = @intCast(runs.len) }, .orphans = .{ .bytes = ol.items, .count = @intCast(orphans.len) } };
+        const body: ae.RunsDelete.Value = .{ .ns = ns.int(), .owner = wf, .before_ms = before_ms, .runs = .{ .bytes = rl.items, .count = @intCast(runs.len) }, .orphans = .{ .bytes = ol.items, .count = @intCast(orphans.len) } };
         const payload = try ae.RunsDelete.encodeInto(try a.alloc(u8, ae.RunsDelete.max_size), body);
         f.index += 1;
         const e = entry_mod.buildEntry(.workflow_runs_delete, entry_mod.Flags.NONE, 1, f.index, 95 * std.time.ns_per_ms, payload);
@@ -1880,8 +1888,12 @@ const Fixture = struct {
 
     /// An orphan mark planted for run `run_id`'s incarnation `created_ns`.
     fn plantOrphan(f: *Fixture, wf: []const u8, run_id: []const u8, created_ns: u64, completed_ms: u64) !void {
+        return f.plantOrphanIn(.default, wf, run_id, created_ns, completed_ms);
+    }
+
+    fn plantOrphanIn(f: *Fixture, ns: NamespaceId, wf: []const u8, run_id: []const u8, created_ns: u64, completed_ms: u64) !void {
         const a = f.scratch.allocator();
-        const k = try he_machine.orphanRowKey(a, .default, wf, run_id, created_ns);
+        const k = try he_machine.orphanRowKey(a, ns, wf, run_id, created_ns);
         var ks = view_mod.KeySet.init(a);
         try ks.add(he_machine.Workflows.ID, "", k);
         var view = View.init(&f.store, a, &ks);
@@ -2309,8 +2321,14 @@ test "workflow runs machine: every way a run ends puts it in its workflow's ende
 /// A workflow other than "wf" whose runs' history this fixture's group
 /// takes too, so a run of it can end here.
 fn otherWorkflowHere(f: *const Fixture) []const u8 {
+    return workflowHereIn(f, .default);
+}
+
+/// A workflow other than "wf" in `ns` whose runs' history this fixture's
+/// group takes.
+fn workflowHereIn(f: *const Fixture, ns: NamespaceId) []const u8 {
     const names = [_][]const u8{ "wf1", "wf2", "wf3", "wf4", "wf5", "wf6", "wf7", "wf8", "wf9", "wfa", "wfb", "wfc" };
-    for (names) |n| if (channels.ownerOf(.{ .group = 0, .count = 2 }, calls_mod.callerSlot(.default, n)) == f.store.place.?.group) return n;
+    for (names) |n| if (channels.ownerOf(.{ .group = 0, .count = 2 }, calls_mod.callerSlot(ns, n)) == f.store.place.?.group) return n;
     unreachable;
 }
 
@@ -2388,6 +2406,39 @@ test "workflow runs machine: a bulk delete drops an orphan still marked before i
     try testing.expectEqual(@as(u64, 7), drops[0].created_ns);
 }
 
+test "workflow runs machine: a bulk delete passes over a run that ended at its bound, and doesn't call it more" {
+    var f = Fixture.init();
+    defer f.deinit();
+    _ = try f.start("at", "wf", "workflow_started", "", 1);
+    var vb: [512]u8 = undefined;
+    _ = try f.complete("at", completeValue(&vb, .cancelled, "wf"), 25);
+    const out = try f.bulkDelete("wf", 25, &.{f.deletedOf("at")}, &.{});
+    const got = Fixture.bulkAnswer(&out);
+    try testing.expectEqual(@as(u32, 0), got.deleted);
+    try testing.expect(!got.more);
+    try testing.expect(f.get("at") != null);
+    // One past it, it goes.
+    try testing.expectEqual(@as(u32, 1), Fixture.bulkAnswer(&(try f.bulkDelete("wf", 26, &.{f.deletedOf("at")}, &.{}))).deleted);
+}
+
+test "workflow runs machine: a bulk delete in a namespace drops its orphan there, not the default namespace's of the same name" {
+    var f = Fixture.init();
+    defer f.deinit();
+    const ns: NamespaceId = .of(16);
+    const wf = workflowHereIn(&f, ns);
+    try f.plantOrphanIn(ns, wf, "o1", 7, 10);
+    const o: ae.DeletedRun.Value = .{ .run = "o1", .created_ns = 7, .completed_ms = 10 };
+    // The default namespace has no such mark: nothing goes.
+    try testing.expectEqual(@as(u32, 0), Fixture.bulkAnswer(&(try f.bulkDeleteIn(.default, wf, 25, &.{}, &.{o}))).left);
+    try testing.expectEqual(@as(usize, 0), (try f.drops()).len);
+    const out = try f.bulkDeleteIn(ns, wf, 25, &.{}, &.{o});
+    try testing.expectEqual(@as(u32, 0), Fixture.bulkAnswer(&out).left);
+    const drops = try f.drops();
+    try testing.expectEqual(@as(usize, 1), drops.len);
+    try testing.expectEqualStrings("o1", drops[0].run);
+    try testing.expectEqual(ns.int(), drops[0].ns);
+}
+
 test "workflow runs machine: a leader's sent orphan leaves its set once its mark is gone, so the one past MAX is taken once earlier drops land" {
     var f = Fixture.init();
     defer f.deinit();
@@ -2437,8 +2488,6 @@ test "workflow runs machine: a bulk delete that names more than one entry may se
     var items: [ae.MAX_RUNS_DELETE + 1]ae.DeletedRun.Value = undefined;
     for (&items) |*i| i.* = .{ .run = "x", .created_ns = 1, .completed_ms = 1 };
     try testing.expectError(error.Halt, f.bulkDelete("wf", 25, items[0..40], items[40..]));
-    comptime std.debug.assert(ae.MAX_RUNS_DELETE + 1 <= channels.MAX_SENDS);
-    comptime std.debug.assert(ae.MAX_RUNS_DELETE * he.Drop.max_size <= channels.MAX_SEND_BYTES);
 }
 
 test "workflow runs machine: a schedule's slot fires once, its run deleted or not; an older slot after a newer one is refused" {

@@ -36050,6 +36050,83 @@ test "Shard: a workflow's bulk delete takes its runs that ended before the bound
     try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
 }
 
+test "Shard: a workflow's bulk delete refuses a limit outside 1..63, and at its leader's held-orphan bound proposes none, counting them all left" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [16 * 1024]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    const Op = table_run.op("workflow.runs_delete");
+    var diag: schema.Diagnostic = .{};
+    // A limit of 0 or 64, which the encoder won't write: patched into one of 1.
+    var rb1: [Op.request.max_size]u8 = undefined;
+    var rb2: [Op.request.max_size]u8 = undefined;
+    const lo = try Op.request.encodeInto(&rb1, .{ .ended_before_ms = std.math.maxInt(i64), .limit = 1 });
+    const hi = try Op.request.encodeInto(&rb2, .{ .ended_before_ms = std.math.maxInt(i64), .limit = 2 });
+    const at = for (lo, hi, 0..) |x, y, i| {
+        if (x != y) break i;
+    } else unreachable;
+    var id: u64 = 1;
+    for ([_]u8{ 0, 64 }) |limit| {
+        var raw = rb1;
+        raw[at] = limit;
+        const last = shard.raft_node.log.lastIndex();
+        try ParkTest.send(&shard, conn, .workflow_runs_delete, id, "gate", raw[0..lo.len]);
+        try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
+        try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
+        id += 1;
+    }
+    // One mark past what the leader holds as sent, all of them before the
+    // bound: the leader has no room for the one it doesn't hold.
+    const hm = @import("../stream/history_machine.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const wh = shard.workflow_handler;
+    {
+        var ks = contract_view.KeySet.init(al);
+        var keys: [hm.OrphansSent.MAX + 1][]const u8 = undefined;
+        for (&keys, 0..) |*k, i| {
+            k.* = try hm.orphanRowKey(al, .default, "gate", "o", i + 1);
+            try ks.add(hm.Workflows.ID, "", k.*);
+        }
+        var view = contract_view.View.init(wh.defsRead().store, al, &ks);
+        view.strict = false;
+        var row = std.mem.zeroes(hm.Row.Value);
+        row.owner = "gate";
+        row.completed_ms = 10;
+        row.retries = hm.MAX_DROP_RETRIES;
+        for (keys) |k| try view.put(hm.Workflows, k, .{ .v = row });
+        try view.commit();
+    }
+    wh.orphans_sent.at(wh.allocator, shard.raft_node.current_term);
+    var i: u64 = 0;
+    while (!wh.orphans_sent.full()) : (i += 1) try wh.orphans_sent.note(wh.allocator, .default, "gate", .{ .run = "o", .created_ns = i + 1, .completed_ms = 10 });
+    var rb: [Op.request.max_size]u8 = undefined;
+    const last = shard.raft_node.log.lastIndex();
+    try ParkTest.send(&shard, conn, .workflow_runs_delete, id, "gate", try Op.request.encodeInto(&rb, .{ .ended_before_ms = std.math.maxInt(i64), .limit = 63 }));
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
+    const r = try Op.response.decodeAll(one[0].data, &diag);
+    try std.testing.expectEqual(@as(u32, 0), r.deleted);
+    // Counted as an apply counts them, the held ones too (not only the one
+    // it doesn't hold), up to the most it counts.
+    try std.testing.expectEqual(hm.MAX_ORPHANS_COUNTED, r.orphans_left);
+}
+
 test "Shard: a workflow run's history read waits while its chunks are on the history lane, and is answered once they land" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);

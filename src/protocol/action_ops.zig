@@ -288,7 +288,7 @@ pub const table = [_]ops.Op{
         .route = .key,
         .request = RunsDeleteRequest,
         .response = RunsDeleteResponse,
-        .cli = .{ .expose = .hand, .key = .{ .name = "action", .doc = "The action's name" }, .examples = &.{"flo action runs-delete send-email --ended-before 2026-11-01T00:00:00Z"} },
+        .cli = .{ .expose = .hand, .key = .{ .name = "action", .doc = "The action's name" }, .examples = &.{"flo action runs-delete send-email --older-than 30d"} },
         .doc = "Delete an action's runs that ended before a time, oldest first, a batch per call, with their histories; ask again while more is true. The action needn't be registered still.",
     },
 };

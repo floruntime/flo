@@ -37,7 +37,7 @@ pub const table = [_]ops.Op{
         .route = .key,
         .request = action_ops.RunsDeleteRequest,
         .response = action_ops.RunsDeleteResponse,
-        .cli = .{ .expose = .hand, .key = .{ .name = "workflow", .doc = "The workflow's name" }, .examples = &.{"flo workflow runs-delete order-flow --ended-before 2026-11-01T00:00:00Z"} },
+        .cli = .{ .expose = .hand, .key = .{ .name = "workflow", .doc = "The workflow's name" }, .examples = &.{"flo workflow runs-delete order-flow --ended-before 1793491200000"} },
         .doc = "Delete a workflow's runs that ended before a time, oldest first, a batch per call, with their histories; ask again while more is true. The workflow needn't be defined still.",
     },
 };

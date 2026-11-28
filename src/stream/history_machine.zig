@@ -815,6 +815,9 @@ pub const OrphansSent = struct {
         gop.value_ptr.* = try inNs(a, ns, rk);
     }
 
+    // Keyed by a 64-bit hash, not the orphan: two that collide share an
+    // entry, so the second is held back as sent until the first's mark is
+    // gone and the prune frees it. A collision only defers a drop.
     fn id(ns: NamespaceId, owner: []const u8, o: Orphan) u64 {
         var h = std.hash.Wyhash.init(0x4f52);
         h.update(std.mem.asBytes(&ns.int()));

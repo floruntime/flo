@@ -1904,11 +1904,16 @@ test "actions machine: a delete of an ended run removes it and drops its history
 
 /// A bulk delete of action "send"'s runs that ended before `before_ms`.
 fn bulkOf(a: std.mem.Allocator, before_ms: i64, runs: []const ae.DeletedRun.Value, orphans: []const ae.DeletedRun.Value) !ae.RunsDelete.Value {
+    return bulkOfAs(a, .default, "send", before_ms, runs, orphans);
+}
+
+/// A bulk delete of action `owner`'s runs in `ns`.
+fn bulkOfAs(a: std.mem.Allocator, ns: NamespaceId, owner: []const u8, before_ms: i64, runs: []const ae.DeletedRun.Value, orphans: []const ae.DeletedRun.Value) !ae.RunsDelete.Value {
     var rl: std.ArrayListUnmanaged(u8) = .empty;
     for (runs) |r| try rl.appendSlice(a, try ae.DeletedRun.encodeInto(try a.alloc(u8, ae.DeletedRun.max_size), r));
     var ol: std.ArrayListUnmanaged(u8) = .empty;
     for (orphans) |r| try ol.appendSlice(a, try ae.DeletedRun.encodeInto(try a.alloc(u8, ae.DeletedRun.max_size), r));
-    return .{ .ns = DEFAULT, .owner = "send", .before_ms = before_ms, .runs = .{ .bytes = rl.items, .count = @intCast(runs.len) }, .orphans = .{ .bytes = ol.items, .count = @intCast(orphans.len) } };
+    return .{ .ns = ns.int(), .owner = owner, .before_ms = before_ms, .runs = .{ .bytes = rl.items, .count = @intCast(runs.len) }, .orphans = .{ .bytes = ol.items, .count = @intCast(orphans.len) } };
 }
 
 fn deletedOf(t: *TestActions, id: []const u8) ae.DeletedRun.Value {
@@ -1986,6 +1991,80 @@ test "actions machine: a bulk delete drops only an orphan still marked, of its a
     const drops = try histDrops(&t, a);
     try testing.expectEqual(@as(usize, 1), drops.len);
     try testing.expectEqualStrings("o1", drops[0].run);
+}
+
+test "actions machine: a bulk delete passes over a run that ended at its bound, read with another end, or named for another action; at the bound none is more" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 3);
+    try invoke(&t, "r1", 10 * ms);
+    _ = try deliver(&t, "r1", 10 * ms, 19 * ms);
+    try testing.expect((try t.apply(.action_settle, settleOf(&t, "r1"), 20 * ms)).refused() == null);
+    const r1 = deletedOf(&t, "r1");
+    // Ended at the bound: not before it, and not more.
+    var rd = (try t.apply(.action_runs_delete, try bulkOf(a, 20, &.{r1}, &.{}), 30 * ms)).reader();
+    try testing.expectEqual(@as(u32, 0), rd.int(u32).?);
+    try testing.expectEqual(@as(u8, 0), rd.int(u8).?);
+    // Read with another end than its own.
+    var later = r1;
+    later.completed_ms += 1;
+    rd = (try t.apply(.action_runs_delete, try bulkOf(a, 25, &.{later}, &.{}), 31 * ms)).reader();
+    try testing.expectEqual(@as(u32, 0), rd.int(u32).?);
+    // Named for another action: its owner is checked.
+    rd = (try t.apply(.action_runs_delete, try bulkOfAs(a, .default, "other", 25, &.{r1}, &.{}), 32 * ms)).reader();
+    try testing.expectEqual(@as(u32, 0), rd.int(u32).?);
+    try testing.expect(t.run(.default, "r1") != null);
+    try testing.expectEqual(@as(usize, 0), (try histDrops(&t, a)).len);
+    // Read right, before a bound past its end, it goes.
+    rd = (try t.apply(.action_runs_delete, try bulkOf(a, 25, &.{r1}, &.{}), 33 * ms)).reader();
+    try testing.expectEqual(@as(u32, 1), rd.int(u32).?);
+    try testing.expect(t.run(.default, "r1") == null);
+}
+
+test "actions machine: a bulk delete that names more than one entry may send is a Flo bug" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    var items: [ae.MAX_RUNS_DELETE + 1]ae.DeletedRun.Value = undefined;
+    for (&items) |*i| i.* = .{ .run = "x", .created_ns = 1, .completed_ms = 1 };
+    try testing.expectError(error.Halt, t.apply(.action_runs_delete, try bulkOf(a, 25, items[0..40], items[40..]), 10 * ms));
+}
+
+test "actions machine: a bulk delete in a namespace drops its orphan there, not the default namespace's of the same name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    const ns: NamespaceId = .of(16);
+    {
+        const k = try hm.orphanRowKey(a, ns, "send", "o1", 7);
+        var ks = view_mod.KeySet.init(a);
+        try ks.add(hm.Actions.ID, "", k);
+        var view = View.init(&t.store, a, &ks);
+        view.strict = false;
+        var row = std.mem.zeroes(hm.Row.Value);
+        row.owner = "send";
+        row.completed_ms = 10;
+        try view.put(hm.Actions, k, .{ .v = row });
+        try view.commit();
+    }
+    const o: ae.DeletedRun.Value = .{ .run = "o1", .created_ns = 7, .completed_ms = 10 };
+    _ = try t.apply(.action_runs_delete, try bulkOf(a, 25, &.{}, &.{o}), 10 * ms);
+    try testing.expectEqual(@as(usize, 0), (try histDrops(&t, a)).len);
+    var rd = (try t.apply(.action_runs_delete, try bulkOfAs(a, ns, "send", 25, &.{}, &.{o}), 11 * ms)).reader();
+    try testing.expectEqual(@as(u32, 0), rd.int(u32).?);
+    try testing.expectEqual(@as(u8, 0), rd.int(u8).?);
+    try testing.expectEqual(@as(u32, 0), rd.int(u32).?);
+    const drops = try histDrops(&t, a);
+    try testing.expectEqual(@as(usize, 1), drops.len);
+    try testing.expectEqualStrings("o1", drops[0].run);
+    try testing.expectEqual(ns.int(), drops[0].ns);
 }
 
 /// The events `records` holds, in order.

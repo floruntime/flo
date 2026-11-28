@@ -1822,9 +1822,12 @@ pub const WorkflowHandler = struct {
         fn run(shard: *Shard, _: *Connection, req: Request, before_ms: i64, limit: u32) Error!table_run.Outcome(Response) {
             const self = shard.workflow_handler;
             if (!shard.raft_node.leaderReady()) return error.NotLeading;
-            if (req.key.len == 0 or req.key.len > he.MAX_OWNER) return error.NotFound;
+            if (req.key.len == 0) return error.NotFound;
             const names = @import("../protocol/names.zig");
             if (names.hasControl(req.key)) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(comptime names.controlRefusal("a workflow name")) } };
+            // No workflow has a name that long, so none has runs: as for
+            // any other with none.
+            if (req.key.len > he.MAX_OWNER) return .{ .answer = .{ .deleted = 0, .more = false, .orphans_left = 0 } };
             var arena_state = std.heap.ArenaAllocator.init(self.allocator);
             defer arena_state.deinit();
             const a = arena_state.allocator();
@@ -1849,13 +1852,18 @@ pub const WorkflowHandler = struct {
             var found: [ae.MAX_RUNS_DELETE]history_machine.Orphan = undefined;
             const room = if (self.orphans_sent.full()) 0 else ae.MAX_RUNS_DELETE - n;
             const got = try history_machine.orphansOf(read, a, .workflow, ns, req.key, found[0..room], Skip{ .before_ms = before_ms, .sent = &self.orphans_sent, .ns = ns, .owner = req.key });
-            if (n == 0 and got.n == 0) return .{ .answer = .{ .deleted = 0, .more = false, .orphans_left = got.left } };
+            // Nothing to propose: the orphans left counted as an apply counts
+            // them, its own sent ones among them, so the two answers agree.
+            if (n == 0 and got.n == 0) {
+                const left = try history_machine.orphansOf(read, a, .workflow, ns, req.key, &.{}, bulk.Skip{ .before_ms = before_ms });
+                return .{ .answer = .{ .deleted = 0, .more = false, .orphans_left = left.left } };
+            }
             var orphans: std.ArrayListUnmanaged(u8) = .empty;
             for (found[0..got.n]) |o| try appendItem(a, &orphans, .{ .run = o.run, .created_ns = o.created_ns, .completed_ms = @intCast(@min(o.completed_ms, std.math.maxInt(i64))) });
             const body: ae.RunsDelete.Value = .{ .ns = ns.int(), .owner = req.key, .before_ms = before_ms, .runs = .{ .bytes = runs.items, .count = n }, .orphans = .{ .bytes = orphans.items, .count = @intCast(got.n) } };
             const buf = try a.alloc(u8, ae.RunsDelete.encodedSize(body) catch return error.OutOfMemory);
             const bytes = ae.RunsDelete.encodeInto(buf, body) catch return error.OutOfMemory;
-            const proposed = shard.raft_node.propose(.workflow_runs_delete, entry_mod.Flags.NONE, bytes) catch |err|
+            const proposed = proposeIn(shard, ns, .workflow_runs_delete, bytes) catch |err|
                 return .{ .refused = .{ .status = persistence_mod.failureStatus(err), .refusal = persistence_mod.failureRefusal(err, "delete not persisted") } };
             for (found[0..got.n]) |o| try self.orphans_sent.note(self.allocator, ns, req.key, o);
             return .{ .park = .{ .proposed = proposed, .answer = answer } };
@@ -1863,6 +1871,13 @@ pub const WorkflowHandler = struct {
 
         fn answer(shard: *Shard, conn: *Connection, request_id: u64, result: *const persistence_mod.Result) void {
             table_run.answer(Response, shard, conn, request_id, answerOf(result));
+        }
+
+        /// An entry naming no namespace halts every replica that applies
+        /// it, so it is refused here, as the action side's is.
+        fn proposeIn(shard: *Shard, ns: NamespaceId, comptime etype: entry_mod.EntryType, bytes: []const u8) !persistence_mod.ProposeResult {
+            if (ns == .invalid) return error.NamespaceUnknown;
+            return shard.raft_node.propose(etype, entry_mod.Flags.NONE, bytes);
         }
     };
 

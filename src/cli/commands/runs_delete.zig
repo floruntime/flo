@@ -10,6 +10,7 @@ const cli_config = @import("../config.zig");
 const schema = @import("../../protocol/schema.zig");
 const proto = @import("../../protocol/proto.zig");
 const action_ops = @import("../../protocol/action_ops.zig");
+const output = @import("../output.zig");
 
 const Client = client_mod.Client;
 
@@ -63,6 +64,7 @@ pub fn run(ctx: *commander.Context, comptime op: proto.OpCode, comptime key: []c
 
     var deleted: u64 = 0;
     var left: u32 = 0;
+    var more = false;
     while (true) {
         var body: [action_ops.RunsDeleteRequest.max_size]u8 = undefined;
         const value = action_ops.RunsDeleteRequest.encodeInto(&body, .{ .ended_before_ms = before_ms, .limit = action_ops.MAX_RUNS_DELETE }) catch return outcome.malformed(ctx, "request");
@@ -74,10 +76,20 @@ pub fn run(ctx: *commander.Context, comptime op: proto.OpCode, comptime key: []c
         const r = action_ops.RunsDeleteResponse.decodeAll(data, &diag) catch return outcome.malformed(ctx, "runs-delete response");
         deleted += r.deleted;
         left = r.orphans_left;
+        more = r.more;
         if (!r.more or r.deleted == 0) break;
     }
+    if (output.getFormat(ctx) == .json) {
+        ctx.print("{{\"deleted\":{d},\"more\":{},\"orphans_left\":{d}}}\n", .{ deleted, more, left });
+        return;
+    }
     ctx.print("Deleted {d} ended run(s) of {s}\n", .{ deleted, owner });
-    if (left > 0) ctx.print("{d} orphaned histories are left; run it again to drop them\n", .{left});
+    // A batch took none though more ended before the bound: another delete
+    // took them meanwhile, or they changed since read.
+    if (more) ctx.print("More ended before then; run it again to delete them\n", .{});
+    // An orphan whose drop is on its way isn't sent again: it goes when that
+    // drop lands, so asking again needn't take it.
+    if (left > 0) ctx.print("{d} orphaned histories are left; they go as their drops land\n", .{left});
 }
 
 test "runs-delete: a duration's units" {

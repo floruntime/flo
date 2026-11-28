@@ -1500,8 +1500,10 @@ pub const ActionsHandler = struct {
     /// needn't be registered: its runs outlive its definition.
     fn runRunsDelete(shard: *Shard, _: *Connection, req: Request, before_ms: i64, limit: u32) Error!table_run.Outcome(RunsDeleteResponse) {
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
-        if (req.key.len == 0 or req.key.len > ae.MAX_ACTION_NAME) return error.NotFound;
+        if (req.key.len == 0) return error.NotFound;
         if (client_names.hasControl(req.key)) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(comptime client_names.controlRefusal("an action name")) } };
+        // No action has a name that long, so none has runs.
+        if (req.key.len > ae.MAX_ACTION_NAME) return .{ .answer = .{ .deleted = 0, .more = false, .orphans_left = 0 } };
         const self = shard.actions_handler;
         var arena_state = std.heap.ArenaAllocator.init(shard.allocator);
         defer arena_state.deinit();
@@ -1528,7 +1530,12 @@ pub const ActionsHandler = struct {
         var found: [ae.MAX_RUNS_DELETE]hm.Orphan = undefined;
         const room = if (self.orphans_sent.full()) 0 else ae.MAX_RUNS_DELETE - n;
         const got = try hm.orphansOf(read, a, .action, ns, req.key, found[0..room], WorkflowHandler.Skip{ .before_ms = before_ms, .sent = &self.orphans_sent, .ns = ns, .owner = req.key });
-        if (n == 0 and got.n == 0) return .{ .answer = .{ .deleted = 0, .more = false, .orphans_left = got.left } };
+        // Nothing to propose: the orphans left counted as an apply counts
+        // them, as `workflow.runs_delete` answers.
+        if (n == 0 and got.n == 0) {
+            const left = try hm.orphansOf(read, a, .action, ns, req.key, &.{}, bulk.Skip{ .before_ms = before_ms });
+            return .{ .answer = .{ .deleted = 0, .more = false, .orphans_left = left.left } };
+        }
         var orphans: std.ArrayListUnmanaged(u8) = .empty;
         for (found[0..got.n]) |o| try WorkflowHandler.appendItem(a, &orphans, .{ .run = o.run, .created_ns = o.created_ns, .completed_ms = @intCast(@min(o.completed_ms, std.math.maxInt(i64))) });
         const proposed = propose(shard, .action_runs_delete, ae.RunsDelete.Value{ .ns = ns.int(), .owner = req.key, .before_ms = before_ms, .runs = .{ .bytes = runs.items, .count = n }, .orphans = .{ .bytes = orphans.items, .count = @intCast(got.n) } }) catch |err|

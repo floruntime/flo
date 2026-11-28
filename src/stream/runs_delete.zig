@@ -16,7 +16,7 @@ pub fn endedMsOf(key: []const u8, prefix_len: usize) i64 {
 /// ended at or after its bound, and those it drops itself.
 pub const Skip = struct {
     before_ms: i64,
-    taken: @FieldType(ae.RunsDelete.Value, "orphans"),
+    taken: @FieldType(ae.RunsDelete.Value, "orphans") = .{ .bytes = "", .count = 0 },
 
     pub fn has(self: Skip, o: hm.Orphan) bool {
         if (@as(i64, @intCast(@min(o.completed_ms, std.math.maxInt(i64)))) >= self.before_ms) return true;
